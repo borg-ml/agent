@@ -31,12 +31,12 @@ const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const DEFAULT_COMMAND_TIMEOUT_MS: u64 = 120_000;
 const MAX_COMMAND_TIMEOUT_MS: u64 = 30 * 60 * 1000;
 const DEFAULT_COMMAND_OUTPUT_BYTES: u64 = 256 * 1024;
-const MAX_COMMAND_OUTPUT_BYTES: u64 = 1024 * 1024;
 
 #[derive(Clone)]
 pub(crate) struct NativeHarness {
     full_access_sessions: Arc<Mutex<HashSet<Uuid>>>,
     model_client: Arc<dyn NativeModelClient>,
+    process_manager: crate::native_process::ProcessManager,
 }
 
 impl std::fmt::Debug for NativeHarness {
@@ -45,6 +45,7 @@ impl std::fmt::Debug for NativeHarness {
             .debug_struct("NativeHarness")
             .field("full_access_sessions", &"[session-scoped]")
             .field("model_client", &"[provider adapter]")
+            .field("process_manager", &"[session-owned processes]")
             .finish()
     }
 }
@@ -54,6 +55,7 @@ impl Default for NativeHarness {
         Self {
             full_access_sessions: Arc::default(),
             model_client: Arc::new(CompatibleModelClient::default()),
+            process_manager: crate::native_process::ProcessManager::default(),
         }
     }
 }
@@ -100,6 +102,7 @@ impl NativeHarness {
             turn.permission_mode,
             turn.agent_tools.clone(),
             turn.external_mcp_servers.clone(),
+            self.process_manager.clone(),
         )
         .await?;
         let tools = runtime.tool_definitions()?;
@@ -484,6 +487,7 @@ struct NativeToolRuntime {
     permission: PermissionMode,
     agent_tools: crate::AgentToolDispatcher,
     mcp: crate::native_mcp::NativeMcpRuntime,
+    processes: crate::native_process::ProcessManager,
 }
 
 impl NativeToolRuntime {
@@ -493,6 +497,7 @@ impl NativeToolRuntime {
         permission: PermissionMode,
         agent_tools: crate::AgentToolDispatcher,
         external_mcp_servers: Vec<borg_provider::mcp::ExternalMcpServer>,
+        processes: crate::native_process::ProcessManager,
     ) -> Result<Self> {
         Ok(Self {
             session_id,
@@ -500,6 +505,7 @@ impl NativeToolRuntime {
             permission,
             agent_tools,
             mcp: crate::native_mcp::NativeMcpRuntime::start(external_mcp_servers).await?,
+            processes,
         })
     }
 
@@ -573,16 +579,36 @@ impl NativeToolRuntime {
             }
             "exec_command" => {
                 let args: ExecCommandArgs = serde_json::from_value(arguments)?;
-                self.command(
-                    vec!["bash".to_string(), "-lc".to_string(), args.cmd],
-                    args.timeout_ms
-                        .unwrap_or(DEFAULT_COMMAND_TIMEOUT_MS)
-                        .clamp(1, MAX_COMMAND_TIMEOUT_MS),
-                    args.output_max_bytes
-                        .unwrap_or(DEFAULT_COMMAND_OUTPUT_BYTES)
-                        .clamp(1, MAX_COMMAND_OUTPUT_BYTES),
-                )
-                .await
+                Ok(serde_json::to_value(
+                    self.processes
+                        .exec(
+                            self.session_id,
+                            &self.root,
+                            args.cmd,
+                            args.workdir.as_deref(),
+                            args.yield_time_ms,
+                            args.max_output_tokens,
+                            args.timeout_ms
+                                .unwrap_or(DEFAULT_COMMAND_TIMEOUT_MS)
+                                .clamp(1, MAX_COMMAND_TIMEOUT_MS),
+                        )
+                        .await?,
+                )?)
+            }
+            "write_stdin" => {
+                let args: WriteStdinArgs = serde_json::from_value(arguments)?;
+                Ok(serde_json::to_value(
+                    self.processes
+                        .write_stdin(
+                            self.session_id,
+                            args.session_id,
+                            args.chars.as_deref(),
+                            args.terminate.unwrap_or(false),
+                            args.yield_time_ms,
+                            args.max_output_tokens,
+                        )
+                        .await?,
+                )?)
             }
             other if self.mcp.contains(other) => self.mcp.call(other, arguments).await,
             other => self.agent_tools.call(other, arguments).await,
@@ -1159,23 +1185,57 @@ fn builtin_tool_specs() -> Vec<Value> {
         ),
         tool(
             "exec_command",
-            "Run one shell command in the workspace with bounded time and output. Non-full-access sessions require user approval.",
+            "Run a shell command in the workspace. Returns promptly with a session_id when it is still running; use write_stdin to poll, interact, or terminate it.",
             json!({
                 "type": "object",
                 "properties": {
                     "cmd": { "type": "string", "minLength": 1 },
+                    "workdir": {
+                        "type": "string",
+                        "description": "Workspace-relative working directory."
+                    },
+                    "yield_time_ms": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 30000,
+                        "description": "Wait this long before returning a running process session."
+                    },
+                    "max_output_tokens": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 64000
+                    },
                     "timeout_ms": {
                         "type": "integer",
                         "minimum": 1,
                         "maximum": MAX_COMMAND_TIMEOUT_MS
-                    },
-                    "output_max_bytes": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": MAX_COMMAND_OUTPUT_BYTES
                     }
                 },
                 "required": ["cmd"],
+                "additionalProperties": false
+            }),
+        ),
+        tool(
+            "write_stdin",
+            "Poll a running command, write to its stdin, or terminate its process tree.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "format": "uuid" },
+                    "chars": { "type": "string" },
+                    "yield_time_ms": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 30000
+                    },
+                    "max_output_tokens": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 64000
+                    },
+                    "terminate": { "type": "boolean", "default": false }
+                },
+                "required": ["session_id"],
                 "additionalProperties": false
             }),
         ),
@@ -1229,8 +1289,20 @@ struct EditFileArgs {
 #[serde(deny_unknown_fields)]
 struct ExecCommandArgs {
     cmd: String,
+    workdir: Option<String>,
+    yield_time_ms: Option<u64>,
+    max_output_tokens: Option<usize>,
     timeout_ms: Option<u64>,
-    output_max_bytes: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WriteStdinArgs {
+    session_id: Uuid,
+    chars: Option<String>,
+    yield_time_ms: Option<u64>,
+    max_output_tokens: Option<usize>,
+    terminate: Option<bool>,
 }
 
 #[cfg(test)]

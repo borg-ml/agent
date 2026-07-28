@@ -16,6 +16,7 @@ mod local_control;
 mod lsp;
 mod native_harness;
 mod native_mcp;
+mod native_process;
 mod receipt;
 mod session;
 mod session_store;
