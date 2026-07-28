@@ -402,6 +402,13 @@ fn existing_path(root: &Path, relative: &Path) -> FsResult<PathBuf> {
     Ok(canonical)
 }
 
+pub(crate) fn resolve_existing_workspace_path(
+    root: &Path,
+    relative: &Path,
+) -> anyhow::Result<PathBuf> {
+    existing_path(root, relative).map_err(|outcome| anyhow::anyhow!("{outcome:?}"))
+}
+
 async fn create_directories(root: &Path, relative: &Path, recursive: bool) -> FsResult<()> {
     let mut current = root.to_path_buf();
     let components = relative

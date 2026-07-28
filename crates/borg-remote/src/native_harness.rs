@@ -18,9 +18,8 @@ use uuid::Uuid;
 
 use crate::{
     AgentTurn, AgentTurnControl, AgentTurnResult, ApprovalDecision, EventActor, MessageStatus,
-    PermissionMode, SessionEventKind, SessionStatus, WorkspaceCommandOutcome,
-    WorkspaceCommandRequest, WorkspaceFilesystemOperation, WorkspaceFilesystemOutcome,
-    WorkspaceFilesystemRequest, execute_workspace_command, execute_workspace_filesystem,
+    PermissionMode, SessionEventKind, SessionStatus, WorkspaceFilesystemOperation,
+    WorkspaceFilesystemOutcome, WorkspaceFilesystemRequest, execute_workspace_filesystem,
 };
 
 const MAX_TOOL_ROUNDS: usize = 32;
@@ -30,7 +29,6 @@ const DEFAULT_FILE_BYTES: u64 = 256 * 1024;
 const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const DEFAULT_COMMAND_TIMEOUT_MS: u64 = 120_000;
 const MAX_COMMAND_TIMEOUT_MS: u64 = 30 * 60 * 1000;
-const DEFAULT_COMMAND_OUTPUT_BYTES: u64 = 256 * 1024;
 
 #[derive(Clone)]
 pub(crate) struct NativeHarness {
@@ -533,29 +531,33 @@ impl NativeToolRuntime {
             }
             "read_file" => {
                 let args: ReadFileArgs = serde_json::from_value(arguments)?;
-                self.filesystem(WorkspaceFilesystemOperation::ReadText {
-                    path: PathBuf::from(args.path),
-                    max_bytes: args
-                        .max_bytes
-                        .unwrap_or(DEFAULT_FILE_BYTES)
-                        .clamp(1, MAX_FILE_BYTES),
-                })
-                .await
+                Ok(serde_json::to_value(
+                    crate::native_io::read_text_range(
+                        self.root.clone(),
+                        PathBuf::from(args.path),
+                        args.offset_line.unwrap_or(1),
+                        args.limit_lines.unwrap_or(2_000),
+                        args.max_bytes
+                            .unwrap_or(DEFAULT_FILE_BYTES)
+                            .clamp(1, MAX_FILE_BYTES) as usize,
+                    )
+                    .await?,
+                )?)
             }
             "search_files" => {
                 let args: SearchFilesArgs = serde_json::from_value(arguments)?;
-                let command = vec![
-                    "rg".to_string(),
-                    "--line-number".to_string(),
-                    "--no-heading".to_string(),
-                    "--color".to_string(),
-                    "never".to_string(),
-                    "--".to_string(),
-                    args.pattern,
-                    args.path.unwrap_or_else(|| ".".to_string()),
-                ];
-                self.command(command, 30_000, DEFAULT_COMMAND_OUTPUT_BYTES)
-                    .await
+                Ok(serde_json::to_value(
+                    crate::native_io::search_text(
+                        self.root.clone(),
+                        PathBuf::from(args.path.unwrap_or_else(|| ".".to_string())),
+                        args.pattern,
+                        args.literal.unwrap_or(false),
+                        args.case_sensitive.unwrap_or(true),
+                        args.offset.unwrap_or(0),
+                        args.limit.unwrap_or(200),
+                    )
+                    .await?,
+                )?)
             }
             "write_file" => {
                 let args: WriteFileArgs = serde_json::from_value(arguments)?;
@@ -668,42 +670,6 @@ impl NativeToolRuntime {
             create_parent_dirs: false,
         })
         .await
-    }
-
-    async fn command(
-        &self,
-        command: Vec<String>,
-        timeout_ms: u64,
-        output_max_bytes: u64,
-    ) -> Result<Value> {
-        let response = execute_workspace_command(
-            std::slice::from_ref(&self.root),
-            WorkspaceCommandRequest {
-                request_id: Uuid::new_v4(),
-                workspace_id: self.session_id,
-                root_path: self.root.clone(),
-                cwd: PathBuf::from("."),
-                command,
-                timeout_ms,
-                output_max_bytes,
-            },
-        )
-        .await;
-        match response.outcome {
-            WorkspaceCommandOutcome::Success { output } => Ok(json!({
-                "exit_code": output.exit_code,
-                "timed_out": output.timed_out,
-                "stdout": output.stdout,
-                "stderr": output.stderr,
-                "stdout_truncated": output.stdout_truncated,
-                "stderr_truncated": output.stderr_truncated,
-            })),
-            WorkspaceCommandOutcome::Failure {
-                code,
-                message,
-                retryable,
-            } => bail!("{code:?}: {message} (retryable={retryable})"),
-        }
     }
 }
 
@@ -1239,11 +1205,13 @@ fn builtin_tool_specs() -> Vec<Value> {
         ),
         tool(
             "read_file",
-            "Read a UTF-8 text file under the workspace root.",
+            "Read a bounded line range from a UTF-8 workspace file. Continue with next_line when truncated.",
             json!({
                 "type": "object",
                 "properties": {
                     "path": { "type": "string", "minLength": 1 },
+                    "offset_line": { "type": "integer", "minimum": 1, "default": 1 },
+                    "limit_lines": { "type": "integer", "minimum": 1, "maximum": 20000, "default": 2000 },
                     "max_bytes": { "type": "integer", "minimum": 1, "maximum": MAX_FILE_BYTES }
                 },
                 "required": ["path"],
@@ -1252,12 +1220,16 @@ fn builtin_tool_specs() -> Vec<Value> {
         ),
         tool(
             "search_files",
-            "Search workspace text with ripgrep and return file, line, and matching text.",
+            "Search workspace text without requiring external executables. Results are gitignore-aware, bounded, and resumable with next_offset.",
             json!({
                 "type": "object",
                 "properties": {
                     "pattern": { "type": "string", "minLength": 1 },
-                    "path": { "type": "string", "default": "." }
+                    "path": { "type": "string", "default": "." },
+                    "literal": { "type": "boolean", "default": false },
+                    "case_sensitive": { "type": "boolean", "default": true },
+                    "offset": { "type": "integer", "minimum": 0, "default": 0 },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 2000, "default": 200 }
                 },
                 "required": ["pattern"],
                 "additionalProperties": false
@@ -1367,6 +1339,8 @@ struct ListFilesArgs {
 #[serde(deny_unknown_fields)]
 struct ReadFileArgs {
     path: String,
+    offset_line: Option<usize>,
+    limit_lines: Option<usize>,
     max_bytes: Option<u64>,
 }
 
@@ -1375,6 +1349,10 @@ struct ReadFileArgs {
 struct SearchFilesArgs {
     pattern: String,
     path: Option<String>,
+    literal: Option<bool>,
+    case_sensitive: Option<bool>,
+    offset: Option<usize>,
+    limit: Option<usize>,
 }
 
 #[derive(Deserialize)]
