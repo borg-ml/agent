@@ -524,12 +524,8 @@ impl Provider for MockProvider {
     }
 }
 
-pub const CLAUDE_SELECTABLE_MODELS: [(&str, &str); 3] = [
-    ("claude-opus-5", "Opus 5"),
-    ("claude-sonnet-5", "Sonnet 5"),
-    ("claude-fable-5", "Fable 5"),
-];
-pub const CLAUDE_DEFAULT_MODEL: &str = "claude-sonnet-5";
+pub use crate::CLAUDE_SELECTABLE_MODELS;
+pub const CLAUDE_DEFAULT_MODEL: &str = crate::CLAUDE_MODEL_CATALOG.default_model;
 
 pub fn default_model_for_backend(backend: &str) -> Option<String> {
     match backend {

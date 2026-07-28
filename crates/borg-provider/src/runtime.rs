@@ -3,6 +3,73 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderModelCatalog {
+    pub backend: &'static str,
+    pub default_model: &'static str,
+    pub selectable_models: &'static [(&'static str, &'static str)],
+    pub effort_levels: &'static [&'static str],
+}
+
+impl ProviderModelCatalog {
+    pub fn supports_model(self, model: &str) -> bool {
+        self.selectable_models
+            .iter()
+            .any(|(candidate, _)| *candidate == model)
+    }
+
+    pub fn supports_effort(self, effort: &str) -> bool {
+        self.effort_levels.contains(&effort)
+    }
+}
+
+pub const CODEX_SELECTABLE_MODELS: [(&str, &str); 3] = [
+    ("gpt-5.6-sol", "Sol"),
+    ("gpt-5.6-terra", "Terra"),
+    ("gpt-5.6-luna", "Luna"),
+];
+pub const CODEX_EFFORT_LEVELS: [&str; 6] = ["low", "medium", "high", "xhigh", "max", "ultra"];
+pub const CODEX_MODEL_CATALOG: ProviderModelCatalog = ProviderModelCatalog {
+    backend: "codex",
+    default_model: "gpt-5.6-sol",
+    selectable_models: &CODEX_SELECTABLE_MODELS,
+    effort_levels: &CODEX_EFFORT_LEVELS,
+};
+
+pub const CLAUDE_SELECTABLE_MODELS: [(&str, &str); 3] = [
+    ("claude-opus-5", "Opus 5"),
+    ("claude-sonnet-5", "Sonnet 5"),
+    ("claude-fable-5", "Fable 5"),
+];
+pub const CLAUDE_MODEL_CATALOG: ProviderModelCatalog = ProviderModelCatalog {
+    backend: "claude",
+    default_model: "claude-sonnet-5",
+    selectable_models: &CLAUDE_SELECTABLE_MODELS,
+    effort_levels: &[],
+};
+
+pub const KIMI_SELECTABLE_MODELS: [(&str, &str); 1] = [("kimi-k3", "Kimi K3")];
+pub const KIMI_EFFORT_LEVELS: [&str; 3] = ["low", "medium", "high"];
+pub const KIMI_MODEL_CATALOG: ProviderModelCatalog = ProviderModelCatalog {
+    backend: "kimi",
+    default_model: "kimi-k3",
+    selectable_models: &KIMI_SELECTABLE_MODELS,
+    effort_levels: &KIMI_EFFORT_LEVELS,
+};
+
+pub const MODEL_CATALOGS: [ProviderModelCatalog; 3] = [
+    CODEX_MODEL_CATALOG,
+    CLAUDE_MODEL_CATALOG,
+    KIMI_MODEL_CATALOG,
+];
+
+pub fn model_catalog_for_backend(backend: &str) -> Option<ProviderModelCatalog> {
+    MODEL_CATALOGS
+        .iter()
+        .copied()
+        .find(|catalog| catalog.backend == backend)
+}
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CostBasis {
@@ -84,7 +151,7 @@ pub fn elapsed_millis_u64(started_at: Instant) -> u64 {
 }
 
 pub fn codex_product_model() -> &'static str {
-    "gpt-5.6-sol"
+    CODEX_MODEL_CATALOG.default_model
 }
 
 pub fn codex_default_effort() -> &'static str {
@@ -92,17 +159,19 @@ pub fn codex_default_effort() -> &'static str {
 }
 
 pub fn codex_effort_levels() -> Vec<String> {
-    ["low", "medium", "high", "xhigh", "max", "ultra"]
-        .map(str::to_string)
-        .to_vec()
+    CODEX_MODEL_CATALOG
+        .effort_levels
+        .iter()
+        .map(|effort| (*effort).to_string())
+        .collect()
 }
 
 pub fn codex_effort_supported(value: &str) -> bool {
-    matches!(value, "low" | "medium" | "high" | "xhigh" | "max" | "ultra")
+    CODEX_MODEL_CATALOG.supports_effort(value)
 }
 
 pub fn kimi_product_model() -> &'static str {
-    "kimi-k3"
+    KIMI_MODEL_CATALOG.default_model
 }
 
 pub fn kimi_default_effort() -> &'static str {
@@ -110,5 +179,9 @@ pub fn kimi_default_effort() -> &'static str {
 }
 
 pub fn kimi_effort_levels() -> Vec<String> {
-    ["low", "medium", "high"].map(str::to_string).to_vec()
+    KIMI_MODEL_CATALOG
+        .effort_levels
+        .iter()
+        .map(|effort| (*effort).to_string())
+        .collect()
 }

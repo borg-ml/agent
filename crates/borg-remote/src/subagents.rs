@@ -116,6 +116,7 @@ pub struct AgentToolDispatcher {
     todos: SessionTodoTools,
     subagents: SubagentCoordinator,
     lsp: crate::LspService,
+    provider: CodingProvider,
 }
 
 #[derive(Debug)]
@@ -126,6 +127,7 @@ pub struct AgentToolServer {
     tcp_addr: std::net::SocketAddr,
     #[cfg(not(unix))]
     token: String,
+    provider: CodingProvider,
     cancel: CancellationToken,
 }
 
@@ -166,6 +168,7 @@ impl AgentToolServer {
         let cancel = CancellationToken::new();
         let server_cancel = cancel.clone();
         let cleanup_path = socket_path.clone();
+        let provider = dispatcher.provider;
         tokio::spawn(async move {
             loop {
                 let accepted = tokio::select! {
@@ -180,6 +183,7 @@ impl AgentToolServer {
         });
         Ok(Self {
             socket_path,
+            provider,
             cancel,
         })
     }
@@ -199,6 +203,7 @@ impl AgentToolServer {
         let cancel = CancellationToken::new();
         let server_cancel = cancel.clone();
         let server_token = token.clone();
+        let provider = dispatcher.provider;
         tokio::spawn(async move {
             loop {
                 let accepted = tokio::select! {
@@ -219,12 +224,17 @@ impl AgentToolServer {
         Ok(Self {
             tcp_addr,
             token,
+            provider,
             cancel,
         })
     }
 
     pub fn external_mcp_server(&self) -> borg_provider::mcp::ExternalMcpServer {
         let mut env = BTreeMap::new();
+        env.insert(
+            "BORG_AGENT_TOOL_PROVIDER".to_string(),
+            self.provider.catalog_backend().to_string(),
+        );
         #[cfg(unix)]
         env.insert(
             "BORG_AGENT_TOOL_SOCKET".to_string(),
@@ -243,7 +253,7 @@ impl AgentToolServer {
                 .into_owned(),
             args: vec!["__agent-mcp".to_string()],
             env,
-            allowed_tools: agent_tool_specs()
+            allowed_tools: agent_tool_specs(self.provider)
                 .into_iter()
                 .filter_map(|tool| {
                     tool["name"]
@@ -310,17 +320,19 @@ impl AgentToolDispatcher {
         todos: SessionTodoTools,
         subagents: SubagentCoordinator,
         lsp: crate::LspService,
+        provider: CodingProvider,
     ) -> Self {
         Self {
             goals,
             todos,
             subagents,
             lsp,
+            provider,
         }
     }
 
     pub fn specs(&self) -> Vec<Value> {
-        agent_tool_specs()
+        agent_tool_specs(self.provider)
     }
 
     pub async fn call(&self, name: &str, arguments: Value) -> Result<Value> {
@@ -631,6 +643,11 @@ impl SubagentCoordinator {
         launch.request_id = Uuid::new_v4();
         launch.initial_prompt = Some(message);
         launch.provider = request.provider.unwrap_or(launch.provider);
+        validate_subagent_overrides(
+            launch.provider,
+            request.model.as_deref(),
+            request.effort.as_deref(),
+        )?;
         if request.model.is_some() {
             launch.model = request.model;
         }
@@ -945,11 +962,12 @@ fn boxed_agent_store_session(
 
 /// Provider-neutral schemas: Codex consumes these as app-server dynamic tools;
 /// Claude and OpenCode consume the same catalog through the local MCP bridge.
-pub fn subagent_tool_specs() -> Vec<Value> {
+pub fn subagent_tool_specs(provider: CodingProvider) -> Vec<Value> {
+    let description = subagent_tool_description(provider);
     vec![
         tool(
             "spawn_agent",
-            "Spawn an isolated child Borg session for a concrete, bounded task.",
+            &description,
             json!({
                 "type": "object",
                 "properties": {
@@ -1006,7 +1024,74 @@ pub fn subagent_tool_specs() -> Vec<Value> {
     ]
 }
 
-pub fn agent_tool_specs() -> Vec<Value> {
+fn subagent_tool_description(provider: CodingProvider) -> String {
+    let inheritance = provider
+        .model_catalog()
+        .map(|catalog| {
+            let models = catalog
+                .selectable_models
+                .iter()
+                .map(|(model, _)| *model)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let efforts = if catalog.effort_levels.is_empty() {
+                "provider default".to_string()
+            } else {
+                catalog.effort_levels.join(", ")
+            };
+            format!(
+                "Available {} model overrides: {models}. Reasoning efforts: {efforts}.",
+                catalog.backend
+            )
+        })
+        .unwrap_or_else(|| {
+            format!(
+                "{} accepts provider-defined model identifiers.",
+                provider.catalog_backend()
+            )
+        });
+    format!(
+        "Spawn an isolated child Borg session for a concrete, bounded task. \
+         Omit provider, model, and reasoning_effort to inherit the parent. {inheritance}"
+    )
+}
+
+fn validate_subagent_overrides(
+    provider: CodingProvider,
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> Result<()> {
+    let Some(catalog) = provider.model_catalog() else {
+        return Ok(());
+    };
+    if let Some(model) = model
+        && !catalog.supports_model(model)
+    {
+        let allowed = catalog
+            .selectable_models
+            .iter()
+            .map(|(model, _)| *model)
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!(
+            "unsupported {} subagent model `{model}`; available models: {allowed}",
+            catalog.backend
+        );
+    }
+    if let Some(effort) = effort
+        && !catalog.effort_levels.is_empty()
+        && !catalog.supports_effort(effort)
+    {
+        bail!(
+            "unsupported {} subagent reasoning effort `{effort}`; available efforts: {}",
+            catalog.backend,
+            catalog.effort_levels.join(", ")
+        );
+    }
+    Ok(())
+}
+
+pub fn agent_tool_specs(provider: CodingProvider) -> Vec<Value> {
     let mut specs = vec![
         tool(
             "get_goal",
@@ -1130,7 +1215,7 @@ pub fn agent_tool_specs() -> Vec<Value> {
             }),
         ),
     ];
-    specs.extend(subagent_tool_specs());
+    specs.extend(subagent_tool_specs(provider));
     specs
 }
 
@@ -1501,7 +1586,7 @@ mod tests {
 
     #[test]
     fn tool_catalog_exposes_one_complete_lifecycle() {
-        let names = subagent_tool_specs()
+        let names = subagent_tool_specs(CodingProvider::Codex)
             .into_iter()
             .filter_map(|tool| tool["name"].as_str().map(str::to_string))
             .collect::<Vec<_>>();
@@ -1515,6 +1600,31 @@ mod tests {
                 "interrupt_agent",
                 "wait_agent"
             ]
+        );
+    }
+
+    #[test]
+    fn subagent_tool_and_validation_use_the_provider_model_catalog() {
+        let catalog = CodingProvider::Codex
+            .model_catalog()
+            .expect("Codex catalog");
+        let spawn = subagent_tool_specs(CodingProvider::Codex)
+            .into_iter()
+            .find(|tool| tool["name"] == "spawn_agent")
+            .expect("spawn_agent tool");
+        let description = spawn["description"].as_str().expect("description");
+        for (model, _) in catalog.selectable_models {
+            assert!(
+                description.contains(model),
+                "agent-facing description omitted {model}"
+            );
+            validate_subagent_overrides(CodingProvider::Codex, Some(model), None)
+                .expect("catalog model should be accepted");
+        }
+        assert!(description.contains("gpt-5.6-luna"));
+        assert!(
+            validate_subagent_overrides(CodingProvider::Codex, Some("not-a-codex-model"), None)
+                .is_err()
         );
     }
 

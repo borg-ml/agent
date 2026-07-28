@@ -1,6 +1,26 @@
 use super::*;
 
 #[test]
+fn model_and_effort_pickers_use_the_provider_catalog() {
+    let catalog = CodingProvider::Codex
+        .model_catalog()
+        .expect("Codex catalog");
+    assert_eq!(
+        model_picker_options(Some(CodingProvider::Codex), None),
+        catalog
+            .selectable_models
+            .iter()
+            .map(|(model, _)| *model)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        effort_picker_options(Some(CodingProvider::Codex)),
+        catalog.effort_levels
+    );
+    assert!(model_picker_options(Some(CodingProvider::Codex), None).contains(&"gpt-5.6-luna"));
+}
+
+#[test]
 fn keybinding_help_is_action_first_and_uses_configuration() {
     let config = crate::agent_config::KeybindingConfig {
         send: vec!["ctrl+s".to_string()],

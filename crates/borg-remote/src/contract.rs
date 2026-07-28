@@ -170,6 +170,21 @@ impl ResponseLanguage {
 }
 
 impl CodingProvider {
+    pub const fn catalog_backend(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+            Self::OpenCode => "opencode",
+            Self::Kimi => "kimi",
+            Self::OpenRouter => "openrouter",
+            Self::OpenAiCompatible => "openai-compatible",
+        }
+    }
+
+    pub fn model_catalog(self) -> Option<borg_provider::ProviderModelCatalog> {
+        borg_provider::model_catalog_for_backend(self.catalog_backend())
+    }
+
     pub fn executable(self) -> &'static str {
         match self {
             Self::Codex => "codex",

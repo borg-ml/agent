@@ -1428,6 +1428,13 @@ fn write_managed_codex_auth(codex_home: &Path, openai_api_key: &str) -> Result<(
 fn thread_config(web_search_allowed: bool, reasoning_effort: Option<&str>) -> Value {
     let mut config = serde_json::json!({
         "web_search": if web_search_allowed { "live" } else { "disabled" },
+        // Borg owns the durable subagent lifecycle. Leaving Codex's parallel
+        // collaboration runtime enabled would expose a second model catalog
+        // and a second child-session authority to the same acting model.
+        "features": {
+            "multi_agent": false,
+            "multi_agent_v2": false,
+        },
     });
     if let Some(effort) = reasoning_effort {
         // `reasoningEffort` was removed from ThreadStartParams and
@@ -1820,6 +1827,18 @@ mod tests {
             Some("low")
         );
         assert!(config.get("reasoningEffort").is_none());
+        assert_eq!(
+            config
+                .pointer("/features/multi_agent")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            config
+                .pointer("/features/multi_agent_v2")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
     }
 
     #[test]

@@ -403,6 +403,7 @@ async fn run_agent_session_store_kernel(
         todo_tools.clone(),
         subagents.clone(),
         crate::LspService::new(&launch.cwd),
+        launch.provider,
     );
     let agent_tool_server =
         crate::AgentToolServer::start(session_root, session_id, dispatcher.clone()).await?;

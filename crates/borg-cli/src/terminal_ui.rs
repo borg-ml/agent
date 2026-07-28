@@ -18,7 +18,6 @@ use std::time::{Duration, Instant};
 use crate::editor_preferences::{TranscriptPreferences, parse_hex_color};
 use anyhow::{Context, Result};
 use attachments::{AttachmentStore, PasteOutcome};
-use borg_provider::provider::CLAUDE_SELECTABLE_MODELS;
 use borg_remote::{
     ApprovalDecision, CodingProvider, EventActor, GoalStatus, MessageStatus, PermissionMode,
     PlanItem, PlanItemStatus, PromptDelivery, ResponseLanguage, SessionEvent, SessionEventKind,
@@ -703,6 +702,41 @@ fn pad_display(value: &str, width: usize) -> String {
     format!("{value}{}", " ".repeat(width.saturating_sub(used)))
 }
 
+fn model_picker_options(provider: Option<CodingProvider>, current: Option<&str>) -> Vec<&str> {
+    if let Some(catalog) = provider.and_then(CodingProvider::model_catalog) {
+        return catalog
+            .selectable_models
+            .iter()
+            .map(|(id, _)| *id)
+            .collect();
+    }
+    match provider {
+        Some(CodingProvider::OpenRouter) => {
+            let mut options = vec!["moonshotai/kimi-k3"];
+            if let Some(current) = current
+                && !options.contains(&current)
+            {
+                options.insert(0, current);
+            }
+            options
+        }
+        Some(CodingProvider::OpenAiCompatible | CodingProvider::OpenCode) | None => {
+            vec![current.unwrap_or("model-id")]
+        }
+        Some(CodingProvider::Codex | CodingProvider::Claude | CodingProvider::Kimi) => {
+            unreachable!("catalog-backed providers have a model catalog")
+        }
+    }
+}
+
+fn effort_picker_options(provider: Option<CodingProvider>) -> &'static [&'static str] {
+    provider
+        .and_then(CodingProvider::model_catalog)
+        .map(|catalog| catalog.effort_levels)
+        .filter(|efforts| !efforts.is_empty())
+        .unwrap_or(&borg_provider::CODEX_EFFORT_LEVELS)
+}
+
 impl BorgTerminal {
     pub fn fallback_requested() -> bool {
         !rich_terminal_supported(
@@ -1064,27 +1098,7 @@ impl BorgTerminal {
             .config
             .as_ref()
             .and_then(|config| config.model.clone());
-        let options = match provider {
-            Some(CodingProvider::Claude) => {
-                CLAUDE_SELECTABLE_MODELS.iter().map(|(id, _)| *id).collect()
-            }
-            Some(CodingProvider::Codex) => {
-                vec!["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
-            }
-            Some(CodingProvider::Kimi) => vec![borg_provider::kimi_product_model()],
-            Some(CodingProvider::OpenRouter) => {
-                let mut options = vec!["moonshotai/kimi-k3"];
-                if let Some(current) = current.as_deref()
-                    && !options.contains(&current)
-                {
-                    options.insert(0, current);
-                }
-                options
-            }
-            Some(CodingProvider::OpenAiCompatible | CodingProvider::OpenCode) | None => {
-                vec![current.as_deref().unwrap_or("model-id")]
-            }
-        };
+        let options = model_picker_options(provider, current.as_deref());
         self.picker = Some(Picker::new(
             PickerKind::Model,
             "Choose model",
@@ -1165,16 +1179,21 @@ impl BorgTerminal {
     }
 
     pub fn open_effort_picker(&mut self) {
+        let provider = self
+            .transcript
+            .config
+            .as_ref()
+            .map(|config| config.provider);
         let current = self
             .transcript
             .config
             .as_ref()
             .and_then(|config| config.effort.clone());
-        let options = borg_provider::codex_effort_levels();
+        let options = effort_picker_options(provider);
         self.picker = Some(Picker::new(
             PickerKind::Effort,
             "Choose effort",
-            options.iter().map(String::as_str),
+            options.iter().copied(),
             current.as_deref(),
         ));
     }

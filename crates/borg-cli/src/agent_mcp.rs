@@ -28,21 +28,26 @@ pub(crate) async fn run() -> Result<()> {
 
 enum AgentToolEndpoint {
     #[cfg(unix)]
-    Unix(PathBuf),
+    Unix {
+        socket: PathBuf,
+        provider: borg_remote::CodingProvider,
+    },
     #[cfg(not(unix))]
     Loopback {
         address: std::net::SocketAddr,
         token: String,
+        provider: borg_remote::CodingProvider,
     },
 }
 
 impl AgentToolEndpoint {
     fn from_env() -> Result<Self> {
+        let provider = agent_tool_provider()?;
         #[cfg(unix)]
         {
             std::env::var_os("BORG_AGENT_TOOL_SOCKET")
                 .map(PathBuf::from)
-                .map(Self::Unix)
+                .map(|socket| Self::Unix { socket, provider })
                 .context("BORG_AGENT_TOOL_SOCKET is required")
         }
         #[cfg(not(unix))]
@@ -57,7 +62,20 @@ impl AgentToolEndpoint {
             }
             let token = std::env::var("BORG_AGENT_TOOL_TOKEN")
                 .context("BORG_AGENT_TOOL_TOKEN is required for loopback agent tools")?;
-            Ok(Self::Loopback { address, token })
+            Ok(Self::Loopback {
+                address,
+                token,
+                provider,
+            })
+        }
+    }
+
+    fn provider(&self) -> borg_remote::CodingProvider {
+        match self {
+            #[cfg(unix)]
+            Self::Unix { provider, .. } => *provider,
+            #[cfg(not(unix))]
+            Self::Loopback { provider, .. } => *provider,
         }
     }
 }
@@ -76,7 +94,9 @@ async fn handle_line(endpoint: &AgentToolEndpoint, line: &str) -> Option<Value> 
             "capabilities": { "tools": {} }
         })),
         "ping" => Ok(json!({})),
-        "tools/list" => Ok(json!({ "tools": borg_remote::agent_tool_specs() })),
+        "tools/list" => Ok(json!({
+            "tools": borg_remote::agent_tool_specs(endpoint.provider())
+        })),
         "tools/call" => {
             let params = request.get("params").cloned().unwrap_or_else(|| json!({}));
             let name = params
@@ -111,10 +131,17 @@ async fn handle_line(endpoint: &AgentToolEndpoint, line: &str) -> Option<Value> 
     })
 }
 
+fn agent_tool_provider() -> Result<borg_remote::CodingProvider> {
+    let provider = std::env::var("BORG_AGENT_TOOL_PROVIDER")
+        .context("BORG_AGENT_TOOL_PROVIDER is required")?;
+    serde_json::from_value(Value::String(provider))
+        .context("BORG_AGENT_TOOL_PROVIDER is not a supported provider")
+}
+
 async fn forward(endpoint: &AgentToolEndpoint, name: &str, arguments: Value) -> Result<Value> {
     #[cfg(unix)]
     let response = match endpoint {
-        AgentToolEndpoint::Unix(socket) => {
+        AgentToolEndpoint::Unix { socket, .. } => {
             let stream = UnixStream::connect(socket)
                 .await
                 .with_context(|| format!("failed to connect to {}", socket.display()))?;
@@ -123,7 +150,7 @@ async fn forward(endpoint: &AgentToolEndpoint, name: &str, arguments: Value) -> 
     };
     #[cfg(not(unix))]
     let response = match endpoint {
-        AgentToolEndpoint::Loopback { address, token } => {
+        AgentToolEndpoint::Loopback { address, token, .. } => {
             let stream = TcpStream::connect(address).await.with_context(|| {
                 format!("failed to connect to local agent tool server {address}")
             })?;
@@ -172,11 +199,15 @@ mod tests {
     #[tokio::test]
     async fn local_proxy_exposes_the_shared_agent_tool_catalog() {
         #[cfg(unix)]
-        let endpoint = AgentToolEndpoint::Unix(Path::new("/unused").to_path_buf());
+        let endpoint = AgentToolEndpoint::Unix {
+            socket: Path::new("/unused").to_path_buf(),
+            provider: borg_remote::CodingProvider::Codex,
+        };
         #[cfg(not(unix))]
         let endpoint = AgentToolEndpoint::Loopback {
             address: "127.0.0.1:1".parse().unwrap(),
             token: "unused".to_string(),
+            provider: borg_remote::CodingProvider::Codex,
         };
         let response = handle_line(
             &endpoint,
