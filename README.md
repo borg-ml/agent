@@ -1,17 +1,17 @@
 # Borg CLI
 
-Borg is a durable coding agent for local and remote work. This repository is
-the public source of truth for the terminal client, provider adapters, and Borg
-Remote host/session runtime used by the private Borg platform.
+Borg is a free and open-source agent harness and orchestrator for reliable
+local and remote work. It provides a terminal interface, provider adapters,
+durable sessions, tool execution, and Borg Remote hosting without requiring
+proprietary software on the user's computer.
 
-## Licence
+This repository is the public source of truth for that runtime.
 
-**AGPL-3.0-only OR a separate Borg Commercial Licence.**
+## Install
 
-The repository distributes the AGPL terms in [`LICENSE`](LICENSE). Contact
-Borg to discuss a separate commercial licence; no commercial contract terms
-are created by this repository. See [`NOTICE.md`](NOTICE.md) and
-[`THIRD_PARTY.md`](THIRD_PARTY.md).
+```sh
+curl -fsSL https://borg.ml/install | sh
+```
 
 ## Boundary
 
@@ -42,5 +42,10 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) before submitting changes.
 
 Tags matching `v*` build checksum-paired `borg` archives for Linux, macOS, and
 Windows on x86-64 and ARM64. Each release archive contains the self-contained
-`borg` CLI, `LICENSE`, `NOTICE.md`, `THIRD_PARTY.md`, and this README. Private
-platform services and tools are never packaged from this repository.
+`borg` CLI, `LICENSE`, `NOTICE.md`, and this README. Private platform services
+and tools are never packaged from this repository.
+
+---
+
+Licensed under AGPL-3.0-only. For a separate Borg Commercial Licence, contact
+Borg.

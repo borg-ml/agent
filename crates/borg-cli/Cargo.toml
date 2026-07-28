@@ -1,6 +1,6 @@
 [package]
 name = "borg"
-description = "Durable coding-agent terminal client and Borg Remote host"
+description = "Free and open-source agent harness, terminal client, and Borg Remote host"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

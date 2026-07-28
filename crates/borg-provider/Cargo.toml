@@ -1,6 +1,6 @@
 [package]
 name = "borg-provider"
-description = "Provider-neutral model, tool, MCP, authentication, usage, and local coding-provider adapters for Borg"
+description = "Provider-neutral model, tool, MCP, authentication, usage, and agent adapters for Borg"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

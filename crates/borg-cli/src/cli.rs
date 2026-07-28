@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 #[derive(Debug, Parser)]
 #[command(name = "borg")]
-#[command(about = "A durable coding agent for local and remote work")]
+#[command(about = "A free and open-source agent harness for local and remote work")]
 #[command(version)]
 pub(crate) struct Cli {
     #[command(subcommand)]
@@ -14,7 +14,7 @@ pub(crate) struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
-    /// Start a local coding-agent session.
+    /// Start a local agent session.
     Agent(LocalAgentCliArgs),
     /// Resume the latest local session, or a specific session by id.
     Resume { session: Option<Uuid> },

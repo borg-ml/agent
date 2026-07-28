@@ -329,7 +329,7 @@ impl NativeHarness {
         );
         let mut messages = Vec::with_capacity(conversation.len().saturating_add(2));
         messages.push(ModelMessage::System {
-            content: "Summarize the conversation for another coding agent that will continue the work. Preserve user requirements, decisions, files changed, commands and tests run, unresolved errors, approvals, and next steps. Be compact but do not omit details needed to continue safely. Return only the summary.".to_string(),
+            content: "Summarize the conversation for another agent that will continue the work. Preserve user requirements, decisions, files changed, commands and tests run, unresolved errors, approvals, and next steps. Be compact but do not omit details needed to continue safely. Return only the summary.".to_string(),
         });
         messages.extend(conversation);
         messages.push(ModelMessage::User {

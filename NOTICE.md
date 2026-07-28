@@ -8,6 +8,6 @@ The complete public licence is in [`LICENSE`](LICENSE). A commercial licence
 is a separate written agreement obtained from Borg; this repository does not
 state or create its terms.
 
-Files identified as third-party or generated exceptions remain under their
-own notices. Nothing in this notice claims Borg copyright or relicensing rights
-over those files.
+Generated TypeScript bindings identify their generator in-file. Third-party
+dependencies remain under their upstream licences and copyright notices;
+nothing here claims Borg ownership or relicensing rights over them.
