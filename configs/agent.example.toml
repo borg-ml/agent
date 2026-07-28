@@ -1,0 +1,10 @@
+# Copy to $XDG_CONFIG_HOME/borg/agent.toml (usually ~/.config/borg/agent.toml)
+# or pass `borg agent --config PATH`.
+#
+# Aliases expand to built-in slash commands. They do not execute shell code,
+# load plugins, or register lifecycle hooks.
+
+[commands.aliases]
+quick = "/fast on"
+normal = "/fast off"
+deep = "/effort xhigh"

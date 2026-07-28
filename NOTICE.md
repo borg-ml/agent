@@ -1,0 +1,13 @@
+# Licensing notice
+
+Borg-authored code in this distribution is available under:
+
+**AGPL-3.0-only OR a separate Borg Commercial Licence.**
+
+The complete public licence is in [`LICENSE`](LICENSE). A commercial licence
+is a separate written agreement obtained from Borg; this repository does not
+state or create its terms.
+
+Files identified as third-party or generated exceptions remain under their
+own notices. Nothing in this notice claims Borg copyright or relicensing rights
+over those files.

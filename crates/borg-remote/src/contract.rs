@@ -1,0 +1,1222 @@
+use std::path::PathBuf;
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use ts_rs::TS;
+use uuid::Uuid;
+
+pub const REMOTE_PROTOCOL_VERSION: u16 = 4;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum CodingProvider {
+    Codex,
+    Claude,
+    OpenCode,
+    Kimi,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub enum ResponseLanguage {
+    #[default]
+    #[serde(rename = "auto")]
+    #[ts(rename = "auto")]
+    Auto,
+    #[serde(rename = "en")]
+    #[ts(rename = "en")]
+    English,
+    #[serde(rename = "zh-Hans")]
+    #[ts(rename = "zh-Hans")]
+    SimplifiedChinese,
+    #[serde(rename = "zh-Hant")]
+    #[ts(rename = "zh-Hant")]
+    TraditionalChinese,
+    #[serde(rename = "es")]
+    #[ts(rename = "es")]
+    Spanish,
+    #[serde(rename = "pt-BR")]
+    #[ts(rename = "pt-BR")]
+    PortugueseBrazil,
+    #[serde(rename = "fr")]
+    #[ts(rename = "fr")]
+    French,
+    #[serde(rename = "de")]
+    #[ts(rename = "de")]
+    German,
+    #[serde(rename = "ja")]
+    #[ts(rename = "ja")]
+    Japanese,
+    #[serde(rename = "ko")]
+    #[ts(rename = "ko")]
+    Korean,
+    #[serde(rename = "ru")]
+    #[ts(rename = "ru")]
+    Russian,
+    #[serde(rename = "ar")]
+    #[ts(rename = "ar")]
+    Arabic,
+}
+
+impl ResponseLanguage {
+    pub const ALL: [Self; 12] = [
+        Self::Auto,
+        Self::English,
+        Self::SimplifiedChinese,
+        Self::TraditionalChinese,
+        Self::Spanish,
+        Self::PortugueseBrazil,
+        Self::French,
+        Self::German,
+        Self::Japanese,
+        Self::Korean,
+        Self::Russian,
+        Self::Arabic,
+    ];
+
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::English => "en",
+            Self::SimplifiedChinese => "zh-Hans",
+            Self::TraditionalChinese => "zh-Hant",
+            Self::Spanish => "es",
+            Self::PortugueseBrazil => "pt-BR",
+            Self::French => "fr",
+            Self::German => "de",
+            Self::Japanese => "ja",
+            Self::Korean => "ko",
+            Self::Russian => "ru",
+            Self::Arabic => "ar",
+        }
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::English => "English",
+            Self::SimplifiedChinese => "Simplified Chinese",
+            Self::TraditionalChinese => "Traditional Chinese",
+            Self::Spanish => "Spanish",
+            Self::PortugueseBrazil => "Portuguese (Brazil)",
+            Self::French => "French",
+            Self::German => "German",
+            Self::Japanese => "Japanese",
+            Self::Korean => "Korean",
+            Self::Russian => "Russian",
+            Self::Arabic => "Arabic",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        let normalized = value
+            .trim()
+            .to_lowercase()
+            .replace(['_', '-', '(', ')'], " ");
+        match normalized
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .as_str()
+        {
+            "auto" => Some(Self::Auto),
+            "en" | "english" => Some(Self::English),
+            "zh hans" | "simplified chinese" | "chinese simplified" => {
+                Some(Self::SimplifiedChinese)
+            }
+            "zh hant" | "traditional chinese" | "chinese traditional" => {
+                Some(Self::TraditionalChinese)
+            }
+            "es" | "spanish" | "español" => Some(Self::Spanish),
+            "pt br" | "portuguese" | "portuguese brazil" | "brazilian portuguese" => {
+                Some(Self::PortugueseBrazil)
+            }
+            "fr" | "french" | "français" => Some(Self::French),
+            "de" | "german" | "deutsch" => Some(Self::German),
+            "ja" | "japanese" | "日本語" => Some(Self::Japanese),
+            "ko" | "korean" | "한국어" => Some(Self::Korean),
+            "ru" | "russian" | "русский" => Some(Self::Russian),
+            "ar" | "arabic" | "العربية" => Some(Self::Arabic),
+            _ => None,
+        }
+    }
+
+    pub const fn instruction(self) -> Option<&'static str> {
+        match self {
+            Self::Auto => None,
+            Self::English => Some("Write assistant responses and drafted content in English."),
+            Self::SimplifiedChinese => {
+                Some("Write assistant responses and drafted content in Simplified Chinese.")
+            }
+            Self::TraditionalChinese => {
+                Some("Write assistant responses and drafted content in Traditional Chinese.")
+            }
+            Self::Spanish => Some("Write assistant responses and drafted content in Spanish."),
+            Self::PortugueseBrazil => {
+                Some("Write assistant responses and drafted content in Brazilian Portuguese.")
+            }
+            Self::French => Some("Write assistant responses and drafted content in French."),
+            Self::German => Some("Write assistant responses and drafted content in German."),
+            Self::Japanese => Some("Write assistant responses and drafted content in Japanese."),
+            Self::Korean => Some("Write assistant responses and drafted content in Korean."),
+            Self::Russian => Some("Write assistant responses and drafted content in Russian."),
+            Self::Arabic => Some("Write assistant responses and drafted content in Arabic."),
+        }
+    }
+}
+
+impl CodingProvider {
+    pub fn executable(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+            Self::OpenCode => "opencode",
+            Self::Kimi => "borg",
+        }
+    }
+
+    pub fn supports_fast(self) -> bool {
+        matches!(self, Self::Codex | Self::Claude)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum PermissionMode {
+    ReadOnly,
+    WorkspaceWrite,
+    FullAccess,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum SessionStatus {
+    Starting,
+    Ready,
+    Running,
+    WaitingForApproval,
+    Completed,
+    Failed,
+    Stopped,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum HostStatus {
+    Online,
+    Offline,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ProviderCapability {
+    pub provider: CodingProvider,
+    pub installed: bool,
+    pub version: Option<String>,
+    pub authenticated: bool,
+    pub auth_detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct HostCapabilities {
+    pub protocol_version: u16,
+    pub providers: Vec<ProviderCapability>,
+    pub roots: Vec<PathBuf>,
+    pub can_launch: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct RemoteHost {
+    pub id: Uuid,
+    pub name: String,
+    pub status: HostStatus,
+    pub platform: String,
+    pub hostname: String,
+    pub capabilities: HostCapabilities,
+    pub last_seen_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct LaunchSession {
+    pub request_id: Uuid,
+    pub cwd: PathBuf,
+    pub provider: CodingProvider,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    #[serde(default)]
+    pub fast: Option<bool>,
+    #[serde(default)]
+    pub response_language: ResponseLanguage,
+    pub permission_mode: PermissionMode,
+    pub name: Option<String>,
+    pub initial_prompt: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct RemoteSession {
+    pub id: Uuid,
+    pub host_id: Uuid,
+    pub workspace_id: Option<Uuid>,
+    pub name: String,
+    #[serde(default)]
+    pub latest_response: Option<String>,
+    pub cwd: PathBuf,
+    pub provider: CodingProvider,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub fast: bool,
+    pub permission_mode: PermissionMode,
+    pub provider_session_id: Option<String>,
+    pub status: SessionStatus,
+    pub last_event_sequence: u64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[ts(export)]
+pub enum HostCommand {
+    Launch {
+        session_id: Uuid,
+        request: LaunchSession,
+    },
+    Prompt {
+        session_id: Uuid,
+        message_id: Uuid,
+        text: String,
+        attachments: Vec<PathBuf>,
+        output_schema: Option<Value>,
+        delivery: PromptDelivery,
+    },
+    RecallQueuedPrompt {
+        session_id: Uuid,
+    },
+    Configure {
+        session_id: Uuid,
+        action: SessionConfigAction,
+    },
+    Approve {
+        session_id: Uuid,
+        approval_id: String,
+        decision: ApprovalDecision,
+    },
+    RespondToProviderInteraction {
+        session_id: Uuid,
+        interaction_id: String,
+        response: Value,
+    },
+    Goal {
+        session_id: Uuid,
+        action: GoalAction,
+    },
+    Todo {
+        session_id: Uuid,
+        action: TodoAction,
+    },
+    Subagent {
+        session_id: Uuid,
+        action: SubagentAction,
+    },
+    Interrupt {
+        session_id: Uuid,
+    },
+    Compact {
+        session_id: Uuid,
+    },
+    ClearContext {
+        session_id: Uuid,
+    },
+    Stop {
+        session_id: Uuid,
+    },
+    WorkspaceFilesystem {
+        request: WorkspaceFilesystemRequest,
+    },
+    CancelWorkspaceFilesystem {
+        request_id: Uuid,
+    },
+    WorkspaceCommand {
+        request: WorkspaceCommandRequest,
+    },
+    CancelWorkspaceCommand {
+        request_id: Uuid,
+    },
+}
+
+impl HostCommand {
+    pub fn session_id(&self) -> Option<Uuid> {
+        match self {
+            Self::Launch { session_id, .. }
+            | Self::Prompt { session_id, .. }
+            | Self::RecallQueuedPrompt { session_id }
+            | Self::Configure { session_id, .. }
+            | Self::Approve { session_id, .. }
+            | Self::RespondToProviderInteraction { session_id, .. }
+            | Self::Goal { session_id, .. }
+            | Self::Todo { session_id, .. }
+            | Self::Subagent { session_id, .. }
+            | Self::Interrupt { session_id }
+            | Self::Compact { session_id }
+            | Self::ClearContext { session_id }
+            | Self::Stop { session_id } => Some(*session_id),
+            Self::WorkspaceFilesystem { .. }
+            | Self::CancelWorkspaceFilesystem { .. }
+            | Self::WorkspaceCommand { .. }
+            | Self::CancelWorkspaceCommand { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[ts(export)]
+pub enum SessionConfigAction {
+    SetModel { model: String },
+    SetEffort { effort: String },
+    SetFast { enabled: bool },
+    SetResponseLanguage { language: ResponseLanguage },
+}
+
+/// Typed control plane for child sessions owned by one parent session actor.
+///
+/// The parent coordinator remains the topology authority. Remote transports
+/// only enqueue these actions and observe the resulting durable event.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[ts(export)]
+pub enum SubagentAction {
+    List {
+        request_id: Uuid,
+        path_prefix: Option<String>,
+    },
+    Message {
+        request_id: Uuid,
+        target: String,
+        message: String,
+        delivery: PromptDelivery,
+    },
+    Interrupt {
+        request_id: Uuid,
+        target: String,
+    },
+    Stop {
+        request_id: Uuid,
+        target: String,
+    },
+    Approve {
+        request_id: Uuid,
+        target: String,
+        approval_id: String,
+        decision: ApprovalDecision,
+    },
+}
+
+impl SubagentAction {
+    pub fn request_id(&self) -> Uuid {
+        match self {
+            Self::List { request_id, .. }
+            | Self::Message { request_id, .. }
+            | Self::Interrupt { request_id, .. }
+            | Self::Stop { request_id, .. }
+            | Self::Approve { request_id, .. } => *request_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[ts(export)]
+pub enum SubagentControlOutcome {
+    Listed {
+        agents: Vec<crate::SubagentSnapshot>,
+    },
+    Accepted {
+        agent: crate::SubagentSnapshot,
+    },
+    Failed {
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct WorkspaceCommandRequest {
+    pub request_id: Uuid,
+    pub workspace_id: Uuid,
+    pub root_path: PathBuf,
+    pub cwd: PathBuf,
+    pub command: Vec<String>,
+    pub timeout_ms: u64,
+    pub output_max_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct WorkspaceCommandOutput {
+    pub id: Uuid,
+    pub workspace_id: Uuid,
+    pub workspace_root: PathBuf,
+    pub cwd: PathBuf,
+    pub command: Vec<String>,
+    pub timeout_seconds: u64,
+    pub timed_out: bool,
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
+    pub output_max_bytes: u64,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: DateTime<Utc>,
+    pub manifest_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[ts(export)]
+pub enum WorkspaceCommandOutcome {
+    Success {
+        output: Box<WorkspaceCommandOutput>,
+    },
+    Failure {
+        code: WorkspaceCommandErrorCode,
+        message: String,
+        retryable: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum WorkspaceCommandErrorCode {
+    InvalidRoot,
+    InvalidCwd,
+    InvalidCommand,
+    PermissionDenied,
+    TimedOut,
+    Cancelled,
+    Indeterminate,
+    Io,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct WorkspaceCommandResponse {
+    pub request_id: Uuid,
+    pub workspace_id: Uuid,
+    pub outcome: WorkspaceCommandOutcome,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct WorkspaceFilesystemRequest {
+    pub request_id: Uuid,
+    pub workspace_id: Uuid,
+    pub root_path: PathBuf,
+    pub timeout_ms: u64,
+    pub operation: WorkspaceFilesystemOperation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[ts(export)]
+pub enum WorkspaceFilesystemOperation {
+    List {
+        path: PathBuf,
+        limit: usize,
+    },
+    Stat {
+        path: PathBuf,
+    },
+    ReadText {
+        path: PathBuf,
+        max_bytes: u64,
+    },
+    ReadBytes {
+        path: PathBuf,
+        max_bytes: u64,
+    },
+    WriteText {
+        path: PathBuf,
+        text: String,
+        overwrite: bool,
+        create_parent_dirs: bool,
+    },
+    WriteBytes {
+        path: PathBuf,
+        content_base64: String,
+        overwrite: bool,
+        create_parent_dirs: bool,
+    },
+    Mkdir {
+        path: PathBuf,
+        recursive: bool,
+    },
+    Move {
+        from_path: PathBuf,
+        to_path: PathBuf,
+        overwrite: bool,
+        create_parent_dirs: bool,
+    },
+    Copy {
+        from_path: PathBuf,
+        to_path: PathBuf,
+        overwrite: bool,
+        create_parent_dirs: bool,
+        recursive: bool,
+        max_entries: usize,
+    },
+    Delete {
+        path: PathBuf,
+        archive: bool,
+        recursive: bool,
+    },
+}
+
+impl WorkspaceFilesystemOperation {
+    pub fn is_mutating(&self) -> bool {
+        !matches!(
+            self,
+            Self::List { .. } | Self::Stat { .. } | Self::ReadText { .. } | Self::ReadBytes { .. }
+        )
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct WorkspaceFileEntry {
+    pub name: String,
+    pub path: PathBuf,
+    pub kind: WorkspaceFileKind,
+    pub bytes: Option<u64>,
+    pub modified_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum WorkspaceFileKind {
+    File,
+    Directory,
+    Symlink,
+    Other,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[ts(export)]
+pub enum WorkspaceFilesystemOutput {
+    Listed {
+        path: PathBuf,
+        entries: Vec<WorkspaceFileEntry>,
+        limit: usize,
+        truncated: bool,
+    },
+    Stat {
+        entry: WorkspaceFileEntry,
+    },
+    Text {
+        path: PathBuf,
+        text: String,
+        bytes: u64,
+        max_bytes: u64,
+        modified_at: Option<DateTime<Utc>>,
+    },
+    Bytes {
+        path: PathBuf,
+        content_base64: String,
+        bytes: u64,
+        max_bytes: u64,
+        modified_at: Option<DateTime<Utc>>,
+    },
+    Mutated {
+        operation: String,
+        path: Option<PathBuf>,
+        from_path: Option<PathBuf>,
+        to_path: Option<PathBuf>,
+        archived_path: Option<PathBuf>,
+        bytes: Option<u64>,
+        created: Option<bool>,
+        changed: bool,
+        files: Option<u64>,
+        directories: Option<u64>,
+        entries: Option<u64>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[ts(export)]
+pub enum WorkspaceFilesystemOutcome {
+    Success {
+        output: WorkspaceFilesystemOutput,
+    },
+    Failure {
+        code: WorkspaceFilesystemErrorCode,
+        message: String,
+        retryable: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum WorkspaceFilesystemErrorCode {
+    InvalidPath,
+    NotFound,
+    AlreadyExists,
+    NotAFile,
+    NotADirectory,
+    PayloadTooLarge,
+    InvalidEncoding,
+    PermissionDenied,
+    TimedOut,
+    Cancelled,
+    Indeterminate,
+    Io,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct WorkspaceFilesystemResponse {
+    pub request_id: Uuid,
+    pub workspace_id: Uuid,
+    pub outcome: WorkspaceFilesystemOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[ts(export)]
+pub enum GoalAction {
+    Set {
+        objective: String,
+        token_budget: Option<u64>,
+    },
+    Pause,
+    Resume,
+    Clear,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum GoalStatus {
+    Active,
+    Paused,
+    Blocked,
+    UsageLimited,
+    BudgetLimited,
+    Complete,
+}
+
+impl GoalStatus {
+    pub fn is_active(self) -> bool {
+        self == Self::Active
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct SessionGoal {
+    pub id: Uuid,
+    pub objective: String,
+    pub status: GoalStatus,
+    pub token_budget: Option<u64>,
+    pub tokens_used: u64,
+    pub time_used_seconds: u64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl SessionGoal {
+    pub fn new(objective: String, token_budget: Option<u64>) -> Self {
+        let now = Utc::now();
+        Self {
+            id: Uuid::new_v4(),
+            objective,
+            status: GoalStatus::Active,
+            token_budget,
+            tokens_used: 0,
+            time_used_seconds: 0,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    pub fn remaining_tokens(&self) -> Option<u64> {
+        self.token_budget
+            .map(|budget| budget.saturating_sub(self.tokens_used))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelGoalStatus {
+    Complete,
+    Blocked,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SessionGoalToolRequest {
+    Get,
+    Create {
+        objective: String,
+        token_budget: Option<u64>,
+    },
+    Update {
+        status: ModelGoalStatus,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionGoalToolResponse {
+    pub goal: Option<SessionGoal>,
+    pub remaining_tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[ts(export)]
+pub enum TodoAction {
+    Replace { items: Vec<TodoItemUpdate> },
+    Add { content: String },
+    SetStatus { id: Uuid, status: PlanItemStatus },
+    Remove { id: Uuid },
+    Clear,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SessionTodoToolRequest {
+    Get,
+    Update { items: Vec<TodoItemUpdate> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionTodoToolResponse {
+    pub items: Vec<PlanItem>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum PromptDelivery {
+    /// Admit immediately and promote at the next safe provider-turn boundary.
+    Steer,
+    /// Keep pending until the session would otherwise become idle.
+    Queue,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum ApprovalDecision {
+    AllowOnce,
+    AllowSession,
+    Deny,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum EventActor {
+    User,
+    Assistant,
+    Tool,
+    System,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum MessageStatus {
+    Queued,
+    InProgress,
+    Complete,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum SessionPayloadKind {
+    ToolInput,
+    ToolOutput,
+    ToolResultInput,
+}
+
+impl SessionPayloadKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ToolInput => "tool_input",
+            Self::ToolOutput => "tool_output",
+            Self::ToolResultInput => "tool_result_input",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct SessionPayloadRef {
+    pub id: Uuid,
+    pub kind: SessionPayloadKind,
+    pub byte_len: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[ts(export)]
+pub enum SessionEventKind {
+    SessionStarted,
+    SessionConfigured {
+        cwd: PathBuf,
+        provider: CodingProvider,
+        model: Option<String>,
+        effort: Option<String>,
+        #[serde(default)]
+        fast: bool,
+        #[serde(default)]
+        response_language: ResponseLanguage,
+        permission_mode: PermissionMode,
+    },
+    StatusChanged {
+        status: SessionStatus,
+        detail: Option<String>,
+    },
+    Message {
+        message_id: Uuid,
+        actor: EventActor,
+        text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<PathBuf>,
+        status: MessageStatus,
+        delivery: Option<PromptDelivery>,
+    },
+    ReasoningDelta {
+        text: String,
+    },
+    ToolStarted {
+        tool_call_id: String,
+        name: String,
+        input: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input_ref: Option<SessionPayloadRef>,
+    },
+    ToolCompleted {
+        tool_call_id: String,
+        output: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_ref: Option<SessionPayloadRef>,
+        is_error: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input: Option<Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input_ref: Option<SessionPayloadRef>,
+    },
+    ApprovalRequested {
+        approval_id: String,
+        title: String,
+        detail: String,
+        command: Option<String>,
+    },
+    ApprovalResolved {
+        approval_id: String,
+        decision: ApprovalDecision,
+    },
+    ProviderInteractionRequested {
+        interaction_id: String,
+        kind: String,
+        title: String,
+        detail: String,
+        payload: Value,
+    },
+    ProviderInteractionResolved {
+        interaction_id: String,
+        response: Value,
+    },
+    PlanUpdated {
+        items: Vec<PlanItem>,
+    },
+    UsageUpdated {
+        #[serde(default)]
+        provider_duration_ms: u64,
+        input_tokens: u64,
+        output_tokens: u64,
+        cached_input_tokens: u64,
+        #[serde(default)]
+        cache_creation_input_tokens: u64,
+        #[serde(default)]
+        total_tokens: u64,
+        #[serde(default)]
+        cost_microusd: Option<u64>,
+        #[serde(default)]
+        cost_basis: String,
+        cost_usd: Option<f64>,
+        #[serde(default)]
+        context_tokens: Option<u64>,
+        #[serde(default)]
+        context_window_tokens: Option<u64>,
+    },
+    ContextWindowUpdated {
+        context_tokens: u64,
+        context_window_tokens: u64,
+    },
+    ContextCleared,
+    GoalUpdated {
+        goal: SessionGoal,
+    },
+    GoalCleared {
+        goal_id: Uuid,
+    },
+    SubagentActivity {
+        activity: crate::SubagentActivityKind,
+        agent: crate::SubagentSnapshot,
+        event: Option<Box<SessionEvent>>,
+    },
+    SubagentControl {
+        request_id: Uuid,
+        outcome: SubagentControlOutcome,
+    },
+    ProviderSessionLinked {
+        provider_session_id: String,
+    },
+    PromptRecalled {
+        message_id: Uuid,
+        text: String,
+        attachments: Vec<PathBuf>,
+    },
+    /// Terminal boundary for exactly one admitted prompt.
+    ///
+    /// Session readiness is lifecycle state and must not be used to infer
+    /// that a particular turn completed: a session can emit `Ready` while
+    /// another queued prompt is being admitted. Consumers correlate on the
+    /// original prompt message id instead.
+    TurnCompleted {
+        message_id: Uuid,
+        provider_session_id: Option<String>,
+        final_text: String,
+        error: Option<String>,
+    },
+    ProviderEvent {
+        provider: CodingProvider,
+        kind: String,
+        payload: Value,
+    },
+    Error {
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct PlanItem {
+    pub id: Uuid,
+    pub content: String,
+    pub status: PlanItemStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
+#[ts(export)]
+pub struct TodoItemUpdate {
+    pub id: Option<Uuid>,
+    pub content: String,
+    pub status: PlanItemStatus,
+}
+
+impl<'de> Deserialize<'de> for TodoItemUpdate {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Wire {
+            #[serde(default)]
+            id: Option<String>,
+            content: String,
+            status: PlanItemStatus,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        Ok(Self {
+            id: wire.id.and_then(|value| Uuid::parse_str(&value).ok()),
+            content: wire.content,
+            status: wire.status,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum PlanItemStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct SessionEvent {
+    pub id: Uuid,
+    pub session_id: Uuid,
+    pub sequence: u64,
+    pub created_at: DateTime<Utc>,
+    pub kind: SessionEventKind,
+}
+
+impl SessionEvent {
+    pub fn new(session_id: Uuid, sequence: u64, kind: SessionEventKind) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            session_id,
+            sequence,
+            created_at: Utc::now(),
+            kind,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn goal_command_has_stable_cross_process_shape() {
+        let session_id = Uuid::nil();
+        let command = HostCommand::Goal {
+            session_id,
+            action: GoalAction::Set {
+                objective: "Finish the remote CLI".to_string(),
+                token_budget: Some(50_000),
+            },
+        };
+
+        assert_eq!(
+            serde_json::to_value(command).unwrap(),
+            json!({
+                "type": "goal",
+                "session_id": session_id,
+                "action": {
+                    "type": "set",
+                    "objective": "Finish the remote CLI",
+                    "token_budget": 50_000
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn turn_completion_has_a_correlated_cross_process_shape() {
+        let message_id = Uuid::nil();
+        let event = SessionEventKind::TurnCompleted {
+            message_id,
+            provider_session_id: Some("provider-session".to_string()),
+            final_text: "done".to_string(),
+            error: None,
+        };
+
+        assert_eq!(
+            serde_json::to_value(event).unwrap(),
+            json!({
+                "type": "turn_completed",
+                "message_id": message_id,
+                "provider_session_id": "provider-session",
+                "final_text": "done",
+                "error": null,
+            })
+        );
+    }
+
+    #[test]
+    fn subagent_control_is_correlated_and_targets_the_parent_actor() {
+        let parent_session_id = Uuid::nil();
+        let request_id = Uuid::from_u128(1);
+        let child_session_id = Uuid::from_u128(2);
+        let command = HostCommand::Subagent {
+            session_id: parent_session_id,
+            action: SubagentAction::Interrupt {
+                request_id,
+                target: child_session_id.to_string(),
+            },
+        };
+
+        assert_eq!(command.session_id(), Some(parent_session_id));
+        assert_eq!(
+            serde_json::to_value(command).unwrap(),
+            json!({
+                "type": "subagent",
+                "session_id": parent_session_id,
+                "action": {
+                    "type": "interrupt",
+                    "request_id": request_id,
+                    "target": child_session_id.to_string(),
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn response_language_has_stable_codes_and_accepts_cli_names() {
+        let expected = [
+            "auto", "en", "zh-Hans", "zh-Hant", "es", "pt-BR", "fr", "de", "ja", "ko", "ru", "ar",
+        ];
+        assert_eq!(ResponseLanguage::ALL.map(ResponseLanguage::code), expected);
+        for (language, code) in ResponseLanguage::ALL.into_iter().zip(expected) {
+            assert_eq!(serde_json::to_value(language).unwrap(), json!(code));
+            assert_eq!(ResponseLanguage::parse(code), Some(language));
+            assert_eq!(ResponseLanguage::parse(language.name()), Some(language));
+        }
+        assert_eq!(
+            ResponseLanguage::parse("Brazilian Portuguese"),
+            Some(ResponseLanguage::PortugueseBrazil)
+        );
+        assert_eq!(ResponseLanguage::parse("not-a-language"), None);
+    }
+
+    #[test]
+    fn plan_update_treats_invented_item_labels_as_new_items() {
+        let update: TodoItemUpdate = serde_json::from_value(json!({
+            "id": "inventory",
+            "content": "Inventory the workspace",
+            "status": "in_progress"
+        }))
+        .unwrap();
+
+        assert_eq!(update.id, None);
+        assert_eq!(update.content, "Inventory the workspace");
+        assert_eq!(update.status, PlanItemStatus::InProgress);
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct HostCommandEnvelope {
+    pub id: Uuid,
+    pub sequence: u64,
+    pub created_at: DateTime<Utc>,
+    pub command: HostCommand,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct HostHeartbeat {
+    pub name: String,
+    pub platform: String,
+    pub hostname: String,
+    pub capabilities: HostCapabilities,
+    pub acknowledged_command_sequence: u64,
+}

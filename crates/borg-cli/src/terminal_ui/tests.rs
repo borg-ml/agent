@@ -1,0 +1,2366 @@
+use super::*;
+
+#[test]
+fn reflow_respects_cell_width_and_grapheme_boundaries() {
+    let input = "alpha 👩🏽‍💻 漢字 omega";
+    for width in [4, 7, 12] {
+        let wrapped = wrap_display(input, width);
+        assert!(
+            wrapped
+                .iter()
+                .all(|line| UnicodeWidthStr::width(line.as_str()) <= width)
+        );
+        assert_eq!(wrapped.concat(), input);
+    }
+}
+
+#[test]
+fn reflow_prefers_word_boundaries_without_losing_text() {
+    assert_eq!(wrap_display("alpha beta", 7), vec!["alpha ", "beta"]);
+}
+
+#[test]
+fn composer_deletes_one_extended_grapheme() {
+    let mut composer = Composer::default();
+    composer.insert("a👩🏽‍💻b");
+    composer.move_left();
+    composer.backspace();
+    assert_eq!(composer.text, "ab");
+}
+
+#[test]
+fn composer_deletes_the_previous_unicode_word() {
+    let mut composer = Composer::default();
+    composer.insert("ship polished интерфейс");
+    composer.backspace_word();
+    assert_eq!(composer.text, "ship polished ");
+    assert_eq!(composer.cursor, composer.text.len());
+}
+
+#[test]
+fn terminal_word_delete_shortcuts_cover_common_encodings() {
+    for event in [
+        KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL),
+        KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT),
+        KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL),
+        KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL),
+    ] {
+        assert!(deletes_previous_word(&event), "{event:?}");
+    }
+    assert!(!deletes_previous_word(&KeyEvent::new(
+        KeyCode::Backspace,
+        KeyModifiers::NONE
+    )));
+}
+
+#[test]
+fn composer_treats_an_image_token_as_one_editable_unit() {
+    let mut composer = Composer::default();
+    composer.insert("before after");
+    composer.cursor = "before ".len();
+    assert_eq!(
+        composer.insert_attachment(PathBuf::from("capture.png")),
+        "Image 1"
+    );
+    assert_eq!(composer.text, "before [Image 1]after");
+
+    composer.move_left();
+    assert_eq!(composer.cursor, "before ".len());
+    composer.move_right();
+    composer.backspace();
+    assert_eq!(composer.text, "before after");
+    assert!(composer.attachments.is_empty());
+}
+
+#[test]
+fn edit_tool_accepts_the_array_diff_contract() {
+    let input = serde_json::json!([
+        {"diff": "@@ -1 +1 @@\n-old\n+new"}
+    ]);
+    assert_eq!(
+        tool_code_view("Edit", &input),
+        Some(("diff".to_string(), "@@ -1 +1 @@\n-old\n+new".to_string()))
+    );
+
+    let rust_input = serde_json::json!([
+        {
+            "path": "src/main.rs",
+            "diff": "@@ -1 +1 @@\n-fn old() {}\n+fn main() {}"
+        }
+    ]);
+    assert_eq!(
+        tool_code_view("Edit", &rust_input),
+        Some((
+            "diff:rs".to_string(),
+            "@@ -1 +1 @@\n-fn old() {}\n+fn main() {}".to_string()
+        ))
+    );
+}
+
+#[test]
+fn completed_file_creation_replaces_null_diff_placeholder() {
+    let session_id = Uuid::new_v4();
+    let input = serde_json::json!({
+        "diff": null,
+        "file_path": "src/new.rs",
+        "paths": ["src/new.rs"]
+    });
+    let mut transcript = Transcript::default();
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::ToolStarted {
+            tool_call_id: "create-1".to_string(),
+            name: "Edit".to_string(),
+            input: input.clone(),
+            input_ref: None,
+        },
+    ));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::ToolCompleted {
+            tool_call_id: "create-1".to_string(),
+            output: r#"[{"diff":"fn main() {}\n","kind":{"type":"add"},"path":"src/new.rs"}]"#
+                .to_string(),
+            output_ref: None,
+            is_error: false,
+            input: Some(input),
+            input_ref: None,
+        },
+    ));
+
+    assert!(matches!(
+        transcript.order.last(),
+        Some(TranscriptEntry::Tool {
+            name,
+            code_view: Some((language, text)),
+            expanded: true,
+            ..
+        }) if name == "Create file"
+            && language == "diff:rs"
+            && text.contains("+fn main() {}")
+    ));
+}
+
+#[test]
+fn running_tool_uses_animated_spinner() {
+    let mut transcript = Transcript::default();
+    transcript.apply(&SessionEvent::new(
+        Uuid::new_v4(),
+        1,
+        SessionEventKind::ToolStarted {
+            tool_call_id: "running-1".to_string(),
+            name: "command_execution".to_string(),
+            input: serde_json::json!({"command": "cargo check"}),
+            input_ref: None,
+        },
+    ));
+
+    assert!(transcript.tool_spinner_cache_tick().is_some());
+    let rendered = transcript
+        .lines(100)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.chars().any(|glyph| "⠋⠙⠹⠸⠼⠴⠦⠧".contains(glyph)));
+    assert!(!rendered.contains('↳'));
+}
+
+#[test]
+fn a_new_edit_or_message_collapses_the_previous_diff() {
+    let session_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    for (sequence, path) in [(1, "src/first.rs"), (2, "src/second.rs")] {
+        transcript.apply(&SessionEvent::new(
+            session_id,
+            sequence,
+            SessionEventKind::ToolStarted {
+                tool_call_id: format!("edit-{sequence}"),
+                name: "Edit".to_string(),
+                input: serde_json::json!([{
+                    "path": path,
+                    "diff": "@@ -1 +1 @@\n-old\n+new"
+                }]),
+                input_ref: None,
+            },
+        ));
+    }
+
+    assert!(matches!(
+        transcript.order.first(),
+        Some(TranscriptEntry::Tool {
+            expanded: false,
+            ..
+        })
+    ));
+    assert!(matches!(
+        transcript.order.get(1),
+        Some(TranscriptEntry::Tool { expanded: true, .. })
+    ));
+
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        3,
+        SessionEventKind::Message {
+            message_id: Uuid::new_v4(),
+            actor: EventActor::Assistant,
+            text: "Edits are complete.".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: None,
+        },
+    ));
+    assert!(matches!(
+        transcript.order.get(1),
+        Some(TranscriptEntry::Tool {
+            expanded: false,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn live_tail_updates_reuse_completed_message_markdown() {
+    let session_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    for (sequence, actor, text) in [
+        (1, EventActor::User, "A **formatted** request"),
+        (2, EventActor::Assistant, "A completed response"),
+    ] {
+        transcript.apply(&SessionEvent::new(
+            session_id,
+            sequence,
+            SessionEventKind::Message {
+                message_id: Uuid::new_v4(),
+                actor,
+                text: text.to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            },
+        ));
+    }
+
+    let _ = transcript.lines(80);
+    assert_eq!(transcript.message_markdown_cache.borrow().misses, 2);
+
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        3,
+        SessionEventKind::ReasoningDelta {
+            text: "new live tail".to_string(),
+        },
+    ));
+    let _ = transcript.lines(80);
+
+    assert_eq!(
+        transcript.message_markdown_cache.borrow().misses,
+        2,
+        "a live tail update must not reparse completed history"
+    );
+}
+
+#[test]
+fn live_tail_updates_reuse_completed_tool_bodies() {
+    let session_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::ToolStarted {
+            tool_call_id: "edit-1".to_string(),
+            name: "Edit".to_string(),
+            input: serde_json::json!([{
+                "path": "src/main.rs",
+                "diff": "@@ -1 +1 @@\n-old\n+new"
+            }]),
+            input_ref: None,
+        },
+    ));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::ToolCompleted {
+            tool_call_id: "edit-1".to_string(),
+            output: String::new(),
+            output_ref: None,
+            is_error: false,
+            input: None,
+            input_ref: None,
+        },
+    ));
+
+    let _ = transcript.lines(80);
+    assert_eq!(transcript.tool_body_cache.borrow().misses, 1);
+
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        3,
+        SessionEventKind::ReasoningDelta {
+            text: "new live tail".to_string(),
+        },
+    ));
+    let _ = transcript.lines(80);
+
+    assert_eq!(
+        transcript.tool_body_cache.borrow().misses,
+        1,
+        "a live tail update must not re-render completed tool bodies"
+    );
+}
+
+#[test]
+#[ignore = "explicit large-transcript TUI render p95 performance gate"]
+fn large_transcript_live_tail_render_p95_gate() {
+    const COMPLETED_MESSAGES: usize = 200;
+    const SAMPLES: usize = 60;
+
+    let session_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    for sequence in 1..=COMPLETED_MESSAGES {
+        transcript.apply(&SessionEvent::new(
+            session_id,
+            sequence as u64,
+            SessionEventKind::Message {
+                message_id: Uuid::new_v4(),
+                actor: if sequence % 2 == 0 {
+                    EventActor::Assistant
+                } else {
+                    EventActor::User
+                },
+                text: format!(
+                    "## Message {sequence}\n\n{}\n\n- first item\n- second item\n- third item",
+                    "A representative long transcript sentence with **formatting**. ".repeat(8)
+                ),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            },
+        ));
+    }
+    let live_message_id = Uuid::new_v4();
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        COMPLETED_MESSAGES as u64 + 1,
+        SessionEventKind::Message {
+            message_id: live_message_id,
+            actor: EventActor::Assistant,
+            text: "starting".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::InProgress,
+            delivery: None,
+        },
+    ));
+    let large_diff = (0..1_000)
+        .map(|line| format!("+let generated_{line} = {line};"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        COMPLETED_MESSAGES as u64 + 2,
+        SessionEventKind::ToolStarted {
+            tool_call_id: "large-edit".to_string(),
+            name: "Edit".to_string(),
+            input: serde_json::json!([{
+                "path": "src/generated.rs",
+                "diff": format!("@@ -0,0 +1,1000 @@\n{large_diff}")
+            }]),
+            input_ref: None,
+        },
+    ));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        COMPLETED_MESSAGES as u64 + 3,
+        SessionEventKind::ToolCompleted {
+            tool_call_id: "large-edit".to_string(),
+            output: String::new(),
+            output_ref: None,
+            is_error: false,
+            input: None,
+            input_ref: None,
+        },
+    ));
+    for tool in 0..9 {
+        let tool_call_id = format!("search-{tool}");
+        transcript.apply(&SessionEvent::new(
+            session_id,
+            (COMPLETED_MESSAGES + 4 + tool * 2) as u64,
+            SessionEventKind::ToolStarted {
+                tool_call_id: tool_call_id.clone(),
+                name: "Search".to_string(),
+                input: serde_json::json!({"query": format!("term {tool}")}),
+                input_ref: None,
+            },
+        ));
+        transcript.apply(&SessionEvent::new(
+            session_id,
+            (COMPLETED_MESSAGES + 5 + tool * 2) as u64,
+            SessionEventKind::ToolCompleted {
+                tool_call_id,
+                output: String::new(),
+                output_ref: None,
+                is_error: false,
+                input: None,
+                input_ref: None,
+            },
+        ));
+    }
+    let _ = transcript.render(120, None, None, None);
+
+    let mut samples = Vec::with_capacity(SAMPLES);
+    for sample in 0..SAMPLES {
+        transcript.apply(&SessionEvent::new(
+            session_id,
+            COMPLETED_MESSAGES as u64 + 2 + sample as u64,
+            SessionEventKind::Message {
+                message_id: live_message_id,
+                actor: EventActor::Assistant,
+                text: format!(
+                    "streaming response snapshot {sample} {}",
+                    "word ".repeat(40)
+                ),
+                attachments: Vec::new(),
+                status: MessageStatus::InProgress,
+                delivery: None,
+            },
+        ));
+        let started = Instant::now();
+        let render = transcript.render(120, None, None, None);
+        assert!(!render.0.is_empty());
+        samples.push(started.elapsed());
+    }
+
+    samples.sort_unstable();
+    let p95 = samples[(samples.len() * 95).div_ceil(100).saturating_sub(1)];
+    let mut uncached_samples = Vec::with_capacity(SAMPLES);
+    for _ in 0..SAMPLES {
+        transcript
+            .message_markdown_cache
+            .borrow_mut()
+            .messages
+            .clear();
+        transcript.tool_body_cache.borrow_mut().lines.clear();
+        let started = Instant::now();
+        let render = transcript.render(120, None, None, None);
+        assert!(!render.0.is_empty());
+        uncached_samples.push(started.elapsed());
+    }
+    uncached_samples.sort_unstable();
+    let uncached_p95 = uncached_samples[(uncached_samples.len() * 95)
+        .div_ceil(100)
+        .saturating_sub(1)];
+    eprintln!("large transcript live-tail render p95: cached {p95:?}, uncached {uncached_p95:?}");
+    assert!(
+        p95 < Duration::from_millis(16),
+        "large transcript live-tail render p95 exceeded one 60 Hz frame: {p95:?}"
+    );
+    assert!(
+        p95 < uncached_p95,
+        "completed-history caching did not improve render p95: cached {p95:?}, uncached {uncached_p95:?}"
+    );
+}
+
+#[test]
+fn projection_only_events_keep_the_transcript_layout_cache() {
+    assert!(!session_event_changes_transcript(
+        &SessionEventKind::UsageUpdated {
+            provider_duration_ms: 10,
+            input_tokens: 1,
+            output_tokens: 2,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+            total_tokens: 3,
+            cost_microusd: None,
+            cost_basis: String::new(),
+            cost_usd: None,
+            context_tokens: Some(1),
+            context_window_tokens: Some(100),
+        }
+    ));
+    assert!(!session_event_changes_transcript(
+        &SessionEventKind::ProviderEvent {
+            provider: CodingProvider::Codex,
+            kind: "response.progress".to_string(),
+            payload: serde_json::json!({}),
+        }
+    ));
+    assert!(session_event_changes_transcript(
+        &SessionEventKind::ProviderEvent {
+            provider: CodingProvider::Codex,
+            kind: "context_compaction".to_string(),
+            payload: serde_json::json!({}),
+        }
+    ));
+}
+
+#[test]
+fn deferred_tool_input_loads_when_the_card_is_expanded() {
+    let session_id = Uuid::new_v4();
+    let payload = SessionPayloadRef {
+        id: Uuid::new_v4(),
+        kind: SessionPayloadKind::ToolInput,
+        byte_len: 1_000_000,
+    };
+    let input = serde_json::json!([{
+        "path": "src/main.rs",
+        "diff": "@@ -1 +1 @@\n-old\n+new"
+    }]);
+    let mut transcript = Transcript {
+        auto_expand_edits: true,
+        ..Transcript::default()
+    };
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::ToolStarted {
+            tool_call_id: "deferred-edit".to_string(),
+            name: "Edit".to_string(),
+            input: serde_json::json!({"borg_payload_deferred": true}),
+            input_ref: Some(payload.clone()),
+        },
+    ));
+
+    assert!(matches!(
+        transcript.order.first(),
+        Some(TranscriptEntry::Tool {
+            expanded: false,
+            ..
+        })
+    ));
+    assert_eq!(transcript.toggle_tool(0)[0].id, payload.id);
+    transcript
+        .hydrate_payload(&payload, serde_json::to_vec(&input).unwrap())
+        .unwrap();
+    assert!(matches!(
+        transcript.order.first(),
+        Some(TranscriptEntry::Tool {
+            code_view: Some((language, source)),
+            payload_refs,
+            expanded: true,
+            ..
+        }) if language.starts_with("diff")
+            && source.contains("+new")
+            && payload_refs.is_empty()
+    ));
+}
+
+#[test]
+fn composer_cursor_uses_terminal_cell_width() {
+    assert_eq!(composer_cursor_position("a漢b", "a漢".len(), 3), (1, 0));
+    assert_eq!(composer_cursor_position("a漢b", "a漢b".len(), 3), (1, 1));
+    assert_eq!(composer_cursor_position("abc", 3, 3), (1, 0));
+}
+
+#[test]
+fn secret_provider_input_is_masked_without_losing_cursor_position() {
+    let (masked, cursor) = mask_secret_composer_text("ab漢\nc", "ab漢".len());
+    assert_eq!(masked, "•••\n•");
+    assert_eq!(cursor, "•••".len());
+    assert!(provider_interaction_contains_secret(&serde_json::json!({
+        "questions": [{"isSecret": true}]
+    })));
+}
+
+#[test]
+fn composer_wraps_every_line_after_the_prompt_marker() {
+    assert_eq!(composer_cursor_x_offset(false), 3);
+    assert_eq!(composer_cursor_x_offset(true), 4);
+
+    let mut composer = Composer::default();
+    composer.insert("abcdef");
+    let rendered = composer.styled_lines(3, " > ");
+    assert_eq!(rendered[0].to_string(), " > abc");
+    assert_eq!(rendered[1].to_string(), "   def");
+}
+
+#[test]
+fn composer_moves_vertically_across_wrapped_lines() {
+    let mut composer = Composer::default();
+    composer.insert("alpha beta gamma");
+    composer.cursor = "alpha be".len();
+    composer.move_vertical(1, 7);
+    assert_eq!(composer.cursor, "alpha beta ga".len());
+    composer.move_vertical(-1, 7);
+    assert_eq!(composer.cursor, "alpha be".len());
+}
+
+#[test]
+fn composer_moves_by_unicode_words() {
+    let mut composer = Composer::default();
+    composer.insert("alpha beta gamma");
+    composer.move_word_left();
+    assert_eq!(&composer.text[composer.cursor..], "gamma");
+    composer.move_word_left();
+    assert_eq!(&composer.text[composer.cursor..], "beta gamma");
+    composer.move_word_right();
+    assert_eq!(&composer.text[composer.cursor..], "gamma");
+}
+
+#[test]
+fn composer_clear_discards_the_unsent_prompt_and_attachments() {
+    let mut composer = Composer::default();
+    composer.insert("unsent prompt");
+    composer.insert_attachment(PathBuf::from("/tmp/image.png"));
+    composer.insert_pasted_text("large pasted payload".to_string());
+
+    composer.clear();
+
+    assert!(composer.text.is_empty());
+    assert!(composer.attachments.is_empty());
+    assert!(composer.pasted_texts.is_empty());
+    assert_eq!(composer.cursor, 0);
+}
+
+#[test]
+fn composer_expands_numbered_pasted_text_tokens_on_submit() {
+    let mut composer = Composer::default();
+    composer.insert("before ");
+    assert_eq!(
+        composer.insert_pasted_text("x".repeat(LARGE_PASTE_CHAR_THRESHOLD + 1)),
+        "Pasted Text 1"
+    );
+    composer.insert(" after");
+
+    assert_eq!(composer.text, "before [Pasted Text 1] after");
+    let rendered = composer.styled_lines(80, " > ");
+    assert!(
+        rendered[0]
+            .spans
+            .iter()
+            .any(|span| span.content == "[Pasted Text 1]"
+                && span.style.fg == Some(Color::LightYellow))
+    );
+
+    let (submitted, attachments) = composer.take();
+    assert_eq!(
+        submitted,
+        format!(
+            "before {} after",
+            "x".repeat(LARGE_PASTE_CHAR_THRESHOLD + 1)
+        )
+    );
+    assert!(attachments.is_empty());
+    assert!(composer.pasted_texts.is_empty());
+}
+
+#[test]
+fn composer_treats_pasted_text_tokens_as_atomic() {
+    let mut composer = Composer::default();
+    composer.insert("prefix ");
+    composer.insert_pasted_text("payload".to_string());
+    let token_start = "prefix ".len();
+    composer.move_left();
+    assert_eq!(composer.cursor, token_start);
+    composer.move_right();
+    composer.backspace();
+    assert_eq!(composer.text, "prefix ");
+    assert!(composer.pasted_texts.is_empty());
+}
+
+#[test]
+fn active_goal_cache_key_advances_once_per_elapsed_minute() {
+    let mut transcript = Transcript::default();
+    let goal = SessionGoal::new("Keep the elapsed timer live".to_string(), None);
+    transcript.goal = Some(goal.clone());
+
+    assert_eq!(
+        transcript.active_goal_cache_tick_at(goal.updated_at),
+        Some(0)
+    );
+    assert_eq!(
+        transcript.active_goal_cache_tick_at(goal.updated_at + chrono::Duration::seconds(1)),
+        Some(0)
+    );
+    assert_eq!(
+        transcript.active_goal_cache_tick_at(goal.updated_at + chrono::Duration::seconds(60)),
+        Some(1)
+    );
+}
+
+#[test]
+fn completed_goal_crosses_out_only_its_objective() {
+    let mut transcript = Transcript::default();
+    let mut goal = SessionGoal::new("Ship the terminal polish".to_string(), None);
+    goal.status = GoalStatus::Complete;
+    transcript.order.push(TranscriptEntry::Goal {
+        goal,
+        time: "12:00".to_string(),
+    });
+
+    let lines = transcript.lines(80);
+    let header = lines
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .find(|span| span.content.contains("Goal"))
+        .expect("goal header");
+    let objective = lines
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .find(|span| span.content.contains("Ship the terminal polish"))
+        .expect("goal objective");
+
+    assert!(!header.style.add_modifier.contains(Modifier::CROSSED_OUT));
+    assert_eq!(objective.style.fg, Some(Color::DarkGray));
+    assert!(objective.style.add_modifier.contains(Modifier::CROSSED_OUT));
+}
+
+#[test]
+fn ctrl_c_only_exits_when_repeated_quickly() {
+    let start = Instant::now();
+    let mut last = None;
+
+    assert!(!repeated_ctrl_c(&mut last, start));
+    assert!(repeated_ctrl_c(&mut last, start + DOUBLE_CTRL_C_WINDOW));
+    assert!(last.is_none());
+    assert!(!repeated_ctrl_c(
+        &mut last,
+        start + DOUBLE_CTRL_C_WINDOW + Duration::from_millis(1)
+    ));
+}
+
+#[test]
+fn shift_or_alt_enter_inserts_a_composer_newline() {
+    assert!(is_composer_newline(&KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::SHIFT
+    )));
+    assert!(is_composer_newline(&KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::ALT
+    )));
+    assert!(!is_composer_newline(&KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::NONE
+    )));
+}
+
+#[test]
+fn composer_history_restores_the_unsent_draft() {
+    let mut composer = Composer::default();
+    composer.insert("first");
+    let _ = composer.take();
+    composer.insert("second");
+    let _ = composer.take();
+    composer.insert("draft");
+
+    composer.history_previous();
+    assert_eq!(composer.text, "second");
+    composer.history_previous();
+    assert_eq!(composer.text, "first");
+    composer.history_next();
+    assert_eq!(composer.text, "second");
+    composer.history_next();
+    assert_eq!(composer.text, "draft");
+}
+
+#[test]
+fn queued_prompt_recall_concatenates_text_and_preserves_image_tokens() {
+    let mut composer = Composer::default();
+    let first = PathBuf::from("/tmp/first.png");
+    let second = PathBuf::from("/tmp/second.png");
+
+    composer.append_recalled("first [Image 1]".to_string(), vec![first.clone()]);
+    composer.append_recalled("second [Image 2]".to_string(), vec![second.clone()]);
+
+    let (text, attachments) = composer.take();
+    assert_eq!(text, "first [Image 1]\n\nsecond [Image 2]");
+    assert_eq!(attachments, [first, second]);
+}
+
+#[test]
+fn composer_history_rehydrates_completed_user_prompts_from_the_session_journal() {
+    let session_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    let message = |sequence| {
+        SessionEvent::new(
+            session_id,
+            sequence,
+            SessionEventKind::Message {
+                message_id,
+                actor: EventActor::User,
+                text: "persistent prompt".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            },
+        )
+    };
+    let mut composer = Composer::default();
+    composer.seed_session_events(&[message(1), message(2)]);
+    composer.history_previous();
+    assert_eq!(composer.text, "persistent prompt");
+    assert_eq!(composer.history.len(), 1);
+}
+
+#[test]
+fn dumb_or_explicit_plain_terminals_use_the_line_input_fallback() {
+    assert!(!rich_terminal_supported(Some("dumb"), None));
+    assert!(!rich_terminal_supported(
+        Some("xterm-256color"),
+        Some("plain")
+    ));
+    assert!(rich_terminal_supported(Some("xterm-256color"), None));
+}
+
+#[test]
+fn slash_command_picker_selects_the_highlighted_match() {
+    assert_eq!(slash_matches("/int")[0].0, "/interrupt");
+    assert_eq!(slash_selected_command("/mo", 0), Some("/model"));
+    assert_eq!(slash_selected_command("/eff", 0), Some("/effort"));
+    assert_eq!(slash_selected_command("/lang", 0), Some("/language"));
+    assert_eq!(slash_selected_command("/st", 1), Some("/stop"));
+    assert_eq!(slash_selected_command("/goal add", 0), None);
+    assert!(slash_matches("/todo add").is_empty());
+    assert!(slash_matches("plain prompt").is_empty());
+    assert!(slash_matches("/").len() > 1);
+}
+
+#[test]
+fn slash_command_picker_navigates_matches_beyond_the_visible_window() {
+    let matches = slash_matches("/");
+    let selected = 7;
+
+    assert_eq!(
+        slash_selected_command("/", selected),
+        Some(matches[selected].0)
+    );
+    let rendered = slash_suggestion_lines("/", selected)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(rendered.len(), 5);
+    assert!(
+        rendered
+            .iter()
+            .any(|line| line.contains(matches[selected].0))
+    );
+    assert!(rendered.iter().any(|line| line.contains('›')));
+}
+
+#[test]
+fn markdown_tables_render_headers_rows_and_narrow_fallbacks() {
+    let markdown = "| Matter | Risk |\n|:--|--:|\n| Acme | High |";
+    let wide = markdown_lines(markdown, 40, None)
+        .into_iter()
+        .map(|line| {
+            line.spans
+                .into_iter()
+                .map(|span| span.content.into_owned())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>();
+    assert!(wide.iter().any(|line| line.contains("Matter")));
+    assert!(wide.iter().any(|line| line.contains("Acme")));
+    assert!(
+        wide.iter().any(|line| line.contains('┼')),
+        "rendered table: {wide:?}"
+    );
+
+    let narrow = markdown_lines(markdown, 7, None)
+        .into_iter()
+        .flat_map(|line| line.spans)
+        .map(|span| span.content.into_owned())
+        .collect::<String>();
+    assert!(narrow.contains("Matter:"));
+    assert!(narrow.contains("Acme"));
+    assert!(narrow.contains("Risk:"));
+    assert!(narrow.contains("High"));
+}
+
+#[test]
+fn markdown_semantics_are_visible_without_source_delimiters() {
+    let rendered = markdown_lines(
+        "## Architecture\nUse `V120` with **care**, *measure*, ~~discard~~, and [notes](https://example.com).\n\n1. First\n2. Second",
+        80,
+        Some(Color::White),
+    );
+    let spans = rendered
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .collect::<Vec<_>>();
+
+    let heading = spans
+        .iter()
+        .find(|span| span.content == "Architecture")
+        .expect("heading");
+    assert_eq!(heading.style.fg, Some(BORG_ORANGE_HOVER));
+    assert!(heading.style.add_modifier.contains(Modifier::BOLD));
+
+    let code = spans
+        .iter()
+        .find(|span| span.content == "V120")
+        .expect("inline code");
+    assert_eq!(code.style.fg, Some(Color::LightCyan));
+    assert!(code.style.add_modifier.contains(Modifier::BOLD));
+    assert!(
+        spans.iter().all(|span| !span.content.contains('`')),
+        "inline code delimiters should not be rendered"
+    );
+
+    let strong = spans
+        .iter()
+        .find(|span| span.content == "care")
+        .expect("strong text");
+    assert!(strong.style.add_modifier.contains(Modifier::BOLD));
+    let emphasis = spans
+        .iter()
+        .find(|span| span.content == "measure")
+        .expect("emphasized text");
+    assert!(emphasis.style.add_modifier.contains(Modifier::ITALIC));
+    let struck = spans
+        .iter()
+        .find(|span| span.content == "discard")
+        .expect("struck text");
+    assert!(struck.style.add_modifier.contains(Modifier::CROSSED_OUT));
+    let link = spans
+        .iter()
+        .find(|span| span.content == "notes")
+        .expect("link");
+    assert_eq!(link.style.fg, Some(Color::LightBlue));
+    assert!(link.style.add_modifier.contains(Modifier::UNDERLINED));
+    assert!(spans.iter().any(|span| {
+        span.content == "1. "
+            && span.style.fg == Some(BORG_ORANGE_HOVER)
+            && span.style.add_modifier.contains(Modifier::BOLD)
+    }));
+}
+
+#[test]
+fn markdown_links_retain_only_clickable_http_destinations() {
+    let markdown = "[Borg docs](https://example.com/docs) and [local](file:///tmp/private.txt)";
+    let lines = markdown_lines(markdown, 80, None);
+
+    assert_eq!(
+        markdown_link_ranges(markdown, &lines),
+        vec![LinkRowRange {
+            row: 0,
+            start: 0,
+            end: 9,
+            url: "https://example.com/docs".to_string(),
+        }]
+    );
+}
+
+#[test]
+fn markdown_math_uses_a_real_terminal_layout() {
+    let rendered = markdown_lines(
+        "A $2 \\times 2$ map satisfies\n\n$$\n\\frac{a}{b} = \\bar{z}\n$$",
+        80,
+        Some(Color::White),
+    );
+    let text = rendered
+        .iter()
+        .map(Line::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(text.contains("2 × 2"));
+    assert!(text.contains('─'));
+    assert!(text.contains('‾'));
+    assert!(!text.contains("\\times"));
+    assert!(!text.contains("\\bar"));
+}
+
+#[test]
+fn quoted_pasted_text_keeps_gutter_without_code_line_numbers() {
+    let markdown = "> ```text\n> pasted first line\n> pasted second line\n> ```";
+    let rendered = markdown_lines(markdown, 80, None)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>();
+
+    assert!(
+        rendered
+            .iter()
+            .filter(|line| !line.is_empty())
+            .all(|line| line.starts_with("│ ")),
+        "rendered quote: {rendered:?}"
+    );
+    assert!(
+        rendered
+            .iter()
+            .any(|line| line.contains("pasted first line"))
+    );
+    assert!(!rendered.iter().any(|line| line.contains("1 │")));
+}
+
+#[test]
+fn tool_call_summaries_cover_cli_display_contract() {
+    assert_eq!(
+        tool_call_summary(
+            "functions.exec_command",
+            &serde_json::json!({"cmd": "rg -g '*.rs' -n 'tool.?call' crates/borg-cli"})
+        ),
+        ("Search".to_string(), "“tool.?call”".to_string())
+    );
+    assert_eq!(
+        tool_call_summary(
+            "functions.exec_command",
+            &serde_json::json!({
+                "cmd": "/usr/bin/bash -c \"rg -n 'tool.?call' crates/borg-cli\""
+            })
+        ),
+        ("Search".to_string(), "“tool.?call”".to_string())
+    );
+    assert_eq!(
+        tool_code_view(
+            "functions.exec_command",
+            &serde_json::json!({"cmd": "cargo check -p borg"})
+        ),
+        Some(("command".to_string(), "cargo check -p borg".to_string()))
+    );
+    assert_eq!(
+        tool_code_view(
+            "functions.exec_command",
+            &serde_json::json!({
+                "cmd": "/usr/bin/bash -c \"sed -n '1,20p' src/main.rs\""
+            })
+        ),
+        Some((
+            "command".to_string(),
+            "sed -n '1,20p' src/main.rs".to_string()
+        ))
+    );
+    assert_eq!(
+        tool_call_summary(
+            "mcp__filesystem__read_file",
+            &serde_json::json!({"path": "/workspace/src/main.rs"})
+        ),
+        ("Read".to_string(), "/workspace/src/main.rs".to_string())
+    );
+    assert_eq!(
+        tool_call_summary(
+            "web.run",
+            &serde_json::json!({
+                "search_query": [
+                    {"q": "Borg CLI"},
+                    {"q": "terminal UI"}
+                ]
+            })
+        ),
+        (
+            "Search web".to_string(),
+            "“Borg CLI · terminal UI”".to_string()
+        )
+    );
+    assert_eq!(
+        tool_call_summary(
+            "web_search",
+            &serde_json::json!({"query": "Borg queue semantics"})
+        ),
+        (
+            "Search web".to_string(),
+            "“Borg queue semantics”".to_string()
+        )
+    );
+    assert_eq!(
+        tool_call_summary(
+            "functions.apply_patch",
+            &serde_json::json!("*** Begin Patch\n*** Update File: src/main.rs\n")
+        ),
+        ("Edit".to_string(), "src/main.rs".to_string())
+    );
+    assert_eq!(
+        tool_call_summary(
+            "mcp__borg_agent__update_plan",
+            &serde_json::json!({"plan": [{"content": "Inspect"}, {"content": "Verify"}]})
+        ),
+        ("Update plan".to_string(), "2 steps".to_string())
+    );
+    assert_eq!(
+        tool_call_summary(
+            "mcp__example__custom_action",
+            &serde_json::json!({"value": 42})
+        ),
+        ("Custom action".to_string(), "value: 42".to_string())
+    );
+    assert_eq!(
+        tool_call_summary(
+            "mcp__borg_agent__spawn_agent",
+            &serde_json::json!({
+                "task_name": "inspect_ui",
+                "message": "Inspect the renderer",
+                "provider": "codex"
+            })
+        ),
+        ("Spawn agent".to_string(), "inspect_ui · codex".to_string())
+    );
+    assert_eq!(
+        tool_call_summary(
+            "functions.collaboration.followup_task",
+            &serde_json::json!({"target": "inspect_ui", "message": "Run focused tests"})
+        ),
+        (
+            "Follow up".to_string(),
+            "inspect_ui · Run focused tests".to_string()
+        )
+    );
+    assert_eq!(
+        tool_call_summary(
+            "mcp__borg_agent__create_goal",
+            &serde_json::json!({"objective": "Ship readable events", "token_budget": 4000})
+        ),
+        (
+            "Create goal".to_string(),
+            "Ship readable events · 4000 tokens".to_string()
+        )
+    );
+    assert_eq!(
+        tool_call_summary(
+            "mcp__borg_agent__lsp_definition",
+            &serde_json::json!({"path": "src/main.rs", "line": 42, "character": 7})
+        ),
+        (
+            "Go to definition".to_string(),
+            "src/main.rs:42:7".to_string()
+        )
+    );
+}
+
+#[test]
+fn active_subagent_count_tracks_only_working_children() {
+    let mut transcript = Transcript::default();
+    assert_eq!(transcript.active_subagent_count(), 0);
+
+    transcript
+        .subagents
+        .insert(Uuid::new_v4(), SubagentStatus::Running);
+    transcript
+        .subagents
+        .insert(Uuid::new_v4(), SubagentStatus::WaitingForApproval);
+    transcript
+        .subagents
+        .insert(Uuid::new_v4(), SubagentStatus::Stopped);
+    transcript
+        .subagents
+        .insert(Uuid::new_v4(), SubagentStatus::Ready);
+
+    assert_eq!(transcript.active_subagent_count(), 2);
+
+    transcript
+        .subagents
+        .values_mut()
+        .for_each(|status| *status = SubagentStatus::Ready);
+    assert_eq!(transcript.active_subagent_count(), 0);
+}
+
+#[test]
+fn subagent_activity_collapses_chatter_and_keeps_terminal_result() {
+    let parent_id = Uuid::new_v4();
+    let child_id = Uuid::new_v4();
+    let now = chrono::Utc::now();
+    let mut agent = SubagentSnapshot {
+        session_id: child_id,
+        parent_session_id: parent_id,
+        task_name: "inspect_ui".to_string(),
+        status: SubagentStatus::Running,
+        provider: CodingProvider::Codex,
+        model: None,
+        effort: None,
+        cwd: PathBuf::from("/workspace"),
+        created_at: now,
+        updated_at: now,
+        detail: None,
+        final_text: None,
+    };
+    let activity = |sequence, activity, agent: &SubagentSnapshot, event| {
+        SessionEvent::new(
+            parent_id,
+            sequence,
+            SessionEventKind::SubagentActivity {
+                activity,
+                agent: agent.clone(),
+                event,
+            },
+        )
+    };
+    let mut transcript = Transcript::default();
+    transcript.apply(&activity(1, SubagentActivityKind::Started, &agent, None));
+    assert_eq!(transcript.order.len(), 1);
+    transcript.apply(&activity(
+        2,
+        SubagentActivityKind::Updated,
+        &agent,
+        Some(Box::new(SessionEvent::new(
+            child_id,
+            1,
+            SessionEventKind::ReasoningDelta {
+                text: "working chatter".to_string(),
+            },
+        ))),
+    ));
+    assert_eq!(transcript.order.len(), 1);
+    agent.status = SubagentStatus::WaitingForApproval;
+    transcript.apply(&activity(
+        3,
+        SubagentActivityKind::Updated,
+        &agent,
+        Some(Box::new(SessionEvent::new(
+            child_id,
+            2,
+            SessionEventKind::ApprovalRequested {
+                approval_id: "approval-1".to_string(),
+                title: "Run focused tests?".to_string(),
+                detail: "Cargo will compile the CLI".to_string(),
+                command: None,
+            },
+        ))),
+    ));
+    assert_eq!(transcript.order.len(), 1);
+    assert!(matches!(
+        &transcript.order[0],
+        TranscriptEntry::Activity { text, .. }
+            if text == "agent · inspect_ui · needs approval · Run focused tests?"
+    ));
+    agent.status = SubagentStatus::Stopped;
+    agent.final_text = Some("Found the renderer issue.\nExtra detail".to_string());
+    transcript.apply(&activity(4, SubagentActivityKind::Completed, &agent, None));
+
+    assert_eq!(transcript.order.len(), 1);
+    assert!(matches!(
+        &transcript.order[0],
+        TranscriptEntry::Activity { text, .. }
+            if text == "agent · inspect_ui · completed · Found the renderer issue."
+    ));
+}
+
+#[test]
+fn transcript_copy_selection_can_move_beyond_last_assistant_message() {
+    let mut transcript = Transcript::default();
+    transcript.order.push(TranscriptEntry::Message {
+        actor: EventActor::Assistant,
+        text: "answer".to_string(),
+        attachments: Vec::new(),
+        model: None,
+        effort: None,
+        time: "12:00".to_string(),
+        status: MessageStatus::Complete,
+        complete: true,
+    });
+    transcript.order.push(TranscriptEntry::Activity {
+        text: "subagent · completed".to_string(),
+        time: "12:01".to_string(),
+    });
+
+    assert_eq!(transcript.copy_text(), Some("answer"));
+    transcript.select_previous();
+    assert_eq!(transcript.copy_text(), Some("subagent · completed"));
+    transcript.select_previous();
+    assert_eq!(transcript.copy_text(), Some("answer"));
+    transcript.select_next();
+    assert_eq!(transcript.copy_text(), Some("subagent · completed"));
+}
+
+#[test]
+fn assistant_message_actions_stay_out_of_the_transcript() {
+    let mut transcript = Transcript::default();
+    transcript.order.push(TranscriptEntry::Message {
+        actor: EventActor::Assistant,
+        text: "answer".to_string(),
+        attachments: Vec::new(),
+        model: None,
+        effort: None,
+        time: "12:00".to_string(),
+        status: MessageStatus::Complete,
+        complete: true,
+    });
+
+    let idle = transcript.lines(80);
+    assert!(
+        !idle
+            .iter()
+            .any(|line| line.to_string().contains("Copy response"))
+    );
+    let actions = Picker::new(
+        PickerKind::MessageActions,
+        "Message actions",
+        ["Revert to here", "Copy response"],
+        None,
+    );
+    assert_eq!(
+        actions
+            .options
+            .iter()
+            .map(|option| option.label.as_str())
+            .collect::<Vec<_>>(),
+        ["Revert to here", "Copy response"]
+    );
+}
+
+#[test]
+fn resume_picker_uses_a_balanced_two_column_layout() {
+    let picker = Picker {
+            kind: PickerKind::Resume,
+            title: "Resume session",
+            options: vec![
+                PickerOption {
+                    label: "Jul 26 18:57 · We need to overhaul the interaction".to_string(),
+                    value: "one".to_string(),
+                    preview: Some(
+                    "We need **bold decisions** and `typed contracts`.\n\n---\n> **Directory:** `/home/shulgin/borg`"
+                        .to_string(),
+                    ),
+                    section: Some("Current directory".to_string()),
+                },
+                PickerOption {
+                    label: "Jul 26 18:56 · No user prompt recorded".to_string(),
+                    value: "two".to_string(),
+                    preview: None,
+                    section: Some("All directories".to_string()),
+                },
+            ],
+            selected: 0,
+        };
+
+    let rendered = picker.display(112);
+    let rows = rendered.lines().collect::<Vec<_>>();
+
+    assert!(rows[0].contains("Resume session"));
+    assert!(rows[0].contains("Latest response"));
+    assert!(rows.iter().any(|row| row.contains("CURRENT DIRECTORY")));
+    assert!(rows.iter().any(|row| row.contains("ALL DIRECTORIES")));
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("We need bold decisions and typed contracts"))
+    );
+    assert!(
+        rows.iter().all(|row| UnicodeWidthStr::width(*row) <= 112),
+        "picker rows must fit their actual render width: {rows:?}"
+    );
+
+    let styled = picker.styled_lines(112, USER_LABEL_BLUE, USER_TEXT);
+    assert!(styled.iter().flat_map(|line| &line.spans).any(|span| {
+        span.content == "bold decisions" && span.style.add_modifier.contains(Modifier::BOLD)
+    }));
+    assert!(styled.iter().flat_map(|line| &line.spans).any(|span| {
+        span.content == "typed contracts" && span.style.fg == Some(Color::LightCyan)
+    }));
+}
+
+#[test]
+fn viewport_range_lookup_skips_large_offscreen_history() {
+    let rows = (0..100_000)
+        .map(|index| (index, index * 3, index * 3 + 2))
+        .collect::<Vec<_>>();
+
+    let visible = visible_row_ranges(&rows, 240_000, 40);
+
+    assert!(visible.len() <= 15, "visible ranges: {}", visible.len());
+    assert_eq!(visible.first().map(|(_, start, _)| *start), Some(240_000));
+    assert!(
+        visible
+            .iter()
+            .all(|(_, start, end)| *end > 240_000 && *start < 240_040)
+    );
+}
+
+#[test]
+fn picker_wheel_hands_off_only_after_reaching_its_boundary() {
+    let mut picker = Picker::new(
+        PickerKind::MessageActions,
+        "Actions",
+        ["First", "Second", "Third"],
+        Some("Second"),
+    );
+
+    assert!(picker.scroll(-1));
+    assert_eq!(picker.selected, 0);
+    assert!(!picker.scroll(-1));
+    assert!(picker.scroll(1));
+    assert!(picker.scroll(1));
+    assert_eq!(picker.selected, 2);
+    assert!(!picker.scroll(1));
+}
+
+#[test]
+fn picker_numbers_are_visible_and_select_immediately() {
+    let mut picker = Picker::new(
+        PickerKind::Effort,
+        "Choose effort",
+        ["low", "medium", "high"],
+        Some("low"),
+    );
+
+    let display = picker.display(40);
+    assert!(display.contains("1. low"));
+    assert!(display.contains("2. medium"));
+    assert!(picker.select_number('2'));
+    assert_eq!(picker.selected, 1);
+    assert!(!picker.select_number('0'));
+    assert!(!picker.select_number('9'));
+}
+
+#[test]
+fn completed_user_message_leaves_the_queue_projection() {
+    let message_id = Uuid::new_v4();
+    let mut queue = Vec::new();
+    update_queued_prompts(
+        &mut queue,
+        &SessionEventKind::Message {
+            message_id,
+            actor: EventActor::User,
+            text: "follow up".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Queued,
+            delivery: Some(PromptDelivery::Steer),
+        },
+    );
+    assert!(queue.is_empty());
+
+    update_queued_prompts(
+        &mut queue,
+        &SessionEventKind::Message {
+            message_id,
+            actor: EventActor::User,
+            text: "follow up".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Queued,
+            delivery: Some(PromptDelivery::Queue),
+        },
+    );
+    assert_eq!(queue, vec![(message_id, "follow up".to_string())]);
+
+    update_queued_prompts(
+        &mut queue,
+        &SessionEventKind::Message {
+            message_id,
+            actor: EventActor::User,
+            text: "follow up".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: None,
+        },
+    );
+    assert!(queue.is_empty());
+}
+
+#[test]
+fn copied_terminal_regions_drop_screen_padding_and_right_gutters() {
+    let pasted = "message                                      ▊\n\
+                         20:03  ✓ Edit  file.rs                      ▊\n\
+                             10 │ + let value = true;                ▊\n\
+                                                                  ▊";
+
+    assert_eq!(
+        normalize_terminal_capture_paste(pasted),
+        "message\n20:03  ✓ Edit  file.rs\n10 │ + let value = true;\n"
+    );
+    assert_eq!(
+        normalize_terminal_capture_paste("    fn preserved_code() {\n        work();\n    }"),
+        "    fn preserved_code() {\n        work();\n    }"
+    );
+}
+
+#[test]
+fn context_percentage_matches_codex_compaction_headroom() {
+    assert_eq!(context_remaining_percent(12_000, 258_400), 100);
+    assert_eq!(context_remaining_percent(135_200, 258_400), 50);
+    assert_eq!(context_remaining_percent(258_400, 258_400), 0);
+}
+
+#[test]
+fn active_terminal_title_identifies_borg_and_the_first_prompt() {
+    let title = terminal_title(
+        SessionStatus::Running,
+        Some("  polish   the terminal\ninteraction  "),
+    );
+
+    assert!(title.contains("Borg CLI - polish the terminal interaction..."));
+    assert!(
+        title
+            .chars()
+            .next()
+            .is_some_and(|glyph| "⠋⠙⠹⠸⠼⠴⠦⠧".contains(glyph))
+    );
+    assert_eq!(
+        terminal_title(SessionStatus::Ready, None),
+        "Borg CLI".to_string()
+    );
+}
+
+#[test]
+fn borging_roll_selects_exactly_one_percent_of_uniform_run_ids() {
+    assert_eq!(
+        (0..100)
+            .filter(|value| borging_for_run(Uuid::from_u128(*value)))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn provider_compaction_events_become_status_cards() {
+    let session_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::ProviderEvent {
+            provider: CodingProvider::Codex,
+            kind: "context_compaction".to_string(),
+            payload: serde_json::json!({
+                "summary": "Earlier conversation was compacted"
+            }),
+        },
+    ));
+
+    assert!(matches!(
+        transcript.order.last(),
+        Some(TranscriptEntry::Compaction { summary, .. })
+            if summary == "Earlier conversation was compacted"
+    ));
+    let rendered = transcript
+        .lines(100)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("Earlier conversation was compacted"));
+    assert!(!rendered.contains("Starting context compaction"));
+    assert!(!rendered.contains("being condensed so Borg can keep working"));
+}
+
+#[test]
+fn automatic_compaction_event_reports_work_in_progress() {
+    let session_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::ProviderEvent {
+            provider: CodingProvider::Codex,
+            kind: "context_compaction".to_string(),
+            payload: serde_json::json!({}),
+        },
+    ));
+
+    assert!(matches!(
+        transcript.order.last(),
+        Some(TranscriptEntry::Compaction { summary, .. })
+            if summary == "Compacting context…"
+    ));
+}
+
+#[test]
+fn adjacent_provider_notifications_render_one_compaction_card() {
+    let session_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    for sequence in 1..=3 {
+        transcript.apply(&SessionEvent::new(
+            session_id,
+            sequence,
+            SessionEventKind::ProviderEvent {
+                provider: CodingProvider::Codex,
+                kind: "context_compaction".to_string(),
+                payload: serde_json::json!({
+                    "summary": "Conversation context condensed"
+                }),
+            },
+        ));
+    }
+
+    assert_eq!(
+        transcript
+            .order
+            .iter()
+            .filter(|entry| matches!(entry, TranscriptEntry::Compaction { .. }))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn low_context_status_announces_imminent_compaction() {
+    let transcript = Transcript {
+        context_remaining_percent: 20,
+        ..Default::default()
+    };
+
+    let (status, imminent) = transcript.context_status();
+
+    assert_eq!(status, "compaction imminent (20% left)");
+    assert!(imminent);
+}
+
+#[test]
+fn projected_session_state_restores_status_config_outside_the_history_tail() {
+    let mut transcript = Transcript::default();
+    transcript.seed_session_state(&SessionState {
+        configuration: Some(borg_remote::SessionConfiguration {
+            cwd: PathBuf::from("/workspace/borg"),
+            provider: CodingProvider::Codex,
+            model: Some("gpt-5.6-sol".to_string()),
+            effort: Some("medium".to_string()),
+            fast: false,
+            response_language: ResponseLanguage::Auto,
+            permission_mode: PermissionMode::FullAccess,
+        }),
+        usage: borg_remote::SessionUsage {
+            context_tokens: Some(69_768),
+            context_window_tokens: Some(258_400),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+
+    assert_eq!(
+        transcript.config_lines(),
+        (
+            "gpt-5.6-sol medium".to_string(),
+            "full access · /workspace/borg".to_string()
+        )
+    );
+    assert_eq!(transcript.context_remaining_percent, 77);
+}
+
+#[test]
+fn transcript_separates_labeled_groups_from_header_and_tool_activity() {
+    let mut transcript = Transcript::default();
+    transcript.order.push(TranscriptEntry::Message {
+        actor: EventActor::User,
+        text: "request".to_string(),
+        attachments: Vec::new(),
+        model: None,
+        effort: None,
+        time: "12:00".to_string(),
+        status: MessageStatus::Complete,
+        complete: true,
+    });
+    transcript.order.push(TranscriptEntry::Tool {
+        source_name: "command_execution".to_string(),
+        name: "command_execution".to_string(),
+        detail: "done".to_string(),
+        code_view: None,
+        output_view: None,
+        payload_refs: Vec::new(),
+        time: "12:01".to_string(),
+        complete: true,
+        error: false,
+        user_interrupted: false,
+        backgrounded: false,
+        expanded: false,
+    });
+    transcript.order.push(TranscriptEntry::Message {
+        actor: EventActor::Assistant,
+        text: "answer".to_string(),
+        attachments: Vec::new(),
+        model: Some("gpt-5.6-sol".to_string()),
+        effort: Some("xhigh".to_string()),
+        time: "12:02".to_string(),
+        status: MessageStatus::Complete,
+        complete: true,
+    });
+    transcript.order.push(TranscriptEntry::Tool {
+        source_name: "command_execution".to_string(),
+        name: "command_execution".to_string(),
+        detail: "done".to_string(),
+        code_view: None,
+        output_view: None,
+        payload_refs: Vec::new(),
+        time: "12:03".to_string(),
+        complete: true,
+        error: false,
+        user_interrupted: false,
+        backgrounded: false,
+        expanded: false,
+    });
+    transcript.order.push(TranscriptEntry::Plan {
+        items: vec![PlanItem {
+            id: Uuid::new_v4(),
+            content: "Verify the result".to_string(),
+            status: PlanItemStatus::InProgress,
+        }],
+        time: "12:04".to_string(),
+    });
+    transcript.user_label = "shulgin".to_string();
+    transcript.assistant_label = "borg".to_string();
+
+    let lines = transcript.lines(80);
+    assert!(lines.first().is_some_and(|line| line.spans.is_empty()));
+    let user_label = lines
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .find(|span| span.content.contains("shulgin"))
+        .expect("user label");
+    assert_eq!(user_label.style.fg, Some(USER_LABEL_BLUE));
+    let user_header = lines
+        .iter()
+        .position(|line| {
+            line.spans
+                .iter()
+                .any(|span| span.content.contains("shulgin"))
+        })
+        .expect("user header");
+    assert_eq!(
+        lines[user_header - 1]
+            .spans
+            .last()
+            .and_then(|span| span.style.bg),
+        Some(MESSAGE_BG)
+    );
+    let user_message = lines
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .find(|span| span.content.contains("request"))
+        .expect("user message");
+    assert_eq!(user_message.style.fg, Some(USER_TEXT));
+    let assistant_header = lines
+        .iter()
+        .position(|line| line.spans.iter().any(|span| span.content.contains("borg")))
+        .expect("assistant header");
+    let assistant_header_spans = &lines[assistant_header].spans;
+    assert_eq!(assistant_header_spans[0].content, "  ▌ borg");
+    assert_eq!(assistant_header_spans[1].content, "  gpt-5.6-sol xhigh");
+    assert_eq!(assistant_header_spans[1].style.fg, Some(Color::DarkGray));
+    assert_eq!(assistant_header_spans[2].content, "  12:02");
+    assert!(lines[assistant_header - 1].to_string().trim().is_empty());
+    assert_eq!(
+        lines[assistant_header - 1]
+            .spans
+            .last()
+            .and_then(|span| span.style.bg),
+        Some(MESSAGE_BG)
+    );
+    let plan_header = lines
+        .iter()
+        .position(|line| line.spans.iter().any(|span| span.content.contains("Plan")))
+        .expect("plan header");
+    assert!(lines[plan_header - 1].spans.is_empty());
+}
+
+#[test]
+fn timestamps_add_the_date_only_when_it_is_not_today() {
+    let today = NaiveDate::from_ymd_opt(2026, 7, 26).unwrap();
+
+    assert_eq!(display_local_time("2026-07-26 12:02", today), "12:02");
+    assert_eq!(
+        display_local_time("2026-07-25 23:58", today),
+        "2026-07-25 23:58"
+    );
+}
+
+#[test]
+fn active_session_status_uses_vibrant_peach() {
+    assert_eq!(
+        session_status_color(SessionStatus::Running),
+        RUNNING_STATUS_PEACH
+    );
+    assert_eq!(
+        session_status_color(SessionStatus::Starting),
+        RUNNING_STATUS_PEACH
+    );
+    assert_eq!(session_status_color(SessionStatus::Failed), Color::LightRed);
+}
+
+#[test]
+fn wheel_distance_advances_in_bounded_frames_and_stops_at_boundaries() {
+    let mut motion = ScrollMotion::default();
+    motion.push(MAX_PENDING_WHEEL_SCROLL_LINES);
+    assert_eq!(
+        motion.advance(0, 500),
+        MAX_WHEEL_SCROLL_LINES_PER_FRAME as usize
+    );
+    assert_eq!(
+        motion.remaining_lines,
+        MAX_PENDING_WHEEL_SCROLL_LINES - MAX_WHEEL_SCROLL_LINES_PER_FRAME
+    );
+
+    motion.remaining_lines = -24;
+    assert_eq!(motion.advance(40, 500), 37);
+    assert_eq!(motion.remaining_lines, -21);
+    motion.remaining_lines = 40;
+    assert_eq!(motion.advance(496, 500), 500);
+    assert!(!motion.is_active());
+    motion.remaining_lines = -40;
+    assert_eq!(motion.advance(3, 500), 0);
+    assert!(!motion.is_active());
+
+    let mut scroll = 0;
+    let mut motion = ScrollMotion::default();
+    motion.push(WHEEL_SCROLL_LINES_PER_EVENT);
+    let mut frames = 0;
+    while motion.is_active() {
+        scroll = motion.advance(scroll, 500);
+        frames += 1;
+    }
+    assert_eq!(scroll, WHEEL_SCROLL_LINES_PER_EVENT as usize);
+    assert_eq!(frames, WHEEL_SCROLL_LINES_PER_EVENT);
+}
+
+#[test]
+fn long_tool_runs_show_eight_lines_and_scroll_independently() {
+    let mut transcript = Transcript::default();
+    for index in 0..20 {
+        transcript.order.push(TranscriptEntry::Tool {
+            source_name: "Run".to_string(),
+            name: "Run".to_string(),
+            detail: format!("call-{index}"),
+            code_view: None,
+            output_view: None,
+            payload_refs: Vec::new(),
+            time: "12:00".to_string(),
+            complete: true,
+            error: false,
+            user_interrupted: false,
+            backgrounded: false,
+            expanded: false,
+        });
+    }
+
+    let rendered = transcript
+        .lines(100)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!rendered.contains("call-11"));
+    assert!(rendered.contains("call-12"));
+    assert!(rendered.contains("call-19"));
+    assert!(rendered.contains("actions · 20 · ↑ more"));
+    assert!(!rendered.contains("scroll for older/newer"));
+
+    transcript.scroll_tool_run(0, 12, -3);
+    let rendered = transcript
+        .lines(100)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("call-9"));
+    assert!(rendered.contains("call-16"));
+    assert!(!rendered.contains("call-17"));
+}
+
+#[test]
+fn tool_run_scroll_only_consumes_wheel_events_while_it_can_move() {
+    let mut transcript = Transcript::default();
+    for index in 0..20 {
+        transcript.order.push(TranscriptEntry::Tool {
+            source_name: "Run".to_string(),
+            name: "Run".to_string(),
+            detail: format!("call-{index}"),
+            code_view: None,
+            output_view: None,
+            payload_refs: Vec::new(),
+            time: "12:00".to_string(),
+            complete: true,
+            error: false,
+            user_interrupted: false,
+            backgrounded: false,
+            expanded: false,
+        });
+    }
+
+    assert!(!transcript.scroll_tool_run(0, 12, 3));
+    assert!(transcript.scroll_tool_run(0, 12, -3));
+    assert!(transcript.scroll_tool_run(0, 12, 3));
+    assert!(!transcript.scroll_tool_run(0, 12, 3));
+}
+
+#[test]
+fn action_viewport_uses_up_to_one_third_of_the_terminal() {
+    assert_eq!(tool_run_viewport_height(66) + TOOL_RUN_CHROME_HEIGHT, 22);
+    assert_eq!(tool_run_viewport_height(20) + TOOL_RUN_CHROME_HEIGHT, 8);
+    assert_eq!(tool_run_viewport_height(200) + TOOL_RUN_CHROME_HEIGHT, 32);
+}
+
+#[test]
+fn nested_tool_scroll_keeps_momentum_out_of_the_transcript() {
+    let started_at = Instant::now();
+    let mut capture = None;
+
+    assert!(nested_scroll_consumed(
+        &mut capture,
+        4,
+        -1,
+        true,
+        started_at,
+    ));
+    assert!(nested_scroll_consumed(
+        &mut capture,
+        4,
+        -1,
+        false,
+        started_at + Duration::from_millis(50),
+    ));
+    assert!(!nested_scroll_consumed(
+        &mut capture,
+        4,
+        -1,
+        false,
+        started_at
+            + Duration::from_millis(50)
+            + NESTED_SCROLL_GESTURE_GAP
+            + Duration::from_millis(1),
+    ));
+}
+
+#[test]
+fn transcript_scroll_anchor_tracks_content_growth_and_collapse() {
+    assert_eq!(preserve_scroll_anchor(0, 20, 24), 4);
+    assert_eq!(preserve_scroll_anchor(7, 20, 24), 11);
+    assert_eq!(preserve_scroll_anchor(11, 24, 20), 7);
+    assert_eq!(preserve_scroll_anchor(2, 24, 20), 0);
+}
+
+#[test]
+fn line_scrolling_preserves_expanded_actions() {
+    let mut transcript = Transcript::default();
+    for index in 0..9 {
+        transcript.order.push(TranscriptEntry::Tool {
+            source_name: "Edit".to_string(),
+            name: "Edit".to_string(),
+            detail: format!("file-{index}.rs"),
+            code_view: Some((
+                "diff:rs".to_string(),
+                (0..12)
+                    .map(|line| format!("+changed-{line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )),
+            output_view: None,
+            payload_refs: Vec::new(),
+            time: "12:00".to_string(),
+            complete: true,
+            error: false,
+            user_interrupted: false,
+            backgrounded: false,
+            expanded: index == 8,
+        });
+    }
+
+    let render = transcript.render(100, None, None, None);
+    let max_offset = render.2[0].3;
+    assert!(max_offset > DEFAULT_TOOL_RUN_VIEWPORT_HEIGHT);
+    assert!(matches!(
+        &transcript.order[8],
+        TranscriptEntry::Tool { expanded: true, .. }
+    ));
+    assert!(render.0.iter().any(|line| line.to_string() == "└─"));
+
+    assert!(transcript.scroll_tool_run(0, max_offset, -3));
+    assert!(matches!(
+        &transcript.order[8],
+        TranscriptEntry::Tool { expanded: true, .. }
+    ));
+    let rendered = transcript
+        .lines(100)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("└─ ↓ more"));
+}
+
+#[test]
+fn scrolled_action_viewport_pins_the_current_tool_header() {
+    let mut transcript = Transcript::default();
+    for index in 0..9 {
+        transcript.order.push(TranscriptEntry::Tool {
+            source_name: "Edit".to_string(),
+            name: "Edit".to_string(),
+            detail: format!("file-{index}.rs"),
+            code_view: Some((
+                "diff:rs".to_string(),
+                (0..20)
+                    .map(|line| format!("+changed-{line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )),
+            output_view: None,
+            payload_refs: Vec::new(),
+            time: "12:00".to_string(),
+            complete: true,
+            error: false,
+            user_interrupted: false,
+            backgrounded: false,
+            expanded: index == 8,
+        });
+    }
+
+    let rendered = transcript.render_with_tool_run_viewport(100, 8, Some(8), None, None);
+    let pinned = &rendered.0[1];
+
+    assert!(pinned.to_string().contains("Edit"));
+    assert!(
+        pinned
+            .spans
+            .iter()
+            .any(|span| span.style.bg == Some(MESSAGE_HOVER_BG))
+    );
+}
+
+#[test]
+fn expanding_an_action_preserves_the_current_line_anchor() {
+    let mut transcript = Transcript::default();
+    for index in 0..9 {
+        transcript.order.push(TranscriptEntry::Tool {
+            source_name: "Edit".to_string(),
+            name: "Edit".to_string(),
+            detail: format!("file-{index}.rs"),
+            code_view: Some(("diff:rs".to_string(), "+first\n+second\n+third".to_string())),
+            output_view: None,
+            payload_refs: Vec::new(),
+            time: "12:00".to_string(),
+            complete: true,
+            error: false,
+            user_interrupted: false,
+            backgrounded: false,
+            expanded: false,
+        });
+    }
+
+    let max_offset = transcript.render(100, None, None, None).2[0].3;
+    transcript.anchor_tool_run(0, max_offset);
+    transcript.toggle_tool(8);
+
+    assert_eq!(transcript.tool_run_offsets.get(&0), Some(&max_offset));
+    assert!(transcript.render(100, None, None, None).2[0].3 > max_offset);
+}
+
+#[test]
+fn reasoning_is_one_live_muted_disclosure_that_collapses_at_a_tool_boundary() {
+    let session_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::ReasoningDelta {
+            text: "Checking".to_string(),
+        },
+    ));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::ReasoningDelta {
+            text: " the source".to_string(),
+        },
+    ));
+
+    assert_eq!(transcript.order.len(), 1);
+    assert!(matches!(
+        &transcript.order[0],
+        TranscriptEntry::Tool {
+            name,
+            code_view: Some((language, source)),
+            complete: false,
+            expanded: true,
+            ..
+        } if name == "Thinking"
+            && language == "reasoning"
+            && source == "Checking the source"
+    ));
+    assert!(transcript.tool_spinner_cache_tick().is_some());
+    let rendered = transcript
+        .lines(100)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.chars().any(|glyph| "⠋⠙⠹⠸⠼⠴⠦⠧".contains(glyph)));
+
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        3,
+        SessionEventKind::ToolStarted {
+            tool_call_id: "read-1".to_string(),
+            name: "read_file".to_string(),
+            input: serde_json::json!({"path": "src/lib.rs"}),
+            input_ref: None,
+        },
+    ));
+    assert!(matches!(
+        &transcript.order[0],
+        TranscriptEntry::Tool {
+            complete: true,
+            expanded: false,
+            ..
+        }
+    ));
+    transcript.toggle_tool(0);
+    assert!(matches!(
+        &transcript.order[0],
+        TranscriptEntry::Tool { expanded: true, .. }
+    ));
+}
+
+#[test]
+fn rich_plan_orders_active_work_first_and_mutes_completed_work() {
+    let mut transcript = Transcript::default();
+    transcript.order.push(TranscriptEntry::Plan {
+        items: vec![
+            PlanItem {
+                id: Uuid::new_v4(),
+                content: "Already done".to_string(),
+                status: PlanItemStatus::Completed,
+            },
+            PlanItem {
+                id: Uuid::new_v4(),
+                content: "Still to do".to_string(),
+                status: PlanItemStatus::Pending,
+            },
+            PlanItem {
+                id: Uuid::new_v4(),
+                content: "Working now".to_string(),
+                status: PlanItemStatus::InProgress,
+            },
+        ],
+        time: "12:00".to_string(),
+    });
+
+    let lines = transcript.lines(80);
+    let find = |text: &str| {
+        lines
+            .iter()
+            .position(|line| line.spans.iter().any(|span| span.content.contains(text)))
+            .expect("plan item is rendered")
+    };
+    let in_progress = find("Working now");
+    let pending = find("Still to do");
+    let completed = find("Already done");
+    assert!(in_progress < pending && pending < completed);
+    assert!(
+        lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .any(|span| span.content.contains("1/3 completed"))
+    );
+    let completed_marker = lines[completed]
+        .spans
+        .iter()
+        .find(|span| span.content.contains('✓'))
+        .expect("completed plan marker");
+    assert!(
+        !completed_marker
+            .style
+            .add_modifier
+            .contains(Modifier::CROSSED_OUT)
+    );
+    let completed_span = lines[completed]
+        .spans
+        .iter()
+        .find(|span| span.content.contains("Already done"))
+        .expect("completed plan text");
+    assert_eq!(completed_span.style.fg, Some(Color::DarkGray));
+    assert!(
+        completed_span
+            .style
+            .add_modifier
+            .contains(Modifier::CROSSED_OUT)
+    );
+}
+
+#[test]
+fn plan_cards_copy_the_complete_readable_todo_list() {
+    let entry = TranscriptEntry::Plan {
+        items: vec![
+            PlanItem {
+                id: Uuid::new_v4(),
+                content: "Inspect scrolling".to_string(),
+                status: PlanItemStatus::Completed,
+            },
+            PlanItem {
+                id: Uuid::new_v4(),
+                content: "Polish interactions".to_string(),
+                status: PlanItemStatus::InProgress,
+            },
+        ],
+        time: "12:00".to_string(),
+    };
+
+    assert_eq!(
+        entry.copy_text_owned().as_deref(),
+        Some("✓ Inspect scrolling\n◌ Polish interactions")
+    );
+}
+
+#[test]
+fn interrupted_tools_update_in_place_with_explicit_user_cause() {
+    let mut transcript = Transcript::default();
+    transcript.order.push(TranscriptEntry::Tool {
+        source_name: "Run".to_string(),
+        name: "Run".to_string(),
+        detail: "cargo check".to_string(),
+        code_view: Some(("bash".to_string(), "cargo check".to_string())),
+        output_view: None,
+        payload_refs: Vec::new(),
+        time: "12:00".to_string(),
+        complete: false,
+        error: false,
+        user_interrupted: false,
+        backgrounded: false,
+        expanded: false,
+    });
+
+    transcript.mark_running_tools_user_interrupted();
+
+    assert!(matches!(
+        transcript.order.first(),
+        Some(TranscriptEntry::Tool {
+            complete: true,
+            user_interrupted: true,
+            ..
+        })
+    ));
+    assert!(
+        transcript
+            .lines(100)
+            .iter()
+            .any(|line| line.to_string().contains("user interrupted"))
+    );
+}
+
+#[test]
+fn turn_completion_settles_unresolved_foreground_tools() {
+    let session_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::ToolStarted {
+            tool_call_id: "run-1".to_string(),
+            name: "exec".to_string(),
+            input: serde_json::json!({"cmd": "just cli"}),
+            input_ref: None,
+        },
+    ));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::TurnCompleted {
+            message_id: Uuid::new_v4(),
+            provider_session_id: None,
+            final_text: String::new(),
+            error: None,
+        },
+    ));
+
+    assert!(matches!(
+        transcript.order.first(),
+        Some(TranscriptEntry::Tool {
+            complete: true,
+            error: false,
+            user_interrupted: false,
+            ..
+        })
+    ));
+    let rendered = transcript
+        .lines(100)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains('✓'));
+    assert!(!rendered.contains("completed"));
+}
+
+#[test]
+fn completed_web_search_updates_the_started_card_with_the_late_query() {
+    let session_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::ToolStarted {
+            tool_call_id: "search-1".to_string(),
+            name: "web_search".to_string(),
+            input: serde_json::Value::Null,
+            input_ref: None,
+        },
+    ));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::ToolCompleted {
+            tool_call_id: "search-1".to_string(),
+            output: String::new(),
+            output_ref: None,
+            is_error: false,
+            input: Some(serde_json::json!({"query": "Borg CLI queue"})),
+            input_ref: None,
+        },
+    ));
+
+    assert!(matches!(
+        transcript.order.first(),
+        Some(TranscriptEntry::Tool { name, detail, complete: true, .. })
+            if name == "Search web" && detail == "“Borg CLI queue”"
+    ));
+}
+
+#[test]
+fn empty_assistant_updates_are_not_rendered() {
+    let mut transcript = Transcript::default();
+    transcript.apply(&SessionEvent::new(
+        Uuid::new_v4(),
+        1,
+        SessionEventKind::Message {
+            message_id: Uuid::new_v4(),
+            actor: EventActor::Assistant,
+            text: "  ".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: None,
+        },
+    ));
+
+    assert!(transcript.order.is_empty());
+}
+
+#[test]
+fn transcript_text_selection_uses_stable_document_rows() {
+    let lines = vec![
+        Line::from("zero"),
+        Line::from("one two"),
+        Line::from("three four"),
+        Line::from("five"),
+    ];
+    let selection = TextSelection {
+        anchor: TranscriptPoint { row: 1, column: 4 },
+        focus: TranscriptPoint { row: 3, column: 2 },
+        dragging: false,
+        autoscroll: 0,
+        pointer: Position::new(0, 0),
+    };
+
+    assert_eq!(
+        selected_transcript_text(&lines, selection).as_deref(),
+        Some("two\nthree four\nfi")
+    );
+}
+
+#[test]
+fn selection_highlight_survives_a_changed_viewport_offset() {
+    let selection = TextSelection {
+        anchor: TranscriptPoint { row: 5, column: 1 },
+        focus: TranscriptPoint { row: 6, column: 2 },
+        dragging: true,
+        autoscroll: 1,
+        pointer: Position::new(0, 0),
+    };
+    let mut first_view = vec![Line::from("abcd"), Line::from("efgh")];
+    apply_text_selection(&mut first_view, 5, selection);
+    assert!(
+        first_view[0]
+            .spans
+            .iter()
+            .any(|span| span.style.bg.is_some())
+    );
+
+    let mut scrolled_view = vec![Line::from("xxxx"), Line::from("abcd")];
+    apply_text_selection(&mut scrolled_view, 4, selection);
+    assert!(
+        scrolled_view[0]
+            .spans
+            .iter()
+            .all(|span| span.style.bg.is_none())
+    );
+    assert!(
+        scrolled_view[1]
+            .spans
+            .iter()
+            .any(|span| span.style.bg.is_some())
+    );
+}

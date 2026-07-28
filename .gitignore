@@ -1,0 +1,5 @@
+/target
+**/bindings/
+/.borg
+*.env.local
+.env
