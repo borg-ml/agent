@@ -808,7 +808,7 @@ async fn run_local_agent_session(
                         .await
                         .ok();
                 } else if pending_approval.is_some() && !args.json && terminal.is_none() {
-                    print!("\n  Allow? [y] once · [a] session · [n] deny › ");
+                    print!("\n  Allow · y   Deny · n › ");
                     io::stdout().flush()?;
                 } else if interactive && status == SessionStatus::Ready && !args.json && terminal.is_none() {
                     print!("> ");
@@ -857,7 +857,6 @@ async fn run_local_agent_session(
                 if let Some(approval_id) = pending_approval.clone() {
                     let decision = match line {
                         "y" | "yes" => Some(ApprovalDecision::AllowOnce),
-                        "a" | "always" => Some(ApprovalDecision::AllowSession),
                         "n" | "no" | "deny" => Some(ApprovalDecision::Deny),
                         _ => None,
                     };
@@ -868,7 +867,7 @@ async fn run_local_agent_session(
                             decision,
                         }).await.ok();
                     } else {
-                        print!("  Choose y, a, or n › ");
+                        print!("  Choose y or n › ");
                         io::stdout().flush()?;
                     }
                     continue;
@@ -2922,9 +2921,9 @@ fn provider_name(provider: CodingProvider) -> &'static str {
 
 fn permission_name(permission: PermissionMode) -> &'static str {
     match permission {
-        PermissionMode::ReadOnly => "read-only",
-        PermissionMode::WorkspaceWrite => "workspace-write",
         PermissionMode::FullAccess => "full-access",
+        PermissionMode::Auto => "auto",
+        PermissionMode::Manual => "manual",
     }
 }
 

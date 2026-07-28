@@ -2012,7 +2012,7 @@ impl BorgTerminal {
                     SessionStatus::Running | SessionStatus::Starting => {
                         "Ask a follow-up or steer the current turn…"
                     }
-                    SessionStatus::WaitingForApproval => "Choose Y once · A session · N deny",
+                    SessionStatus::WaitingForApproval => "Allow · Y   Deny · N",
                     _ => "Describe a task…",
                 }
             };
@@ -2793,7 +2793,6 @@ impl BorgTerminal {
         if self.pending_approval {
             return Ok(match key.code {
                 KeyCode::Char('y') => UiAction::Approve(ApprovalDecision::AllowOnce),
-                KeyCode::Char('a') => UiAction::Approve(ApprovalDecision::AllowSession),
                 KeyCode::Char('n') => UiAction::Approve(ApprovalDecision::Deny),
                 KeyCode::Esc => UiAction::Approve(ApprovalDecision::Deny),
                 _ => UiAction::None,
@@ -4523,8 +4522,8 @@ impl Transcript {
         let secondary = [
             match config.permission_mode {
                 PermissionMode::FullAccess => "full access",
-                PermissionMode::WorkspaceWrite => "workspace write",
-                PermissionMode::ReadOnly => "read only",
+                PermissionMode::Auto => "auto approvals",
+                PermissionMode::Manual => "manual approvals",
             }
             .to_string(),
             config.cwd.display().to_string(),

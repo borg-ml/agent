@@ -364,12 +364,7 @@ mod tests {
         );
         assert!(!full_access.iter().any(|arg| arg == "--auto"));
 
-        let guarded = opencode_run_args(
-            None,
-            "openai/gpt-5.6",
-            None,
-            LocalAgentPermission::WorkspaceWrite,
-        );
+        let guarded = opencode_run_args(None, "openai/gpt-5.6", None, LocalAgentPermission::Manual);
         assert!(
             !guarded
                 .iter()

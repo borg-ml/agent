@@ -267,9 +267,11 @@ impl CodexAppServerClient {
         persist_session: bool,
         permission: LocalAgentPermission,
     ) -> Result<String> {
-        let (approval_policy, sandbox, sandbox_policy) = permission.codex_policy();
+        let (approval_policy, sandbox, sandbox_policy, approvals_reviewer) =
+            permission.codex_policy();
         let mut params = serde_json::json!({
             "approvalPolicy": approval_policy,
+            "approvalsReviewer": approvals_reviewer,
             "sandbox": sandbox,
             "sandboxPolicy": sandbox_policy,
             "networkAccess": self.network_access,
@@ -338,10 +340,12 @@ impl CodexAppServerClient {
         working_directory: &str,
         permission: LocalAgentPermission,
     ) -> Result<String> {
-        let (approval_policy, sandbox, sandbox_policy) = permission.codex_policy();
+        let (approval_policy, sandbox, sandbox_policy, approvals_reviewer) =
+            permission.codex_policy();
         let mut params = serde_json::json!({
             "threadId": thread_id,
             "approvalPolicy": approval_policy,
+            "approvalsReviewer": approvals_reviewer,
             "sandbox": sandbox,
             "sandboxPolicy": sandbox_policy,
             "networkAccess": self.network_access,
@@ -1088,11 +1092,16 @@ fn turn_user_input(prompt: &str, attachments: &[PathBuf]) -> Vec<Value> {
 }
 
 impl LocalAgentPermission {
-    fn codex_policy(self) -> (&'static str, &'static str, &'static str) {
+    fn codex_policy(self) -> (&'static str, &'static str, &'static str, &'static str) {
         match self {
-            Self::ReadOnly => ("on-request", "read-only", "readOnly"),
-            Self::WorkspaceWrite => ("on-request", "workspace-write", "workspaceWrite"),
-            Self::FullAccess => ("never", "danger-full-access", "dangerFullAccess"),
+            Self::FullAccess => ("never", "danger-full-access", "dangerFullAccess", "user"),
+            Self::Auto => (
+                "untrusted",
+                "workspace-write",
+                "workspaceWrite",
+                "auto_review",
+            ),
+            Self::Manual => ("untrusted", "workspace-write", "workspaceWrite", "user"),
         }
     }
 }
@@ -1467,6 +1476,27 @@ impl Drop for CodexAppServerClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_modes_select_the_expected_codex_reviewer() {
+        assert_eq!(
+            LocalAgentPermission::FullAccess.codex_policy(),
+            ("never", "danger-full-access", "dangerFullAccess", "user")
+        );
+        assert_eq!(
+            LocalAgentPermission::Auto.codex_policy(),
+            (
+                "untrusted",
+                "workspace-write",
+                "workspaceWrite",
+                "auto_review"
+            )
+        );
+        assert_eq!(
+            LocalAgentPermission::Manual.codex_policy(),
+            ("untrusted", "workspace-write", "workspaceWrite", "user")
+        );
+    }
 
     #[test]
     fn unattended_server_requests_are_resolved_without_granting_authority() {

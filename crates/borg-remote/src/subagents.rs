@@ -1454,7 +1454,7 @@ mod tests {
             effort: Some("high".into()),
             fast: Some(false),
             response_language: crate::ResponseLanguage::Auto,
-            permission_mode: PermissionMode::WorkspaceWrite,
+            permission_mode: PermissionMode::Manual,
             name: None,
             initial_prompt: None,
         }
@@ -1637,7 +1637,7 @@ mod tests {
                     effort: Some("high".into()),
                     fast: false,
                     response_language: crate::ResponseLanguage::Auto,
-                    permission_mode: PermissionMode::WorkspaceWrite,
+                    permission_mode: PermissionMode::Manual,
                 },
             ))
             .unwrap();

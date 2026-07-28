@@ -148,17 +148,18 @@ impl From<RemoteProviderArg> for borg_remote::CodingProvider {
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub(crate) enum RemotePermissionArg {
-    ReadOnly,
-    WorkspaceWrite,
     FullAccess,
+    Auto,
+    #[value(alias = "read-only", alias = "workspace-write")]
+    Manual,
 }
 
 impl From<RemotePermissionArg> for borg_remote::PermissionMode {
     fn from(value: RemotePermissionArg) -> Self {
         match value {
-            RemotePermissionArg::ReadOnly => Self::ReadOnly,
-            RemotePermissionArg::WorkspaceWrite => Self::WorkspaceWrite,
             RemotePermissionArg::FullAccess => Self::FullAccess,
+            RemotePermissionArg::Auto => Self::Auto,
+            RemotePermissionArg::Manual => Self::Manual,
         }
     }
 }

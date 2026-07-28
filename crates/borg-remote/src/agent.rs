@@ -754,9 +754,9 @@ fn map_controls(
 
 fn local_permission(permission: PermissionMode) -> LocalAgentPermission {
     match permission {
-        PermissionMode::ReadOnly => LocalAgentPermission::ReadOnly,
-        PermissionMode::WorkspaceWrite => LocalAgentPermission::WorkspaceWrite,
         PermissionMode::FullAccess => LocalAgentPermission::FullAccess,
+        PermissionMode::Auto => LocalAgentPermission::Auto,
+        PermissionMode::Manual => LocalAgentPermission::Manual,
     }
 }
 

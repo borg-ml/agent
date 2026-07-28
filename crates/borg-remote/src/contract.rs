@@ -188,13 +188,38 @@ impl CodingProvider {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(export)]
 pub enum PermissionMode {
-    ReadOnly,
-    WorkspaceWrite,
     FullAccess,
+    Auto,
+    Manual,
+}
+
+impl<'de> Deserialize<'de> for PermissionMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum StoredPermissionMode {
+            FullAccess,
+            Auto,
+            Manual,
+            ReadOnly,
+            WorkspaceWrite,
+        }
+
+        Ok(match StoredPermissionMode::deserialize(deserializer)? {
+            StoredPermissionMode::FullAccess => Self::FullAccess,
+            StoredPermissionMode::Auto => Self::Auto,
+            StoredPermissionMode::Manual
+            | StoredPermissionMode::ReadOnly
+            | StoredPermissionMode::WorkspaceWrite => Self::Manual,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]

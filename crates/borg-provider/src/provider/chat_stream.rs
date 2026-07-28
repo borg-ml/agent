@@ -141,9 +141,9 @@ pub enum ChatApprovalDecision {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LocalAgentPermission {
-    ReadOnly,
-    WorkspaceWrite,
     FullAccess,
+    Auto,
+    Manual,
 }
 
 #[derive(Debug, Clone)]
@@ -486,9 +486,9 @@ async fn run_claude_sdk_inner(
         "workspace_dir": workspace_dir,
         "effort": req.effort.unwrap_or_else(|| "medium".to_string()),
         "permission_mode": match permission {
-            LocalAgentPermission::ReadOnly => "plan",
-            LocalAgentPermission::WorkspaceWrite => "acceptEdits",
             LocalAgentPermission::FullAccess => "bypassPermissions",
+            LocalAgentPermission::Auto => "acceptEdits",
+            LocalAgentPermission::Manual => "default",
         },
         "system_prompt": req.system_prompt,
     });
