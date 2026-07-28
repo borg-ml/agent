@@ -1,9 +1,8 @@
 # Borg CLI
 
-Borg is the free and open-source agent harness and orchestrator for reliable
-local and remote work. It is not limited to coding: use it for research,
-operations, document work, analysis, or any task an agent can complete with
-local tools. No proprietary Borg runtime runs on your computer.
+Borg is a free and open-source agent harness and orchestrator written entirely
+in Rust. It combines a responsive terminal UI, durable sessions, native tools,
+major AI subscriptions and APIs, and optional remote control through borg.ml.
 
 ```sh
 curl -fsSL https://borg.ml/install | sh
@@ -30,16 +29,15 @@ configurable.
 - a responsive terminal UI with durable resume, steering, compaction, image
   input, transcript selection, and configurable keybindings;
 - Codex, Claude, OpenCode, Kimi, OpenRouter, and OpenAI-compatible providers;
-- a provider-neutral native harness with bounded file tools, background
+- a native harness with bounded file tools, background
   processes, LSP, goals, plans, subagents, MCP, project guidance, and skills;
 - non-blocking, checksum-verified updates that take effect on the next launch;
 - **Full Access** (default), **Auto** model-reviewed commands, and **Manual**
   user-reviewed commands;
-- enrolled Borg Remote hosts using the same public session and tool runtime.
+- Borg Remote hosts using the same durable session and tool runtime.
 
-The implementation deliberately keeps state, safety boundaries, validation,
-and tool execution in typed Rust. It does not include an extension runtime or
-product-specific workflow semantics.
+State, safety boundaries, validation, and tool execution are implemented in
+typed Rust.
 
 ## Configuration
 
@@ -48,21 +46,11 @@ Copy [`configs/agent.example.toml`](configs/agent.example.toml) to
 `~/.config/borg/agent.toml`). The typed config supports slash-command aliases,
 keybindings, and the model/effort used by native Auto approval review.
 
-## Boundary
-
-Included:
+## Repository layout
 
 - `borg-provider`: provider-neutral messages, tools, usage and local adapters;
 - `borg-remote`: session protocol, journal, actor, host and local tools; and
 - `borg`: public CLI commands and terminal UI.
-
-Excluded: Borg's proprietary server, engine, legal workflows, billing, web
-apps, platform MCP/catalog, database/search implementations, internal tooling,
-deployment configuration, and generated product assets.
-
-The dependency direction is one-way: the private platform imports versioned
-packages from this repository. Public packages never import the private
-monorepo.
 
 ## Development
 
@@ -77,9 +65,8 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) before submitting changes.
 
 Tags matching `v*` build checksum-paired `borg` archives for Linux, macOS, and
 Windows on x86-64 and ARM64. Each release archive contains the self-contained
-`borg` CLI, `LICENSE`, `NOTICE.md`, and this README. Private platform services
-and tools are never packaged from this repository.
+`borg` CLI, `LICENSE`, `NOTICE.md`, and this README.
 
 ---
 
-AGPL-3.0-only OR a separate Borg Commercial Licence. Contact Borg.
+AGPL-3.0-only OR a separate Borg Commercial Licence.

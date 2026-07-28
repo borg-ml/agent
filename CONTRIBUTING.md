@@ -29,5 +29,5 @@ cargo check --workspace
 cargo test --workspace
 ```
 
-Keep public protocol and provider contracts in their owning crate. Private Borg
-platform code depends on this repository and must not be copied into it.
+Keep protocol and provider contracts in their owning crate, and keep changes
+small enough to review and validate independently.

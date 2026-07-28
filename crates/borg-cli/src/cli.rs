@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 #[derive(Debug, Parser)]
 #[command(name = "borg")]
-#[command(about = "A free and open-source agent harness for local and remote work")]
+#[command(about = "A high-performance, open-source agent harness and orchestrator")]
 #[command(version)]
 pub(crate) struct Cli {
     #[command(subcommand)]
