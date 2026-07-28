@@ -36,6 +36,8 @@ const MAX_COMMAND_TIMEOUT_MS: u64 = 30 * 60 * 1000;
 pub(crate) struct NativeHarness {
     model_client: Arc<dyn NativeModelClient>,
     process_manager: crate::native_process::ProcessManager,
+    reviewer_model: Option<String>,
+    reviewer_effort: Option<String>,
 }
 
 impl std::fmt::Debug for NativeHarness {
@@ -44,6 +46,8 @@ impl std::fmt::Debug for NativeHarness {
             .debug_struct("NativeHarness")
             .field("model_client", &"[provider adapter]")
             .field("process_manager", &"[session-owned processes]")
+            .field("reviewer_model", &self.reviewer_model)
+            .field("reviewer_effort", &self.reviewer_effort)
             .finish()
     }
 }
@@ -53,17 +57,30 @@ impl Default for NativeHarness {
         Self {
             model_client: Arc::new(CompatibleModelClient::default()),
             process_manager: crate::native_process::ProcessManager::default(),
+            reviewer_model: None,
+            reviewer_effort: None,
         }
     }
 }
 
 impl NativeHarness {
-    pub(crate) fn with_model_gateway(model_gateway: ModelGateway) -> Self {
+    pub(crate) fn with_settings(settings: &super::agent::LocalAgentSettings) -> Self {
+        Self {
+            reviewer_model: settings.approval_reviewer_model.clone(),
+            reviewer_effort: settings.approval_reviewer_effort.clone(),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn with_model_gateway(
+        model_gateway: ModelGateway,
+        settings: &super::agent::LocalAgentSettings,
+    ) -> Self {
         Self {
             model_client: Arc::new(CompatibleModelClient {
                 gateway: Some(model_gateway),
             }),
-            ..Self::default()
+            ..Self::with_settings(settings)
         }
     }
 
@@ -305,7 +322,6 @@ impl NativeHarness {
                                 NativeApprovalContext {
                                     provider: turn.provider,
                                     model: &model,
-                                    effort: turn.effort.as_deref(),
                                 },
                                 &events,
                                 &mut controls,
@@ -1019,7 +1035,6 @@ async fn execute_tool(
 struct NativeApprovalContext<'a> {
     provider: crate::CodingProvider,
     model: &'a str,
-    effort: Option<&'a str>,
 }
 
 struct AutomaticReview {
@@ -1074,8 +1089,8 @@ async fn review_tool_automatically(
         Duration::from_secs(30),
         harness.model_client.model_turn(
             context.provider,
-            context.model,
-            context.effort,
+            harness.reviewer_model.as_deref().unwrap_or(context.model),
+            harness.reviewer_effort.as_deref().or(Some("low")),
             request,
             None,
         ),

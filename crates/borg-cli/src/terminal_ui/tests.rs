@@ -1,6 +1,24 @@
 use super::*;
 
 #[test]
+fn keybinding_help_is_action_first_and_uses_configuration() {
+    let mut config = crate::agent_config::KeybindingConfig::default();
+    config.send = vec!["ctrl+s".to_string()];
+    let keymap = KeyMap::from_config(&config).expect("keymap");
+    assert_eq!(
+        primary_controls_line(&keymap),
+        "send ctrl+s · commands / · keybindings ?"
+    );
+    let help = keybinding_lines(&keymap, 60)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(help.contains("send"));
+    assert!(help.find("send").unwrap() < help.find("ctrl+s").unwrap());
+}
+
+#[test]
 fn reflow_respects_cell_width_and_grapheme_boundaries() {
     let input = "alpha 👩🏽‍💻 漢字 omega";
     for width in [4, 7, 12] {

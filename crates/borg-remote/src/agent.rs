@@ -130,10 +130,30 @@ pub struct LocalAgentTurnExecutor {
     native_harness: NativeHarness,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct LocalAgentSettings {
+    pub approval_reviewer_model: Option<String>,
+    pub approval_reviewer_effort: Option<String>,
+}
+
 impl LocalAgentTurnExecutor {
-    pub fn with_model_gateway(gateway: borg_provider::provider::ModelGateway) -> Self {
+    pub fn with_settings(settings: LocalAgentSettings) -> Self {
         Self {
-            native_harness: NativeHarness::with_model_gateway(gateway),
+            native_harness: NativeHarness::with_settings(&settings),
+            ..Self::default()
+        }
+    }
+
+    pub fn with_model_gateway(gateway: borg_provider::provider::ModelGateway) -> Self {
+        Self::with_model_gateway_and_settings(gateway, LocalAgentSettings::default())
+    }
+
+    pub fn with_model_gateway_and_settings(
+        gateway: borg_provider::provider::ModelGateway,
+        settings: LocalAgentSettings,
+    ) -> Self {
+        Self {
+            native_harness: NativeHarness::with_model_gateway(gateway, &settings),
             ..Self::default()
         }
     }

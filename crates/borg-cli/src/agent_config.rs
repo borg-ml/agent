@@ -9,6 +9,8 @@ use serde::Deserialize;
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct AgentConfig {
     pub(crate) commands: CommandConfig,
+    pub(crate) keybindings: KeybindingConfig,
+    pub(crate) approvals: ApprovalConfig,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -17,6 +19,55 @@ pub(crate) struct CommandConfig {
     /// User-defined slash-command aliases. The key omits the leading slash;
     /// the value is a built-in slash command and may include fixed arguments.
     pub(crate) aliases: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct KeybindingConfig {
+    pub(crate) send: Vec<String>,
+    pub(crate) newline: Vec<String>,
+    pub(crate) keybindings: Vec<String>,
+    pub(crate) interrupt: Vec<String>,
+    pub(crate) clear_or_exit: Vec<String>,
+    pub(crate) exit: Vec<String>,
+    pub(crate) attach_image: Vec<String>,
+    pub(crate) copy: Vec<String>,
+    pub(crate) scroll_up: Vec<String>,
+    pub(crate) scroll_down: Vec<String>,
+    pub(crate) select_previous: Vec<String>,
+    pub(crate) select_next: Vec<String>,
+    pub(crate) approve: Vec<String>,
+    pub(crate) deny: Vec<String>,
+}
+
+impl Default for KeybindingConfig {
+    fn default() -> Self {
+        Self {
+            send: vec!["enter".into()],
+            newline: vec!["shift+enter".into(), "alt+enter".into()],
+            keybindings: vec!["?".into()],
+            interrupt: vec!["esc".into()],
+            clear_or_exit: vec!["ctrl+c".into()],
+            exit: vec!["ctrl+d".into()],
+            attach_image: vec!["ctrl+v".into()],
+            copy: vec!["ctrl+y".into()],
+            scroll_up: vec!["pageup".into()],
+            scroll_down: vec!["pagedown".into()],
+            select_previous: vec!["alt+up".into()],
+            select_next: vec!["alt+down".into()],
+            approve: vec!["y".into()],
+            deny: vec!["n".into(), "esc".into()],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct ApprovalConfig {
+    /// Optional faster/cheaper model for native Auto command reviews.
+    pub(crate) reviewer_model: Option<String>,
+    /// Reviewer reasoning effort. Defaults to `low` when a dedicated model is set.
+    pub(crate) reviewer_effort: Option<String>,
 }
 
 impl AgentConfig {
@@ -53,6 +104,25 @@ impl AgentConfig {
                 "command alias `{alias}` cannot expand to itself"
             );
         }
+        for (action, bindings) in self.keybindings.entries() {
+            anyhow::ensure!(
+                !bindings.is_empty(),
+                "keybinding action `{action}` must have at least one key"
+            );
+            for binding in bindings {
+                validate_key_chord(binding)
+                    .with_context(|| format!("invalid `{action}` keybinding `{binding}`"))?;
+            }
+        }
+        if let Some(model) = &self.approvals.reviewer_model {
+            anyhow::ensure!(!model.trim().is_empty(), "reviewer_model must not be empty");
+        }
+        if let Some(effort) = &self.approvals.reviewer_effort {
+            anyhow::ensure!(
+                !effort.trim().is_empty(),
+                "reviewer_effort must not be empty"
+            );
+        }
         Ok(())
     }
 
@@ -68,6 +138,62 @@ impl AgentConfig {
             .map(|target| format!("{target}{suffix}"))
             .unwrap_or_else(|| line.to_string())
     }
+}
+
+impl KeybindingConfig {
+    pub(crate) fn entries(&self) -> [(&'static str, &[String]); 14] {
+        [
+            ("send", &self.send),
+            ("newline", &self.newline),
+            ("keybindings", &self.keybindings),
+            ("interrupt", &self.interrupt),
+            ("clear_or_exit", &self.clear_or_exit),
+            ("exit", &self.exit),
+            ("attach_image", &self.attach_image),
+            ("copy", &self.copy),
+            ("scroll_up", &self.scroll_up),
+            ("scroll_down", &self.scroll_down),
+            ("select_previous", &self.select_previous),
+            ("select_next", &self.select_next),
+            ("approve", &self.approve),
+            ("deny", &self.deny),
+        ]
+    }
+}
+
+fn validate_key_chord(value: &str) -> Result<()> {
+    let mut parts = value.split('+').peekable();
+    let mut key = None;
+    while let Some(part) = parts.next() {
+        let part = part.trim().to_ascii_lowercase();
+        if parts.peek().is_some() && matches!(part.as_str(), "ctrl" | "alt" | "shift") {
+            continue;
+        }
+        anyhow::ensure!(key.is_none(), "only one non-modifier key is allowed");
+        anyhow::ensure!(
+            matches!(
+                part.as_str(),
+                "enter"
+                    | "esc"
+                    | "tab"
+                    | "backspace"
+                    | "delete"
+                    | "up"
+                    | "down"
+                    | "left"
+                    | "right"
+                    | "pageup"
+                    | "pagedown"
+                    | "home"
+                    | "end"
+                    | "space"
+            ) || part.chars().count() == 1,
+            "unsupported key `{part}`"
+        );
+        key = Some(part);
+    }
+    anyhow::ensure!(key.is_some(), "key chord must include a key");
+    Ok(())
 }
 
 fn default_path() -> Option<PathBuf> {
@@ -94,6 +220,7 @@ mod tests {
             commands: CommandConfig {
                 aliases: BTreeMap::from([("quick".into(), "/fast on".into())]),
             },
+            ..AgentConfig::default()
         };
         assert_eq!(config.expand_command("/quick"), "/fast on");
         assert_eq!(config.expand_command("/quick extra"), "/fast on extra");
@@ -106,5 +233,19 @@ mod tests {
             toml::from_str(include_str!("../../../configs/agent.example.toml")).unwrap();
         config.validate().unwrap();
         assert_eq!(config.expand_command("/quick"), "/fast on");
+    }
+
+    #[test]
+    fn partial_keybinding_tables_keep_unspecified_defaults() {
+        let config: AgentConfig = toml::from_str(
+            r#"
+            [keybindings]
+            send = ["ctrl+s"]
+            "#,
+        )
+        .expect("config");
+        config.validate().expect("valid config");
+        assert_eq!(config.keybindings.send, ["ctrl+s"]);
+        assert_eq!(config.keybindings.interrupt, ["esc"]);
     }
 }

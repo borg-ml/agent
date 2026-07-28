@@ -60,6 +60,7 @@ use self::cache_diagnostics::{CacheDiagnostics, CacheSignature, CacheUsage};
 use self::markdown::{markdown_lines, markdown_link_ranges, open_http_link, truncate_table_cell};
 use self::terminal_input::TerminalInput;
 pub(crate) use self::terminal_input::TerminalInputEvent;
+use crate::agent_config::KeybindingConfig;
 
 const INLINE_VIEWPORT_HEIGHT: u16 = 24;
 const HORIZONTAL_MARGIN: u16 = 0;
@@ -114,6 +115,154 @@ type CachedTranscriptRender = (
     NaiveDate,
     Arc<TranscriptRender>,
 );
+
+#[derive(Clone, Copy)]
+enum KeyAction {
+    Send,
+    Newline,
+    Keybindings,
+    Interrupt,
+    ClearOrExit,
+    Exit,
+    AttachImage,
+    Copy,
+    ScrollUp,
+    ScrollDown,
+    SelectPrevious,
+    SelectNext,
+    Approve,
+    Deny,
+}
+
+#[derive(Clone)]
+struct KeyChord {
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    label: String,
+}
+
+#[derive(Clone)]
+struct KeyMap {
+    send: Vec<KeyChord>,
+    newline: Vec<KeyChord>,
+    keybindings: Vec<KeyChord>,
+    interrupt: Vec<KeyChord>,
+    clear_or_exit: Vec<KeyChord>,
+    exit: Vec<KeyChord>,
+    attach_image: Vec<KeyChord>,
+    copy: Vec<KeyChord>,
+    scroll_up: Vec<KeyChord>,
+    scroll_down: Vec<KeyChord>,
+    select_previous: Vec<KeyChord>,
+    select_next: Vec<KeyChord>,
+    approve: Vec<KeyChord>,
+    deny: Vec<KeyChord>,
+}
+
+impl KeyMap {
+    fn from_config(config: &KeybindingConfig) -> Result<Self> {
+        Ok(Self {
+            send: parse_key_chords(&config.send)?,
+            newline: parse_key_chords(&config.newline)?,
+            keybindings: parse_key_chords(&config.keybindings)?,
+            interrupt: parse_key_chords(&config.interrupt)?,
+            clear_or_exit: parse_key_chords(&config.clear_or_exit)?,
+            exit: parse_key_chords(&config.exit)?,
+            attach_image: parse_key_chords(&config.attach_image)?,
+            copy: parse_key_chords(&config.copy)?,
+            scroll_up: parse_key_chords(&config.scroll_up)?,
+            scroll_down: parse_key_chords(&config.scroll_down)?,
+            select_previous: parse_key_chords(&config.select_previous)?,
+            select_next: parse_key_chords(&config.select_next)?,
+            approve: parse_key_chords(&config.approve)?,
+            deny: parse_key_chords(&config.deny)?,
+        })
+    }
+
+    fn chords(&self, action: KeyAction) -> &[KeyChord] {
+        match action {
+            KeyAction::Send => &self.send,
+            KeyAction::Newline => &self.newline,
+            KeyAction::Keybindings => &self.keybindings,
+            KeyAction::Interrupt => &self.interrupt,
+            KeyAction::ClearOrExit => &self.clear_or_exit,
+            KeyAction::Exit => &self.exit,
+            KeyAction::AttachImage => &self.attach_image,
+            KeyAction::Copy => &self.copy,
+            KeyAction::ScrollUp => &self.scroll_up,
+            KeyAction::ScrollDown => &self.scroll_down,
+            KeyAction::SelectPrevious => &self.select_previous,
+            KeyAction::SelectNext => &self.select_next,
+            KeyAction::Approve => &self.approve,
+            KeyAction::Deny => &self.deny,
+        }
+    }
+
+    fn matches(&self, action: KeyAction, key: &KeyEvent) -> bool {
+        let modifiers =
+            key.modifiers & (KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT);
+        self.chords(action)
+            .iter()
+            .any(|chord| key_codes_match(chord.code, key.code) && chord.modifiers == modifiers)
+    }
+
+    fn label(&self, action: KeyAction) -> String {
+        self.chords(action)
+            .iter()
+            .map(|chord| chord.label.as_str())
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+}
+
+fn key_codes_match(left: KeyCode, right: KeyCode) -> bool {
+    match (left, right) {
+        (KeyCode::Char(left), KeyCode::Char(right)) => {
+            left.to_ascii_lowercase() == right.to_ascii_lowercase()
+        }
+        _ => left == right,
+    }
+}
+
+fn parse_key_chords(values: &[String]) -> Result<Vec<KeyChord>> {
+    values.iter().map(|value| parse_key_chord(value)).collect()
+}
+
+fn parse_key_chord(value: &str) -> Result<KeyChord> {
+    let mut modifiers = KeyModifiers::NONE;
+    let mut code = None;
+    for part in value.split('+') {
+        let part = part.trim().to_ascii_lowercase();
+        match part.as_str() {
+            "ctrl" => modifiers.insert(KeyModifiers::CONTROL),
+            "alt" => modifiers.insert(KeyModifiers::ALT),
+            "shift" => modifiers.insert(KeyModifiers::SHIFT),
+            "enter" => code = Some(KeyCode::Enter),
+            "esc" => code = Some(KeyCode::Esc),
+            "tab" => code = Some(KeyCode::Tab),
+            "backspace" => code = Some(KeyCode::Backspace),
+            "delete" => code = Some(KeyCode::Delete),
+            "up" => code = Some(KeyCode::Up),
+            "down" => code = Some(KeyCode::Down),
+            "left" => code = Some(KeyCode::Left),
+            "right" => code = Some(KeyCode::Right),
+            "pageup" => code = Some(KeyCode::PageUp),
+            "pagedown" => code = Some(KeyCode::PageDown),
+            "home" => code = Some(KeyCode::Home),
+            "end" => code = Some(KeyCode::End),
+            "space" => code = Some(KeyCode::Char(' ')),
+            character if character.chars().count() == 1 => {
+                code = character.chars().next().map(KeyCode::Char);
+            }
+            _ => anyhow::bail!("unsupported key chord `{value}`"),
+        }
+    }
+    Ok(KeyChord {
+        code: code.with_context(|| format!("key chord `{value}` has no key"))?,
+        modifiers,
+        label: value.to_ascii_lowercase(),
+    })
+}
 
 #[derive(Clone, Copy)]
 struct NestedScrollCapture {
@@ -254,6 +403,7 @@ pub struct BorgTerminal {
     transcript: Transcript,
     composer: Composer,
     attachment_store: AttachmentStore,
+    keymap: KeyMap,
     cwd: PathBuf,
     status: SessionStatus,
     pending_approval: bool,
@@ -563,7 +713,12 @@ impl BorgTerminal {
         )
     }
 
-    pub fn enter(sessions_dir: &Path, session_id: Uuid, cwd: PathBuf) -> Result<Self> {
+    pub fn enter(
+        sessions_dir: &Path,
+        session_id: Uuid,
+        cwd: PathBuf,
+        keybindings: &KeybindingConfig,
+    ) -> Result<Self> {
         anyhow::ensure!(
             rich_terminal_supported(
                 std::env::var("TERM").ok().as_deref(),
@@ -573,6 +728,7 @@ impl BorgTerminal {
         );
         let mode = ScreenMode::from_environment();
         let attachment_store = AttachmentStore::for_session(sessions_dir, session_id)?;
+        let keymap = KeyMap::from_config(keybindings)?;
         enable_raw_mode().context("failed to enable terminal raw mode")?;
         let mut stdout = io::stdout();
         let keyboard_enhancement = supports_keyboard_enhancement().unwrap_or(false);
@@ -649,6 +805,7 @@ impl BorgTerminal {
             transcript: Transcript::default(),
             composer: Composer::default(),
             attachment_store,
+            keymap,
             cwd,
             status: SessionStatus::Starting,
             pending_approval: false,
@@ -1933,6 +2090,8 @@ impl BorgTerminal {
             });
         let showing_primary_controls =
             !showing_slash_suggestions && notice.is_none() && cold_cache_guidance.is_none();
+        let primary_controls = primary_controls_line(&self.keymap);
+        let keybindings_hint = format!("keybindings {}", self.keymap.label(KeyAction::Keybindings));
         let notice_style = Style::default().fg(
             if notice
                 .as_deref()
@@ -1954,7 +2113,7 @@ impl BorgTerminal {
                     .map(|line| Line::from(Span::styled(line, Style::default().fg(Color::Yellow))))
                     .collect()
             } else {
-                vec![Line::from(primary_controls_line())]
+                vec![Line::from(primary_controls.clone())]
             }
         });
         let controls = if is_launch_screen {
@@ -2556,7 +2715,7 @@ impl BorgTerminal {
             }
             if showing_primary_controls {
                 let (controls_x, controls_y, controls_width) = if is_launch_screen {
-                    let width = primary_controls_line().width() as u16;
+                    let width = primary_controls.width() as u16;
                     (
                         composer_area
                             .x
@@ -2568,10 +2727,10 @@ impl BorgTerminal {
                     (
                         footer_area.x.saturating_add(1),
                         footer_area.y,
-                        primary_controls_line().width() as u16,
+                        primary_controls.width() as u16,
                     )
                 };
-                let hint_width = KEYBINDINGS_HINT.width() as u16;
+                let hint_width = keybindings_hint.width() as u16;
                 next_keybindings_hint_area = Some(Rect {
                     x: controls_x.saturating_add(controls_width.saturating_sub(hint_width)),
                     y: controls_y,
@@ -2584,8 +2743,10 @@ impl BorgTerminal {
                 && let Some(hint_area) = next_keybindings_hint_area.or(self.keybindings_hint_area)
             {
                 let tooltip_width = area.width.min(82);
-                let tooltip_lines =
-                    keybinding_lines(tooltip_width.saturating_sub(2).max(1) as usize);
+                let tooltip_lines = keybinding_lines(
+                    &self.keymap,
+                    tooltip_width.saturating_sub(2).max(1) as usize,
+                );
                 let tooltip_height = (tooltip_lines.len() as u16)
                     .saturating_add(2)
                     .min(hint_area.y.saturating_sub(area.y).max(1));
@@ -2607,7 +2768,11 @@ impl BorgTerminal {
                                 .borders(Borders::ALL)
                                 .border_style(Style::default().fg(BORG_ORANGE))
                                 .title(Span::styled(
-                                    " Keybindings · ? or Esc close ",
+                                    format!(
+                                        " Keybindings · close {} or {} ",
+                                        self.keymap.label(KeyAction::Keybindings),
+                                        self.keymap.label(KeyAction::Interrupt)
+                                    ),
                                     Style::default()
                                         .fg(Color::White)
                                         .add_modifier(Modifier::BOLD),
@@ -2748,20 +2913,18 @@ impl BorgTerminal {
                 _ => UiAction::None,
             });
         }
-        if key.modifiers == KeyModifiers::NONE
-            && key.code == KeyCode::Char('?')
-            && self.composer.text.is_empty()
-        {
+        if self.keymap.matches(KeyAction::Keybindings, &key) && self.composer.text.is_empty() {
             self.keybindings_open = !self.keybindings_open;
             self.notice = None;
             return Ok(UiAction::None);
         }
-        if self.keybindings_open && key.code == KeyCode::Esc {
+        if self.keybindings_open && self.keymap.matches(KeyAction::Interrupt, &key) {
             self.keybindings_open = false;
             return Ok(UiAction::None);
         }
-        if key.code == KeyCode::Esc
+        if self.keymap.matches(KeyAction::Interrupt, &key)
             && self.composer.text.is_empty()
+            && !self.pending_approval
             && !matches!(
                 self.status,
                 SessionStatus::Starting | SessionStatus::Running
@@ -2771,14 +2934,17 @@ impl BorgTerminal {
                 self.open_rewind_picker();
             } else {
                 self.rewind_primed = true;
-                self.notice = Some("Esc again to edit a previous message".to_string());
+                self.notice = Some(format!(
+                    "Edit a previous message · press {} again",
+                    self.keymap.label(KeyAction::Interrupt)
+                ));
             }
             return Ok(UiAction::None);
         }
         if self.rewind_primed {
             self.rewind_primed = false;
         }
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+        if self.keymap.matches(KeyAction::ClearOrExit, &key) {
             if self.copy_text_selection() {
                 return Ok(UiAction::None);
             }
@@ -2786,16 +2952,20 @@ impl BorgTerminal {
                 return Ok(UiAction::Quit);
             }
             self.composer.clear();
-            self.notice = Some("Prompt cleared · press Ctrl-C again to exit".to_string());
+            self.notice = Some(format!(
+                "Prompt cleared · press {} again to exit",
+                self.keymap.label(KeyAction::ClearOrExit)
+            ));
             return Ok(UiAction::None);
         }
         self.last_ctrl_c = None;
         if self.pending_approval {
-            return Ok(match key.code {
-                KeyCode::Char('y') => UiAction::Approve(ApprovalDecision::AllowOnce),
-                KeyCode::Char('n') => UiAction::Approve(ApprovalDecision::Deny),
-                KeyCode::Esc => UiAction::Approve(ApprovalDecision::Deny),
-                _ => UiAction::None,
+            return Ok(if self.keymap.matches(KeyAction::Approve, &key) {
+                UiAction::Approve(ApprovalDecision::AllowOnce)
+            } else if self.keymap.matches(KeyAction::Deny, &key) {
+                UiAction::Approve(ApprovalDecision::Deny)
+            } else {
+                UiAction::None
             });
         }
         if deletes_previous_word(&key) {
@@ -2803,31 +2973,33 @@ impl BorgTerminal {
             self.update_slash_notice();
             return Ok(UiAction::None);
         }
+        if self.keymap.matches(KeyAction::Exit, &key) {
+            return Ok(UiAction::Quit);
+        }
+        if self.keymap.matches(KeyAction::AttachImage, &key) {
+            match self.attachment_store.capture_clipboard_image() {
+                Ok(path) => {
+                    let label = self.composer.insert_attachment(path);
+                    self.notice = Some(format!("Attached {label}"));
+                }
+                Err(error) => self.notice = Some(format!("Image paste failed: {error:#}")),
+            }
+            return Ok(UiAction::None);
+        }
+        if self.keymap.matches(KeyAction::Copy, &key) {
+            if let Some(text) = self.transcript.copy_text() {
+                match clipboard::copy(text) {
+                    Ok(lease) => {
+                        self.clipboard_lease = lease;
+                        self.show_copy_notice(self.transcript.copy_notice());
+                    }
+                    Err(error) => self.notice = Some(format!("Copy failed: {error}")),
+                }
+            }
+            return Ok(UiAction::None);
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             return match key.code {
-                KeyCode::Char('d') => Ok(UiAction::Quit),
-                KeyCode::Char('v') => {
-                    match self.attachment_store.capture_clipboard_image() {
-                        Ok(path) => {
-                            let label = self.composer.insert_attachment(path);
-                            self.notice = Some(format!("Attached {label}"));
-                        }
-                        Err(error) => self.notice = Some(format!("Image paste failed: {error:#}")),
-                    }
-                    Ok(UiAction::None)
-                }
-                KeyCode::Char('y') => {
-                    if let Some(text) = self.transcript.copy_text() {
-                        match clipboard::copy(text) {
-                            Ok(lease) => {
-                                self.clipboard_lease = lease;
-                                self.show_copy_notice(self.transcript.copy_notice());
-                            }
-                            Err(error) => self.notice = Some(format!("Copy failed: {error}")),
-                        }
-                    }
-                    Ok(UiAction::None)
-                }
                 KeyCode::Left => {
                     self.composer.move_word_left();
                     Ok(UiAction::None)
@@ -2839,36 +3011,50 @@ impl BorgTerminal {
                 _ => Ok(UiAction::None),
             };
         }
+        if self.keymap.matches(KeyAction::SelectPrevious, &key) {
+            self.transcript.select_previous();
+            self.notice = Some(self.transcript.selection_notice(&self.keymap));
+            return Ok(UiAction::None);
+        }
+        if self.keymap.matches(KeyAction::SelectNext, &key) {
+            self.transcript.select_next();
+            self.notice = Some(self.transcript.selection_notice(&self.keymap));
+            return Ok(UiAction::None);
+        }
+        if self.keymap.matches(KeyAction::Newline, &key) {
+            self.composer.insert("\n");
+            return Ok(UiAction::None);
+        }
+        if self.keymap.matches(KeyAction::Send, &key) {
+            if self.composer.attachments.is_empty()
+                && let Some(command) =
+                    slash_selected_command(&self.composer.text, self.slash_selection)
+            {
+                self.composer.replace_text(command);
+            }
+            let (text, attachments) = self.composer.take();
+            if text.trim().is_empty() && attachments.is_empty() {
+                return Ok(UiAction::None);
+            }
+            self.notice = None;
+            return Ok(UiAction::Submit { text, attachments });
+        }
+        if self.keymap.matches(KeyAction::ScrollUp, &key) {
+            self.scroll_from_bottom = self.scroll_from_bottom.saturating_add(8);
+            return Ok(UiAction::None);
+        }
+        if self.keymap.matches(KeyAction::ScrollDown, &key) {
+            self.scroll_from_bottom = self.scroll_from_bottom.saturating_sub(8);
+            return Ok(UiAction::None);
+        }
+        if self.keymap.matches(KeyAction::Interrupt, &key) {
+            return Ok(if !self.queued_prompts.is_empty() {
+                UiAction::InterruptAndRecallQueued
+            } else {
+                UiAction::Interrupt
+            });
+        }
         match key.code {
-            KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) => {
-                self.transcript.select_previous();
-                self.notice = Some(self.transcript.selection_notice());
-                Ok(UiAction::None)
-            }
-            KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => {
-                self.transcript.select_next();
-                self.notice = Some(self.transcript.selection_notice());
-                Ok(UiAction::None)
-            }
-            KeyCode::Enter if is_composer_newline(&key) => {
-                self.composer.insert("\n");
-                Ok(UiAction::None)
-            }
-            KeyCode::Enter => {
-                if self.composer.attachments.is_empty()
-                    && let Some(command) =
-                        slash_selected_command(&self.composer.text, self.slash_selection)
-                {
-                    self.composer.replace_text(command);
-                }
-                let (text, attachments) = self.composer.take();
-                if text.trim().is_empty() && attachments.is_empty() {
-                    Ok(UiAction::None)
-                } else {
-                    self.notice = None;
-                    Ok(UiAction::Submit { text, attachments })
-                }
-            }
             KeyCode::Char(character) => {
                 self.keybindings_open = false;
                 self.composer.insert(&character.to_string());
@@ -2952,18 +3138,6 @@ impl BorgTerminal {
                 }
                 Ok(UiAction::None)
             }
-            KeyCode::PageUp => {
-                self.scroll_from_bottom = self.scroll_from_bottom.saturating_add(8);
-                Ok(UiAction::None)
-            }
-            KeyCode::PageDown => {
-                self.scroll_from_bottom = self.scroll_from_bottom.saturating_sub(8);
-                Ok(UiAction::None)
-            }
-            KeyCode::Esc if !self.queued_prompts.is_empty() => {
-                Ok(UiAction::InterruptAndRecallQueued)
-            }
-            KeyCode::Esc => Ok(UiAction::Interrupt),
             _ => Ok(UiAction::None),
         }
     }
@@ -2979,6 +3153,7 @@ impl BorgTerminal {
     }
 }
 
+#[cfg(test)]
 fn is_composer_newline(key: &KeyEvent) -> bool {
     key.code == KeyCode::Enter
         && key
@@ -5373,12 +5548,15 @@ impl Transcript {
         });
     }
 
-    fn selection_notice(&self) -> String {
+    fn selection_notice(&self, keymap: &KeyMap) -> String {
         match self.selected {
             Some(index) => format!(
-                "Copy selection {}/{} · Alt+↑/↓ choose · Ctrl+Y copy",
+                "Selection {}/{} · choose {}/{} · copy {}",
                 index + 1,
-                self.order.len()
+                self.order.len(),
+                keymap.label(KeyAction::SelectPrevious),
+                keymap.label(KeyAction::SelectNext),
+                keymap.label(KeyAction::Copy)
             ),
             None => "No transcript entries to select".to_string(),
         }
@@ -5856,10 +6034,12 @@ fn slash_help(matches: &[&(&str, &str)]) -> String {
         .join(" · ")
 }
 
-const KEYBINDINGS_HINT: &str = "? keybindings";
-
-fn primary_controls_line() -> &'static str {
-    "enter send · / commands · ? keybindings"
+fn primary_controls_line(keymap: &KeyMap) -> String {
+    format!(
+        "send {} · commands / · keybindings {}",
+        keymap.label(KeyAction::Send),
+        keymap.label(KeyAction::Keybindings)
+    )
 }
 
 fn inset_control_lines(mut lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
@@ -5869,33 +6049,47 @@ fn inset_control_lines(mut lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
     lines
 }
 
-fn keybinding_lines(width: usize) -> Vec<Line<'static>> {
-    const BINDINGS: [(&str, &str); 12] = [
-        ("enter", "send"),
-        ("shift/alt+enter", "newline"),
-        ("/", "commands"),
-        ("tab", "complete command"),
-        ("esc", "interrupt or close"),
-        ("ctrl+c", "clear · twice exit"),
-        ("ctrl+d", "exit"),
-        ("ctrl+v", "attach image"),
-        ("ctrl+y", "copy selection or last response"),
-        ("page up/down", "scroll transcript"),
-        ("alt+↑/↓", "select transcript entry"),
-        ("shift+drag", "select terminal text"),
+fn keybinding_lines(keymap: &KeyMap, width: usize) -> Vec<Line<'static>> {
+    let bindings = [
+        ("send", keymap.label(KeyAction::Send)),
+        ("newline", keymap.label(KeyAction::Newline)),
+        ("commands", "/".to_string()),
+        ("complete command", "tab".to_string()),
+        ("interrupt or close", keymap.label(KeyAction::Interrupt)),
+        ("clear · twice exit", keymap.label(KeyAction::ClearOrExit)),
+        ("exit", keymap.label(KeyAction::Exit)),
+        ("attach image", keymap.label(KeyAction::AttachImage)),
+        ("copy selection/response", keymap.label(KeyAction::Copy)),
+        (
+            "scroll transcript",
+            format!(
+                "{}/{}",
+                keymap.label(KeyAction::ScrollUp),
+                keymap.label(KeyAction::ScrollDown)
+            ),
+        ),
+        (
+            "select transcript entry",
+            format!(
+                "{}/{}",
+                keymap.label(KeyAction::SelectPrevious),
+                keymap.label(KeyAction::SelectNext)
+            ),
+        ),
+        ("select terminal text", "shift+drag".to_string()),
     ];
-    let binding = |(key, action): (&str, &str)| format!("{key:<16} {action}");
+    let binding = |(action, key): &(&str, String)| format!("{action:<26} {key}");
     let mut lines = Vec::new();
     if width >= 76 {
-        for pair in BINDINGS.chunks(2) {
-            let left = binding(pair[0]);
+        for pair in bindings.chunks(2) {
+            let left = binding(&pair[0]);
             let text = pair.get(1).map_or(left.clone(), |right| {
-                format!(" {left:<36} {}", binding(*right))
+                format!(" {left:<43} {}", binding(right))
             });
             lines.push(Line::from(text));
         }
     } else {
-        for binding_pair in BINDINGS {
+        for binding_pair in &bindings {
             lines.extend(
                 wrap_display(&format!(" {}", binding(binding_pair)), width.max(1))
                     .into_iter()

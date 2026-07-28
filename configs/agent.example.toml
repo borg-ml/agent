@@ -8,3 +8,27 @@
 quick = "/fast on"
 normal = "/fast off"
 deep = "/effort xhigh"
+
+# Actions can have one or more key chords. Supported modifiers are ctrl, alt,
+# and shift. Omitted actions keep their defaults.
+[keybindings]
+send = ["enter"]
+newline = ["shift+enter", "alt+enter"]
+keybindings = ["?"]
+interrupt = ["esc"]
+clear_or_exit = ["ctrl+c"]
+exit = ["ctrl+d"]
+attach_image = ["ctrl+v"]
+copy = ["ctrl+y"]
+scroll_up = ["pageup"]
+scroll_down = ["pagedown"]
+select_previous = ["alt+up"]
+select_next = ["alt+down"]
+approve = ["y"]
+deny = ["n", "esc"]
+
+# Auto approval uses the active model by default. Set a dedicated reviewer to
+# trade model quality, latency, and cost independently from the acting agent.
+[approvals]
+# reviewer_model = "openai/gpt-5-mini"
+# reviewer_effort = "low"

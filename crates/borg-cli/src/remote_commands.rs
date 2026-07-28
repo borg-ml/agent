@@ -7,12 +7,12 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use borg_remote::{
     AgentTurnExecutor, ApprovalDecision, CodingProvider, EventActor, GoalAction, GoalStatus,
-    HostCommand, HostConfig, LaunchSession, LocalAgentTurnExecutor, LocalSessionControlServer,
-    MessageStatus, PermissionMode, PlanItem, PlanItemStatus, PromptDelivery, ResponseLanguage,
-    SessionConfigAction, SessionEvent, SessionEventKind, SessionGoal, SessionStatus, SessionStore,
-    SessionWriterLease, SqliteSessionStore, TodoAction, default_host_config_path, enroll_host,
-    login_provider, mirror_local_session, probe_capabilities,
-    run_agent_session_with_store_and_writer, run_attached_session, run_host,
+    HostCommand, HostConfig, LaunchSession, LocalAgentSettings, LocalAgentTurnExecutor,
+    LocalSessionControlServer, MessageStatus, PermissionMode, PlanItem, PlanItemStatus,
+    PromptDelivery, ResponseLanguage, SessionConfigAction, SessionEvent, SessionEventKind,
+    SessionGoal, SessionStatus, SessionStore, SessionWriterLease, SqliteSessionStore, TodoAction,
+    default_host_config_path, enroll_host, login_provider, mirror_local_session,
+    probe_capabilities, run_agent_session_with_store_and_writer, run_attached_session, run_host,
     session_control_socket_path,
 };
 use chrono::{Local, Utc};
@@ -420,21 +420,28 @@ async fn run_local_agent_session(
         "recorded project directory no longer exists: {}; pass --cwd to resume the session in its new location",
         cwd.display()
     );
+    let local_settings = LocalAgentSettings {
+        approval_reviewer_model: agent_config.approvals.reviewer_model.clone(),
+        approval_reviewer_effort: agent_config.approvals.reviewer_effort.clone(),
+    };
     let local_executor = if provider == CodingProvider::Kimi && host_config_path.is_file() {
         let config: HostConfig = serde_json::from_slice(
             &fs::read(&host_config_path)
                 .with_context(|| format!("failed to read {}", host_config_path.display()))?,
         )
         .with_context(|| format!("invalid host config {}", host_config_path.display()))?;
-        LocalAgentTurnExecutor::with_model_gateway(borg_provider::provider::ModelGateway {
-            endpoint: format!(
-                "{}/api/remote/host/kimi/chat/completions",
-                config.server.trim_end_matches('/')
-            ),
-            bearer_token: config.host_token,
-        })
+        LocalAgentTurnExecutor::with_model_gateway_and_settings(
+            borg_provider::provider::ModelGateway {
+                endpoint: format!(
+                    "{}/api/remote/host/kimi/chat/completions",
+                    config.server.trim_end_matches('/')
+                ),
+                bearer_token: config.host_token,
+            },
+            local_settings,
+        )
     } else {
-        LocalAgentTurnExecutor::default()
+        LocalAgentTurnExecutor::with_settings(local_settings)
     };
     local_executor.prewarm(provider);
     let executor: Arc<dyn AgentTurnExecutor> = Arc::new(local_executor);
@@ -606,7 +613,12 @@ async fn run_local_agent_session(
     let mut shutdown_signals =
         ShutdownSignals::new().context("failed to install process shutdown handlers")?;
     let mut terminal = if can_prompt && !args.json {
-        match BorgTerminal::enter(&sessions_dir, session_id, cwd.clone()) {
+        match BorgTerminal::enter(
+            &sessions_dir,
+            session_id,
+            cwd.clone(),
+            &agent_config.keybindings,
+        ) {
             Ok(terminal) => Some(terminal),
             Err(error) => {
                 eprintln!("  Rich terminal unavailable ({error}); using line input.");
@@ -1890,6 +1902,7 @@ async fn run_local_agent_session(
                                             &sessions_dir,
                                             session_id,
                                             cwd.clone(),
+                                            &agent_config.keybindings,
                                         )?;
                                         restored.seed_history(&latest);
                                         restored.seed_session_state(&latest_state);
@@ -1924,6 +1937,7 @@ async fn run_local_agent_session(
                                             &sessions_dir,
                                             session_id,
                                             cwd.clone(),
+                                            &agent_config.keybindings,
                                         )?;
                                         restored.seed_history(&latest);
                                         restored.seed_session_state(&latest_state);
