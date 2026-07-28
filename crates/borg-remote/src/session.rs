@@ -231,6 +231,7 @@ pub async fn run_agent_session_with_executor(
 /// Local callers must hold their per-session writer lease for the duration of
 /// this future. The store owns event sequencing and transactions; the actor
 /// owns all session workflow semantics.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_agent_session_with_store_and_writer(
     session_root: &Path,
     session_id: Uuid,
@@ -3101,20 +3102,10 @@ mod tests {
             .await
             .unwrap();
         called.notified().await;
-        command_tx
-            .send(HostCommand::Stop { session_id })
-            .await
-            .unwrap();
-        drop(command_tx);
-        actor.await.unwrap().unwrap();
-
-        assert_eq!(
-            seen.lock().unwrap().as_slice(),
-            [(root.path().join("managed-workspace"), Some(output_schema))]
-        );
         let mut observed_managed_response = false;
         let mut observed_turn_completion = false;
-        while let Some(event) = event_rx.recv().await {
+        while !observed_turn_completion {
+            let event = event_rx.recv().await.expect("session event");
             if matches!(
                 &event.kind,
                 SessionEventKind::Message {
@@ -3137,6 +3128,29 @@ mod tests {
                     && final_text == "managed executor response"
             ) {
                 observed_turn_completion = true;
+            }
+        }
+        command_tx
+            .send(HostCommand::Stop { session_id })
+            .await
+            .unwrap();
+        drop(command_tx);
+        actor.await.unwrap().unwrap();
+
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            [(root.path().join("managed-workspace"), Some(output_schema))]
+        );
+        while let Some(event) = event_rx.recv().await {
+            if matches!(
+                &event.kind,
+                SessionEventKind::Message {
+                    actor: EventActor::Assistant,
+                    text,
+                    ..
+                } if text == "managed executor response"
+            ) {
+                observed_managed_response = true;
             }
         }
         assert!(observed_managed_response);

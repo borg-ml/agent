@@ -2,8 +2,10 @@ use super::*;
 
 #[test]
 fn keybinding_help_is_action_first_and_uses_configuration() {
-    let mut config = crate::agent_config::KeybindingConfig::default();
-    config.send = vec!["ctrl+s".to_string()];
+    let config = crate::agent_config::KeybindingConfig {
+        send: vec!["ctrl+s".to_string()],
+        ..Default::default()
+    };
     let keymap = KeyMap::from_config(&config).expect("keymap");
     assert_eq!(
         primary_controls_line(&keymap),

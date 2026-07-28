@@ -294,9 +294,11 @@ impl OpenAiCompatibleProvider {
                         progress.as_ref(),
                         profile,
                         &self.model,
-                        attempt,
-                        max_attempts,
-                        delay,
+                        CompatibleRetryAttempt {
+                            attempt,
+                            max_attempts,
+                            delay,
+                        },
                         "http_status",
                         Some(response.status().as_u16()),
                     );
@@ -309,9 +311,11 @@ impl OpenAiCompatibleProvider {
                         progress.as_ref(),
                         profile,
                         &self.model,
-                        attempt,
-                        max_attempts,
-                        delay,
+                        CompatibleRetryAttempt {
+                            attempt,
+                            max_attempts,
+                            delay,
+                        },
                         "connect",
                         None,
                     );
@@ -844,13 +848,18 @@ fn kimi_retryable_status(status: reqwest::StatusCode) -> bool {
     status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
 }
 
+#[derive(Clone, Copy)]
+struct CompatibleRetryAttempt {
+    attempt: u32,
+    max_attempts: u32,
+    delay: Duration,
+}
+
 fn emit_compatible_retry_event(
     progress: Option<&UnboundedSender<ProviderProgress>>,
     profile: OpenAiCompatibleProfile,
     model: &str,
-    attempt: u32,
-    max_attempts: u32,
-    delay: Duration,
+    retry: CompatibleRetryAttempt,
     reason: &str,
     status: Option<u16>,
 ) {
@@ -863,9 +872,9 @@ fn emit_compatible_retry_event(
             "provider": profile.label(),
             "reason": reason,
             "status": status,
-            "attempt": attempt,
-            "max_attempts": max_attempts,
-            "delay_ms": delay.as_millis().min(u128::from(u64::MAX)) as u64,
+            "attempt": retry.attempt,
+            "max_attempts": retry.max_attempts,
+            "delay_ms": retry.delay.as_millis().min(u128::from(u64::MAX)) as u64,
         }),
         raw_payload: None,
         stream_channel: None,
@@ -1075,9 +1084,11 @@ mod tests {
             Some(&sender),
             OpenAiCompatibleProfile::Kimi,
             "kimi-k3",
-            1,
-            3,
-            Duration::from_millis(750),
+            CompatibleRetryAttempt {
+                attempt: 1,
+                max_attempts: 3,
+                delay: Duration::from_millis(750),
+            },
             "http_status",
             Some(429),
         );

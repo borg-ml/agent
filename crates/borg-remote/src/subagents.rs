@@ -917,6 +917,7 @@ impl SubagentCoordinator {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn boxed_agent_store_session(
     session_root: PathBuf,
     session_id: Uuid,

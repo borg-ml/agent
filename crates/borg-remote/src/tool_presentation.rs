@@ -737,12 +737,7 @@ fn coverage_summary(value: &str) -> Option<String> {
     let rest = marker[matched + "matched:".len()..].trim_start();
     let (found, rest) = rest.split_once('/')?;
     let found = found.trim().parse::<usize>().ok()?;
-    let total = rest
-        .trim_start()
-        .split_whitespace()
-        .next()?
-        .parse::<usize>()
-        .ok()?;
+    let total = rest.split_whitespace().next()?.parse::<usize>().ok()?;
     Some(format!("{found}/{total} files covered"))
 }
 

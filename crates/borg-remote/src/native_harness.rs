@@ -161,7 +161,7 @@ impl NativeHarness {
                 )
                 .await?
             {
-                NativeModelOutcome::Completed(result) => result,
+                NativeModelOutcome::Completed(result) => *result,
                 NativeModelOutcome::Steered(steer) => {
                     let message =
                         native_user_message(&turn.cwd, &steer.text, &steer.attachments).await?;
@@ -465,7 +465,7 @@ struct NativeSteer {
 }
 
 enum NativeModelOutcome {
-    Completed(ModelTurnResult),
+    Completed(Box<ModelTurnResult>),
     Steered(NativeSteer),
 }
 
@@ -807,6 +807,7 @@ async fn call_model_streaming(
                     .await;
                 }
                 return result
+                    .map(Box::new)
                     .map(NativeModelOutcome::Completed)
                     .map_err(|error| anyhow::anyhow!(error.message));
             }
@@ -895,6 +896,7 @@ fn live_text_interval(bytes: usize) -> Duration {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_tool(
     harness: &NativeHarness,
     runtime: &NativeToolRuntime,

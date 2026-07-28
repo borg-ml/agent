@@ -89,6 +89,7 @@ impl Default for ProcessManager {
 }
 
 impl ProcessManager {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn exec(
         &self,
         owner_session_id: Uuid,

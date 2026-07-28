@@ -217,9 +217,7 @@ impl KeyMap {
 
 fn key_codes_match(left: KeyCode, right: KeyCode) -> bool {
     match (left, right) {
-        (KeyCode::Char(left), KeyCode::Char(right)) => {
-            left.to_ascii_lowercase() == right.to_ascii_lowercase()
-        }
+        (KeyCode::Char(left), KeyCode::Char(right)) => left.eq_ignore_ascii_case(&right),
         _ => left == right,
     }
 }
@@ -5938,8 +5936,7 @@ fn selected_transcript_text(lines: &[Line<'static>], selection: TextSelection) -
     }
     let last_row = end.row.min(lines.len().saturating_sub(1));
     let mut selected = Vec::new();
-    for row in start.row..=last_row {
-        let line = &lines[row];
+    for (row, line) in lines.iter().enumerate().take(last_row + 1).skip(start.row) {
         let line_width = line
             .spans
             .iter()
