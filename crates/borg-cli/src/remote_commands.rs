@@ -530,7 +530,7 @@ async fn run_local_agent_session(
             )
             .await
             {
-                eprintln!("\n  Remote mirror stopped: {error:#}");
+                tracing::warn!(%error, "remote mirror stopped");
             }
         }));
     }
@@ -1890,7 +1890,7 @@ async fn run_local_agent_session(
                                                 )
                                                 .await
                                                 {
-                                                    eprintln!("\n  Remote mirror stopped: {error:#}");
+                                                    tracing::warn!(%error, "remote mirror stopped");
                                                 }
                                             }));
                                             remote_open = true;

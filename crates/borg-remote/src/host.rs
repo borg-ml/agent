@@ -483,10 +483,23 @@ pub async fn mirror_local_session(
             Ok(response) if response.status() == StatusCode::UNAUTHORIZED => {
                 bail!("remote host token was rejected; enroll this host again");
             }
-            Ok(response) => tracing::warn!(
-                status = %response.status(),
-                "local session registration failed; retrying"
-            ),
+            Ok(response)
+                if response.status().is_server_error()
+                    || response.status() == StatusCode::TOO_MANY_REQUESTS =>
+            {
+                tracing::warn!(
+                    status = %response.status(),
+                    "local session registration failed; retrying"
+                );
+            }
+            Ok(response) => {
+                let status = response.status();
+                let detail = response.text().await.unwrap_or_default().trim().to_string();
+                if detail.is_empty() {
+                    bail!("remote session registration was rejected ({status})");
+                }
+                bail!("remote session registration was rejected ({status}): {detail}");
+            }
             Err(error) => {
                 tracing::warn!(%error, "local session registration failed; retrying");
             }
