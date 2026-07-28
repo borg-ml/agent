@@ -378,6 +378,10 @@ impl NativeHarness {
         bail!("native provider exceeded the harness limit of {MAX_TOOL_ROUNDS} tool rounds")
     }
 
+    pub(crate) async fn stop_session(&self, session_id: Uuid) {
+        self.process_manager.terminate_session(session_id).await;
+    }
+
     pub(crate) async fn compact(
         &self,
         provider: crate::CodingProvider,

@@ -258,6 +258,32 @@ impl ProcessManager {
         }
         Ok(entry)
     }
+
+    pub(crate) async fn terminate_session(&self, owner_session_id: Uuid) {
+        let entries = {
+            let mut processes = self
+                .inner
+                .processes
+                .lock()
+                .expect("native process registry lock poisoned");
+            let ids = processes
+                .iter()
+                .filter_map(|(id, entry)| (entry.session_id == owner_session_id).then_some(*id))
+                .collect::<Vec<_>>();
+            ids.into_iter()
+                .filter_map(|id| processes.remove(&id))
+                .collect::<Vec<_>>()
+        };
+        futures::future::join_all(
+            entries
+                .iter()
+                .map(|entry| terminate_process_tree(entry.pid)),
+        )
+        .await;
+        for entry in entries {
+            entry.stdin.lock().await.take();
+        }
+    }
 }
 
 impl Drop for ProcessManagerInner {
@@ -555,5 +581,28 @@ mod tests {
             completed.stdout.contains("got:hello"),
             "unexpected process result: {completed:?}"
         );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stopping_a_session_reaps_its_background_processes() {
+        let root = tempfile::tempdir().expect("workspace");
+        let manager = ProcessManager::default();
+        let owner = Uuid::new_v4();
+        let process = manager
+            .exec(
+                owner,
+                root.path(),
+                "sleep 30".to_string(),
+                None,
+                Some(1),
+                Some(100),
+                60_000,
+            )
+            .await
+            .expect("spawn");
+        assert!(process.running);
+        manager.terminate_session(owner).await;
+        assert!(manager.entry(owner, process.session_id).is_err());
     }
 }

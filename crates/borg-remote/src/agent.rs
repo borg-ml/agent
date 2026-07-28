@@ -121,6 +121,10 @@ pub trait AgentTurnExecutor: Send + Sync {
     ) -> Result<AgentCompaction> {
         anyhow::bail!("native context compaction is not supported by this provider")
     }
+
+    async fn stop_session(&self, _session_id: Uuid) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Direct provider execution used by the CLI and enrolled hosts.
@@ -214,6 +218,11 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
             .compact(provider, model, effort, conversation)
             .await?;
         Ok(AgentCompaction { summary, usage })
+    }
+
+    async fn stop_session(&self, session_id: Uuid) -> Result<()> {
+        self.native_harness.stop_session(session_id).await;
+        Ok(())
     }
 }
 

@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashSet};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -267,7 +268,7 @@ impl OpenAiCompatibleProvider {
             }
         }
 
-        let client = reqwest::Client::new();
+        let client = compatible_http_client();
         let max_attempts = 3;
         let mut attempt = 0_u32;
         let response = loop {
@@ -593,6 +594,11 @@ impl OpenAiCompatibleProvider {
     fn is_kimi(&self) -> bool {
         self.model == crate::kimi_product_model()
     }
+}
+
+fn compatible_http_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(reqwest::Client::new)
 }
 
 fn model_message_wire_value(message: &ModelMessage) -> Value {

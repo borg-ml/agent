@@ -678,6 +678,7 @@ async fn run_agent_session_store_kernel(
                             &mut goal_active_since,
                         )
                         .await?;
+                        executor.stop_session(session_id).await?;
                         break None;
                     }
                     Some(_) => continue,
@@ -1335,6 +1336,7 @@ async fn run_agent_session_store_kernel(
                             ).await?;
                             running.abort();
                             let _ = (&mut running).await;
+                            executor.stop_session(session_id).await?;
                             deny_pending_approval(
                                 &mut journal,
                                 &events,
