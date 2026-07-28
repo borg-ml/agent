@@ -3038,7 +3038,7 @@ mod tests {
             let turns = turns.lock().unwrap();
             assert_eq!(turns.len(), 2);
             assert_eq!(turns[0].0, "first");
-            assert!(turns[1].0.ends_with("\n\nfollowup"));
+            assert_eq!(turns[1].0, "followup");
         }
 
         let mut transitions = Vec::new();
