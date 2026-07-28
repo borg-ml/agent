@@ -1399,12 +1399,20 @@ async fn run_agent_session_store_kernel(
         )
         .await?;
         if interrupted {
-            provider_session_id = None;
-            retained_context = if launch.provider.uses_native_harness() {
-                None
-            } else {
-                retained_conversation_context(journal.context_events())
-            };
+            // Codex interruption is scoped to the active turn. The app-server
+            // returns the same durable thread id after `turn/interrupt`, so
+            // discarding it here silently forks the conversation, loses the
+            // provider cache, and replaces native thread history with Borg's
+            // lossy retained-context projection. Only providers whose stream
+            // is aborted without a resumable turn contract need that fallback.
+            if launch.provider != CodingProvider::Codex {
+                provider_session_id = None;
+                retained_context = if launch.provider.uses_native_harness() {
+                    None
+                } else {
+                    retained_conversation_context(journal.context_events())
+                };
+            }
             continue;
         }
     }
@@ -2507,6 +2515,7 @@ mod tests {
 
     struct InterruptibleQueueExecutor {
         seen: RecordedPromptTurns,
+        provider_sessions: Arc<Mutex<Vec<Option<String>>>>,
         called: Arc<Notify>,
     }
 
@@ -2541,6 +2550,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((turn.prompt.clone(), turn.attachments.clone()));
+            self.provider_sessions
+                .lock()
+                .unwrap()
+                .push(turn.provider_session_id.clone());
             self.called.notify_one();
             if turn.prompt == "first" {
                 let mut controls = controls.expect("active turn has controls");
@@ -2769,9 +2782,11 @@ mod tests {
         let (command_tx, command_rx) = mpsc::channel(8);
         let (event_tx, _event_rx) = mpsc::channel(32);
         let seen = Arc::new(Mutex::new(Vec::new()));
+        let provider_sessions = Arc::new(Mutex::new(Vec::new()));
         let called = Arc::new(Notify::new());
         let executor = Arc::new(InterruptibleQueueExecutor {
             seen: Arc::clone(&seen),
+            provider_sessions: Arc::clone(&provider_sessions),
             called: Arc::clone(&called),
         });
         let actor = tokio::spawn(async move {
@@ -2836,15 +2851,16 @@ mod tests {
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 2);
         assert_eq!(seen[0], ("first".to_string(), Vec::new()));
-        assert!(
-            seen[1].0.ends_with("\n\nsecond [Image 1]"),
-            "second turn: {}",
-            seen[1].0
-        );
+        assert_eq!(seen[1].0, "second [Image 1]");
         assert_eq!(
             seen[1].1,
             [PathBuf::from("/tmp/queued-image.png")],
             "queued image attachments must stay on their FIFO prompt"
+        );
+        assert_eq!(
+            provider_sessions.lock().unwrap().as_slice(),
+            [None, Some("provider-session".to_string())],
+            "interrupting a Codex turn must preserve its provider thread"
         );
     }
 
