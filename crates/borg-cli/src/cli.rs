@@ -9,7 +9,14 @@ use uuid::Uuid;
 #[command(version)]
 pub(crate) struct Cli {
     #[command(subcommand)]
-    pub(crate) command: Command,
+    pub(crate) command: Option<Command>,
+}
+
+impl Cli {
+    pub(crate) fn command_or_agent(self) -> Command {
+        self.command
+            .unwrap_or_else(|| Command::Agent(LocalAgentCliArgs::interactive()))
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -67,6 +74,23 @@ pub(crate) struct LocalAgentCliArgs {
 }
 
 impl LocalAgentCliArgs {
+    fn interactive() -> Self {
+        Self {
+            prompt: Vec::new(),
+            cwd: None,
+            provider: RemoteProviderArg::Codex,
+            model: None,
+            effort: None,
+            fast: false,
+            config: None,
+            permission: RemotePermissionArg::FullAccess,
+            json: false,
+            resume: None,
+            continue_latest: false,
+            local_only: false,
+        }
+    }
+
     pub(crate) fn resume(session: Option<Uuid>) -> Self {
         Self {
             prompt: Vec::new(),
@@ -82,6 +106,25 @@ impl LocalAgentCliArgs {
             continue_latest: session.is_none(),
             local_only: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_subcommand_launches_the_interactive_agent() {
+        let command = Cli::try_parse_from(["borg"])
+            .expect("plain borg command parses")
+            .command_or_agent();
+
+        let Command::Agent(args) = command else {
+            panic!("plain borg must launch the agent");
+        };
+        assert!(args.prompt.is_empty());
+        assert!(!args.continue_latest);
+        assert!(args.resume.is_none());
     }
 }
 

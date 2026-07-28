@@ -22,7 +22,7 @@ async fn main() -> Result<()> {
         )
         .with_writer(std::io::stderr)
         .init();
-    match Cli::parse().command {
+    match Cli::parse().command_or_agent() {
         Command::Agent(args) => run_local_agent(args).await,
         Command::Resume { session } => run_local_agent(LocalAgentCliArgs::resume(session)).await,
         Command::Remote { command } => run_remote_command(command).await,
