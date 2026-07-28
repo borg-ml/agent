@@ -18,6 +18,8 @@ pub enum ModelMessage {
     },
     User {
         content: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<ModelInputAttachment>,
     },
     Assistant {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -36,6 +38,33 @@ pub enum ModelMessage {
         tool_call_id: String,
         content: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelInputAttachment {
+    pub media_type: String,
+    pub data_base64: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filename: Option<String>,
+}
+
+impl ModelMessage {
+    pub fn user(content: impl Into<String>) -> Self {
+        Self::User {
+            content: content.into(),
+            attachments: Vec::new(),
+        }
+    }
+
+    pub fn user_with_attachments(
+        content: impl Into<String>,
+        attachments: Vec<ModelInputAttachment>,
+    ) -> Self {
+        Self::User {
+            content: content.into(),
+            attachments,
+        }
+    }
 }
 
 impl ModelMessage {
@@ -173,5 +202,18 @@ impl ModelTurnResult {
             } => Some((content, reasoning_content, tool_calls)),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_text_only_user_messages_remain_replayable() {
+        let message: ModelMessage =
+            serde_json::from_value(json!({"role": "user", "content": "hello"}))
+                .expect("legacy message");
+        assert_eq!(message, ModelMessage::user("hello"));
     }
 }

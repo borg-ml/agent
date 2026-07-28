@@ -185,9 +185,14 @@ impl OpenAiCompatibleProvider {
             });
         }
         let request_id = request.request_id.clone();
+        let wire_messages = request
+            .messages
+            .iter()
+            .map(model_message_wire_value)
+            .collect::<Vec<_>>();
         let mut body = json!({
             "model": self.model,
-            "messages": request.messages,
+            "messages": wire_messages,
             "stream": true,
             "stream_options": { "include_usage": true },
         });
@@ -389,9 +394,7 @@ impl OpenAiCompatibleProvider {
                     content: self.system_prompt.to_string(),
                 });
             }
-            messages.push(ModelMessage::User {
-                content: prompt.to_string(),
-            });
+            messages.push(ModelMessage::user(prompt));
             let result = self
                 .model_turn(
                     ModelTurnRequest {
@@ -589,6 +592,30 @@ impl OpenAiCompatibleProvider {
     }
     fn is_kimi(&self) -> bool {
         self.model == crate::kimi_product_model()
+    }
+}
+
+fn model_message_wire_value(message: &ModelMessage) -> Value {
+    match message {
+        ModelMessage::User {
+            content,
+            attachments,
+        } if !attachments.is_empty() => {
+            let mut blocks = vec![json!({ "type": "text", "text": content })];
+            blocks.extend(attachments.iter().map(|attachment| {
+                json!({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": format!(
+                            "data:{};base64,{}",
+                            attachment.media_type, attachment.data_base64
+                        )
+                    }
+                })
+            }));
+            json!({ "role": "user", "content": blocks })
+        }
+        _ => serde_json::to_value(message).expect("model messages are serializable"),
     }
 }
 
@@ -980,6 +1007,25 @@ fn merge_object(target: &mut Value, extra: Map<String, Value>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_images_use_chat_completions_multimodal_blocks() {
+        let message = ModelMessage::user_with_attachments(
+            "inspect",
+            vec![super::super::ModelInputAttachment {
+                media_type: "image/png".to_string(),
+                data_base64: "aW1hZ2U=".to_string(),
+                filename: Some("screen.png".to_string()),
+            }],
+        );
+        let wire = model_message_wire_value(&message);
+        assert_eq!(wire["content"][0]["type"], "text");
+        assert_eq!(wire["content"][1]["type"], "image_url");
+        assert_eq!(
+            wire["content"][1]["image_url"]["url"],
+            "data:image/png;base64,aW1hZ2U="
+        );
+    }
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]

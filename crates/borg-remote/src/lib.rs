@@ -14,6 +14,7 @@ mod host;
 mod journal;
 mod local_control;
 mod lsp;
+mod native_context;
 mod native_harness;
 mod native_io;
 mod native_mcp;

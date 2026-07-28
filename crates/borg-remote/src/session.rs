@@ -1441,9 +1441,9 @@ fn native_conversation(
                 pending.clear();
                 conversation.clear();
                 if let Some(summary) = payload.get("summary").and_then(Value::as_str) {
-                    conversation.push(borg_provider::provider::ModelMessage::User {
-                        content: format!("Previous conversation summary:\n\n{summary}"),
-                    });
+                    conversation.push(borg_provider::provider::ModelMessage::user(format!(
+                        "Previous conversation summary:\n\n{summary}"
+                    )));
                 }
             }
             SessionEventKind::ProviderEvent {
@@ -3705,12 +3705,7 @@ mod tests {
             )
         };
         let events = vec![
-            native(
-                1,
-                ModelMessage::User {
-                    content: "inspect".to_string(),
-                },
-            ),
+            native(1, ModelMessage::user("inspect")),
             native(
                 2,
                 ModelMessage::assistant(
@@ -3783,10 +3778,7 @@ mod tests {
                 SessionEventKind::ProviderEvent {
                     provider: CodingProvider::OpenRouter,
                     kind: "native_model_message".to_string(),
-                    payload: serde_json::to_value(ModelMessage::User {
-                        content: content.to_string(),
-                    })
-                    .unwrap(),
+                    payload: serde_json::to_value(ModelMessage::user(content)).unwrap(),
                 },
             )
         };
@@ -3828,16 +3820,9 @@ mod tests {
         assert_eq!(replay.len(), 2);
         assert_eq!(
             replay[0],
-            ModelMessage::User {
-                content: "Previous conversation summary:\n\nkept decisions".to_string()
-            }
+            ModelMessage::user("Previous conversation summary:\n\nkept decisions")
         );
-        assert_eq!(
-            replay[1],
-            ModelMessage::User {
-                content: "new context".to_string()
-            }
-        );
+        assert_eq!(replay[1], ModelMessage::user("new context"));
     }
 
     #[tokio::test]

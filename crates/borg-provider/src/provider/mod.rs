@@ -14,8 +14,8 @@ pub use chat_stream::{
 };
 pub use codex_app_server::{CodexAppServerClient, CodexWeeklyUsage, TokenUsage};
 pub use model_turn::{
-    ModelFunctionCall, ModelMessage, ModelToolCall, ModelToolDefinition, ModelTurnRequest,
-    ModelTurnResult,
+    ModelFunctionCall, ModelInputAttachment, ModelMessage, ModelToolCall, ModelToolDefinition,
+    ModelTurnRequest, ModelTurnResult,
 };
 pub use openai_compatible::{
     ModelGateway, OpenAiCompatibleProfile, OpenAiCompatibleProvider, kimi_cost_microusd,
