@@ -7,8 +7,8 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use borg_provider::provider::{
     ModelGateway, ModelMessage, ModelToolCall, ModelToolDefinition, ModelTurnRequest,
-    ModelTurnResult, OpenAiCompatibleProvider, ProviderCallError, ProviderProgress,
-    ProviderProgressStream,
+    ModelTurnResult, OpenAiCompatibleProfile, OpenAiCompatibleProvider, ProviderAttemptTrace,
+    ProviderCallError, ProviderInvocation, ProviderProgress, ProviderProgressStream,
 };
 use borg_provider::{CostBasis, ProviderCallUsage};
 use serde::Deserialize;
@@ -53,7 +53,7 @@ impl Default for NativeHarness {
     fn default() -> Self {
         Self {
             full_access_sessions: Arc::default(),
-            model_client: Arc::new(KimiModelClient::default()),
+            model_client: Arc::new(CompatibleModelClient::default()),
         }
     }
 }
@@ -61,7 +61,7 @@ impl Default for NativeHarness {
 impl NativeHarness {
     pub(crate) fn with_model_gateway(model_gateway: ModelGateway) -> Self {
         Self {
-            model_client: Arc::new(KimiModelClient {
+            model_client: Arc::new(CompatibleModelClient {
                 gateway: Some(model_gateway),
             }),
             ..Self::default()
@@ -86,12 +86,14 @@ impl NativeHarness {
         let model = turn
             .model
             .clone()
-            .unwrap_or_else(|| borg_provider::kimi_product_model().to_string());
-        anyhow::ensure!(
-            model == borg_provider::kimi_product_model(),
-            "native Kimi sessions require model `{}`",
-            borg_provider::kimi_product_model()
-        );
+            .context("native provider sessions require an explicit model")?;
+        if turn.provider == crate::CodingProvider::Kimi {
+            anyhow::ensure!(
+                model == borg_provider::kimi_product_model(),
+                "native Kimi sessions require model `{}`",
+                borg_provider::kimi_product_model()
+            );
+        }
         let runtime = NativeToolRuntime::start(
             turn.session_id,
             turn.cwd.clone(),
@@ -114,18 +116,22 @@ impl NativeHarness {
         let user_message = ModelMessage::User {
             content: prompt_with_attachments(&turn.cwd, &turn.prompt, &turn.attachments),
         };
-        record_native_message(&events, &user_message).await?;
+        record_native_message(&events, turn.provider, &user_message).await?;
         messages.push(user_message);
 
         let mut usage = ProviderCallUsage::default();
         let mut assistant_message_id = Uuid::new_v4();
-        for round in 0..MAX_TOOL_ROUNDS {
-            let result = self
+        let mut model_round = 0_usize;
+        let mut tool_round = 0_usize;
+        while model_round < MAX_TOOL_ROUNDS {
+            model_round += 1;
+            let result = match self
                 .call_model(
+                    turn.provider,
                     &model,
                     turn.effort.as_deref(),
                     ModelTurnRequest {
-                        request_id: Some(format!("{}:{round}", turn.message_id)),
+                        request_id: Some(format!("{}:{model_round}", turn.message_id)),
                         messages: messages.clone(),
                         tools: tools.clone(),
                         output_schema: turn.output_schema.clone(),
@@ -137,32 +143,58 @@ impl NativeHarness {
                         controls: &mut controls,
                     },
                 )
-                .await?;
+                .await?
+            {
+                NativeModelOutcome::Completed(result) => result,
+                NativeModelOutcome::Steered(steer) => {
+                    let message = ModelMessage::User {
+                        content: prompt_with_attachments(
+                            &turn.cwd,
+                            &steer.text,
+                            &steer.attachments,
+                        ),
+                    };
+                    record_native_message(&events, turn.provider, &message).await?;
+                    messages.push(message);
+                    assistant_message_id = Uuid::new_v4();
+                    send(
+                        &events,
+                        SessionEventKind::ProviderEvent {
+                            provider: turn.provider,
+                            kind: "native_steer_applied".to_string(),
+                            payload: json!({ "model_round": model_round }),
+                        },
+                    )
+                    .await;
+                    continue;
+                }
+            };
             absorb_usage(&mut usage, &result.usage);
             let ModelMessage::Assistant {
                 content,
                 reasoning_content: _,
+                reasoning_details: _,
                 tool_calls,
             } = &result.message
             else {
                 bail!("native provider returned a non-assistant model turn")
             };
-            record_native_message(&events, &result.message).await?;
+            record_native_message(&events, turn.provider, &result.message).await?;
             messages.push(result.message.clone());
 
             if result.finish_reason == "length" {
-                bail!("Kimi response was truncated at the completion-token limit");
+                bail!("native provider response was truncated at the completion-token limit");
             }
             if tool_calls.is_empty() {
                 if result.finish_reason != "stop" {
                     bail!(
-                        "Kimi ended the native turn with unexpected finish reason `{}`",
+                        "native provider ended the turn with unexpected finish reason `{}`",
                         result.finish_reason
                     );
                 }
                 let final_text = content.clone().unwrap_or_default();
                 if final_text.trim().is_empty() {
-                    bail!("Kimi ended the native turn without a final response");
+                    bail!("native provider ended the turn without a final response");
                 }
                 send(
                     &events,
@@ -192,7 +224,7 @@ impl NativeHarness {
             }
             if result.finish_reason != "tool_calls" {
                 bail!(
-                    "Kimi returned tool calls with inconsistent finish reason `{}`",
+                    "native provider returned tool calls with inconsistent finish reason `{}`",
                     result.finish_reason
                 );
             }
@@ -212,6 +244,7 @@ impl NativeHarness {
             }
             assistant_message_id = Uuid::new_v4();
 
+            let mut pending_steer = None;
             for tool_call in tool_calls {
                 let input = parse_tool_arguments(tool_call);
                 send(
@@ -229,13 +262,14 @@ impl NativeHarness {
                     },
                 )
                 .await;
-                let (output, is_error) = match input {
+                let (output, is_error, steer) = match input {
                     Ok(input) => {
                         execute_tool(self, &runtime, tool_call, input, &events, &mut controls)
                             .await?
                     }
-                    Err(error) => (json!({ "error": error }).to_string(), true),
+                    Err(error) => (json!({ "error": error }).to_string(), true, None),
                 };
+                pending_steer = pending_steer.or(steer);
                 let output = bounded_tool_content(output);
                 send(
                     &events,
@@ -253,21 +287,88 @@ impl NativeHarness {
                     tool_call_id: tool_call.id.clone(),
                     content: output,
                 };
-                record_native_message(&events, &tool_message).await?;
+                record_native_message(&events, turn.provider, &tool_message).await?;
                 messages.push(tool_message);
             }
 
+            if let Some(steer) = pending_steer {
+                let message = ModelMessage::User {
+                    content: prompt_with_attachments(&turn.cwd, &steer.text, &steer.attachments),
+                };
+                record_native_message(&events, turn.provider, &message).await?;
+                messages.push(message);
+            }
+            tool_round += 1;
             send(
                 &events,
                 SessionEventKind::ProviderEvent {
                     provider: turn.provider,
                     kind: "native_tool_round_completed".to_string(),
-                    payload: json!({ "round": round + 1 }),
+                    payload: json!({ "round": tool_round }),
                 },
             )
             .await;
         }
-        bail!("Kimi exceeded the native harness limit of {MAX_TOOL_ROUNDS} tool rounds")
+        bail!("native provider exceeded the harness limit of {MAX_TOOL_ROUNDS} tool rounds")
+    }
+
+    pub(crate) async fn compact(
+        &self,
+        provider: crate::CodingProvider,
+        model: &str,
+        effort: Option<&str>,
+        conversation: Vec<ModelMessage>,
+    ) -> Result<(String, ProviderCallUsage)> {
+        anyhow::ensure!(
+            provider.uses_native_harness(),
+            "{provider:?} does not use Borg's native harness"
+        );
+        anyhow::ensure!(
+            !conversation.is_empty(),
+            "there is no native conversation to compact yet"
+        );
+        let mut messages = Vec::with_capacity(conversation.len().saturating_add(2));
+        messages.push(ModelMessage::System {
+            content: "Summarize the conversation for another coding agent that will continue the work. Preserve user requirements, decisions, files changed, commands and tests run, unresolved errors, approvals, and next steps. Be compact but do not omit details needed to continue safely. Return only the summary.".to_string(),
+        });
+        messages.extend(conversation);
+        messages.push(ModelMessage::User {
+            content: "Create the continuation summary now.".to_string(),
+        });
+        let result = self
+            .model_client
+            .model_turn(
+                provider,
+                model,
+                effort,
+                ModelTurnRequest {
+                    request_id: Some(format!("compact:{}", Uuid::new_v4())),
+                    messages,
+                    tools: Vec::new(),
+                    output_schema: None,
+                },
+                None,
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!(error.message))?;
+        let ModelMessage::Assistant {
+            content,
+            tool_calls,
+            ..
+        } = result.message
+        else {
+            bail!("native compaction returned a non-assistant message")
+        };
+        anyhow::ensure!(
+            tool_calls.is_empty(),
+            "native compaction unexpectedly requested a tool"
+        );
+        let summary = content.unwrap_or_default();
+        anyhow::ensure!(
+            !summary.trim().is_empty(),
+            "native compaction returned an empty summary"
+        );
+        Ok((summary, result.usage))
     }
 
     fn has_full_access(&self, session_id: Uuid) -> bool {
@@ -286,19 +387,39 @@ impl NativeHarness {
 
     async fn call_model(
         &self,
+        provider: crate::CodingProvider,
         model: &str,
         effort: Option<&str>,
         request: ModelTurnRequest,
         context: ModelStreamContext<'_>,
-    ) -> Result<ModelTurnResult> {
-        call_model_streaming(self.model_client.as_ref(), model, effort, request, context).await
+    ) -> Result<NativeModelOutcome> {
+        call_model_streaming(
+            self.model_client.as_ref(),
+            provider,
+            model,
+            effort,
+            request,
+            context,
+        )
+        .await
     }
+}
+
+struct NativeSteer {
+    text: String,
+    attachments: Vec<PathBuf>,
+}
+
+enum NativeModelOutcome {
+    Completed(ModelTurnResult),
+    Steered(NativeSteer),
 }
 
 #[async_trait]
 trait NativeModelClient: Send + Sync {
     async fn model_turn(
         &self,
+        provider: crate::CodingProvider,
         model: &str,
         effort: Option<&str>,
         request: ModelTurnRequest,
@@ -307,25 +428,52 @@ trait NativeModelClient: Send + Sync {
 }
 
 #[derive(Debug, Clone, Default)]
-struct KimiModelClient {
+struct CompatibleModelClient {
     gateway: Option<ModelGateway>,
 }
 
 #[async_trait]
-impl NativeModelClient for KimiModelClient {
+impl NativeModelClient for CompatibleModelClient {
     async fn model_turn(
         &self,
+        provider: crate::CodingProvider,
         model: &str,
         effort: Option<&str>,
         request: ModelTurnRequest,
         progress: Option<mpsc::UnboundedSender<ProviderProgress>>,
     ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
+        let profile = match provider {
+            crate::CodingProvider::Kimi => OpenAiCompatibleProfile::Kimi,
+            crate::CodingProvider::OpenRouter => OpenAiCompatibleProfile::OpenRouter,
+            crate::CodingProvider::OpenAiCompatible => OpenAiCompatibleProfile::Generic,
+            crate::CodingProvider::Codex
+            | crate::CodingProvider::Claude
+            | crate::CodingProvider::OpenCode => {
+                return Err(ProviderCallError {
+                    message: format!("{provider:?} does not use Borg's native model client"),
+                    trace: ProviderAttemptTrace {
+                        invocation: ProviderInvocation {
+                            provider_label: "native".to_string(),
+                            executable: String::new(),
+                            args: Vec::new(),
+                            cwd: None,
+                            model: Some(model.to_string()),
+                            effort: effort.map(str::to_string),
+                        },
+                        exit_status: Some(1),
+                        stdout: String::new(),
+                        stderr: "invalid native provider".to_string(),
+                    },
+                    session_id: None,
+                });
+            }
+        };
         OpenAiCompatibleProvider {
             model: model.to_string(),
             effort: effort.map(str::to_string),
             system_prompt: "",
         }
-        .model_turn_via(request, progress, self.gateway.as_ref())
+        .model_turn_via_profile(request, progress, self.gateway.as_ref(), profile)
         .await
     }
 }
@@ -555,20 +703,25 @@ struct ModelStreamContext<'a> {
 
 async fn call_model_streaming(
     model_client: &dyn NativeModelClient,
+    provider: crate::CodingProvider,
     model: &str,
     effort: Option<&str>,
     request: ModelTurnRequest,
     context: ModelStreamContext<'_>,
-) -> Result<borg_provider::provider::ModelTurnResult> {
+) -> Result<NativeModelOutcome> {
     let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
-    let call = model_client.model_turn(model, effort, request, Some(progress_tx));
+    let call = model_client.model_turn(provider, model, effort, request, Some(progress_tx));
     tokio::pin!(call);
     let mut text = String::new();
     let mut last_text_emit = Instant::now() - Duration::from_millis(50);
     let mut progress_open = true;
     loop {
         tokio::select! {
-            result = &mut call => return result.map_err(|error| anyhow::anyhow!(error.message)),
+            result = &mut call => {
+                return result
+                    .map(NativeModelOutcome::Completed)
+                    .map_err(|error| anyhow::anyhow!(error.message));
+            }
             progress = progress_rx.recv(), if progress_open => match progress {
                 Some(ProviderProgress::Bytes {
                     stream: ProviderProgressStream::Stdout,
@@ -612,12 +765,18 @@ async fn call_model_streaming(
                 None => progress_open = false,
             },
             control = next_control(context.controls) => match control {
-                Some(AgentTurnControl::Interrupt) => bail!("Kimi turn interrupted"),
-                Some(AgentTurnControl::Steer { ack, .. }) => {
-                    let _ = ack.send(Err(
-                        "native Kimi turns queue steering messages at the next model boundary"
-                            .to_string(),
-                    ));
+                Some(AgentTurnControl::Interrupt) => bail!("native provider turn interrupted"),
+                Some(AgentTurnControl::Steer {
+                    text,
+                    attachments,
+                    ack,
+                    ..
+                }) => {
+                    let _ = ack.send(Ok(()));
+                    return Ok(NativeModelOutcome::Steered(NativeSteer {
+                        text,
+                        attachments,
+                    }));
                 }
                 Some(AgentTurnControl::Approval { .. })
                 | Some(AgentTurnControl::ProviderInteractionResponse { .. }) => {}
@@ -634,7 +793,7 @@ async fn execute_tool(
     input: Value,
     events: &mpsc::Sender<SessionEventKind>,
     controls: &mut Option<mpsc::Receiver<AgentTurnControl>>,
-) -> Result<(String, bool)> {
+) -> Result<(String, bool, Option<NativeSteer>)> {
     if tool_call.function.name == "exec_command" && runtime.permission == PermissionMode::ReadOnly {
         return Ok((
             json!({
@@ -642,6 +801,7 @@ async fn execute_tool(
             })
             .to_string(),
             true,
+            None,
         ));
     }
     let external_mcp = runtime.mcp.contains(&tool_call.function.name);
@@ -683,6 +843,7 @@ async fn execute_tool(
                 return Ok((
                     json!({ "error": "tool execution was denied by the user" }).to_string(),
                     true,
+                    None,
                 ));
             }
             ApprovalDecision::AllowOnce | ApprovalDecision::AllowSession => {}
@@ -694,16 +855,35 @@ async fn execute_tool(
     loop {
         tokio::select! {
             result = &mut call => return Ok(match result {
-                Ok(value) => (serde_json::to_string(&value)?, false),
-                Err(error) => (json!({ "error": format!("{error:#}") }).to_string(), true),
+                Ok(value) => (serde_json::to_string(&value)?, false, None),
+                Err(error) => (
+                    json!({ "error": format!("{error:#}") }).to_string(),
+                    true,
+                    None,
+                ),
             }),
             control = next_control(controls) => match control {
-                Some(AgentTurnControl::Interrupt) => bail!("Kimi turn interrupted"),
-                Some(AgentTurnControl::Steer { ack, .. }) => {
-                    let _ = ack.send(Err(
-                        "native Kimi turns queue steering messages at the next model boundary"
-                            .to_string(),
-                    ));
+                Some(AgentTurnControl::Interrupt) => bail!("native provider turn interrupted"),
+                Some(AgentTurnControl::Steer {
+                    text,
+                    attachments,
+                    ack,
+                    ..
+                }) => {
+                    let _ = ack.send(Ok(()));
+                    let result = (&mut call).await;
+                    return Ok(match result {
+                        Ok(value) => (
+                            serde_json::to_string(&value)?,
+                            false,
+                            Some(NativeSteer { text, attachments }),
+                        ),
+                        Err(error) => (
+                            json!({ "error": format!("{error:#}") }).to_string(),
+                            true,
+                            Some(NativeSteer { text, attachments }),
+                        ),
+                    });
                 }
                 Some(AgentTurnControl::Approval { .. })
                 | Some(AgentTurnControl::ProviderInteractionResponse { .. }) => {}
@@ -760,7 +940,7 @@ async fn request_tool_approval(
                 .await;
                 return Ok(decision);
             }
-            Some(AgentTurnControl::Interrupt) => bail!("Kimi turn interrupted"),
+            Some(AgentTurnControl::Interrupt) => bail!("native provider turn interrupted"),
             Some(AgentTurnControl::Steer { ack, .. }) => {
                 let _ = ack.send(Err(
                     "resolve the pending tool approval before steering the turn".to_string(),
@@ -784,12 +964,13 @@ async fn next_control(
 
 async fn record_native_message(
     events: &mpsc::Sender<SessionEventKind>,
+    provider: crate::CodingProvider,
     message: &ModelMessage,
 ) -> Result<()> {
     let payload = serde_json::to_value(message)?;
     events
         .send(SessionEventKind::ProviderEvent {
-            provider: crate::CodingProvider::Kimi,
+            provider,
             kind: "native_model_message".to_string(),
             payload,
         })

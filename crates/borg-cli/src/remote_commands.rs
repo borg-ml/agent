@@ -374,11 +374,16 @@ async fn run_local_agent_session(
     let requested_model = args.model.clone().or_else(|| match requested_provider {
         CodingProvider::Codex => Some(borg_provider::codex_product_model().to_string()),
         CodingProvider::Kimi => Some(borg_provider::kimi_product_model().to_string()),
+        CodingProvider::OpenRouter => Some("moonshotai/kimi-k3".to_string()),
+        CodingProvider::OpenAiCompatible => std::env::var("BORG_OPENAI_COMPATIBLE_MODEL")
+            .ok()
+            .filter(|model| !model.trim().is_empty()),
         CodingProvider::Claude | CodingProvider::OpenCode => None,
     });
     let requested_effort = args.effort.clone().or_else(|| match requested_provider {
         CodingProvider::Codex => Some(borg_provider::codex_default_effort().to_string()),
-        CodingProvider::Kimi => Some("high".to_string()),
+        CodingProvider::Kimi | CodingProvider::OpenRouter => Some("high".to_string()),
+        CodingProvider::OpenAiCompatible => None,
         CodingProvider::Claude | CodingProvider::OpenCode => None,
     });
     let (recorded_cwd, provider, model, effort, fast, response_language, permission_mode) =
@@ -400,6 +405,10 @@ async fn run_local_agent_session(
     anyhow::ensure!(
         !fast.unwrap_or(false) || provider.supports_fast(),
         "--fast is not supported by the {provider:?} transport"
+    );
+    anyhow::ensure!(
+        !provider.uses_native_harness() || model.is_some(),
+        "{provider:?} requires --model or BORG_OPENAI_COMPATIBLE_MODEL"
     );
     let cwd = requested_cwd.unwrap_or(recorded_cwd);
     let mut current_model = model.clone();
@@ -2512,14 +2521,14 @@ fn idle_input(line: &str) -> (PromptDelivery, String) {
 fn running_input(
     line: &str,
     provider: CodingProvider,
-    steer_active_codex: bool,
+    steer_active_turn: bool,
 ) -> (PromptDelivery, String) {
     if let Some(text) = line.strip_prefix("/queue ") {
         return (PromptDelivery::Queue, text.trim().to_string());
     }
     if let Some(text) = line.strip_prefix("/steer ") {
         return (
-            if provider == CodingProvider::Codex {
+            if provider == CodingProvider::Codex || provider.uses_native_harness() {
                 PromptDelivery::Steer
             } else {
                 PromptDelivery::Queue
@@ -2528,7 +2537,9 @@ fn running_input(
         );
     }
     (
-        if provider == CodingProvider::Codex && steer_active_codex {
+        if (provider == CodingProvider::Codex || provider.uses_native_harness())
+            && steer_active_turn
+        {
             PromptDelivery::Steer
         } else {
             PromptDelivery::Queue
@@ -2886,6 +2897,8 @@ fn provider_name(provider: CodingProvider) -> &'static str {
         CodingProvider::Claude => "claude",
         CodingProvider::OpenCode => "opencode",
         CodingProvider::Kimi => "kimi",
+        CodingProvider::OpenRouter => "openrouter",
+        CodingProvider::OpenAiCompatible => "openai-compatible",
     }
 }
 
@@ -3241,7 +3254,7 @@ mod tests {
     }
 
     #[test]
-    fn active_codex_message_delivery_respects_setting_and_explicit_override() {
+    fn active_message_delivery_respects_provider_capability_and_explicit_override() {
         assert_eq!(
             running_input("plain", CodingProvider::Codex, true).0,
             PromptDelivery::Steer
@@ -3257,6 +3270,18 @@ mod tests {
         assert_eq!(
             running_input("/steer now", CodingProvider::Codex, false).0,
             PromptDelivery::Steer
+        );
+        assert_eq!(
+            running_input("plain", CodingProvider::OpenRouter, true).0,
+            PromptDelivery::Steer
+        );
+        assert_eq!(
+            running_input("/steer now", CodingProvider::OpenAiCompatible, false).0,
+            PromptDelivery::Steer
+        );
+        assert_eq!(
+            running_input("plain", CodingProvider::Claude, true).0,
+            PromptDelivery::Queue
         );
     }
 

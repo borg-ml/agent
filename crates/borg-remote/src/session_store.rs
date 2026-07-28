@@ -35,14 +35,12 @@ pub enum EventPersistence {
 impl SessionEventKind {
     pub fn persistence(&self) -> EventPersistence {
         match self {
-            Self::ProviderEvent {
-                provider: CodingProvider::Kimi,
-                kind,
-                ..
-            } if matches!(
-                kind.as_str(),
-                "native_model_message" | "native_tool_round_completed"
-            ) =>
+            Self::ProviderEvent { provider, kind, .. }
+                if provider.uses_native_harness()
+                    && matches!(
+                        kind.as_str(),
+                        "native_model_message" | "native_tool_round_completed"
+                    ) =>
             {
                 EventPersistence::Durable
             }
@@ -64,6 +62,7 @@ impl SessionEventKind {
         !matches!(
             self,
             Self::ProviderSessionLinked { .. }
+                | Self::TurnStarted { .. }
                 | Self::StatusChanged { .. }
                 | Self::SubagentActivity { .. }
                 | Self::SubagentControl { .. }
@@ -79,14 +78,12 @@ impl SessionEventKind {
             }
             | Self::TurnCompleted { .. }
             | Self::ContextCleared => true,
-            Self::ProviderEvent {
-                provider: CodingProvider::Kimi,
-                kind,
-                ..
-            } => matches!(
-                kind.as_str(),
-                "native_model_message" | "native_tool_round_completed"
-            ),
+            Self::ProviderEvent { provider, kind, .. } if provider.uses_native_harness() => {
+                matches!(
+                    kind.as_str(),
+                    "native_model_message" | "native_tool_round_completed" | "context_compaction"
+                )
+            }
             _ => false,
         }
     }

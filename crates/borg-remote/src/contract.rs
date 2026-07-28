@@ -6,7 +6,7 @@ use serde_json::Value;
 use ts_rs::TS;
 use uuid::Uuid;
 
-pub const REMOTE_PROTOCOL_VERSION: u16 = 4;
+pub const REMOTE_PROTOCOL_VERSION: u16 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
@@ -16,6 +16,8 @@ pub enum CodingProvider {
     Claude,
     OpenCode,
     Kimi,
+    OpenRouter,
+    OpenAiCompatible,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
@@ -173,12 +175,16 @@ impl CodingProvider {
             Self::Codex => "codex",
             Self::Claude => "claude",
             Self::OpenCode => "opencode",
-            Self::Kimi => "borg",
+            Self::Kimi | Self::OpenRouter | Self::OpenAiCompatible => "borg",
         }
     }
 
     pub fn supports_fast(self) -> bool {
         matches!(self, Self::Codex | Self::Claude)
+    }
+
+    pub fn uses_native_harness(self) -> bool {
+        matches!(self, Self::Kimi | Self::OpenRouter | Self::OpenAiCompatible)
     }
 }
 
@@ -890,6 +896,19 @@ pub enum SessionEventKind {
         #[serde(default)]
         response_language: ResponseLanguage,
         permission_mode: PermissionMode,
+    },
+    /// Effective provider configuration captured for one admitted turn.
+    ///
+    /// `SessionConfigured` may change while this turn is still running; this
+    /// snapshot keeps provider telemetry and assistant attribution attached
+    /// to the configuration that actually produced them.
+    TurnStarted {
+        message_id: Uuid,
+        provider: CodingProvider,
+        model: Option<String>,
+        effort: Option<String>,
+        #[serde(default)]
+        fast: bool,
     },
     StatusChanged {
         status: SessionStatus,

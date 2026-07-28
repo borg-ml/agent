@@ -23,8 +23,8 @@ mod subagents;
 mod tool_presentation;
 
 pub use agent::{
-    AgentTurn, AgentTurnControl, AgentTurnExecutor, AgentTurnResult, LocalAgentTurnExecutor,
-    run_agent_turn, run_agent_turn_controlled,
+    AgentCompaction, AgentTurn, AgentTurnControl, AgentTurnExecutor, AgentTurnResult,
+    LocalAgentTurnExecutor, run_agent_turn, run_agent_turn_controlled,
 };
 pub use command::execute_workspace_command;
 pub use contract::*;

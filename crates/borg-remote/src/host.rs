@@ -257,6 +257,8 @@ async fn probe_capabilities_with_managed_kimi(
         CodingProvider::Claude,
         CodingProvider::OpenCode,
         CodingProvider::Kimi,
+        CodingProvider::OpenRouter,
+        CodingProvider::OpenAiCompatible,
     ] {
         providers.push(probe_provider(provider, managed_kimi).await);
     }
@@ -284,6 +286,10 @@ async fn probe_provider(provider: CodingProvider, managed_kimi: bool) -> Provide
             .or_else(|_| std::env::var("MOONSHOT_API_KEY"))
             .map(|_| "Local Kimi credentials available".to_string())
             .map_err(anyhow::Error::from),
+        CodingProvider::OpenRouter => std::env::var("OPENROUTER_API_KEY")
+            .map(|_| "OpenRouter credentials available".to_string())
+            .map_err(anyhow::Error::from),
+        CodingProvider::OpenAiCompatible => Ok("OpenAI-compatible endpoint available".to_string()),
     };
     let authenticated = auth.as_ref().is_ok_and(|output| match provider {
         // OpenCode prints a non-empty table header even with zero credentials.
@@ -321,9 +327,9 @@ async fn command_output_from(command: &mut Command, executable: &str) -> Result<
 }
 
 pub async fn login_provider(provider: CodingProvider) -> Result<()> {
-    if provider == CodingProvider::Kimi {
+    if provider.uses_native_harness() {
         bail!(
-            "Kimi credentials are managed by Borg; configure BORG_KIMI_API_KEY or use a managed Borg session"
+            "{provider:?} uses API credentials from the environment; configure the provider key and endpoint variables"
         );
     }
     let status = match provider {
@@ -334,7 +340,9 @@ pub async fn login_provider(provider: CodingProvider) -> Result<()> {
         CodingProvider::OpenCode => Command::new("opencode")
             .args(["providers", "login"])
             .status(),
-        CodingProvider::Kimi => unreachable!("handled above"),
+        CodingProvider::Kimi | CodingProvider::OpenRouter | CodingProvider::OpenAiCompatible => {
+            unreachable!("handled above")
+        }
     }
     .await
     .with_context(|| format!("failed to start {} login", provider.executable()))?;

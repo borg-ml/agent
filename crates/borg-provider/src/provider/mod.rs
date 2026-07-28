@@ -18,7 +18,8 @@ pub use model_turn::{
     ModelTurnResult,
 };
 pub use openai_compatible::{
-    ModelGateway, OpenAiCompatibleProvider, kimi_cost_microusd, kimi_usage_from_response,
+    ModelGateway, OpenAiCompatibleProfile, OpenAiCompatibleProvider, kimi_cost_microusd,
+    kimi_usage_from_response,
 };
 pub use openrouter::OpenRouterProvider;
 pub use sdk_providers::{

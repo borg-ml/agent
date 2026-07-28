@@ -11,7 +11,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.94"
 license = "AGPL-3.0-only"
-repository = "https://github.com/sashaduke/borg-cli"
+repository = "https://github.com/borg-ml/cli"
 homepage = "https://borg.ml"
 authors = ["Borg contributors"]
 

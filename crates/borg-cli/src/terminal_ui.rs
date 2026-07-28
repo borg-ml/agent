@@ -913,7 +913,22 @@ impl BorgTerminal {
             Some(CodingProvider::Claude) => {
                 CLAUDE_SELECTABLE_MODELS.iter().map(|(id, _)| *id).collect()
             }
-            _ => vec!["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"],
+            Some(CodingProvider::Codex) => {
+                vec!["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
+            }
+            Some(CodingProvider::Kimi) => vec![borg_provider::kimi_product_model()],
+            Some(CodingProvider::OpenRouter) => {
+                let mut options = vec!["moonshotai/kimi-k3"];
+                if let Some(current) = current.as_deref()
+                    && !options.contains(&current)
+                {
+                    options.insert(0, current);
+                }
+                options
+            }
+            Some(CodingProvider::OpenAiCompatible | CodingProvider::OpenCode) | None => {
+                vec![current.as_deref().unwrap_or("model-id")]
+            }
         };
         self.picker = Some(Picker::new(
             PickerKind::Model,
@@ -1891,11 +1906,6 @@ impl BorgTerminal {
         let active_subagents = self.transcript.active_subagent_count();
         let working_agents = active_subagents + 1;
         let session_is_active = matches!(status, SessionStatus::Starting | SessionStatus::Running);
-        let live_status_label = if session_is_active && active_subagents > 0 {
-            format!("{working_agents} agents {status_label}")
-        } else {
-            status_label.to_string()
-        };
         let goal_status = self.transcript.goal_status();
         let slash_suggestions = (self.picker.is_none())
             .then(|| slash_suggestion_lines(&self.composer.text, self.slash_selection))
@@ -1944,9 +1954,14 @@ impl BorgTerminal {
                     .map(|line| Line::from(Span::styled(line, Style::default().fg(Color::Yellow))))
                     .collect()
             } else {
-                vec![Line::from(primary_controls_line(is_launch_screen))]
+                vec![Line::from(primary_controls_line())]
             }
         });
+        let controls = if is_launch_screen {
+            controls
+        } else {
+            inset_control_lines(controls)
+        };
         let controls_height = controls.len().min(u16::MAX as usize) as u16;
         let footer_height = if is_launch_screen {
             1
@@ -2418,7 +2433,7 @@ impl BorgTerminal {
                 });
             }
             let mut status_spans = vec![Span::styled(
-                format!(" {status_glyph} {live_status_label}"),
+                format!(" {status_glyph} {status_label}"),
                 Style::default().fg(status_color),
             )];
             if session_is_active
@@ -2435,6 +2450,13 @@ impl BorgTerminal {
                     Style::default().fg(status_color),
                 ));
             }
+            if active_subagents > 0 {
+                push_status_segment(
+                    &mut status_spans,
+                    format!("{working_agents} agents"),
+                    SUBAGENT_PINK,
+                );
+            }
             let goal_status_start = status_spans.iter().map(|span| span.width()).sum::<usize>();
             let goal_status_width = goal_status
                 .as_ref()
@@ -2444,13 +2466,6 @@ impl BorgTerminal {
                     format!(" · {goal_status}"),
                     Style::default().fg(Color::Yellow),
                 ));
-            }
-            if active_subagents > 0 && !session_is_active {
-                push_status_segment(
-                    &mut status_spans,
-                    format!("{working_agents} agents working"),
-                    Color::Gray,
-                );
             }
             push_status_segment(&mut status_spans, config_primary, Color::Gray);
             push_status_segment(
@@ -2541,7 +2556,7 @@ impl BorgTerminal {
             }
             if showing_primary_controls {
                 let (controls_x, controls_y, controls_width) = if is_launch_screen {
-                    let width = primary_controls_line(true).width() as u16;
+                    let width = primary_controls_line().width() as u16;
                     (
                         composer_area
                             .x
@@ -2551,9 +2566,9 @@ impl BorgTerminal {
                     )
                 } else {
                     (
-                        footer_area.x,
+                        footer_area.x.saturating_add(1),
                         footer_area.y,
-                        primary_controls_line(false).width() as u16,
+                        primary_controls_line().width() as u16,
                     )
                 };
                 let hint_width = KEYBINDINGS_HINT.width() as u16;
@@ -3522,6 +3537,7 @@ struct Transcript {
     goal: Option<SessionGoal>,
     todos: Vec<PlanItem>,
     config: Option<SessionDisplayConfig>,
+    active_turn: Option<ActiveTurnDisplayConfig>,
     subagents: HashMap<Uuid, SubagentStatus>,
     subagent_entries: HashMap<Uuid, usize>,
     follow_tail: bool,
@@ -3575,6 +3591,7 @@ impl Default for Transcript {
             goal: None,
             todos: Vec::new(),
             config: None,
+            active_turn: None,
             subagents: HashMap::new(),
             subagent_entries: HashMap::new(),
             follow_tail: false,
@@ -3606,6 +3623,7 @@ struct ToolRunWindow {
     total: usize,
 }
 
+#[derive(Clone)]
 struct SessionDisplayConfig {
     cwd: PathBuf,
     provider: CodingProvider,
@@ -3617,6 +3635,19 @@ struct SessionDisplayConfig {
 }
 
 impl SessionDisplayConfig {
+    fn cache_signature(&self) -> CacheSignature {
+        CacheSignature::new(self.provider, self.model.as_deref(), self.effort.as_deref())
+    }
+}
+
+struct ActiveTurnDisplayConfig {
+    message_id: Uuid,
+    provider: CodingProvider,
+    model: Option<String>,
+    effort: Option<String>,
+}
+
+impl ActiveTurnDisplayConfig {
     fn cache_signature(&self) -> CacheSignature {
         CacheSignature::new(self.provider, self.model.as_deref(), self.effort.as_deref())
     }
@@ -3877,6 +3908,14 @@ impl Transcript {
     }
 
     fn apply(&mut self, event: &SessionEvent) {
+        if let SessionEventKind::TurnCompleted { message_id, .. } = &event.kind
+            && self
+                .active_turn
+                .as_ref()
+                .is_some_and(|turn| turn.message_id == *message_id)
+        {
+            self.active_turn = None;
+        }
         match &event.kind {
             SessionEventKind::SessionConfigured {
                 cwd,
@@ -3898,6 +3937,20 @@ impl Transcript {
                     permission_mode: *permission_mode,
                 });
             }
+            SessionEventKind::TurnStarted {
+                message_id,
+                provider,
+                model,
+                effort,
+                ..
+            } => {
+                self.active_turn = Some(ActiveTurnDisplayConfig {
+                    message_id: *message_id,
+                    provider: *provider,
+                    model: model.clone(),
+                    effort: effort.clone(),
+                });
+            }
             SessionEventKind::UsageUpdated {
                 input_tokens,
                 cached_input_tokens,
@@ -3915,9 +3968,14 @@ impl Transcript {
                         context_remaining_percent(*context_tokens, *context_window_tokens);
                 }
                 if let Some(signature) = self
-                    .config
+                    .active_turn
                     .as_ref()
-                    .map(SessionDisplayConfig::cache_signature)
+                    .map(ActiveTurnDisplayConfig::cache_signature)
+                    .or_else(|| {
+                        self.config
+                            .as_ref()
+                            .map(SessionDisplayConfig::cache_signature)
+                    })
                     && let Some(notice) = self.cache_diagnostics.observe(
                         event.created_at,
                         signature,
@@ -4003,9 +4061,14 @@ impl Transcript {
                         .collect();
                     self.messages.insert(*message_id, self.order.len());
                     let (model, effort) = if *actor == EventActor::Assistant {
-                        self.config
+                        self.active_turn
                             .as_ref()
-                            .map(|config| (config.model.clone(), config.effort.clone()))
+                            .map(|turn| (turn.model.clone(), turn.effort.clone()))
+                            .or_else(|| {
+                                self.config
+                                    .as_ref()
+                                    .map(|config| (config.model.clone(), config.effort.clone()))
+                            })
                             .unwrap_or_default()
                     } else {
                         (None, None)
@@ -4483,7 +4546,15 @@ impl Transcript {
     }
 
     fn cache_status(&self, now: DateTime<Utc>) -> Option<(String, bool)> {
-        let signature = self.config.as_ref()?.cache_signature();
+        let signature = self
+            .active_turn
+            .as_ref()
+            .map(ActiveTurnDisplayConfig::cache_signature)
+            .or_else(|| {
+                self.config
+                    .as_ref()
+                    .map(SessionDisplayConfig::cache_signature)
+            })?;
         self.cache_diagnostics
             .status(now, &signature)
             .map(|status| (status.label, status.warning))
@@ -5421,7 +5492,8 @@ fn session_event_changes_transcript(kind: &SessionEventKind) -> bool {
         | SessionEventKind::UsageUpdated { .. }
         | SessionEventKind::ContextWindowUpdated { .. }
         | SessionEventKind::SubagentControl { .. }
-        | SessionEventKind::ProviderSessionLinked { .. } => false,
+        | SessionEventKind::ProviderSessionLinked { .. }
+        | SessionEventKind::TurnStarted { .. } => false,
         SessionEventKind::StatusChanged { status, detail } => {
             *status == SessionStatus::Ready
                 && detail
@@ -5787,12 +5859,15 @@ fn slash_help(matches: &[&(&str, &str)]) -> String {
 
 const KEYBINDINGS_HINT: &str = "? keybindings";
 
-fn primary_controls_line(is_launch_screen: bool) -> &'static str {
-    if is_launch_screen {
-        "enter send · / commands · ? keybindings"
-    } else {
-        " enter send · / commands · ? keybindings"
+fn primary_controls_line() -> &'static str {
+    "enter send · / commands · ? keybindings"
+}
+
+fn inset_control_lines(mut lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
+    for line in &mut lines {
+        line.spans.insert(0, Span::raw(" "));
     }
+    lines
 }
 
 fn keybinding_lines(width: usize) -> Vec<Line<'static>> {

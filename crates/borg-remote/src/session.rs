@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Sleep;
 use uuid::Uuid;
@@ -364,9 +365,9 @@ async fn run_agent_session_store_kernel(
     validate_session_state(session_id, &state)?;
     let mut provider_session_id = state.provider_session_id;
     let mut retained_context = (provider_session_id.is_none()
-        && launch.provider != CodingProvider::Kimi)
-        .then(|| retained_conversation_context(journal.context_events()))
-        .flatten();
+        && !launch.provider.uses_native_harness())
+    .then(|| retained_conversation_context(journal.context_events()))
+    .flatten();
     let mut goal = state.goal;
     let mut todos = state.todos;
     let mut goal_active_since = goal
@@ -375,6 +376,7 @@ async fn run_agent_session_store_kernel(
         .then(Instant::now);
     let mut goal_turn_failures = ConsecutiveGoalTurnFailures::default();
     let mut pending = recover_queued_prompts(&recovery.queue_events);
+    let mut deferred_commands = VecDeque::new();
     let (goal_tool_tx, mut goal_tool_rx) = mpsc::channel(8);
     let goal_tools = SessionGoalTools {
         requests: goal_tool_tx,
@@ -423,6 +425,17 @@ async fn run_agent_session_store_kernel(
         });
     }
     loop {
+        if !pending.is_empty() {
+            prioritize_recall_at_turn_boundary(
+                &mut journal,
+                &events,
+                session_id,
+                &mut pending,
+                &mut commands,
+                &mut deferred_commands,
+            )
+            .await?;
+        }
         let next = if let Some(prompt) = pending.pop_front() {
             Some(prompt)
         } else if let Some(active_goal) = goal
@@ -452,7 +465,7 @@ async fn run_agent_session_store_kernel(
                         }
                         continue;
                     }
-                    command = commands.recv() => command,
+                    command = next_host_command(&mut deferred_commands, &mut commands) => command,
                 };
                 match command {
                     Some(HostCommand::Prompt {
@@ -549,16 +562,58 @@ async fn run_agent_session_store_kernel(
                     Some(HostCommand::Compact {
                         session_id: command_session_id,
                     }) if command_session_id == session_id => {
-                        let result = match provider_session_id.as_deref() {
-                            Some(provider_session_id) => {
-                                executor.compact(launch.provider, provider_session_id).await
+                        record(
+                            &mut journal,
+                            &events,
+                            session_id,
+                            SessionEventKind::StatusChanged {
+                                status: SessionStatus::Running,
+                                detail: Some("Compacting context".to_string()),
+                            },
+                        )
+                        .await?;
+                        let result: Result<Option<crate::AgentCompaction>> = async {
+                            if launch.provider.uses_native_harness() {
+                                let model = launch
+                                    .model
+                                    .as_deref()
+                                    .context("native context compaction requires a model")?;
+                                executor
+                                    .compact_native(
+                                        launch.provider,
+                                        model,
+                                        launch.effort.as_deref(),
+                                        native_conversation(
+                                            journal.context_events(),
+                                            launch.provider,
+                                        )?,
+                                    )
+                                    .await
+                                    .map(Some)
+                            } else {
+                                match provider_session_id.as_deref() {
+                                    Some(provider_session_id) => executor
+                                        .compact(launch.provider, provider_session_id)
+                                        .await
+                                        .map(|()| None),
+                                    None => Err(anyhow::anyhow!(
+                                        "there is no provider conversation to compact yet"
+                                    )),
+                                }
                             }
-                            None => Err(anyhow::anyhow!(
-                                "there is no provider conversation to compact yet"
-                            )),
-                        };
+                        }
+                        .await;
                         match result {
-                            Ok(()) => {
+                            Ok(native) => {
+                                if let Some(native) = native.as_ref() {
+                                    record(
+                                        &mut journal,
+                                        &events,
+                                        session_id,
+                                        native_usage_event(&native.usage),
+                                    )
+                                    .await?;
+                                }
                                 record(
                                     &mut journal,
                                     &events,
@@ -567,7 +622,10 @@ async fn run_agent_session_store_kernel(
                                         provider: launch.provider,
                                         kind: "context_compaction".to_string(),
                                         payload: serde_json::json!({
-                                            "summary": "Conversation context compacted on request"
+                                            "summary": native
+                                                .map(|native| native.summary)
+                                                .unwrap_or_else(|| "Conversation context compacted on request".to_string()),
+                                            "native": launch.provider.uses_native_harness(),
                                         }),
                                     },
                                 )
@@ -585,6 +643,16 @@ async fn run_agent_session_store_kernel(
                                 .await?;
                             }
                         }
+                        record(
+                            &mut journal,
+                            &events,
+                            session_id,
+                            SessionEventKind::StatusChanged {
+                                status: SessionStatus::Ready,
+                                detail: None,
+                            },
+                        )
+                        .await?;
                     }
                     Some(HostCommand::ClearContext {
                         session_id: command_session_id,
@@ -648,6 +716,19 @@ async fn run_agent_session_store_kernel(
         } else {
             prompt.text
         };
+        record(
+            &mut journal,
+            &events,
+            session_id,
+            SessionEventKind::TurnStarted {
+                message_id: prompt.message_id,
+                provider: launch.provider,
+                model: launch.model.clone(),
+                effort: launch.effort.clone(),
+                fast: launch.fast.unwrap_or(false),
+            },
+        )
+        .await?;
         let turn = AgentTurn {
             session_id,
             message_id: prompt.message_id,
@@ -662,7 +743,7 @@ async fn run_agent_session_store_kernel(
             fast: launch.fast,
             response_language: launch.response_language,
             permission_mode: launch.permission_mode,
-            conversation: native_conversation(journal.context_events())?,
+            conversation: native_conversation(journal.context_events(), launch.provider)?,
             agent_mcp_server: agent_mcp_server.clone(),
             agent_tools: dispatcher.clone(),
             external_mcp_servers: Vec::new(),
@@ -894,7 +975,7 @@ async fn run_agent_session_store_kernel(
                         .await?;
                     }
                 }
-                command = commands.recv() => {
+                command = next_host_command(&mut deferred_commands, &mut commands) => {
                     let Some(command) = command else {
                         running.abort();
                         deny_pending_approval(
@@ -1112,7 +1193,9 @@ async fn run_agent_session_store_kernel(
                                     .filter(|goal| goal.status == GoalStatus::Active)
                             {
                                 let text = objective_updated_prompt(active_goal);
-                                if launch.provider == CodingProvider::Codex {
+                                if launch.provider == CodingProvider::Codex
+                                    || launch.provider.uses_native_harness()
+                                {
                                     let (ack, _result) = oneshot::channel();
                                     control_tx
                                         .send(AgentTurnControl::Steer {
@@ -1314,7 +1397,7 @@ async fn run_agent_session_store_kernel(
         .await?;
         if interrupted {
             provider_session_id = None;
-            retained_context = if launch.provider == CodingProvider::Kimi {
+            retained_context = if launch.provider.uses_native_harness() {
                 None
             } else {
                 retained_conversation_context(journal.context_events())
@@ -1341,25 +1424,42 @@ fn validate_session_state(session_id: Uuid, state: &SessionState) -> Result<()> 
 
 fn native_conversation(
     events: &[SessionEvent],
+    provider: CodingProvider,
 ) -> Result<Vec<borg_provider::provider::ModelMessage>> {
+    if !provider.uses_native_harness() {
+        return Ok(Vec::new());
+    }
     let mut conversation = Vec::new();
     let mut pending = Vec::new();
     for event in events {
         match &event.kind {
             SessionEventKind::ProviderEvent {
-                provider: CodingProvider::Kimi,
+                provider: event_provider,
                 kind,
                 payload,
-            } if kind == "native_model_message" => {
+            } if *event_provider == provider && kind == "context_compaction" => {
+                pending.clear();
+                conversation.clear();
+                if let Some(summary) = payload.get("summary").and_then(Value::as_str) {
+                    conversation.push(borg_provider::provider::ModelMessage::User {
+                        content: format!("Previous conversation summary:\n\n{summary}"),
+                    });
+                }
+            }
+            SessionEventKind::ProviderEvent {
+                provider: event_provider,
+                kind,
+                payload,
+            } if *event_provider == provider && kind == "native_model_message" => {
                 pending.push(serde_json::from_value(payload.clone()).context(
                     "durable native model message does not match the model-turn contract",
                 )?);
             }
             SessionEventKind::ProviderEvent {
-                provider: CodingProvider::Kimi,
+                provider: event_provider,
                 kind,
                 ..
-            } if kind == "native_tool_round_completed" => {
+            } if *event_provider == provider && kind == "native_tool_round_completed" => {
                 conversation.append(&mut pending);
             }
             SessionEventKind::TurnCompleted { error: None, .. } => {
@@ -1372,6 +1472,22 @@ fn native_conversation(
         }
     }
     Ok(conversation)
+}
+
+fn native_usage_event(usage: &borg_provider::ProviderCallUsage) -> SessionEventKind {
+    SessionEventKind::UsageUpdated {
+        provider_duration_ms: usage.duration_ms,
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        cached_input_tokens: usage.cached_input_tokens,
+        cache_creation_input_tokens: usage.cache_creation_input_tokens,
+        total_tokens: usage.total_tokens,
+        cost_microusd: usage.cost_microusd,
+        cost_basis: usage.cost_basis.to_string(),
+        cost_usd: None,
+        context_tokens: usage.context_tokens,
+        context_window_tokens: usage.context_window_tokens,
+    }
 }
 
 fn retained_conversation_context(events: &[SessionEvent]) -> Option<String> {
@@ -1448,12 +1564,63 @@ fn recall_all_visible(pending: &mut VecDeque<QueuedPrompt>) -> Vec<QueuedPrompt>
     recalled
 }
 
+async fn next_host_command(
+    deferred: &mut VecDeque<HostCommand>,
+    commands: &mut mpsc::Receiver<HostCommand>,
+) -> Option<HostCommand> {
+    match deferred.pop_front() {
+        Some(command) => Some(command),
+        None => commands.recv().await,
+    }
+}
+
+async fn prioritize_recall_at_turn_boundary(
+    journal: &mut RuntimeSessionStore,
+    events: &mpsc::Sender<SessionEvent>,
+    session_id: Uuid,
+    pending: &mut VecDeque<QueuedPrompt>,
+    commands: &mut mpsc::Receiver<HostCommand>,
+    deferred: &mut VecDeque<HostCommand>,
+) -> Result<()> {
+    // Let input already emitted by the TUI reach the actor before promoting the
+    // next queued prompt into a turn. This closes the completion-boundary race
+    // where Up was pressed while the prompt still appeared queued.
+    tokio::task::yield_now().await;
+    while let Ok(command) = commands.try_recv() {
+        if matches!(
+            command,
+            HostCommand::RecallQueuedPrompt {
+                session_id: command_session_id
+            } if command_session_id == session_id
+        ) {
+            for recalled in recall_all_visible(pending) {
+                record(
+                    journal,
+                    events,
+                    session_id,
+                    SessionEventKind::PromptRecalled {
+                        message_id: recalled.message_id,
+                        text: recalled.text,
+                        attachments: recalled.attachments,
+                    },
+                )
+                .await?;
+            }
+        } else {
+            deferred.push_back(command);
+        }
+    }
+    Ok(())
+}
+
 fn steers_active_codex_turn(
     provider: CodingProvider,
     delivery: PromptDelivery,
     has_queued_prompts: bool,
 ) -> bool {
-    provider == CodingProvider::Codex && !has_queued_prompts && delivery == PromptDelivery::Steer
+    (provider == CodingProvider::Codex || provider.uses_native_harness())
+        && !has_queued_prompts
+        && delivery == PromptDelivery::Steer
 }
 
 async fn record_prompt_status(
@@ -1783,10 +1950,8 @@ async fn record_subagent_activity(
             if !matches!(
                 event.kind,
                 SessionEventKind::ApprovalRequested { .. }
-                    | SessionEventKind::StatusChanged {
-                        status: SessionStatus::WaitingForApproval,
-                        ..
-                    }
+                    | SessionEventKind::StatusChanged { .. }
+                    | SessionEventKind::Error { .. }
             ) {
                 return Ok(());
             }
@@ -2355,6 +2520,12 @@ mod tests {
         steer_seen: Arc<Notify>,
     }
 
+    struct BoundaryQueueExecutor {
+        turns: RecordedPromptTurns,
+        first_started: Arc<Notify>,
+        release_first: Arc<Notify>,
+    }
+
     #[async_trait::async_trait]
     impl AgentTurnExecutor for InterruptibleQueueExecutor {
         async fn execute(
@@ -2450,6 +2621,141 @@ mod tests {
                 final_text: String::new(),
             })
         }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentTurnExecutor for BoundaryQueueExecutor {
+        async fn execute(
+            &self,
+            turn: AgentTurn,
+            _events: mpsc::Sender<SessionEventKind>,
+            _controls: Option<mpsc::Receiver<AgentTurnControl>>,
+        ) -> Result<AgentTurnResult> {
+            self.turns
+                .lock()
+                .unwrap()
+                .push((turn.prompt.clone(), turn.attachments));
+            if turn.prompt == "first" {
+                self.first_started.notify_one();
+                self.release_first.notified().await;
+            }
+            Ok(AgentTurnResult {
+                provider_session_id: Some("provider-session".to_string()),
+                final_text: String::new(),
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn queued_prompt_can_be_recalled_at_the_turn_completion_boundary() {
+        let root = tempdir().unwrap();
+        let journal_path = root.path().join("session.jsonl");
+        let session_id = Uuid::new_v4();
+        let queued_message_id = Uuid::new_v4();
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let turns = Arc::new(Mutex::new(Vec::new()));
+        let first_started = Arc::new(Notify::new());
+        let release_first = Arc::new(Notify::new());
+        let executor = Arc::new(BoundaryQueueExecutor {
+            turns: Arc::clone(&turns),
+            first_started: Arc::clone(&first_started),
+            release_first: Arc::clone(&release_first),
+        });
+        let actor = tokio::spawn(async move {
+            run_agent_session_with_executor(
+                &journal_path,
+                session_id,
+                LaunchSession {
+                    request_id: Uuid::new_v4(),
+                    cwd: root.path().to_path_buf(),
+                    provider: CodingProvider::Codex,
+                    model: None,
+                    effort: None,
+                    fast: Some(false),
+                    response_language: crate::ResponseLanguage::Auto,
+                    permission_mode: PermissionMode::ReadOnly,
+                    name: None,
+                    initial_prompt: None,
+                },
+                command_rx,
+                event_tx,
+                executor,
+            )
+            .await
+        });
+
+        command_tx
+            .send(HostCommand::Prompt {
+                session_id,
+                message_id: Uuid::new_v4(),
+                text: "first".to_string(),
+                attachments: Vec::new(),
+                output_schema: None,
+                delivery: PromptDelivery::Steer,
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), first_started.notified())
+            .await
+            .expect("first turn starts");
+        command_tx
+            .send(HostCommand::Prompt {
+                session_id,
+                message_id: queued_message_id,
+                text: "recall me".to_string(),
+                attachments: Vec::new(),
+                output_schema: None,
+                delivery: PromptDelivery::Queue,
+            })
+            .await
+            .unwrap();
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+                .await
+                .expect("queued event arrives")
+                .expect("session event stream remains open");
+            if matches!(
+                event.kind,
+                SessionEventKind::Message {
+                    message_id,
+                    status: MessageStatus::Queued,
+                    ..
+                } if message_id == queued_message_id
+            ) {
+                break;
+            }
+        }
+
+        release_first.notify_one();
+        tokio::task::yield_now().await;
+        command_tx
+            .send(HostCommand::RecallQueuedPrompt { session_id })
+            .await
+            .unwrap();
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+                .await
+                .expect("recall event arrives")
+                .expect("session event stream remains open");
+            if matches!(
+                event.kind,
+                SessionEventKind::PromptRecalled { message_id, .. }
+                    if message_id == queued_message_id
+            ) {
+                break;
+            }
+        }
+
+        command_tx
+            .send(HostCommand::Stop { session_id })
+            .await
+            .unwrap();
+        actor.await.unwrap().unwrap();
+        assert_eq!(
+            turns.lock().unwrap().as_slice(),
+            [("first".to_string(), Vec::new())]
+        );
     }
 
     #[tokio::test]
@@ -3410,6 +3716,7 @@ mod tests {
                 ModelMessage::assistant(
                     None,
                     None,
+                    None,
                     vec![ModelToolCall::function(
                         "one".to_string(),
                         "read_file".to_string(),
@@ -3438,6 +3745,7 @@ mod tests {
                 ModelMessage::assistant(
                     None,
                     None,
+                    None,
                     vec![ModelToolCall::function(
                         "two".to_string(),
                         "read_file".to_string(),
@@ -3457,10 +3765,79 @@ mod tests {
             ),
         ];
 
-        let replay = native_conversation(&events).unwrap();
+        let replay = native_conversation(&events, CodingProvider::Kimi).unwrap();
         assert_eq!(replay.len(), 3);
         assert!(matches!(replay[0], ModelMessage::User { .. }));
         assert!(matches!(replay[2], ModelMessage::Tool { .. }));
+    }
+
+    #[test]
+    fn native_replay_restarts_from_the_latest_compaction_summary() {
+        use borg_provider::provider::ModelMessage;
+
+        let session_id = Uuid::new_v4();
+        let native = |sequence, content: &str| {
+            SessionEvent::new(
+                session_id,
+                sequence,
+                SessionEventKind::ProviderEvent {
+                    provider: CodingProvider::OpenRouter,
+                    kind: "native_model_message".to_string(),
+                    payload: serde_json::to_value(ModelMessage::User {
+                        content: content.to_string(),
+                    })
+                    .unwrap(),
+                },
+            )
+        };
+        let events = vec![
+            native(1, "old context"),
+            SessionEvent::new(
+                session_id,
+                2,
+                SessionEventKind::TurnCompleted {
+                    message_id: Uuid::new_v4(),
+                    provider_session_id: None,
+                    final_text: String::new(),
+                    error: None,
+                },
+            ),
+            SessionEvent::new(
+                session_id,
+                3,
+                SessionEventKind::ProviderEvent {
+                    provider: CodingProvider::OpenRouter,
+                    kind: "context_compaction".to_string(),
+                    payload: json!({ "summary": "kept decisions" }),
+                },
+            ),
+            native(4, "new context"),
+            SessionEvent::new(
+                session_id,
+                5,
+                SessionEventKind::TurnCompleted {
+                    message_id: Uuid::new_v4(),
+                    provider_session_id: None,
+                    final_text: String::new(),
+                    error: None,
+                },
+            ),
+        ];
+
+        let replay = native_conversation(&events, CodingProvider::OpenRouter).unwrap();
+        assert_eq!(replay.len(), 2);
+        assert_eq!(
+            replay[0],
+            ModelMessage::User {
+                content: "Previous conversation summary:\n\nkept decisions".to_string()
+            }
+        );
+        assert_eq!(
+            replay[1],
+            ModelMessage::User {
+                content: "new context".to_string()
+            }
+        );
     }
 
     #[tokio::test]

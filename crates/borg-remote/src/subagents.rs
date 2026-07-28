@@ -953,7 +953,14 @@ pub fn subagent_tool_specs() -> Vec<Value> {
                     "message": { "type": "string" },
                     "provider": {
                         "type": "string",
-                        "enum": ["codex", "claude", "open_code", "kimi"]
+                        "enum": [
+                            "codex",
+                            "claude",
+                            "open_code",
+                            "kimi",
+                            "open_router",
+                            "open_ai_compatible"
+                        ]
                     },
                     "model": { "type": "string" },
                     "reasoning_effort": { "type": "string" }

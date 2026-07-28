@@ -24,6 +24,11 @@ pub enum ModelMessage {
         content: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reasoning_content: Option<String>,
+        /// Provider-native reasoning blocks preserved byte-for-byte across
+        /// tool rounds. OpenRouter uses this for encrypted/summarized
+        /// reasoning that cannot be represented as plain text.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_details: Option<Value>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         tool_calls: Vec<ModelToolCall>,
     },
@@ -37,11 +42,13 @@ impl ModelMessage {
     pub fn assistant(
         content: Option<String>,
         reasoning_content: Option<String>,
+        reasoning_details: Option<Value>,
         tool_calls: Vec<ModelToolCall>,
     ) -> Self {
         Self::Assistant {
             content,
             reasoning_content,
+            reasoning_details,
             tool_calls,
         }
     }
@@ -161,6 +168,7 @@ impl ModelTurnResult {
             ModelMessage::Assistant {
                 content,
                 reasoning_content,
+                reasoning_details: _,
                 tool_calls,
             } => Some((content, reasoning_content, tool_calls)),
             _ => None,

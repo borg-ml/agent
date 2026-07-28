@@ -65,6 +65,12 @@ pub struct AgentTurnResult {
     pub final_text: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct AgentCompaction {
+    pub summary: String,
+    pub usage: borg_provider::ProviderCallUsage,
+}
+
 #[derive(Debug)]
 pub enum AgentTurnControl {
     Steer {
@@ -103,6 +109,16 @@ pub trait AgentTurnExecutor: Send + Sync {
     async fn compact(&self, _provider: CodingProvider, _provider_session_id: &str) -> Result<()> {
         anyhow::bail!("manual context compaction is not supported by this provider")
     }
+
+    async fn compact_native(
+        &self,
+        _provider: CodingProvider,
+        _model: &str,
+        _effort: Option<&str>,
+        _conversation: Vec<borg_provider::provider::ModelMessage>,
+    ) -> Result<AgentCompaction> {
+        anyhow::bail!("native context compaction is not supported by this provider")
+    }
 }
 
 /// Direct provider execution used by the CLI and enrolled hosts.
@@ -135,7 +151,7 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
         events: mpsc::Sender<SessionEventKind>,
         controls: Option<mpsc::Receiver<AgentTurnControl>>,
     ) -> Result<AgentTurnResult> {
-        if turn.provider == CodingProvider::Kimi {
+        if turn.provider.uses_native_harness() {
             return self.native_harness.run(turn, events, controls).await;
         }
         events
@@ -163,6 +179,20 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
         );
         self.codex_pool.compact(provider_session_id)
     }
+
+    async fn compact_native(
+        &self,
+        provider: CodingProvider,
+        model: &str,
+        effort: Option<&str>,
+        conversation: Vec<borg_provider::provider::ModelMessage>,
+    ) -> Result<AgentCompaction> {
+        let (summary, usage) = self
+            .native_harness
+            .compact(provider, model, effort, conversation)
+            .await?;
+        Ok(AgentCompaction { summary, usage })
+    }
 }
 
 pub async fn run_agent_turn(
@@ -188,7 +218,9 @@ pub async fn run_agent_turn_controlled(
         CodingProvider::Codex | CodingProvider::Claude | CodingProvider::OpenCode => {
             run_borg_provider_turn(turn, events, controls, None, true, None).await
         }
-        CodingProvider::Kimi => NativeHarness::default().run(turn, events, controls).await,
+        CodingProvider::Kimi | CodingProvider::OpenRouter | CodingProvider::OpenAiCompatible => {
+            NativeHarness::default().run(turn, events, controls).await
+        }
     }
 }
 
@@ -268,7 +300,9 @@ async fn run_borg_provider_turn(
         CodingProvider::OpenCode => {
             bail!("OpenCode execution is only supported on an enrolled host")
         }
-        CodingProvider::Kimi => bail!("Kimi must execute through Borg's native harness"),
+        CodingProvider::Kimi | CodingProvider::OpenRouter | CodingProvider::OpenAiCompatible => {
+            bail!("native providers must execute through Borg's native harness")
+        }
     };
     tracing::debug!(
         target: "borg_ttft",

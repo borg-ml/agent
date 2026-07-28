@@ -496,6 +496,88 @@ fn projection_only_events_keep_the_transcript_layout_cache() {
 }
 
 #[test]
+fn effort_changes_do_not_relabel_usage_from_the_active_turn() {
+    let session_id = Uuid::new_v4();
+    let old_turn = Uuid::new_v4();
+    let new_turn = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    let configured = |effort: &str| SessionEventKind::SessionConfigured {
+        cwd: PathBuf::from("/workspace"),
+        provider: CodingProvider::Codex,
+        model: Some("gpt-5.4".to_string()),
+        effort: Some(effort.to_string()),
+        fast: false,
+        response_language: ResponseLanguage::English,
+        permission_mode: PermissionMode::FullAccess,
+    };
+    let started = |message_id, effort: &str| SessionEventKind::TurnStarted {
+        message_id,
+        provider: CodingProvider::Codex,
+        model: Some("gpt-5.4".to_string()),
+        effort: Some(effort.to_string()),
+        fast: false,
+    };
+    let usage = |cached_input_tokens| SessionEventKind::UsageUpdated {
+        provider_duration_ms: 10,
+        input_tokens: 1_000,
+        output_tokens: 100,
+        cached_input_tokens,
+        cache_creation_input_tokens: 0,
+        total_tokens: 1_100 + cached_input_tokens,
+        cost_microusd: None,
+        cost_basis: String::new(),
+        cost_usd: None,
+        context_tokens: Some(10_000),
+        context_window_tokens: Some(100_000),
+    };
+    let mut sequence = 1;
+    let mut apply = |transcript: &mut Transcript, kind| {
+        transcript.apply(&SessionEvent::new(session_id, sequence, kind));
+        sequence += 1;
+    };
+
+    apply(&mut transcript, configured("medium"));
+    apply(&mut transcript, started(old_turn, "medium"));
+    apply(&mut transcript, usage(0));
+    apply(&mut transcript, configured("high"));
+    apply(&mut transcript, usage(9_000));
+
+    assert_eq!(
+        transcript.cache_status(Utc::now()).map(|(label, _)| label),
+        Some("cache 90% hit".to_string())
+    );
+    assert_eq!(
+        transcript
+            .active_turn
+            .as_ref()
+            .and_then(|turn| turn.effort.as_deref()),
+        Some("medium")
+    );
+
+    apply(
+        &mut transcript,
+        SessionEventKind::TurnCompleted {
+            message_id: old_turn,
+            provider_session_id: None,
+            final_text: String::new(),
+            error: None,
+        },
+    );
+    assert!(
+        transcript
+            .cache_status(Utc::now())
+            .is_some_and(|(label, _)| label.contains("effort changed"))
+    );
+
+    apply(&mut transcript, started(new_turn, "high"));
+    apply(&mut transcript, usage(9_000));
+    assert_eq!(
+        transcript.cache_status(Utc::now()).map(|(label, _)| label),
+        Some("cache 90% hit".to_string())
+    );
+}
+
+#[test]
 fn deferred_tool_input_loads_when_the_card_is_expanded() {
     let session_id = Uuid::new_v4();
     let payload = SessionPayloadRef {
