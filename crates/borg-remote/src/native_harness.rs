@@ -239,8 +239,11 @@ impl NativeHarness {
             assistant_message_id = Uuid::new_v4();
 
             let mut pending_steer = None;
-            for tool_call in tool_calls {
-                let input = parse_tool_arguments(tool_call);
+            let inputs = tool_calls
+                .iter()
+                .map(parse_tool_arguments)
+                .collect::<Vec<_>>();
+            for (tool_call, input) in tool_calls.iter().zip(&inputs) {
                 send(
                     &events,
                     SessionEventKind::ToolStarted {
@@ -256,26 +259,67 @@ impl NativeHarness {
                     },
                 )
                 .await;
-                let (output, is_error, steer) = match input {
-                    Ok(input) => {
-                        execute_tool(
-                            self,
-                            &runtime,
-                            tool_call,
-                            input,
-                            NativeApprovalContext {
-                                provider: turn.provider,
-                                model: &model,
-                                effort: turn.effort.as_deref(),
-                            },
-                            &events,
-                            &mut controls,
-                            &mut usage,
-                        )
-                        .await?
+            }
+            let parallel_reads = tool_calls.len() > 1
+                && inputs.iter().all(|input| input.is_ok())
+                && tool_calls.iter().all(|call| {
+                    runtime.execution_class(&call.function.name) == ToolExecutionClass::ReadOnly
+                });
+            let outcomes = if parallel_reads {
+                let pairs = tool_calls.iter().zip(&inputs).collect::<Vec<_>>();
+                let mut outcomes = Vec::with_capacity(pairs.len());
+                for chunk in pairs.chunks(4) {
+                    let chunk_outcomes =
+                        futures::future::join_all(chunk.iter().map(|(tool_call, input)| async {
+                            match runtime
+                                .call(
+                                    &tool_call.function.name,
+                                    input.as_ref().expect("validated input").clone(),
+                                )
+                                .await
+                            {
+                                Ok(value) => (serde_json::to_string(&value), false, None),
+                                Err(error) => (
+                                    Ok(json!({ "error": format!("{error:#}") }).to_string()),
+                                    true,
+                                    None,
+                                ),
+                            }
+                        }))
+                        .await;
+                    for (output, is_error, steer) in chunk_outcomes {
+                        outcomes.push((output?, is_error, steer));
                     }
-                    Err(error) => (json!({ "error": error }).to_string(), true, None),
-                };
+                }
+                outcomes
+            } else {
+                let mut outcomes = Vec::with_capacity(tool_calls.len());
+                for (tool_call, input) in tool_calls.iter().zip(inputs) {
+                    let outcome = match input {
+                        Ok(input) => {
+                            execute_tool(
+                                self,
+                                &runtime,
+                                tool_call,
+                                input,
+                                NativeApprovalContext {
+                                    provider: turn.provider,
+                                    model: &model,
+                                    effort: turn.effort.as_deref(),
+                                },
+                                &events,
+                                &mut controls,
+                                &mut usage,
+                            )
+                            .await?
+                        }
+                        Err(error) => (json!({ "error": error }).to_string(), true, None),
+                    };
+                    outcomes.push(outcome);
+                }
+                outcomes
+            };
+            for (tool_call, (output, is_error, steer)) in tool_calls.iter().zip(outcomes) {
                 pending_steer = pending_steer.or(steer);
                 let output = bounded_tool_content(output);
                 send(
@@ -478,6 +522,12 @@ struct NativeToolRuntime {
     context: crate::native_context::NativeContext,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolExecutionClass {
+    ReadOnly,
+    Stateful,
+}
+
 impl NativeToolRuntime {
     async fn start(
         session_id: Uuid,
@@ -517,6 +567,10 @@ impl NativeToolRuntime {
             }
         }
         Ok(definitions)
+    }
+
+    fn execution_class(&self, name: &str) -> ToolExecutionClass {
+        tool_execution_class(name)
     }
 
     async fn call(&self, name: &str, arguments: Value) -> Result<Value> {
@@ -677,6 +731,26 @@ impl NativeToolRuntime {
     }
 }
 
+fn tool_execution_class(name: &str) -> ToolExecutionClass {
+    match name {
+        "list_files"
+        | "read_file"
+        | "search_files"
+        | "read_skill"
+        | "get_goal"
+        | "get_plan"
+        | "list_agents"
+        | "lsp_status"
+        | "lsp_diagnostics"
+        | "lsp_hover"
+        | "lsp_definition"
+        | "lsp_references"
+        | "lsp_document_symbols"
+        | "lsp_workspace_symbols" => ToolExecutionClass::ReadOnly,
+        _ => ToolExecutionClass::Stateful,
+    }
+}
+
 struct ModelStreamContext<'a> {
     coding_provider: crate::CodingProvider,
     assistant_message_id: Uuid,
@@ -697,10 +771,21 @@ async fn call_model_streaming(
     tokio::pin!(call);
     let mut text = String::new();
     let mut last_text_emit = Instant::now() - Duration::from_millis(50);
+    let mut pending_reasoning = String::new();
+    let mut last_reasoning_emit = Instant::now() - Duration::from_millis(50);
     let mut progress_open = true;
     loop {
         tokio::select! {
             result = &mut call => {
+                if !pending_reasoning.is_empty() {
+                    send(
+                        context.events,
+                        SessionEventKind::ReasoningDelta {
+                            text: std::mem::take(&mut pending_reasoning),
+                        },
+                    )
+                    .await;
+                }
                 return result
                     .map(NativeModelOutcome::Completed)
                     .map_err(|error| anyhow::anyhow!(error.message));
@@ -711,7 +796,7 @@ async fn call_model_streaming(
                     chunk,
                 }) => {
                     text.push_str(&String::from_utf8_lossy(&chunk));
-                    if last_text_emit.elapsed() >= Duration::from_millis(40)
+                    if last_text_emit.elapsed() >= live_text_interval(text.len())
                         || chunk.ends_with(b"\n")
                     {
                         send(context.events, SessionEventKind::Message {
@@ -734,7 +819,19 @@ async fn call_model_streaming(
                     if let Some(text) = content_text
                         .or_else(|| payload.get("text").and_then(Value::as_str).map(str::to_string))
                     {
-                        send(context.events, SessionEventKind::ReasoningDelta { text }).await;
+                        pending_reasoning.push_str(&text);
+                        if last_reasoning_emit.elapsed() >= Duration::from_millis(50)
+                            || pending_reasoning.ends_with('\n')
+                        {
+                            send(
+                                context.events,
+                                SessionEventKind::ReasoningDelta {
+                                    text: std::mem::take(&mut pending_reasoning),
+                                },
+                            )
+                            .await;
+                            last_reasoning_emit = Instant::now();
+                        }
                     }
                 }
                 Some(ProviderProgress::ProviderEvent { kind, payload, .. }) => {
@@ -766,6 +863,15 @@ async fn call_model_streaming(
                 None => {}
             }
         }
+    }
+}
+
+fn live_text_interval(bytes: usize) -> Duration {
+    match bytes {
+        0..=16_384 => Duration::from_millis(40),
+        16_385..=65_536 => Duration::from_millis(80),
+        65_537..=262_144 => Duration::from_millis(160),
+        _ => Duration::from_millis(300),
     }
 }
 
@@ -1460,5 +1566,28 @@ mod tests {
         let bounded = bounded_tool_content(output);
         assert!(bounded.is_char_boundary(MAX_TOOL_RESULT_BYTES));
         assert!(bounded.contains("tool output truncated"));
+    }
+
+    #[test]
+    fn only_explicitly_read_only_tools_are_parallelizable() {
+        assert_eq!(
+            tool_execution_class("read_file"),
+            ToolExecutionClass::ReadOnly
+        );
+        assert_eq!(
+            tool_execution_class("exec_command"),
+            ToolExecutionClass::Stateful
+        );
+        assert_eq!(
+            tool_execution_class("update_plan"),
+            ToolExecutionClass::Stateful
+        );
+    }
+
+    #[test]
+    fn live_text_updates_back_off_as_the_response_grows() {
+        assert_eq!(live_text_interval(1_000), Duration::from_millis(40));
+        assert_eq!(live_text_interval(100_000), Duration::from_millis(160));
+        assert_eq!(live_text_interval(1_000_000), Duration::from_millis(300));
     }
 }

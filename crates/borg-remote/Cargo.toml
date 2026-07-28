@@ -16,6 +16,7 @@ async-trait.workspace = true
 base64.workspace = true
 borg-provider = { path = "../borg-provider" }
 chrono.workspace = true
+futures.workspace = true
 ignore.workspace = true
 libc.workspace = true
 regex.workspace = true

@@ -301,6 +301,7 @@ dependencies = [
  "base64",
  "borg-provider",
  "chrono",
+ "futures",
  "ignore",
  "libc",
  "regex",
