@@ -657,7 +657,8 @@ async fn run_local_agent_session(
     let mut resume_session = None;
     let mut rewind_prompt = None;
     let mut sleep_inhibitor = SleepInhibitor::new(prevent_sleep);
-    let mut render_tick = tui_render_interval(tui_fps);
+    let mut render_frame_interval = tui_frame_interval(tui_fps);
+    let mut render_tick = tui_render_interval(render_frame_interval);
     let mut activity_tick = tokio::time::interval(ACTIVITY_FRAME_INTERVAL);
     activity_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut cache_tick = tokio::time::interval(std::time::Duration::from_secs(30));
@@ -668,7 +669,14 @@ async fn run_local_agent_session(
             _ = render_tick.tick(), if terminal.is_some() && terminal_dirty => {
                 let terminal = terminal.as_mut().expect("terminal");
                 terminal.advance_scroll_frame();
+                let draw_started = std::time::Instant::now();
                 terminal.draw()?;
+                let next_interval =
+                    responsive_tui_frame_interval(tui_fps, draw_started.elapsed());
+                if next_interval != render_frame_interval {
+                    render_frame_interval = next_interval;
+                    render_tick = tui_render_interval(render_frame_interval);
+                }
                 terminal_dirty = terminal.has_pending_scroll_frame();
             }
             _ = activity_tick.tick(), if terminal.as_ref().is_some_and(|terminal| {
@@ -1033,7 +1041,8 @@ async fn run_local_agent_session(
                     match fps.trim().parse::<u64>() {
                         Ok(fps @ MIN_TUI_FPS..=MAX_TUI_FPS) => {
                             tui_fps = fps;
-                            render_tick = tui_render_interval(tui_fps);
+                            render_frame_interval = tui_frame_interval(tui_fps);
+                            render_tick = tui_render_interval(render_frame_interval);
                             editor_preferences.presentation.refresh_rate_fps =
                                 u16::try_from(tui_fps).expect("bounded refresh rate fits u16");
                             editor_preferences.save()?;
@@ -1319,7 +1328,8 @@ async fn run_local_agent_session(
                     }
                     UiAction::SetRefreshRate(fps) => {
                         tui_fps = fps.clamp(MIN_TUI_FPS, MAX_TUI_FPS);
-                        render_tick = tui_render_interval(tui_fps);
+                        render_frame_interval = tui_frame_interval(tui_fps);
+                        render_tick = tui_render_interval(render_frame_interval);
                         editor_preferences.presentation.refresh_rate_fps =
                             u16::try_from(tui_fps).expect("bounded refresh rate fits u16");
                         editor_preferences.save()?;
@@ -1639,7 +1649,8 @@ async fn run_local_agent_session(
                             match value.parse::<u64>() {
                                 Ok(fps @ MIN_TUI_FPS..=MAX_TUI_FPS) => {
                                     tui_fps = fps;
-                                    render_tick = tui_render_interval(tui_fps);
+                                    render_frame_interval = tui_frame_interval(tui_fps);
+                                    render_tick = tui_render_interval(render_frame_interval);
                                     editor_preferences.presentation.refresh_rate_fps =
                                         u16::try_from(fps)
                                             .expect("bounded refresh rate fits u16");
@@ -2409,6 +2420,12 @@ fn tui_frame_interval(fps: u64) -> std::time::Duration {
     std::time::Duration::from_nanos(1_000_000_000 / fps.clamp(MIN_TUI_FPS, MAX_TUI_FPS))
 }
 
+fn responsive_tui_frame_interval(fps: u64, last_draw: std::time::Duration) -> std::time::Duration {
+    tui_frame_interval(fps)
+        .max(last_draw.saturating_mul(3))
+        .min(ACTIVITY_FRAME_INTERVAL)
+}
+
 fn parse_on_off(value: &str) -> Option<bool> {
     match value.trim().to_ascii_lowercase().as_str() {
         "on" | "true" | "1" => Some(true),
@@ -2467,8 +2484,9 @@ fn transcript_colors_summary(preferences: &EditorPreferences) -> String {
     )
 }
 
-fn tui_render_interval(fps: u64) -> tokio::time::Interval {
-    let mut interval = tokio::time::interval(tui_frame_interval(fps));
+fn tui_render_interval(frame_interval: std::time::Duration) -> tokio::time::Interval {
+    let mut interval =
+        tokio::time::interval_at(tokio::time::Instant::now() + frame_interval, frame_interval);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     interval
 }
@@ -3316,6 +3334,22 @@ mod tests {
         );
         assert_eq!(tui_frame_interval(1), tui_frame_interval(MIN_TUI_FPS));
         assert_eq!(tui_frame_interval(1_000), tui_frame_interval(MAX_TUI_FPS));
+    }
+
+    #[test]
+    fn expensive_draws_leave_time_for_input_and_animation_events() {
+        assert_eq!(
+            responsive_tui_frame_interval(165, std::time::Duration::from_millis(5)),
+            std::time::Duration::from_millis(15)
+        );
+        assert_eq!(
+            responsive_tui_frame_interval(60, std::time::Duration::from_millis(40)),
+            ACTIVITY_FRAME_INTERVAL
+        );
+        assert_eq!(
+            responsive_tui_frame_interval(60, std::time::Duration::ZERO),
+            tui_frame_interval(60)
+        );
     }
 
     #[test]
