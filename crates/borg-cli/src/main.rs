@@ -1,4 +1,5 @@
 mod agent_config;
+mod agent_mcp;
 mod cli;
 mod editor_preferences;
 mod remote_commands;
@@ -24,5 +25,6 @@ async fn main() -> Result<()> {
         Command::Agent(args) => run_local_agent(args).await,
         Command::Resume { session } => run_local_agent(LocalAgentCliArgs::resume(session)).await,
         Command::Remote { command } => run_remote_command(command).await,
+        Command::AgentMcp => agent_mcp::run().await,
     }
 }

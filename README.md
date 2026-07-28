@@ -41,6 +41,6 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) before submitting changes.
 ## Releases
 
 Tags matching `v*` build checksum-paired `borg` archives for Linux, macOS, and
-Windows on x86-64 and ARM64. Each release archive contains the CLI binary,
-`LICENSE`, `NOTICE.md`, `THIRD_PARTY.md`, and this README. Private platform
-services and tools are never packaged from this repository.
+Windows on x86-64 and ARM64. Each release archive contains the self-contained
+`borg` CLI, `LICENSE`, `NOTICE.md`, `THIRD_PARTY.md`, and this README. Private
+platform services and tools are never packaged from this repository.

@@ -23,6 +23,8 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: RemoteCommand,
     },
+    #[command(name = "__agent-mcp", hide = true)]
+    AgentMcp,
 }
 
 #[derive(Debug, Args)]

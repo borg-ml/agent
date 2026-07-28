@@ -237,8 +237,11 @@ impl AgentToolServer {
         }
         borg_provider::mcp::ExternalMcpServer {
             name: "borg_agent".to_string(),
-            command: std::env::var("BORG_MCP_SERVER").unwrap_or_else(|_| "borg-mcp".to_string()),
-            args: Vec::new(),
+            command: std::env::current_exe()
+                .expect("Borg cannot expose session tools without its executable path")
+                .to_string_lossy()
+                .into_owned(),
+            args: vec!["__agent-mcp".to_string()],
             env,
             allowed_tools: agent_tool_specs()
                 .into_iter()
