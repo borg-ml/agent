@@ -32,3 +32,9 @@ deny = ["n", "esc"]
 [approvals]
 # reviewer_model = "openai/gpt-5-mini"
 # reviewer_effort = "low"
+
+# Stable releases are verified and installed in the background for the next
+# launch. Active sessions are never restarted.
+[updates]
+auto_install = true
+check_interval_hours = 24

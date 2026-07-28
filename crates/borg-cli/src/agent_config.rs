@@ -11,6 +11,25 @@ pub(crate) struct AgentConfig {
     pub(crate) commands: CommandConfig,
     pub(crate) keybindings: KeybindingConfig,
     pub(crate) approvals: ApprovalConfig,
+    pub(crate) updates: UpdateConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct UpdateConfig {
+    /// Download verified stable releases in the background for the next launch.
+    pub(crate) auto_install: bool,
+    /// Minimum interval between release checks.
+    pub(crate) check_interval_hours: u64,
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self {
+            auto_install: true,
+            check_interval_hours: 24,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -123,6 +142,10 @@ impl AgentConfig {
                 "reviewer_effort must not be empty"
             );
         }
+        anyhow::ensure!(
+            (1..=24 * 30).contains(&self.updates.check_interval_hours),
+            "updates.check_interval_hours must be between 1 and 720"
+        );
         Ok(())
     }
 

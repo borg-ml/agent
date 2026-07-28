@@ -5,6 +5,7 @@ mod editor_preferences;
 mod remote_commands;
 mod sleep_inhibitor;
 mod terminal_ui;
+mod updater;
 
 use anyhow::Result;
 use clap::Parser;
@@ -25,6 +26,7 @@ async fn main() -> Result<()> {
         Command::Agent(args) => run_local_agent(args).await,
         Command::Resume { session } => run_local_agent(LocalAgentCliArgs::resume(session)).await,
         Command::Remote { command } => run_remote_command(command).await,
+        Command::Update(args) => updater::run(args).await,
         Command::AgentMcp => agent_mcp::run().await,
     }
 }

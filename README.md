@@ -19,6 +19,12 @@ The installer detects the operating system and CPU, verifies the release
 checksum, installs to a user-local binary directory, and checks the installed
 binary with `borg --version`.
 
+Borg checks for verified stable releases in the background and installs them
+for the next launch without interrupting active work. Run `borg update`
+(`borg install` is an alias) to update immediately, or `borg update --check`
+to check without installing. Automatic updates and their check interval are
+configurable.
+
 ## What Borg provides
 
 - a responsive terminal UI with durable resume, steering, compaction, image
@@ -26,6 +32,7 @@ binary with `borg --version`.
 - Codex, Claude, OpenCode, Kimi, OpenRouter, and OpenAI-compatible providers;
 - a provider-neutral native harness with bounded file tools, background
   processes, LSP, goals, plans, subagents, MCP, project guidance, and skills;
+- non-blocking, checksum-verified updates that take effect on the next launch;
 - **Full Access** (default), **Auto** model-reviewed commands, and **Manual**
   user-reviewed commands;
 - enrolled Borg Remote hosts using the same public session and tool runtime.

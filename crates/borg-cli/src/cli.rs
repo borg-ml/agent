@@ -23,8 +23,18 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: RemoteCommand,
     },
+    /// Check for or install the latest Borg CLI release.
+    #[command(visible_alias = "install")]
+    Update(UpdateArgs),
     #[command(name = "__agent-mcp", hide = true)]
     AgentMcp,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct UpdateArgs {
+    /// Report whether an update is available without installing it.
+    #[arg(long)]
+    pub(crate) check: bool,
 }
 
 #[derive(Debug, Args)]

@@ -62,6 +62,8 @@ pub(crate) async fn run_remote_command(command: RemoteCommand) -> Result<()> {
             );
         }
         RemoteCommand::Host { config } => {
+            let agent_config = AgentConfig::load(None)?;
+            crate::updater::spawn_background(agent_config.updates);
             let config_path = config.unwrap_or_else(default_host_config_path);
             println!("Borg Remote host connected from {}", config_path.display());
             run_host(&config_path).await?;
@@ -252,6 +254,8 @@ fn systemd_quote(value: &str) -> String {
 }
 
 pub(crate) async fn run_local_agent(args: LocalAgentCliArgs) -> Result<()> {
+    let agent_config = AgentConfig::load(args.config.as_deref())?;
+    crate::updater::spawn_background(agent_config.updates.clone());
     let mut selected_session = None;
     let mut restored_prompt = None;
     loop {
