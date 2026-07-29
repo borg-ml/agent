@@ -245,7 +245,7 @@ dependencies = [
 
 [[package]]
 name = "borg"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "anyhow",
  "arboard",
@@ -285,7 +285,7 @@ dependencies = [
 
 [[package]]
 name = "borg-provider"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -308,7 +308,7 @@ dependencies = [
 
 [[package]]
 name = "borg-remote"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "anyhow",
  "async-trait",

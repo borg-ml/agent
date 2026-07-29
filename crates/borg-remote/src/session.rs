@@ -974,6 +974,7 @@ async fn run_agent_session_store_kernel(
             stop(&mut journal, &events, session_id).await?;
             return Ok(());
         };
+        next_ready_detail = None;
         if prompt.visible {
             record(
                 &mut journal,
