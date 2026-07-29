@@ -1431,6 +1431,19 @@ async fn run_local_agent_session(
                         user_requested_exit = true;
                         session_command_tx.send(HostCommand::Stop { session_id }).await.ok();
                     }
+                    UiAction::Queue { text, attachments } => {
+                        session_command_tx
+                            .send(HostCommand::Prompt {
+                                session_id,
+                                message_id: Uuid::new_v4(),
+                                text,
+                                attachments,
+                                output_schema: None,
+                                delivery: PromptDelivery::Queue,
+                            })
+                            .await
+                            .ok();
+                    }
                     UiAction::Submit { text, attachments } => {
                         if let Some((interaction_id, kind, payload)) =
                             pending_provider_interaction.clone()

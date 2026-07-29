@@ -44,6 +44,7 @@ pub(crate) struct CommandConfig {
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct KeybindingConfig {
     pub(crate) send: Vec<String>,
+    pub(crate) queue: Vec<String>,
     pub(crate) newline: Vec<String>,
     pub(crate) keybindings: Vec<String>,
     pub(crate) interrupt: Vec<String>,
@@ -63,6 +64,7 @@ impl Default for KeybindingConfig {
     fn default() -> Self {
         Self {
             send: vec!["enter".into()],
+            queue: vec!["tab".into()],
             newline: vec!["shift+enter".into(), "alt+enter".into()],
             keybindings: vec!["?".into()],
             interrupt: vec!["esc".into()],
@@ -164,9 +166,10 @@ impl AgentConfig {
 }
 
 impl KeybindingConfig {
-    pub(crate) fn entries(&self) -> [(&'static str, &[String]); 14] {
+    pub(crate) fn entries(&self) -> [(&'static str, &[String]); 15] {
         [
             ("send", &self.send),
+            ("queue", &self.queue),
             ("newline", &self.newline),
             ("keybindings", &self.keybindings),
             ("interrupt", &self.interrupt),
@@ -269,6 +272,7 @@ mod tests {
         .expect("config");
         config.validate().expect("valid config");
         assert_eq!(config.keybindings.send, ["ctrl+s"]);
+        assert_eq!(config.keybindings.queue, ["tab"]);
         assert_eq!(config.keybindings.interrupt, ["esc"]);
     }
 }

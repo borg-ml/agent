@@ -118,6 +118,7 @@ type CachedTranscriptRender = (
 #[derive(Clone, Copy)]
 enum KeyAction {
     Send,
+    Queue,
     Newline,
     Keybindings,
     Interrupt,
@@ -143,6 +144,7 @@ struct KeyChord {
 #[derive(Clone)]
 struct KeyMap {
     send: Vec<KeyChord>,
+    queue: Vec<KeyChord>,
     newline: Vec<KeyChord>,
     keybindings: Vec<KeyChord>,
     interrupt: Vec<KeyChord>,
@@ -162,6 +164,7 @@ impl KeyMap {
     fn from_config(config: &KeybindingConfig) -> Result<Self> {
         Ok(Self {
             send: parse_key_chords(&config.send)?,
+            queue: parse_key_chords(&config.queue)?,
             newline: parse_key_chords(&config.newline)?,
             keybindings: parse_key_chords(&config.keybindings)?,
             interrupt: parse_key_chords(&config.interrupt)?,
@@ -181,6 +184,7 @@ impl KeyMap {
     fn chords(&self, action: KeyAction) -> &[KeyChord] {
         match action {
             KeyAction::Send => &self.send,
+            KeyAction::Queue => &self.queue,
             KeyAction::Newline => &self.newline,
             KeyAction::Keybindings => &self.keybindings,
             KeyAction::Interrupt => &self.interrupt,
@@ -368,6 +372,10 @@ fn rich_terminal_supported(term: Option<&str>, borg_tui: Option<&str>) -> bool {
 pub enum UiAction {
     None,
     Submit {
+        text: String,
+        attachments: Vec<PathBuf>,
+    },
+    Queue {
         text: String,
         attachments: Vec<PathBuf>,
     },
@@ -3083,6 +3091,27 @@ impl BorgTerminal {
         if self.keymap.matches(KeyAction::Newline, &key) {
             self.composer.insert("\n");
             return Ok(UiAction::None);
+        }
+        if self.keymap.matches(KeyAction::Queue, &key)
+            && slash_matches(&self.composer.text).is_empty()
+        {
+            let (text, attachments) = self.composer.take();
+            if text.trim().is_empty() && attachments.is_empty() {
+                return Ok(UiAction::None);
+            }
+            self.notice = None;
+            return Ok(
+                if matches!(
+                    self.status,
+                    SessionStatus::Starting
+                        | SessionStatus::Running
+                        | SessionStatus::WaitingForApproval
+                ) {
+                    UiAction::Queue { text, attachments }
+                } else {
+                    UiAction::Submit { text, attachments }
+                },
+            );
         }
         if self.keymap.matches(KeyAction::Send, &key) {
             if self.composer.attachments.is_empty()
@@ -6115,8 +6144,9 @@ fn slash_help(matches: &[&(&str, &str)]) -> String {
 
 fn primary_controls_line(keymap: &KeyMap) -> String {
     format!(
-        "send {} · commands / · keybindings {}",
+        "send {} · queue {} · commands / · keybindings {}",
         keymap.label(KeyAction::Send),
+        keymap.label(KeyAction::Queue),
         keymap.label(KeyAction::Keybindings)
     )
 }
@@ -6131,9 +6161,9 @@ fn inset_control_lines(mut lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
 fn keybinding_lines(keymap: &KeyMap, width: usize) -> Vec<Line<'static>> {
     let bindings = [
         ("send", keymap.label(KeyAction::Send)),
+        ("queue next turn", keymap.label(KeyAction::Queue)),
         ("newline", keymap.label(KeyAction::Newline)),
         ("commands", "/".to_string()),
-        ("complete command", "tab".to_string()),
         ("interrupt or close", keymap.label(KeyAction::Interrupt)),
         ("clear · twice exit", keymap.label(KeyAction::ClearOrExit)),
         ("exit", keymap.label(KeyAction::Exit)),

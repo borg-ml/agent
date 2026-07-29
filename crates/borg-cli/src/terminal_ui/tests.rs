@@ -29,7 +29,7 @@ fn keybinding_help_is_action_first_and_uses_configuration() {
     let keymap = KeyMap::from_config(&config).expect("keymap");
     assert_eq!(
         primary_controls_line(&keymap),
-        "send ctrl+s · commands / · keybindings ?"
+        "send ctrl+s · queue tab · commands / · keybindings ?"
     );
     let help = keybinding_lines(&keymap, 60)
         .into_iter()
@@ -38,6 +38,7 @@ fn keybinding_help_is_action_first_and_uses_configuration() {
         .join("\n");
     assert!(help.contains("send"));
     assert!(help.find("send").unwrap() < help.find("ctrl+s").unwrap());
+    assert!(help.contains("queue next turn"));
 }
 
 #[test]

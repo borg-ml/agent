@@ -13,6 +13,7 @@ deep = "/effort xhigh"
 # and shift. Omitted actions keep their defaults.
 [keybindings]
 send = ["enter"]
+queue = ["tab"]
 newline = ["shift+enter", "alt+enter"]
 keybindings = ["?"]
 interrupt = ["esc"]
