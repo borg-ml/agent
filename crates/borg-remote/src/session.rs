@@ -2605,14 +2605,6 @@ async fn record_subagent_activity(
             let Some(agent) = subagents.get(event.session_id).await else {
                 return Ok(());
             };
-            if !matches!(
-                event.kind,
-                SessionEventKind::ApprovalRequested { .. }
-                    | SessionEventKind::StatusChanged { .. }
-                    | SessionEventKind::Error { .. }
-            ) {
-                return Ok(());
-            }
             (SubagentActivityKind::Updated, agent, Some(Box::new(event)))
         }
     };
@@ -2652,6 +2644,29 @@ async fn apply_subagent_action(
                     PromptDelivery::Queue => subagents.send_message(&target, &message).await?,
                     PromptDelivery::Steer => subagents.followup_task(&target, &message).await?,
                 }
+                Ok(SubagentControlOutcome::Accepted {
+                    agent: subagents.resolve_snapshot(&target).await?,
+                })
+            }
+            SubagentAction::Prompt {
+                target,
+                message_id,
+                text,
+                attachments,
+                delivery,
+                ..
+            } => {
+                subagents
+                    .prompt_child(&target, message_id, text, attachments, delivery)
+                    .await?;
+                Ok(SubagentControlOutcome::Accepted {
+                    agent: subagents.resolve_snapshot(&target).await?,
+                })
+            }
+            SubagentAction::RecallPrompt {
+                target, message_id, ..
+            } => {
+                subagents.recall_child_prompt(&target, message_id).await?;
                 Ok(SubagentControlOutcome::Accepted {
                     agent: subagents.resolve_snapshot(&target).await?,
                 })
@@ -5633,6 +5648,115 @@ mod tests {
                 ref interaction_id,
                 response: serde_json::Value::Null,
             } if interaction_id == "interaction-1"
+        ));
+    }
+
+    #[tokio::test]
+    async fn parent_stream_preserves_full_child_transcript_events() {
+        let root = tempdir().unwrap();
+        let parent_id = Uuid::new_v4();
+        let child_id = Uuid::new_v4();
+        let sqlite = Arc::new(
+            SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+                .await
+                .unwrap(),
+        );
+        sqlite.create_session(parent_id).await.unwrap();
+        let launch = LaunchSession {
+            request_id: Uuid::new_v4(),
+            cwd: root.path().to_path_buf(),
+            provider: CodingProvider::Codex,
+            model: Some("gpt-test".to_string()),
+            effort: Some("low".to_string()),
+            fast: Some(false),
+            response_language: crate::ResponseLanguage::Auto,
+            permission_mode: PermissionMode::FullAccess,
+            name: None,
+            initial_prompt: None,
+            capabilities: Default::default(),
+            subagent_concurrency_limit: None,
+            extension_skill_roots: Vec::new(),
+            team_policy: None,
+        };
+        let coordinator = SubagentCoordinator::new_with_store_and_executor(
+            root.path(),
+            parent_id,
+            launch,
+            16,
+            Arc::new(LocalAgentTurnExecutor::default()),
+            sqlite.clone(),
+        )
+        .unwrap();
+        let snapshot = crate::SubagentSnapshot {
+            session_id: child_id,
+            parent_session_id: parent_id,
+            task_name: "/root/worker".to_string(),
+            status: crate::SubagentStatus::Stopped,
+            provider: CodingProvider::Codex,
+            model: Some("gpt-test".to_string()),
+            effort: Some("low".to_string()),
+            cwd: root.path().to_path_buf(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            detail: None,
+            final_text: None,
+            usage: Default::default(),
+        };
+        coordinator
+            .restore_from_events(&[SessionEvent::new(
+                parent_id,
+                1,
+                SessionEventKind::SubagentActivity {
+                    activity: SubagentActivityKind::Stopped,
+                    agent: snapshot,
+                    event: None,
+                },
+            )])
+            .await
+            .unwrap();
+
+        let store: Arc<dyn SessionStore> = sqlite;
+        let mut journal = RuntimeSessionStore::new(store, Vec::new());
+        let (events, mut event_rx) = mpsc::channel(2);
+        let child_event = SessionEvent::new(
+            child_id,
+            7,
+            SessionEventKind::ToolStarted {
+                tool_call_id: "call-1".to_string(),
+                name: "exec".to_string(),
+                input: json!({"cmd": "cargo test"}),
+                input_ref: None,
+            },
+        );
+
+        record_subagent_activity(
+            &mut journal,
+            &events,
+            parent_id,
+            &coordinator,
+            SubagentActivity::SessionEvent {
+                parent_session_id: parent_id,
+                task_name: "/root/worker".to_string(),
+                event: child_event,
+            },
+        )
+        .await
+        .unwrap();
+
+        let projected = event_rx.recv().await.unwrap();
+        assert!(matches!(
+            projected.kind,
+            SessionEventKind::SubagentActivity {
+                event: Some(child_event),
+                ..
+            } if matches!(
+                child_event.kind,
+                SessionEventKind::ToolStarted {
+                    ref tool_call_id,
+                    ref name,
+                    ..
+                } if tool_call_id == "call-1" && name == "exec"
+            )
         ));
     }
 }

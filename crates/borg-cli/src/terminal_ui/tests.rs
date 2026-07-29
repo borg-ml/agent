@@ -28,6 +28,78 @@ fn focused_child_transcript_round_trips_back_to_director() {
 }
 
 #[test]
+fn focused_transcript_can_switch_directly_between_children() {
+    let first_id = Uuid::new_v4();
+    let second_id = Uuid::new_v4();
+    let mut displayed = Transcript::default();
+    displayed.order.push(TranscriptEntry::Activity {
+        text: "first child".to_string(),
+        time: "now".to_string(),
+    });
+    let mut second = Transcript::default();
+    second.order.push(TranscriptEntry::Activity {
+        text: "second child".to_string(),
+        time: "now".to_string(),
+    });
+    let mut children = HashMap::from([(second_id, second)]);
+
+    switch_between_child_transcripts(&mut displayed, &mut children, first_id, second_id);
+
+    assert!(matches!(
+        &displayed.order[0],
+        TranscriptEntry::Activity { text, .. } if text == "second child"
+    ));
+    assert!(matches!(
+        &children[&first_id].order[0],
+        TranscriptEntry::Activity { text, .. } if text == "first child"
+    ));
+    assert!(!children.contains_key(&second_id));
+}
+
+#[test]
+fn team_roster_hover_is_visually_distinct_from_focus_and_idle() {
+    let hovered = team_roster_row_style(false, true);
+    let focused = team_roster_row_style(true, false);
+    let idle = team_roster_row_style(false, false);
+
+    assert_eq!(hovered.bg, Some(SUBAGENT_PINK));
+    assert_eq!(hovered.fg, Some(Color::Black));
+    assert!(hovered.add_modifier.contains(Modifier::BOLD));
+    assert_eq!(focused.fg, Some(SUBAGENT_PINK));
+    assert_eq!(idle.fg, Some(Color::White));
+    assert_ne!(hovered, focused);
+    assert_ne!(hovered, idle);
+}
+
+#[test]
+fn team_roster_hit_testing_selects_each_exact_agent_row() {
+    let first = Uuid::new_v4();
+    let second = Uuid::new_v4();
+    let hit_areas = [
+        (Rect::new(4, 10, 40, 1), None),
+        (Rect::new(4, 11, 40, 1), Some(first)),
+        (Rect::new(4, 12, 40, 1), Some(second)),
+    ];
+
+    assert_eq!(
+        team_roster_target_at(&hit_areas, Position::new(8, 10)),
+        Some((0, None))
+    );
+    assert_eq!(
+        team_roster_target_at(&hit_areas, Position::new(8, 11)),
+        Some((1, Some(first)))
+    );
+    assert_eq!(
+        team_roster_target_at(&hit_areas, Position::new(8, 12)),
+        Some((2, Some(second)))
+    );
+    assert_eq!(
+        team_roster_target_at(&hit_areas, Position::new(8, 13)),
+        None
+    );
+}
+
+#[test]
 fn model_and_effort_pickers_use_the_provider_catalog() {
     let catalog = CodingProvider::Codex
         .model_catalog()
@@ -1736,6 +1808,26 @@ fn picker_wheel_hands_off_only_after_reaching_its_boundary() {
 }
 
 #[test]
+fn picker_hover_selects_the_option_without_a_click() {
+    let mut picker = Picker::new(
+        PickerKind::MessageActions,
+        "Actions",
+        ["First", "Second", "Third"],
+        None,
+    );
+
+    assert!(picker.select_hovered(&MouseEventKind::Moved, Some(2)));
+
+    assert_eq!(picker.selected, 2);
+    assert!(!picker.select_hovered(&MouseEventKind::Down(MouseButton::Left), Some(1),));
+    assert_eq!(picker.selected, 2);
+    assert!(!picker.select_hovered(&MouseEventKind::Moved, None));
+    assert!(!picker.select_index(3));
+    assert_eq!(picker.selected, 2);
+    assert_eq!(picker.selected_value(), "Third");
+}
+
+#[test]
 fn picker_numbers_are_visible_and_select_immediately() {
     let mut picker = Picker::new(
         PickerKind::Effort,
@@ -1971,7 +2063,7 @@ fn one_queued_prompt_allocates_a_content_row_below_its_border() {
         .collect::<String>();
     assert!(content.contains("NEXT TURN"));
     assert!(content.contains("visible follow-up"));
-    assert!(hint.contains("↑ edit all queued"));
+    assert!(hint.contains("↑ edit / recall queued"));
 }
 
 #[test]
@@ -1990,7 +2082,7 @@ fn pending_steer_ui_names_the_tool_boundary_and_interrupt_action() {
     assert!(rendered.contains("NEXT TOOL"));
     assert!(rendered.contains("focus on the failing test"));
     assert!(rendered.contains("esc interrupt + send now"));
-    assert!(!rendered.contains("edit all queued"));
+    assert!(rendered.contains("↑ edit / recall pending"));
 }
 
 #[test]
@@ -2478,6 +2570,55 @@ fn long_tool_runs_show_eight_lines_and_scroll_independently() {
     assert!(rendered.contains("call-9"));
     assert!(rendered.contains("call-16"));
     assert!(!rendered.contains("call-17"));
+}
+
+#[test]
+fn agent_lifecycle_rows_keep_one_continuous_actions_accordion() {
+    let mut transcript = Transcript::default();
+    let tool = |index| TranscriptEntry::Tool {
+        source_name: "Run".to_string(),
+        name: "Run".to_string(),
+        detail: format!("call-{index}"),
+        code_view: None,
+        output_view: None,
+        payload_refs: Vec::new(),
+        time: "19:38".to_string(),
+        started_at: Utc::now(),
+        completed_at: Some(Utc::now()),
+        complete: true,
+        error: false,
+        user_interrupted: false,
+        backgrounded: false,
+        expanded: false,
+    };
+    for index in 0..4 {
+        transcript.order.push(tool(index));
+    }
+    transcript.order.push(TranscriptEntry::Activity {
+        text: "agent · /root/v391_scaling_audit · started".to_string(),
+        time: "19:38".to_string(),
+    });
+    for index in 4..10 {
+        transcript.order.push(tool(index));
+    }
+
+    let windows = transcript.tool_run_windows();
+    assert!(windows.iter().all(Option::is_some));
+    assert_eq!(windows[0].unwrap().total, 11);
+    assert_eq!(windows[10].unwrap().start, 0);
+
+    let rendered = transcript
+        .lines(100)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(rendered.matches("┌─ actions").count(), 1);
+    assert!(rendered.contains("actions · 11"));
+    assert!(
+        rendered.contains("│ 19:38  agent · /root/v391_scaling_audit · started"),
+        "{rendered}"
+    );
 }
 
 #[test]
@@ -3206,37 +3347,43 @@ fn selection_highlight_survives_a_changed_viewport_offset() {
 }
 
 #[test]
-fn incoming_transcript_lines_keep_a_selected_viewport_anchored() {
+fn incoming_transcript_lines_move_selection_with_live_content() {
     let previous_height = 20;
-    let next_height = 23;
+    let next_height = 21;
     let viewport_height = 5;
     let previous_scroll_from_bottom = 0;
     let previous_scroll_start = previous_height - viewport_height;
-
     let next_scroll_from_bottom =
-        preserve_scroll_anchor(previous_scroll_from_bottom, previous_height, next_height);
+        if should_preserve_transcript_viewport(previous_scroll_from_bottom, true) {
+            preserve_scroll_anchor(previous_scroll_from_bottom, previous_height, next_height)
+        } else {
+            previous_scroll_from_bottom
+        };
     let next_scroll_start = (next_height - viewport_height) - next_scroll_from_bottom;
 
-    assert_eq!(next_scroll_start, previous_scroll_start);
+    assert_eq!(next_scroll_start, previous_scroll_start + 1);
 
     let selection = TextSelection {
         anchor: TranscriptPoint {
-            row: previous_scroll_start,
+            row: previous_scroll_start + 2,
             column: 1,
         },
         focus: TranscriptPoint {
-            row: previous_scroll_start + 1,
+            row: previous_scroll_start + 2,
             column: 2,
         },
         dragging: false,
         autoscroll: 0,
         pointer: Position::new(0, 0),
     };
-    let mut viewport = vec![Line::from("abcd"), Line::from("efgh")];
+    let mut viewport = vec![
+        Line::from("line 16"),
+        Line::from("selected"),
+        Line::from("line 18"),
+    ];
     apply_text_selection(&mut viewport, next_scroll_start, selection);
-    assert!(
-        viewport
-            .iter()
-            .all(|line| line.spans.iter().any(|span| span.style.bg.is_some()))
-    );
+    assert!(viewport[1].spans.iter().any(|span| span.style.bg.is_some()));
+    assert!(viewport[2].spans.iter().all(|span| span.style.bg.is_none()));
+    assert!(should_preserve_transcript_viewport(3, false));
+    assert!(!should_preserve_transcript_viewport(3, true));
 }

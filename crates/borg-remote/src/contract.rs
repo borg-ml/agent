@@ -675,6 +675,26 @@ pub enum SubagentAction {
         message: String,
         delivery: PromptDelivery,
     },
+    /// Send human-authored input directly to a child session.
+    ///
+    /// Unlike `Message`, this is not wrapped as an agent-to-agent team
+    /// message. It is the remote/TUI equivalent of typing into that child's
+    /// own composer.
+    Prompt {
+        request_id: Uuid,
+        target: String,
+        message_id: Uuid,
+        text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<PathBuf>,
+        delivery: PromptDelivery,
+    },
+    RecallPrompt {
+        request_id: Uuid,
+        target: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_id: Option<Uuid>,
+    },
     Interrupt {
         request_id: Uuid,
         target: String,
@@ -696,6 +716,8 @@ impl SubagentAction {
         match self {
             Self::List { request_id, .. }
             | Self::Message { request_id, .. }
+            | Self::Prompt { request_id, .. }
+            | Self::RecallPrompt { request_id, .. }
             | Self::Interrupt { request_id, .. }
             | Self::Stop { request_id, .. }
             | Self::Approve { request_id, .. } => *request_id,
@@ -1512,6 +1534,43 @@ mod tests {
                     "type": "interrupt",
                     "request_id": request_id,
                     "target": child_session_id.to_string(),
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn focused_child_prompt_preserves_human_input_identity_and_delivery() {
+        let parent_session_id = Uuid::nil();
+        let child_session_id = Uuid::from_u128(2);
+        let request_id = Uuid::from_u128(3);
+        let message_id = Uuid::from_u128(4);
+        let command = HostCommand::Subagent {
+            session_id: parent_session_id,
+            action: SubagentAction::Prompt {
+                request_id,
+                target: child_session_id.to_string(),
+                message_id,
+                text: "inspect this directly".to_string(),
+                attachments: vec![PathBuf::from("trace.txt")],
+                delivery: PromptDelivery::Steer,
+            },
+        };
+
+        assert_eq!(command.session_id(), Some(parent_session_id));
+        assert_eq!(
+            serde_json::to_value(command).unwrap(),
+            json!({
+                "type": "subagent",
+                "session_id": parent_session_id,
+                "action": {
+                    "type": "prompt",
+                    "request_id": request_id,
+                    "target": child_session_id.to_string(),
+                    "message_id": message_id,
+                    "text": "inspect this directly",
+                    "attachments": ["trace.txt"],
+                    "delivery": "steer",
                 }
             })
         );

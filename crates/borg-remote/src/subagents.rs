@@ -1343,6 +1343,88 @@ impl SubagentCoordinator {
             .clone())
     }
 
+    /// Send human-authored input directly to a child actor.
+    ///
+    /// Unlike team messages, this records an ordinary user prompt in the
+    /// child's own thread, matching input from a focused TUI composer.
+    pub async fn prompt_child(
+        &self,
+        target: &str,
+        message_id: Uuid,
+        text: String,
+        attachments: Vec<PathBuf>,
+        delivery: PromptDelivery,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            !text.trim().is_empty() || !attachments.is_empty(),
+            "subagent prompt must not be empty"
+        );
+        let (id, commands, task_name) = {
+            let table = self.table.lock().await;
+            let id = table.resolve(target)?;
+            anyhow::ensure!(
+                id != table.root_session_id,
+                "director is not a child session"
+            );
+            let entry = table
+                .entries
+                .get(&id)
+                .ok_or_else(|| anyhow::anyhow!("unknown subagent target: {target}"))?;
+            anyhow::ensure!(
+                !entry.snapshot.status.is_terminal(),
+                "subagent {} is not running",
+                entry.snapshot.task_name
+            );
+            (
+                id,
+                entry.commands.clone().ok_or_else(|| {
+                    anyhow::anyhow!("subagent {} is still starting", entry.snapshot.task_name)
+                })?,
+                entry.snapshot.task_name.clone(),
+            )
+        };
+        commands
+            .send(HostCommand::Prompt {
+                session_id: id,
+                message_id,
+                text,
+                attachments,
+                output_schema: None,
+                delivery,
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("subagent {task_name} command channel closed"))
+    }
+
+    pub async fn recall_child_prompt(&self, target: &str, message_id: Option<Uuid>) -> Result<()> {
+        let (id, commands, task_name) = {
+            let table = self.table.lock().await;
+            let id = table.resolve(target)?;
+            anyhow::ensure!(
+                id != table.root_session_id,
+                "director is not a child session"
+            );
+            let entry = table
+                .entries
+                .get(&id)
+                .ok_or_else(|| anyhow::anyhow!("unknown subagent target: {target}"))?;
+            (
+                id,
+                entry.commands.clone().ok_or_else(|| {
+                    anyhow::anyhow!("subagent {} is still starting", entry.snapshot.task_name)
+                })?,
+                entry.snapshot.task_name.clone(),
+            )
+        };
+        commands
+            .send(HostCommand::RecallQueuedPrompt {
+                session_id: id,
+                message_id,
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("subagent {task_name} command channel closed"))
+    }
+
     /// Queue a message without waking an idle child.
     pub async fn send_message(&self, target: &str, message: &str) -> Result<()> {
         let root_session_id = self.table.lock().await.root_session_id;
@@ -3010,6 +3092,76 @@ mod tests {
                 .iter()
                 .all(|message| message.message_id != broadcast_id)
         );
+    }
+
+    #[tokio::test]
+    async fn focused_human_prompt_and_recall_target_the_exact_child_actor() {
+        let directory = tempdir().unwrap();
+        let root = Uuid::new_v4();
+        let store = Arc::new(
+            crate::SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
+                .await
+                .unwrap(),
+        );
+        store.create_session(root).await.unwrap();
+        let coordinator = SubagentCoordinator::new_with_store_and_executor(
+            directory.path(),
+            root,
+            launch(),
+            3,
+            Arc::new(crate::LocalAgentTurnExecutor::default()),
+            store,
+        )
+        .unwrap();
+        let mut table = coordinator.table.lock().await;
+        let child = table.reserve("worker", &launch()).unwrap();
+        let (commands, mut received) = mpsc::channel(2);
+        let entry = table.entries.get_mut(&child.session_id).unwrap();
+        entry.snapshot.status = SubagentStatus::Running;
+        entry.commands = Some(commands);
+        drop(table);
+
+        let message_id = Uuid::new_v4();
+        coordinator
+            .prompt_child(
+                "worker",
+                message_id,
+                "inspect the scheduler".to_string(),
+                vec![PathBuf::from("/workspace/trace.txt")],
+                PromptDelivery::Steer,
+            )
+            .await
+            .unwrap();
+        let HostCommand::Prompt {
+            session_id,
+            message_id: received_id,
+            text,
+            attachments,
+            delivery,
+            ..
+        } = received.recv().await.unwrap()
+        else {
+            panic!("expected direct child prompt");
+        };
+        assert_eq!(session_id, child.session_id);
+        assert_eq!(received_id, message_id);
+        assert_eq!(text, "inspect the scheduler");
+        assert_eq!(attachments, [PathBuf::from("/workspace/trace.txt")]);
+        assert_eq!(delivery, PromptDelivery::Steer);
+
+        coordinator
+            .recall_child_prompt("worker", Some(message_id))
+            .await
+            .unwrap();
+        let HostCommand::RecallQueuedPrompt {
+            session_id,
+            message_id: recalled_id,
+        } = received.recv().await.unwrap()
+        else {
+            panic!("expected exact child prompt recall");
+        };
+        assert_eq!(session_id, child.session_id);
+        assert_eq!(recalled_id, Some(message_id));
     }
 
     #[tokio::test]

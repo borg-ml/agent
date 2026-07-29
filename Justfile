@@ -3,6 +3,18 @@ set shell := ["bash", "-eu", "-o", "pipefail", "-c"]
 default:
     @just --list
 
+# Validate a release without changing the repository.
+release-check version="":
+    ./scripts/release.sh --check {{ quote(version) }}
+
+# Exercise release versioning, rollback, tagging, and publication hermetically.
+release-test:
+    ./scripts/release-test.sh
+
+# Bump, verify, commit, tag, and publish a release. Defaults to the next patch.
+release version="":
+    ./scripts/release.sh {{ quote(version) }}
+
 # Build and install the optimized public Borg CLI from this checkout.
 cli:
     #!/usr/bin/env bash

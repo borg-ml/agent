@@ -393,16 +393,23 @@ fn rich_terminal_supported(term: Option<&str>, borg_tui: Option<&str>) -> bool {
 pub enum UiAction {
     None,
     Submit {
+        target: Option<Uuid>,
         text: String,
         attachments: Vec<PathBuf>,
     },
     Queue {
+        target: Option<Uuid>,
         message_id: Uuid,
         text: String,
         attachments: Vec<PathBuf>,
     },
-    Approve(ApprovalDecision),
-    RecallQueuedPrompts,
+    Approve {
+        target: Option<Uuid>,
+        decision: ApprovalDecision,
+    },
+    RecallQueuedPrompts {
+        target: Option<Uuid>,
+    },
     Rewind {
         sequence: u64,
         text: String,
@@ -418,7 +425,9 @@ pub enum UiAction {
     SetAutoExpandEdits(bool),
     SetAutoExpandTools(bool),
     LoadPayloads(Vec<SessionPayloadRef>),
-    Interrupt,
+    Interrupt {
+        target: Option<Uuid>,
+    },
     Quit,
 }
 
@@ -429,10 +438,15 @@ pub struct BorgTerminal {
     transcript: Transcript,
     director_transcript: Option<Box<Transcript>>,
     child_transcripts: HashMap<Uuid, Transcript>,
+    child_queued_prompts: HashMap<Uuid, Vec<PendingPromptProjection>>,
+    child_statuses: HashMap<Uuid, SessionStatus>,
+    child_pending_approvals: HashSet<Uuid>,
     focused_child: Option<Uuid>,
     team_switcher_open: bool,
     team_roster_hit_areas: Vec<(Rect, Option<Uuid>)>,
+    hovered_team_roster: Option<usize>,
     back_to_director_area: Option<Rect>,
+    back_to_director_hovered: bool,
     composer: Composer,
     attachment_store: AttachmentStore,
     keymap: KeyMap,
@@ -584,6 +598,21 @@ impl Picker {
 
     fn next(&mut self) {
         self.selected = (self.selected + 1) % self.options.len();
+    }
+
+    fn select_index(&mut self, index: usize) -> bool {
+        if index >= self.options.len() {
+            return false;
+        }
+        self.selected = index;
+        true
+    }
+
+    fn select_hovered(&mut self, kind: &MouseEventKind, hovered: Option<usize>) -> bool {
+        if !matches!(kind, MouseEventKind::Moved) {
+            return false;
+        }
+        hovered.is_some_and(|index| self.select_index(index))
     }
 
     fn scroll(&mut self, delta: isize) -> bool {
@@ -878,10 +907,15 @@ impl BorgTerminal {
             transcript: Transcript::default(),
             director_transcript: None,
             child_transcripts: HashMap::new(),
+            child_queued_prompts: HashMap::new(),
+            child_statuses: HashMap::new(),
+            child_pending_approvals: HashSet::new(),
             focused_child: None,
             team_switcher_open: false,
             team_roster_hit_areas: Vec::new(),
+            hovered_team_roster: None,
             back_to_director_area: None,
+            back_to_director_hovered: false,
             composer: Composer::default(),
             attachment_store,
             keymap,
@@ -999,28 +1033,46 @@ impl BorgTerminal {
 
     pub fn project_pending_prompt(
         &mut self,
+        target: Option<Uuid>,
         message_id: Uuid,
         text: String,
         delivery: PromptDelivery,
     ) {
-        push_queued_prompt(&mut self.queued_prompts, message_id, text, delivery);
+        if let Some(child) = target {
+            push_queued_prompt(
+                self.child_queued_prompts.entry(child).or_default(),
+                message_id,
+                text,
+                delivery,
+            );
+        } else {
+            push_queued_prompt(&mut self.queued_prompts, message_id, text, delivery);
+        }
     }
 
     pub fn reject_optimistic_prompt(
         &mut self,
+        target: Option<Uuid>,
         message_id: Uuid,
         text: String,
         attachments: Vec<PathBuf>,
     ) {
-        self.queued_prompts
-            .retain(|queued| queued.message_id != message_id);
+        if let Some(child) = target {
+            self.child_queued_prompts
+                .entry(child)
+                .or_default()
+                .retain(|queued| queued.message_id != message_id);
+        } else {
+            self.queued_prompts
+                .retain(|queued| queued.message_id != message_id);
+        }
         self.composer.restore(text, attachments);
         self.notice = Some("Could not send the prompt; it was returned to the composer".into());
     }
 
     pub fn is_launch_screen(&self) -> bool {
         self.transcript.order.is_empty()
-            && self.queued_prompts.is_empty()
+            && self.active_queued_prompts().is_empty()
             && self.composer.text.is_empty()
             && self.composer.attachments.is_empty()
     }
@@ -1096,6 +1148,10 @@ impl BorgTerminal {
                 self.pending_provider_interaction_secret = false;
             }
             SessionEventKind::Error { message } => self.notice = Some(message.clone()),
+            SessionEventKind::SubagentControl {
+                outcome: borg_remote::SubagentControlOutcome::Failed { message },
+                ..
+            } => self.notice = Some(format!("Agent action failed · {message}")),
             SessionEventKind::ContextCleared if !self.replaying_history => {
                 self.notice = Some("Conversation context cleared".to_string());
                 self.scroll_from_bottom = 0;
@@ -1123,8 +1179,10 @@ impl BorgTerminal {
         let transcript_changed =
             transcript_changed || transcript.order.len() != transcript_entries_before;
         if transcript_changed {
-            if (self.scroll_from_bottom > 0 || self.text_selection.is_some())
-                && self.pending_scroll_anchor_height.is_none()
+            if should_preserve_transcript_viewport(
+                self.scroll_from_bottom,
+                self.text_selection.is_some(),
+            ) && self.pending_scroll_anchor_height.is_none()
             {
                 self.pending_scroll_anchor_height = Some(self.rendered_transcript_height);
             }
@@ -1140,36 +1198,83 @@ impl BorgTerminal {
     fn record_child_event(&mut self, event: &SessionEvent) {
         let SessionEventKind::SubagentActivity {
             agent,
-            event: Some(child_event),
+            event: child_event,
             ..
         } = &event.kind
         else {
             return;
         };
+        let child_id = agent.session_id;
+        self.child_statuses
+            .insert(child_id, subagent_session_status(agent.status));
+        let Some(child_event) = child_event else {
+            return;
+        };
+        if let SessionEventKind::StatusChanged { status, .. } = child_event.kind {
+            self.child_statuses.insert(child_id, status);
+        }
+        update_queued_prompts(
+            self.child_queued_prompts.entry(child_id).or_default(),
+            &child_event.kind,
+        );
+        match &child_event.kind {
+            SessionEventKind::ApprovalRequested { .. } => {
+                self.child_pending_approvals.insert(child_id);
+            }
+            SessionEventKind::ApprovalResolved { .. } => {
+                self.child_pending_approvals.remove(&child_id);
+            }
+            SessionEventKind::PromptRecalled {
+                text, attachments, ..
+            } if self.focused_child == Some(child_id) && !self.replaying_history => {
+                self.composer
+                    .append_recalled(text.clone(), attachments.clone());
+                self.notice = Some("Queued prompts returned to composer".to_string());
+            }
+            _ => {}
+        }
         if self.focused_child == Some(agent.session_id) {
             self.transcript.apply(child_event);
         } else {
             self.child_transcripts
-                .entry(agent.session_id)
+                .entry(child_id)
                 .or_default()
                 .apply(child_event);
         }
     }
 
     fn focus_child_transcript(&mut self, child_id: Uuid) {
-        if self.focused_child.is_some() {
+        if self.focused_child == Some(child_id) {
+            self.team_switcher_open = false;
             return;
         }
-        switch_to_child_transcript(
-            &mut self.transcript,
-            &mut self.director_transcript,
-            &mut self.child_transcripts,
-            child_id,
-        );
+        if let Some(previous_child) = self.focused_child {
+            switch_between_child_transcripts(
+                &mut self.transcript,
+                &mut self.child_transcripts,
+                previous_child,
+                child_id,
+            );
+        } else {
+            switch_to_child_transcript(
+                &mut self.transcript,
+                &mut self.director_transcript,
+                &mut self.child_transcripts,
+                child_id,
+            );
+        }
         self.focused_child = Some(child_id);
         self.team_switcher_open = false;
         self.reset_transcript_focus();
-        self.notice = Some("Viewing child transcript · click Director to return".to_string());
+        let name = self
+            .director_transcript
+            .as_deref()
+            .and_then(|transcript| transcript.subagent_snapshots.get(&child_id))
+            .map(|agent| display_agent_name(&agent.task_name))
+            .unwrap_or_else(|| child_id.to_string());
+        self.notice = Some(format!(
+            "Viewing {name} · messages and interrupts target this agent"
+        ));
     }
 
     fn focus_director_transcript(&mut self) {
@@ -1185,6 +1290,91 @@ impl BorgTerminal {
         self.team_switcher_open = false;
         self.reset_transcript_focus();
         self.notice = Some("Viewing director transcript".to_string());
+    }
+
+    #[must_use]
+    pub const fn focused_child(&self) -> Option<Uuid> {
+        self.focused_child
+    }
+
+    pub fn seed_child_history(&mut self, child_id: Uuid, events: &[SessionEvent]) {
+        let was_replaying = self.replaying_history;
+        self.replaying_history = true;
+        // The root journal may contain a recent nested copy of these events.
+        // The child's own journal is authoritative for its full thread, so
+        // replace that partial projection instead of appending duplicates.
+        self.child_transcripts
+            .insert(child_id, Transcript::default());
+        self.child_queued_prompts.remove(&child_id);
+        self.child_pending_approvals.remove(&child_id);
+        for event in events {
+            if let SessionEventKind::StatusChanged { status, .. } = event.kind {
+                self.child_statuses.insert(child_id, status);
+            }
+            update_queued_prompts(
+                self.child_queued_prompts.entry(child_id).or_default(),
+                &event.kind,
+            );
+            match event.kind {
+                SessionEventKind::ApprovalRequested { .. } => {
+                    self.child_pending_approvals.insert(child_id);
+                }
+                SessionEventKind::ApprovalResolved { .. } => {
+                    self.child_pending_approvals.remove(&child_id);
+                }
+                _ => {}
+            }
+            self.child_transcripts
+                .entry(child_id)
+                .or_default()
+                .apply(event);
+        }
+        self.replaying_history = was_replaying;
+    }
+
+    pub fn seed_team_roster(&mut self, agents: &[SubagentSnapshot]) {
+        let transcript = self
+            .director_transcript
+            .as_deref_mut()
+            .unwrap_or(&mut self.transcript);
+        for agent in agents {
+            transcript.subagents.insert(agent.session_id, agent.status);
+            transcript
+                .subagent_snapshots
+                .insert(agent.session_id, agent.clone());
+            self.child_statuses
+                .insert(agent.session_id, subagent_session_status(agent.status));
+        }
+    }
+
+    fn active_status(&self) -> SessionStatus {
+        self.focused_child()
+            .and_then(|child| self.child_statuses.get(&child).copied())
+            .unwrap_or(self.status)
+    }
+
+    fn active_pending_approval(&self) -> bool {
+        self.focused_child.map_or(self.pending_approval, |child| {
+            self.child_pending_approvals.contains(&child)
+        })
+    }
+
+    fn active_queued_prompts(&self) -> &[PendingPromptProjection] {
+        if let Some(child) = self.focused_child {
+            self.child_queued_prompts
+                .get(&child)
+                .map_or(&[], Vec::as_slice)
+        } else {
+            self.queued_prompts.as_slice()
+        }
+    }
+
+    fn active_queued_prompts_mut(&mut self) -> &mut Vec<PendingPromptProjection> {
+        if let Some(child) = self.focused_child {
+            self.child_queued_prompts.entry(child).or_default()
+        } else {
+            &mut self.queued_prompts
+        }
     }
 
     fn reset_transcript_focus(&mut self) {
@@ -1602,6 +1792,12 @@ impl BorgTerminal {
                 self.agents_status_hovered = self
                     .agents_status_area
                     .is_some_and(|area| area.contains(pointer));
+                self.hovered_team_roster =
+                    team_roster_target_at(&self.team_roster_hit_areas, pointer)
+                        .map(|(index, _)| index);
+                self.back_to_director_hovered = self
+                    .back_to_director_area
+                    .is_some_and(|area| area.contains(pointer));
                 self.scrollbar_hovered = self
                     .scrollbar_area
                     .is_some_and(|area| area.contains(pointer));
@@ -1619,13 +1815,11 @@ impl BorgTerminal {
                         self.focus_director_transcript();
                         return Ok(UiAction::None);
                     }
-                    if let Some((_, child_id)) = self
-                        .team_roster_hit_areas
-                        .iter()
-                        .find(|(area, _)| area.contains(pointer))
+                    if let Some((_, child_id)) =
+                        team_roster_target_at(&self.team_roster_hit_areas, pointer)
                     {
                         if let Some(child_id) = child_id {
-                            self.focus_child_transcript(*child_id);
+                            self.focus_child_transcript(child_id);
                         } else {
                             self.focus_director_transcript();
                         }
@@ -1638,8 +1832,13 @@ impl BorgTerminal {
                         self.team_switcher_open = !self.team_switcher_open;
                         return Ok(UiAction::None);
                     }
+                    if self.team_switcher_open {
+                        self.team_switcher_open = false;
+                        self.hovered_team_roster = None;
+                    }
                 }
                 if let Some(picker) = self.picker.as_mut() {
+                    picker.select_hovered(&mouse.kind, self.hovered_picker_option);
                     let consumed = match mouse.kind {
                         MouseEventKind::ScrollUp => picker.scroll(-(scroll_repetitions as isize)),
                         MouseEventKind::ScrollDown => picker.scroll(scroll_repetitions as isize),
@@ -1655,7 +1854,10 @@ impl BorgTerminal {
                 ) {
                     if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
                         if let Some(option) = self.hovered_picker_option {
-                            self.picker.as_mut().expect("checked above").selected = option;
+                            self.picker
+                                .as_mut()
+                                .expect("checked above")
+                                .select_index(option);
                             return Ok(self.run_selected_message_action());
                         }
                         self.picker = None;
@@ -2180,10 +2382,12 @@ impl BorgTerminal {
         }
         Ok(match picker.kind {
             PickerKind::Settings => UiAction::Submit {
+                target: None,
                 text: picker.selected_value(),
                 attachments: Vec::new(),
             },
             PickerKind::Resume => UiAction::Submit {
+                target: None,
                 text: format!("/resume {}", picker.selected_value()),
                 attachments: Vec::new(),
             },
@@ -2229,7 +2433,7 @@ impl BorgTerminal {
             }
             self.copy_notice_expires_at = None;
         }
-        let title = terminal_title(self.status, self.transcript.first_prompt());
+        let title = terminal_title(self.active_status(), self.transcript.first_prompt());
         if self.last_terminal_title.as_deref() != Some(&title) {
             execute!(self.terminal.backend_mut(), SetTitle(&title))?;
             self.last_terminal_title = Some(title);
@@ -2284,7 +2488,7 @@ impl BorgTerminal {
             });
         let (transcript, tool_rows, tool_run_rows, message_rows, entry_rows, link_rows) =
             transcript_render.as_ref();
-        let queued_prompts = &self.queued_prompts;
+        let queued_prompts = self.active_queued_prompts().to_vec();
         // Keep the first draft anchored in the splash composition area. Moving
         // it to the chat footer on the first keystroke makes the whole screen
         // jump before the user has actually submitted anything.
@@ -2312,8 +2516,12 @@ impl BorgTerminal {
         } else {
             content_width
         };
-        let pending_approval = self.pending_approval;
-        let status = self.status;
+        let pending_approval = self.active_pending_approval();
+        let pending_provider_interaction =
+            self.focused_child.is_none() && self.pending_provider_interaction;
+        let pending_provider_interaction_secret =
+            self.focused_child.is_none() && self.pending_provider_interaction_secret;
+        let status = self.active_status();
         let status_label = if self.borging_this_run
             && matches!(status, SessionStatus::Starting | SessionStatus::Running)
         {
@@ -2330,9 +2538,19 @@ impl BorgTerminal {
             .as_deref()
             .unwrap_or(&self.transcript);
         let active_subagents = team_transcript.active_subagent_count();
-        let working_agents = active_subagents + 1;
-        let agent_roster_rows = team_transcript.active_agent_roster_rows();
         let agent_roster_entries = team_transcript.agent_roster_entries();
+        let focused_agent_name = self.focused_child.and_then(|child| {
+            team_transcript
+                .subagent_snapshots
+                .get(&child)
+                .map(|agent| display_agent_name(&agent.task_name))
+        });
+        let agent_roster_rows = agent_roster_entries
+            .iter()
+            .map(|(row, _)| row.clone())
+            .collect::<Vec<_>>();
+        let total_subagents = agent_roster_entries.len().saturating_sub(1);
+        let team_agent_count = total_subagents.saturating_add(1);
         let session_is_active = matches!(status, SessionStatus::Starting | SessionStatus::Running);
         let goal_status = self.transcript.goal_status();
         let slash_suggestions = (self.picker.is_none())
@@ -2403,7 +2621,7 @@ impl BorgTerminal {
             .saturating_sub(if is_launch_screen { 5 } else { 4 })
             .max(1) as usize;
         let (composer_display_text, composer_display_cursor) =
-            if self.pending_provider_interaction_secret {
+            if pending_provider_interaction_secret {
                 mask_secret_composer_text(&self.composer.text, self.composer.cursor)
             } else {
                 (self.composer.text.clone(), self.composer.cursor)
@@ -2428,7 +2646,7 @@ impl BorgTerminal {
         let composer_line_count = picker_lines
             .as_ref()
             .map_or_else(|| composer_ranges.len(), Vec::len);
-        let prompt_marker = if pending_approval || self.pending_provider_interaction {
+        let prompt_marker = if pending_approval || pending_provider_interaction {
             " ! "
         } else {
             " > "
@@ -2436,7 +2654,7 @@ impl BorgTerminal {
         let composer_render_lines = if self.picker.as_ref().is_some_and(|_| !message_actions_open) {
             Vec::new()
         } else if self.composer.text.is_empty() {
-            let placeholder = if self.pending_provider_interaction {
+            let placeholder = if pending_provider_interaction {
                 "Answer the provider request…"
             } else {
                 match status {
@@ -2451,7 +2669,7 @@ impl BorgTerminal {
                 Span::styled(prompt_marker, Style::default().fg(Color::DarkGray)),
                 Span::styled(placeholder, Style::default().fg(Color::DarkGray)),
             ])]
-        } else if self.pending_provider_interaction_secret {
+        } else if pending_provider_interaction_secret {
             styled_plain_composer_lines(&composer_display_text, &composer_ranges, prompt_marker)
         } else {
             self.composer
@@ -2489,7 +2707,7 @@ impl BorgTerminal {
                 .direction(Direction::Vertical)
                 .constraints([
                     Constraint::Min(3),
-                    Constraint::Length(queued_prompt_panel_height(queued_prompts)),
+                    Constraint::Length(queued_prompt_panel_height(&queued_prompts)),
                     Constraint::Length(2 * u16::from(!is_launch_screen)),
                     Constraint::Length(composer_height),
                     Constraint::Length(footer_height),
@@ -2820,7 +3038,7 @@ impl BorgTerminal {
                     },
                 );
             }
-            let composer_block = Block::default()
+            let mut composer_block = Block::default()
                 .style(Style::default().bg(if !is_launch_screen {
                     COMMAND_PANEL_BG
                 } else {
@@ -2836,6 +3054,14 @@ impl BorgTerminal {
                 } else {
                     Color::DarkGray
                 }));
+            if let Some(name) = focused_agent_name.as_deref() {
+                composer_block = composer_block.title(Span::styled(
+                    format!(" TO {name} "),
+                    Style::default()
+                        .fg(SUBAGENT_PINK)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
             if let Some(lines) = picker_lines.clone() {
                 frame.render_widget(
                     Paragraph::new(lines)
@@ -2870,6 +3096,7 @@ impl BorgTerminal {
                 Style::default().fg(status_color),
             )];
             if session_is_active
+                && self.focused_child.is_none()
                 && let Some(duration) =
                     format_elapsed_duration(self.active_since.map_or(0, |started| {
                         Utc::now()
@@ -2885,13 +3112,22 @@ impl BorgTerminal {
             }
             let agents_status_start = status_spans.iter().map(|span| span.width()).sum::<usize>();
             let agents_status_width =
-                (active_subagents > 0).then(|| format!(" · {working_agents} agents").width());
-            if active_subagents > 0 {
-                push_status_segment(
-                    &mut status_spans,
-                    format!("{working_agents} agents"),
-                    SUBAGENT_PINK,
-                );
+                (total_subagents > 0).then(|| format!(" · {team_agent_count} agents").width());
+            if total_subagents > 0 {
+                status_spans.push(Span::styled(
+                    format!(" · {team_agent_count} agents"),
+                    Style::default()
+                        .fg(if self.agents_status_hovered || self.team_switcher_open {
+                            Color::White
+                        } else {
+                            SUBAGENT_PINK
+                        })
+                        .add_modifier(if self.agents_status_hovered || self.team_switcher_open {
+                            Modifier::BOLD | Modifier::UNDERLINED
+                        } else {
+                            Modifier::empty()
+                        }),
+                ));
             }
             let goal_status_start = status_spans.iter().map(|span| span.width()).sum::<usize>();
             let goal_status_width = goal_status
@@ -2960,7 +3196,11 @@ impl BorgTerminal {
                     }),
                 status_area,
             );
-            if (self.agents_status_hovered || self.team_switcher_open) && active_subagents > 0 {
+            if (self.agents_status_hovered
+                || self.team_switcher_open
+                || self.hovered_team_roster.is_some())
+                && total_subagents > 0
+            {
                 let tooltip_width = agent_roster_rows
                     .iter()
                     .map(|row| row.width() as u16)
@@ -2981,29 +3221,37 @@ impl BorgTerminal {
                     height: tooltip_height,
                 };
                 frame.render_widget(Clear, tooltip);
+                let roster_lines = agent_roster_entries
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (row, child_id))| {
+                        let focused = *child_id == self.focused_child;
+                        let hovered = self.hovered_team_roster == Some(index);
+                        Line::from(format!("{} {row}", if focused { "›" } else { " " }))
+                            .style(team_roster_row_style(focused, hovered))
+                    })
+                    .collect::<Vec<_>>();
                 frame.render_widget(
-                    Paragraph::new(agent_roster_rows.join("\n"))
+                    Paragraph::new(roster_lines)
                         .style(Style::default().fg(Color::White).bg(COMMAND_PANEL_BG))
                         .block(
                             Block::default()
                                 .borders(Borders::ALL)
                                 .border_style(Style::default().fg(SUBAGENT_PINK))
-                                .title(" Team "),
+                                .title(format!(" Team · {active_subagents} working ")),
                         ),
                     tooltip,
                 );
-                if self.team_switcher_open {
-                    for (index, (_, child_id)) in agent_roster_entries.iter().enumerate() {
-                        next_team_roster_hit_areas.push((
-                            Rect {
-                                x: tooltip.x.saturating_add(1),
-                                y: tooltip.y.saturating_add(1 + index as u16),
-                                width: tooltip.width.saturating_sub(2),
-                                height: 1,
-                            },
-                            *child_id,
-                        ));
-                    }
+                for (index, (_, child_id)) in agent_roster_entries.iter().enumerate() {
+                    next_team_roster_hit_areas.push((
+                        Rect {
+                            x: tooltip.x.saturating_add(1),
+                            y: tooltip.y.saturating_add(1 + index as u16),
+                            width: tooltip.width.saturating_sub(2),
+                            height: 1,
+                        },
+                        *child_id,
+                    ));
                 }
             }
             if self.focused_child.is_some() {
@@ -3016,7 +3264,7 @@ impl BorgTerminal {
                 };
                 frame.render_widget(
                     Paragraph::new(label).style(Style::default().fg(Color::White).bg(
-                        if self.back_to_director_area == Some(button) {
+                        if self.back_to_director_hovered {
                             MESSAGE_HOVER_BG
                         } else {
                             COMMAND_PANEL_BG
@@ -3323,9 +3571,15 @@ impl BorgTerminal {
         self.last_ctrl_c = None;
         if self.pending_approval {
             return Ok(if self.keymap.matches(KeyAction::Approve, &key) {
-                UiAction::Approve(ApprovalDecision::AllowOnce)
+                UiAction::Approve {
+                    target: self.focused_child,
+                    decision: ApprovalDecision::AllowOnce,
+                }
             } else if self.keymap.matches(KeyAction::Deny, &key) {
-                UiAction::Approve(ApprovalDecision::Deny)
+                UiAction::Approve {
+                    target: self.focused_child,
+                    decision: ApprovalDecision::Deny,
+                }
             } else {
                 UiAction::None
             });
@@ -3397,25 +3651,30 @@ impl BorgTerminal {
             self.notice = None;
             return Ok(
                 if matches!(
-                    self.status,
+                    self.active_status(),
                     SessionStatus::Starting
                         | SessionStatus::Running
                         | SessionStatus::WaitingForApproval
                 ) {
                     let message_id = Uuid::new_v4();
                     push_queued_prompt(
-                        &mut self.queued_prompts,
+                        self.active_queued_prompts_mut(),
                         message_id,
                         text.clone(),
                         PromptDelivery::Queue,
                     );
                     UiAction::Queue {
+                        target: self.focused_child,
                         message_id,
                         text,
                         attachments,
                     }
                 } else {
-                    UiAction::Submit { text, attachments }
+                    UiAction::Submit {
+                        target: self.focused_child,
+                        text,
+                        attachments,
+                    }
                 },
             );
         }
@@ -3431,7 +3690,11 @@ impl BorgTerminal {
                 return Ok(UiAction::None);
             }
             self.notice = None;
-            return Ok(UiAction::Submit { text, attachments });
+            return Ok(UiAction::Submit {
+                target: self.focused_child,
+                text,
+                attachments,
+            });
         }
         if self.keymap.matches(KeyAction::ScrollUp, &key) {
             self.scroll_from_bottom = self.scroll_from_bottom.saturating_add(8);
@@ -3442,7 +3705,9 @@ impl BorgTerminal {
             return Ok(UiAction::None);
         }
         if self.keymap.matches(KeyAction::Interrupt, &key) {
-            return Ok(UiAction::Interrupt);
+            return Ok(UiAction::Interrupt {
+                target: self.focused_child,
+            });
         }
         match key.code {
             KeyCode::Char(character) => {
@@ -3491,10 +3756,16 @@ impl BorgTerminal {
                         .unwrap_or(slash_matches - 1);
                     return Ok(UiAction::None);
                 }
-                if has_recallable_queued_prompts(&self.composer.text, &self.queued_prompts) {
-                    return Ok(UiAction::RecallQueuedPrompts);
+                if has_recallable_queued_prompts(&self.composer.text, self.active_queued_prompts())
+                {
+                    return Ok(UiAction::RecallQueuedPrompts {
+                        target: self.focused_child,
+                    });
                 }
-                if pending_steer_blocks_history_recall(&self.composer.text, &self.queued_prompts) {
+                if pending_steer_blocks_history_recall(
+                    &self.composer.text,
+                    self.active_queued_prompts(),
+                ) {
                     // A steer is already owned by the active provider turn and
                     // cannot be truthfully withdrawn after turn/steer accepts
                     // it. Do not fall through to ordinary composer history:
@@ -3604,6 +3875,16 @@ fn switch_to_child_transcript(
     *director_transcript = Some(Box::new(std::mem::replace(transcript, child)));
 }
 
+fn switch_between_child_transcripts(
+    transcript: &mut Transcript,
+    child_transcripts: &mut HashMap<Uuid, Transcript>,
+    previous_child: Uuid,
+    next_child: Uuid,
+) {
+    let next = child_transcripts.remove(&next_child).unwrap_or_default();
+    child_transcripts.insert(previous_child, std::mem::replace(transcript, next));
+}
+
 fn switch_to_director_transcript(
     transcript: &mut Transcript,
     director_transcript: &mut Option<Box<Transcript>>,
@@ -3614,6 +3895,50 @@ fn switch_to_director_transcript(
         .take()
         .expect("child focus has director transcript");
     child_transcripts.insert(child_id, std::mem::replace(transcript, director));
+}
+
+fn subagent_session_status(status: SubagentStatus) -> SessionStatus {
+    match status {
+        SubagentStatus::Starting => SessionStatus::Starting,
+        SubagentStatus::Running => SessionStatus::Running,
+        SubagentStatus::Ready => SessionStatus::Ready,
+        SubagentStatus::WaitingForApproval => SessionStatus::WaitingForApproval,
+        SubagentStatus::Stopped => SessionStatus::Stopped,
+        SubagentStatus::Failed => SessionStatus::Failed,
+    }
+}
+
+fn display_agent_name(task_name: &str) -> String {
+    task_name
+        .strip_prefix("/root/")
+        .unwrap_or(task_name)
+        .to_string()
+}
+
+fn team_roster_row_style(focused: bool, hovered: bool) -> Style {
+    if hovered {
+        Style::default()
+            .fg(Color::Black)
+            .bg(SUBAGENT_PINK)
+            .add_modifier(Modifier::BOLD)
+    } else if focused {
+        Style::default()
+            .fg(SUBAGENT_PINK)
+            .bg(COMMAND_PANEL_BG)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::White).bg(COMMAND_PANEL_BG)
+    }
+}
+
+fn team_roster_target_at(
+    hit_areas: &[(Rect, Option<Uuid>)],
+    pointer: Position,
+) -> Option<(usize, Option<Uuid>)> {
+    hit_areas
+        .iter()
+        .enumerate()
+        .find_map(|(index, (area, child_id))| area.contains(pointer).then_some((index, *child_id)))
 }
 
 #[derive(Default)]
@@ -4506,15 +4831,7 @@ impl Transcript {
         if !matches!(self.order.get(index), Some(TranscriptEntry::Tool { .. })) {
             return None;
         }
-        let mut start = index;
-        while start > 0 && matches!(self.order[start - 1], TranscriptEntry::Tool { .. }) {
-            start -= 1;
-        }
-        let total = self.order[start..]
-            .iter()
-            .take_while(|entry| matches!(entry, TranscriptEntry::Tool { .. }))
-            .count();
-        (total > TOOL_RUN_BOX_THRESHOLD).then_some(start)
+        self.tool_run_windows()[index].map(|window| window.start)
     }
 
     fn apply(&mut self, event: &SessionEvent) {
@@ -5209,13 +5526,6 @@ impl Transcript {
             .count()
     }
 
-    fn active_agent_roster_rows(&self) -> Vec<String> {
-        self.agent_roster_entries()
-            .into_iter()
-            .map(|(row, _)| row)
-            .collect()
-    }
-
     fn agent_roster_entries(&self) -> Vec<(String, Option<Uuid>)> {
         let mut rows = Vec::new();
         if let Some(config) = self.config.as_ref() {
@@ -5236,10 +5546,7 @@ impl Transcript {
         let mut agents = self.subagent_snapshots.values().collect::<Vec<_>>();
         agents.sort_by(|left, right| left.task_name.cmp(&right.task_name));
         rows.extend(agents.into_iter().map(|agent| {
-            let name = agent
-                .task_name
-                .strip_prefix("/root/")
-                .unwrap_or(&agent.task_name);
+            let name = display_agent_name(&agent.task_name);
             let model = agent
                 .model
                 .as_deref()
@@ -5547,9 +5854,10 @@ impl Transcript {
                 }
                 TranscriptEntry::Activity { text, time } => {
                     let time = display_local_time(time, today);
+                    let prefix = if tool_window.is_some() { "│ " } else { "  " };
                     for line in wrap_display(text, width.saturating_sub(8)) {
                         lines.push(Line::from(Span::styled(
-                            format!("  {time}  {line}"),
+                            format!("{prefix}{time}  {line}"),
                             Style::default().fg(Color::DarkGray),
                         )));
                     }
@@ -6013,10 +6321,21 @@ impl Transcript {
                 continue;
             }
             let start = index;
-            while index < self.order.len()
-                && matches!(self.order[index], TranscriptEntry::Tool { .. })
-            {
-                index += 1;
+            while index < self.order.len() {
+                if matches!(self.order[index], TranscriptEntry::Tool { .. }) {
+                    index += 1;
+                    continue;
+                }
+                if action_run_bridge(&self.order[index])
+                    && matches!(
+                        self.order.get(index + 1),
+                        Some(TranscriptEntry::Tool { .. })
+                    )
+                {
+                    index += 1;
+                    continue;
+                }
+                break;
             }
             let total = index - start;
             if total <= TOOL_RUN_BOX_THRESHOLD {
@@ -6564,9 +6883,10 @@ fn queued_prompt_lines(
     let mut hints = Vec::new();
     if has_steers {
         hints.push("esc interrupt + send now");
+        hints.push("↑ edit / recall pending");
     }
     if has_queue {
-        hints.push("↑ edit all queued");
+        hints.push("↑ edit / recall queued");
     }
     lines.push(Line::from(Span::styled(
         format!("   {}", hints.join("  ·  ")),
@@ -6690,6 +7010,13 @@ fn apply_text_selection(
     }
 }
 
+fn action_run_bridge(entry: &TranscriptEntry) -> bool {
+    matches!(
+        entry,
+        TranscriptEntry::Activity { text, .. } if text.starts_with("agent · ")
+    )
+}
+
 fn selected_transcript_text(lines: &[Line<'static>], selection: TextSelection) -> Option<String> {
     let (start, end) = selection.ordered();
     if start == end || start.row >= lines.len() {
@@ -6764,6 +7091,10 @@ fn preserve_scroll_anchor(
     } else {
         scroll_from_bottom.saturating_sub(previous_height - next_height)
     }
+}
+
+fn should_preserve_transcript_viewport(scroll_from_bottom: usize, selection_active: bool) -> bool {
+    scroll_from_bottom > 0 && !selection_active
 }
 
 fn transcript_viewport_anchor(

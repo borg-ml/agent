@@ -7,13 +7,14 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use borg_remote::{
     AgentTurnExecutor, ApprovalDecision, CodingProvider, EventActor, GoalAction, GoalStatus,
-    HostCommand, HostConfig, LaunchSession, LocalAgentSettings, LocalAgentTurnExecutor,
-    LocalSessionControlServer, MessageStatus, PermissionMode, PlanItem, PlanItemStatus,
-    PromptDelivery, ResponseLanguage, SessionConfigAction, SessionEvent, SessionEventKind,
-    SessionGoal, SessionStatus, SessionStore, SessionWriterLease, SqliteSessionStore,
-    SqliteWorkspaceStore, TodoAction, default_host_config_path, enroll_host, login_provider,
-    mirror_local_session, probe_capabilities, run_agent_session_with_store_and_writer,
-    run_attached_session, run_host, session_control_socket_path,
+    HostCommand, HostConfig, JsonlSessionStore, LaunchSession, LocalAgentSettings,
+    LocalAgentTurnExecutor, LocalSessionControlServer, MessageStatus, PermissionMode, PlanItem,
+    PlanItemStatus, PromptDelivery, ResponseLanguage, SessionConfigAction, SessionEvent,
+    SessionEventKind, SessionGoal, SessionStatus, SessionStore, SessionWriterLease,
+    SqliteSessionStore, SqliteWorkspaceStore, SubagentAction, SubagentSnapshot, TodoAction,
+    default_host_config_path, enroll_host, login_provider, mirror_local_session,
+    probe_capabilities, run_agent_session_with_store_and_writer, run_attached_session, run_host,
+    session_control_socket_path,
 };
 use chrono::{Local, Utc};
 use pulldown_cmark::{Event as MarkdownEvent, Parser as MarkdownParser};
@@ -583,6 +584,11 @@ async fn run_local_agent_session(
     } else {
         store.read(session_id).await?
     };
+    let (team_history, team_snapshots, child_histories) = if can_prompt && !fallback_terminal {
+        load_subagent_thread_state(store.as_ref(), &sessions_dir, session_id).await?
+    } else {
+        (Vec::new(), Vec::new(), HashMap::new())
+    };
     let request_id = initial_prompt
         .as_ref()
         .map_or(session_id, |_| Uuid::new_v4());
@@ -756,6 +762,7 @@ async fn run_local_agent_session(
     };
     if let Some(terminal) = terminal.as_mut() {
         terminal.seed_history(&history);
+        seed_terminal_subagent_threads(terminal, &team_snapshots, &child_histories);
         terminal.seed_session_state(&session_state);
         terminal.set_auto_expand_edits(editor_preferences.presentation.auto_expand_edits);
         terminal.set_auto_expand_tools(editor_preferences.presentation.auto_expand_tools);
@@ -779,6 +786,7 @@ async fn run_local_agent_session(
         .zip(session_state.pending_provider_interaction_kind.clone())
         .zip(session_state.pending_provider_interaction_payload.clone())
         .map(|((interaction_id, kind), payload)| (interaction_id, kind, payload));
+    let mut child_pending_approvals = child_pending_approval_ids(&team_history);
     let mut saw_running = false;
     let mut stop_sent = false;
     let mut user_requested_exit = false;
@@ -901,6 +909,24 @@ async fn run_local_agent_session(
                         *cached_input_tokens,
                         *cost_usd,
                     ),
+                    SessionEventKind::SubagentActivity {
+                        agent,
+                        event: Some(child_event),
+                        ..
+                    } => match &child_event.kind {
+                        SessionEventKind::ApprovalRequested { approval_id, .. } => {
+                            child_pending_approvals
+                                .insert(agent.session_id, approval_id.clone());
+                        }
+                        SessionEventKind::ApprovalResolved { approval_id, .. }
+                            if child_pending_approvals
+                                .get(&agent.session_id)
+                                .is_some_and(|pending| pending == approval_id) =>
+                        {
+                            child_pending_approvals.remove(&agent.session_id);
+                        }
+                        _ => {}
+                    },
                     _ => {}
                 }
                 if let Some(terminal) = terminal.as_mut() {
@@ -1394,8 +1420,25 @@ async fn run_local_agent_session(
                 }
                 match action {
                     UiAction::None => {}
-                    UiAction::Approve(decision) => {
-                        if let Some(approval_id) = pending_approval.clone() {
+                    UiAction::Approve { target, decision } => {
+                        if let Some(target) = target {
+                            if let Some(approval_id) =
+                                child_pending_approvals.get(&target).cloned()
+                            {
+                                session_command_tx
+                                    .send(HostCommand::Subagent {
+                                        session_id,
+                                        action: SubagentAction::Approve {
+                                            request_id: Uuid::new_v4(),
+                                            target: target.to_string(),
+                                            approval_id,
+                                            decision,
+                                        },
+                                    })
+                                    .await
+                                    .ok();
+                            }
+                        } else if let Some(approval_id) = pending_approval.clone() {
                             session_command_tx.send(HostCommand::Approve {
                                 session_id,
                                 approval_id,
@@ -1403,14 +1446,28 @@ async fn run_local_agent_session(
                             }).await.ok();
                         }
                     }
-                    UiAction::RecallQueuedPrompts => {
-                        session_command_tx
-                            .send(HostCommand::RecallQueuedPrompt {
-                                session_id,
-                                message_id: None,
-                            })
-                            .await
-                            .ok();
+                    UiAction::RecallQueuedPrompts { target } => {
+                        if let Some(target) = target {
+                            session_command_tx
+                                .send(HostCommand::Subagent {
+                                    session_id,
+                                    action: SubagentAction::RecallPrompt {
+                                        request_id: Uuid::new_v4(),
+                                        target: target.to_string(),
+                                        message_id: None,
+                                    },
+                                })
+                                .await
+                                .ok();
+                        } else {
+                            session_command_tx
+                                .send(HostCommand::RecallQueuedPrompt {
+                                    session_id,
+                                    message_id: None,
+                                })
+                                .await
+                                .ok();
+                        }
                     }
                     UiAction::Rewind {
                         sequence,
@@ -1553,8 +1610,19 @@ async fn run_local_agent_session(
                             }
                         }
                     }
-                    UiAction::Interrupt => {
-                        if matches!(
+                    UiAction::Interrupt { target } => {
+                        if let Some(target) = target {
+                            session_command_tx
+                                .send(HostCommand::Subagent {
+                                    session_id,
+                                    action: SubagentAction::Interrupt {
+                                        request_id: Uuid::new_v4(),
+                                        target: target.to_string(),
+                                    },
+                                })
+                                .await
+                                .ok();
+                        } else if matches!(
                             status,
                             SessionStatus::Starting
                                 | SessionStatus::Running
@@ -1569,34 +1637,89 @@ async fn run_local_agent_session(
                         session_command_tx.send(HostCommand::Stop { session_id }).await.ok();
                     }
                     UiAction::Queue {
+                        target,
                         message_id,
                         text,
                         attachments,
                     } => {
-                        if let Err(error) = session_command_tx
-                            .send(HostCommand::Prompt {
+                        let command = target.map_or_else(
+                            || HostCommand::Prompt {
                                 session_id,
                                 message_id,
-                                text,
-                                attachments,
+                                text: text.clone(),
+                                attachments: attachments.clone(),
                                 output_schema: None,
                                 delivery: PromptDelivery::Queue,
-                            })
-                            .await
-                        {
-                            let HostCommand::Prompt {
-                                text, attachments, ..
-                            } = error.0
-                            else {
-                                unreachable!("queue submission always sends a prompt command");
+                            },
+                            |target| HostCommand::Subagent {
+                                session_id,
+                                action: SubagentAction::Prompt {
+                                    request_id: Uuid::new_v4(),
+                                    target: target.to_string(),
+                                    message_id,
+                                    text: text.clone(),
+                                    attachments: attachments.clone(),
+                                    delivery: PromptDelivery::Queue,
+                                },
+                            },
+                        );
+                        if session_command_tx.send(command).await.is_err() {
+                            terminal
+                                .as_mut()
+                                .expect("terminal")
+                                .reject_optimistic_prompt(
+                                    target,
+                                    message_id,
+                                    text,
+                                    attachments,
+                                );
+                        }
+                    }
+                    UiAction::Submit {
+                        target,
+                        text,
+                        attachments,
+                    } => {
+                        if let Some(target) = target {
+                            let message_id = Uuid::new_v4();
+                            let delivery = if steer_active_codex {
+                                PromptDelivery::Steer
+                            } else {
+                                PromptDelivery::Queue
                             };
                             terminal
                                 .as_mut()
                                 .expect("terminal")
-                                .reject_optimistic_prompt(message_id, text, attachments);
+                                .project_pending_prompt(
+                                    Some(target),
+                                    message_id,
+                                    text.clone(),
+                                    delivery,
+                                );
+                            let command = HostCommand::Subagent {
+                                session_id,
+                                action: SubagentAction::Prompt {
+                                    request_id: Uuid::new_v4(),
+                                    target: target.to_string(),
+                                    message_id,
+                                    text: text.clone(),
+                                    attachments: attachments.clone(),
+                                    delivery,
+                                },
+                            };
+                            if session_command_tx.send(command).await.is_err() {
+                                terminal
+                                    .as_mut()
+                                    .expect("terminal")
+                                    .reject_optimistic_prompt(
+                                        Some(target),
+                                        message_id,
+                                        text,
+                                        attachments,
+                                    );
+                            }
+                            continue;
                         }
-                    }
-                    UiAction::Submit { text, attachments } => {
                         if let Some((interaction_id, kind, payload)) =
                             pending_provider_interaction.clone()
                         {
@@ -2080,6 +2203,18 @@ async fn run_local_agent_session(
                                             &agent_config.keybindings,
                                         )?;
                                         restored.seed_history(&latest);
+                                        let (_, agents, histories) =
+                                            load_subagent_thread_state(
+                                                store.as_ref(),
+                                                &sessions_dir,
+                                                session_id,
+                                            )
+                                                .await?;
+                                        seed_terminal_subagent_threads(
+                                            &mut restored,
+                                            &agents,
+                                            &histories,
+                                        );
                                         restored.seed_session_state(&latest_state);
                                         restored.set_notice(match connected {
                                             Ok(()) => "Remote connected. This chat is now available at borg.ml/remote.".to_string(),
@@ -2117,6 +2252,18 @@ async fn run_local_agent_session(
                                             &agent_config.keybindings,
                                         )?;
                                         restored.seed_history(&latest);
+                                        let (_, agents, histories) =
+                                            load_subagent_thread_state(
+                                                store.as_ref(),
+                                                &sessions_dir,
+                                                session_id,
+                                            )
+                                                .await?;
+                                        seed_terminal_subagent_threads(
+                                            &mut restored,
+                                            &agents,
+                                            &histories,
+                                        );
                                         restored.seed_session_state(&latest_state);
                                         restored.set_notice(match login {
                                             Ok(()) => "Signed in. Retry your message.".to_string(),
@@ -2152,6 +2299,7 @@ async fn run_local_agent_session(
                                                 .as_mut()
                                                 .expect("terminal")
                                                 .project_pending_prompt(
+                                                    None,
                                                     message_id,
                                                     text.clone(),
                                                     delivery,
@@ -2175,6 +2323,7 @@ async fn run_local_agent_session(
                                                 .as_mut()
                                                 .expect("terminal")
                                                 .reject_optimistic_prompt(
+                                                    None,
                                                     message_id,
                                                     text,
                                                     attachments,
@@ -2603,6 +2752,115 @@ async fn recent_tui_history(
             RICH_TUI_HISTORY_EVENT_LIMIT,
         )
         .await
+}
+
+fn child_pending_approval_ids(events: &[SessionEvent]) -> HashMap<Uuid, String> {
+    let mut pending = HashMap::new();
+    for event in events {
+        let SessionEventKind::SubagentActivity {
+            agent,
+            event: Some(child_event),
+            ..
+        } = &event.kind
+        else {
+            continue;
+        };
+        match &child_event.kind {
+            SessionEventKind::ApprovalRequested { approval_id, .. } => {
+                pending.insert(agent.session_id, approval_id.clone());
+            }
+            SessionEventKind::ApprovalResolved { approval_id, .. }
+                if pending
+                    .get(&agent.session_id)
+                    .is_some_and(|current| current == approval_id) =>
+            {
+                pending.remove(&agent.session_id);
+            }
+            _ => {}
+        }
+    }
+    pending
+}
+
+fn latest_subagent_snapshots(events: &[SessionEvent]) -> Vec<SubagentSnapshot> {
+    let mut latest = HashMap::new();
+    for event in events {
+        if let SessionEventKind::SubagentActivity { agent, .. } = &event.kind {
+            latest.insert(agent.session_id, agent.clone());
+        }
+    }
+    let mut agents = latest.into_values().collect::<Vec<_>>();
+    agents.sort_by(|left, right| left.task_name.cmp(&right.task_name));
+    agents
+}
+
+fn seed_terminal_subagent_threads(
+    terminal: &mut BorgTerminal,
+    agents: &[SubagentSnapshot],
+    histories: &HashMap<Uuid, Vec<SessionEvent>>,
+) {
+    terminal.seed_team_roster(agents);
+    for (child_id, events) in histories {
+        terminal.seed_child_history(*child_id, events);
+    }
+}
+
+async fn load_subagent_thread_state(
+    store: &dyn SessionStore,
+    sessions_dir: &Path,
+    session_id: Uuid,
+) -> Result<(
+    Vec<SessionEvent>,
+    Vec<SubagentSnapshot>,
+    HashMap<Uuid, Vec<SessionEvent>>,
+)> {
+    let team_history = store.recovery(session_id).await?.subagent_events;
+    let team_snapshots = latest_subagent_snapshots(&team_history);
+    let mut child_histories = HashMap::new();
+    for agent in &team_snapshots {
+        match store.read(agent.session_id).await {
+            Ok(events) => {
+                child_histories.insert(agent.session_id, events);
+            }
+            Err(store_error) => {
+                let legacy_path = sessions_dir
+                    .join("subagents")
+                    .join(format!("{}.jsonl", agent.session_id));
+                if !legacy_path.is_file() {
+                    tracing::warn!(
+                        child_session_id = %agent.session_id,
+                        %store_error,
+                        "could not load subagent transcript history"
+                    );
+                    continue;
+                }
+                match JsonlSessionStore::open(&legacy_path) {
+                    Ok(legacy) => match legacy.read(agent.session_id).await {
+                        Ok(events) => {
+                            child_histories.insert(agent.session_id, events);
+                        }
+                        Err(legacy_error) => {
+                            tracing::warn!(
+                                child_session_id = %agent.session_id,
+                                %store_error,
+                                %legacy_error,
+                                "could not load subagent transcript history"
+                            );
+                        }
+                    },
+                    Err(legacy_error) => {
+                        tracing::warn!(
+                            child_session_id = %agent.session_id,
+                            %store_error,
+                            %legacy_error,
+                            "could not load subagent transcript history"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    Ok((team_history, team_snapshots, child_histories))
 }
 
 async fn recent_sessions_summary(
@@ -3450,6 +3708,66 @@ mod tests {
                 &["--user", "enable", "borg-remote.service"][..],
                 &["--user", "restart", "borg-remote.service"][..],
             ]
+        );
+    }
+
+    #[test]
+    fn team_history_restores_every_agent_and_child_approval() {
+        let root = Uuid::new_v4();
+        let child = Uuid::new_v4();
+        let now = Utc::now();
+        let mut agent = SubagentSnapshot {
+            session_id: child,
+            parent_session_id: root,
+            task_name: "/root/worker".to_string(),
+            status: borg_remote::SubagentStatus::Running,
+            provider: CodingProvider::Codex,
+            model: Some("gpt-test".to_string()),
+            effort: Some("low".to_string()),
+            cwd: PathBuf::from("/workspace"),
+            created_at: now,
+            updated_at: now,
+            detail: None,
+            final_text: None,
+            usage: borg_remote::SubagentUsage::default(),
+        };
+        let approval_id = "approval-1".to_string();
+        let approval = SessionEvent::new(
+            root,
+            1,
+            SessionEventKind::SubagentActivity {
+                activity: borg_remote::SubagentActivityKind::Updated,
+                agent: agent.clone(),
+                event: Some(Box::new(SessionEvent::new(
+                    child,
+                    1,
+                    SessionEventKind::ApprovalRequested {
+                        approval_id: approval_id.clone(),
+                        title: "Run tests?".to_string(),
+                        detail: String::new(),
+                        command: None,
+                    },
+                ))),
+            },
+        );
+        agent.status = borg_remote::SubagentStatus::Ready;
+        let completed = SessionEvent::new(
+            root,
+            2,
+            SessionEventKind::SubagentActivity {
+                activity: borg_remote::SubagentActivityKind::Completed,
+                agent: agent.clone(),
+                event: None,
+            },
+        );
+
+        let restored = latest_subagent_snapshots(&[approval.clone(), completed]);
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].session_id, child);
+        assert_eq!(restored[0].status, borg_remote::SubagentStatus::Ready);
+        assert_eq!(
+            child_pending_approval_ids(&[approval]),
+            HashMap::from([(child, approval_id)])
         );
     }
 
