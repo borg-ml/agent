@@ -3320,6 +3320,8 @@ mod tests {
     #[tokio::test]
     async fn restored_live_child_migrates_to_sqlite_and_accepts_typed_control() {
         let directory = tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
         let root = Uuid::new_v4();
         let child_id = Uuid::new_v4();
         let now = Utc::now();
@@ -3331,7 +3333,7 @@ mod tests {
             provider: CodingProvider::Codex,
             model: Some("gpt-test".into()),
             effort: Some("high".into()),
-            cwd: PathBuf::from("/workspace"),
+            cwd: workspace.clone(),
             created_at: now,
             updated_at: now,
             detail: None,
@@ -3361,7 +3363,7 @@ mod tests {
                 child_id,
                 0,
                 SessionEventKind::SessionConfigured {
-                    cwd: PathBuf::from("/workspace"),
+                    cwd: workspace,
                     provider: CodingProvider::Codex,
                     model: Some("gpt-test".into()),
                     effort: Some("high".into()),

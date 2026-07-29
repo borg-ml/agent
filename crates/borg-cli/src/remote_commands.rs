@@ -365,7 +365,9 @@ impl LocalSessionAccess {
             Self::Owned
                 if matches!(
                     status,
-                    SessionStatus::Running | SessionStatus::WaitingForApproval
+                    SessionStatus::Starting
+                        | SessionStatus::Running
+                        | SessionStatus::WaitingForApproval
                 ) =>
             {
                 anyhow::bail!("Interrupt the current turn before resuming another session.")
@@ -1319,7 +1321,9 @@ async fn run_local_agent_session(
                     _ => {
                         let active = matches!(
                             status,
-                            SessionStatus::Running | SessionStatus::WaitingForApproval
+                            SessionStatus::Starting
+                                | SessionStatus::Running
+                                | SessionStatus::WaitingForApproval
                         );
                         let (delivery, text) = if active {
                             running_input(line, provider, steer_active_codex)
@@ -1399,11 +1403,11 @@ async fn run_local_agent_session(
                             }).await.ok();
                         }
                     }
-                    UiAction::RecallQueuedPrompt { message_id } => {
+                    UiAction::RecallQueuedPrompts => {
                         session_command_tx
                             .send(HostCommand::RecallQueuedPrompt {
                                 session_id,
-                                message_id: Some(message_id),
+                                message_id: None,
                             })
                             .await
                             .ok();
@@ -1413,7 +1417,12 @@ async fn run_local_agent_session(
                         text,
                         attachments,
                     } => {
-                        if matches!(status, SessionStatus::Running | SessionStatus::WaitingForApproval) {
+                        if matches!(
+                            status,
+                            SessionStatus::Starting
+                                | SessionStatus::Running
+                                | SessionStatus::WaitingForApproval
+                        ) {
                             terminal.as_mut().expect("terminal").set_notice(
                                 "Interrupt the current turn before rewinding".to_string(),
                             );
@@ -1545,7 +1554,12 @@ async fn run_local_agent_session(
                         }
                     }
                     UiAction::Interrupt => {
-                        if matches!(status, SessionStatus::Running | SessionStatus::WaitingForApproval) {
+                        if matches!(
+                            status,
+                            SessionStatus::Starting
+                                | SessionStatus::Running
+                                | SessionStatus::WaitingForApproval
+                        ) {
                             session_command_tx.send(HostCommand::Interrupt { session_id }).await.ok();
                         }
                     }
@@ -2003,7 +2017,9 @@ async fn run_local_agent_session(
                                 "/remote" if attachments.is_empty() => {
                                     if matches!(
                                         status,
-                                        SessionStatus::Running | SessionStatus::WaitingForApproval
+                                        SessionStatus::Starting
+                                            | SessionStatus::Running
+                                            | SessionStatus::WaitingForApproval
                                     ) {
                                         terminal.as_mut().expect("terminal").set_notice(
                                             "Interrupt the current turn before connecting Borg Remote."
@@ -2075,7 +2091,9 @@ async fn run_local_agent_session(
                                 "/login" if attachments.is_empty() => {
                                     if matches!(
                                         status,
-                                        SessionStatus::Running | SessionStatus::WaitingForApproval
+                                        SessionStatus::Starting
+                                            | SessionStatus::Running
+                                            | SessionStatus::WaitingForApproval
                                     ) {
                                         terminal.as_mut().expect("terminal").set_notice(
                                             "Interrupt the current turn before reconnecting the provider."
@@ -2118,7 +2136,9 @@ async fn run_local_agent_session(
                                 _ => {
                                     let active = matches!(
                                         status,
-                                        SessionStatus::Running | SessionStatus::WaitingForApproval
+                                        SessionStatus::Starting
+                                            | SessionStatus::Running
+                                            | SessionStatus::WaitingForApproval
                                     );
                                     let (delivery, text) = if active {
                                         running_input(&text, provider, steer_active_codex)

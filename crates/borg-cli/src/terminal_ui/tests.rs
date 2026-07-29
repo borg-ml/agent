@@ -1971,7 +1971,7 @@ fn one_queued_prompt_allocates_a_content_row_below_its_border() {
         .collect::<String>();
     assert!(content.contains("NEXT TURN"));
     assert!(content.contains("visible follow-up"));
-    assert!(hint.contains("↑ edit latest queued"));
+    assert!(hint.contains("↑ edit all queued"));
 }
 
 #[test]
@@ -1990,11 +1990,11 @@ fn pending_steer_ui_names_the_tool_boundary_and_interrupt_action() {
     assert!(rendered.contains("NEXT TOOL"));
     assert!(rendered.contains("focus on the failing test"));
     assert!(rendered.contains("esc interrupt + send now"));
-    assert!(!rendered.contains("edit latest queued"));
+    assert!(!rendered.contains("edit all queued"));
 }
 
 #[test]
-fn up_recall_targets_the_latest_exact_queued_prompt_only_for_an_empty_composer() {
+fn up_recall_targets_all_queued_prompts_only_for_an_empty_composer() {
     let queued = PendingPromptProjection {
         message_id: Uuid::new_v4(),
         text: "edit me".to_string(),
@@ -2006,36 +2006,27 @@ fn up_recall_targets_the_latest_exact_queued_prompt_only_for_an_empty_composer()
         delivery: PromptDelivery::Steer,
     };
 
-    assert_eq!(
-        latest_recallable_prompt_id("", &[queued.clone()]),
-        Some(queued.message_id)
-    );
-    assert_eq!(
-        latest_recallable_prompt_id("", &[queued.clone(), steer.clone()]),
-        Some(queued.message_id)
-    );
-    assert_eq!(latest_recallable_prompt_id("", &[steer]), None);
-    assert_eq!(
-        latest_recallable_prompt_id(
-            "draft in progress",
-            &[PendingPromptProjection {
-                message_id: Uuid::new_v4(),
-                text: "queued".to_string(),
-                delivery: PromptDelivery::Queue,
-            }]
-        ),
-        None
-    );
+    assert!(has_recallable_queued_prompts("", &[queued.clone()]));
+    assert!(has_recallable_queued_prompts(
+        "",
+        &[queued.clone(), steer.clone()]
+    ));
+    assert!(!has_recallable_queued_prompts("", &[steer]));
+    assert!(!has_recallable_queued_prompts(
+        "draft in progress",
+        &[PendingPromptProjection {
+            message_id: Uuid::new_v4(),
+            text: "queued".to_string(),
+            delivery: PromptDelivery::Queue,
+        }]
+    ));
 
     let newer = PendingPromptProjection {
         message_id: Uuid::new_v4(),
         text: "newer".to_string(),
         delivery: PromptDelivery::Queue,
     };
-    assert_eq!(
-        latest_recallable_prompt_id("", &[queued, newer.clone()]),
-        Some(newer.message_id)
-    );
+    assert!(has_recallable_queued_prompts("", &[queued, newer]));
 }
 
 #[test]
@@ -2046,7 +2037,7 @@ fn up_does_not_fake_recall_an_already_submitted_steer() {
         delivery: PromptDelivery::Steer,
     };
 
-    assert_eq!(latest_recallable_prompt_id("", &[steer.clone()]), None);
+    assert!(!has_recallable_queued_prompts("", &[steer.clone()]));
     assert!(pending_steer_blocks_history_recall("", &[steer.clone()]));
     assert!(!pending_steer_blocks_history_recall(
         "draft in progress",

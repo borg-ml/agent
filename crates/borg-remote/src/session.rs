@@ -538,17 +538,6 @@ async fn run_agent_session_store_kernel(
         )
         .await?;
     }
-    record(
-        &mut journal,
-        &events,
-        session_id,
-        SessionEventKind::StatusChanged {
-            status: SessionStatus::Ready,
-            detail: (!fresh).then(|| "Resumed".to_string()),
-        },
-    )
-    .await?;
-
     let state = journal.state(session_id).await?;
     validate_session_state(session_id, &state)?;
     let mut provider_session_id = state.provider_session_id;
@@ -565,6 +554,8 @@ async fn run_agent_session_store_kernel(
     let mut goal_turn_failures = ConsecutiveGoalTurnFailures::default();
     let mut pending = recover_queued_prompts(&recovery.queue_events);
     let mut deferred_commands = VecDeque::new();
+    let mut at_turn_boundary = !pending.is_empty();
+    let mut next_ready_detail = (!fresh).then(|| "Resumed".to_string());
     let (goal_tool_tx, mut goal_tool_rx) = mpsc::channel(8);
     let goal_tools = SessionGoalTools {
         requests: goal_tool_tx,
@@ -653,8 +644,8 @@ async fn run_agent_session_store_kernel(
         });
     }
     loop {
-        if !pending.is_empty() {
-            prioritize_recall_at_turn_boundary(
+        if at_turn_boundary {
+            let interrupted_at_boundary = collect_input_at_turn_boundary(
                 &mut journal,
                 &events,
                 session_id,
@@ -663,6 +654,17 @@ async fn run_agent_session_store_kernel(
                 &mut deferred_commands,
             )
             .await?;
+            if interrupted_at_boundary {
+                pause_active_goal(
+                    &mut journal,
+                    &events,
+                    session_id,
+                    &mut goal,
+                    &mut goal_active_since,
+                )
+                .await?;
+                coalesce_queued_prompts(&mut pending);
+            }
         }
         let next = if let Some(prompt) = pending.pop_front() {
             Some(prompt)
@@ -679,6 +681,16 @@ async fn run_agent_session_store_kernel(
                 visible: false,
             })
         } else {
+            record(
+                &mut journal,
+                &events,
+                session_id,
+                SessionEventKind::StatusChanged {
+                    status: SessionStatus::Ready,
+                    detail: next_ready_detail.take(),
+                },
+            )
+            .await?;
             loop {
                 let command = tokio::select! {
                     activity = subagent_activity_rx.recv(), if owns_team => {
@@ -1002,6 +1014,16 @@ async fn run_agent_session_store_kernel(
             },
         )
         .await?;
+        record(
+            &mut journal,
+            &events,
+            session_id,
+            SessionEventKind::StatusChanged {
+                status: SessionStatus::Running,
+                detail: None,
+            },
+        )
+        .await?;
         let turn = AgentTurn {
             session_id,
             message_id: prompt.message_id,
@@ -1035,12 +1057,16 @@ async fn run_agent_session_store_kernel(
             mpsc::channel::<(Uuid, std::result::Result<(), String>)>(32);
         let mut provider_events_open = true;
         let mut interrupted = false;
+        let mut batch_pending_after_interrupt = false;
         let mut interrupt_deadline: Option<Pin<Box<Sleep>>> = None;
         loop {
             tokio::select! {
                 result = &mut running => {
                     let result = result.context("agent turn task failed")?;
                     while let Ok(kind) = provider_events.try_recv() {
+                        if is_executor_lifecycle_status(&kind) {
+                            continue;
+                        }
                         track_approval(&kind, &mut pending_approval);
                         track_provider_interaction(&kind, &mut pending_provider_interaction);
                         let usage = goal_token_usage(&kind);
@@ -1107,6 +1133,8 @@ async fn run_agent_session_store_kernel(
                         }
                         Err(error) => {
                             let error = format!("{error:#}");
+                            let ready_detail =
+                                format!("Turn failed; the session remains available: {error}");
                             if goal_turn_failures.record(&error) >= 3 {
                                 block_active_goal(
                                     &mut journal,
@@ -1120,17 +1148,6 @@ async fn run_agent_session_store_kernel(
                                 &mut journal,
                                 &events,
                                 session_id,
-                                SessionEventKind::StatusChanged {
-                                    status: SessionStatus::Ready,
-                                    detail: Some(format!(
-                                        "Turn failed; the session remains available: {error}"
-                                    )),
-                                },
-                            ).await?;
-                            record(
-                                &mut journal,
-                                &events,
-                                session_id,
                                 SessionEventKind::TurnCompleted {
                                     message_id: prompt.message_id,
                                     provider_session_id: provider_session_id.clone(),
@@ -1139,7 +1156,12 @@ async fn run_agent_session_store_kernel(
                                 },
                             )
                             .await?;
+                            next_ready_detail = Some(ready_detail);
                         }
+                    }
+                    if interrupted {
+                        next_ready_detail
+                            .get_or_insert_with(|| "Interrupted".to_string());
                     }
                     break;
                 }
@@ -1148,6 +1170,9 @@ async fn run_agent_session_store_kernel(
                         provider_events_open = false;
                         continue;
                     };
+                    if is_executor_lifecycle_status(&kind) {
+                        continue;
+                    }
                     let retry_steers = provider_event_is_steer_boundary(&kind);
                     track_approval(&kind, &mut pending_approval);
                     track_provider_interaction(&kind, &mut pending_provider_interaction);
@@ -1231,15 +1256,6 @@ async fn run_agent_session_store_kernel(
                         &mut journal,
                         &events,
                         session_id,
-                        SessionEventKind::StatusChanged {
-                            status: SessionStatus::Ready,
-                            detail: Some("Interrupted".to_string()),
-                        },
-                    ).await?;
-                    record(
-                        &mut journal,
-                        &events,
-                        session_id,
                         SessionEventKind::TurnCompleted {
                             message_id: prompt.message_id,
                             provider_session_id: provider_session_id.clone(),
@@ -1256,6 +1272,7 @@ async fn run_agent_session_store_kernel(
                         true,
                     )
                     .await?;
+                    next_ready_detail = Some("Interrupted".to_string());
                     break;
                 }
                 steer_result = steer_results.recv(), if !pending_steers.is_empty() => {
@@ -1392,8 +1409,8 @@ async fn run_agent_session_store_kernel(
                             });
                         }
                         HostCommand::RecallQueuedPrompt { message_id, .. } => {
-                            if let Some(recalled) =
-                                recall_visible_queued_prompt(&mut pending, message_id)
+                            for recalled in
+                                recall_visible_queued_prompts(&mut pending, message_id)
                             {
                                 record(
                                     &mut journal,
@@ -1561,6 +1578,7 @@ async fn run_agent_session_store_kernel(
                                 },
                             ).await?;
                             interrupted = true;
+                            batch_pending_after_interrupt = true;
                         }
                         HostCommand::Interrupt { .. } => {
                             pause_active_goal(
@@ -1591,15 +1609,6 @@ async fn run_agent_session_store_kernel(
                                 &mut journal,
                                 &events,
                                 session_id,
-                                SessionEventKind::StatusChanged {
-                                    status: SessionStatus::Ready,
-                                    detail: Some("Interrupted".to_string()),
-                                },
-                            ).await?;
-                            record(
-                                &mut journal,
-                                &events,
-                                session_id,
                                 SessionEventKind::TurnCompleted {
                                     message_id: prompt.message_id,
                                     provider_session_id: provider_session_id.clone(),
@@ -1608,6 +1617,8 @@ async fn run_agent_session_store_kernel(
                                 },
                             )
                             .await?;
+                            next_ready_detail = Some("Interrupted".to_string());
+                            batch_pending_after_interrupt = true;
                             break;
                         }
                         HostCommand::Compact { .. } => {
@@ -1699,6 +1710,9 @@ async fn run_agent_session_store_kernel(
                 }
             }
         }
+        if batch_pending_after_interrupt {
+            coalesce_queued_prompts(&mut pending);
+        }
         settle_goal_time(
             &mut journal,
             &events,
@@ -1707,6 +1721,7 @@ async fn run_agent_session_store_kernel(
             &mut goal_active_since,
         )
         .await?;
+        at_turn_boundary = true;
         if interrupted {
             // Codex interruption is scoped to the active turn. The app-server
             // returns the same durable thread id after `turn/interrupt`, so
@@ -1995,16 +2010,68 @@ fn recover_queued_prompts(events: &[SessionEvent]) -> VecDeque<QueuedPrompt> {
     pending
 }
 
-fn recall_visible_queued_prompt(
+fn recall_visible_queued_prompts(
     pending: &mut VecDeque<QueuedPrompt>,
     message_id: Option<Uuid>,
-) -> Option<QueuedPrompt> {
-    let index = pending.iter().rposition(|prompt| {
-        prompt.visible
-            && prompt.delivery == PromptDelivery::Queue
-            && message_id.is_none_or(|message_id| prompt.message_id == message_id)
-    })?;
-    pending.remove(index)
+) -> Vec<QueuedPrompt> {
+    if let Some(message_id) = message_id {
+        return pending
+            .iter()
+            .rposition(|prompt| {
+                prompt.visible
+                    && prompt.delivery == PromptDelivery::Queue
+                    && prompt.message_id == message_id
+            })
+            .and_then(|index| pending.remove(index))
+            .into_iter()
+            .collect();
+    }
+
+    let mut recalled = Vec::new();
+    let mut retained = VecDeque::with_capacity(pending.len());
+    while let Some(prompt) = pending.pop_front() {
+        if prompt.visible && prompt.delivery == PromptDelivery::Queue {
+            recalled.push(prompt);
+        } else {
+            retained.push_back(prompt);
+        }
+    }
+    *pending = retained;
+    recalled
+}
+
+fn coalesce_queued_prompts(pending: &mut VecDeque<QueuedPrompt>) {
+    if pending.len() < 2 {
+        return;
+    }
+
+    let mut prompts = pending.drain(..).collect::<Vec<_>>();
+    let mut combined = prompts.pop().expect("at least two queued prompts");
+    let mut text = String::new();
+    let mut attachments = Vec::new();
+    let mut visible = combined.visible;
+    for prompt in &prompts {
+        if !prompt.text.is_empty() {
+            if !text.is_empty() {
+                text.push_str("\n\n");
+            }
+            text.push_str(&prompt.text);
+        }
+        attachments.extend(prompt.attachments.iter().cloned());
+        visible |= prompt.visible;
+    }
+    if !combined.text.is_empty() {
+        if !text.is_empty() {
+            text.push_str("\n\n");
+        }
+        text.push_str(&combined.text);
+    }
+    attachments.append(&mut combined.attachments);
+    combined.text = text;
+    combined.attachments = attachments;
+    combined.delivery = PromptDelivery::Queue;
+    combined.visible = visible;
+    pending.push_back(combined);
 }
 
 async fn next_host_command(
@@ -2017,25 +2084,61 @@ async fn next_host_command(
     }
 }
 
-async fn prioritize_recall_at_turn_boundary(
+async fn collect_input_at_turn_boundary(
     journal: &mut RuntimeSessionStore,
     events: &mpsc::Sender<SessionEvent>,
     session_id: Uuid,
     pending: &mut VecDeque<QueuedPrompt>,
     commands: &mut mpsc::Receiver<HostCommand>,
     deferred: &mut VecDeque<HostCommand>,
-) -> Result<()> {
-    // Let input already emitted by the TUI reach the actor before promoting the
-    // next queued prompt into a turn. This closes the completion-boundary race
-    // where Up was pressed while the prompt still appeared queued.
+) -> Result<bool> {
+    // Let input already emitted by the TUI reach the actor before promoting a
+    // queued prompt into a turn. Prompt, Up, and Escape must stay ordered at
+    // this boundary so none of them is stranded behind a newly started turn.
     tokio::task::yield_now().await;
+    let mut ready = std::mem::take(deferred);
     while let Ok(command) = commands.try_recv() {
+        ready.push_back(command);
+    }
+
+    let mut interrupted = false;
+    while let Some(command) = ready.pop_front() {
         match command {
+            HostCommand::Prompt {
+                session_id: command_session_id,
+                message_id,
+                text,
+                attachments,
+                output_schema,
+                ..
+            } if command_session_id == session_id => {
+                if journal.contains_message(session_id, message_id).await? {
+                    continue;
+                }
+                let prompt = QueuedPrompt {
+                    message_id,
+                    text,
+                    attachments,
+                    output_schema,
+                    delivery: PromptDelivery::Queue,
+                    visible: true,
+                };
+                record_prompt_status(
+                    journal,
+                    events,
+                    session_id,
+                    &prompt,
+                    MessageStatus::Queued,
+                    PromptDelivery::Queue,
+                )
+                .await?;
+                pending.push_back(prompt);
+            }
             HostCommand::RecallQueuedPrompt {
                 session_id: command_session_id,
                 message_id,
             } if command_session_id == session_id => {
-                if let Some(recalled) = recall_visible_queued_prompt(pending, message_id) {
+                for recalled in recall_visible_queued_prompts(pending, message_id) {
                     record(
                         journal,
                         events,
@@ -2049,15 +2152,34 @@ async fn prioritize_recall_at_turn_boundary(
                     .await?;
                 }
             }
-            command => deferred.push_back(command),
+            HostCommand::Interrupt {
+                session_id: command_session_id,
+            } if command_session_id == session_id => {
+                interrupted = true;
+            }
+            command => {
+                deferred.push_back(command);
+                deferred.append(&mut ready);
+                break;
+            }
         }
     }
-    Ok(())
+    Ok(interrupted)
 }
 
 fn steers_active_codex_turn(provider: CodingProvider, delivery: PromptDelivery) -> bool {
     (provider == CodingProvider::Codex || provider.uses_native_harness())
         && delivery == PromptDelivery::Steer
+}
+
+fn is_executor_lifecycle_status(kind: &SessionEventKind) -> bool {
+    matches!(
+        kind,
+        SessionEventKind::StatusChanged {
+            status: SessionStatus::Running | SessionStatus::Ready,
+            ..
+        }
+    )
 }
 
 fn provider_event_is_steer_boundary(kind: &SessionEventKind) -> bool {
@@ -3226,6 +3348,11 @@ mod tests {
         release_first: Arc<Notify>,
     }
 
+    struct PrematureReadyExecutor {
+        first_started: Arc<Notify>,
+        release_first: Arc<Notify>,
+    }
+
     #[async_trait::async_trait]
     impl AgentTurnExecutor for InterruptibleQueueExecutor {
         async fn execute(
@@ -3460,12 +3587,208 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
+    impl AgentTurnExecutor for PrematureReadyExecutor {
+        async fn execute(
+            &self,
+            turn: AgentTurn,
+            events: mpsc::Sender<SessionEventKind>,
+            _controls: Option<mpsc::Receiver<AgentTurnControl>>,
+        ) -> Result<AgentTurnResult> {
+            if turn.prompt == "first" {
+                self.first_started.notify_one();
+                self.release_first.notified().await;
+            }
+            events
+                .send(SessionEventKind::StatusChanged {
+                    status: SessionStatus::Running,
+                    detail: Some("executor lifecycle".to_string()),
+                })
+                .await
+                .unwrap();
+            events
+                .send(SessionEventKind::Message {
+                    message_id: Uuid::new_v4(),
+                    actor: EventActor::Assistant,
+                    text: format!("response to {}", turn.prompt),
+                    attachments: Vec::new(),
+                    status: MessageStatus::Complete,
+                    delivery: None,
+                })
+                .await
+                .unwrap();
+            events
+                .send(SessionEventKind::StatusChanged {
+                    status: SessionStatus::Ready,
+                    detail: Some("executor returned early".to_string()),
+                })
+                .await
+                .unwrap();
+            Ok(AgentTurnResult {
+                provider_session_id: Some("provider-session".to_string()),
+                final_text: format!("response to {}", turn.prompt),
+            })
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
-    async fn queued_prompt_can_be_recalled_at_the_turn_completion_boundary() {
+    async fn ready_is_emitted_only_after_all_queued_turn_events_are_complete() {
+        let root = tempdir().unwrap();
+        let journal_path = root.path().join("session.jsonl");
+        let cwd = root.path().to_path_buf();
+        let session_id = Uuid::new_v4();
+        let initial_message_id = Uuid::new_v4();
+        let queued_message_id = Uuid::new_v4();
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(128);
+        let first_started = Arc::new(Notify::new());
+        let release_first = Arc::new(Notify::new());
+        let executor = Arc::new(PrematureReadyExecutor {
+            first_started: Arc::clone(&first_started),
+            release_first: Arc::clone(&release_first),
+        });
+        let actor = tokio::spawn(async move {
+            run_agent_session_with_executor(
+                &journal_path,
+                session_id,
+                LaunchSession {
+                    request_id: initial_message_id,
+                    cwd,
+                    provider: CodingProvider::Codex,
+                    model: None,
+                    effort: None,
+                    fast: Some(false),
+                    response_language: crate::ResponseLanguage::Auto,
+                    permission_mode: PermissionMode::Manual,
+                    name: None,
+                    initial_prompt: Some("first".to_string()),
+                    capabilities: Default::default(),
+                    subagent_concurrency_limit: None,
+                    extension_skill_roots: Vec::new(),
+                    team_policy: None,
+                },
+                command_rx,
+                event_tx,
+                executor,
+            )
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), first_started.notified())
+            .await
+            .expect("first turn starts");
+        command_tx
+            .send(HostCommand::Prompt {
+                session_id,
+                message_id: queued_message_id,
+                text: "second".to_string(),
+                attachments: Vec::new(),
+                output_schema: None,
+                delivery: PromptDelivery::Queue,
+            })
+            .await
+            .unwrap();
+
+        let mut observed = Vec::new();
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+                .await
+                .expect("queued event arrives")
+                .expect("session event stream remains open");
+            let queued = matches!(
+                event.kind,
+                SessionEventKind::Message {
+                    message_id,
+                    status: MessageStatus::Queued,
+                    ..
+                } if message_id == queued_message_id
+            );
+            observed.push(event.kind);
+            if queued {
+                break;
+            }
+        }
+        release_first.notify_one();
+
+        while observed
+            .iter()
+            .filter(|kind| matches!(kind, SessionEventKind::TurnCompleted { .. }))
+            .count()
+            < 2
+        {
+            observed.push(
+                tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+                    .await
+                    .expect("turn event arrives")
+                    .expect("session event stream remains open")
+                    .kind,
+            );
+        }
+        observed.push(
+            tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+                .await
+                .expect("canonical ready event arrives")
+                .expect("session event stream remains open")
+                .kind,
+        );
+
+        command_tx
+            .send(HostCommand::Stop { session_id })
+            .await
+            .unwrap();
+        actor.await.unwrap().unwrap();
+
+        let running = observed
+            .iter()
+            .enumerate()
+            .filter_map(|(index, kind)| {
+                matches!(
+                    kind,
+                    SessionEventKind::StatusChanged {
+                        status: SessionStatus::Running,
+                        ..
+                    }
+                )
+                .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        let ready = observed
+            .iter()
+            .enumerate()
+            .filter_map(|(index, kind)| {
+                matches!(
+                    kind,
+                    SessionEventKind::StatusChanged {
+                        status: SessionStatus::Ready,
+                        ..
+                    }
+                )
+                .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        let completed = observed
+            .iter()
+            .enumerate()
+            .filter_map(|(index, kind)| {
+                matches!(kind, SessionEventKind::TurnCompleted { .. }).then_some(index)
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(running.len(), 2, "executor Running events must be filtered");
+        assert_eq!(completed.len(), 2);
+        assert_eq!(ready.len(), 1, "executor Ready events must be filtered");
+        assert!(
+            ready[0] > completed[1],
+            "Ready must follow the final queued TurnCompleted event"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn all_queued_prompts_can_be_recalled_at_the_turn_completion_boundary() {
         let root = tempdir().unwrap();
         let journal_path = root.path().join("session.jsonl");
         let session_id = Uuid::new_v4();
-        let queued_message_id = Uuid::new_v4();
+        let queued_message_ids = [Uuid::new_v4(), Uuid::new_v4()];
         let (command_tx, command_rx) = mpsc::channel(8);
         let (event_tx, mut event_rx) = mpsc::channel(64);
         let turns = Arc::new(Mutex::new(Vec::new()));
@@ -3517,31 +3840,36 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), first_started.notified())
             .await
             .expect("first turn starts");
-        command_tx
-            .send(HostCommand::Prompt {
-                session_id,
-                message_id: queued_message_id,
-                text: "recall me".to_string(),
-                attachments: Vec::new(),
-                output_schema: None,
-                delivery: PromptDelivery::Queue,
-            })
-            .await
-            .unwrap();
-        loop {
+        for (message_id, text) in queued_message_ids
+            .into_iter()
+            .zip(["recall first", "recall second"])
+        {
+            command_tx
+                .send(HostCommand::Prompt {
+                    session_id,
+                    message_id,
+                    text: text.to_string(),
+                    attachments: Vec::new(),
+                    output_schema: None,
+                    delivery: PromptDelivery::Queue,
+                })
+                .await
+                .unwrap();
+        }
+        let mut queued = Vec::new();
+        while queued.len() < queued_message_ids.len() {
             let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
                 .await
                 .expect("queued event arrives")
                 .expect("session event stream remains open");
-            if matches!(
-                event.kind,
-                SessionEventKind::Message {
-                    message_id,
-                    status: MessageStatus::Queued,
-                    ..
-                } if message_id == queued_message_id
-            ) {
-                break;
+            if let SessionEventKind::Message {
+                message_id,
+                status: MessageStatus::Queued,
+                ..
+            } = event.kind
+                && queued_message_ids.contains(&message_id)
+            {
+                queued.push(message_id);
             }
         }
 
@@ -3550,23 +3878,23 @@ mod tests {
         command_tx
             .send(HostCommand::RecallQueuedPrompt {
                 session_id,
-                message_id: Some(queued_message_id),
+                message_id: None,
             })
             .await
             .unwrap();
-        loop {
+        let mut recalled = Vec::new();
+        while recalled.len() < queued_message_ids.len() {
             let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
                 .await
                 .expect("recall event arrives")
                 .expect("session event stream remains open");
-            if matches!(
-                event.kind,
-                SessionEventKind::PromptRecalled { message_id, .. }
-                    if message_id == queued_message_id
-            ) {
-                break;
+            if let SessionEventKind::PromptRecalled { message_id, .. } = event.kind
+                && queued_message_ids.contains(&message_id)
+            {
+                recalled.push(message_id);
             }
         }
+        assert_eq!(recalled, queued_message_ids);
 
         command_tx
             .send(HostCommand::Stop { session_id })
@@ -3628,6 +3956,7 @@ mod tests {
                 vec![PathBuf::from("/tmp/queued-image.png")],
                 PromptDelivery::Queue,
             ),
+            ("third", Vec::new(), PromptDelivery::Queue),
         ] {
             command_tx
                 .send(HostCommand::Prompt {
@@ -3660,7 +3989,7 @@ mod tests {
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 2);
         assert_eq!(seen[0], ("first".to_string(), Vec::new()));
-        assert_eq!(seen[1].0, "second [Image 1]");
+        assert_eq!(seen[1].0, "second [Image 1]\n\nthird");
         assert_eq!(
             seen[1].1,
             [PathBuf::from("/tmp/queued-image.png")],
@@ -4133,6 +4462,7 @@ mod tests {
     async fn session_semantics_are_independent_of_turn_execution_location() {
         let root = tempdir().unwrap();
         let journal_path = root.path().join("session.jsonl");
+        std::fs::create_dir_all(root.path().join("managed-workspace")).unwrap();
         let session_id = Uuid::new_v4();
         let (command_tx, command_rx) = mpsc::channel(2);
         let (event_tx, mut event_rx) = mpsc::channel(16);
@@ -4716,18 +5046,132 @@ mod tests {
             },
         ]);
 
-        let recalled = recall_visible_queued_prompt(&mut pending, Some(first_visible_id));
+        let recalled = recall_visible_queued_prompts(&mut pending, Some(first_visible_id));
 
         assert_eq!(
-            recalled.map(|prompt| prompt.message_id),
-            Some(first_visible_id)
+            recalled
+                .iter()
+                .map(|prompt| prompt.message_id)
+                .collect::<Vec<_>>(),
+            [first_visible_id]
         );
         assert_eq!(pending.len(), 3);
         assert_eq!(pending[0].message_id, internal_id);
         assert_eq!(pending[1].message_id, second_visible_id);
         assert_eq!(pending[2].delivery, PromptDelivery::Steer);
         let steer_id = pending[2].message_id;
-        assert!(recall_visible_queued_prompt(&mut pending, Some(steer_id)).is_none());
+        assert!(recall_visible_queued_prompts(&mut pending, Some(steer_id)).is_empty());
+
+        let recalled = recall_visible_queued_prompts(&mut pending, None);
+        assert_eq!(
+            recalled
+                .iter()
+                .map(|prompt| prompt.message_id)
+                .collect::<Vec<_>>(),
+            [second_visible_id]
+        );
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].message_id, internal_id);
+        assert_eq!(pending[1].message_id, steer_id);
+    }
+
+    #[test]
+    fn escape_batch_coalesces_queued_prompts_in_fifo_order() {
+        let first_image = PathBuf::from("/tmp/first.png");
+        let last_image = PathBuf::from("/tmp/last.png");
+        let last_id = Uuid::new_v4();
+        let mut pending = VecDeque::from([
+            QueuedPrompt {
+                message_id: Uuid::new_v4(),
+                text: "first [Image 1]".to_string(),
+                attachments: vec![first_image.clone()],
+                output_schema: None,
+                delivery: PromptDelivery::Queue,
+                visible: true,
+            },
+            QueuedPrompt {
+                message_id: Uuid::new_v4(),
+                text: "second".to_string(),
+                attachments: Vec::new(),
+                output_schema: None,
+                delivery: PromptDelivery::Queue,
+                visible: true,
+            },
+            QueuedPrompt {
+                message_id: last_id,
+                text: "last [Image 2]".to_string(),
+                attachments: vec![last_image.clone()],
+                output_schema: None,
+                delivery: PromptDelivery::Queue,
+                visible: true,
+            },
+        ]);
+
+        coalesce_queued_prompts(&mut pending);
+
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].message_id, last_id);
+        assert_eq!(
+            pending[0].text,
+            "first [Image 1]\n\nsecond\n\nlast [Image 2]"
+        );
+        assert_eq!(pending[0].attachments, [first_image, last_image]);
+        assert_eq!(pending[0].delivery, PromptDelivery::Queue);
+    }
+
+    #[tokio::test]
+    async fn turn_boundary_collects_all_emitted_prompts_before_escape() {
+        let root = tempdir().unwrap();
+        let journal = SessionJournal::open(root.path().join("session.jsonl")).unwrap();
+        let store: Arc<dyn SessionStore> = Arc::new(
+            crate::session_store::JsonlSessionStore::from_journal(journal),
+        );
+        let mut journal = RuntimeSessionStore::new(store, Vec::new());
+        let session_id = Uuid::new_v4();
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let (command_tx, mut command_rx) = mpsc::channel(8);
+        let last_id = Uuid::new_v4();
+        for (message_id, text) in [
+            (Uuid::new_v4(), "first follow-up"),
+            (last_id, "second follow-up"),
+        ] {
+            command_tx
+                .send(HostCommand::Prompt {
+                    session_id,
+                    message_id,
+                    text: text.to_string(),
+                    attachments: Vec::new(),
+                    output_schema: None,
+                    delivery: PromptDelivery::Queue,
+                })
+                .await
+                .unwrap();
+        }
+        command_tx
+            .send(HostCommand::Interrupt { session_id })
+            .await
+            .unwrap();
+
+        let mut pending = VecDeque::new();
+        let mut deferred = VecDeque::new();
+        let interrupted = collect_input_at_turn_boundary(
+            &mut journal,
+            &event_tx,
+            session_id,
+            &mut pending,
+            &mut command_rx,
+            &mut deferred,
+        )
+        .await
+        .unwrap();
+
+        assert!(interrupted);
+        assert!(deferred.is_empty());
+        assert_eq!(pending.len(), 2);
+        coalesce_queued_prompts(&mut pending);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].message_id, last_id);
+        assert_eq!(pending[0].text, "first follow-up\n\nsecond follow-up");
     }
 
     #[test]

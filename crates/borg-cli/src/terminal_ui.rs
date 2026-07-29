@@ -402,9 +402,7 @@ pub enum UiAction {
         attachments: Vec<PathBuf>,
     },
     Approve(ApprovalDecision),
-    RecallQueuedPrompt {
-        message_id: Uuid,
-    },
+    RecallQueuedPrompts,
     Rewind {
         sequence: u64,
         text: String,
@@ -1111,7 +1109,7 @@ impl BorgTerminal {
             } if !self.replaying_history => {
                 self.composer
                     .append_recalled(text.clone(), attachments.clone());
-                self.notice = Some("Latest queued prompt returned to composer".to_string());
+                self.notice = Some("Queued prompts returned to composer".to_string());
             }
             _ => {}
         }
@@ -3289,7 +3287,9 @@ impl BorgTerminal {
             && !self.pending_approval
             && !matches!(
                 self.status,
-                SessionStatus::Starting | SessionStatus::Running
+                SessionStatus::Starting
+                    | SessionStatus::Running
+                    | SessionStatus::WaitingForApproval
             )
         {
             if self.rewind_primed {
@@ -3491,10 +3491,8 @@ impl BorgTerminal {
                         .unwrap_or(slash_matches - 1);
                     return Ok(UiAction::None);
                 }
-                if let Some(message_id) =
-                    latest_recallable_prompt_id(&self.composer.text, &self.queued_prompts)
-                {
-                    return Ok(UiAction::RecallQueuedPrompt { message_id });
+                if has_recallable_queued_prompts(&self.composer.text, &self.queued_prompts) {
+                    return Ok(UiAction::RecallQueuedPrompts);
                 }
                 if pending_steer_blocks_history_recall(&self.composer.text, &self.queued_prompts) {
                     // A steer is already owned by the active provider turn and
@@ -6489,16 +6487,14 @@ fn push_queued_prompt(
     }
 }
 
-fn latest_recallable_prompt_id(
+fn has_recallable_queued_prompts(
     composer_text: &str,
     queued_prompts: &[PendingPromptProjection],
-) -> Option<Uuid> {
-    composer_text.is_empty().then(|| {
-        queued_prompts
+) -> bool {
+    composer_text.is_empty()
+        && queued_prompts
             .iter()
-            .rfind(|prompt| prompt.delivery == PromptDelivery::Queue)
-            .map(|prompt| prompt.message_id)
-    })?
+            .any(|prompt| prompt.delivery == PromptDelivery::Queue)
 }
 
 fn pending_steer_blocks_history_recall(
@@ -6570,7 +6566,7 @@ fn queued_prompt_lines(
         hints.push("esc interrupt + send now");
     }
     if has_queue {
-        hints.push("↑ edit latest queued");
+        hints.push("↑ edit all queued");
     }
     lines.push(Line::from(Span::styled(
         format!("   {}", hints.join("  ·  ")),
