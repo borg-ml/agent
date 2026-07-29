@@ -2444,6 +2444,117 @@ fn transcript_scroll_anchor_tracks_content_growth_and_collapse() {
     assert_eq!(preserve_scroll_anchor(2, 24, 20), 0);
 }
 
+fn tall_expanded_diff_transcript() -> Transcript {
+    let mut transcript = Transcript::default();
+    transcript.order.push(TranscriptEntry::Tool {
+        source_name: "Edit".to_string(),
+        name: "Edit".to_string(),
+        detail: "very-tall.rs".to_string(),
+        code_view: Some((
+            "diff:rs".to_string(),
+            (0..240)
+                .map(|line| format!("+changed line {line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )),
+        output_view: None,
+        payload_refs: Vec::new(),
+        time: "12:00".to_string(),
+        started_at: Utc::now(),
+        completed_at: Some(Utc::now()),
+        complete: true,
+        error: false,
+        user_interrupted: false,
+        backgrounded: false,
+        expanded: true,
+    });
+    transcript
+}
+
+#[test]
+fn mouse_collapse_of_tall_diff_keeps_the_tool_header_at_the_anchor_row() {
+    let mut transcript = tall_expanded_diff_transcript();
+    let before = transcript.render(100, None, None, None);
+    let viewport_height = 12;
+    let scroll_max = before.0.len() - viewport_height;
+    let scroll_from_bottom = scroll_max - 40;
+    let anchor = transcript_viewport_anchor(
+        &before.1,
+        &before.4,
+        scroll_max,
+        scroll_from_bottom,
+        viewport_height,
+        true,
+    )
+    .expect("anchor inside the tall diff");
+    assert_eq!(anchor.collapsed_tool_header, Some(0));
+
+    transcript.toggle_tool(0);
+    let after = transcript.render(100, None, None, None);
+    let restored = restore_transcript_viewport_anchor(
+        anchor,
+        &after.1,
+        &after.4,
+        after.0.len(),
+        viewport_height,
+        scroll_from_bottom,
+    );
+    let restored_start = after.0.len().saturating_sub(viewport_height + restored);
+    assert_eq!(
+        restored_start.saturating_add(anchor.viewport_row),
+        after.1[0].1
+    );
+}
+
+#[test]
+fn keyboard_collapse_of_tall_output_uses_the_same_reflow_anchor() {
+    let mut transcript = tall_expanded_diff_transcript();
+    if let Some(TranscriptEntry::Tool {
+        code_view,
+        output_view,
+        ..
+    }) = transcript.order.first_mut()
+    {
+        *code_view = Some(("text".to_string(), "command input".to_string()));
+        *output_view = Some((
+            "text".to_string(),
+            (0..240)
+                .map(|line| format!("output line {line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ));
+    }
+    let before = transcript.render(100, None, None, None);
+    let viewport_height = 10;
+    let scroll_max = before.0.len() - viewport_height;
+    let scroll_from_bottom = scroll_max - 30;
+    let anchor = transcript_viewport_anchor(
+        &before.1,
+        &before.4,
+        scroll_max,
+        scroll_from_bottom,
+        viewport_height,
+        true,
+    )
+    .expect("anchor inside the tall output");
+
+    transcript.set_auto_expand_tools(false);
+    let after = transcript.render(100, None, None, None);
+    let restored = restore_transcript_viewport_anchor(
+        anchor,
+        &after.1,
+        &after.4,
+        after.0.len(),
+        viewport_height,
+        scroll_from_bottom,
+    );
+    let restored_start = after.0.len().saturating_sub(viewport_height + restored);
+    assert_eq!(
+        restored_start.saturating_add(anchor.viewport_row),
+        after.1[0].1
+    );
+}
+
 #[test]
 fn line_scrolling_preserves_expanded_actions() {
     let mut transcript = Transcript::default();

@@ -9,12 +9,21 @@ use serde::Deserialize;
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct AgentConfig {
     pub(crate) capabilities: CapabilityConfig,
+    pub(crate) extensions: ExtensionConfig,
     pub(crate) team: TeamConfig,
     pub(crate) commands: CommandConfig,
     pub(crate) keybindings: KeybindingConfig,
     pub(crate) mcp: McpConfig,
     pub(crate) approvals: ApprovalConfig,
     pub(crate) updates: UpdateConfig,
+}
+
+/// Trust controls for declarative extension catalogs.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct ExtensionConfig {
+    /// Project checkouts are not trusted to launch local MCP processes by default.
+    pub(crate) allow_project_mcp: bool,
 }
 
 /// Opt-in autonomous-team policy. Leaving `preset` unset keeps the existing
@@ -470,18 +479,33 @@ mod tests {
         assert!(config.capabilities.subagents);
         assert!(config.capabilities.autonomous_team);
         assert!(!config.capabilities.telemetry);
+        assert!(!config.extensions.allow_project_mcp);
+    }
+
+    #[test]
+    fn project_extension_trust_is_user_controlled() {
+        let config: AgentConfig = toml::from_str(
+            r#"
+            [extensions]
+            allow_project_mcp = true
+            "#,
+        )
+        .unwrap();
+        assert!(config.extensions.allow_project_mcp);
     }
 
     #[test]
     fn team_policy_is_opt_in_and_uses_the_existing_preset_limits() {
         let disabled: AgentConfig = toml::from_str("").unwrap();
-        assert!(disabled
-            .autonomous_team_policy(
-                &borg_remote::SessionCapabilities::from(&disabled.capabilities),
-                borg_remote::CodingProvider::Codex,
-                uuid::Uuid::nil(),
-            )
-            .is_none());
+        assert!(
+            disabled
+                .autonomous_team_policy(
+                    &borg_remote::SessionCapabilities::from(&disabled.capabilities),
+                    borg_remote::CodingProvider::Codex,
+                    uuid::Uuid::nil(),
+                )
+                .is_none()
+        );
 
         let config: AgentConfig = toml::from_str(
             r#"
@@ -507,7 +531,10 @@ mod tests {
         assert_eq!(policy.limits.budget.max_cost_microusd, Some(120000));
         assert_eq!(policy.limits.budget.max_wall_time_ms, Some(30000));
         assert_eq!(
-            policy.topology.members[0].profile.reasoning_effort.as_deref(),
+            policy.topology.members[0]
+                .profile
+                .reasoning_effort
+                .as_deref(),
             Some("xhigh")
         );
     }
@@ -524,13 +551,15 @@ mod tests {
             "#,
         )
         .unwrap();
-        assert!(config
-            .autonomous_team_policy(
-                &borg_remote::SessionCapabilities::from(&config.capabilities),
-                borg_remote::CodingProvider::Codex,
-                uuid::Uuid::nil(),
-            )
-            .is_none());
+        assert!(
+            config
+                .autonomous_team_policy(
+                    &borg_remote::SessionCapabilities::from(&config.capabilities),
+                    borg_remote::CodingProvider::Codex,
+                    uuid::Uuid::nil(),
+                )
+                .is_none()
+        );
     }
 
     #[test]

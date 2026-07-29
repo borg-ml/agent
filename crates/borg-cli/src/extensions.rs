@@ -54,23 +54,41 @@ fn yes() -> bool {
 pub(crate) fn discover(
     cwd: &Path,
     capabilities: &CapabilityConfig,
+    allow_project_mcp: bool,
 ) -> Result<(ExtensionCatalog, Vec<borg_provider::mcp::ExternalMcpServer>)> {
-    let mut dirs = vec![cwd.join(".borg/extensions")];
-    if let Some(root) = std::env::var_os("XDG_CONFIG_HOME")
+    let user_dir = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|v| PathBuf::from(v).join(".config")))
-    {
-        dirs.push(root.join("borg/extensions"));
-    }
+        .map(|root| root.join("borg/extensions"));
+    discover_in_dirs(
+        Some(cwd.join(".borg/extensions")),
+        user_dir,
+        capabilities,
+        allow_project_mcp,
+    )
+}
+
+fn discover_in_dirs(
+    project_dir: Option<PathBuf>,
+    user_dir: Option<PathBuf>,
+    capabilities: &CapabilityConfig,
+    allow_project_mcp: bool,
+) -> Result<(ExtensionCatalog, Vec<borg_provider::mcp::ExternalMcpServer>)> {
+    let dirs = [(project_dir, true), (user_dir, false)];
     let mut ids = BTreeSet::new();
     let mut list = Vec::new();
     let mut servers = Vec::new();
-    for dir in dirs {
+    for (dir, is_project) in dirs
+        .into_iter()
+        .filter_map(|(dir, is_project)| dir.map(|dir| (dir, is_project)))
+    {
         if !dir.exists() {
             continue;
         }
-        for entry in fs::read_dir(&dir)? {
-            let path = entry?.path();
+        let mut entries = fs::read_dir(&dir)?.collect::<std::io::Result<Vec<_>>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
             if path.extension().and_then(|x| x.to_str()) != Some("toml") {
                 continue;
             }
@@ -89,10 +107,17 @@ pub(crate) fn discover(
                 .required_capabilities
                 .iter()
                 .find(|x| !cap(capabilities, x));
-            let active = m.enabled && missing.is_none();
+            let project_untrusted = is_project && !allow_project_mcp;
+            let active = m.enabled && missing.is_none() && !project_untrusted;
             let reason = (!m.enabled)
                 .then(|| "disabled by manifest".into())
-                .or_else(|| missing.map(|x| format!("requires capability `{x}`")));
+                .or_else(|| missing.map(|x| format!("requires capability `{x}`")))
+                .or_else(|| {
+                    project_untrusted.then(|| {
+                        "project MCP trust is disabled; set [extensions].allow_project_mcp = true"
+                            .into()
+                    })
+                });
             let roots = m
                 .skill_roots
                 .into_iter()
@@ -175,12 +200,12 @@ mod tests {
             manifest("docs", "multiplayer"),
         )
         .unwrap();
-        let (catalog, servers) = discover(dir.path(), &CapabilityConfig::default()).unwrap();
+        let (catalog, servers) = discover(dir.path(), &CapabilityConfig::default(), true).unwrap();
         assert!(catalog.extensions[0].active);
         assert_eq!(servers[0].name, "docs__docs");
         let mut disabled = CapabilityConfig::default();
         disabled.multiplayer = false;
-        let (catalog, servers) = discover(dir.path(), &disabled).unwrap();
+        let (catalog, servers) = discover(dir.path(), &disabled, true).unwrap();
         assert!(!catalog.extensions[0].active);
         assert!(servers.is_empty());
     }
@@ -200,6 +225,115 @@ mod tests {
             manifest("same", "multiplayer"),
         )
         .unwrap();
-        assert!(discover(dir.path(), &CapabilityConfig::default()).is_err());
+        assert!(discover(dir.path(), &CapabilityConfig::default(), true).is_err());
+    }
+
+    #[test]
+    fn path_traversal_and_unknown_capabilities_are_inactive_or_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let extension_dir = dir.path().join(".borg/extensions");
+        fs::create_dir_all(&extension_dir).unwrap();
+        fs::write(
+            extension_dir.join("bad.toml"),
+            "manifest_version=1\nid=\"bad\"\nversion=\"1\"\nskill_roots=[\"../escape\"]\n",
+        )
+        .unwrap();
+        assert!(discover(dir.path(), &CapabilityConfig::default(), true).is_err());
+        fs::remove_file(extension_dir.join("bad.toml")).unwrap();
+        fs::write(
+            extension_dir.join("unknown.toml"),
+            manifest("unknown", "not_real"),
+        )
+        .unwrap();
+        let (catalog, servers) = discover(dir.path(), &CapabilityConfig::default(), true).unwrap();
+        assert!(!catalog.extensions[0].active);
+        assert!(
+            catalog.extensions[0]
+                .reason
+                .as_deref()
+                .unwrap()
+                .contains("not_real")
+        );
+        assert!(servers.is_empty());
+    }
+
+    #[test]
+    fn project_manifests_are_listed_before_user_catalog_position() {
+        let dir = tempfile::tempdir().unwrap();
+        let extension_dir = dir.path().join(".borg/extensions");
+        fs::create_dir_all(&extension_dir).unwrap();
+        fs::write(
+            extension_dir.join("first.toml"),
+            manifest("first", "multiplayer"),
+        )
+        .unwrap();
+        fs::write(
+            extension_dir.join("second.toml"),
+            manifest("second", "multiplayer"),
+        )
+        .unwrap();
+        let (catalog, _) = discover(dir.path(), &CapabilityConfig::default(), true).unwrap();
+        let ids = catalog
+            .extensions
+            .into_iter()
+            .map(|extension| extension.id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["first", "second"]);
+    }
+
+    #[test]
+    fn project_mcp_is_denied_by_default_and_activates_only_when_trusted() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("docs.toml"),
+            manifest("docs", "multiplayer"),
+        )
+        .unwrap();
+
+        let (catalog, servers) = discover_in_dirs(
+            Some(dir.path().to_owned()),
+            None,
+            &CapabilityConfig::default(),
+            false,
+        )
+        .unwrap();
+        assert!(!catalog.extensions[0].active);
+        assert!(
+            catalog.extensions[0]
+                .reason
+                .as_deref()
+                .unwrap()
+                .contains("project MCP trust is disabled")
+        );
+        assert!(servers.is_empty());
+
+        let (catalog, servers) = discover_in_dirs(
+            Some(dir.path().to_owned()),
+            None,
+            &CapabilityConfig::default(),
+            true,
+        )
+        .unwrap();
+        assert!(catalog.extensions[0].active);
+        assert_eq!(servers[0].name, "docs__docs");
+    }
+
+    #[test]
+    fn user_manifest_remains_active_without_project_trust() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("docs.toml"),
+            manifest("docs", "multiplayer"),
+        )
+        .unwrap();
+        let (catalog, servers) = discover_in_dirs(
+            None,
+            Some(dir.path().to_owned()),
+            &CapabilityConfig::default(),
+            false,
+        )
+        .unwrap();
+        assert!(catalog.extensions[0].active);
+        assert_eq!(servers[0].name, "docs__docs");
     }
 }

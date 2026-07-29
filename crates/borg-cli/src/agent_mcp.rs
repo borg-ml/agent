@@ -31,6 +31,7 @@ enum AgentToolEndpoint {
     Unix {
         socket: PathBuf,
         provider: borg_remote::CodingProvider,
+        shared_work_enabled: bool,
         team_policy: Option<borg_remote::TeamPolicy>,
     },
     #[cfg(not(unix))]
@@ -38,6 +39,7 @@ enum AgentToolEndpoint {
         address: std::net::SocketAddr,
         token: String,
         provider: borg_remote::CodingProvider,
+        shared_work_enabled: bool,
         team_policy: Option<borg_remote::TeamPolicy>,
     },
 }
@@ -50,6 +52,12 @@ impl AgentToolEndpoint {
             .map(|policy| serde_json::from_str(&policy))
             .transpose()
             .context("BORG_AGENT_TEAM_POLICY must contain a valid team policy")?;
+        let shared_work_enabled = std::env::var("BORG_AGENT_SHARED_WORK_ENABLED")
+            .ok()
+            .map(|value| value.parse::<bool>())
+            .transpose()
+            .context("BORG_AGENT_SHARED_WORK_ENABLED must be true or false")?
+            .unwrap_or(false);
         #[cfg(unix)]
         {
             std::env::var_os("BORG_AGENT_TOOL_SOCKET")
@@ -57,6 +65,7 @@ impl AgentToolEndpoint {
                 .map(|socket| Self::Unix {
                     socket,
                     provider,
+                    shared_work_enabled,
                     team_policy,
                 })
                 .context("BORG_AGENT_TOOL_SOCKET is required")
@@ -77,6 +86,7 @@ impl AgentToolEndpoint {
                 address,
                 token,
                 provider,
+                shared_work_enabled,
                 team_policy,
             })
         }
@@ -99,6 +109,21 @@ impl AgentToolEndpoint {
             Self::Loopback { team_policy, .. } => team_policy.as_ref(),
         }
     }
+
+    fn shared_work_enabled(&self) -> bool {
+        match self {
+            #[cfg(unix)]
+            Self::Unix {
+                shared_work_enabled,
+                ..
+            } => *shared_work_enabled,
+            #[cfg(not(unix))]
+            Self::Loopback {
+                shared_work_enabled,
+                ..
+            } => *shared_work_enabled,
+        }
+    }
 }
 
 async fn handle_line(endpoint: &AgentToolEndpoint, line: &str) -> Option<Value> {
@@ -116,9 +141,10 @@ async fn handle_line(endpoint: &AgentToolEndpoint, line: &str) -> Option<Value> 
         })),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({
-            "tools": borg_remote::agent_tool_specs_with_team_policy(
+            "tools": borg_remote::agent_tool_specs_with_capabilities(
                 endpoint.provider(),
                 true,
+                endpoint.shared_work_enabled(),
                 endpoint.team_policy(),
             )
         })),
@@ -227,6 +253,7 @@ mod tests {
         let endpoint = AgentToolEndpoint::Unix {
             socket: Path::new("/unused").to_path_buf(),
             provider: borg_remote::CodingProvider::Codex,
+            shared_work_enabled: true,
             team_policy: None,
         };
         #[cfg(not(unix))]
@@ -234,6 +261,7 @@ mod tests {
             address: "127.0.0.1:1".parse().unwrap(),
             token: "unused".to_string(),
             provider: borg_remote::CodingProvider::Codex,
+            shared_work_enabled: true,
             team_policy: None,
         };
         let response = handle_line(
@@ -252,5 +280,6 @@ mod tests {
         assert!(names.contains(&"update_plan"));
         assert!(names.contains(&"spawn_agent"));
         assert!(names.contains(&"wait_agent"));
+        assert!(names.contains(&"create_shared_work"));
     }
 }

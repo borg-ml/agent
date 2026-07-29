@@ -21,6 +21,11 @@ telemetry = false
 # reserved provider-neutral declarations in this CLI release. They do not
 # initialize a runtime or register tools yet.
 
+# Project-local extension manifests are untrusted by default because they can
+# declare stdio MCP commands. User-owned manifests remain eligible to start.
+[extensions]
+allow_project_mcp = false
+
 # Optional autonomous-team policy. Omit this entire table to preserve ordinary
 # manual subagent launches and their inherited model/effort settings.
 # The preset takes effect only while `autonomous_team` is effective. It gives

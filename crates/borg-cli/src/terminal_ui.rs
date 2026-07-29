@@ -119,6 +119,16 @@ type CachedTranscriptRender = (
     Arc<TranscriptRender>,
 );
 
+/// A semantic viewport position that survives transcript reflow.  Tool bodies
+/// are special: after they collapse their header is the nearest durable row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TranscriptViewportAnchor {
+    entry_index: usize,
+    entry_row_offset: usize,
+    viewport_row: usize,
+    collapsed_tool_header: Option<usize>,
+}
+
 #[derive(Clone, Copy)]
 enum KeyAction {
     Send,
@@ -481,6 +491,7 @@ pub struct BorgTerminal {
     transcript_render_cache: Option<CachedTranscriptRender>,
     rendered_transcript_height: usize,
     pending_scroll_anchor_height: Option<usize>,
+    pending_transcript_anchor: Option<TranscriptViewportAnchor>,
     event_redraw_needed: bool,
     cursor_blink_started_at: Instant,
     terminal_restored: bool,
@@ -929,6 +940,7 @@ impl BorgTerminal {
             transcript_render_cache: None,
             rendered_transcript_height: 0,
             pending_scroll_anchor_height: None,
+            pending_transcript_anchor: None,
             event_redraw_needed: false,
             cursor_blink_started_at: Instant::now(),
             terminal_restored: false,
@@ -1423,11 +1435,17 @@ impl BorgTerminal {
     }
 
     pub fn set_auto_expand_edits(&mut self, enabled: bool) {
+        if !enabled {
+            self.capture_transcript_anchor_for_collapse();
+        }
         self.transcript.set_auto_expand_edits(enabled);
         self.transcript_render_cache = None;
     }
 
     pub fn set_auto_expand_tools(&mut self, enabled: bool) {
+        if !enabled {
+            self.capture_transcript_anchor_for_collapse();
+        }
         self.transcript.set_auto_expand_tools(enabled);
         self.transcript_render_cache = None;
     }
@@ -1730,12 +1748,14 @@ impl BorgTerminal {
                     }
                     MouseEventKind::Down(MouseButton::Left) if self.hovered_tool.is_some() => {
                         self.nested_scroll_motion = None;
+                        let tool_index = self.hovered_tool.expect("checked above");
+                        if self.transcript.tool_is_expanded(tool_index) {
+                            self.capture_transcript_anchor_for_collapse();
+                        }
                         if let Some((start, max_offset, _)) = hovered_tool_run {
                             self.transcript.anchor_tool_run(start, max_offset);
                         }
-                        let payloads = self
-                            .transcript
-                            .toggle_tool(self.hovered_tool.expect("checked above"));
+                        let payloads = self.transcript.toggle_tool(tool_index);
                         self.transcript_render_cache = None;
                         if !payloads.is_empty() {
                             return Ok(UiAction::LoadPayloads(payloads));
@@ -2044,6 +2064,29 @@ impl BorgTerminal {
                 / usize::from(thumb_travel)
         };
         self.scroll_from_bottom = self.transcript_scroll_max.saturating_sub(scroll_from_top);
+    }
+
+    fn capture_transcript_anchor_for_collapse(&mut self) {
+        if self.scroll_from_bottom == 0 || self.pending_transcript_anchor.is_some() {
+            return;
+        }
+        let Some(area) = self.transcript_viewport_area else {
+            return;
+        };
+        let Some((_, _, _, _, _, render)) = self.transcript_render_cache.as_ref() else {
+            return;
+        };
+        self.pending_transcript_anchor = transcript_viewport_anchor(
+            &render.1,
+            &render.4,
+            self.transcript_scroll_max,
+            self.scroll_from_bottom,
+            usize::from(area.height),
+            true,
+        );
+        if self.pending_transcript_anchor.is_some() {
+            self.pending_scroll_anchor_height = None;
+        }
     }
 
     fn copy_transcript_entry(&mut self, index: usize) {
@@ -2437,6 +2480,8 @@ impl BorgTerminal {
         let mut next_team_roster_hit_areas = Vec::new();
         let mut next_back_to_director_area = None;
         let mut next_keybindings_hint_area = None;
+        let pending_transcript_anchor = self.pending_transcript_anchor.take();
+        let mut restored_scroll_from_bottom = None;
         let cursor_visible = cursor_blink_visible(self.cursor_blink_started_at.elapsed());
         self.terminal.draw(|frame| {
             let area = centered_content_area(frame.area());
@@ -2526,9 +2571,22 @@ impl BorgTerminal {
                 );
             }
             if !transcript_area.is_empty() {
+                let visible_height = transcript_area.height as usize;
+                let scroll_from_bottom =
+                    pending_transcript_anchor.map_or(self.scroll_from_bottom, |anchor| {
+                        restore_transcript_viewport_anchor(
+                            anchor,
+                            tool_rows,
+                            entry_rows,
+                            transcript_height,
+                            visible_height,
+                            self.scroll_from_bottom,
+                        )
+                    });
+                restored_scroll_from_bottom = Some(scroll_from_bottom);
                 let scroll_max = transcript_height.saturating_sub(transcript_area.height as usize);
                 next_scroll_max = scroll_max;
-                let scroll = scroll_max.saturating_sub(self.scroll_from_bottom.min(scroll_max));
+                let scroll = scroll_max.saturating_sub(scroll_from_bottom.min(scroll_max));
                 let content_area = if transcript_area.width > 4 {
                     Rect {
                         width: transcript_area.width - 3,
@@ -3154,7 +3212,9 @@ impl BorgTerminal {
         self.team_roster_hit_areas = next_team_roster_hit_areas;
         self.back_to_director_area = next_back_to_director_area;
         self.keybindings_hint_area = next_keybindings_hint_area;
-        self.scroll_from_bottom = self.scroll_from_bottom.min(next_scroll_max);
+        self.scroll_from_bottom = restored_scroll_from_bottom
+            .unwrap_or(self.scroll_from_bottom)
+            .min(next_scroll_max);
         Ok(())
     }
 
@@ -4330,6 +4390,13 @@ impl Transcript {
             }
         }
         Vec::new()
+    }
+
+    fn tool_is_expanded(&self, index: usize) -> bool {
+        matches!(
+            self.order.get(index),
+            Some(TranscriptEntry::Tool { expanded: true, .. })
+        )
     }
 
     fn hydrate_payload(&mut self, payload: &SessionPayloadRef, bytes: Vec<u8>) -> Result<()> {
@@ -6617,6 +6684,79 @@ fn preserve_scroll_anchor(
     } else {
         scroll_from_bottom.saturating_sub(previous_height - next_height)
     }
+}
+
+fn transcript_viewport_anchor(
+    tool_rows: &[RowRange],
+    entry_rows: &[RowRange],
+    scroll_max: usize,
+    scroll_from_bottom: usize,
+    viewport_height: usize,
+    collapsing: bool,
+) -> Option<TranscriptViewportAnchor> {
+    let scroll_start = scroll_max.saturating_sub(scroll_from_bottom.min(scroll_max));
+    let viewport_row = viewport_height.saturating_sub(1) / 2;
+    let row = scroll_start.saturating_add(viewport_row);
+    let entry = entry_rows
+        .iter()
+        .find(|(_, start, end)| *start <= row && row < *end)
+        .copied()
+        .or_else(|| {
+            tool_rows
+                .iter()
+                .find(|(_, start, end)| *start <= row && row < *end)
+                .copied()
+        })?;
+    let (entry_index, entry_start, _) = entry;
+    let collapsed_tool_header = if collapsing {
+        tool_rows
+            .iter()
+            .find(|(_, start, end)| *start < row && row < *end)
+            .map(|(index, _, _)| *index)
+    } else {
+        None
+    };
+    Some(TranscriptViewportAnchor {
+        entry_index: *entry_index,
+        entry_row_offset: row.saturating_sub(*entry_start),
+        viewport_row,
+        collapsed_tool_header,
+    })
+}
+
+fn restore_transcript_viewport_anchor(
+    anchor: TranscriptViewportAnchor,
+    tool_rows: &[RowRange],
+    entry_rows: &[RowRange],
+    transcript_height: usize,
+    viewport_height: usize,
+    current_scroll_from_bottom: usize,
+) -> usize {
+    let scroll_max = transcript_height.saturating_sub(viewport_height);
+    let target_row = anchor
+        .collapsed_tool_header
+        .and_then(|index| {
+            tool_rows
+                .iter()
+                .find(|(candidate, _, _)| *candidate == index)
+                .map(|(_, start, _)| *start)
+        })
+        .or_else(|| {
+            entry_rows
+                .iter()
+                .find(|(index, _, _)| *index == anchor.entry_index)
+                .map(|(_, start, end)| {
+                    start
+                        .saturating_add(anchor.entry_row_offset.min(end.saturating_sub(*start + 1)))
+                })
+        });
+    let Some(target_row) = target_row else {
+        return current_scroll_from_bottom.min(scroll_max);
+    };
+    let scroll_start = target_row
+        .saturating_sub(anchor.viewport_row)
+        .min(scroll_max);
+    scroll_max.saturating_sub(scroll_start)
 }
 
 fn fish_style_path(path: &Path) -> String {

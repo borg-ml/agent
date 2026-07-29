@@ -41,7 +41,11 @@ async fn main() -> Result<()> {
 
 fn print_extensions(args: ExtensionsArgs) -> Result<()> {
     let config = agent_config::AgentConfig::load(None)?;
-    let (catalog, _) = extensions::discover(&std::env::current_dir()?, &config.capabilities)?;
+    let (catalog, _) = extensions::discover(
+        &std::env::current_dir()?,
+        &config.capabilities,
+        config.extensions.allow_project_mcp,
+    )?;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&catalog)?);
     } else {

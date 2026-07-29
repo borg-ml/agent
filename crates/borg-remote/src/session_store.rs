@@ -658,6 +658,42 @@ impl SqliteSessionStore {
         Ok(found != 0)
     }
 
+    /// Create a new execution session directly inside an existing or
+    /// caller-selected workspace. This is only valid before the session has
+    /// events, so a resumed transcript can never silently move workspaces.
+    pub async fn create_session_in_workspace(
+        &self,
+        session_id: Uuid,
+        workspace_id: Uuid,
+    ) -> Result<SessionWorkspaceBinding> {
+        self.create_session(session_id).await?;
+        let attached_at = Utc::now();
+        sqlx::query(
+            "update session_workspace_bindings \
+             set workspace_id=?, participant_id=?, host_id=null, attached_at=? \
+             where session_id=? and workspace_id=? and participant_id=?",
+        )
+        .bind(workspace_id.to_string())
+        .bind(session_id.to_string())
+        .bind(attached_at.to_rfc3339())
+        .bind(session_id.to_string())
+        .bind(session_id.to_string())
+        .bind(session_id.to_string())
+        .execute(&self.pool)
+        .await?
+        .rows_affected()
+        .eq(&1)
+        .then_some(())
+        .context("new session workspace binding was not in its default state")?;
+        Ok(SessionWorkspaceBinding {
+            session_id,
+            workspace_id,
+            participant_id: session_id,
+            host_id: None,
+            attached_at,
+        })
+    }
+
     async fn ensure_schema(&self) -> Result<()> {
         sqlx::raw_sql(
             r#"
@@ -2062,6 +2098,34 @@ mod tests {
         let child_binding = store.workspace_binding(child).await.unwrap().unwrap();
         assert_eq!(child_binding.workspace_id, root);
         assert_eq!(child_binding.participant_id, child);
+    }
+
+    #[tokio::test]
+    async fn new_session_can_start_in_a_selected_workspace_without_becoming_rebindable() {
+        let (_directory, store) = store().await;
+        let session_id = Uuid::new_v4();
+        let workspace_id = Uuid::new_v4();
+        let binding = store
+            .create_session_in_workspace(session_id, workspace_id)
+            .await
+            .unwrap();
+        assert_eq!(binding.workspace_id, workspace_id);
+        assert_eq!(binding.participant_id, session_id);
+        assert_eq!(
+            store.workspace_binding(session_id).await.unwrap().unwrap(),
+            binding
+        );
+        assert!(
+            store
+                .attach_workspace(SessionWorkspaceBinding {
+                    workspace_id: Uuid::new_v4(),
+                    ..binding
+                })
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("already attached")
+        );
     }
 
     #[tokio::test]

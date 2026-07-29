@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 #[cfg(test)]
 use crate::SessionJournal;
+use crate::subagents::SharedWorkToolContext;
 use crate::{
     AgentTurn, AgentTurnControl, AgentTurnExecutor, CodingProvider, EventActor, GoalAction,
     GoalStatus, HostCommand, LaunchSession, LocalAgentTurnExecutor, MessageStatus, ModelGoalStatus,
@@ -466,9 +467,8 @@ async fn run_agent_session_store_kernel(
             .with_context(|| format!("session {session_id} has no workspace binding"))?;
         let workspace_store =
             SqliteWorkspaceStore::open(session_root.join("workspaces.sqlite3")).await?;
-        let human_participant_id =
-            Uuid::new_v5(&binding.workspace_id, b"borg-local-human-participant");
         let human_display_name = std::env::var("USER").unwrap_or_else(|_| "Local user".to_string());
+        let human_participant_id = crate::local_human_participant_id(&human_display_name);
         let workspace_name = launch
             .cwd
             .file_name()
@@ -510,7 +510,7 @@ async fn run_agent_session_store_kernel(
     };
     let subagent_store = Arc::clone(&store);
     let mut journal = RuntimeSessionStore::new(store, recovery.context_events);
-    if let Some(projection) = workspace_projection {
+    if let Some(projection) = workspace_projection.clone() {
         journal = journal.with_workspace_projection(projection);
     }
     if fresh {
@@ -606,6 +606,19 @@ async fn run_agent_session_store_kernel(
             .restore_from_events(&recovery.subagent_events)
             .await?;
     }
+    let shared_work = launch
+        .capabilities
+        .shared_work
+        .then(|| {
+            workspace_projection.as_ref().map(|projection| {
+                SharedWorkToolContext::new(
+                    projection.store.clone(),
+                    projection.workspace_id,
+                    projection.agent_participant_id,
+                )
+            })
+        })
+        .flatten();
     let dispatcher = crate::AgentToolDispatcher::new(
         goal_tools.clone(),
         todo_tools.clone(),
@@ -614,6 +627,7 @@ async fn run_agent_session_store_kernel(
         launch.provider,
         session_id,
         launch.capabilities.subagents,
+        shared_work,
         launch.team_policy.clone(),
     );
     let agent_tool_server =
@@ -2886,7 +2900,7 @@ mod tests {
         let workspace_store = SqliteWorkspaceStore::open(root.path().join("workspaces.sqlite3"))
             .await
             .unwrap();
-        let human_id = Uuid::new_v5(&binding.workspace_id, b"borg-local-human-participant");
+        let human_id = crate::local_human_participant_id("Human");
         workspace_store
             .ensure_execution_workspace(
                 binding.workspace_id,

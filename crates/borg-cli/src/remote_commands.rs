@@ -360,7 +360,13 @@ async fn run_local_agent_session(
              stop that process and resume it once to migrate it to SQLite"
         )
     } else {
-        sqlite_store.create_session(session_id).await?;
+        if let Some(workspace_id) = args.workspace {
+            sqlite_store
+                .create_session_in_workspace(session_id, workspace_id)
+                .await?;
+        } else {
+            sqlite_store.create_session(session_id).await?;
+        }
         sqlite_store.clone()
     };
     let session_state = store.state(session_id).await?;
@@ -477,7 +483,11 @@ async fn run_local_agent_session(
     }
     .with_external_mcp_servers({
         let mut servers = agent_config.external_mcp_servers();
-        let (_, extension_servers) = crate::extensions::discover(&cwd, &agent_config.capabilities)?;
+        let (_, extension_servers) = crate::extensions::discover(
+            &cwd,
+            &agent_config.capabilities,
+            agent_config.extensions.allow_project_mcp,
+        )?;
         servers.extend(extension_servers);
         servers
     });

@@ -57,7 +57,8 @@ pub use session_store::{
 pub use subagents::{
     AgentToolDispatcher, AgentToolServer, DEFAULT_MAX_SUBAGENTS, SpawnSubagent, SubagentActivity,
     SubagentActivityKind, SubagentCoordinator, SubagentSnapshot, SubagentStatus, SubagentUsage,
-    agent_tool_specs, agent_tool_specs_with_team_policy, subagent_tool_specs,
+    agent_tool_specs, agent_tool_specs_with_capabilities, agent_tool_specs_with_subagents,
+    agent_tool_specs_with_team_policy, subagent_tool_specs,
 };
 pub use tool_presentation::{
     ToolPresentation, ToolPresentationBody, ToolPresentationCategory, compact_text,
@@ -71,5 +72,6 @@ pub use workspace::{
     RecipientDelivery, SharedWork, SqliteWorkspaceStore, StructuredMention, Thread, WorkDependency,
     WorkReview, Workspace, WorkspaceArtifact, WorkspaceDecision, WorkspaceEvent,
     WorkspaceEventKind, WorkspaceHost, WorkspaceHostCapabilities, WorkspaceMembership,
-    WorkspaceMessage, WorkspaceMessageBody, WorkspaceReference, WorkspaceRole, WorkspaceStore,
+    WorkspaceMessage, WorkspaceMessageBody, WorkspaceReference, WorkspaceReviewRequest,
+    WorkspaceRole, WorkspaceRosterEntry, WorkspaceStore, local_human_participant_id,
 };

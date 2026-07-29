@@ -22,11 +22,13 @@ use ts_rs::TS;
 use uuid::Uuid;
 
 use crate::{
-    ApprovalDecision, Audience, CodingProvider, DeliveryMode, EventActor, HostCommand,
-    LaunchSession, MessageStatus, ModelGoalStatus, PromptDelivery, SessionEvent, SessionEventKind,
-    SessionGoalToolRequest, SessionGoalTools, SessionStatus, SessionStore, SessionTodoToolRequest,
-    SessionTodoTools, SqliteWorkspaceStore, StructuredMention, TodoItemUpdate, WorkspaceEvent,
-    WorkspaceEventKind, WorkspaceMessage, WorkspaceMessageBody, WorkspaceStore,
+    ApprovalDecision, AtomicWorkClaim, Audience, CodingProvider, DeliveryMode, EventActor,
+    HostCommand, LaunchSession, MessageStatus, ModelGoalStatus, PromptDelivery, Provenance,
+    SessionEvent, SessionEventKind, SessionGoalToolRequest, SessionGoalTools, SessionStatus,
+    SessionStore, SessionTodoToolRequest, SessionTodoTools, SharedWork, SqliteWorkspaceStore,
+    StructuredMention, TodoItemUpdate, WorkDependency, WorkReview, WorkspaceArtifact,
+    WorkspaceDecision, WorkspaceEvent, WorkspaceEventKind, WorkspaceMessage, WorkspaceMessageBody,
+    WorkspaceReference, WorkspaceReviewRequest, WorkspaceStore,
 };
 
 pub const DEFAULT_MAX_SUBAGENTS: usize = 3;
@@ -129,6 +131,7 @@ pub struct AgentToolDispatcher {
     todos: SessionTodoTools,
     subagents: Option<SubagentCoordinator>,
     subagents_enabled: bool,
+    shared_work: Option<SharedWorkToolContext>,
     lsp: crate::LspService,
     provider: CodingProvider,
     actor_session_id: Uuid,
@@ -145,8 +148,30 @@ pub struct AgentToolServer {
     token: String,
     provider: CodingProvider,
     subagents_enabled: bool,
+    shared_work_enabled: bool,
     team_policy: Option<crate::TeamPolicy>,
     cancel: CancellationToken,
+}
+
+#[derive(Clone)]
+pub(crate) struct SharedWorkToolContext {
+    store: SqliteWorkspaceStore,
+    workspace_id: Uuid,
+    participant_id: Uuid,
+}
+
+impl SharedWorkToolContext {
+    pub(crate) fn new(
+        store: SqliteWorkspaceStore,
+        workspace_id: Uuid,
+        participant_id: Uuid,
+    ) -> Self {
+        Self {
+            store,
+            workspace_id,
+            participant_id,
+        }
+    }
 }
 
 impl AgentToolServer {
@@ -188,6 +213,7 @@ impl AgentToolServer {
         let cleanup_path = socket_path.clone();
         let provider = dispatcher.provider;
         let subagents_enabled = dispatcher.subagents_enabled;
+        let shared_work_enabled = dispatcher.shared_work.is_some();
         let team_policy = dispatcher.team_policy.clone();
         tokio::spawn(async move {
             loop {
@@ -205,6 +231,7 @@ impl AgentToolServer {
             socket_path,
             provider,
             subagents_enabled,
+            shared_work_enabled,
             team_policy,
             cancel,
         })
@@ -227,6 +254,7 @@ impl AgentToolServer {
         let server_token = token.clone();
         let provider = dispatcher.provider;
         let subagents_enabled = dispatcher.subagents_enabled;
+        let shared_work_enabled = dispatcher.shared_work.is_some();
         let team_policy = dispatcher.team_policy.clone();
         tokio::spawn(async move {
             loop {
@@ -250,6 +278,7 @@ impl AgentToolServer {
             token,
             provider,
             subagents_enabled,
+            shared_work_enabled,
             team_policy,
             cancel,
         })
@@ -266,6 +295,10 @@ impl AgentToolServer {
                 env.insert("BORG_AGENT_TEAM_POLICY".to_string(), policy);
             }
         }
+        env.insert(
+            "BORG_AGENT_SHARED_WORK_ENABLED".to_string(),
+            self.shared_work_enabled.to_string(),
+        );
         #[cfg(unix)]
         env.insert(
             "BORG_AGENT_TOOL_SOCKET".to_string(),
@@ -284,14 +317,19 @@ impl AgentToolServer {
                 .into_owned(),
             args: vec!["__agent-mcp".to_string()],
             env,
-            allowed_tools: agent_tool_specs_with_subagents(self.provider, self.subagents_enabled)
-                .into_iter()
-                .filter_map(|tool| {
-                    tool["name"]
-                        .as_str()
-                        .map(|name| format!("mcp__borg_agent__{name}"))
-                })
-                .collect(),
+            allowed_tools: agent_tool_specs_with_capabilities(
+                self.provider,
+                self.subagents_enabled,
+                self.shared_work_enabled,
+                self.team_policy.as_ref(),
+            )
+            .into_iter()
+            .filter_map(|tool| {
+                tool["name"]
+                    .as_str()
+                    .map(|name| format!("mcp__borg_agent__{name}"))
+            })
+            .collect(),
         }
     }
 }
@@ -346,7 +384,7 @@ async fn serve_agent_tool_connection<S>(
 }
 
 impl AgentToolDispatcher {
-    pub fn new(
+    pub(crate) fn new(
         goals: SessionGoalTools,
         todos: SessionTodoTools,
         subagents: Option<SubagentCoordinator>,
@@ -354,6 +392,7 @@ impl AgentToolDispatcher {
         provider: CodingProvider,
         actor_session_id: Uuid,
         subagents_enabled: bool,
+        shared_work: Option<SharedWorkToolContext>,
         team_policy: Option<crate::TeamPolicy>,
     ) -> Self {
         Self {
@@ -361,6 +400,7 @@ impl AgentToolDispatcher {
             todos,
             subagents,
             subagents_enabled,
+            shared_work,
             lsp,
             provider,
             actor_session_id,
@@ -369,9 +409,10 @@ impl AgentToolDispatcher {
     }
 
     pub fn specs(&self) -> Vec<Value> {
-        agent_tool_specs_with_team_policy(
+        agent_tool_specs_with_capabilities(
             self.provider,
             self.subagents_enabled,
+            self.shared_work.is_some(),
             self.team_policy.as_ref(),
         )
     }
@@ -447,6 +488,13 @@ impl AgentToolDispatcher {
                 let args: LspWorkspaceSymbolArgs = serde_json::from_value(arguments)?;
                 self.lsp.workspace_symbols(&args.query).await
             }
+            name if is_shared_work_tool(name) => {
+                self.shared_work
+                    .as_ref()
+                    .context("shared-work tools are disabled by session capabilities")?
+                    .call(name, arguments)
+                    .await
+            }
             _ => {
                 if !self.subagents_enabled {
                     bail!("subagent tools are disabled by session capabilities");
@@ -459,6 +507,238 @@ impl AgentToolDispatcher {
             }
         }
     }
+}
+
+impl SharedWorkToolContext {
+    async fn call(&self, name: &str, arguments: Value) -> Result<Value> {
+        match name {
+            "list_shared_work" => {
+                let args: ListSharedWorkArgs = serde_json::from_value(arguments)?;
+                let limit = args.limit.unwrap_or(200).clamp(1, 1_000);
+                let events = self
+                    .store
+                    .replay(
+                        self.workspace_id,
+                        self.participant_id,
+                        args.after_sequence.unwrap_or(0),
+                        limit,
+                    )
+                    .await?
+                    .into_iter()
+                    .filter(|event| is_shared_work_event(&event.kind))
+                    .collect::<Vec<_>>();
+                Ok(json!({ "events": events }))
+            }
+            "create_shared_work" => {
+                let args: CreateSharedWorkArgs = serde_json::from_value(arguments)?;
+                let key = required_idempotency_key(&args.idempotency_key)?;
+                let work = SharedWork {
+                    id: self.stable_object_id("work", &key),
+                    title: required_tool_text("title", &args.title)?,
+                    detail: optional_tool_text(args.detail),
+                };
+                self.append(
+                    key,
+                    WorkspaceEventKind::WorkCreated {
+                        work,
+                        mode: DeliveryMode::Notify,
+                    },
+                )
+                .await
+            }
+            "claim_shared_work" => {
+                let args: ClaimSharedWorkArgs = serde_json::from_value(arguments)?;
+                self.append(
+                    required_idempotency_key(&args.idempotency_key)?,
+                    WorkspaceEventKind::WorkClaimed {
+                        claim: AtomicWorkClaim {
+                            work_id: args.work_id,
+                            claimant_id: self.participant_id,
+                            expected_claim_id: args.expected_claim_id,
+                        },
+                        mode: DeliveryMode::Notify,
+                    },
+                )
+                .await
+            }
+            "declare_work_dependency" => {
+                let args: DeclareWorkDependencyArgs = serde_json::from_value(arguments)?;
+                self.append(
+                    required_idempotency_key(&args.idempotency_key)?,
+                    WorkspaceEventKind::DependencyDeclared {
+                        dependency: WorkDependency {
+                            work_id: args.work_id,
+                            depends_on_work_id: args.depends_on_work_id,
+                        },
+                        mode: DeliveryMode::Notify,
+                    },
+                )
+                .await
+            }
+            "publish_workspace_artifact" => {
+                let args: PublishWorkspaceArtifactArgs = serde_json::from_value(arguments)?;
+                let key = required_idempotency_key(&args.idempotency_key)?;
+                let artifact = WorkspaceArtifact {
+                    id: self.stable_object_id("artifact", &key),
+                    work_id: args.work_id,
+                    name: required_tool_text("name", &args.name)?,
+                    media_type: optional_tool_text(args.media_type),
+                    uri: required_tool_text("uri", &args.uri)?,
+                    content_hash: optional_tool_text(args.content_hash),
+                };
+                self.append(
+                    key,
+                    WorkspaceEventKind::ArtifactPublished {
+                        artifact,
+                        mode: DeliveryMode::Notify,
+                    },
+                )
+                .await
+            }
+            "record_workspace_decision" => {
+                let args: RecordWorkspaceDecisionArgs = serde_json::from_value(arguments)?;
+                let key = required_idempotency_key(&args.idempotency_key)?;
+                let decision = WorkspaceDecision {
+                    id: self.stable_object_id("decision", &key),
+                    subject: required_tool_text("subject", &args.subject)?,
+                    outcome: required_tool_text("outcome", &args.outcome)?,
+                    rationale: optional_tool_text(args.rationale),
+                };
+                self.append(
+                    key,
+                    WorkspaceEventKind::DecisionRecorded {
+                        decision,
+                        mode: DeliveryMode::Notify,
+                    },
+                )
+                .await
+            }
+            "request_work_review" => {
+                let args: RequestWorkReviewArgs = serde_json::from_value(arguments)?;
+                let key = required_idempotency_key(&args.idempotency_key)?;
+                let request = WorkspaceReviewRequest {
+                    id: self.stable_object_id("review-request", &key),
+                    work_id: args.work_id,
+                    requested_reviewer_id: args.requested_reviewer_id,
+                    instructions: optional_tool_text(args.instructions),
+                };
+                self.append(
+                    key,
+                    WorkspaceEventKind::ReviewRequested {
+                        request,
+                        mode: DeliveryMode::Notify,
+                    },
+                )
+                .await
+            }
+            "record_work_review" => {
+                let args: RecordWorkReviewArgs = serde_json::from_value(arguments)?;
+                let review = WorkReview {
+                    work_id: args.work_id,
+                    reviewer_id: self.participant_id,
+                    verdict: required_tool_text("verdict", &args.verdict)?,
+                    detail: optional_tool_text(args.detail),
+                };
+                self.append(
+                    required_idempotency_key(&args.idempotency_key)?,
+                    WorkspaceEventKind::ReviewRecorded {
+                        review,
+                        mode: DeliveryMode::Notify,
+                    },
+                )
+                .await
+            }
+            "add_workspace_reference" => {
+                let args: AddWorkspaceReferenceArgs = serde_json::from_value(arguments)?;
+                let key = required_idempotency_key(&args.idempotency_key)?;
+                let reference = WorkspaceReference {
+                    id: self.stable_object_id("reference", &key),
+                    label: required_tool_text("label", &args.label)?,
+                    target: required_tool_text("target", &args.target)?,
+                };
+                self.append(
+                    key,
+                    WorkspaceEventKind::ReferenceAdded {
+                        reference,
+                        mode: DeliveryMode::Notify,
+                    },
+                )
+                .await
+            }
+            "record_workspace_provenance" => {
+                let args: RecordWorkspaceProvenanceArgs = serde_json::from_value(arguments)?;
+                let provenance = Provenance {
+                    subject_id: args.subject_id,
+                    source_kind: required_tool_text("source_kind", &args.source_kind)?,
+                    source_id: required_tool_text("source_id", &args.source_id)?,
+                    detail: optional_tool_text(args.detail),
+                };
+                self.append(
+                    required_idempotency_key(&args.idempotency_key)?,
+                    WorkspaceEventKind::ProvenanceRecorded {
+                        provenance,
+                        mode: DeliveryMode::Notify,
+                    },
+                )
+                .await
+            }
+            other => bail!("unknown shared-work tool: {other}"),
+        }
+    }
+
+    fn stable_object_id(&self, kind: &str, idempotency_key: &str) -> Uuid {
+        Uuid::new_v5(
+            &self.workspace_id,
+            format!("{kind}:{}:{idempotency_key}", self.participant_id).as_bytes(),
+        )
+    }
+
+    async fn append(&self, idempotency_key: String, kind: WorkspaceEventKind) -> Result<Value> {
+        let appended = self
+            .store
+            .append(WorkspaceEvent {
+                id: Uuid::new_v4(),
+                workspace_id: self.workspace_id,
+                sequence: 0,
+                author_id: self.participant_id,
+                idempotency_key,
+                created_at: Utc::now(),
+                kind,
+            })
+            .await?;
+        Ok(serde_json::to_value(appended)?)
+    }
+}
+
+fn is_shared_work_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "list_shared_work"
+            | "create_shared_work"
+            | "claim_shared_work"
+            | "declare_work_dependency"
+            | "publish_workspace_artifact"
+            | "record_workspace_decision"
+            | "request_work_review"
+            | "record_work_review"
+            | "add_workspace_reference"
+            | "record_workspace_provenance"
+    )
+}
+
+fn is_shared_work_event(kind: &WorkspaceEventKind) -> bool {
+    matches!(
+        kind,
+        WorkspaceEventKind::WorkCreated { .. }
+            | WorkspaceEventKind::ArtifactPublished { .. }
+            | WorkspaceEventKind::DecisionRecorded { .. }
+            | WorkspaceEventKind::WorkClaimed { .. }
+            | WorkspaceEventKind::DependencyDeclared { .. }
+            | WorkspaceEventKind::ReviewRequested { .. }
+            | WorkspaceEventKind::ReviewRecorded { .. }
+            | WorkspaceEventKind::ReferenceAdded { .. }
+            | WorkspaceEventKind::ProvenanceRecorded { .. }
+    )
 }
 
 struct SubagentEntry {
@@ -965,10 +1245,9 @@ impl SubagentCoordinator {
                 })?;
             let workspace_store =
                 SqliteWorkspaceStore::open(self.journal_root.join("workspaces.sqlite3")).await?;
-            let human_participant_id =
-                Uuid::new_v5(&binding.workspace_id, b"borg-local-human-participant");
             let human_display_name =
                 std::env::var("USER").unwrap_or_else(|_| "Local user".to_string());
+            let human_participant_id = crate::local_human_participant_id(&human_display_name);
             workspace_store
                 .ensure_execution_workspace(
                     binding.workspace_id,
@@ -1666,28 +1945,42 @@ fn validate_subagent_overrides(
     Ok(())
 }
 
-fn effective_worker_effort(launch: &LaunchSession, requested_effort: Option<String>) -> Option<String> {
-    requested_effort.or_else(|| {
-        // The only opt-in preset assigns workers low effort. Without a policy,
-        // retain the existing inheritance from the root launch.
-        launch.team_policy.as_ref().map(|_| "low".to_string())
-    }).or_else(|| launch.effort.clone())
+fn effective_worker_effort(
+    launch: &LaunchSession,
+    requested_effort: Option<String>,
+) -> Option<String> {
+    requested_effort
+        .or_else(|| {
+            // The only opt-in preset assigns workers low effort. Without a policy,
+            // retain the existing inheritance from the root launch.
+            launch.team_policy.as_ref().map(|_| "low".to_string())
+        })
+        .or_else(|| launch.effort.clone())
 }
 
 pub fn agent_tool_specs(provider: CodingProvider) -> Vec<Value> {
-    agent_tool_specs_with_subagents(provider, true)
+    agent_tool_specs_with_capabilities(provider, true, true, None)
 }
 
 pub fn agent_tool_specs_with_subagents(
     provider: CodingProvider,
     subagents_enabled: bool,
 ) -> Vec<Value> {
-    agent_tool_specs_with_team_policy(provider, subagents_enabled, None)
+    agent_tool_specs_with_capabilities(provider, subagents_enabled, true, None)
 }
 
 pub fn agent_tool_specs_with_team_policy(
     provider: CodingProvider,
     subagents_enabled: bool,
+    team_policy: Option<&crate::TeamPolicy>,
+) -> Vec<Value> {
+    agent_tool_specs_with_capabilities(provider, subagents_enabled, true, team_policy)
+}
+
+pub fn agent_tool_specs_with_capabilities(
+    provider: CodingProvider,
+    subagents_enabled: bool,
+    shared_work_enabled: bool,
     team_policy: Option<&crate::TeamPolicy>,
 ) -> Vec<Value> {
     let mut specs = vec![
@@ -1813,6 +2106,9 @@ pub fn agent_tool_specs_with_team_policy(
             }),
         ),
     ];
+    if shared_work_enabled {
+        specs.extend(shared_work_tool_specs());
+    }
     if subagents_enabled {
         let mut subagent_specs = subagent_tool_specs(provider);
         if let Some(policy) = team_policy {
@@ -1832,6 +2128,165 @@ pub fn agent_tool_specs_with_team_policy(
         specs.extend(subagent_specs);
     }
     specs
+}
+
+fn shared_work_tool_specs() -> Vec<Value> {
+    let idempotency_key = || {
+        json!({
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256,
+            "description": "Caller-stable key. Exact retries return the original event; conflicting reuse is rejected."
+        })
+    };
+    vec![
+        tool(
+            "list_shared_work",
+            "Replay durable shared-work, artifact, decision, review, reference, and provenance events visible to this workspace participant.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "after_sequence": { "type": "integer", "minimum": 0 },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000 }
+                },
+                "additionalProperties": false
+            }),
+        ),
+        tool(
+            "create_shared_work",
+            "Create one durable shared work item in the current workspace.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "title": { "type": "string", "minLength": 1 },
+                    "detail": { "type": "string" },
+                    "idempotency_key": idempotency_key()
+                },
+                "required": ["title", "idempotency_key"],
+                "additionalProperties": false
+            }),
+        ),
+        tool(
+            "claim_shared_work",
+            "Atomically claim a work item as this agent using the claim event ID currently observed, or null when unclaimed.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "work_id": { "type": "string", "format": "uuid" },
+                    "expected_claim_id": { "type": "string", "format": "uuid" },
+                    "idempotency_key": idempotency_key()
+                },
+                "required": ["work_id", "idempotency_key"],
+                "additionalProperties": false
+            }),
+        ),
+        tool(
+            "declare_work_dependency",
+            "Declare that one existing work item depends on another existing work item.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "work_id": { "type": "string", "format": "uuid" },
+                    "depends_on_work_id": { "type": "string", "format": "uuid" },
+                    "idempotency_key": idempotency_key()
+                },
+                "required": ["work_id", "depends_on_work_id", "idempotency_key"],
+                "additionalProperties": false
+            }),
+        ),
+        tool(
+            "publish_workspace_artifact",
+            "Publish a durable artifact reference, optionally attached to a shared work item.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "work_id": { "type": "string", "format": "uuid" },
+                    "name": { "type": "string", "minLength": 1 },
+                    "media_type": { "type": "string" },
+                    "uri": { "type": "string", "minLength": 1 },
+                    "content_hash": { "type": "string" },
+                    "idempotency_key": idempotency_key()
+                },
+                "required": ["name", "uri", "idempotency_key"],
+                "additionalProperties": false
+            }),
+        ),
+        tool(
+            "record_workspace_decision",
+            "Record a durable workspace decision and optional rationale.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "subject": { "type": "string", "minLength": 1 },
+                    "outcome": { "type": "string", "minLength": 1 },
+                    "rationale": { "type": "string" },
+                    "idempotency_key": idempotency_key()
+                },
+                "required": ["subject", "outcome", "idempotency_key"],
+                "additionalProperties": false
+            }),
+        ),
+        tool(
+            "request_work_review",
+            "Request review of a shared work item, optionally from one workspace participant.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "work_id": { "type": "string", "format": "uuid" },
+                    "requested_reviewer_id": { "type": "string", "format": "uuid" },
+                    "instructions": { "type": "string" },
+                    "idempotency_key": idempotency_key()
+                },
+                "required": ["work_id", "idempotency_key"],
+                "additionalProperties": false
+            }),
+        ),
+        tool(
+            "record_work_review",
+            "Record this participant's durable verdict for a shared work item.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "work_id": { "type": "string", "format": "uuid" },
+                    "verdict": { "type": "string", "minLength": 1 },
+                    "detail": { "type": "string" },
+                    "idempotency_key": idempotency_key()
+                },
+                "required": ["work_id", "verdict", "idempotency_key"],
+                "additionalProperties": false
+            }),
+        ),
+        tool(
+            "add_workspace_reference",
+            "Add a durable named reference to the workspace.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "label": { "type": "string", "minLength": 1 },
+                    "target": { "type": "string", "minLength": 1 },
+                    "idempotency_key": idempotency_key()
+                },
+                "required": ["label", "target", "idempotency_key"],
+                "additionalProperties": false
+            }),
+        ),
+        tool(
+            "record_workspace_provenance",
+            "Attach durable source provenance to a workspace subject.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "subject_id": { "type": "string", "format": "uuid" },
+                    "source_kind": { "type": "string", "minLength": 1 },
+                    "source_id": { "type": "string", "minLength": 1 },
+                    "detail": { "type": "string" },
+                    "idempotency_key": idempotency_key()
+                },
+                "required": ["subject_id", "source_kind", "source_id", "idempotency_key"],
+                "additionalProperties": false
+            }),
+        ),
+    ]
 }
 
 #[derive(Deserialize)]
@@ -1878,6 +2333,93 @@ struct LspPositionArgs {
 #[serde(deny_unknown_fields)]
 struct LspWorkspaceSymbolArgs {
     query: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ListSharedWorkArgs {
+    after_sequence: Option<u64>,
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateSharedWorkArgs {
+    title: String,
+    detail: Option<String>,
+    idempotency_key: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClaimSharedWorkArgs {
+    work_id: Uuid,
+    expected_claim_id: Option<Uuid>,
+    idempotency_key: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeclareWorkDependencyArgs {
+    work_id: Uuid,
+    depends_on_work_id: Uuid,
+    idempotency_key: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublishWorkspaceArtifactArgs {
+    work_id: Option<Uuid>,
+    name: String,
+    media_type: Option<String>,
+    uri: String,
+    content_hash: Option<String>,
+    idempotency_key: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecordWorkspaceDecisionArgs {
+    subject: String,
+    outcome: String,
+    rationale: Option<String>,
+    idempotency_key: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RequestWorkReviewArgs {
+    work_id: Uuid,
+    requested_reviewer_id: Option<Uuid>,
+    instructions: Option<String>,
+    idempotency_key: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecordWorkReviewArgs {
+    work_id: Uuid,
+    verdict: String,
+    detail: Option<String>,
+    idempotency_key: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AddWorkspaceReferenceArgs {
+    label: String,
+    target: String,
+    idempotency_key: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecordWorkspaceProvenanceArgs {
+    subject_id: Uuid,
+    source_kind: String,
+    source_id: String,
+    detail: Option<String>,
+    idempotency_key: String,
 }
 
 #[derive(Deserialize)]
@@ -2030,6 +2572,32 @@ fn required_message(message: &str) -> Result<String> {
         bail!("subagent message must not be empty");
     }
     Ok(message.to_string())
+}
+
+fn required_idempotency_key(value: &str) -> Result<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        bail!("idempotency_key must not be empty");
+    }
+    if value.len() > 256 {
+        bail!("idempotency_key must be at most 256 bytes");
+    }
+    Ok(value.to_string())
+}
+
+fn required_tool_text(field: &str, value: &str) -> Result<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        bail!("{field} must not be empty");
+    }
+    Ok(value.to_string())
+}
+
+fn optional_tool_text(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let value = value.trim();
+        (!value.is_empty()).then(|| value.to_string())
+    })
 }
 
 fn attributed_team_message(actor: &str, message: &str) -> String {
@@ -2238,7 +2806,7 @@ mod tests {
         let workspace = crate::SqliteWorkspaceStore::open(directory.join("workspaces.sqlite3"))
             .await
             .unwrap();
-        let human = Uuid::new_v5(&root, b"borg-local-human-participant");
+        let human = crate::local_human_participant_id("Human");
         workspace
             .ensure_execution_workspace(root, "test team", human, "Human", root, "Director")
             .await
@@ -2493,16 +3061,121 @@ mod tests {
     }
 
     #[test]
+    fn shared_work_tools_are_absent_when_the_capability_is_disabled() {
+        let names = agent_tool_specs_with_capabilities(CodingProvider::Codex, false, false, None)
+            .into_iter()
+            .filter_map(|tool| tool["name"].as_str().map(str::to_string))
+            .collect::<Vec<_>>();
+        assert!(!names.iter().any(|name| is_shared_work_tool(name)));
+        assert!(!names.iter().any(|name| name == "spawn_agent"));
+
+        let enabled = agent_tool_specs_with_capabilities(CodingProvider::Codex, false, true, None)
+            .into_iter()
+            .filter_map(|tool| tool["name"].as_str().map(str::to_string))
+            .collect::<Vec<_>>();
+        assert!(enabled.iter().any(|name| name == "create_shared_work"));
+        assert!(enabled.iter().any(|name| name == "request_work_review"));
+    }
+
+    #[tokio::test]
+    async fn shared_work_tools_are_idempotent_atomic_and_replayable() {
+        let directory = tempdir().unwrap();
+        let workspace_id = Uuid::new_v4();
+        let human_id = Uuid::new_v4();
+        let agent_id = Uuid::new_v4();
+        let store = SqliteWorkspaceStore::open(directory.path().join("workspaces.sqlite3"))
+            .await
+            .unwrap();
+        store
+            .ensure_execution_workspace(
+                workspace_id,
+                "shared tools",
+                human_id,
+                "Human",
+                agent_id,
+                "Agent",
+            )
+            .await
+            .unwrap();
+        let tools = SharedWorkToolContext::new(store, workspace_id, agent_id);
+
+        let create_args = json!({
+            "title": "Verify boundary delivery",
+            "detail": "Exercise the real provider boundary.",
+            "idempotency_key": "work:boundary-delivery"
+        });
+        let created = tools
+            .call("create_shared_work", create_args.clone())
+            .await
+            .unwrap();
+        let retried = tools.call("create_shared_work", create_args).await.unwrap();
+        assert_eq!(created, retried);
+        assert!(
+            tools
+                .call(
+                    "create_shared_work",
+                    json!({
+                        "title": "Conflicting payload",
+                        "idempotency_key": "work:boundary-delivery"
+                    }),
+                )
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("idempotency conflict")
+        );
+
+        let work_id: Uuid = serde_json::from_value(created["kind"]["work"]["id"].clone()).unwrap();
+        let claim_args = json!({
+            "work_id": work_id,
+            "idempotency_key": "claim:boundary-delivery"
+        });
+        let claim = tools
+            .call("claim_shared_work", claim_args.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            claim,
+            tools.call("claim_shared_work", claim_args).await.unwrap()
+        );
+        tools
+            .call(
+                "request_work_review",
+                json!({
+                    "work_id": work_id,
+                    "requested_reviewer_id": human_id,
+                    "instructions": "Review the boundary trace.",
+                    "idempotency_key": "review-request:boundary-delivery"
+                }),
+            )
+            .await
+            .unwrap();
+
+        let replay = tools
+            .call("list_shared_work", json!({ "limit": 20 }))
+            .await
+            .unwrap();
+        let events = replay["events"].as_array().unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0]["kind"]["type"], "work_created");
+        assert_eq!(events[1]["kind"]["type"], "work_claimed");
+        assert_eq!(events[2]["kind"]["type"], "review_requested");
+    }
+
+    #[test]
     fn autonomous_team_defaults_workers_to_low_without_overriding_tool_input() {
         let mut team_launch = launch();
-        team_launch.team_policy = Some(TeamPreset::XhighDirectorLowWorkers.policy(
+        team_launch.team_policy = Some(crate::TeamPreset::XhighDirectorLowWorkers.policy(
             Uuid::new_v4(),
             Uuid::new_v4(),
             Uuid::new_v4(),
             std::iter::empty(),
             crate::ProviderId("codex".into()),
         ));
-        assert_eq!(effective_worker_effort(&team_launch, None).as_deref(), Some("low"));
+        assert_eq!(
+            effective_worker_effort(&team_launch, None).as_deref(),
+            Some("low")
+        );
         assert_eq!(
             effective_worker_effort(&team_launch, Some("high".into())).as_deref(),
             Some("high")
@@ -2516,7 +3189,7 @@ mod tests {
 
     #[test]
     fn autonomous_team_policy_is_visible_in_spawn_tool_metadata() {
-        let policy = TeamPreset::XhighDirectorLowWorkers.policy(
+        let policy = crate::TeamPreset::XhighDirectorLowWorkers.policy(
             Uuid::new_v4(),
             Uuid::new_v4(),
             Uuid::new_v4(),
@@ -2527,10 +3200,12 @@ mod tests {
             .into_iter()
             .find(|tool| tool["name"] == "spawn_agent")
             .unwrap();
-        assert!(spawn["description"]
-            .as_str()
-            .unwrap()
-            .contains("Effective autonomous-team policy"));
+        assert!(
+            spawn["description"]
+                .as_str()
+                .unwrap()
+                .contains("Effective autonomous-team policy")
+        );
     }
 
     #[test]

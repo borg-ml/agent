@@ -16,6 +16,16 @@ use uuid::Uuid;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const WRITE_TRANSACTION: &str = "BEGIN IMMEDIATE";
 
+/// Stable identity for the local OS user across all personal workspaces in one
+/// Borg installation. Authenticated cloud workspaces replace this projection
+/// with the product user participant ID.
+pub fn local_human_participant_id(display_name: &str) -> Uuid {
+    Uuid::new_v5(
+        &Uuid::NAMESPACE_URL,
+        format!("borg://local-human/{}", display_name.trim()).as_bytes(),
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Participant {
     pub id: Uuid,
@@ -43,6 +53,12 @@ pub enum WorkspaceRole {
 pub struct WorkspaceMembership {
     pub workspace_id: Uuid,
     pub participant_id: Uuid,
+    pub role: WorkspaceRole,
+    pub joined_at: DateTime<Utc>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceRosterEntry {
+    pub participant: Participant,
     pub role: WorkspaceRole,
     pub joined_at: DateTime<Utc>,
 }
@@ -208,6 +224,13 @@ pub struct WorkDependency {
     pub depends_on_work_id: Uuid,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceReviewRequest {
+    pub id: Uuid,
+    pub work_id: Uuid,
+    pub requested_reviewer_id: Option<Uuid>,
+    pub instructions: Option<String>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkReview {
     pub work_id: Uuid,
     pub reviewer_id: Uuid,
@@ -258,6 +281,10 @@ pub enum WorkspaceEventKind {
     },
     DependencyDeclared {
         dependency: WorkDependency,
+        mode: DeliveryMode,
+    },
+    ReviewRequested {
+        request: WorkspaceReviewRequest,
         mode: DeliveryMode,
     },
     ReviewRecorded {
@@ -338,6 +365,89 @@ impl SqliteWorkspaceStore {
     }
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
+    }
+
+    pub async fn list_workspaces_for_participant(
+        &self,
+        participant_id: Uuid,
+    ) -> Result<Vec<Workspace>> {
+        let rows = sqlx::query(
+            "select w.id,w.name,w.created_at from workspaces w \
+             join workspace_members m on m.workspace_id=w.id \
+             where m.participant_id=? order by w.created_at,w.id",
+        )
+        .bind(participant_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(Workspace {
+                    id: Uuid::parse_str(row.try_get("id")?)?,
+                    name: row.try_get("name")?,
+                    created_at: DateTime::parse_from_rfc3339(row.try_get("created_at")?)?
+                        .with_timezone(&Utc),
+                })
+            })
+            .collect()
+    }
+
+    pub async fn workspace_roster(
+        &self,
+        workspace_id: Uuid,
+        viewer_id: Uuid,
+    ) -> Result<Vec<WorkspaceRosterEntry>> {
+        self.require_member(workspace_id, viewer_id).await?;
+        let rows = sqlx::query(
+            "select p.id,p.display_name,p.kind,p.created_at,m.role,m.joined_at \
+             from workspace_members m \
+             join workspace_participants p on p.id=m.participant_id \
+             where m.workspace_id=? order by m.joined_at,p.id",
+        )
+        .bind(workspace_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(WorkspaceRosterEntry {
+                    participant: Participant {
+                        id: Uuid::parse_str(row.try_get("id")?)?,
+                        display_name: row.try_get("display_name")?,
+                        kind: serde_json::from_str(row.try_get("kind")?)?,
+                        created_at: DateTime::parse_from_rfc3339(row.try_get("created_at")?)?
+                            .with_timezone(&Utc),
+                    },
+                    role: serde_json::from_str(row.try_get("role")?)?,
+                    joined_at: DateTime::parse_from_rfc3339(row.try_get("joined_at")?)?
+                        .with_timezone(&Utc),
+                })
+            })
+            .collect()
+    }
+
+    pub async fn workspace_threads(
+        &self,
+        workspace_id: Uuid,
+        viewer_id: Uuid,
+    ) -> Result<Vec<Thread>> {
+        self.require_member(workspace_id, viewer_id).await?;
+        let rows = sqlx::query(
+            "select id,title,created_at from workspace_threads \
+             where workspace_id=? order by created_at,id",
+        )
+        .bind(workspace_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(Thread {
+                    id: Uuid::parse_str(row.try_get("id")?)?,
+                    workspace_id,
+                    title: row.try_get("title")?,
+                    created_at: DateTime::parse_from_rfc3339(row.try_get("created_at")?)?
+                        .with_timezone(&Utc),
+                })
+            })
+            .collect()
     }
 
     /// Idempotently materialize the stable local identities for one execution
@@ -544,6 +654,19 @@ impl SqliteWorkspaceStore {
         Ok(found != 0)
     }
 
+    async fn require_member(&self, workspace_id: Uuid, participant_id: Uuid) -> Result<()> {
+        let found: i64 = sqlx::query_scalar(
+            "select exists(select 1 from workspace_members \
+             where workspace_id=? and participant_id=?)",
+        )
+        .bind(workspace_id.to_string())
+        .bind(participant_id.to_string())
+        .fetch_one(&self.pool)
+        .await?;
+        ensure!(found != 0, "viewer is not a workspace member");
+        Ok(())
+    }
+
     fn canonical_event(mut event: WorkspaceEvent) -> Result<String> {
         let epoch = DateTime::<Utc>::from_timestamp(0, 0).expect("Unix epoch is valid");
         event.id = Uuid::nil();
@@ -635,12 +758,22 @@ impl WorkspaceStore for SqliteWorkspaceStore {
                 "work already exists in workspace"
             );
         }
-        if let WorkspaceEventKind::ArtifactPublished { artifact, .. } = &e.kind
-            && let Some(work_id) = artifact.work_id
-        {
+        if let WorkspaceEventKind::ArtifactPublished { artifact, .. } = &e.kind {
             ensure!(
-                Self::work_exists(&mut tx, e.workspace_id, work_id).await?,
-                "artifact work item is not in workspace"
+                !artifact.name.trim().is_empty() && !artifact.uri.trim().is_empty(),
+                "artifact name and URI must not be empty"
+            );
+            if let Some(work_id) = artifact.work_id {
+                ensure!(
+                    Self::work_exists(&mut tx, e.workspace_id, work_id).await?,
+                    "artifact work item is not in workspace"
+                );
+            }
+        }
+        if let WorkspaceEventKind::DecisionRecorded { decision, .. } = &e.kind {
+            ensure!(
+                !decision.subject.trim().is_empty() && !decision.outcome.trim().is_empty(),
+                "decision subject and outcome must not be empty"
             );
         }
         if let WorkspaceEventKind::WorkClaimed { claim, .. } = &e.kind {
@@ -681,6 +814,18 @@ impl WorkspaceStore for SqliteWorkspaceStore {
                 "dependency work item is not in workspace"
             );
         }
+        if let WorkspaceEventKind::ReviewRequested { request, .. } = &e.kind {
+            ensure!(
+                Self::work_exists(&mut tx, e.workspace_id, request.work_id).await?,
+                "reviewed work item is not in workspace"
+            );
+            if let Some(reviewer_id) = request.requested_reviewer_id {
+                ensure!(
+                    members.iter().any(|(id, _)| *id == reviewer_id),
+                    "requested reviewer is not a workspace member"
+                );
+            }
+        }
         if let WorkspaceEventKind::ReviewRecorded { review, .. } = &e.kind {
             ensure!(
                 Self::work_exists(&mut tx, e.workspace_id, review.work_id).await?,
@@ -689,6 +834,23 @@ impl WorkspaceStore for SqliteWorkspaceStore {
             ensure!(
                 members.iter().any(|(id, _)| *id == review.reviewer_id),
                 "reviewer is not a workspace member"
+            );
+            ensure!(
+                !review.verdict.trim().is_empty(),
+                "review verdict must not be empty"
+            );
+        }
+        if let WorkspaceEventKind::ReferenceAdded { reference, .. } = &e.kind {
+            ensure!(
+                !reference.label.trim().is_empty() && !reference.target.trim().is_empty(),
+                "reference label and target must not be empty"
+            );
+        }
+        if let WorkspaceEventKind::ProvenanceRecorded { provenance, .. } = &e.kind {
+            ensure!(
+                !provenance.source_kind.trim().is_empty()
+                    && !provenance.source_id.trim().is_empty(),
+                "provenance source kind and source id must not be empty"
             );
         }
         let (mode, audience) = match &e.kind {
@@ -730,6 +892,7 @@ impl WorkspaceStore for SqliteWorkspaceStore {
             | WorkspaceEventKind::DecisionRecorded { mode, .. }
             | WorkspaceEventKind::WorkClaimed { mode, .. }
             | WorkspaceEventKind::DependencyDeclared { mode, .. }
+            | WorkspaceEventKind::ReviewRequested { mode, .. }
             | WorkspaceEventKind::ReviewRecorded { mode, .. }
             | WorkspaceEventKind::ReferenceAdded { mode, .. }
             | WorkspaceEventKind::ProvenanceRecorded { mode, .. } => (*mode, &Audience::Workspace),
@@ -972,6 +1135,19 @@ impl WorkspaceStore for SqliteWorkspaceStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_human_identity_is_stable_across_workspaces() {
+        assert_eq!(
+            local_human_participant_id("shulgin"),
+            local_human_participant_id(" shulgin ")
+        );
+        assert_ne!(
+            local_human_participant_id("shulgin"),
+            local_human_participant_id("teammate")
+        );
+    }
+
     async fn fixture() -> (
         SqliteWorkspaceStore,
         Workspace,
@@ -1021,6 +1197,51 @@ mod tests {
         }
         (s, w, a, b, c)
     }
+
+    #[tokio::test]
+    async fn workspace_listing_roster_and_threads_are_member_scoped() {
+        let (store, workspace, owner, agent, outsider) = fixture().await;
+        store
+            .create_thread(Thread {
+                id: Uuid::new_v4(),
+                workspace_id: workspace.id,
+                title: "Coordination".into(),
+                created_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .list_workspaces_for_participant(owner.id)
+                .await
+                .unwrap(),
+            vec![workspace.clone()]
+        );
+        let roster = store
+            .workspace_roster(workspace.id, owner.id)
+            .await
+            .unwrap();
+        assert_eq!(roster.len(), 2);
+        assert!(roster.iter().any(|entry| entry.participant.id == agent.id));
+        assert_eq!(
+            store
+                .workspace_threads(workspace.id, owner.id)
+                .await
+                .unwrap()[0]
+                .title,
+            "Coordination"
+        );
+        assert!(
+            store
+                .workspace_roster(workspace.id, outsider.id)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("not a workspace member")
+        );
+    }
+
     fn event(w: Uuid, a: Uuid, audience: Audience, key: &str) -> WorkspaceEvent {
         let now = Utc::now();
         WorkspaceEvent {
@@ -1408,6 +1629,15 @@ mod tests {
                 },
                 mode: DeliveryMode::Notify,
             },
+            WorkspaceEventKind::ReviewRequested {
+                request: WorkspaceReviewRequest {
+                    id: Uuid::new_v4(),
+                    work_id: work.id,
+                    requested_reviewer_id: Some(b.id),
+                    instructions: Some("check the evidence".into()),
+                },
+                mode: DeliveryMode::Notify,
+            },
             WorkspaceEventKind::ReviewRecorded {
                 review: WorkReview {
                     work_id: work.id,
@@ -1446,13 +1676,13 @@ mod tests {
             .unwrap();
         }
         let replay = s.replay(w.id, b.id, 0, 20).await.unwrap();
-        assert_eq!(replay.len(), 9);
+        assert_eq!(replay.len(), 10);
         assert!(matches!(
             replay[0].kind,
             WorkspaceEventKind::WorkCreated { .. }
         ));
         assert!(matches!(
-            replay[8].kind,
+            replay[9].kind,
             WorkspaceEventKind::ProvenanceRecorded { .. }
         ));
         assert!(

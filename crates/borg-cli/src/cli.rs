@@ -89,6 +89,9 @@ pub(crate) struct LocalAgentCliArgs {
     pub(crate) resume: Option<Uuid>,
     #[arg(long = "continue", conflicts_with = "resume")]
     pub(crate) continue_latest: bool,
+    /// Start a new session in this local multiplayer workspace.
+    #[arg(long, conflicts_with_all = ["resume", "continue_latest"])]
+    pub(crate) workspace: Option<Uuid>,
     #[arg(long)]
     pub(crate) local_only: bool,
     /// Use a temporary local session store and discard it when this process exits.
@@ -110,6 +113,7 @@ impl LocalAgentCliArgs {
             json: false,
             resume: None,
             continue_latest: false,
+            workspace: None,
             local_only: false,
             ephemeral: false,
         }
@@ -128,6 +132,7 @@ impl LocalAgentCliArgs {
             json: false,
             resume: session,
             continue_latest: session.is_none(),
+            workspace: None,
             local_only: false,
             ephemeral: false,
         }
@@ -174,6 +179,30 @@ mod tests {
                 "--ephemeral",
                 "--resume",
                 "00000000-0000-0000-0000-000000000000"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_new_agent_can_join_a_selected_workspace_but_a_resume_cannot_move() {
+        let workspace = "11111111-1111-1111-1111-111111111111";
+        let session = "22222222-2222-2222-2222-222222222222";
+        let command = Cli::try_parse_from(["borg", "agent", "--workspace", workspace])
+            .expect("selected workspace parses")
+            .command_or_agent();
+        let Command::Agent(args) = command else {
+            panic!("agent command expected");
+        };
+        assert_eq!(args.workspace, Some(Uuid::parse_str(workspace).unwrap()));
+        assert!(
+            Cli::try_parse_from([
+                "borg",
+                "agent",
+                "--workspace",
+                workspace,
+                "--resume",
+                session
             ])
             .is_err()
         );

@@ -107,3 +107,16 @@ Windows on x86-64 and ARM64. Each release archive contains the self-contained
 ---
 
 AGPL-3.0-only OR a separate Borg Commercial Licence.
+# Extensions
+
+Extensions are declarative TOML manifests stored in project
+`.borg/extensions/*.toml` or user `$XDG_CONFIG_HOME/borg/extensions/*.toml`
+(falling back to `~/.config/borg/extensions`). Project manifests are discovered
+first, but their MCP declarations are inactive unless the user explicitly sets
+`[extensions].allow_project_mcp = true` in their agent config. User-owned
+manifests remain eligible to start when enabled. They may declare capability
+requirements, skill-root metadata, and stdio MCP servers. Skill roots are
+catalog metadata only in this release; Borg does not load or execute them.
+Borg never loads shell hooks or lifecycle scripts. The only executable manifest
+fields are enabled, capability-eligible stdio MCP declarations. Inspect the
+effective catalog with `borg extensions` or `borg extensions --json`.
