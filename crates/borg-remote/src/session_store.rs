@@ -498,6 +498,31 @@ pub struct SqliteSessionStore {
     pool: SqlitePool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionStoreHealth {
+    pub integrity: String,
+    pub journal_mode: String,
+    pub synchronous: i64,
+    pub foreign_keys: bool,
+    pub wal_busy: i64,
+    pub wal_log_frames: i64,
+    pub wal_checkpointed_frames: i64,
+    pub sessions: i64,
+    pub events: i64,
+    pub payloads: i64,
+    pub projection_version: i32,
+}
+
+impl SessionStoreHealth {
+    pub fn is_ready(&self) -> bool {
+        self.integrity == "ok"
+            && self.journal_mode.eq_ignore_ascii_case("wal")
+            && self.synchronous >= 2
+            && self.foreign_keys
+            && self.wal_busy == 0
+    }
+}
+
 pub struct JsonlSessionStore {
     journal: Mutex<SessionJournal>,
 }
@@ -629,7 +654,7 @@ impl SqliteSessionStore {
         let options = SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))?
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
-            .synchronous(SqliteSynchronous::Normal)
+            .synchronous(SqliteSynchronous::Full)
             .busy_timeout(SQLITE_BUSY_TIMEOUT)
             .foreign_keys(true);
         let pool = SqlitePoolOptions::new()
@@ -644,6 +669,48 @@ impl SqliteSessionStore {
 
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
+    }
+
+    /// Check the durable authority without reading prompt or tool payload data.
+    pub async fn health(&self) -> Result<SessionStoreHealth> {
+        let integrity: String = sqlx::query_scalar("pragma quick_check")
+            .fetch_one(&self.pool)
+            .await?;
+        let journal_mode: String = sqlx::query_scalar("pragma journal_mode")
+            .fetch_one(&self.pool)
+            .await?;
+        let synchronous: i64 = sqlx::query_scalar("pragma synchronous")
+            .fetch_one(&self.pool)
+            .await?;
+        let foreign_keys: i64 = sqlx::query_scalar("pragma foreign_keys")
+            .fetch_one(&self.pool)
+            .await?;
+        let (wal_busy, wal_log_frames, wal_checkpointed_frames): (i64, i64, i64) =
+            sqlx::query_as("pragma wal_checkpoint(passive)")
+                .fetch_one(&self.pool)
+                .await?;
+        let sessions: i64 = sqlx::query_scalar("select count(*) from sessions")
+            .fetch_one(&self.pool)
+            .await?;
+        let events: i64 = sqlx::query_scalar("select count(*) from session_events")
+            .fetch_one(&self.pool)
+            .await?;
+        let payloads: i64 = sqlx::query_scalar("select count(*) from session_payloads")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(SessionStoreHealth {
+            integrity,
+            journal_mode,
+            synchronous,
+            foreign_keys: foreign_keys != 0,
+            wal_busy,
+            wal_log_frames,
+            wal_checkpointed_frames,
+            sessions,
+            events,
+            payloads,
+            projection_version: SESSION_PROJECTION_VERSION,
+        })
     }
 
     async fn begin_write(&self) -> Result<Transaction<'static, Sqlite>, sqlx::Error> {
@@ -915,6 +982,15 @@ impl SqliteSessionStore {
         sqlx::query(
             "create index if not exists idx_session_events_recovery \
              on session_events (session_id, sequence) where recovery_relevant = 1",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "create index if not exists idx_session_events_subagent_recovery \
+             on session_events ( \
+               session_id, event_kind, \
+               json_extract(event_json, '$.kind.agent.session_id'), sequence desc \
+             ) where event_kind = 'subagent_activity'",
         )
         .execute(&self.pool)
         .await?;
@@ -1224,8 +1300,17 @@ impl SqliteSessionStore {
                 let rows = sqlx::query(
                     "select event_json, fork_inheritable from session_events \
                      where session_id = ? and sequence > ? and sequence <= ? \
-                     and recovery_relevant = 1 order by sequence",
+                     and recovery_relevant = 1 \
+                     and (event_kind != 'subagent_activity' or sequence in ( \
+                       select max(sequence) from session_events \
+                       where session_id = ? and sequence > ? and sequence <= ? \
+                       and event_kind = 'subagent_activity' \
+                       group by json_extract(event_json, '$.kind.agent.session_id') \
+                     )) order by sequence",
                 )
+                .bind(session_id.to_string())
+                .bind(i64::try_from(session.inherited_event_count).unwrap_or(i64::MAX))
+                .bind(i64::try_from(logical_limit).unwrap_or(i64::MAX))
                 .bind(session_id.to_string())
                 .bind(i64::try_from(session.inherited_event_count).unwrap_or(i64::MAX))
                 .bind(i64::try_from(logical_limit).unwrap_or(i64::MAX))
@@ -2322,6 +2407,17 @@ mod tests {
         assert_eq!(recovery.queue_events.len(), 1);
         assert!(recovery.subagent_events.is_empty());
         assert_eq!(store.list_sessions(10).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn durable_store_health_requires_full_sync_wal_and_foreign_keys() {
+        let (_directory, store) = store().await;
+        let health = store.health().await.unwrap();
+        assert_eq!(health.integrity, "ok");
+        assert_eq!(health.journal_mode.to_ascii_lowercase(), "wal");
+        assert!(health.synchronous >= 2);
+        assert!(health.foreign_keys);
+        assert!(health.is_ready());
     }
 
     #[tokio::test]

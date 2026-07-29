@@ -85,6 +85,7 @@ const MIN_NESTED_SCROLL_LINES_PER_FRAME: usize = 2;
 const MAX_NESTED_SCROLL_LINES_PER_FRAME: usize = 12;
 const MAX_PENDING_WHEEL_SCROLL_LINES: isize = 160;
 const TOOL_RUN_BOX_THRESHOLD: usize = 8;
+const MAX_TERMINAL_AGENTS_IN_ROSTER: usize = 4;
 #[cfg(test)]
 const DEFAULT_TOOL_RUN_VIEWPORT_HEIGHT: usize = 8;
 const MIN_TOOL_RUN_VIEWPORT_HEIGHT: usize = 6;
@@ -355,6 +356,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/stop", "alias for /interrupt"),
     ("/login", "reconnect the current provider"),
     ("/remote", "connect this machine to your Borg account"),
+    ("/collab", "share this live session"),
     ("/quit", "end the session"),
     ("/exit", "alias for /quit"),
 ];
@@ -3255,7 +3257,7 @@ impl BorgTerminal {
                 }
             }
             if self.focused_child.is_some() {
-                let label = " ← Director ";
+                let label = " ↩ Return ";
                 let button = Rect {
                     x: status_area.right().saturating_sub(label.width() as u16),
                     y: status_area.y,
@@ -3489,6 +3491,13 @@ impl BorgTerminal {
                 _ => UiAction::None,
             });
         }
+        // Composer editing shortcuts take precedence over Enter-driven picker
+        // confirmation. Otherwise opening any picker turns Shift+Enter into a
+        // selection action instead of the configured newline action.
+        if is_composer_newline(&self.keymap, &key) {
+            self.composer.insert("\n");
+            return Ok(UiAction::None);
+        }
         let selected_by_number = if key.modifiers == KeyModifiers::NONE
             && let KeyCode::Char(number) = key.code
         {
@@ -3635,10 +3644,6 @@ impl BorgTerminal {
         if self.keymap.matches(KeyAction::SelectNext, &key) {
             self.transcript.select_next();
             self.notice = Some(self.transcript.selection_notice(&self.keymap));
-            return Ok(UiAction::None);
-        }
-        if self.keymap.matches(KeyAction::Newline, &key) {
-            self.composer.insert("\n");
             return Ok(UiAction::None);
         }
         if self.keymap.matches(KeyAction::Queue, &key)
@@ -3826,12 +3831,8 @@ impl BorgTerminal {
     }
 }
 
-#[cfg(test)]
-fn is_composer_newline(key: &KeyEvent) -> bool {
-    key.code == KeyCode::Enter
-        && key
-            .modifiers
-            .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
+fn is_composer_newline(keymap: &KeyMap, key: &KeyEvent) -> bool {
+    keymap.matches(KeyAction::Newline, key)
 }
 
 impl Drop for BorgTerminal {
@@ -5544,7 +5545,35 @@ impl Transcript {
             rows.push(("director  model pending  main thread".to_string(), None));
         }
         let mut agents = self.subagent_snapshots.values().collect::<Vec<_>>();
-        agents.sort_by(|left, right| left.task_name.cmp(&right.task_name));
+        agents.sort_by(|left, right| {
+            let left_terminal = matches!(
+                left.status,
+                SubagentStatus::Stopped | SubagentStatus::Failed
+            );
+            let right_terminal = matches!(
+                right.status,
+                SubagentStatus::Stopped | SubagentStatus::Failed
+            );
+            left_terminal.cmp(&right_terminal).then_with(|| {
+                if left_terminal {
+                    right.updated_at.cmp(&left.updated_at)
+                } else {
+                    left.task_name.cmp(&right.task_name)
+                }
+            })
+        });
+        let mut terminal_agents = 0;
+        agents.retain(|agent| {
+            if matches!(
+                agent.status,
+                SubagentStatus::Stopped | SubagentStatus::Failed
+            ) {
+                terminal_agents += 1;
+                terminal_agents <= MAX_TERMINAL_AGENTS_IN_ROSTER
+            } else {
+                true
+            }
+        });
         rows.extend(agents.into_iter().map(|agent| {
             let name = display_agent_name(&agent.task_name);
             let model = agent
@@ -7171,6 +7200,28 @@ fn restore_transcript_viewport_anchor(
 }
 
 fn fish_style_path(path: &Path) -> String {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    fish_style_path_with_home(path, home.as_deref())
+}
+
+fn fish_style_path_with_home(path: &Path, home: Option<&Path>) -> String {
+    if let Some(relative) = home
+        .filter(|home| !home.as_os_str().is_empty())
+        .and_then(|home| path.strip_prefix(home).ok())
+    {
+        if relative.as_os_str().is_empty() {
+            return "~".to_string();
+        }
+        return format!(
+            "~{}{}",
+            std::path::MAIN_SEPARATOR,
+            abbreviated_path(relative)
+        );
+    }
+    abbreviated_path(path)
+}
+
+fn abbreviated_path(path: &Path) -> String {
     let components = path.components().collect::<Vec<_>>();
     let final_directory = components
         .iter()
@@ -7498,16 +7549,34 @@ fn borg_control_tool_output_view(
         "update_goal",
         "get_plan",
         "update_plan",
+        "list_unread_team_messages",
     ]
     .iter()
     .any(|candidate| name.to_ascii_lowercase().ends_with(candidate));
     if !control {
         return None;
     }
-    let value = serde_json::from_str::<serde_json::Value>(output).ok()?;
+    let value = decoded_tool_output(output)?;
     let tool = name.to_ascii_lowercase();
     let mut rows = Vec::new();
-    if tool.ends_with("list_agents") || value.get("agents").is_some() || value.is_array() {
+    if tool.ends_with("list_unread_team_messages") {
+        let messages = value.as_array()?;
+        rows.push(format!(
+            "UNREAD · {} message{}",
+            messages.len(),
+            if messages.len() == 1 { "" } else { "s" }
+        ));
+        for message in messages.iter().take(12) {
+            let delivery = json_text(message, &["delivery"]).unwrap_or("queued");
+            let sender = json_text(message, &["sender", "from", "actor"]);
+            let text = json_text(message, &["text", "message"]).unwrap_or("empty message");
+            let prefix = sender.map_or_else(
+                || format!("  {delivery:>10}  "),
+                |sender| format!("  {delivery:>10}  {sender} · "),
+            );
+            rows.push(format!("{prefix}{}", compact_text(text, 140)));
+        }
+    } else if tool.ends_with("list_agents") || value.get("agents").is_some() || value.is_array() {
         let agents = value
             .get("agents")
             .and_then(serde_json::Value::as_array)
@@ -7613,6 +7682,27 @@ fn borg_control_tool_output_view(
         }
     }
     Some(rows.join("\n"))
+}
+
+fn decoded_tool_output(output: &str) -> Option<serde_json::Value> {
+    let value = serde_json::from_str::<serde_json::Value>(output).ok()?;
+    if let Some(structured) = value
+        .get("structuredContent")
+        .filter(|structured| !structured.is_null())
+    {
+        return Some(structured.clone());
+    }
+    value
+        .get("content")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|content| {
+            content.iter().find_map(|item| {
+                item.get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|text| serde_json::from_str(text).ok())
+            })
+        })
+        .or(Some(value))
 }
 
 fn json_text<'a>(value: &'a serde_json::Value, names: &[&str]) -> Option<&'a str> {

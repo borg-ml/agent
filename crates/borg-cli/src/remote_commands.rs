@@ -19,7 +19,8 @@ use borg_remote::{
 use chrono::{Local, Utc};
 use pulldown_cmark::{Event as MarkdownEvent, Parser as MarkdownParser};
 use serde::Deserialize;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+use tokio::process::{Child, Command as TokioCommand};
 use tokio::sync::{mpsc, watch};
 use uuid::Uuid;
 
@@ -32,7 +33,9 @@ use crate::terminal_ui::{BorgTerminal, ResumeSessionOption, TerminalInputEvent, 
 const MIN_TUI_FPS: u64 = 15;
 const MAX_TUI_FPS: u64 = 240;
 const ACTIVITY_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(120);
-const RICH_TUI_HISTORY_EVENT_LIMIT: usize = 2_048;
+/// Keep first paint bounded. The canonical store remains complete and indexed;
+/// a resumed actor recovers independently of this presentation-only tail.
+const RICH_TUI_HISTORY_EVENT_LIMIT: usize = 512;
 
 pub(crate) async fn run_remote_command(command: RemoteCommand) -> Result<()> {
     match command {
@@ -633,6 +636,7 @@ async fn run_local_agent_session(
         && host_config_path.is_file();
     let mut mirror_shutdown = None;
     let mut mirror_task = None;
+    let mut collab_child: Option<Child> = None;
     if remote_open {
         let mut registration = launch.clone();
         // Attached-session identity is stable across CLI resume and does not
@@ -2135,8 +2139,46 @@ async fn run_local_agent_session(
                                     .expect("terminal")
                                     .show_info(
                                         "Commands",
-                                        "/settings · /model · /effort · /followups · /refresh · /sleep · /usage · /clear · /compact · /resume · /goal · /todo · /login · /remote · /quit",
+                                        "/settings · /model · /effort · /followups · /refresh · /sleep · /usage · /clear · /compact · /resume · /goal · /todo · /login · /collab · /remote · /quit",
                                     ),
+                                "/collab" | "/collab view" if attachments.is_empty() => {
+                                    if collab_child.is_some() {
+                                        terminal.as_mut().expect("terminal").set_notice(
+                                            "This session already has an active collaboration link. Use /collab stop first."
+                                        );
+                                    } else {
+                                        match start_collaboration_host(session_id).await {
+                                            Ok((child, view, control)) => {
+                                                let notice = if line == "/collab view" {
+                                                    format!("Read-only collaboration link:\n{view}")
+                                                } else {
+                                                    format!("Control link:\n{control}\n\nRead-only link:\n{view}")
+                                                };
+                                                collab_child = Some(child);
+                                                terminal.as_mut().expect("terminal").show_info(
+                                                    "Collaboration",
+                                                    &notice,
+                                                );
+                                            }
+                                            Err(error) => terminal
+                                                .as_mut()
+                                                .expect("terminal")
+                                                .set_notice(format!("Collaboration failed: {error:#}")),
+                                        }
+                                    }
+                                }
+                                "/collab stop" if attachments.is_empty() => {
+                                    if let Some(mut child) = collab_child.take() {
+                                        child.kill().await.ok();
+                                        terminal.as_mut().expect("terminal").set_notice(
+                                            "Collaboration link stopped."
+                                        );
+                                    } else {
+                                        terminal.as_mut().expect("terminal").set_notice(
+                                            "No collaboration link is active."
+                                        );
+                                    }
+                                }
                                 "/remote" if attachments.is_empty() => {
                                     if matches!(
                                         status,
@@ -2394,6 +2436,9 @@ async fn run_local_agent_session(
         ));
     }
     drop(control_server);
+    if let Some(mut child) = collab_child {
+        child.kill().await.ok();
+    }
     if let Some(shutdown) = mirror_shutdown {
         shutdown.send(true).ok();
     }
@@ -2411,6 +2456,39 @@ async fn run_local_agent_session(
         return Ok(Some((session_id, None)));
     }
     Ok(resume_session.map(|session| (session, rewind_prompt)))
+}
+
+async fn start_collaboration_host(session_id: Uuid) -> Result<(Child, String, String)> {
+    let executable = std::env::current_exe().context("failed to locate the Borg executable")?;
+    let relay =
+        std::env::var("BORG_COLLAB_RELAY").unwrap_or_else(|_| "ws://127.0.0.1:8787".to_string());
+    let mut child = TokioCommand::new(executable)
+        .args(["collab", "host", &session_id.to_string(), "--relay", &relay])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .context("failed to start collaboration host")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("collaboration host has no stdout")?;
+    let mut lines = BufReader::new(stdout).lines();
+    let view = tokio::time::timeout(std::time::Duration::from_secs(10), lines.next_line())
+        .await
+        .context("collaboration relay connection timed out")??
+        .context("collaboration host exited before returning a view link")?
+        .strip_prefix("View: ")
+        .context("collaboration host returned an invalid view link")?
+        .to_string();
+    let control = lines
+        .next_line()
+        .await?
+        .context("collaboration host exited before returning a control link")?
+        .strip_prefix("Control: ")
+        .context("collaboration host returned an invalid control link")?
+        .to_string();
+    Ok((child, view, control))
 }
 
 async fn shutdown_terminal(terminal: &mut Option<BorgTerminal>) {

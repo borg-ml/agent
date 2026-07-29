@@ -1009,12 +1009,36 @@ fn actionable_inactive_goals_remain_in_the_status_line() {
 #[test]
 fn status_path_uses_fish_style_parent_abbreviations() {
     assert_eq!(
-        fish_style_path(Path::new("/home/shulgin/twilight")),
-        "/h/s/twilight"
+        fish_style_path_with_home(
+            Path::new("/home/shulgin/borg-cli"),
+            Some(Path::new("/home/shulgin"))
+        ),
+        "~/borg-cli"
     );
     assert_eq!(
-        fish_style_path(Path::new("/home/shulgin/.config/borg")),
-        "/h/s/.c/borg"
+        fish_style_path_with_home(
+            Path::new("/home/shulgin/projects/borg-cli"),
+            Some(Path::new("/home/shulgin"))
+        ),
+        "~/p/borg-cli"
+    );
+    assert_eq!(
+        fish_style_path_with_home(
+            Path::new("/home/shulgin/.config/borg"),
+            Some(Path::new("/home/shulgin"))
+        ),
+        "~/.c/borg"
+    );
+    assert_eq!(
+        fish_style_path_with_home(Path::new("/home/shulgin"), Some(Path::new("/home/shulgin"))),
+        "~"
+    );
+    assert_eq!(
+        fish_style_path_with_home(
+            Path::new("/srv/workspace"),
+            Some(Path::new("/home/shulgin"))
+        ),
+        "/s/workspace"
     );
     assert_eq!(fish_style_path(Path::new("/workspace")), "/workspace");
     assert_eq!(
@@ -1067,18 +1091,19 @@ fn ctrl_c_only_exits_when_repeated_quickly() {
 
 #[test]
 fn shift_or_alt_enter_inserts_a_composer_newline() {
-    assert!(is_composer_newline(&KeyEvent::new(
-        KeyCode::Enter,
-        KeyModifiers::SHIFT
-    )));
-    assert!(is_composer_newline(&KeyEvent::new(
-        KeyCode::Enter,
-        KeyModifiers::ALT
-    )));
-    assert!(!is_composer_newline(&KeyEvent::new(
-        KeyCode::Enter,
-        KeyModifiers::NONE
-    )));
+    let keymap = KeyMap::from_config(&KeybindingConfig::default()).unwrap();
+    assert!(is_composer_newline(
+        &keymap,
+        &KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)
+    ));
+    assert!(is_composer_newline(
+        &keymap,
+        &KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)
+    ));
+    assert!(!is_composer_newline(
+        &keymap,
+        &KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+    ));
 }
 
 #[test]
@@ -1522,6 +1547,37 @@ fn borg_control_results_tolerate_partial_payloads_and_leave_unknown_tools_generi
 }
 
 #[test]
+fn unread_team_messages_render_the_structured_payload_not_the_mcp_envelope() {
+    let output = serde_json::json!({
+        "_meta": null,
+        "content": [{
+            "type": "text",
+            "text": "[{\"delivery\":\"queue\",\"message_id\":\"message-1\",\"text\":\"Please inspect the failing benchmark\"}]"
+        }],
+        "structuredContent": [{
+            "delivery": "queue",
+            "message_id": "message-1",
+            "text": "Please inspect the failing benchmark"
+        }]
+    })
+    .to_string();
+
+    let rendered = borg_control_tool_output_view(
+        "mcp__borg_agent__list_unread_team_messages",
+        Some(&serde_json::json!({})),
+        &output,
+    )
+    .expect("structured unread messages");
+
+    assert_eq!(
+        rendered,
+        "UNREAD · 1 message\n       queue  Please inspect the failing benchmark"
+    );
+    assert!(!rendered.contains("structuredContent"));
+    assert!(!rendered.contains("_meta"));
+}
+
+#[test]
 fn wait_spawn_and_lsp_diagnostics_use_compact_stable_result_shapes() {
     let wait = borg_control_tool_output_view(
         "wait_agent",
@@ -1576,6 +1632,57 @@ fn active_subagent_count_tracks_only_working_children() {
         .values_mut()
         .for_each(|status| *status = SubagentStatus::Ready);
     assert_eq!(transcript.active_subagent_count(), 0);
+}
+
+#[test]
+fn agent_roster_keeps_live_agents_and_only_recent_terminal_agents() {
+    let parent_id = Uuid::new_v4();
+    let now = chrono::Utc::now();
+    let snapshot = |name: &str, status, age_minutes| SubagentSnapshot {
+        session_id: Uuid::new_v4(),
+        parent_session_id: parent_id,
+        task_name: format!("/root/{name}"),
+        status,
+        provider: CodingProvider::Codex,
+        model: None,
+        effort: None,
+        cwd: PathBuf::from("/workspace"),
+        created_at: now,
+        updated_at: now - chrono::Duration::minutes(age_minutes),
+        detail: None,
+        final_text: None,
+        usage: borg_remote::SubagentUsage::default(),
+    };
+    let agents = [
+        snapshot("z_live", SubagentStatus::Running, 20),
+        snapshot("a_live", SubagentStatus::Ready, 10),
+        snapshot("oldest", SubagentStatus::Failed, 6),
+        snapshot("older", SubagentStatus::Stopped, 5),
+        snapshot("recent_4", SubagentStatus::Failed, 4),
+        snapshot("recent_3", SubagentStatus::Stopped, 3),
+        snapshot("recent_2", SubagentStatus::Failed, 2),
+        snapshot("recent_1", SubagentStatus::Stopped, 1),
+    ];
+    let mut transcript = Transcript::default();
+    for agent in agents {
+        transcript
+            .subagent_snapshots
+            .insert(agent.session_id, agent);
+    }
+
+    let rows = transcript
+        .agent_roster_entries()
+        .into_iter()
+        .map(|(row, _)| row)
+        .collect::<Vec<_>>();
+
+    assert_eq!(rows.len(), 7);
+    assert!(rows[1].starts_with("a_live "));
+    assert!(rows[2].starts_with("z_live "));
+    assert!(rows[3].starts_with("recent_1 "));
+    assert!(rows[4].starts_with("recent_2 "));
+    assert!(rows[5].starts_with("recent_3 "));
+    assert!(rows[6].starts_with("recent_4 "));
 }
 
 #[test]

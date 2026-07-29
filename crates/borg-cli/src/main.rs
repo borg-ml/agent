@@ -1,6 +1,8 @@
+mod acp;
 mod agent_config;
 mod agent_mcp;
 mod cli;
+mod collab;
 mod editor_preferences;
 mod extensions;
 mod remote_commands;
@@ -36,8 +38,49 @@ async fn main() -> Result<()> {
         Command::Capabilities(args) => print_capabilities(args),
         Command::Extensions(args) => print_extensions(args),
         Command::Workspaces(args) => print_local_workspaces(args.json).await,
+        Command::Acp(args) => acp::run(args).await,
+        Command::Collab { command } => collab::run(command).await,
+        Command::Doctor { json } => doctor(json).await,
         Command::AgentMcp => agent_mcp::run().await,
     }
+}
+
+async fn doctor(json: bool) -> Result<()> {
+    let sessions_dir = borg_remote::default_host_config_path()
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("sessions");
+    let store =
+        borg_remote::SqliteSessionStore::open(sessions_dir.join("sessions.sqlite3")).await?;
+    let health = store.health().await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&health)?);
+    } else {
+        println!(
+            "Durable session store: {}",
+            if health.is_ready() {
+                "ready"
+            } else {
+                "degraded"
+            }
+        );
+        println!("  integrity: {}", health.integrity);
+        println!(
+            "  sqlite: {} · synchronous={} · foreign_keys={}",
+            health.journal_mode, health.synchronous, health.foreign_keys
+        );
+        println!(
+            "  WAL: busy={} · log={} · checkpointed={}",
+            health.wal_busy, health.wal_log_frames, health.wal_checkpointed_frames
+        );
+        println!(
+            "  durable rows: {} sessions · {} events · {} payloads",
+            health.sessions, health.events, health.payloads
+        );
+        println!("  projection version: {}", health.projection_version);
+    }
+    anyhow::ensure!(health.is_ready(), "durable session store is degraded");
+    Ok(())
 }
 
 fn print_extensions(args: ExtensionsArgs) -> Result<()> {

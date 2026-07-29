@@ -17,6 +17,48 @@ pub fn session_control_socket_path(sessions_dir: &Path, session_id: Uuid) -> Pat
     sessions_dir.join(format!("{session_id}.control.sock"))
 }
 
+/// Send one typed command to the process holding a session's writer lease.
+#[cfg(unix)]
+pub async fn send_local_session_command(
+    socket_path: &Path,
+    session_id: Uuid,
+    command: HostCommand,
+) -> Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::UnixStream;
+
+    anyhow::ensure!(
+        command.session_id() == Some(session_id),
+        "command targets a different session"
+    );
+    let mut stream = UnixStream::connect(socket_path)
+        .await
+        .with_context(|| format!("failed to connect to {}", socket_path.display()))?;
+    stream.write_all(&serde_json::to_vec(&command)?).await?;
+    stream.shutdown().await?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await?;
+    let response: serde_json::Value =
+        serde_json::from_slice(&response).context("session owner returned invalid control JSON")?;
+    if let Some(error) = response.get("error").and_then(serde_json::Value::as_str) {
+        bail!("session owner rejected command: {error}");
+    }
+    anyhow::ensure!(
+        response.get("ok").and_then(serde_json::Value::as_bool) == Some(true),
+        "session owner did not acknowledge command"
+    );
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub async fn send_local_session_command(
+    _socket_path: &Path,
+    _session_id: Uuid,
+    _command: HostCommand,
+) -> Result<()> {
+    bail!("local session control is only supported on Unix")
+}
+
 /// Single-owner local command endpoint for a durable session.
 ///
 /// The journal writer remains exclusive. Additional terminals tail the

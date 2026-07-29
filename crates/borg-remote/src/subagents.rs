@@ -1166,6 +1166,15 @@ impl SubagentCoordinator {
             self.start_reserved(snapshot, launch, false).await?;
         }
         for message in self.pending_messages_for_session(root_session_id).await? {
+            if self
+                .store
+                .contains_message(root_session_id, message.message_id)
+                .await?
+            {
+                self.acknowledge_message_for_session(root_session_id, message.message_id)
+                    .await?;
+                continue;
+            }
             if let Err(error) = self.root_message_tx.send(message) {
                 self.root_inbox.lock().await.push(error.0);
             }
@@ -1184,11 +1193,27 @@ impl SubagentCoordinator {
             if messages.is_empty() {
                 continue;
             }
+            let mut fresh_messages = Vec::with_capacity(messages.len());
+            for message in messages {
+                if self
+                    .store
+                    .contains_message(child_id, message.message_id)
+                    .await?
+                {
+                    self.acknowledge_message_for_session(child_id, message.message_id)
+                        .await?;
+                } else {
+                    fresh_messages.push(message);
+                }
+            }
+            if fresh_messages.is_empty() {
+                continue;
+            }
             let mut table = self.table.lock().await;
             let Some(entry) = table.entries.get_mut(&child_id) else {
                 continue;
             };
-            for message in messages {
+            for message in fresh_messages {
                 send_prompt(entry, child_id, message).await?;
             }
         }

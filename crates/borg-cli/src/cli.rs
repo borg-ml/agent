@@ -39,8 +39,56 @@ pub(crate) enum Command {
     Extensions(ExtensionsArgs),
     /// List local multiplayer workspaces available to this OS user.
     Workspaces(WorkspacesArgs),
+    /// Serve Borg as an Agent Client Protocol agent over stdio.
+    Acp(AcpArgs),
+    /// Share or join an end-to-end encrypted live session.
+    Collab {
+        #[command(subcommand)]
+        command: CollabCommand,
+    },
+    /// Check durable storage and runtime readiness.
+    Doctor {
+        #[arg(long)]
+        json: bool,
+    },
     #[command(name = "__agent-mcp", hide = true)]
     AgentMcp,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum CollabCommand {
+    /// Share an active local session through an untrusted relay.
+    Host {
+        session: Uuid,
+        #[arg(long, default_value = "ws://127.0.0.1:8787")]
+        relay: String,
+    },
+    /// Join a collaboration link from this terminal.
+    Join { link: String },
+    /// Run a stateless, opaque WebSocket relay.
+    Relay {
+        #[arg(long, default_value = "127.0.0.1:8787")]
+        listen: String,
+    },
+}
+
+#[derive(Debug, Args, Clone)]
+pub(crate) struct AcpArgs {
+    /// Default provider for newly created ACP sessions.
+    #[arg(long, value_enum, default_value_t = RemoteProviderArg::Codex)]
+    pub(crate) provider: RemoteProviderArg,
+    /// Default model for newly created ACP sessions.
+    #[arg(long)]
+    pub(crate) model: Option<String>,
+    /// Default reasoning effort for newly created ACP sessions.
+    #[arg(long)]
+    pub(crate) effort: Option<String>,
+    /// Permission policy used before the ACP client answers tool requests.
+    #[arg(long, value_enum, default_value_t = RemotePermissionArg::Manual)]
+    pub(crate) permission: RemotePermissionArg,
+    /// Read Borg runtime capabilities from this configuration file.
+    #[arg(long)]
+    pub(crate) config: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -187,6 +235,39 @@ mod tests {
             panic!("workspaces command must not launch an agent");
         };
         assert!(args.json);
+    }
+
+    #[test]
+    fn collaboration_and_acp_commands_have_stable_cli_shapes() {
+        let session = "22222222-2222-2222-2222-222222222222";
+        assert!(matches!(
+            Cli::try_parse_from(["borg", "collab", "host", session])
+                .unwrap()
+                .command_or_agent(),
+            Command::Collab {
+                command: CollabCommand::Host { .. }
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["borg", "collab", "relay", "--listen", "127.0.0.1:9999"])
+                .unwrap()
+                .command_or_agent(),
+            Command::Collab {
+                command: CollabCommand::Relay { .. }
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["borg", "acp", "--permission", "manual"])
+                .unwrap()
+                .command_or_agent(),
+            Command::Acp(_)
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["borg", "doctor", "--json"])
+                .unwrap()
+                .command_or_agent(),
+            Command::Doctor { json: true }
+        ));
     }
 
     #[test]

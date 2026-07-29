@@ -40,7 +40,8 @@ pub use host::{
 };
 pub use journal::{SessionJournal, SessionWriterLease};
 pub use local_control::{
-    LocalSessionControlServer, run_attached_session, session_control_socket_path,
+    LocalSessionControlServer, run_attached_session, send_local_session_command,
+    session_control_socket_path,
 };
 pub use lsp::LspService;
 pub use orchestration::*;
@@ -52,7 +53,7 @@ pub use session::{
 pub use session_store::{
     EventPersistence, JsonlSessionStore, SESSION_PROJECTION_VERSION, SessionConfiguration,
     SessionImport, SessionLiveEvent, SessionRecovery, SessionState, SessionStore, SessionStoreFork,
-    SessionSummary, SessionUsage, SessionWorkspaceBinding, SqliteSessionStore,
+    SessionStoreHealth, SessionSummary, SessionUsage, SessionWorkspaceBinding, SqliteSessionStore,
 };
 pub use subagents::{
     AgentToolDispatcher, AgentToolServer, DEFAULT_MAX_SUBAGENTS, SpawnSubagent, SubagentActivity,

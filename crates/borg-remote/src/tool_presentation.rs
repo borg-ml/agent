@@ -487,13 +487,14 @@ pub fn tool_output_code_view(name: &str, output: &str) -> Option<(String, String
     if normalized.contains("lsp") || normalized.contains("diagnostic") {
         return Some(("lsp".to_string(), trimmed.to_string()));
     }
-    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+    let readable = readable_result_text(trimmed);
+    if let Ok(value) = serde_json::from_str::<Value>(&readable) {
         return Some((
             "json".to_string(),
-            serde_json::to_string_pretty(&value).unwrap_or_else(|_| trimmed.to_string()),
+            serde_json::to_string_pretty(&value).unwrap_or(readable),
         ));
     }
-    Some(("text".to_string(), readable_result_text(trimmed)))
+    Some(("text".to_string(), readable))
 }
 
 pub fn tool_output_is_backgrounded(output: &str) -> bool {
@@ -714,6 +715,12 @@ fn readable_result_text(value: &str) -> String {
     let Ok(Value::Object(fields)) = serde_json::from_str::<Value>(value) else {
         return value.to_string();
     };
+    if let Some(structured) = fields
+        .get("structuredContent")
+        .filter(|structured| !structured.is_null())
+    {
+        return serde_json::to_string_pretty(structured).unwrap_or_else(|_| value.to_string());
+    }
     if let Some(Value::Array(content)) = fields.get("content") {
         let text = content
             .iter()
@@ -724,9 +731,6 @@ fn readable_result_text(value: &str) -> String {
         if !text.is_empty() {
             return text;
         }
-    }
-    if let Some(structured) = fields.get("structuredContent") {
-        return serde_json::to_string_pretty(structured).unwrap_or_else(|_| value.to_string());
     }
     value.to_string()
 }
@@ -1258,5 +1262,32 @@ mod tests {
             true,
         );
         assert_eq!(missing_error.result, None);
+    }
+
+    #[test]
+    fn generic_code_view_unwraps_structured_mcp_results() {
+        let output = json!({
+            "_meta": null,
+            "content": [{
+                "type": "text",
+                "text": "[{\"message_id\":\"message-1\",\"text\":\"hello\"}]"
+            }],
+            "structuredContent": [{
+                "message_id": "message-1",
+                "text": "hello"
+            }]
+        })
+        .to_string();
+
+        let (language, rendered) =
+            tool_output_code_view("mcp__example__messages", &output).expect("tool output");
+
+        assert_eq!(language, "json");
+        assert_eq!(
+            serde_json::from_str::<Value>(&rendered).unwrap(),
+            json!([{"message_id": "message-1", "text": "hello"}])
+        );
+        assert!(!rendered.contains("structuredContent"));
+        assert!(!rendered.contains("_meta"));
     }
 }

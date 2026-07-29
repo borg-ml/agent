@@ -15,6 +15,8 @@ name = "borg"
 path = "src/main.rs"
 
 [dependencies]
+agent-client-protocol.workspace = true
+aes-gcm = "0.10.3"
 anyhow.workspace = true
 arboard = { version = "3.6", features = ["wayland-data-control"] }
 base64.workspace = true
@@ -24,8 +26,10 @@ chrono.workspace = true
 clap = { version = "4.5.53", features = ["derive"] }
 crossterm = { version = "0.29", features = ["bracketed-paste", "event-stream"] }
 futures-util = "0.3"
+getrandom = "0.3.4"
 image = { version = "0.25.9", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 pulldown-cmark = "0.13"
+qrcode = { version = "0.14.1", default-features = false }
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache", "macros", "underline-color"] }
 reqwest.workspace = true
 serde.workspace = true
@@ -37,6 +41,7 @@ syntect = { version = "5.2", default-features = false, features = ["default-synt
 term-maths = "1.0.0"
 tempfile.workspace = true
 tokio.workspace = true
+tokio-tungstenite = { version = "0.28.0", features = ["rustls-tls-webpki-roots"] }
 tokio-util = { version = "0.7", features = ["io", "rt"] }
 toml = "0.8.23"
 tracing.workspace = true
