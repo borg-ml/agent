@@ -873,6 +873,41 @@ fn active_goal_cache_key_advances_once_per_elapsed_minute() {
 }
 
 #[test]
+fn actionable_inactive_goals_remain_in_the_status_line() {
+    let mut transcript = Transcript::default();
+    let mut goal = SessionGoal::new("Wait for operator input".to_string(), None);
+    goal.time_used_seconds = 125;
+    let session_id = Uuid::new_v4();
+
+    goal.status = GoalStatus::Paused;
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::GoalUpdated { goal: goal.clone() },
+    ));
+    assert_eq!(transcript.goal_status().as_deref(), Some("paused /goal 2m"));
+
+    goal.status = GoalStatus::Blocked;
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::GoalUpdated { goal: goal.clone() },
+    ));
+    assert_eq!(
+        transcript.goal_status().as_deref(),
+        Some("blocked /goal 2m")
+    );
+
+    goal.status = GoalStatus::Complete;
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        3,
+        SessionEventKind::GoalUpdated { goal },
+    ));
+    assert_eq!(transcript.goal_status(), None);
+}
+
+#[test]
 fn completed_goal_crosses_out_only_its_objective() {
     let mut transcript = Transcript::default();
     let mut goal = SessionGoal::new("Ship the terminal polish".to_string(), None);
@@ -1357,6 +1392,7 @@ fn subagent_activity_collapses_chatter_and_keeps_terminal_result() {
         updated_at: now,
         detail: None,
         final_text: None,
+        usage: borg_remote::SubagentUsage::default(),
     };
     let activity = |sequence, activity, agent: &SubagentSnapshot, event| {
         SessionEvent::new(
@@ -1716,29 +1752,84 @@ fn queue_projection_preserves_fifo_and_discards_bypassed_stale_entries() {
 
 #[test]
 fn one_queued_prompt_allocates_a_content_row_below_its_border() {
-    assert_eq!(queued_prompt_panel_height(0), 0);
-    assert_eq!(queued_prompt_panel_height(1), 2);
-    assert_eq!(queued_prompt_panel_height(6), 7);
-    assert_eq!(queued_prompt_panel_height(7), 8);
-
-    let area = Rect::new(0, 0, 60, queued_prompt_panel_height(1));
-    let mut buffer = ratatui::buffer::Buffer::empty(area);
     let prompts = [PendingPromptProjection {
         message_id: Uuid::new_v4(),
         text: "visible follow-up".to_string(),
         delivery: PromptDelivery::Queue,
     }];
+    let six = (0..6).map(|_| prompts[0].clone()).collect::<Vec<_>>();
+    let seven = (0..7).map(|_| prompts[0].clone()).collect::<Vec<_>>();
+    assert_eq!(queued_prompt_panel_height(&[]), 0);
+    assert_eq!(queued_prompt_panel_height(&prompts), 3);
+    assert_eq!(queued_prompt_panel_height(&six), 8);
+    assert_eq!(queued_prompt_panel_height(&seven), 9);
+
+    let area = Rect::new(0, 0, 60, queued_prompt_panel_height(&prompts));
+    let mut buffer = ratatui::buffer::Buffer::empty(area);
     let widget = Paragraph::new(queued_prompt_lines(&prompts, area.width)).block(
         Block::default()
-            .borders(Borders::TOP)
-            .border_style(Style::default().fg(Color::DarkGray)),
+            .borders(Borders::TOP | Borders::LEFT)
+            .border_style(Style::default().fg(Color::DarkGray))
+            .title(" PENDING INPUT · 1 "),
     );
     ratatui::widgets::Widget::render(widget, area, &mut buffer);
     let content = (0..area.width)
         .map(|x| buffer[(x, 1)].symbol())
         .collect::<String>();
-    assert!(content.contains("Queued 1"));
+    let hint = (0..area.width)
+        .map(|x| buffer[(x, 2)].symbol())
+        .collect::<String>();
+    assert!(content.contains("NEXT TURN"));
     assert!(content.contains("visible follow-up"));
+    assert!(hint.contains("↑ edit latest queued"));
+}
+
+#[test]
+fn pending_steer_ui_names_the_tool_boundary_and_interrupt_action() {
+    let prompts = [PendingPromptProjection {
+        message_id: Uuid::new_v4(),
+        text: "focus on the failing test".to_string(),
+        delivery: PromptDelivery::Steer,
+    }];
+    let rendered = queued_prompt_lines(&prompts, 80)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(rendered.contains("NEXT TOOL"));
+    assert!(rendered.contains("focus on the failing test"));
+    assert!(rendered.contains("esc interrupt + send now"));
+    assert!(!rendered.contains("edit latest queued"));
+}
+
+#[test]
+fn up_recall_is_available_only_for_an_empty_composer_with_a_queued_follow_up() {
+    let queued = PendingPromptProjection {
+        message_id: Uuid::new_v4(),
+        text: "edit me".to_string(),
+        delivery: PromptDelivery::Queue,
+    };
+    let steer = PendingPromptProjection {
+        message_id: Uuid::new_v4(),
+        text: "already submitted".to_string(),
+        delivery: PromptDelivery::Steer,
+    };
+
+    assert!(should_recall_latest_queued_prompt("", &[queued.clone()]));
+    assert!(should_recall_latest_queued_prompt(
+        "",
+        &[steer.clone(), queued]
+    ));
+    assert!(!should_recall_latest_queued_prompt("", &[steer]));
+    assert!(!should_recall_latest_queued_prompt(
+        "draft in progress",
+        &[PendingPromptProjection {
+            message_id: Uuid::new_v4(),
+            text: "queued".to_string(),
+            delivery: PromptDelivery::Queue,
+        }]
+    ));
 }
 
 #[test]
@@ -2088,21 +2179,23 @@ fn wheel_distance_advances_in_bounded_frames_and_stops_at_boundaries() {
 
     let mut scroll = 0;
     let mut motion = ScrollMotion::default();
-    motion.push(WHEEL_SCROLL_LINES_PER_EVENT);
+    let event_lines = wheel_scroll_lines(30);
+    motion.push(event_lines);
     let mut frames = 0;
     while motion.is_active() {
         scroll = motion.advance(scroll, 500);
         frames += 1;
     }
-    assert_eq!(scroll, WHEEL_SCROLL_LINES_PER_EVENT as usize);
-    assert_eq!(frames, WHEEL_SCROLL_LINES_PER_EVENT);
+    assert_eq!(scroll, event_lines as usize);
+    assert_eq!(frames, event_lines as usize);
 }
 
 #[test]
 fn nested_wheel_motion_finishes_small_gestures_without_expensive_single_row_frames() {
     let mut scroll = 0;
     let mut motion = ScrollMotion::default();
-    motion.push(WHEEL_SCROLL_LINES_PER_EVENT);
+    let event_lines = wheel_scroll_lines(30);
+    motion.push(event_lines);
     let mut frames = 0;
     while motion.is_active() {
         scroll = motion.advance_with_limits(
@@ -2114,8 +2207,18 @@ fn nested_wheel_motion_finishes_small_gestures_without_expensive_single_row_fram
         frames += 1;
     }
 
-    assert_eq!(scroll, WHEEL_SCROLL_LINES_PER_EVENT as usize);
+    assert_eq!(scroll, event_lines as usize);
     assert_eq!(frames, 3);
+}
+
+#[test]
+fn wheel_distance_scales_with_the_target_viewport_height() {
+    assert_eq!(wheel_scroll_lines(6), 3);
+    assert_eq!(wheel_scroll_lines(18), 3);
+    assert_eq!(wheel_scroll_lines(30), 5);
+    assert_eq!(wheel_scroll_lines(48), 8);
+    assert_eq!(wheel_scroll_lines(72), 12);
+    assert_eq!(wheel_scroll_lines(120), 12);
 }
 
 #[test]
@@ -2703,5 +2806,41 @@ fn selection_highlight_survives_a_changed_viewport_offset() {
             .spans
             .iter()
             .any(|span| span.style.bg.is_some())
+    );
+}
+
+#[test]
+fn incoming_transcript_lines_keep_a_selected_viewport_anchored() {
+    let previous_height = 20;
+    let next_height = 23;
+    let viewport_height = 5;
+    let previous_scroll_from_bottom = 0;
+    let previous_scroll_start = previous_height - viewport_height;
+
+    let next_scroll_from_bottom =
+        preserve_scroll_anchor(previous_scroll_from_bottom, previous_height, next_height);
+    let next_scroll_start = (next_height - viewport_height) - next_scroll_from_bottom;
+
+    assert_eq!(next_scroll_start, previous_scroll_start);
+
+    let selection = TextSelection {
+        anchor: TranscriptPoint {
+            row: previous_scroll_start,
+            column: 1,
+        },
+        focus: TranscriptPoint {
+            row: previous_scroll_start + 1,
+            column: 2,
+        },
+        dragging: false,
+        autoscroll: 0,
+        pointer: Position::new(0, 0),
+    };
+    let mut viewport = vec![Line::from("abcd"), Line::from("efgh")];
+    apply_text_selection(&mut viewport, next_scroll_start, selection);
+    assert!(
+        viewport
+            .iter()
+            .all(|line| line.spans.iter().any(|span| span.style.bg.is_some()))
     );
 }

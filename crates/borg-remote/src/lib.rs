@@ -19,11 +19,13 @@ mod native_harness;
 mod native_io;
 mod native_mcp;
 mod native_process;
+mod orchestration;
 mod receipt;
 mod session;
 mod session_store;
 mod subagents;
 mod tool_presentation;
+mod workspace;
 
 pub use agent::{
     AgentCompaction, AgentTurn, AgentTurnControl, AgentTurnExecutor, AgentTurnResult,
@@ -41,6 +43,7 @@ pub use local_control::{
     LocalSessionControlServer, run_attached_session, session_control_socket_path,
 };
 pub use lsp::LspService;
+pub use orchestration::*;
 pub use session::{
     SessionGoalTools, SessionTodoTools, run_agent_session, run_agent_session_with_executor,
     run_agent_session_with_executor_and_writer, run_agent_session_with_store_and_writer,
@@ -61,4 +64,11 @@ pub use tool_presentation::{
     is_diff_language, is_subagent_tool, project_tool_presentation, tool_call_summary,
     tool_code_view, tool_has_rich_ui, tool_output_code_view, tool_output_is_backgrounded,
     web_search_query,
+};
+pub use workspace::{
+    Audience, DeliveryAttempt, DeliveryCursor, DeliveryMode, DeliveryState, HostAttachment,
+    HostIdentity, Participant, ParticipantKind, PresenceLease, RecipientDelivery,
+    SqliteWorkspaceStore, StructuredMention, Thread, Workspace, WorkspaceEvent, WorkspaceEventKind,
+    WorkspaceHost, WorkspaceHostCapabilities, WorkspaceMembership, WorkspaceMessage,
+    WorkspaceMessageBody, WorkspaceRole, WorkspaceStore,
 };

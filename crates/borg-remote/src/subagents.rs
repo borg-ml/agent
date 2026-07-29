@@ -48,6 +48,16 @@ impl SubagentStatus {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(default)]
+#[ts(export)]
+pub struct SubagentUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub total_tokens: u64,
+    pub cost_microusd: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct SubagentSnapshot {
@@ -63,6 +73,8 @@ pub struct SubagentSnapshot {
     pub updated_at: DateTime<Utc>,
     pub detail: Option<String>,
     pub final_text: Option<String>,
+    #[serde(default)]
+    pub usage: SubagentUsage,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -117,6 +129,7 @@ pub struct AgentToolDispatcher {
     subagents: SubagentCoordinator,
     lsp: crate::LspService,
     provider: CodingProvider,
+    actor_session_id: Uuid,
 }
 
 #[derive(Debug)]
@@ -321,6 +334,7 @@ impl AgentToolDispatcher {
         subagents: SubagentCoordinator,
         lsp: crate::LspService,
         provider: CodingProvider,
+        actor_session_id: Uuid,
     ) -> Self {
         Self {
             goals,
@@ -328,6 +342,7 @@ impl AgentToolDispatcher {
             subagents,
             lsp,
             provider,
+            actor_session_id,
         }
     }
 
@@ -406,7 +421,11 @@ impl AgentToolDispatcher {
                 let args: LspWorkspaceSymbolArgs = serde_json::from_value(arguments)?;
                 self.lsp.workspace_symbols(&args.query).await
             }
-            _ => self.subagents.call_tool(name, arguments).await,
+            _ => {
+                self.subagents
+                    .call_tool_as(self.actor_session_id, name, arguments)
+                    .await
+            }
         }
     }
 }
@@ -452,6 +471,8 @@ impl SubagentTable {
             updated_at: now,
             detail: None,
             final_text: None,
+            usage: SubagentUsage::default(),
+            usage: SubagentUsage::default(),
         };
         self.task_names.insert(task_name, snapshot.session_id);
         self.entries.insert(
@@ -467,8 +488,11 @@ impl SubagentTable {
 
     fn resolve(&self, target: &str) -> Result<Uuid> {
         let target = target.trim();
+        if target == "/root" || target == "root" {
+            return Ok(self.root_session_id);
+        }
         if let Ok(id) = Uuid::parse_str(target)
-            && self.entries.contains_key(&id)
+            && (id == self.root_session_id || self.entries.contains_key(&id))
         {
             return Ok(id);
         }
@@ -483,6 +507,16 @@ impl SubagentTable {
             .ok_or_else(|| anyhow::anyhow!("unknown subagent target: {target}"))
     }
 
+    fn task_name(&self, session_id: Uuid) -> Result<String> {
+        if session_id == self.root_session_id {
+            return Ok("/root".to_string());
+        }
+        self.entries
+            .get(&session_id)
+            .map(|entry| entry.snapshot.task_name.clone())
+            .ok_or_else(|| anyhow::anyhow!("session {session_id} is not part of this agent team"))
+    }
+
     fn snapshots(&self) -> Vec<SubagentSnapshot> {
         let mut agents = self
             .entries
@@ -492,6 +526,12 @@ impl SubagentTable {
         agents.sort_by(|left, right| left.task_name.cmp(&right.task_name));
         agents
     }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct TeamInboxMessage {
+    pub message_id: Uuid,
+    pub text: String,
 }
 
 /// Borg-native child sessions for one root CLI session.
@@ -507,6 +547,8 @@ pub struct SubagentCoordinator {
     store: Arc<dyn SessionStore>,
     table: Arc<Mutex<SubagentTable>>,
     activity_tx: broadcast::Sender<SubagentActivity>,
+    root_inbox: Arc<Mutex<Vec<TeamInboxMessage>>>,
+    root_message_tx: broadcast::Sender<TeamInboxMessage>,
 }
 
 impl SubagentCoordinator {
@@ -522,6 +564,7 @@ impl SubagentCoordinator {
             bail!("subagent concurrency limit must be positive");
         }
         let (activity_tx, _) = broadcast::channel(512);
+        let (root_message_tx, _) = broadcast::channel(128);
         Ok(Self {
             journal_root: journal_root.into(),
             root_launch,
@@ -534,11 +577,34 @@ impl SubagentCoordinator {
                 task_names: HashMap::new(),
             })),
             activity_tx,
+            root_inbox: Arc::new(Mutex::new(Vec::new())),
+            root_message_tx,
         })
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<SubagentActivity> {
         self.activity_tx.subscribe()
+    }
+
+    pub(crate) fn subscribe_root_messages(&self) -> broadcast::Receiver<TeamInboxMessage> {
+        self.root_message_tx.subscribe()
+    }
+
+    pub(crate) async fn take_root_inbox(&self) -> Vec<TeamInboxMessage> {
+        std::mem::take(&mut *self.root_inbox.lock().await)
+    }
+
+    pub(crate) async fn prepend_root_inbox(&self, text: String) -> String {
+        let inbox = self.take_root_inbox().await;
+        if inbox.is_empty() {
+            return text;
+        }
+        let mut sections = inbox
+            .into_iter()
+            .map(|message| message.text)
+            .collect::<Vec<_>>();
+        sections.push(text);
+        sections.join("\n\n")
     }
 
     /// Rebuild the coordinator projection from the durable parent event
@@ -706,6 +772,7 @@ impl SubagentCoordinator {
             Arc::clone(&self.executor),
             Arc::clone(&self.store),
             writer,
+            self.clone(),
         ));
         let table = self.table.clone();
         let activity_tx = self.activity_tx.clone();
@@ -766,9 +833,30 @@ impl SubagentCoordinator {
 
     /// Queue a message without waking an idle child.
     pub async fn send_message(&self, target: &str, message: &str) -> Result<()> {
+        let root_session_id = self.table.lock().await.root_session_id;
+        self.send_message_as(root_session_id, target, message).await
+    }
+
+    /// Queue a team-attributed message without waking an idle recipient.
+    pub async fn send_message_as(
+        &self,
+        actor_session_id: Uuid,
+        target: &str,
+        message: &str,
+    ) -> Result<()> {
         let message = required_message(message)?;
         let mut table = self.table.lock().await;
+        let actor = table.task_name(actor_session_id)?;
         let id = table.resolve(target)?;
+        let text = attributed_team_message(&actor, &message);
+        if id == table.root_session_id {
+            drop(table);
+            self.root_inbox.lock().await.push(TeamInboxMessage {
+                message_id: Uuid::new_v4(),
+                text,
+            });
+            return Ok(());
+        }
         let entry = table
             .entries
             .get_mut(&id)
@@ -780,18 +868,50 @@ impl SubagentCoordinator {
             entry.snapshot.status,
             SubagentStatus::Running | SubagentStatus::WaitingForApproval | SubagentStatus::Starting
         ) {
-            send_prompt(entry, id, message, PromptDelivery::Queue).await
+            send_prompt(entry, id, text, PromptDelivery::Queue).await
         } else {
-            entry.inbox.push(message);
+            entry.inbox.push(text);
             Ok(())
         }
     }
 
     /// Wake an idle child, or steer a running provider when supported.
     pub async fn followup_task(&self, target: &str, message: &str) -> Result<()> {
+        let root_session_id = self.table.lock().await.root_session_id;
+        self.followup_task_as(root_session_id, target, message)
+            .await
+    }
+
+    /// Wake or steer a team recipient while preserving the sender identity.
+    pub async fn followup_task_as(
+        &self,
+        actor_session_id: Uuid,
+        target: &str,
+        message: &str,
+    ) -> Result<()> {
         let message = required_message(message)?;
         let mut table = self.table.lock().await;
+        let actor = table.task_name(actor_session_id)?;
         let id = table.resolve(target)?;
+        let text = attributed_team_message(&actor, &message);
+        if id == table.root_session_id {
+            drop(table);
+            let mut messages = self.take_root_inbox().await;
+            messages.push(TeamInboxMessage {
+                message_id: Uuid::new_v4(),
+                text,
+            });
+            let merged = TeamInboxMessage {
+                message_id: Uuid::new_v4(),
+                text: messages
+                    .into_iter()
+                    .map(|message| message.text)
+                    .collect::<Vec<_>>()
+                    .join("\n\n"),
+            };
+            let _ = self.root_message_tx.send(merged);
+            return Ok(());
+        }
         let entry = table
             .entries
             .get_mut(&id)
@@ -800,7 +920,7 @@ impl SubagentCoordinator {
             bail!("subagent {} is not running", entry.snapshot.task_name);
         }
         let mut messages = std::mem::take(&mut entry.inbox);
-        messages.push(message);
+        messages.push(text);
         send_prompt(entry, id, messages.join("\n\n"), PromptDelivery::Steer).await
     }
 
@@ -890,6 +1010,17 @@ impl SubagentCoordinator {
 
     /// Execute one model collaboration tool against this typed lifecycle.
     pub async fn call_tool(&self, name: &str, arguments: Value) -> Result<Value> {
+        let root_session_id = self.table.lock().await.root_session_id;
+        self.call_tool_as(root_session_id, name, arguments).await
+    }
+
+    /// Execute one collaboration tool as a specific member of the shared team.
+    pub async fn call_tool_as(
+        &self,
+        actor_session_id: Uuid,
+        name: &str,
+        arguments: Value,
+    ) -> Result<Value> {
         match name {
             "spawn_agent" => {
                 let args: SpawnAgentArgs = serde_json::from_value(arguments)?;
@@ -910,12 +1041,14 @@ impl SubagentCoordinator {
             }
             "send_message" => {
                 let args: MessageArgs = serde_json::from_value(arguments)?;
-                self.send_message(&args.target, &args.message).await?;
+                self.send_message_as(actor_session_id, &args.target, &args.message)
+                    .await?;
                 Ok(json!({ "queued": true }))
             }
             "followup_task" => {
                 let args: MessageArgs = serde_json::from_value(arguments)?;
-                self.followup_task(&args.target, &args.message).await?;
+                self.followup_task_as(actor_session_id, &args.target, &args.message)
+                    .await?;
                 Ok(json!({ "accepted": true }))
             }
             "interrupt_agent" => {
@@ -944,9 +1077,10 @@ fn boxed_agent_store_session(
     executor: Arc<dyn crate::AgentTurnExecutor>,
     store: Arc<dyn SessionStore>,
     writer: crate::SessionWriterLease,
+    team: SubagentCoordinator,
 ) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
     Box::pin(async move {
-        crate::run_agent_session_with_store_and_writer(
+        crate::session::run_agent_session_with_store_and_writer_and_team(
             &session_root,
             session_id,
             launch,
@@ -955,6 +1089,7 @@ fn boxed_agent_store_session(
             executor,
             store,
             writer,
+            team,
         )
         .await
     })
@@ -1390,6 +1525,10 @@ fn required_message(message: &str) -> Result<String> {
     Ok(message.to_string())
 }
 
+fn attributed_team_message(actor: &str, message: &str) -> String {
+    format!("Team message from {actor}:\n\n{message}")
+}
+
 fn child_journal_path(root: &Path, session_id: Uuid) -> PathBuf {
     root.join("subagents").join(format!("{session_id}.jsonl"))
 }
@@ -1443,6 +1582,37 @@ async fn update_from_session_event(
             status: MessageStatus::Complete,
             ..
         } => entry.snapshot.final_text = Some(text.clone()),
+        SessionEventKind::UsageUpdated {
+            input_tokens,
+            output_tokens,
+            total_tokens,
+            cost_microusd,
+            ..
+        } => {
+            entry.snapshot.usage.input_tokens = entry
+                .snapshot
+                .usage
+                .input_tokens
+                .saturating_add(*input_tokens);
+            entry.snapshot.usage.output_tokens = entry
+                .snapshot
+                .usage
+                .output_tokens
+                .saturating_add(*output_tokens);
+            entry.snapshot.usage.total_tokens = entry
+                .snapshot
+                .usage
+                .total_tokens
+                .saturating_add(*total_tokens);
+            entry.snapshot.usage.cost_microusd =
+                match (entry.snapshot.usage.cost_microusd, cost_microusd) {
+                    (Some(current), Some(additional)) => {
+                        Some(current.saturating_add(*additional))
+                    }
+                    (None, Some(value)) => Some(*value),
+                    (current, None) => current,
+                };
+        }
         _ => {}
     }
     entry.snapshot.updated_at = event.created_at;
@@ -1463,6 +1633,13 @@ fn project_child_state(snapshot: &mut SubagentSnapshot, state: &crate::SessionSt
     if let Some(updated_at) = state.activity_at {
         snapshot.updated_at = updated_at;
     }
+    snapshot.final_text = state.latest_response.clone();
+    snapshot.usage = SubagentUsage {
+        input_tokens: state.usage.input_tokens,
+        output_tokens: state.usage.output_tokens,
+        total_tokens: state.usage.total_tokens,
+        cost_microusd: state.usage.cost_microusd,
+    };
 }
 
 fn significant_activity(activity: &SubagentActivity) -> bool {
@@ -1718,6 +1895,7 @@ mod tests {
             updated_at: now,
             detail: None,
             final_text: Some("ready".into()),
+            usage: SubagentUsage::default(),
         };
         let parent_event = SessionEvent::new(
             root,

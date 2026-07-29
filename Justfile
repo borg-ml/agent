@@ -16,6 +16,10 @@ cli:
       echo "Installed $installed, but this shell resolves borg to $resolved" >&2
       exit 1
     fi
+    remote_config="${BORG_REMOTE_CONFIG:-${BORG_HOME:-$HOME/.borg}/remote/host.json}"
+    if [[ "$(uname -s)" == "Linux" && -f "$remote_config" ]]; then
+      "$installed" remote install --config "$remote_config"
+    fi
     "$installed" --version
 
 # Build and install an unoptimized binary for local debugging.
@@ -30,5 +34,9 @@ cli-dev:
     if [[ "$resolved" != "$installed" ]]; then
       echo "Installed $installed, but this shell resolves borg to $resolved" >&2
       exit 1
+    fi
+    remote_config="${BORG_REMOTE_CONFIG:-${BORG_HOME:-$HOME/.borg}/remote/host.json}"
+    if [[ "$(uname -s)" == "Linux" && -f "$remote_config" ]]; then
+      "$installed" remote install --config "$remote_config"
     fi
     "$installed" --version

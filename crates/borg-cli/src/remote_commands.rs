@@ -225,10 +225,7 @@ async fn install_host_service(config_path: &Path) -> Result<()> {
     );
     fs::write(&service_path, service)
         .with_context(|| format!("failed to write {}", service_path.display()))?;
-    for args in [
-        &["--user", "daemon-reload"][..],
-        &["--user", "enable", "--now", "borg-remote.service"][..],
-    ] {
+    for args in host_service_systemctl_commands() {
         let status = tokio::process::Command::new("systemctl")
             .args(args)
             .status()
@@ -241,6 +238,14 @@ async fn install_host_service(config_path: &Path) -> Result<()> {
         service_path.display()
     );
     Ok(())
+}
+
+fn host_service_systemctl_commands() -> [&'static [&'static str]; 3] {
+    [
+        &["--user", "daemon-reload"],
+        &["--user", "enable", "borg-remote.service"],
+        &["--user", "restart", "borg-remote.service"],
+    ]
 }
 
 fn systemd_quote(value: &str) -> String {
@@ -2275,8 +2280,22 @@ async fn recent_session_ids(sessions_dir: &Path, store: &SqliteSessionStore) -> 
         .list_sessions(10_000)
         .await?
         .into_iter()
+        .filter(|session| session_has_resumable_activity(&session.state))
         .map(|session| session.session_id)
         .collect())
+}
+
+fn session_has_resumable_activity(state: &borg_remote::SessionState) -> bool {
+    state.first_prompt.is_some()
+        || state.latest_response.is_some()
+        || state.provider_session_id.is_some()
+        || state.goal.is_some()
+        || !state.todos.is_empty()
+        || state.usage.calls > 0
+        // A prompt, interaction, context reset, or other durable user action
+        // advances beyond the launch-only Started/Configured/Ready/Stopped
+        // lifecycle emitted by automated terminal probes.
+        || state.latest_sequence > 4
 }
 
 async fn recent_session_options(
@@ -3289,6 +3308,18 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn reinstalling_the_remote_host_restarts_it_on_the_new_binary() {
+        assert_eq!(
+            host_service_systemctl_commands(),
+            [
+                &["--user", "daemon-reload"][..],
+                &["--user", "enable", "borg-remote.service"][..],
+                &["--user", "restart", "borg-remote.service"][..],
+            ]
+        );
+    }
+
+    #[test]
     fn provider_user_input_response_uses_question_ids() {
         let payload = serde_json::json!({
             "questions": [{
@@ -3502,6 +3533,18 @@ mod tests {
                         permission_mode: PermissionMode::FullAccess,
                     },
                 ),
+                SessionEvent::new(
+                    session_id,
+                    3,
+                    SessionEventKind::Message {
+                        message_id: Uuid::new_v4(),
+                        actor: EventActor::User,
+                        text: "real resumable work".to_string(),
+                        attachments: Vec::new(),
+                        status: MessageStatus::Complete,
+                        delivery: None,
+                    },
+                ),
             ];
             fs::write(
                 dir.path().join(format!("{session_id}.jsonl")),
@@ -3686,6 +3729,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resume_discovery_ignores_launch_only_probe_sessions() {
+        let dir = tempdir().expect("session directory");
+        let store = SqliteSessionStore::open(dir.path().join("sessions.sqlite3"))
+            .await
+            .unwrap();
+        let probe = Uuid::new_v4();
+        let real = Uuid::new_v4();
+        for session_id in [probe, real] {
+            store.create_session(session_id).await.unwrap();
+            for kind in [
+                SessionEventKind::SessionStarted,
+                SessionEventKind::SessionConfigured {
+                    cwd: dir.path().to_path_buf(),
+                    provider: CodingProvider::Codex,
+                    model: Some("gpt-5.6-sol".to_string()),
+                    effort: Some("low".to_string()),
+                    fast: false,
+                    response_language: ResponseLanguage::Auto,
+                    permission_mode: PermissionMode::FullAccess,
+                },
+                SessionEventKind::StatusChanged {
+                    status: SessionStatus::Ready,
+                    detail: None,
+                },
+                SessionEventKind::StatusChanged {
+                    status: SessionStatus::Stopped,
+                    detail: None,
+                },
+            ] {
+                store
+                    .append(SessionEvent::new(session_id, 0, kind))
+                    .await
+                    .unwrap();
+            }
+        }
+        store
+            .append(SessionEvent::new(
+                real,
+                0,
+                SessionEventKind::Message {
+                    message_id: Uuid::new_v4(),
+                    actor: EventActor::User,
+                    text: "real user work".to_string(),
+                    attachments: Vec::new(),
+                    status: MessageStatus::Complete,
+                    delivery: Some(PromptDelivery::Queue),
+                },
+            ))
+            .await
+            .unwrap();
+
+        let sessions = recent_session_ids(dir.path(), &store).await.unwrap();
+        assert_eq!(sessions, vec![real]);
+        assert!(
+            store.contains_session(probe).await.unwrap(),
+            "filtering the resume surface must not destructively delete legacy rows"
+        );
+    }
+
+    #[tokio::test]
     async fn resume_picker_prioritizes_current_directory_and_keeps_global_choices() {
         let dir = tempdir().expect("session directory");
         let store = SqliteSessionStore::open(dir.path().join("sessions.sqlite3"))
@@ -3754,6 +3857,21 @@ mod tests {
                 valid,
                 0,
                 SessionEventKind::SessionStarted,
+            ))
+            .await
+            .unwrap();
+        store
+            .append(SessionEvent::new(
+                valid,
+                0,
+                SessionEventKind::Message {
+                    message_id: Uuid::new_v4(),
+                    actor: EventActor::User,
+                    text: "valid resumable work".to_string(),
+                    attachments: Vec::new(),
+                    status: MessageStatus::Complete,
+                    delivery: None,
+                },
             ))
             .await
             .unwrap();

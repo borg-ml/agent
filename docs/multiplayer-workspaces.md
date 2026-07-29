@@ -1,0 +1,239 @@
+# Multiplayer workspaces
+
+Status: implementation contract
+
+## Product model
+
+Borg is multiplayer infrastructure for humans and agents. A workspace is the
+shared durable unit. Humans, agents, automation, and execution hosts attach to
+the same workspace and consume the same ordered event stream from CLI or web.
+
+An execution session is not an identity and a chat thread is not a workspace.
+A participant can outlive many sessions, use more than one client, and take
+part in more than one thread.
+
+## Authorities
+
+Each kind of fact has exactly one durable authority:
+
+| Fact | Authority |
+| --- | --- |
+| Shared authored content and coordination | workspace event stream |
+| Provider turns, tool calls, approvals, usage | session event stream |
+| Current participant access | workspace membership projection |
+| Message admission for one recipient | message delivery projection |
+| Ephemeral online state | renewable presence lease |
+| Local process control | attached execution host |
+
+The product backend extends its existing `workspaces` and `chat_messages`
+tables. It must not create a second cloud chat log. The local runtime keeps a
+SQLite projection of the same contracts. `SessionEvent` remains the complete
+execution transcript; workspace events reference session IDs and sequences
+instead of copying tool deltas.
+
+## Stable identities
+
+`Participant` is the shared identity envelope:
+
+- `human`: authenticated user or explicitly invited teammate;
+- `agent`: persistent logical teammate that may have many execution sessions;
+- `service`: trusted automation or integration.
+
+Every authored event records an immutable `author_participant_id`. Display
+names, avatars, providers, models, and presence are mutable projections and
+must never replace authorization identity.
+
+An agent's participant ID is created when the agent joins the workspace. A
+restart creates or resumes a session attached to that participant; it does not
+create a new teammate.
+
+`ExecutionHost` is separate from participant identity. Local laptops, shared
+machines, and cloud workers advertise capabilities and hold expiring presence
+leases. A participant may request work on a host only within both its
+membership authority and the host's granted capability scope.
+
+## Ordered event envelope
+
+Every committed workspace event has:
+
+- globally unique event ID;
+- workspace ID;
+- monotonically increasing workspace sequence;
+- immutable author participant ID;
+- client idempotency key scoped to `(workspace, author)`;
+- typed payload and schema version;
+- server commit time and optional causal event ID.
+
+The append transaction allocates a sequence and persists the event atomically.
+Repeating the same idempotency key returns the original event. Reusing the key
+with a different payload is a conflict. Consumers replay after a cursor and
+then subscribe; reconnecting cannot create a gap between backfill and live
+delivery.
+
+## Messages and threads
+
+A message has one body, one author, and one immutable audience. It may start a
+thread or reply to an earlier message. Mentions are structured participant
+references, not reparsed display text.
+
+Audience forms:
+
+- whole workspace;
+- explicit participants;
+- role or group;
+- direct message.
+
+The workspace timeline is not a mandatory group chat. Workspace broadcasts are
+rendered on the shared timeline, work/artifact threads are rendered with their
+subject, and direct messages appear only in the participants' private inboxes.
+All three use the same ordered envelope and delivery machinery so identity,
+restart recovery, and references remain consistent. A participant can
+explicitly promote a useful direct-message result into a shared thread; Borg
+never does so implicitly.
+
+Visibility and delivery are different. Visibility determines who may read a
+message. `MessageDelivery` records how each recipient agent should admit it:
+
+- `boundary`: steer the active turn at the next real model/tool boundary;
+- `wake`: wake an idle participant, or use boundary delivery if already busy;
+- `next_turn`: save for the next separately started turn;
+- `notify`: update the inbox without model admission.
+
+Delivery state is per recipient and transitions monotonically through pending,
+admitted, acknowledged, or terminal failure. Admission is exactly once even
+across process restart. A message may be recalled only while that recipient's
+delivery remains pending. Read cursors are per participant and thread.
+
+## Shared work
+
+Messages carry discussion; typed events carry coordination:
+
+- work item created, claimed, released, blocked, completed, or reviewed;
+- artifact published or revised with content hash and provenance;
+- decision proposed, accepted, superseded, or rejected;
+- escalation requested, accepted, resolved, or declined;
+- session and host attached, detached, or capability-changed.
+
+Claims are transactional. Dependencies reference durable work item IDs.
+Artifacts reference their producing participant, session, event, and revision.
+Decisions remain in history when superseded.
+
+## Autonomous teams
+
+Autonomous teams are a configurable topology over normal participants and work
+events. They are not a separate agent runtime.
+
+A useful preset is:
+
+- one high-reasoning director owns decomposition, assignment, review,
+  synthesis, and the team budget;
+- low-cost workers execute bounded work items concurrently;
+- workers report completion, uncertainty, blockers, and evidence into the
+  workspace;
+- the director may clarify, retry, reassign, or spawn a temporary
+  high-reasoning specialist;
+- stop conditions bound time, tokens, cost, failures, and fan-out.
+
+Core policy is provider-neutral. Provider, model, reasoning effort, permission
+mode, concurrency, budgets, retry limits, and escalation thresholds are
+configuration. An `xhigh` Codex director with `low` Codex workers is a preset,
+not a protocol requirement.
+
+Escalation is explicit and durable. A worker reports a reason such as missing
+authority, ambiguous acceptance criteria, repeated failure, low confidence,
+security risk, or budget pressure, together with evidence and the work item
+cursor. The director decides whether to answer, change scope, grant authority,
+or start a specialist. This makes autonomous execution inspectable instead of
+hiding coordination in prompts.
+
+## Authorization
+
+Workspace roles are capability sets, not presentation labels. The built-in
+roles are owner, administrator, editor, contributor, and viewer. Agent/service
+members receive explicit roles and may be further restricted to assigned work,
+hosts, paths, tools, budgets, and approval modes.
+
+Required checks:
+
+1. authenticate the acting human, service credential, or host;
+2. resolve the durable participant represented by that credential;
+3. verify active workspace membership and required capability;
+4. validate payload references are visible in the same workspace;
+5. persist immutable actor and approval provenance.
+
+The client cannot choose an arbitrary `author_participant_id`. Server-side
+credentials and session attachment determine it.
+
+## Local and cloud synchronization
+
+The same cursor protocol serves local CLI, remote CLI, and web:
+
+1. attach using workspace, participant, client, and optional host identity;
+2. send idempotent commands carrying the last observed sequence;
+3. replay events after the local cursor;
+4. renew presence and host capability leases;
+5. receive live events and advance durable read/delivery cursors;
+6. reconnect from the last committed cursor.
+
+Cloud workspaces use Postgres as authority. Local-only workspaces use SQLite as
+authority. Attaching a local workspace to cloud is an explicit one-time
+authority transfer/import with recorded provenance; Borg never silently merges
+two writable authorities with the same workspace ID.
+
+Execution is disposable; coordination is durable. Workers, sandboxes,
+worktrees, containers, and cloud hosts may be ephemeral, but their lifecycle,
+authority, costs, approvals, reports, and published outputs are committed to
+the workspace. Borg also supports explicitly declared scratch workspaces with
+a retention TTL. A scratch workspace is still persisted during its lifetime so
+restart and recovery work; expiry performs a policy-controlled purge and keeps
+only the minimum tombstone or audit record required by the configured
+retention policy. Memory-only autonomous teams are not a supported durability
+mode.
+
+## Compatibility and migration
+
+Migration is additive and restart-safe:
+
+1. add participant, membership, thread, audience, idempotency, and delivery
+   storage without changing legacy reads;
+2. create a deterministic human participant for each existing workspace owner
+   and membership;
+3. project legacy `role=user` messages to the submitting human participant and
+   legacy `role=assistant` messages to a deterministic workspace Borg agent;
+4. retain `role` and `actor` as compatibility projections until all clients
+   consume participant identity;
+5. attach existing sessions to deterministic personal workspaces locally;
+6. backfill delivery only for messages that require agent admission; historical
+   display-only messages are considered visible and read;
+7. reject partial or contradictory backfills transactionally.
+
+Existing event IDs, message IDs, workspace IDs, ordering, encrypted bodies,
+session journals, and access grants must remain unchanged.
+
+## Extension surface
+
+Extensions may add typed workspace payloads, views, coordination policies,
+tools, hooks, and participant groups. They register versioned schemas and
+reducers. Unknown event payloads remain replayable and visible as unsupported;
+they must not corrupt the core projection.
+
+Extensions cannot bypass membership checks, forge authorship, mutate committed
+audiences, weaken delivery idempotency, or obtain host capabilities not granted
+by the user.
+
+## Verification matrix
+
+Completion requires boundary-level tests for:
+
+- concurrent append produces a gap-free sequence;
+- idempotent retry returns the original event and conflicting retry fails;
+- human, agent, and service authors round-trip without losing identity;
+- audience and membership prevent unauthorized replay;
+- one message has independent delivery outcomes for two recipients;
+- boundary delivery survives tool/model transitions and process restart;
+- recall succeeds only before admission;
+- director delegates to low-cost workers, receives reports, escalates a blocked
+  item to a specialist, and respects team budget/concurrency/stop policies;
+- two human clients plus several agents converge after disconnect/reconnect;
+- local and cloud hosts retain explicit approval and execution provenance;
+- legacy chat/session data migrates without ID, content, access, or order loss.

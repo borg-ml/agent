@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::time::Sleep;
 use uuid::Uuid;
 
@@ -33,6 +33,13 @@ struct QueuedPrompt {
 
 struct PendingSteer {
     prompt: QueuedPrompt,
+    state: PendingSteerState,
+}
+
+enum PendingSteerState {
+    AwaitingAcknowledgement,
+    Accepted,
+    RetryAtBoundary { error: String },
 }
 
 struct RuntimeSessionStore {
@@ -254,6 +261,37 @@ pub async fn run_agent_session_with_store_and_writer(
         events,
         executor,
         store,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_agent_session_with_store_and_writer_and_team(
+    session_root: &Path,
+    session_id: Uuid,
+    launch: LaunchSession,
+    commands: mpsc::Receiver<HostCommand>,
+    events: mpsc::Sender<SessionEvent>,
+    executor: Arc<dyn AgentTurnExecutor>,
+    store: Arc<dyn SessionStore>,
+    _writer: SessionWriterLease,
+    team: SubagentCoordinator,
+) -> Result<()> {
+    anyhow::ensure!(
+        !launch.fast.unwrap_or(false) || launch.provider.supports_fast(),
+        "fast mode is not supported by the {:?} transport",
+        launch.provider
+    );
+    run_agent_session_store_kernel(
+        session_root,
+        session_id,
+        launch,
+        commands,
+        events,
+        executor,
+        store,
+        Some(team),
     )
     .await
 }
@@ -303,6 +341,7 @@ async fn run_agent_session_kernel(
         events,
         executor,
         runtime_store,
+        None,
     )
     .await
 }
@@ -315,6 +354,7 @@ async fn run_agent_session_store_kernel(
     events: mpsc::Sender<SessionEvent>,
     executor: Arc<dyn AgentTurnExecutor>,
     store: Arc<dyn SessionStore>,
+    shared_team: Option<SubagentCoordinator>,
 ) -> Result<()> {
     store.create_session(session_id).await?;
     let initial_state = store.state(session_id).await?;
@@ -385,24 +425,32 @@ async fn run_agent_session_store_kernel(
     let todo_tools = SessionTodoTools {
         requests: todo_tool_tx,
     };
-    let subagents = crate::SubagentCoordinator::new_with_store_and_executor(
-        session_root,
-        session_id,
-        launch.clone(),
-        crate::DEFAULT_MAX_SUBAGENTS,
-        Arc::clone(&executor),
-        subagent_store,
-    )?;
+    let owns_team = shared_team.is_none();
+    let subagents = match shared_team {
+        Some(team) => team,
+        None => crate::SubagentCoordinator::new_with_store_and_executor(
+            session_root,
+            session_id,
+            launch.clone(),
+            crate::DEFAULT_MAX_SUBAGENTS,
+            Arc::clone(&executor),
+            subagent_store,
+        )?,
+    };
     let mut subagent_activity_rx = subagents.subscribe();
-    subagents
-        .restore_from_events(&recovery.subagent_events)
-        .await?;
+    let mut root_message_rx = subagents.subscribe_root_messages();
+    if owns_team {
+        subagents
+            .restore_from_events(&recovery.subagent_events)
+            .await?;
+    }
     let dispatcher = crate::AgentToolDispatcher::new(
         goal_tools.clone(),
         todo_tools.clone(),
         subagents.clone(),
         crate::LspService::new(&launch.cwd),
         launch.provider,
+        session_id,
     );
     let agent_tool_server =
         crate::AgentToolServer::start(session_root, session_id, dispatcher.clone()).await?;
@@ -454,7 +502,7 @@ async fn run_agent_session_store_kernel(
         } else {
             loop {
                 let command = tokio::select! {
-                    activity = subagent_activity_rx.recv() => {
+                    activity = subagent_activity_rx.recv(), if owns_team => {
                         if let Ok(activity) = activity {
                             record_subagent_activity(
                                 &mut journal,
@@ -465,6 +513,20 @@ async fn run_agent_session_store_kernel(
                             ).await?;
                         }
                         continue;
+                    }
+                    message = root_message_rx.recv(), if owns_team => {
+                        match message {
+                            Ok(message) => Some(HostCommand::Prompt {
+                                session_id,
+                                message_id: message.message_id,
+                                text: message.text,
+                                attachments: Vec::new(),
+                                output_schema: None,
+                                delivery: PromptDelivery::Steer,
+                            }),
+                            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(broadcast::error::RecvError::Closed) => continue,
+                        }
                     }
                     command = next_host_command(&mut deferred_commands, &mut commands) => command,
                 };
@@ -480,6 +542,11 @@ async fn run_agent_session_store_kernel(
                         if journal.contains_message(session_id, message_id).await? {
                             continue;
                         }
+                        let text = if owns_team {
+                            subagents.prepend_root_inbox(text).await
+                        } else {
+                            text
+                        };
                         break Some(QueuedPrompt {
                             message_id,
                             text,
@@ -876,6 +943,7 @@ async fn run_agent_session_store_kernel(
                         provider_events_open = false;
                         continue;
                     };
+                    let retry_steers = provider_event_is_steer_boundary(&kind);
                     track_approval(&kind, &mut pending_approval);
                     track_provider_interaction(&kind, &mut pending_provider_interaction);
                     let usage = goal_token_usage(&kind);
@@ -888,6 +956,14 @@ async fn run_agent_session_store_kernel(
                     )
                     .await?;
                     record(&mut journal, &events, session_id, kind).await?;
+                    if retry_steers {
+                        retry_pending_steers(
+                            &control_tx,
+                            &steer_result_tx,
+                            &mut pending_steers,
+                        )
+                        .await;
+                    }
                     if let Some(tokens) = usage {
                         account_goal_tokens(
                             &mut journal,
@@ -900,7 +976,7 @@ async fn run_agent_session_store_kernel(
                         .await?;
                     }
                 }
-                activity = subagent_activity_rx.recv() => {
+                activity = subagent_activity_rx.recv(), if owns_team => {
                     if let Ok(activity) = activity {
                         record_subagent_activity(
                             &mut journal,
@@ -909,6 +985,20 @@ async fn run_agent_session_store_kernel(
                             &subagents,
                             activity,
                         ).await?;
+                    }
+                }
+                message = root_message_rx.recv(), if owns_team => {
+                    match message {
+                        Ok(message) => deferred_commands.push_front(HostCommand::Prompt {
+                            session_id,
+                            message_id: message.message_id,
+                            text: message.text,
+                            attachments: Vec::new(),
+                            output_schema: None,
+                            delivery: PromptDelivery::Steer,
+                        }),
+                        Err(broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(broadcast::error::RecvError::Closed) => {}
                     }
                 }
                 _ = async {
@@ -973,33 +1063,33 @@ async fn run_agent_session_store_kernel(
                     else {
                         continue;
                     };
-                    if acknowledgement.is_ok()
-                        && launch.provider != CodingProvider::Codex
-                    {
-                        let steer = pending_steers
-                            .remove(index)
-                            .expect("matching pending steer index exists");
-                        record_prompt_status(
-                            &mut journal,
-                            &events,
-                            session_id,
-                            &steer.prompt,
-                            MessageStatus::Complete,
-                            PromptDelivery::Steer,
-                        )
-                        .await?;
-                    } else if acknowledgement.is_err() {
-                        let prompt = &mut pending_steers[index].prompt;
-                        prompt.delivery = PromptDelivery::Queue;
-                        record_prompt_status(
-                            &mut journal,
-                            &events,
-                            session_id,
-                            prompt,
-                            MessageStatus::Queued,
-                            PromptDelivery::Queue,
-                        )
-                        .await?;
+                    match acknowledgement {
+                        Ok(()) if launch.provider != CodingProvider::Codex => {
+                            let steer = pending_steers
+                                .remove(index)
+                                .expect("matching pending steer index exists");
+                            record_prompt_status(
+                                &mut journal,
+                                &events,
+                                session_id,
+                                &steer.prompt,
+                                MessageStatus::Complete,
+                                PromptDelivery::Steer,
+                            )
+                            .await?;
+                        }
+                        Ok(()) => {
+                            pending_steers[index].state = PendingSteerState::Accepted;
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                %message_id,
+                                %error,
+                                "provider rejected active-turn steer; retaining it for the next boundary"
+                            );
+                            pending_steers[index].state =
+                                PendingSteerState::RetryAtBoundary { error };
+                        }
                     }
                 }
                 command = next_host_command(&mut deferred_commands, &mut commands) => {
@@ -1047,44 +1137,22 @@ async fn run_agent_session_store_kernel(
                                 PromptDelivery::Steer,
                             )
                             .await?;
-                            let (ack, result) = oneshot::channel();
-                            let sent = control_tx
-                                .send(AgentTurnControl::Steer {
-                                    message_id,
-                                    text: prompt.text.clone(),
-                                    attachments: prompt.attachments.clone(),
-                                    ack,
-                                })
-                                .await
-                                .is_ok();
-                            if sent {
-                                pending_steers.push_back(PendingSteer { prompt });
-                                let steer_result_tx = steer_result_tx.clone();
-                                tokio::spawn(async move {
-                                    let acknowledgement = result.await.unwrap_or_else(|_| {
-                                        Err(
-                                            "provider turn ended before the steer was acknowledged"
-                                                .to_string(),
-                                        )
-                                    });
-                                    let _ = steer_result_tx
-                                        .send((message_id, acknowledgement))
-                                        .await;
-                                });
-                            } else {
-                                let mut prompt = prompt;
-                                prompt.delivery = PromptDelivery::Queue;
-                                record_prompt_status(
-                                    &mut journal,
-                                    &events,
-                                    session_id,
-                                    &prompt,
-                                    MessageStatus::Queued,
-                                    PromptDelivery::Queue,
-                                )
-                                .await?;
-                                pending_steers.push_back(PendingSteer { prompt });
-                            }
+                            let sent = dispatch_steer(
+                                &control_tx,
+                                &steer_result_tx,
+                                &prompt,
+                            )
+                            .await;
+                            pending_steers.push_back(PendingSteer {
+                                prompt,
+                                state: if sent {
+                                    PendingSteerState::AwaitingAcknowledgement
+                                } else {
+                                    PendingSteerState::RetryAtBoundary {
+                                        error: "provider turn control was unavailable".to_string(),
+                                    }
+                                },
+                            });
                         }
                         HostCommand::Prompt {
                             message_id,
@@ -1119,7 +1187,7 @@ async fn run_agent_session_store_kernel(
                             });
                         }
                         HostCommand::RecallQueuedPrompt { .. } => {
-                            for recalled in recall_all_visible(&mut pending) {
+                            if let Some(recalled) = recall_latest_visible(&mut pending) {
                                 record(
                                     &mut journal,
                                     &events,
@@ -1626,21 +1694,9 @@ fn recover_queued_prompts(events: &[SessionEvent]) -> VecDeque<QueuedPrompt> {
     pending
 }
 
-fn recall_all_visible(pending: &mut VecDeque<QueuedPrompt>) -> Vec<QueuedPrompt> {
-    let mut recalled = Vec::new();
-    let mut index = 0;
-    while index < pending.len() {
-        if pending[index].visible {
-            recalled.push(
-                pending
-                    .remove(index)
-                    .expect("visible queued prompt index must exist"),
-            );
-        } else {
-            index += 1;
-        }
-    }
-    recalled
+fn recall_latest_visible(pending: &mut VecDeque<QueuedPrompt>) -> Option<QueuedPrompt> {
+    let index = pending.iter().rposition(|prompt| prompt.visible)?;
+    pending.remove(index)
 }
 
 async fn next_host_command(
@@ -1672,7 +1728,7 @@ async fn prioritize_recall_at_turn_boundary(
                 session_id: command_session_id
             } if command_session_id == session_id
         ) {
-            for recalled in recall_all_visible(pending) {
+            if let Some(recalled) = recall_latest_visible(pending) {
                 record(
                     journal,
                     events,
@@ -1695,6 +1751,70 @@ async fn prioritize_recall_at_turn_boundary(
 fn steers_active_codex_turn(provider: CodingProvider, delivery: PromptDelivery) -> bool {
     (provider == CodingProvider::Codex || provider.uses_native_harness())
         && delivery == PromptDelivery::Steer
+}
+
+fn provider_event_is_steer_boundary(kind: &SessionEventKind) -> bool {
+    matches!(
+        kind,
+        SessionEventKind::ToolCompleted { .. }
+            | SessionEventKind::ApprovalResolved { .. }
+            | SessionEventKind::ProviderInteractionResolved { .. }
+            | SessionEventKind::Message {
+                actor: EventActor::Assistant,
+                status: MessageStatus::Complete,
+                ..
+            }
+    )
+}
+
+async fn dispatch_steer(
+    control_tx: &mpsc::Sender<AgentTurnControl>,
+    steer_result_tx: &mpsc::Sender<(Uuid, std::result::Result<(), String>)>,
+    prompt: &QueuedPrompt,
+) -> bool {
+    let (ack, result) = oneshot::channel();
+    if control_tx
+        .send(AgentTurnControl::Steer {
+            message_id: prompt.message_id,
+            text: prompt.text.clone(),
+            attachments: prompt.attachments.clone(),
+            ack,
+        })
+        .await
+        .is_err()
+    {
+        return false;
+    }
+
+    let message_id = prompt.message_id;
+    let steer_result_tx = steer_result_tx.clone();
+    tokio::spawn(async move {
+        let acknowledgement = result.await.unwrap_or_else(|_| {
+            Err("provider turn ended before the steer was acknowledged".to_string())
+        });
+        let _ = steer_result_tx.send((message_id, acknowledgement)).await;
+    });
+    true
+}
+
+async fn retry_pending_steers(
+    control_tx: &mpsc::Sender<AgentTurnControl>,
+    steer_result_tx: &mpsc::Sender<(Uuid, std::result::Result<(), String>)>,
+    pending_steers: &mut VecDeque<PendingSteer>,
+) {
+    for steer in pending_steers.iter_mut() {
+        let PendingSteerState::RetryAtBoundary { error } = &steer.state else {
+            continue;
+        };
+        tracing::debug!(
+            message_id = %steer.prompt.message_id,
+            previous_error = %error,
+            "retrying active-turn steer at provider boundary"
+        );
+        if dispatch_steer(control_tx, steer_result_tx, &steer.prompt).await {
+            steer.state = PendingSteerState::AwaitingAcknowledgement;
+        }
+    }
 }
 
 async fn record_prompt_status(
@@ -2635,6 +2755,13 @@ mod tests {
         release_commit: Arc<Notify>,
     }
 
+    struct BoundaryRetrySteerExecutor {
+        turn_started: Arc<Notify>,
+        first_attempt_rejected: Arc<Notify>,
+        release_tool_boundary: Arc<Notify>,
+        retry_accepted: Arc<Notify>,
+    }
+
     struct BoundaryQueueExecutor {
         turns: RecordedPromptTurns,
         first_started: Arc<Notify>,
@@ -2771,6 +2898,76 @@ mod tests {
                     .await
                     .unwrap();
             }
+            while !matches!(
+                controls.recv().await,
+                Some(AgentTurnControl::Interrupt) | None
+            ) {}
+            Ok(AgentTurnResult {
+                provider_session_id: Some("provider-session".to_string()),
+                final_text: String::new(),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentTurnExecutor for BoundaryRetrySteerExecutor {
+        async fn execute(
+            &self,
+            _turn: AgentTurn,
+            events: mpsc::Sender<SessionEventKind>,
+            controls: Option<mpsc::Receiver<AgentTurnControl>>,
+        ) -> Result<AgentTurnResult> {
+            self.turn_started.notify_one();
+            let mut controls = controls.expect("active turn has controls");
+            events
+                .send(SessionEventKind::ToolStarted {
+                    tool_call_id: "tool-1".to_string(),
+                    name: "command_execution".to_string(),
+                    input: json!({"command": "long-running-check"}),
+                    input_ref: None,
+                })
+                .await
+                .unwrap();
+
+            let Some(AgentTurnControl::Steer { ack, .. }) = controls.recv().await else {
+                panic!("first steer attempt");
+            };
+            let _ = ack.send(Err("temporary active-turn boundary rejection".to_string()));
+            self.first_attempt_rejected.notify_one();
+
+            self.release_tool_boundary.notified().await;
+            events
+                .send(SessionEventKind::ToolCompleted {
+                    tool_call_id: "tool-1".to_string(),
+                    output: "done".to_string(),
+                    output_ref: None,
+                    is_error: false,
+                    input: None,
+                    input_ref: None,
+                })
+                .await
+                .unwrap();
+
+            let Some(AgentTurnControl::Steer {
+                message_id, ack, ..
+            }) = controls.recv().await
+            else {
+                panic!("boundary retry");
+            };
+            let _ = ack.send(Ok(()));
+            events
+                .send(SessionEventKind::ProviderEvent {
+                    provider: CodingProvider::Codex,
+                    kind: "item/completed:userMessage".to_string(),
+                    payload: json!({
+                        "item_type": "userMessage",
+                        "client_id": message_id.to_string(),
+                    }),
+                })
+                .await
+                .unwrap();
+            self.retry_accepted.notify_one();
+
             while !matches!(
                 controls.recv().await,
                 Some(AgentTurnControl::Interrupt) | None
@@ -3188,6 +3385,129 @@ mod tests {
             let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
                 .await
                 .expect("committed steer event arrives")
+                .expect("session remains open");
+            if matches!(
+                event.kind,
+                SessionEventKind::Message {
+                    message_id,
+                    status: MessageStatus::Complete,
+                    delivery: Some(PromptDelivery::Steer),
+                    ..
+                } if message_id == followup_id
+            ) {
+                break;
+            }
+        }
+
+        command_tx
+            .send(HostCommand::Interrupt { session_id })
+            .await
+            .unwrap();
+        command_tx
+            .send(HostCommand::Stop { session_id })
+            .await
+            .unwrap();
+        actor.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejected_codex_steer_retries_at_the_next_tool_boundary() {
+        let root = tempdir().unwrap();
+        let journal_path = root.path().join("session.jsonl");
+        let session_id = Uuid::new_v4();
+        let followup_id = Uuid::new_v4();
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let turn_started = Arc::new(Notify::new());
+        let first_attempt_rejected = Arc::new(Notify::new());
+        let release_tool_boundary = Arc::new(Notify::new());
+        let retry_accepted = Arc::new(Notify::new());
+        let executor = Arc::new(BoundaryRetrySteerExecutor {
+            turn_started: Arc::clone(&turn_started),
+            first_attempt_rejected: Arc::clone(&first_attempt_rejected),
+            release_tool_boundary: Arc::clone(&release_tool_boundary),
+            retry_accepted: Arc::clone(&retry_accepted),
+        });
+        let actor = tokio::spawn(async move {
+            run_agent_session_with_executor(
+                &journal_path,
+                session_id,
+                LaunchSession {
+                    request_id: Uuid::new_v4(),
+                    cwd: root.path().to_path_buf(),
+                    provider: CodingProvider::Codex,
+                    model: None,
+                    effort: None,
+                    fast: Some(false),
+                    response_language: crate::ResponseLanguage::Auto,
+                    permission_mode: PermissionMode::Manual,
+                    name: None,
+                    initial_prompt: None,
+                },
+                command_rx,
+                event_tx,
+                executor,
+            )
+            .await
+        });
+
+        command_tx
+            .send(HostCommand::Prompt {
+                session_id,
+                message_id: Uuid::new_v4(),
+                text: "first".to_string(),
+                attachments: Vec::new(),
+                output_schema: None,
+                delivery: PromptDelivery::Steer,
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), turn_started.notified())
+            .await
+            .expect("first turn starts");
+        command_tx
+            .send(HostCommand::Prompt {
+                session_id,
+                message_id: followup_id,
+                text: "apply after the running tool".to_string(),
+                attachments: Vec::new(),
+                output_schema: None,
+                delivery: PromptDelivery::Steer,
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), first_attempt_rejected.notified())
+            .await
+            .expect("first steer attempt is rejected");
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let mut transitions = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            if let SessionEventKind::Message {
+                message_id,
+                status,
+                delivery: Some(delivery),
+                ..
+            } = event.kind
+                && message_id == followup_id
+            {
+                transitions.push((status, delivery));
+            }
+        }
+        assert_eq!(
+            transitions,
+            [(MessageStatus::Queued, PromptDelivery::Steer)],
+            "a transient rejection must not downgrade a same-turn steer"
+        );
+
+        release_tool_boundary.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), retry_accepted.notified())
+            .await
+            .expect("steer retries when the tool completes");
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+                .await
+                .expect("committed retry event arrives")
                 .expect("session remains open");
             if matches!(
                 event.kind,
@@ -3887,17 +4207,15 @@ mod tests {
             },
         ]);
 
-        let recalled = recall_all_visible(&mut pending);
+        let recalled = recall_latest_visible(&mut pending);
 
         assert_eq!(
-            recalled
-                .iter()
-                .map(|prompt| prompt.message_id)
-                .collect::<Vec<_>>(),
-            [first_visible_id, second_visible_id]
+            recalled.map(|prompt| prompt.message_id),
+            Some(second_visible_id)
         );
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].message_id, internal_id);
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].message_id, first_visible_id);
+        assert_eq!(pending[1].message_id, internal_id);
     }
 
     #[test]

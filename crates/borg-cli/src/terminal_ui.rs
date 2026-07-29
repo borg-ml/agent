@@ -76,7 +76,9 @@ const COMMAND_PANEL_BG: Color = Color::Rgb(31, 24, 27);
 const DOUBLE_CTRL_C_WINDOW: Duration = Duration::from_secs(1);
 const COPY_NOTICE_DURATION: Duration = Duration::from_secs(5);
 const NESTED_SCROLL_GESTURE_GAP: Duration = Duration::from_millis(200);
-const WHEEL_SCROLL_LINES_PER_EVENT: isize = 5;
+const WHEEL_SCROLL_VIEWPORT_DIVISOR: usize = 6;
+const MIN_WHEEL_SCROLL_LINES_PER_EVENT: usize = 3;
+const MAX_WHEEL_SCROLL_LINES_PER_EVENT: usize = 12;
 const MAX_WHEEL_SCROLL_LINES_PER_FRAME: isize = 8;
 const WHEEL_SCROLL_EASING_DIVISOR: usize = 8;
 const MIN_NESTED_SCROLL_LINES_PER_FRAME: usize = 2;
@@ -1078,7 +1080,7 @@ impl BorgTerminal {
             } if !self.replaying_history => {
                 self.composer
                     .append_recalled(text.clone(), attachments.clone());
-                self.notice = Some("Queued prompts returned to composer".to_string());
+                self.notice = Some("Latest queued prompt returned to composer".to_string());
             }
             _ => {}
         }
@@ -1088,8 +1090,7 @@ impl BorgTerminal {
         let transcript_changed =
             transcript_changed || self.transcript.order.len() != transcript_entries_before;
         if transcript_changed {
-            if self.scroll_from_bottom > 0
-                && self.text_selection.is_none()
+            if (self.scroll_from_bottom > 0 || self.text_selection.is_some())
                 && self.pending_scroll_anchor_height.is_none()
             {
                 self.pending_scroll_anchor_height = Some(self.rendered_transcript_height);
@@ -1537,17 +1538,28 @@ impl BorgTerminal {
                         return Ok(UiAction::None);
                     }
                 }
-                let hovered_tool_run = self.hovered_tool_run.or_else(|| {
-                    self.hovered_tool
-                        .and_then(|index| self.transcript.tool_run_start_containing(index))
-                        .and_then(|start| {
-                            self.tool_run_hit_areas
-                                .iter()
-                                .find_map(|(_, candidate, max_offset)| {
-                                    (*candidate == start).then_some((start, *max_offset))
-                                })
-                        })
-                });
+                let hovered_tool_run = self
+                    .tool_run_hit_areas
+                    .iter()
+                    .find_map(|(area, start, max_offset)| {
+                        area.contains(pointer)
+                            .then_some((*start, *max_offset, area.height))
+                    })
+                    .or_else(|| {
+                        self.hovered_tool
+                            .and_then(|index| self.transcript.tool_run_start_containing(index))
+                            .and_then(|start| {
+                                self.tool_run_hit_areas.iter().find_map(
+                                    |(area, candidate, max_offset)| {
+                                        (*candidate == start).then_some((
+                                            start,
+                                            *max_offset,
+                                            area.height,
+                                        ))
+                                    },
+                                )
+                            })
+                    });
                 if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
                     && !mouse.modifiers.contains(KeyModifiers::SHIFT)
                 {
@@ -1606,7 +1618,7 @@ impl BorgTerminal {
                     }
                     MouseEventKind::Down(MouseButton::Left) if self.hovered_tool.is_some() => {
                         self.nested_scroll_motion = None;
-                        if let Some((start, max_offset)) = hovered_tool_run {
+                        if let Some((start, max_offset, _)) = hovered_tool_run {
                             self.transcript.anchor_tool_run(start, max_offset);
                         }
                         let payloads = self
@@ -1646,13 +1658,16 @@ impl BorgTerminal {
                         }
                     }
                     MouseEventKind::ScrollUp => {
-                        let consumed = if let Some((start, max_offset)) = hovered_tool_run {
+                        let consumed = if let Some((start, max_offset, viewport_height)) =
+                            hovered_tool_run
+                        {
                             let can_move = self.transcript.tool_run_offset(start, max_offset) > 0;
                             if can_move {
                                 self.queue_nested_wheel_scroll(
                                     start,
                                     max_offset,
-                                    -WHEEL_SCROLL_LINES_PER_EVENT * scroll_repetitions as isize,
+                                    -wheel_scroll_lines(viewport_height)
+                                        * scroll_repetitions as isize,
                                 );
                             }
                             nested_scroll_consumed(
@@ -1667,36 +1682,42 @@ impl BorgTerminal {
                             false
                         };
                         if !consumed {
+                            let viewport_height =
+                                self.transcript_viewport_area.map_or(1, |area| area.height);
                             self.queue_wheel_scroll(
-                                WHEEL_SCROLL_LINES_PER_EVENT * scroll_repetitions as isize,
+                                wheel_scroll_lines(viewport_height) * scroll_repetitions as isize,
                             );
                         }
                     }
                     MouseEventKind::ScrollDown => {
-                        let consumed = if let Some((start, max_offset)) = hovered_tool_run {
-                            let can_move =
-                                self.transcript.tool_run_offset(start, max_offset) < max_offset;
-                            if can_move {
-                                self.queue_nested_wheel_scroll(
+                        let consumed =
+                            if let Some((start, max_offset, viewport_height)) = hovered_tool_run {
+                                let can_move =
+                                    self.transcript.tool_run_offset(start, max_offset) < max_offset;
+                                if can_move {
+                                    self.queue_nested_wheel_scroll(
+                                        start,
+                                        max_offset,
+                                        wheel_scroll_lines(viewport_height)
+                                            * scroll_repetitions as isize,
+                                    );
+                                }
+                                nested_scroll_consumed(
+                                    &mut self.nested_scroll_capture,
                                     start,
-                                    max_offset,
-                                    WHEEL_SCROLL_LINES_PER_EVENT * scroll_repetitions as isize,
-                                );
-                            }
-                            nested_scroll_consumed(
-                                &mut self.nested_scroll_capture,
-                                start,
-                                1,
-                                can_move,
-                                Instant::now(),
-                            )
-                        } else {
-                            self.nested_scroll_capture = None;
-                            false
-                        };
+                                    1,
+                                    can_move,
+                                    Instant::now(),
+                                )
+                            } else {
+                                self.nested_scroll_capture = None;
+                                false
+                            };
                         if !consumed {
+                            let viewport_height =
+                                self.transcript_viewport_area.map_or(1, |area| area.height);
                             self.queue_wheel_scroll(
-                                -WHEEL_SCROLL_LINES_PER_EVENT * scroll_repetitions as isize,
+                                -wheel_scroll_lines(viewport_height) * scroll_repetitions as isize,
                             );
                         }
                     }
@@ -2302,7 +2323,7 @@ impl BorgTerminal {
                 .direction(Direction::Vertical)
                 .constraints([
                     Constraint::Min(3),
-                    Constraint::Length(queued_prompt_panel_height(queued_prompts.len())),
+                    Constraint::Length(queued_prompt_panel_height(queued_prompts)),
                     Constraint::Length(2 * u16::from(!is_launch_screen)),
                     Constraint::Length(composer_height),
                     Constraint::Length(footer_height),
@@ -2597,8 +2618,14 @@ impl BorgTerminal {
                     ))
                     .block(
                         Block::default()
-                            .borders(Borders::TOP)
-                            .border_style(Style::default().fg(Color::DarkGray)),
+                            .borders(Borders::TOP | Borders::LEFT)
+                            .border_style(Style::default().fg(Color::DarkGray))
+                            .title(Span::styled(
+                                format!(" PENDING INPUT · {} ", queued_prompts.len()),
+                                Style::default()
+                                    .fg(BORG_ORANGE)
+                                    .add_modifier(Modifier::BOLD),
+                            )),
                     ),
                     chunks[1],
                 );
@@ -3198,7 +3225,7 @@ impl BorgTerminal {
                         .unwrap_or(slash_matches - 1);
                     return Ok(UiAction::None);
                 }
-                if self.composer.text.is_empty() && !self.queued_prompts.is_empty() {
+                if should_recall_latest_queued_prompt(&self.composer.text, &self.queued_prompts) {
                     return Ok(UiAction::RecallQueuedPrompt);
                 }
                 if self.composer.history_index.is_some() || self.composer.text.is_empty() {
@@ -4862,21 +4889,29 @@ impl Transcript {
     }
 
     fn goal_status(&self) -> Option<String> {
-        self.goal
-            .as_ref()
-            .filter(|goal| goal.status.is_active())
-            .map(|goal| {
-                let live_time = goal.time_used_seconds.saturating_add(
-                    Utc::now()
-                        .signed_duration_since(goal.updated_at)
-                        .num_seconds()
-                        .max(0) as u64,
-                );
-                format_elapsed_duration(live_time).map_or_else(
-                    || "pursuing /goal".to_string(),
-                    |duration| format!("pursuing /goal {duration}"),
-                )
-            })
+        let goal = self.goal.as_ref()?;
+        let label = match goal.status {
+            GoalStatus::Active => "pursuing",
+            GoalStatus::Paused => "paused",
+            GoalStatus::Blocked => "blocked",
+            GoalStatus::UsageLimited => "usage limited",
+            GoalStatus::BudgetLimited => "budget limited",
+            GoalStatus::Complete => return None,
+        };
+        let live_time = goal
+            .time_used_seconds
+            .saturating_add(if goal.status.is_active() {
+                Utc::now()
+                    .signed_duration_since(goal.updated_at)
+                    .num_seconds()
+                    .max(0) as u64
+            } else {
+                0
+            });
+        Some(format_elapsed_duration(live_time).map_or_else(
+            || format!("{label} /goal"),
+            |duration| format!("{label} /goal {duration}"),
+        ))
     }
 
     fn active_goal_cache_tick(&self) -> Option<i64> {
@@ -6000,15 +6035,26 @@ fn push_queued_prompt(
     }
 }
 
-fn queued_prompt_panel_height(prompt_count: usize) -> u16 {
-    if prompt_count == 0 {
+fn should_recall_latest_queued_prompt(
+    composer_text: &str,
+    queued_prompts: &[PendingPromptProjection],
+) -> bool {
+    composer_text.is_empty()
+        && queued_prompts
+            .iter()
+            .any(|prompt| prompt.delivery == PromptDelivery::Queue)
+}
+
+fn queued_prompt_panel_height(queued_prompts: &[PendingPromptProjection]) -> u16 {
+    if queued_prompts.is_empty() {
         return 0;
     }
-    prompt_count
+    queued_prompts
+        .len()
         .min(6)
-        .saturating_add(usize::from(prompt_count > 6))
-        // The queue paragraph has a top border, which needs its own row.
-        .saturating_add(1)
+        .saturating_add(usize::from(queued_prompts.len() > 6))
+        // One top-border/title row plus one contextual shortcut row.
+        .saturating_add(2)
         .min(u16::MAX as usize) as u16
 }
 
@@ -6017,21 +6063,21 @@ fn queued_prompt_lines(
     panel_width: u16,
 ) -> Vec<Line<'static>> {
     let visible = queued_prompts.len().min(6);
-    let queue_width = panel_width.saturating_sub(16).max(1) as usize;
+    let queue_width = panel_width.saturating_sub(26).max(1) as usize;
     let mut lines = queued_prompts
         .iter()
         .take(visible)
-        .enumerate()
-        .map(|(index, prompt)| {
-            let label = match prompt.delivery {
-                PromptDelivery::Steer => "Steering",
-                PromptDelivery::Queue => "Queued",
+        .map(|prompt| {
+            let (label, label_color) = match prompt.delivery {
+                PromptDelivery::Steer => ("NEXT TOOL", BORG_ORANGE),
+                PromptDelivery::Queue => ("NEXT TURN", Color::Gray),
             };
             Line::from(vec![
+                Span::styled(" ↳ ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
-                    format!(" {label} {}  ", index + 1),
+                    format!("{label:<9} "),
                     Style::default()
-                        .fg(BORG_ORANGE)
+                        .fg(label_color)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
@@ -6043,10 +6089,27 @@ fn queued_prompt_lines(
         .collect::<Vec<_>>();
     if queued_prompts.len() > visible {
         lines.push(Line::from(Span::styled(
-            format!("           +{} more", queued_prompts.len() - visible),
+            format!("   +{} more pending", queued_prompts.len() - visible),
             Style::default().fg(Color::DarkGray),
         )));
     }
+    let has_steers = queued_prompts
+        .iter()
+        .any(|prompt| prompt.delivery == PromptDelivery::Steer);
+    let has_queue = queued_prompts
+        .iter()
+        .any(|prompt| prompt.delivery == PromptDelivery::Queue);
+    let mut hints = Vec::new();
+    if has_steers {
+        hints.push("esc interrupt + send now");
+    }
+    if has_queue {
+        hints.push("↑ edit latest queued");
+    }
+    lines.push(Line::from(Span::styled(
+        format!("   {}", hints.join("  ·  ")),
+        Style::default().fg(Color::DarkGray),
+    )));
     lines
 }
 
@@ -6411,6 +6474,15 @@ fn tool_run_viewport_height(viewport_height: usize) -> usize {
     (viewport_height / 3)
         .saturating_sub(TOOL_RUN_CHROME_HEIGHT)
         .clamp(MIN_TOOL_RUN_VIEWPORT_HEIGHT, MAX_TOOL_RUN_VIEWPORT_HEIGHT)
+}
+
+fn wheel_scroll_lines(viewport_height: u16) -> isize {
+    usize::from(viewport_height)
+        .div_ceil(WHEEL_SCROLL_VIEWPORT_DIVISOR)
+        .clamp(
+            MIN_WHEEL_SCROLL_LINES_PER_EVENT,
+            MAX_WHEEL_SCROLL_LINES_PER_EVENT,
+        ) as isize
 }
 
 fn visible_row_ranges(
