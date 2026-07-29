@@ -10,10 +10,10 @@ use borg_remote::{
     HostCommand, HostConfig, LaunchSession, LocalAgentSettings, LocalAgentTurnExecutor,
     LocalSessionControlServer, MessageStatus, PermissionMode, PlanItem, PlanItemStatus,
     PromptDelivery, ResponseLanguage, SessionConfigAction, SessionEvent, SessionEventKind,
-    SessionGoal, SessionStatus, SessionStore, SessionWriterLease, SqliteSessionStore, TodoAction,
-    default_host_config_path, enroll_host, login_provider, mirror_local_session,
-    probe_capabilities, run_agent_session_with_store_and_writer, run_attached_session, run_host,
-    session_control_socket_path,
+    SessionGoal, SessionStatus, SessionStore, SessionWriterLease, SqliteSessionStore,
+    SqliteWorkspaceStore, TodoAction, default_host_config_path, enroll_host, login_provider,
+    mirror_local_session, probe_capabilities, run_agent_session_with_store_and_writer,
+    run_attached_session, run_host, session_control_socket_path,
 };
 use chrono::{Local, Utc};
 use pulldown_cmark::{Event as MarkdownEvent, Parser as MarkdownParser};
@@ -278,6 +278,34 @@ pub(crate) async fn run_local_agent(args: LocalAgentCliArgs) -> Result<()> {
         selected_session = Some(next_session);
         restored_prompt = next_prompt;
     }
+}
+
+pub(crate) async fn print_local_workspaces(json: bool) -> Result<()> {
+    let host_config_path = default_host_config_path();
+    let sessions_dir = host_config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("sessions");
+    let workspace_path = sessions_dir.join("workspaces.sqlite3");
+    let workspaces = if workspace_path.is_file() {
+        let store = SqliteWorkspaceStore::open(&workspace_path).await?;
+        let display_name = std::env::var("USER").unwrap_or_else(|_| "Local user".to_string());
+        store
+            .list_workspaces_for_participant(borg_remote::local_human_participant_id(&display_name))
+            .await?
+    } else {
+        Vec::new()
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&workspaces)?);
+    } else if workspaces.is_empty() {
+        println!("No local multiplayer workspaces.");
+    } else {
+        for workspace in workspaces {
+            println!("{}  {}", workspace.id, workspace.name);
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1329,9 +1357,12 @@ async fn run_local_agent_session(
                             }).await.ok();
                         }
                     }
-                    UiAction::RecallQueuedPrompt => {
+                    UiAction::RecallQueuedPrompt { message_id } => {
                         session_command_tx
-                            .send(HostCommand::RecallQueuedPrompt { session_id })
+                            .send(HostCommand::RecallQueuedPrompt {
+                                session_id,
+                                message_id: Some(message_id),
+                            })
                             .await
                             .ok();
                     }

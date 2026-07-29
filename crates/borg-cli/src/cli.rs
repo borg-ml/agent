@@ -37,12 +37,21 @@ pub(crate) enum Command {
     Capabilities(CapabilitiesArgs),
     /// Discover effective project and user extension manifests.
     Extensions(ExtensionsArgs),
+    /// List local multiplayer workspaces available to this OS user.
+    Workspaces(WorkspacesArgs),
     #[command(name = "__agent-mcp", hide = true)]
     AgentMcp,
 }
 
 #[derive(Debug, Args)]
 pub(crate) struct ExtensionsArgs {
+    #[arg(long)]
+    pub(crate) json: bool,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct WorkspacesArgs {
+    /// Emit the local workspace catalog as JSON.
     #[arg(long)]
     pub(crate) json: bool,
 }
@@ -167,6 +176,17 @@ mod tests {
         };
         assert!(args.json);
         assert!(args.config.is_none());
+    }
+
+    #[test]
+    fn workspaces_command_accepts_machine_readable_output() {
+        let command = Cli::try_parse_from(["borg", "workspaces", "--json"])
+            .expect("workspaces command parses")
+            .command_or_agent();
+        let Command::Workspaces(args) = command else {
+            panic!("workspaces command must not launch an agent");
+        };
+        assert!(args.json);
     }
 
     #[test]

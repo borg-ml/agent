@@ -402,7 +402,9 @@ pub enum UiAction {
         attachments: Vec<PathBuf>,
     },
     Approve(ApprovalDecision),
-    RecallQueuedPrompt,
+    RecallQueuedPrompt {
+        message_id: Uuid,
+    },
     Rewind {
         sequence: u64,
         text: String,
@@ -3489,8 +3491,10 @@ impl BorgTerminal {
                         .unwrap_or(slash_matches - 1);
                     return Ok(UiAction::None);
                 }
-                if should_recall_latest_queued_prompt(&self.composer.text, &self.queued_prompts) {
-                    return Ok(UiAction::RecallQueuedPrompt);
+                if let Some(message_id) =
+                    latest_recallable_prompt_id(&self.composer.text, &self.queued_prompts)
+                {
+                    return Ok(UiAction::RecallQueuedPrompt { message_id });
                 }
                 if self.composer.history_index.is_some() || self.composer.text.is_empty() {
                     self.composer.history_previous();
@@ -4689,6 +4693,9 @@ impl Transcript {
             }
             SessionEventKind::ReasoningDelta { text } => {
                 self.append_reasoning(text, event.created_at, local_event_time(event));
+            }
+            SessionEventKind::ReasoningCompleted => {
+                self.finish_reasoning(event.created_at);
             }
             SessionEventKind::ToolStarted {
                 tool_call_id,
@@ -6234,6 +6241,7 @@ fn session_event_changes_transcript(kind: &SessionEventKind) -> bool {
         SessionEventKind::ProviderEvent { kind, .. } => is_context_compaction(kind),
         SessionEventKind::Message { .. }
         | SessionEventKind::ReasoningDelta { .. }
+        | SessionEventKind::ReasoningCompleted
         | SessionEventKind::ToolStarted { .. }
         | SessionEventKind::ToolCompleted { .. }
         | SessionEventKind::ApprovalRequested { .. }
@@ -6417,14 +6425,16 @@ fn push_queued_prompt(
     }
 }
 
-fn should_recall_latest_queued_prompt(
+fn latest_recallable_prompt_id(
     composer_text: &str,
     queued_prompts: &[PendingPromptProjection],
-) -> bool {
-    composer_text.is_empty()
-        && queued_prompts
+) -> Option<Uuid> {
+    composer_text.is_empty().then(|| {
+        queued_prompts
             .iter()
-            .any(|prompt| prompt.delivery == PromptDelivery::Queue)
+            .rfind(|prompt| prompt.delivery == PromptDelivery::Queue)
+            .map(|prompt| prompt.message_id)
+    })?
 }
 
 fn queued_prompt_panel_height(queued_prompts: &[PendingPromptProjection]) -> u16 {
@@ -6717,8 +6727,8 @@ fn transcript_viewport_anchor(
         None
     };
     Some(TranscriptViewportAnchor {
-        entry_index: *entry_index,
-        entry_row_offset: row.saturating_sub(*entry_start),
+        entry_index,
+        entry_row_offset: row.saturating_sub(entry_start),
         viewport_row,
         collapsed_tool_header,
     })

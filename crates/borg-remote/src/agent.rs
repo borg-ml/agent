@@ -474,6 +474,10 @@ async fn run_borg_provider_turn(
                 last_text_emit = Instant::now() - Duration::from_millis(50);
             }
             ChatStreamEvent::Phase { name, input } => {
+                if name == "reasoning_completed" {
+                    send(&events, SessionEventKind::ReasoningCompleted).await;
+                    continue;
+                }
                 send(
                     &events,
                     SessionEventKind::ProviderEvent {

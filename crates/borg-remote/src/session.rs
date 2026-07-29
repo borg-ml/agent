@@ -1389,8 +1389,10 @@ async fn run_agent_session_store_kernel(
                                 visible: true,
                             });
                         }
-                        HostCommand::RecallQueuedPrompt { .. } => {
-                            if let Some(recalled) = recall_latest_visible(&mut pending) {
+                        HostCommand::RecallQueuedPrompt { message_id, .. } => {
+                            if let Some(recalled) =
+                                recall_visible_queued_prompt(&mut pending, message_id)
+                            {
                                 record(
                                     &mut journal,
                                     &events,
@@ -1905,8 +1907,15 @@ fn recover_queued_prompts(events: &[SessionEvent]) -> VecDeque<QueuedPrompt> {
     pending
 }
 
-fn recall_latest_visible(pending: &mut VecDeque<QueuedPrompt>) -> Option<QueuedPrompt> {
-    let index = pending.iter().rposition(|prompt| prompt.visible)?;
+fn recall_visible_queued_prompt(
+    pending: &mut VecDeque<QueuedPrompt>,
+    message_id: Option<Uuid>,
+) -> Option<QueuedPrompt> {
+    let index = pending.iter().rposition(|prompt| {
+        prompt.visible
+            && prompt.delivery == PromptDelivery::Queue
+            && message_id.is_none_or(|message_id| prompt.message_id == message_id)
+    })?;
     pending.remove(index)
 }
 
@@ -1933,27 +1942,26 @@ async fn prioritize_recall_at_turn_boundary(
     // where Up was pressed while the prompt still appeared queued.
     tokio::task::yield_now().await;
     while let Ok(command) = commands.try_recv() {
-        if matches!(
-            command,
+        match command {
             HostCommand::RecallQueuedPrompt {
-                session_id: command_session_id
-            } if command_session_id == session_id
-        ) {
-            if let Some(recalled) = recall_latest_visible(pending) {
-                record(
-                    journal,
-                    events,
-                    session_id,
-                    SessionEventKind::PromptRecalled {
-                        message_id: recalled.message_id,
-                        text: recalled.text,
-                        attachments: recalled.attachments,
-                    },
-                )
-                .await?;
+                session_id: command_session_id,
+                message_id,
+            } if command_session_id == session_id => {
+                if let Some(recalled) = recall_visible_queued_prompt(pending, message_id) {
+                    record(
+                        journal,
+                        events,
+                        session_id,
+                        SessionEventKind::PromptRecalled {
+                            message_id: recalled.message_id,
+                            text: recalled.text,
+                            attachments: recalled.attachments,
+                        },
+                    )
+                    .await?;
+                }
             }
-        } else {
-            deferred.push_back(command);
+            command => deferred.push_back(command),
         }
     }
     Ok(())
@@ -3450,7 +3458,10 @@ mod tests {
         release_first.notify_one();
         tokio::task::yield_now().await;
         command_tx
-            .send(HostCommand::RecallQueuedPrompt { session_id })
+            .send(HostCommand::RecallQueuedPrompt {
+                session_id,
+                message_id: Some(queued_message_id),
+            })
             .await
             .unwrap();
         loop {
@@ -4558,7 +4569,7 @@ mod tests {
     }
 
     #[test]
-    fn recalling_prompts_preserves_fifo_order_and_skips_internal_entries() {
+    fn recalling_prompts_targets_the_exact_queue_entry_and_skips_steers() {
         let first_visible_id = Uuid::new_v4();
         let internal_id = Uuid::new_v4();
         let second_visible_id = Uuid::new_v4();
@@ -4587,17 +4598,28 @@ mod tests {
                 delivery: PromptDelivery::Queue,
                 visible: true,
             },
+            QueuedPrompt {
+                message_id: Uuid::new_v4(),
+                text: "pending steer".to_string(),
+                attachments: Vec::new(),
+                output_schema: None,
+                delivery: PromptDelivery::Steer,
+                visible: true,
+            },
         ]);
 
-        let recalled = recall_latest_visible(&mut pending);
+        let recalled = recall_visible_queued_prompt(&mut pending, Some(first_visible_id));
 
         assert_eq!(
             recalled.map(|prompt| prompt.message_id),
-            Some(second_visible_id)
+            Some(first_visible_id)
         );
-        assert_eq!(pending.len(), 2);
-        assert_eq!(pending[0].message_id, first_visible_id);
-        assert_eq!(pending[1].message_id, internal_id);
+        assert_eq!(pending.len(), 3);
+        assert_eq!(pending[0].message_id, internal_id);
+        assert_eq!(pending[1].message_id, second_visible_id);
+        assert_eq!(pending[2].delivery, PromptDelivery::Steer);
+        let steer_id = pending[2].message_id;
+        assert!(recall_visible_queued_prompt(&mut pending, Some(steer_id)).is_none());
     }
 
     #[test]

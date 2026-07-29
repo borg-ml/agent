@@ -82,6 +82,24 @@ runtime:
 
 MCP extensions can be disabled per server and restricted with
 `allowed_tools`. See the checked-in config examples for the complete schema.
+Declarative extension manifests live in project `.borg/extensions/*.toml` or
+user `$XDG_CONFIG_HOME/borg/extensions/*.toml` (normally
+`~/.config/borg/extensions`). Project MCP declarations are cataloged but
+inactive unless the user explicitly sets
+`[extensions].allow_project_mcp = true`; user-owned manifests remain eligible
+when enabled. Manifests can declare capability requirements, skill-root
+metadata, and stdio MCP servers, but no shell or lifecycle hooks. Skill roots
+are catalog metadata only in this release. Inspect the effective catalog with
+`borg extensions` or `borg extensions --json`.
+
+## Local multiplayer workspaces
+
+Run `borg workspaces` to list the current OS user's durable local workspaces.
+Start another agent in one of them with `borg agent --workspace <uuid>`.
+Selected workspaces are only accepted for new sessions: resuming a transcript
+cannot silently move it to another workspace. Agents in the same workspace
+share the canonical team messages, delivery state, work items, artifacts,
+decisions, reviews, references, and provenance records.
 
 ## Repository layout
 
@@ -107,16 +125,3 @@ Windows on x86-64 and ARM64. Each release archive contains the self-contained
 ---
 
 AGPL-3.0-only OR a separate Borg Commercial Licence.
-# Extensions
-
-Extensions are declarative TOML manifests stored in project
-`.borg/extensions/*.toml` or user `$XDG_CONFIG_HOME/borg/extensions/*.toml`
-(falling back to `~/.config/borg/extensions`). Project manifests are discovered
-first, but their MCP declarations are inactive unless the user explicitly sets
-`[extensions].allow_project_mcp = true` in their agent config. User-owned
-manifests remain eligible to start when enabled. They may declare capability
-requirements, skill-root metadata, and stdio MCP servers. Skill roots are
-catalog metadata only in this release; Borg does not load or execute them.
-Borg never loads shell hooks or lifecycle scripts. The only executable manifest
-fields are enabled, capability-eligible stdio MCP declarations. Inspect the
-effective catalog with `borg extensions` or `borg extensions --json`.

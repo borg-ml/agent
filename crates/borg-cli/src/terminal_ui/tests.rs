@@ -1907,7 +1907,7 @@ fn pending_steer_ui_names_the_tool_boundary_and_interrupt_action() {
 }
 
 #[test]
-fn up_recall_is_available_only_for_an_empty_composer_with_a_queued_follow_up() {
+fn up_recall_targets_the_latest_exact_queued_prompt_only_for_an_empty_composer() {
     let queued = PendingPromptProjection {
         message_id: Uuid::new_v4(),
         text: "edit me".to_string(),
@@ -1919,20 +1919,36 @@ fn up_recall_is_available_only_for_an_empty_composer_with_a_queued_follow_up() {
         delivery: PromptDelivery::Steer,
     };
 
-    assert!(should_recall_latest_queued_prompt("", &[queued.clone()]));
-    assert!(should_recall_latest_queued_prompt(
-        "",
-        &[steer.clone(), queued]
-    ));
-    assert!(!should_recall_latest_queued_prompt("", &[steer]));
-    assert!(!should_recall_latest_queued_prompt(
-        "draft in progress",
-        &[PendingPromptProjection {
-            message_id: Uuid::new_v4(),
-            text: "queued".to_string(),
-            delivery: PromptDelivery::Queue,
-        }]
-    ));
+    assert_eq!(
+        latest_recallable_prompt_id("", &[queued.clone()]),
+        Some(queued.message_id)
+    );
+    assert_eq!(
+        latest_recallable_prompt_id("", &[queued.clone(), steer.clone()]),
+        Some(queued.message_id)
+    );
+    assert_eq!(latest_recallable_prompt_id("", &[steer]), None);
+    assert_eq!(
+        latest_recallable_prompt_id(
+            "draft in progress",
+            &[PendingPromptProjection {
+                message_id: Uuid::new_v4(),
+                text: "queued".to_string(),
+                delivery: PromptDelivery::Queue,
+            }]
+        ),
+        None
+    );
+
+    let newer = PendingPromptProjection {
+        message_id: Uuid::new_v4(),
+        text: "newer".to_string(),
+        delivery: PromptDelivery::Queue,
+    };
+    assert_eq!(
+        latest_recallable_prompt_id("", &[queued, newer.clone()]),
+        Some(newer.message_id)
+    );
 }
 
 #[test]
@@ -2446,6 +2462,12 @@ fn transcript_scroll_anchor_tracks_content_growth_and_collapse() {
 
 fn tall_expanded_diff_transcript() -> Transcript {
     let mut transcript = Transcript::default();
+    for index in 0..20 {
+        transcript.order.push(TranscriptEntry::Activity {
+            text: format!("before tool {index}"),
+            time: "12:00".to_string(),
+        });
+    }
     transcript.order.push(TranscriptEntry::Tool {
         source_name: "Edit".to_string(),
         name: "Edit".to_string(),
@@ -2468,6 +2490,12 @@ fn tall_expanded_diff_transcript() -> Transcript {
         backgrounded: false,
         expanded: true,
     });
+    for index in 0..20 {
+        transcript.order.push(TranscriptEntry::Activity {
+            text: format!("after tool {index}"),
+            time: "12:00".to_string(),
+        });
+    }
     transcript
 }
 
@@ -2487,9 +2515,14 @@ fn mouse_collapse_of_tall_diff_keeps_the_tool_header_at_the_anchor_row() {
         true,
     )
     .expect("anchor inside the tall diff");
-    assert_eq!(anchor.collapsed_tool_header, Some(0));
+    let tool_index = transcript
+        .order
+        .iter()
+        .position(|entry| matches!(entry, TranscriptEntry::Tool { .. }))
+        .unwrap();
+    assert_eq!(anchor.collapsed_tool_header, Some(tool_index));
 
-    transcript.toggle_tool(0);
+    transcript.toggle_tool(tool_index);
     let after = transcript.render(100, None, None, None);
     let restored = restore_transcript_viewport_anchor(
         anchor,
@@ -2513,7 +2546,10 @@ fn keyboard_collapse_of_tall_output_uses_the_same_reflow_anchor() {
         code_view,
         output_view,
         ..
-    }) = transcript.order.first_mut()
+    }) = transcript
+        .order
+        .iter_mut()
+        .find(|entry| matches!(entry, TranscriptEntry::Tool { .. }))
     {
         *code_view = Some(("text".to_string(), "command input".to_string()));
         *output_view = Some((
@@ -2740,6 +2776,58 @@ fn reasoning_is_one_live_muted_disclosure_that_collapses_at_a_tool_boundary() {
         &transcript.order[0],
         TranscriptEntry::Tool { expanded: true, .. }
     ));
+}
+
+#[test]
+fn reasoning_completion_freezes_thinking_duration_before_a_delayed_tool() {
+    let session_id = Uuid::new_v4();
+    let started_at = Utc::now();
+    let completed_at = started_at + chrono::Duration::seconds(2);
+    let tool_started_at = started_at + chrono::Duration::seconds(9);
+    let mut transcript = Transcript::default();
+    let mut reasoning = SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::ReasoningDelta {
+            text: "Checking the source".to_string(),
+        },
+    );
+    reasoning.created_at = started_at;
+    transcript.apply(&reasoning);
+    let mut completed = SessionEvent::new(session_id, 2, SessionEventKind::ReasoningCompleted);
+    completed.created_at = completed_at;
+    transcript.apply(&completed);
+    let mut tool = SessionEvent::new(
+        session_id,
+        3,
+        SessionEventKind::ToolStarted {
+            tool_call_id: "read-1".to_string(),
+            name: "read_file".to_string(),
+            input: serde_json::json!({"path": "src/lib.rs"}),
+            input_ref: None,
+        },
+    );
+    tool.created_at = tool_started_at;
+    transcript.apply(&tool);
+
+    let TranscriptEntry::Tool {
+        started_at: stored_started_at,
+        completed_at: Some(stored_completed_at),
+        ..
+    } = &transcript.order[0]
+    else {
+        panic!("expected completed thinking card");
+    };
+    assert_eq!(*stored_started_at, started_at);
+    assert_eq!(*stored_completed_at, completed_at);
+    let rendered = transcript
+        .lines(100)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("2.0s"));
+    assert!(!rendered.contains("9.0s"));
 }
 
 #[test]

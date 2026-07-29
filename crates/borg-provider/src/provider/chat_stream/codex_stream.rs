@@ -300,6 +300,16 @@ impl CodexStreamMapper {
                     self.emit_completed_agent_message(item, tx)?;
                     return Ok(());
                 }
+                if matches_codex_type(item_type, &["reasoning", "reasoningSummary"]) {
+                    let _ = send_stream_event(
+                        tx,
+                        ChatStreamEvent::Phase {
+                            name: "reasoning_completed".to_string(),
+                            input: Value::Null,
+                        },
+                    );
+                    return Ok(());
+                }
                 if should_skip_codex_item(item_type) {
                     return Ok(());
                 }
@@ -730,6 +740,32 @@ mod tests {
 
         assert_eq!(summary["item_type"], "userMessage");
         assert_eq!(summary["client_id"], "4ff8407e-5dc5-4d72-828a-0d60ea12dc77");
+    }
+
+    #[test]
+    fn completed_reasoning_item_emits_a_normalized_completion_phase() {
+        let message: JsonRpcMessage = serde_json::from_value(json!({
+            "method": "item/completed",
+            "params": {
+                "item": { "type": "reasoning", "id": "reasoning-1" }
+            }
+        }))
+        .expect("valid notification");
+        let (tx, mut rx) = mpsc::channel(4);
+
+        CodexStreamMapper::default()
+            .handle(&message, &tx)
+            .expect("reasoning mapping");
+
+        assert!(matches!(
+            rx.try_recv().expect("provider event"),
+            ChatStreamEvent::ProviderEvent { .. }
+        ));
+        assert!(matches!(
+            rx.try_recv().expect("completion phase"),
+            ChatStreamEvent::Phase { name, input }
+                if name == "reasoning_completed" && input == Value::Null
+        ));
     }
 
     #[test]

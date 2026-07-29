@@ -15,7 +15,7 @@ use std::sync::Mutex;
 use tracing_subscriber::fmt::writer::BoxMakeWriter;
 
 use crate::cli::{CapabilitiesArgs, Cli, Command, ExtensionsArgs, LocalAgentCliArgs};
-use crate::remote_commands::{run_local_agent, run_remote_command};
+use crate::remote_commands::{print_local_workspaces, run_local_agent, run_remote_command};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -35,6 +35,7 @@ async fn main() -> Result<()> {
         Command::Update(args) => updater::run(args).await,
         Command::Capabilities(args) => print_capabilities(args),
         Command::Extensions(args) => print_extensions(args),
+        Command::Workspaces(args) => print_local_workspaces(args.json).await,
         Command::AgentMcp => agent_mcp::run().await,
     }
 }

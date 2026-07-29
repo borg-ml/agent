@@ -521,6 +521,8 @@ pub enum HostCommand {
     },
     RecallQueuedPrompt {
         session_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_id: Option<Uuid>,
     },
     Configure {
         session_id: Uuid,
@@ -579,7 +581,7 @@ impl HostCommand {
         match self {
             Self::Launch { session_id, .. }
             | Self::Prompt { session_id, .. }
-            | Self::RecallQueuedPrompt { session_id }
+            | Self::RecallQueuedPrompt { session_id, .. }
             | Self::Configure { session_id, .. }
             | Self::Approve { session_id, .. }
             | Self::RespondToProviderInteraction { session_id, .. }
@@ -1140,6 +1142,9 @@ pub enum SessionEventKind {
     ReasoningDelta {
         text: String,
     },
+    /// The provider has ended its reasoning item. This freezes the displayed
+    /// thinking duration independently from any later tool boundary.
+    ReasoningCompleted,
     ToolStarted {
         tool_call_id: String,
         name: String,
