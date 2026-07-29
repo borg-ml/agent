@@ -409,6 +409,8 @@ pub struct BorgTerminal {
     scroll_from_bottom: usize,
     scroll_motion: ScrollMotion,
     scrollbar_area: Option<Rect>,
+    scrollbar_thumb_area: Option<Rect>,
+    scrollbar_drag_offset: u16,
     transcript_viewport_area: Option<Rect>,
     transcript_scroll_max: usize,
     dragging_scrollbar: bool,
@@ -847,6 +849,8 @@ impl BorgTerminal {
             scroll_from_bottom: 0,
             scroll_motion: ScrollMotion::default(),
             scrollbar_area: None,
+            scrollbar_thumb_area: None,
+            scrollbar_drag_offset: 0,
             transcript_viewport_area: None,
             transcript_scroll_max: 0,
             dragging_scrollbar: false,
@@ -1519,6 +1523,16 @@ impl BorgTerminal {
                     {
                         self.cancel_scroll_motion();
                         self.dragging_scrollbar = true;
+                        self.scrollbar_drag_offset = self
+                            .scrollbar_thumb_area
+                            .filter(|thumb| thumb.contains(Position::new(mouse.column, mouse.row)))
+                            .map_or_else(
+                                || {
+                                    self.scrollbar_thumb_area
+                                        .map_or(0, |thumb| thumb.height.saturating_sub(1) / 2)
+                                },
+                                |thumb| mouse.row.saturating_sub(thumb.y),
+                            );
                         self.scroll_to_scrollbar_row(mouse.row);
                     }
                     MouseEventKind::Down(MouseButton::Left)
@@ -1836,17 +1850,24 @@ impl BorgTerminal {
     }
 
     fn scroll_to_scrollbar_row(&mut self, row: u16) {
-        let Some(area) = self.scrollbar_area else {
+        let (Some(area), Some(thumb)) = (self.scrollbar_area, self.scrollbar_thumb_area) else {
             return;
         };
-        let offset = row
+        let pointer_offset = row
             .saturating_sub(area.y)
             .min(area.height.saturating_sub(1));
-        let denominator = area.height.saturating_sub(1).max(1);
-        self.scroll_from_bottom = self
-            .transcript_scroll_max
-            .saturating_mul(usize::from(denominator.saturating_sub(offset)))
-            / usize::from(denominator);
+        let thumb_travel = area.height.saturating_sub(thumb.height);
+        let thumb_top = pointer_offset
+            .saturating_sub(self.scrollbar_drag_offset)
+            .min(thumb_travel);
+        let scroll_from_top = if thumb_travel == 0 {
+            0
+        } else {
+            self.transcript_scroll_max
+                .saturating_mul(usize::from(thumb_top))
+                / usize::from(thumb_travel)
+        };
+        self.scroll_from_bottom = self.transcript_scroll_max.saturating_sub(scroll_from_top);
     }
 
     fn copy_transcript_entry(&mut self, index: usize) {
@@ -2223,6 +2244,7 @@ impl BorgTerminal {
         let composer_scroll =
             (composer_cursor.0 as u16).saturating_sub(composer_height.saturating_sub(3));
         let mut next_scrollbar_area = None;
+        let mut next_scrollbar_thumb_area = None;
         let mut next_transcript_viewport_area = None;
         let mut next_scroll_max = 0;
         let mut next_tool_hit_areas = Vec::new();
@@ -2500,6 +2522,11 @@ impl BorgTerminal {
                         .collect::<Vec<_>>();
                     frame.render_widget(Paragraph::new(rows), area);
                     next_scrollbar_area = Some(area);
+                    next_scrollbar_thumb_area = Some(Rect {
+                        y: area.y.saturating_add(thumb_top),
+                        height: thumb_height,
+                        ..area
+                    });
                 }
             }
             if !is_launch_screen && self.scroll_from_bottom > 0 {
@@ -2874,6 +2901,7 @@ impl BorgTerminal {
             }
         })?;
         self.scrollbar_area = next_scrollbar_area;
+        self.scrollbar_thumb_area = next_scrollbar_thumb_area;
         self.transcript_viewport_area = next_transcript_viewport_area;
         self.transcript_scroll_max = next_scroll_max;
         self.tool_hit_areas = next_tool_hit_areas;

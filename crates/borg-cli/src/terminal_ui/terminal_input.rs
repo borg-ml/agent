@@ -6,6 +6,7 @@ use futures_util::{Stream, StreamExt};
 
 const DISCRETE_EVENT_CHANNEL_CAPACITY: usize = 32;
 const WHEEL_FLUSH_INTERVAL: Duration = Duration::from_millis(4);
+const DRAG_FLUSH_INTERVAL: Duration = Duration::from_millis(8);
 const RESIZE_FLUSH_INTERVAL: Duration = Duration::from_millis(33);
 const MAX_PENDING_WHEEL_EVENTS: isize = 32;
 
@@ -219,6 +220,13 @@ fn flush_resize(
     }
 }
 
+fn flush_drag(
+    pending: &mut Option<Event>,
+    discrete_tx: &tokio::sync::mpsc::Sender<io::Result<Event>>,
+) -> bool {
+    flush_resize(pending, discrete_tx)
+}
+
 async fn pump_terminal_events<S>(
     mut events: S,
     discrete_tx: tokio::sync::mpsc::Sender<io::Result<Event>>,
@@ -227,9 +235,15 @@ async fn pump_terminal_events<S>(
     S: Stream<Item = io::Result<Event>> + Unpin,
 {
     let mut pending_wheel = None;
+    let mut pending_drag = None;
     let mut pending_resize = None;
     let mut wheel_flush_tick = tokio::time::interval(WHEEL_FLUSH_INTERVAL);
     wheel_flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut drag_flush_tick = tokio::time::interval_at(
+        tokio::time::Instant::now() + DRAG_FLUSH_INTERVAL,
+        DRAG_FLUSH_INTERVAL,
+    );
+    drag_flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut resize_flush_tick = tokio::time::interval_at(
         tokio::time::Instant::now() + RESIZE_FLUSH_INTERVAL,
         RESIZE_FLUSH_INTERVAL,
@@ -241,6 +255,9 @@ async fn pump_terminal_events<S>(
             event = events.next() => {
                 let Some(event) = event else {
                     let _ = flush_wheel(&mut pending_wheel, &wheel_tx);
+                    if let Some(event) = pending_drag.take() {
+                        let _ = discrete_tx.send(Ok(event)).await;
+                    }
                     if let Some(event) = pending_resize.take() {
                         let _ = discrete_tx.send(Ok(event)).await;
                     }
@@ -255,7 +272,16 @@ async fn pump_terminal_events<S>(
                     )
                 {
                     push_wheel(&mut pending_wheel, *mouse);
+                } else if let Ok(Event::Mouse(mouse)) = &event
+                    && matches!(mouse.kind, MouseEventKind::Drag(_))
+                {
+                    pending_drag = event.ok();
                 } else {
+                    if let Some(drag) = pending_drag.take()
+                        && discrete_tx.send(Ok(drag)).await.is_err()
+                    {
+                        return;
+                    }
                     if let Some(resize) = pending_resize.take()
                         && discrete_tx.send(Ok(resize)).await.is_err()
                     {
@@ -268,6 +294,11 @@ async fn pump_terminal_events<S>(
             }
             _ = wheel_flush_tick.tick() => {
                 if !flush_wheel(&mut pending_wheel, &wheel_tx) {
+                    return;
+                }
+            }
+            _ = drag_flush_tick.tick() => {
+                if !flush_drag(&mut pending_drag, &discrete_tx) {
                     return;
                 }
             }
@@ -358,6 +389,48 @@ mod tests {
             })))
         ));
         assert!(discrete_events.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn drag_burst_keeps_the_latest_pointer_position_before_release() {
+        let (discrete_tx, mut discrete_events) =
+            tokio::sync::mpsc::channel(DISCRETE_EVENT_CHANNEL_CAPACITY);
+        let (wheel_tx, _wheel_events) = tokio::sync::mpsc::channel(1);
+        let events = (1..=10_000)
+            .map(|row| {
+                Ok(Event::Mouse(MouseEvent {
+                    kind: MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+                    column: 10,
+                    row,
+                    modifiers: KeyModifiers::NONE,
+                }))
+            })
+            .chain(std::iter::once(Ok(Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Up(crossterm::event::MouseButton::Left),
+                column: 10,
+                row: 10_000,
+                modifiers: KeyModifiers::NONE,
+            }))));
+
+        pump_terminal_events(futures_util::stream::iter(events), discrete_tx, wheel_tx).await;
+
+        let events = std::iter::from_fn(|| discrete_events.try_recv().ok()).collect::<Vec<_>>();
+        assert!(events.len() <= 2);
+        assert!(matches!(
+            events.as_slice(),
+            [
+                Ok(Event::Mouse(MouseEvent {
+                    kind: MouseEventKind::Drag(_),
+                    row: 10_000,
+                    ..
+                })),
+                Ok(Event::Mouse(MouseEvent {
+                    kind: MouseEventKind::Up(_),
+                    row: 10_000,
+                    ..
+                }))
+            ]
+        ));
     }
 
     #[tokio::test]
