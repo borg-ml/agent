@@ -2527,12 +2527,23 @@ fn nested_wheel_motion_finishes_small_gestures_without_expensive_single_row_fram
 
 #[test]
 fn wheel_distance_scales_with_the_target_viewport_height() {
-    assert_eq!(wheel_scroll_lines(6), 3);
+    assert_eq!(wheel_scroll_lines(1), 1);
+    assert_eq!(wheel_scroll_lines(6), 1);
+    assert_eq!(wheel_scroll_lines(12), 2);
     assert_eq!(wheel_scroll_lines(18), 3);
     assert_eq!(wheel_scroll_lines(30), 5);
     assert_eq!(wheel_scroll_lines(48), 8);
     assert_eq!(wheel_scroll_lines(72), 12);
     assert_eq!(wheel_scroll_lines(120), 12);
+}
+
+#[test]
+fn coalesced_wheel_bursts_preserve_viewport_scaled_distance() {
+    let repetitions = 3;
+
+    assert_eq!(wheel_scroll_distance(6, repetitions), 3);
+    assert_eq!(wheel_scroll_distance(12, repetitions), 6);
+    assert_eq!(wheel_scroll_distance(18, repetitions), 9);
 }
 
 #[test]

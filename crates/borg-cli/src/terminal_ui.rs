@@ -77,7 +77,7 @@ const DOUBLE_CTRL_C_WINDOW: Duration = Duration::from_secs(1);
 const COPY_NOTICE_DURATION: Duration = Duration::from_secs(5);
 const NESTED_SCROLL_GESTURE_GAP: Duration = Duration::from_millis(200);
 const WHEEL_SCROLL_VIEWPORT_DIVISOR: usize = 6;
-const MIN_WHEEL_SCROLL_LINES_PER_EVENT: usize = 3;
+const MIN_WHEEL_SCROLL_LINES_PER_EVENT: usize = 1;
 const MAX_WHEEL_SCROLL_LINES_PER_EVENT: usize = 12;
 const MAX_WHEEL_SCROLL_LINES_PER_FRAME: isize = 8;
 const WHEEL_SCROLL_EASING_DIVISOR: usize = 8;
@@ -2000,8 +2000,7 @@ impl BorgTerminal {
                                 self.queue_nested_wheel_scroll(
                                     start,
                                     max_offset,
-                                    -wheel_scroll_lines(viewport_height)
-                                        * scroll_repetitions as isize,
+                                    -wheel_scroll_distance(viewport_height, scroll_repetitions),
                                 );
                             }
                             nested_scroll_consumed(
@@ -2018,9 +2017,10 @@ impl BorgTerminal {
                         if !consumed {
                             let viewport_height =
                                 self.transcript_viewport_area.map_or(1, |area| area.height);
-                            self.queue_wheel_scroll(
-                                wheel_scroll_lines(viewport_height) * scroll_repetitions as isize,
-                            );
+                            self.queue_wheel_scroll(wheel_scroll_distance(
+                                viewport_height,
+                                scroll_repetitions,
+                            ));
                         }
                     }
                     MouseEventKind::ScrollDown => {
@@ -2032,8 +2032,7 @@ impl BorgTerminal {
                                     self.queue_nested_wheel_scroll(
                                         start,
                                         max_offset,
-                                        wheel_scroll_lines(viewport_height)
-                                            * scroll_repetitions as isize,
+                                        wheel_scroll_distance(viewport_height, scroll_repetitions),
                                     );
                                 }
                                 nested_scroll_consumed(
@@ -2050,9 +2049,10 @@ impl BorgTerminal {
                         if !consumed {
                             let viewport_height =
                                 self.transcript_viewport_area.map_or(1, |area| area.height);
-                            self.queue_wheel_scroll(
-                                -wheel_scroll_lines(viewport_height) * scroll_repetitions as isize,
-                            );
+                            self.queue_wheel_scroll(-wheel_scroll_distance(
+                                viewport_height,
+                                scroll_repetitions,
+                            ));
                         }
                     }
                     _ => {}
@@ -7376,6 +7376,11 @@ fn wheel_scroll_lines(viewport_height: u16) -> isize {
             MIN_WHEEL_SCROLL_LINES_PER_EVENT,
             MAX_WHEEL_SCROLL_LINES_PER_EVENT,
         ) as isize
+}
+
+fn wheel_scroll_distance(viewport_height: u16, repetitions: usize) -> isize {
+    wheel_scroll_lines(viewport_height)
+        .saturating_mul(isize::try_from(repetitions).unwrap_or(isize::MAX))
 }
 
 fn visible_row_ranges(
