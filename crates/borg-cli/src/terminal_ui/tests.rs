@@ -209,6 +209,15 @@ fn running_tool_uses_animated_spinner() {
 }
 
 #[test]
+fn composer_cursor_has_a_stable_software_blink_phase() {
+    assert!(cursor_blink_visible(Duration::ZERO));
+    assert!(cursor_blink_visible(Duration::from_millis(499)));
+    assert!(!cursor_blink_visible(Duration::from_millis(500)));
+    assert!(!cursor_blink_visible(Duration::from_millis(999)));
+    assert!(cursor_blink_visible(Duration::from_millis(1_000)));
+}
+
+#[test]
 fn completed_tool_duration_is_frozen_at_the_right_edge() {
     let session_id = Uuid::new_v4();
     let started_at = DateTime::parse_from_rfc3339("2026-07-29T10:00:00Z")

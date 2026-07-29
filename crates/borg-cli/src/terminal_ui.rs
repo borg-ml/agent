@@ -453,6 +453,7 @@ pub struct BorgTerminal {
     rendered_transcript_height: usize,
     pending_scroll_anchor_height: Option<usize>,
     event_redraw_needed: bool,
+    cursor_blink_started_at: Instant,
     terminal_restored: bool,
 }
 
@@ -890,6 +891,7 @@ impl BorgTerminal {
             rendered_transcript_height: 0,
             pending_scroll_anchor_height: None,
             event_redraw_needed: false,
+            cursor_blink_started_at: Instant::now(),
             terminal_restored: false,
         })
     }
@@ -958,6 +960,10 @@ impl BorgTerminal {
     pub fn has_cache_idle_timer(&self) -> bool {
         self.transcript.active_turn.is_none()
             && self.transcript.cache_diagnostics.needs_idle_timer()
+    }
+
+    pub fn has_blinking_cursor(&self) -> bool {
+        self.picker.is_none()
     }
 
     pub fn apply_session_event(&mut self, event: &SessionEvent) -> bool {
@@ -1381,6 +1387,11 @@ impl BorgTerminal {
             event,
             scroll_repetitions,
         } = input;
+        if matches!(&event, Event::Paste(_))
+            || matches!(&event, Event::Key(key) if key.kind != KeyEventKind::Release)
+        {
+            self.cursor_blink_started_at = Instant::now();
+        }
         self.event_redraw_needed = true;
         match event {
             Event::Resize(width, height) => {
@@ -2223,6 +2234,7 @@ impl BorgTerminal {
         let mut next_jump_to_bottom_area = None;
         let mut next_goal_status_area = None;
         let mut next_keybindings_hint_area = None;
+        let cursor_visible = cursor_blink_visible(self.cursor_blink_started_at.elapsed());
         self.terminal.draw(|frame| {
             let area = centered_content_area(frame.area());
             let chunks = Layout::default()
@@ -2596,7 +2608,7 @@ impl BorgTerminal {
                     composer_area,
                 );
             }
-            if self.picker.is_none() {
+            if self.picker.is_none() && cursor_visible {
                 let (cursor_row, cursor_column) = composer_cursor;
                 frame.set_cursor_position(Position {
                     x: composer_area
@@ -6635,4 +6647,8 @@ fn spinner_frame_index() -> usize {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_millis() / 120);
     frame as usize % 8
+}
+
+fn cursor_blink_visible(elapsed: Duration) -> bool {
+    (elapsed.as_millis() / 500).is_multiple_of(2)
 }

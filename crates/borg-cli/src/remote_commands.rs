@@ -696,7 +696,11 @@ async fn run_local_agent_session(
                 terminal_dirty = terminal.has_pending_scroll_frame();
             }
             _ = activity_tick.tick(), if terminal.as_ref().is_some_and(|terminal| {
-                terminal_needs_activity_tick(terminal.has_expiring_notice(), status)
+                terminal_needs_activity_tick(
+                    terminal.has_expiring_notice(),
+                    terminal.has_blinking_cursor(),
+                    status,
+                )
             }) => {
                 terminal_dirty = true;
             }
@@ -2508,8 +2512,14 @@ fn tui_render_interval(frame_interval: std::time::Duration) -> tokio::time::Inte
     interval
 }
 
-fn terminal_needs_activity_tick(has_expiring_notice: bool, status: SessionStatus) -> bool {
-    has_expiring_notice || matches!(status, SessionStatus::Starting | SessionStatus::Running)
+fn terminal_needs_activity_tick(
+    has_expiring_notice: bool,
+    has_blinking_cursor: bool,
+    status: SessionStatus,
+) -> bool {
+    has_expiring_notice
+        || has_blinking_cursor
+        || matches!(status, SessionStatus::Starting | SessionStatus::Running)
 }
 
 fn spawn_terminal_input() -> mpsc::Receiver<io::Result<String>> {
@@ -3371,10 +3381,31 @@ mod tests {
 
     #[test]
     fn active_terminal_frames_do_not_depend_on_composer_text() {
-        assert!(terminal_needs_activity_tick(false, SessionStatus::Starting));
-        assert!(terminal_needs_activity_tick(false, SessionStatus::Running));
-        assert!(terminal_needs_activity_tick(true, SessionStatus::Ready));
-        assert!(!terminal_needs_activity_tick(false, SessionStatus::Ready));
+        assert!(terminal_needs_activity_tick(
+            false,
+            false,
+            SessionStatus::Starting
+        ));
+        assert!(terminal_needs_activity_tick(
+            false,
+            false,
+            SessionStatus::Running
+        ));
+        assert!(terminal_needs_activity_tick(
+            true,
+            false,
+            SessionStatus::Ready
+        ));
+        assert!(terminal_needs_activity_tick(
+            false,
+            true,
+            SessionStatus::Ready
+        ));
+        assert!(!terminal_needs_activity_tick(
+            false,
+            false,
+            SessionStatus::Ready
+        ));
     }
 
     #[tokio::test]
