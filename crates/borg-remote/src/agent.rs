@@ -59,6 +59,8 @@ pub struct AgentTurn {
     pub agent_tools: crate::AgentToolDispatcher,
     /// Product/user MCP integrations available to a Borg-native turn.
     pub external_mcp_servers: Vec<borg_provider::mcp::ExternalMcpServer>,
+    /// Trusted extension-owned skill roots supplied by the launch contract.
+    pub extension_skill_roots: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone)]

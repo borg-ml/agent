@@ -33,6 +33,10 @@ pub(crate) struct ExtensionConfig {
 pub(crate) struct TeamConfig {
     pub(crate) preset: Option<borg_remote::TeamPreset>,
     pub(crate) worker_concurrency: Option<u32>,
+    pub(crate) max_total_assignments: Option<u32>,
+    pub(crate) max_total_reports: Option<u32>,
+    pub(crate) max_total_escalations: Option<u32>,
+    pub(crate) max_specialists: Option<u32>,
     pub(crate) max_tokens: Option<u64>,
     pub(crate) max_cost_microusd: Option<u64>,
     pub(crate) max_wall_time_ms: Option<u64>,
@@ -210,11 +214,27 @@ impl AgentConfig {
     }
 
     fn validate(&self) -> Result<()> {
-        if self.team.preset.is_some() {
+        if let Some(worker_concurrency) = self.team.worker_concurrency {
             anyhow::ensure!(
-                self.team.worker_concurrency.unwrap_or(1) > 0,
+                worker_concurrency > 0,
                 "team.worker_concurrency must be positive"
             );
+        }
+        if self.team.preset.is_some() {
+            for (name, value) in [
+                (
+                    "team.max_total_assignments",
+                    self.team.max_total_assignments,
+                ),
+                ("team.max_total_reports", self.team.max_total_reports),
+                (
+                    "team.max_total_escalations",
+                    self.team.max_total_escalations,
+                ),
+                ("team.max_specialists", self.team.max_specialists),
+            ] {
+                anyhow::ensure!(value != Some(0), "{name} must be positive when set");
+            }
             for (name, value) in [
                 ("team.max_tokens", self.team.max_tokens),
                 ("team.max_cost_microusd", self.team.max_cost_microusd),
@@ -304,7 +324,7 @@ impl AgentConfig {
         {
             return None;
         }
-        let worker_concurrency = self.team.worker_concurrency.unwrap_or(1);
+        let worker_concurrency = self.subagent_concurrency_limit();
         let mut policy = preset.policy(
             session_id,
             session_id,
@@ -313,10 +333,10 @@ impl AgentConfig {
             borg_remote::ProviderId(format!("{provider:?}").to_ascii_lowercase()),
         );
         policy.limits.max_concurrent_assignments = worker_concurrency;
-        policy.limits.max_total_assignments = worker_concurrency;
-        policy.limits.max_total_reports = worker_concurrency;
-        policy.limits.max_total_escalations = worker_concurrency;
-        policy.specialists.max_specialists = worker_concurrency;
+        policy.limits.max_total_assignments = self.team.max_total_assignments.unwrap_or(u32::MAX);
+        policy.limits.max_total_reports = self.team.max_total_reports.unwrap_or(u32::MAX);
+        policy.limits.max_total_escalations = self.team.max_total_escalations.unwrap_or(u32::MAX);
+        policy.specialists.max_specialists = self.team.max_specialists.unwrap_or(u32::MAX);
         policy.limits.per_role_concurrency = vec![borg_remote::RoleConcurrencyLimit {
             role: borg_remote::TeamRole::Worker,
             max_concurrent_assignments: worker_concurrency,
@@ -325,6 +345,12 @@ impl AgentConfig {
         policy.limits.budget.max_cost_microusd = self.team.max_cost_microusd;
         policy.limits.budget.max_wall_time_ms = self.team.max_wall_time_ms;
         Some(policy)
+    }
+
+    pub(crate) fn subagent_concurrency_limit(&self) -> u32 {
+        self.team
+            .worker_concurrency
+            .unwrap_or(borg_remote::DEFAULT_MAX_SUBAGENTS as u32)
     }
 
     pub(crate) fn expand_command(&self, line: &str) -> String {
@@ -497,6 +523,10 @@ mod tests {
     #[test]
     fn team_policy_is_opt_in_and_uses_the_existing_preset_limits() {
         let disabled: AgentConfig = toml::from_str("").unwrap();
+        assert_eq!(
+            disabled.subagent_concurrency_limit(),
+            borg_remote::DEFAULT_MAX_SUBAGENTS as u32
+        );
         assert!(
             disabled
                 .autonomous_team_policy(
@@ -527,6 +557,10 @@ mod tests {
             )
             .expect("opt-in policy");
         assert_eq!(policy.limits.max_concurrent_assignments, 2);
+        assert_eq!(policy.limits.max_total_assignments, u32::MAX);
+        assert_eq!(policy.limits.max_total_reports, u32::MAX);
+        assert_eq!(policy.limits.max_total_escalations, u32::MAX);
+        assert_eq!(policy.specialists.max_specialists, u32::MAX);
         assert_eq!(policy.limits.budget.max_tokens, Some(5000));
         assert_eq!(policy.limits.budget.max_cost_microusd, Some(120000));
         assert_eq!(policy.limits.budget.max_wall_time_ms, Some(30000));
@@ -537,6 +571,30 @@ mod tests {
                 .as_deref(),
             Some("xhigh")
         );
+    }
+
+    #[test]
+    fn manual_team_concurrency_can_be_lowered_without_enabling_a_preset() {
+        let config: AgentConfig = toml::from_str(
+            r#"
+            [team]
+            worker_concurrency = 4
+            "#,
+        )
+        .unwrap();
+
+        config.validate().unwrap();
+        assert_eq!(config.subagent_concurrency_limit(), 4);
+        assert!(config.team.preset.is_none());
+
+        let invalid: AgentConfig = toml::from_str(
+            r#"
+            [team]
+            worker_concurrency = 0
+            "#,
+        )
+        .unwrap();
+        assert!(invalid.validate().is_err());
     }
 
     #[test]

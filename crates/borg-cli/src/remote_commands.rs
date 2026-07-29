@@ -226,8 +226,10 @@ async fn install_host_service(config_path: &Path) -> Result<()> {
     fs::write(&service_path, service)
         .with_context(|| format!("failed to write {}", service_path.display()))?;
     for args in host_service_systemctl_commands() {
-        let status = tokio::process::Command::new("systemctl")
-            .args(args)
+        let mut command = tokio::process::Command::new("systemctl");
+        command.args(args);
+        configure_systemd_user_bus(&mut command);
+        let status = command
             .status()
             .await
             .context("failed to run systemctl --user")?;
@@ -239,6 +241,38 @@ async fn install_host_service(config_path: &Path) -> Result<()> {
     );
     Ok(())
 }
+
+#[cfg(target_os = "linux")]
+fn configure_systemd_user_bus(command: &mut tokio::process::Command) {
+    use std::os::unix::fs::MetadataExt;
+
+    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .or_else(|| {
+            let home = std::env::var_os("HOME").map(PathBuf::from)?;
+            let uid = fs::metadata(home).ok()?.uid();
+            let candidate = PathBuf::from(format!("/run/user/{uid}"));
+            candidate.is_dir().then_some(candidate)
+        });
+    let Some(runtime_dir) = runtime_dir else {
+        return;
+    };
+    if std::env::var_os("XDG_RUNTIME_DIR").is_none() {
+        command.env("XDG_RUNTIME_DIR", &runtime_dir);
+    }
+    if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none() {
+        let bus = runtime_dir.join("bus");
+        if bus.exists() {
+            command.env(
+                "DBUS_SESSION_BUS_ADDRESS",
+                format!("unix:path={}", bus.display()),
+            );
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn configure_systemd_user_bus(_command: &mut tokio::process::Command) {}
 
 fn host_service_systemctl_commands() -> [&'static [&'static str]; 3] {
     [
@@ -490,6 +524,17 @@ async fn run_local_agent_session(
         approval_reviewer_model: agent_config.approvals.reviewer_model.clone(),
         approval_reviewer_effort: agent_config.approvals.reviewer_effort.clone(),
     };
+    let (extension_catalog, extension_servers) = crate::extensions::discover(
+        &cwd,
+        &agent_config.capabilities,
+        agent_config.extensions.allow_project_mcp,
+    )?;
+    let extension_skill_roots = extension_catalog
+        .extensions
+        .iter()
+        .filter(|extension| extension.active)
+        .flat_map(|extension| extension.skill_roots.iter().cloned())
+        .collect::<Vec<_>>();
     let local_executor = if provider == CodingProvider::Kimi && host_config_path.is_file() {
         let config: HostConfig = serde_json::from_slice(
             &fs::read(&host_config_path)
@@ -511,11 +556,6 @@ async fn run_local_agent_session(
     }
     .with_external_mcp_servers({
         let mut servers = agent_config.external_mcp_servers();
-        let (_, extension_servers) = crate::extensions::discover(
-            &cwd,
-            &agent_config.capabilities,
-            agent_config.extensions.allow_project_mcp,
-        )?;
         servers.extend(extension_servers);
         servers
     });
@@ -559,6 +599,8 @@ async fn run_local_agent_session(
             .map(str::to_string),
         initial_prompt,
         capabilities,
+        subagent_concurrency_limit: Some(agent_config.subagent_concurrency_limit()),
+        extension_skill_roots,
         team_policy,
     };
     if session_access.is_attached() {

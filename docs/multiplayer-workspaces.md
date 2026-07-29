@@ -139,6 +139,12 @@ mode, concurrency, budgets, retry limits, and escalation thresholds are
 configuration. An `xhigh` Codex director with `low` Codex workers is a preset,
 not a protocol requirement.
 
+Borg admits up to 16 live child agents by default for both manual and
+autonomous teams. Users can lower that ceiling with
+`[team].worker_concurrency` without enabling an autonomous preset. Total
+assignment, report, escalation, and specialist limits are separate policy
+settings; concurrency is not a hidden lifetime work budget.
+
 Escalation is explicit and durable. A worker reports a reason such as missing
 authority, ambiguous acceptance criteria, repeated failure, low confidence,
 security risk, or budget pressure, together with evidence and the work item

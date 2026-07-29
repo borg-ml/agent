@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
-use chrono::Utc;
+use anyhow::{Context, Result, bail, ensure};
+use chrono::{DateTime, Utc};
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
@@ -68,6 +68,27 @@ struct RegisterSessionResponse {
 struct SessionSyncResponse {
     event_cursor: u64,
     live_revision: u64,
+}
+
+/// Reconnect cursors are lower bounds, never instructions to rewind.  Taking
+/// the component-wise maximum prevents duplicate command delivery and event
+/// uploads after either side restarts.
+fn merge_reconnect_cursors(
+    remote: (u64, u64, u64),
+    attachment: Option<&crate::RemoteReconnectSyncCursors>,
+) -> (u64, u64, u64) {
+    match attachment {
+        Some(cursor) => (
+            remote.0.max(cursor.command_cursor),
+            remote.1.max(cursor.event_cursor),
+            remote.2.max(cursor.live_revision),
+        ),
+        None => remote,
+    }
+}
+
+fn presence_lease_is_active(lease: &crate::RemotePresenceLease, now: DateTime<Utc>) -> bool {
+    lease.expires_at > now
 }
 
 #[derive(Serialize)]
@@ -295,11 +316,16 @@ async fn probe_capabilities_with_managed_kimi(
         providers,
         roots,
         can_launch: true,
-        workspace_attachment: Some(crate::WorkspaceAttachmentCapabilities {
-            presence_leases: true,
-            approval_provenance: true,
-            reconnect_sync_cursors: true,
-        }),
+        workspace_attachment: Some(workspace_attachment_capabilities()),
+    }
+}
+
+fn workspace_attachment_capabilities() -> crate::WorkspaceAttachmentCapabilities {
+    crate::WorkspaceAttachmentCapabilities {
+        presence_leases: true,
+        approval_provenance: true,
+        reconnect_sync_cursors: true,
+        participant_scoped_command_authority: true,
     }
 }
 
@@ -507,10 +533,13 @@ pub async fn mirror_local_session(
                     .json()
                     .await
                     .context("Borg returned an invalid local session registration")?;
-                break (
-                    registered.command_cursor,
-                    registered.event_cursor,
-                    registered.live_revision,
+                break merge_reconnect_cursors(
+                    (
+                        registered.command_cursor,
+                        registered.event_cursor,
+                        registered.live_revision,
+                    ),
+                    None,
                 );
             }
             Ok(response) if response.status() == StatusCode::UNAUTHORIZED => {
@@ -890,6 +919,21 @@ async fn dispatch(
         return true;
     }
     if let Some(session_id) = command.session_id() {
+        let metadata_path = session_root.join(format!("{session_id}.launch.json"));
+        let attachment = fs::read(&metadata_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<StoredLaunchMetadata>(&bytes).ok())
+            .map(StoredLaunchMetadata::into_current)
+            .and_then(|metadata| metadata.attachment);
+        if let Some(attachment) = attachment.as_ref()
+            && let Err(error) = authorize_workspace_command(attachment, &command)
+        {
+            tracing::warn!(%error, %session_id, "rejected unauthorized workspace command");
+            // The command was handled by rejecting it. Leaving its envelope
+            // unacknowledged would make the relay retry the same denied
+            // command forever and head-of-line block every later command.
+            return true;
+        }
         let existing = { sessions.lock().await.get(&session_id).cloned() };
         let session = match existing {
             Some(session) => Some(session),
@@ -1080,19 +1124,64 @@ fn validate_workspace_attachment(
     if attachment.workspace_id.is_some() != attachment.participant_id.is_some() {
         bail!("workspace attachment requires workspace_id and participant_id together");
     }
+    if let Some(authority) = &attachment.command_authority {
+        let participant_id = attachment
+            .participant_id
+            .context("participant command authority requires a workspace participant")?;
+        ensure!(
+            authority.participant_id == participant_id,
+            "participant command authority does not match workspace participant"
+        );
+    }
     if let Some(identity) = &attachment.host_identity
         && identity.host_id != config.host_id
     {
         bail!("workspace attachment host identity does not match enrolled host");
     }
     if let Some(lease) = &attachment.presence_lease
-        && lease.expires_at <= Utc::now()
+        && !presence_lease_is_active(lease, Utc::now())
     {
         bail!("workspace presence lease has expired");
     }
     if attachment.reconnect_sync_cursors.is_some() && session_id.is_nil() {
         bail!("workspace reconnect cursors require a non-nil session id");
     }
+    Ok(())
+}
+
+fn authorize_workspace_command(
+    attachment: &WorkspaceAttachment,
+    command: &HostCommand,
+) -> Result<()> {
+    let Some(authority) = &attachment.command_authority else {
+        return Ok(());
+    };
+    let kind = match command {
+        HostCommand::Prompt { .. } => crate::ParticipantCommandKind::Prompt,
+        HostCommand::RecallQueuedPrompt { .. } => crate::ParticipantCommandKind::RecallQueuedPrompt,
+        HostCommand::Configure { .. } => crate::ParticipantCommandKind::Configure,
+        HostCommand::Approve { .. } => crate::ParticipantCommandKind::Approve,
+        HostCommand::RespondToProviderInteraction { .. } => {
+            crate::ParticipantCommandKind::RespondToProviderInteraction
+        }
+        HostCommand::Goal { .. } => crate::ParticipantCommandKind::Goal,
+        HostCommand::Todo { .. } => crate::ParticipantCommandKind::Todo,
+        HostCommand::Subagent { .. } => crate::ParticipantCommandKind::Subagent,
+        HostCommand::Interrupt { .. } => crate::ParticipantCommandKind::Interrupt,
+        HostCommand::Compact { .. } => crate::ParticipantCommandKind::Compact,
+        HostCommand::ClearContext { .. } => crate::ParticipantCommandKind::ClearContext,
+        HostCommand::Stop { .. } => crate::ParticipantCommandKind::Stop,
+        HostCommand::Launch { .. }
+        | HostCommand::WorkspaceFilesystem { .. }
+        | HostCommand::CancelWorkspaceFilesystem { .. }
+        | HostCommand::WorkspaceCommand { .. }
+        | HostCommand::CancelWorkspaceCommand { .. } => return Ok(()),
+    };
+    ensure!(
+        authority.allowed.contains(&kind),
+        "workspace participant {} is not authorized for {kind:?}",
+        authority.participant_id
+    );
     Ok(())
 }
 
@@ -1354,6 +1443,7 @@ mod tests {
         let attachment = WorkspaceAttachment {
             workspace_id: Some(Uuid::new_v4()),
             participant_id: Some(Uuid::new_v4()),
+            command_authority: None,
             host_identity: Some(RemoteHostIdentity {
                 host_id: config.host_id,
                 hostname: "test".to_string(),
@@ -1377,6 +1467,151 @@ mod tests {
         expired.presence_lease.as_mut().unwrap().expires_at =
             Utc::now() - ChronoDuration::seconds(1);
         assert!(validate_workspace_attachment(&config, Uuid::new_v4(), Some(&expired)).is_err());
+    }
+
+    #[test]
+    fn participant_command_authority_rejects_commands_outside_the_grant() {
+        let participant_id = Uuid::new_v4();
+        let attachment = WorkspaceAttachment {
+            workspace_id: Some(Uuid::new_v4()),
+            participant_id: Some(participant_id),
+            command_authority: Some(crate::ParticipantCommandAuthority {
+                participant_id,
+                allowed: vec![crate::ParticipantCommandKind::Prompt],
+            }),
+            host_identity: None,
+            host_capabilities: None,
+            presence_lease: None,
+            approval_provenance: None,
+            reconnect_sync_cursors: None,
+        };
+        let session_id = Uuid::new_v4();
+        assert!(
+            authorize_workspace_command(
+                &attachment,
+                &HostCommand::Prompt {
+                    session_id,
+                    message_id: Uuid::new_v4(),
+                    text: "allowed".to_string(),
+                    attachments: Vec::new(),
+                    output_schema: None,
+                    delivery: crate::PromptDelivery::Queue,
+                },
+            )
+            .is_ok()
+        );
+        assert!(
+            authorize_workspace_command(&attachment, &HostCommand::Stop { session_id }).is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn denied_session_command_is_consumed_without_blocking_the_host_queue() {
+        let root = tempdir().unwrap();
+        let config = test_config(root.path());
+        let session_id = Uuid::new_v4();
+        let participant_id = Uuid::new_v4();
+        let attachment = WorkspaceAttachment {
+            workspace_id: Some(Uuid::new_v4()),
+            participant_id: Some(participant_id),
+            command_authority: Some(crate::ParticipantCommandAuthority {
+                participant_id,
+                allowed: vec![crate::ParticipantCommandKind::Prompt],
+            }),
+            host_identity: None,
+            host_capabilities: None,
+            presence_lease: None,
+            approval_provenance: None,
+            reconnect_sync_cursors: None,
+        };
+        let launch = LaunchSession {
+            request_id: Uuid::new_v4(),
+            cwd: root.path().to_path_buf(),
+            provider: CodingProvider::Codex,
+            model: None,
+            effort: None,
+            fast: Some(false),
+            response_language: crate::ResponseLanguage::Auto,
+            permission_mode: crate::PermissionMode::Manual,
+            name: None,
+            initial_prompt: None,
+            capabilities: Default::default(),
+            subagent_concurrency_limit: None,
+            extension_skill_roots: Vec::new(),
+            team_policy: None,
+        };
+        persist_launch_metadata(
+            &root.path().join(format!("{session_id}.launch.json")),
+            &launch,
+            Some(&attachment),
+        )
+        .unwrap();
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+
+        assert!(
+            dispatch(
+                Client::new(),
+                config,
+                root.path().to_path_buf(),
+                Arc::clone(&sessions),
+                HostCommand::Stop { session_id },
+            )
+            .await,
+            "a denied command must be acknowledged as handled"
+        );
+        assert!(sessions.lock().await.is_empty());
+    }
+
+    #[test]
+    fn participant_command_authority_must_match_the_attachment_identity() {
+        let root = tempdir().unwrap();
+        let config = test_config(root.path());
+        let attachment = WorkspaceAttachment {
+            workspace_id: Some(Uuid::new_v4()),
+            participant_id: Some(Uuid::new_v4()),
+            command_authority: Some(crate::ParticipantCommandAuthority {
+                participant_id: Uuid::new_v4(),
+                allowed: Vec::new(),
+            }),
+            host_identity: None,
+            host_capabilities: None,
+            presence_lease: None,
+            approval_provenance: None,
+            reconnect_sync_cursors: None,
+        };
+        assert!(validate_workspace_attachment(&config, Uuid::new_v4(), Some(&attachment)).is_err());
+    }
+
+    #[test]
+    fn host_declares_participant_scoped_attachment_authority() {
+        assert!(workspace_attachment_capabilities().participant_scoped_command_authority);
+    }
+
+    #[test]
+    fn reconnect_cursors_never_rewind_after_restart() {
+        let attachment = crate::RemoteReconnectSyncCursors {
+            command_cursor: 9,
+            event_cursor: 12,
+            live_revision: 7,
+        };
+        assert_eq!(
+            merge_reconnect_cursors((4, 15, 2), Some(&attachment)),
+            (9, 15, 7)
+        );
+        assert_eq!(merge_reconnect_cursors((4, 15, 2), None), (4, 15, 2));
+    }
+
+    #[test]
+    fn presence_lease_expiry_is_not_durable_offline_presence() {
+        let lease = crate::RemotePresenceLease {
+            lease_id: Uuid::new_v4(),
+            expires_at: Utc::now() + ChronoDuration::seconds(1),
+        };
+        assert!(presence_lease_is_active(&lease, Utc::now()));
+        assert!(!presence_lease_is_active(
+            &lease,
+            Utc::now() + ChronoDuration::seconds(2)
+        ));
     }
 
     #[test]

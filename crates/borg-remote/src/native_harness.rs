@@ -116,6 +116,7 @@ impl NativeHarness {
             turn.permission_mode,
             turn.agent_tools.clone(),
             turn.external_mcp_servers.clone(),
+            turn.extension_skill_roots.clone(),
             self.process_manager.clone(),
         )
         .await?;
@@ -555,9 +556,11 @@ impl NativeToolRuntime {
         permission: PermissionMode,
         agent_tools: crate::AgentToolDispatcher,
         external_mcp_servers: Vec<borg_provider::mcp::ExternalMcpServer>,
+        extension_skill_roots: Vec<PathBuf>,
         processes: crate::native_process::ProcessManager,
     ) -> Result<Self> {
-        let context = crate::native_context::NativeContext::load(root.clone()).await?;
+        let context =
+            crate::native_context::NativeContext::load(root.clone(), extension_skill_roots).await?;
         Ok(Self {
             session_id,
             root,

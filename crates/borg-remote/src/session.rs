@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -459,6 +459,7 @@ async fn run_agent_session_store_kernel(
     store: Arc<dyn SessionStore>,
     shared_team: Option<SubagentCoordinator>,
 ) -> Result<()> {
+    validate_launch_session(&mut launch)?;
     store.create_session(session_id).await?;
     let workspace_projection = if launch.capabilities.multiplayer {
         let binding = store
@@ -1019,6 +1020,7 @@ async fn run_agent_session_store_kernel(
             agent_mcp_server: agent_mcp_server.clone(),
             agent_tools: dispatcher.clone(),
             external_mcp_servers: Vec::new(),
+            extension_skill_roots: launch.extension_skill_roots.clone(),
         };
         let turn_executor = Arc::clone(&executor);
         let mut running = tokio::spawn(async move {
@@ -1727,10 +1729,96 @@ async fn run_agent_session_store_kernel(
 
 fn subagent_concurrency_limit(launch: &LaunchSession) -> usize {
     launch
-        .team_policy
-        .as_ref()
-        .map(|policy| policy.limits.max_concurrent_assignments as usize)
+        .subagent_concurrency_limit
+        .map(|limit| limit as usize)
+        .or_else(|| {
+            launch
+                .team_policy
+                .as_ref()
+                .map(|policy| policy.limits.max_concurrent_assignments as usize)
+        })
         .unwrap_or(crate::DEFAULT_MAX_SUBAGENTS)
+}
+
+/// Resolve serialized extension roots at the host launch boundary.
+///
+/// `LaunchSession` crosses a trust boundary, so paths supplied by a remote
+/// caller must never be treated as general host filesystem capabilities.  An
+/// empty list remains safe for legacy and resumed sessions.  A non-empty list
+/// is deliberately strict: missing roots are rejected rather than ignored.
+fn validate_launch_session(launch: &mut LaunchSession) -> Result<()> {
+    anyhow::ensure!(
+        launch.subagent_concurrency_limit != Some(0),
+        "subagent concurrency limit must be positive"
+    );
+    let bases = host_extension_bases(&launch.cwd)?;
+    launch.extension_skill_roots =
+        resolve_extension_skill_roots(&launch.extension_skill_roots, &bases)?;
+    Ok(())
+}
+
+fn host_extension_bases(cwd: &Path) -> Result<Vec<PathBuf>> {
+    let cwd = cwd
+        .canonicalize()
+        .with_context(|| format!("canonicalize launch cwd {}", cwd.display()))?;
+    let project_base = cwd.join(".borg").join("extensions");
+
+    let user_config_base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+        .map(|config| config.join("borg").join("extensions"));
+
+    [Some(project_base), user_config_base]
+        .into_iter()
+        .flatten()
+        .filter(|base| base.is_dir())
+        .map(|base| {
+            base.canonicalize()
+                .with_context(|| format!("canonicalize extension base {}", base.display()))
+        })
+        .collect()
+}
+
+fn resolve_extension_skill_roots(
+    requested_roots: &[PathBuf],
+    allowed_bases: &[PathBuf],
+) -> Result<Vec<PathBuf>> {
+    if requested_roots.is_empty() {
+        return Ok(Vec::new());
+    }
+    anyhow::ensure!(
+        !allowed_bases.is_empty(),
+        "extension skill roots were supplied but this host has no extension manifest base"
+    );
+
+    let mut resolved = Vec::with_capacity(requested_roots.len());
+    for root in requested_roots {
+        anyhow::ensure!(
+            root.is_absolute(),
+            "extension skill root must be an absolute path: {}",
+            root.display()
+        );
+        let canonical = root.canonicalize().with_context(|| {
+            format!(
+                "extension skill root is missing or unreadable: {}",
+                root.display()
+            )
+        })?;
+        anyhow::ensure!(
+            canonical.is_dir(),
+            "extension skill root is not a directory: {}",
+            canonical.display()
+        );
+        anyhow::ensure!(
+            allowed_bases.iter().any(|base| canonical.starts_with(base)),
+            "extension skill root is outside this host's extension manifest bases: {}",
+            canonical.display()
+        );
+        resolved.push(canonical);
+    }
+    resolved.sort();
+    resolved.dedup();
+    Ok(resolved)
 }
 
 fn validate_session_state(session_id: Uuid, state: &SessionState) -> Result<()> {
@@ -3404,6 +3492,8 @@ mod tests {
                     name: None,
                     initial_prompt: None,
                     capabilities: Default::default(),
+                    subagent_concurrency_limit: None,
+                    extension_skill_roots: Vec::new(),
                     team_policy: None,
                 },
                 command_rx,
@@ -3520,6 +3610,8 @@ mod tests {
                     name: None,
                     initial_prompt: None,
                     capabilities: Default::default(),
+                    subagent_concurrency_limit: None,
+                    extension_skill_roots: Vec::new(),
                     team_policy: None,
                 },
                 command_rx,
@@ -3614,6 +3706,8 @@ mod tests {
                     name: None,
                     initial_prompt: None,
                     capabilities: Default::default(),
+                    subagent_concurrency_limit: None,
+                    extension_skill_roots: Vec::new(),
                     team_policy: None,
                 },
                 command_rx,
@@ -3704,6 +3798,8 @@ mod tests {
                     name: None,
                     initial_prompt: None,
                     capabilities: Default::default(),
+                    subagent_concurrency_limit: None,
+                    extension_skill_roots: Vec::new(),
                     team_policy: None,
                 },
                 command_rx,
@@ -3825,6 +3921,8 @@ mod tests {
                     name: None,
                     initial_prompt: None,
                     capabilities: Default::default(),
+                    subagent_concurrency_limit: None,
+                    extension_skill_roots: Vec::new(),
                     team_policy: None,
                 },
                 command_rx,
@@ -3947,6 +4045,8 @@ mod tests {
                     name: None,
                     initial_prompt: None,
                     capabilities: Default::default(),
+                    subagent_concurrency_limit: None,
+                    extension_skill_roots: Vec::new(),
                     team_policy: None,
                 },
                 command_rx,
@@ -4054,6 +4154,8 @@ mod tests {
             name: None,
             initial_prompt: None,
             capabilities: Default::default(),
+            subagent_concurrency_limit: None,
+            extension_skill_roots: Vec::new(),
             team_policy: None,
         };
         let actor = tokio::spawn(async move {
@@ -4167,6 +4269,8 @@ mod tests {
                     name: None,
                     initial_prompt: None,
                     capabilities: Default::default(),
+                    subagent_concurrency_limit: None,
+                    extension_skill_roots: Vec::new(),
                     team_policy: None,
                 },
                 command_rx,
@@ -4260,6 +4364,8 @@ mod tests {
                 name: None,
                 initial_prompt: None,
                 capabilities: Default::default(),
+                subagent_concurrency_limit: None,
+                extension_skill_roots: Vec::new(),
                 team_policy: None,
             },
             command_rx,
@@ -4345,6 +4451,8 @@ mod tests {
                 name: None,
                 initial_prompt: None,
                 capabilities: Default::default(),
+                subagent_concurrency_limit: None,
+                extension_skill_roots: Vec::new(),
                 team_policy: None,
             },
             command_rx,
@@ -4620,6 +4728,102 @@ mod tests {
         assert_eq!(pending[2].delivery, PromptDelivery::Steer);
         let steer_id = pending[2].message_id;
         assert!(recall_visible_queued_prompt(&mut pending, Some(steer_id)).is_none());
+    }
+
+    #[test]
+    fn subagent_concurrency_defaults_to_sixteen_and_accepts_a_lower_launch_limit() {
+        let mut launch = LaunchSession {
+            request_id: Uuid::new_v4(),
+            cwd: PathBuf::from("/workspace"),
+            provider: CodingProvider::Codex,
+            model: None,
+            effort: None,
+            fast: Some(false),
+            response_language: crate::ResponseLanguage::Auto,
+            permission_mode: PermissionMode::Manual,
+            name: None,
+            initial_prompt: None,
+            capabilities: Default::default(),
+            subagent_concurrency_limit: None,
+            extension_skill_roots: Vec::new(),
+            team_policy: None,
+        };
+
+        assert_eq!(
+            subagent_concurrency_limit(&launch),
+            crate::DEFAULT_MAX_SUBAGENTS
+        );
+        assert_eq!(crate::DEFAULT_MAX_SUBAGENTS, 16);
+
+        launch.subagent_concurrency_limit = Some(4);
+        assert_eq!(subagent_concurrency_limit(&launch), 4);
+
+        launch.subagent_concurrency_limit = Some(0);
+        assert!(validate_launch_session(&mut launch).is_err());
+    }
+
+    #[test]
+    fn launch_rejects_serialized_skill_root_outside_host_extension_bases() {
+        let root = tempdir().unwrap();
+        let cwd = root.path().join("workspace");
+        std::fs::create_dir_all(cwd.join(".borg/extensions")).unwrap();
+        let serialized = serde_json::json!({
+            "request_id": Uuid::new_v4(),
+            "cwd": cwd,
+            "provider": "codex",
+            "permission_mode": "manual",
+            "extension_skill_roots": ["/tmp"]
+        });
+        let mut launch: LaunchSession = serde_json::from_value(serialized).unwrap();
+
+        let error = validate_launch_session(&mut launch).unwrap_err();
+
+        assert!(error.to_string().contains("outside this host"));
+    }
+
+    #[test]
+    fn extension_skill_root_resolution_accepts_project_and_user_bases() {
+        let root = tempdir().unwrap();
+        let project_base = root.path().join("workspace/.borg/extensions");
+        let user_base = root.path().join("user-config/borg/extensions");
+        let project_skill = project_base.join("trusted-project/skills");
+        let user_skill = user_base.join("trusted-user/skills");
+        std::fs::create_dir_all(&project_skill).unwrap();
+        std::fs::create_dir_all(&user_skill).unwrap();
+        let bases = vec![
+            project_base.canonicalize().unwrap(),
+            user_base.canonicalize().unwrap(),
+        ];
+
+        let resolved =
+            resolve_extension_skill_roots(&[project_skill.clone(), user_skill.clone()], &bases)
+                .unwrap();
+
+        let mut expected = vec![
+            project_skill.canonicalize().unwrap(),
+            user_skill.canonicalize().unwrap(),
+        ];
+        expected.sort();
+        assert_eq!(resolved, expected);
+    }
+
+    #[test]
+    fn extension_skill_root_resolution_rejects_sibling_and_missing_roots() {
+        let root = tempdir().unwrap();
+        let base = root.path().join("workspace/.borg/extensions");
+        let sibling = root.path().join("workspace/.borg/not-extensions/skills");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        let bases = vec![base.canonicalize().unwrap()];
+
+        let sibling_error = resolve_extension_skill_roots(&[sibling], &bases).unwrap_err();
+        assert!(sibling_error.to_string().contains("outside this host"));
+
+        let missing = base.join("trusted/skills");
+        let missing_error = resolve_extension_skill_roots(&[missing], &bases).unwrap_err();
+        assert!(missing_error.to_string().contains("missing or unreadable"));
+
+        assert!(resolve_extension_skill_roots(&[], &[]).unwrap().is_empty());
     }
 
     #[test]

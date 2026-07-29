@@ -118,6 +118,10 @@ fn discover_in_dirs(
                             .into()
                     })
                 });
+            let manifest_dir =
+                path.parent().unwrap().canonicalize().with_context(|| {
+                    format!("canonicalize extension directory {}", path.display())
+                })?;
             let roots = m
                 .skill_roots
                 .into_iter()
@@ -129,9 +133,23 @@ fn discover_in_dirs(
                                 .any(|c| matches!(c, std::path::Component::ParentDir)),
                         "invalid skill root"
                     );
-                    Ok(path.parent().unwrap().join(r))
+                    let requested = manifest_dir.join(r);
+                    if !requested.exists() {
+                        return Ok(None);
+                    }
+                    let root = requested.canonicalize().with_context(|| {
+                        format!("canonicalize extension skill root in {}", path.display())
+                    })?;
+                    ensure!(
+                        root.starts_with(&manifest_dir),
+                        "extension skill root escapes manifest directory"
+                    );
+                    Ok(Some(root))
                 })
-                .collect::<Result<Vec<_>>>()?;
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
             let names = m.mcp.keys().map(|n| format!("{}__{}", m.id, n)).collect();
             if active {
                 for (n, s) in m.mcp {
@@ -316,6 +334,52 @@ mod tests {
         .unwrap();
         assert!(catalog.extensions[0].active);
         assert_eq!(servers[0].name, "docs__docs");
+    }
+
+    #[test]
+    fn trusted_skill_roots_are_canonical_and_untrusted_project_roots_are_inactive() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest_dir = dir.path().join(".borg/extensions");
+        let skills = manifest_dir.join("skills");
+        fs::create_dir_all(&skills).unwrap();
+        fs::write(
+            manifest_dir.join("docs.toml"),
+            manifest("docs", "multiplayer"),
+        )
+        .unwrap();
+        let (untrusted, _) = discover(dir.path(), &CapabilityConfig::default(), false).unwrap();
+        assert!(!untrusted.extensions[0].active);
+        assert!(
+            untrusted.extensions[0]
+                .skill_roots
+                .iter()
+                .all(|root| root.starts_with(&manifest_dir))
+        );
+        let (trusted, _) = discover(dir.path(), &CapabilityConfig::default(), true).unwrap();
+        assert!(trusted.extensions[0].active);
+        assert_eq!(
+            trusted.extensions[0].skill_roots,
+            vec![skills.canonicalize().unwrap()]
+        );
+    }
+
+    #[test]
+    fn symlinked_skill_root_escape_is_rejected() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let dir = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let manifest_dir = dir.path().join(".borg/extensions");
+            fs::create_dir_all(&manifest_dir).unwrap();
+            symlink(outside.path(), manifest_dir.join("skills")).unwrap();
+            fs::write(
+                manifest_dir.join("bad.toml"),
+                manifest("bad", "multiplayer"),
+            )
+            .unwrap();
+            assert!(discover(dir.path(), &CapabilityConfig::default(), true).is_err());
+        }
     }
 
     #[test]

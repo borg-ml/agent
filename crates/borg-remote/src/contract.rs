@@ -282,9 +282,44 @@ pub struct HostCapabilities {
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct WorkspaceAttachmentCapabilities {
+    #[serde(default)]
     pub presence_leases: bool,
+    #[serde(default)]
     pub approval_provenance: bool,
+    #[serde(default)]
     pub reconnect_sync_cursors: bool,
+    /// The host enforces the launch attachment's participant command grants.
+    #[serde(default)]
+    pub participant_scoped_command_authority: bool,
+}
+
+/// Commands a workspace participant may authorize for an attached session.
+/// The relay remains the transport authority; this limits which session actions
+/// the enrolled host will accept for the attached participant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum ParticipantCommandKind {
+    Prompt,
+    RecallQueuedPrompt,
+    Configure,
+    Approve,
+    RespondToProviderInteraction,
+    Goal,
+    Todo,
+    Subagent,
+    Interrupt,
+    Compact,
+    ClearContext,
+    Stop,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ParticipantCommandAuthority {
+    pub participant_id: Uuid,
+    #[serde(default)]
+    pub allowed: Vec<ParticipantCommandKind>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -325,6 +360,10 @@ pub struct RemoteReconnectSyncCursors {
 pub struct WorkspaceAttachment {
     pub workspace_id: Option<Uuid>,
     pub participant_id: Option<Uuid>,
+    /// Optional restriction for commands sent after this launch. Missing
+    /// preserves legacy host behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_authority: Option<ParticipantCommandAuthority>,
     pub host_identity: Option<RemoteHostIdentity>,
     pub host_capabilities: Option<WorkspaceAttachmentCapabilities>,
     pub presence_lease: Option<RemotePresenceLease>,
@@ -365,6 +404,14 @@ pub struct LaunchSession {
     /// Provider-neutral runtime feature gates. Missing fields preserve legacy behavior.
     #[serde(default)]
     pub capabilities: SessionCapabilities,
+    /// Maximum concurrently live child agents for this team. Missing values
+    /// use Borg's current default and keep older launch payloads compatible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_concurrency_limit: Option<u32>,
+    /// Canonical paths from active, trusted extension manifests. Missing data
+    /// preserves legacy launch payload behavior.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extension_skill_roots: Vec<PathBuf>,
     /// Optional autonomous-team policy. Absent preserves ordinary manual
     /// subagent behavior.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1406,6 +1453,18 @@ mod tests {
                 ..
             }
         ));
+
+        let attachment: WorkspaceAttachment = serde_json::from_value(json!({
+            "workspace_id": Uuid::new_v4(),
+            "participant_id": Uuid::new_v4(),
+            "host_identity": null,
+            "host_capabilities": null,
+            "presence_lease": null,
+            "approval_provenance": null,
+            "reconnect_sync_cursors": null
+        }))
+        .unwrap();
+        assert!(attachment.command_authority.is_none());
     }
 
     #[test]
@@ -1488,6 +1547,23 @@ mod tests {
         assert_eq!(update.id, None);
         assert_eq!(update.content, "Inventory the workspace");
         assert_eq!(update.status, PlanItemStatus::InProgress);
+    }
+
+    #[test]
+    fn launch_session_accepts_legacy_payload_without_extension_skill_roots() {
+        let launch: LaunchSession = serde_json::from_value(json!({
+            "request_id": Uuid::nil(), "cwd": "/workspace", "provider": "codex",
+            "model": null, "effort": null, "permission_mode": "manual",
+            "name": null, "initial_prompt": null
+        }))
+        .unwrap();
+        assert!(launch.extension_skill_roots.is_empty());
+        assert!(
+            serde_json::to_value(&launch)
+                .unwrap()
+                .get("extension_skill_roots")
+                .is_none()
+        );
     }
 }
 

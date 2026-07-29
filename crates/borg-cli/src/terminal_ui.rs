@@ -3496,6 +3496,18 @@ impl BorgTerminal {
                 {
                     return Ok(UiAction::RecallQueuedPrompt { message_id });
                 }
+                if pending_steer_blocks_history_recall(&self.composer.text, &self.queued_prompts) {
+                    // A steer is already owned by the active provider turn and
+                    // cannot be truthfully withdrawn after turn/steer accepts
+                    // it. Do not fall through to ordinary composer history:
+                    // that makes the steer look recalled while its pending row
+                    // correctly remains visible.
+                    self.notice = Some(
+                        "Steer already sent to the active turn · Esc interrupts and sends it next"
+                            .to_string(),
+                    );
+                    return Ok(UiAction::None);
+                }
                 if self.composer.history_index.is_some() || self.composer.text.is_empty() {
                     self.composer.history_previous();
                 } else {
@@ -4810,7 +4822,12 @@ impl Transcript {
                         *output_view = if *is_error && !output.trim().is_empty() {
                             Some(("text".to_string(), output.trim_end().to_string()))
                         } else {
-                            tool_output_code_view(name, output)
+                            borg_control_tool_output_view(source_name, input.as_ref(), output)
+                                .or_else(|| {
+                                    borg_lsp_diagnostics_view(source_name, input.as_ref(), output)
+                                })
+                                .map(|text| ("command".to_string(), text))
+                                .or_else(|| tool_output_code_view(name, output))
                         };
                     }
                     let _ = name;
@@ -6114,6 +6131,53 @@ fn format_compact_count(value: u64) -> String {
     }
 }
 
+fn borg_lsp_diagnostics_view(
+    name: &str,
+    input: Option<&serde_json::Value>,
+    output: &str,
+) -> Option<String> {
+    if !name.to_ascii_lowercase().ends_with("lsp_diagnostics") {
+        return None;
+    }
+    let value = serde_json::from_str::<serde_json::Value>(output).ok()?;
+    let items = value
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .or_else(|| value.as_array())?;
+    let path = input
+        .and_then(|input| json_text(input, &["path"]))
+        .unwrap_or("workspace");
+    let mut rows = vec![format!(
+        "DIAGNOSTICS · {path} · {} issue{}",
+        items.len(),
+        if items.len() == 1 { "" } else { "s" }
+    )];
+    for item in items.iter().take(8) {
+        let severity = item
+            .get("severity")
+            .and_then(serde_json::Value::as_u64)
+            .map(|value| match value {
+                1 => "error",
+                2 => "warning",
+                3 => "info",
+                4 => "hint",
+                _ => "issue",
+            })
+            .unwrap_or("issue");
+        let message = json_text(item, &["message"]).unwrap_or("diagnostic");
+        let line = item
+            .pointer("/range/start/line")
+            .and_then(serde_json::Value::as_u64)
+            .map(|line| format!(":{}", line + 1))
+            .unwrap_or_default();
+        rows.push(format!(
+            "  {severity:>7}{line}  {}",
+            compact_text(message, 120)
+        ));
+    }
+    Some(rows.join("\n"))
+}
+
 fn is_context_compaction(kind: &str) -> bool {
     matches!(
         kind.rsplit(['.', ':', '/'])
@@ -6435,6 +6499,16 @@ fn latest_recallable_prompt_id(
             .rfind(|prompt| prompt.delivery == PromptDelivery::Queue)
             .map(|prompt| prompt.message_id)
     })?
+}
+
+fn pending_steer_blocks_history_recall(
+    composer_text: &str,
+    queued_prompts: &[PendingPromptProjection],
+) -> bool {
+    composer_text.is_empty()
+        && queued_prompts
+            .iter()
+            .any(|prompt| prompt.delivery == PromptDelivery::Steer)
 }
 
 fn queued_prompt_panel_height(queued_prompts: &[PendingPromptProjection]) -> u16 {
@@ -7065,6 +7139,154 @@ fn wrap_display(value: &str, width: usize) -> Vec<String> {
         .into_iter()
         .map(|(start, end)| value[start..end].to_string())
         .collect()
+}
+
+/// Compact operator-facing results for Borg's own control surface. Unknown
+/// tools deliberately return None and retain the generic JSON renderer.
+fn borg_control_tool_output_view(
+    name: &str,
+    input: Option<&serde_json::Value>,
+    output: &str,
+) -> Option<String> {
+    let leaf = name
+        .rsplit(['.', '_'])
+        .next()
+        .unwrap_or(name)
+        .to_ascii_lowercase();
+    let control = matches!(
+        leaf.as_str(),
+        "agents" | "agent" | "message" | "task" | "goal" | "plan"
+    ) || [
+        "list_agents",
+        "spawn_agent",
+        "followup_task",
+        "send_message",
+        "wait_agent",
+        "get_goal",
+        "update_goal",
+        "get_plan",
+        "update_plan",
+    ]
+    .iter()
+    .any(|candidate| name.to_ascii_lowercase().ends_with(candidate));
+    if !control {
+        return None;
+    }
+    let value = serde_json::from_str::<serde_json::Value>(output).ok()?;
+    let tool = name.to_ascii_lowercase();
+    let mut rows = Vec::new();
+    if tool.ends_with("list_agents") || value.get("agents").is_some() || value.is_array() {
+        let agents = value
+            .get("agents")
+            .and_then(serde_json::Value::as_array)
+            .or_else(|| value.as_array())?;
+        rows.push(format!(
+            "TEAM · {} agent{}",
+            agents.len(),
+            if agents.len() == 1 { "" } else { "s" }
+        ));
+        for agent in agents.iter().take(12) {
+            let id = json_text(agent, &["task_name", "name", "id", "agent_id"]).unwrap_or("agent");
+            let status = json_text(agent, &["status", "state"]).unwrap_or("unknown");
+            let model = json_text(agent, &["model", "provider"]);
+            let effort = json_text(agent, &["effort", "reasoning_effort"]);
+            let task = json_text(agent, &["task", "objective", "message"]);
+            let mut line = format!("  {status:>10}  {id}");
+            if let Some(model) = model {
+                line.push_str(&format!(" · {model}"));
+            }
+            if let Some(effort) = effort {
+                line.push_str(&format!("/{effort}"));
+            }
+            rows.push(line);
+            if let Some(task) = task {
+                rows.push(format!("              {}", compact_text(task, 100)));
+            }
+        }
+    } else if tool.ends_with("get_plan")
+        || tool.ends_with("update_plan")
+        || value.get("plan").is_some()
+        || value.get("items").is_some()
+    {
+        let steps = value
+            .get("plan")
+            .or_else(|| value.get("items"))
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        rows.push(format!(
+            "PLAN · {} step{}",
+            steps.len(),
+            if steps.len() == 1 { "" } else { "s" }
+        ));
+        for step in steps.iter().take(12) {
+            let status = json_text(step, &["status"]).unwrap_or("pending");
+            let text = json_text(step, &["step", "content", "title", "description"])
+                .unwrap_or("unnamed step");
+            rows.push(format!("  {status:>10}  {}", compact_text(text, 120)));
+        }
+    } else if tool.ends_with("get_goal")
+        || tool.ends_with("update_goal")
+        || value.get("goal").is_some()
+    {
+        let goal = value.get("goal").unwrap_or(&value);
+        let status = json_text(goal, &["status"]).unwrap_or("current");
+        let objective = json_text(goal, &["objective", "title"]).unwrap_or("goal");
+        rows.push(format!(
+            "GOAL · {status} · {}",
+            compact_text(objective, 140)
+        ));
+    } else if tool.ends_with("wait_agent") || tool.ends_with("spawn_agent") {
+        let agent = value.get("agent").unwrap_or(&value);
+        let id = json_text(agent, &["task_name", "name", "id", "agent_id"])
+            .or_else(|| input.and_then(|input| json_text(input, &["task_name", "target"])))
+            .unwrap_or("agent");
+        let status = json_text(agent, &["status", "state"]).unwrap_or("updated");
+        let action = if tool.ends_with("wait_agent") {
+            "WAIT"
+        } else {
+            "SPAWN"
+        };
+        let mut row = format!("{action} · {status} · {id}");
+        if let Some(model) = json_text(agent, &["model", "provider"]) {
+            row.push_str(&format!(" · {model}"));
+        }
+        if let Some(effort) = json_text(agent, &["effort", "reasoning_effort"]) {
+            row.push_str(&format!("/{effort}"));
+        }
+        rows.push(row);
+        if let Some(text) = json_text(
+            agent,
+            &["message", "update", "final_text", "task", "objective"],
+        ) {
+            rows.push(format!("  {}", compact_text(text, 140)));
+        }
+    } else {
+        let target = input
+            .and_then(|input| json_text(input, &["target", "task_name"]))
+            .unwrap_or("team");
+        let message = input.and_then(|input| json_text(input, &["message", "prompt"]));
+        let action = if tool.ends_with("wait_agent") {
+            "WAIT"
+        } else if tool.ends_with("spawn_agent") {
+            "SPAWN"
+        } else if tool.ends_with("followup_task") {
+            "FOLLOW UP"
+        } else {
+            "MESSAGE"
+        };
+        rows.push(format!("{action} · {target}"));
+        if let Some(message) = message {
+            rows.push(format!("  {}", compact_text(message, 140)));
+        }
+    }
+    Some(rows.join("\n"))
+}
+
+fn json_text<'a>(value: &'a serde_json::Value, names: &[&str]) -> Option<&'a str> {
+    names
+        .iter()
+        .find_map(|name| value.get(*name).and_then(serde_json::Value::as_str))
 }
 
 fn tool_summary_lines(

@@ -31,7 +31,7 @@ use crate::{
     WorkspaceReference, WorkspaceReviewRequest, WorkspaceStore,
 };
 
-pub const DEFAULT_MAX_SUBAGENTS: usize = 3;
+pub const DEFAULT_MAX_SUBAGENTS: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
@@ -2793,6 +2793,8 @@ mod tests {
             name: None,
             initial_prompt: None,
             capabilities: Default::default(),
+            subagent_concurrency_limit: None,
+            extension_skill_roots: Vec::new(),
             team_policy: None,
         }
     }

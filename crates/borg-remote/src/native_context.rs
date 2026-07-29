@@ -21,13 +21,13 @@ struct SkillEntry {
 }
 
 impl NativeContext {
-    pub(crate) async fn load(cwd: PathBuf) -> Result<Self> {
-        tokio::task::spawn_blocking(move || Self::load_blocking(&cwd))
+    pub(crate) async fn load(cwd: PathBuf, extension_skill_roots: Vec<PathBuf>) -> Result<Self> {
+        tokio::task::spawn_blocking(move || Self::load_blocking(&cwd, &extension_skill_roots))
             .await
             .context("native context loader stopped")?
     }
 
-    fn load_blocking(cwd: &Path) -> Result<Self> {
+    fn load_blocking(cwd: &Path, extension_skill_roots: &[PathBuf]) -> Result<Self> {
         let cwd = cwd.canonicalize().context("canonicalize agent workspace")?;
         let project_chain = project_chain(&cwd);
         let mut project_instructions = String::new();
@@ -55,11 +55,18 @@ impl NativeContext {
                 content.trim()
             ));
         }
-
         let mut skill_roots = user_skill_roots();
         for directory in &project_chain {
             skill_roots.push(directory.join(".agents").join("skills"));
             skill_roots.push(directory.join(".borg").join("skills"));
+        }
+        // Session launch validation has already constrained these roots to
+        // trusted host extension bases.  Do not silently drop a root here:
+        // doing so would make resumed-session behavior depend on timing.
+        for root in extension_skill_roots {
+            skill_roots.push(root.canonicalize().with_context(|| {
+                format!("canonicalize extension skill root {}", root.display())
+            })?);
         }
         let mut skills = BTreeMap::new();
         for root in skill_roots {
@@ -234,5 +241,25 @@ mod tests {
         load_skill_root(&user.path().join("skills"), &mut skills).expect("user skills");
         load_skill_root(&root.path().join("skills"), &mut skills).expect("project skills");
         assert_eq!(skills["review"].description, "project");
+    }
+
+    #[test]
+    fn trusted_launch_skill_roots_contribute_skills() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let extension = tempfile::tempdir().expect("extension");
+        let directory = extension.path().join("skills").join("audit");
+        std::fs::create_dir_all(&directory).expect("skill directory");
+        std::fs::write(
+            directory.join("SKILL.md"),
+            "---\nname: extension-audit\ndescription: trusted extension\n---\n",
+        )
+        .expect("skill");
+        let context =
+            NativeContext::load_blocking(workspace.path(), &[extension.path().join("skills")])
+                .expect("context");
+        assert_eq!(
+            context.skills["extension-audit"].description,
+            "trusted extension"
+        );
     }
 }

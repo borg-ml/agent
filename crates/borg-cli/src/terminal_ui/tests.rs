@@ -1393,6 +1393,93 @@ fn tool_call_summaries_cover_cli_display_contract() {
 }
 
 #[test]
+fn borg_control_results_render_compact_roster_plan_goal_and_follow_up() {
+    let roster = borg_control_tool_output_view(
+        "mcp__borg_agent__list_agents",
+        None,
+        r#"{"agents":[{"task_name":"inspect_ui","status":"running","model":"codex","effort":"low","message":"Inspect the renderer"}]}"#,
+    )
+    .expect("structured roster");
+    assert!(roster.contains("TEAM · 1 agent"));
+    assert!(roster.contains("running  inspect_ui · codex/low"));
+    assert!(roster.contains("Inspect the renderer"));
+    assert!(!roster.contains("Debug payload"));
+    assert!(!roster.contains("\"agents\""));
+
+    let plan = borg_control_tool_output_view(
+        "functions.update_plan",
+        None,
+        r#"{"plan":[{"status":"in_progress","step":"Render team activity"}]}"#,
+    )
+    .expect("structured plan");
+    assert!(plan.contains("PLAN · 1 step"));
+    assert!(plan.contains("in_progress  Render team activity"));
+
+    let goal = borg_control_tool_output_view(
+        "mcp__borg_agent__get_goal",
+        None,
+        r#"{"goal":{"status":"active","objective":"Ship calm controls"}}"#,
+    )
+    .expect("structured goal");
+    assert_eq!(goal, "GOAL · active · Ship calm controls");
+
+    let follow_up = borg_control_tool_output_view(
+        "functions.collaboration.followup_task",
+        Some(&serde_json::json!({"target":"inspect_ui","message":"Run focused tests"})),
+        "{}",
+    )
+    .expect("structured follow-up");
+    assert!(follow_up.contains("FOLLOW UP · inspect_ui"));
+    assert!(follow_up.contains("Run focused tests"));
+}
+
+#[test]
+fn borg_control_results_tolerate_partial_payloads_and_leave_unknown_tools_generic() {
+    let partial = borg_control_tool_output_view(
+        "functions.collaboration.send_message",
+        Some(&serde_json::json!({"target":"research","message":"Please check tests"})),
+        "{}",
+    )
+    .expect("message activity");
+    assert!(partial.contains("MESSAGE · research"));
+    assert!(partial.contains("Please check tests"));
+    assert!(borg_control_tool_output_view("mcp__example__new_tool", None, "{}").is_none());
+    assert!(
+        borg_control_tool_output_view("mcp__borg_agent__list_agents", None, "not json").is_none()
+    );
+}
+
+#[test]
+fn wait_spawn_and_lsp_diagnostics_use_compact_stable_result_shapes() {
+    let wait = borg_control_tool_output_view(
+        "wait_agent",
+        Some(&serde_json::json!({"target":"review"})),
+        r#"{"task_name":"review","status":"completed","model":"codex","effort":"low","final_text":"Reviewed the patch"}"#,
+    )
+    .expect("structured wait");
+    assert!(wait.contains("WAIT · completed · review · codex/low"));
+    assert!(wait.contains("Reviewed the patch"));
+
+    let spawn = borg_control_tool_output_view(
+        "spawn_agent",
+        Some(&serde_json::json!({"task_name":"lint"})),
+        r#"{"agent":{"task_name":"lint","status":"running","id":"session-7"}}"#,
+    )
+    .expect("structured spawn");
+    assert!(spawn.contains("SPAWN · running · lint"));
+
+    let diagnostics = borg_lsp_diagnostics_view(
+        "lsp_diagnostics",
+        Some(&serde_json::json!({"path":"src/main.rs"})),
+        r#"{"items":[{"severity":1,"message":"expected expression","range":{"start":{"line":4}}}]}"#,
+    )
+    .expect("structured diagnostics");
+    assert!(diagnostics.contains("DIAGNOSTICS · src/main.rs · 1 issue"));
+    assert!(diagnostics.contains("error:5  expected expression"));
+    assert!(borg_lsp_diagnostics_view("lsp_diagnostics", None, "{}").is_none());
+}
+
+#[test]
 fn active_subagent_count_tracks_only_working_children() {
     let mut transcript = Transcript::default();
     assert_eq!(transcript.active_subagent_count(), 0);
@@ -1949,6 +2036,22 @@ fn up_recall_targets_the_latest_exact_queued_prompt_only_for_an_empty_composer()
         latest_recallable_prompt_id("", &[queued, newer.clone()]),
         Some(newer.message_id)
     );
+}
+
+#[test]
+fn up_does_not_fake_recall_an_already_submitted_steer() {
+    let steer = PendingPromptProjection {
+        message_id: Uuid::new_v4(),
+        text: "already submitted".to_string(),
+        delivery: PromptDelivery::Steer,
+    };
+
+    assert_eq!(latest_recallable_prompt_id("", &[steer.clone()]), None);
+    assert!(pending_steer_blocks_history_recall("", &[steer.clone()]));
+    assert!(!pending_steer_blocks_history_recall(
+        "draft in progress",
+        &[steer]
+    ));
 }
 
 #[test]

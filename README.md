@@ -53,6 +53,12 @@ disabled independently; parent capability disablement cascades to dependent
 features. Run `borg capabilities` (or `borg capabilities --json`) to inspect
 the effective runtime.
 
+Manual and autonomous teams allow 16 concurrently live child agents by
+default. Set `[team].worker_concurrency` to a smaller positive integer to fit
+local resources or provider budgets; the setting does not require an
+autonomous-team preset. Autonomous lifetime assignment, report, escalation,
+and specialist limits are separate optional `[team]` settings.
+
 Telemetry is disabled by default, and this release does not initialize a
 telemetry exporter. Future telemetry support must document the exact emitted
 fields and retention rather than treating README disclosure as consent.
