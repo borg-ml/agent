@@ -52,12 +52,12 @@ pub use session::{
 pub use session_store::{
     EventPersistence, JsonlSessionStore, SESSION_PROJECTION_VERSION, SessionConfiguration,
     SessionImport, SessionLiveEvent, SessionRecovery, SessionState, SessionStore, SessionStoreFork,
-    SessionSummary, SessionUsage, SqliteSessionStore,
+    SessionSummary, SessionUsage, SessionWorkspaceBinding, SqliteSessionStore,
 };
 pub use subagents::{
     AgentToolDispatcher, AgentToolServer, DEFAULT_MAX_SUBAGENTS, SpawnSubagent, SubagentActivity,
-    SubagentActivityKind, SubagentCoordinator, SubagentSnapshot, SubagentStatus, agent_tool_specs,
-    subagent_tool_specs,
+    SubagentActivityKind, SubagentCoordinator, SubagentSnapshot, SubagentStatus, SubagentUsage,
+    agent_tool_specs, agent_tool_specs_with_team_policy, subagent_tool_specs,
 };
 pub use tool_presentation::{
     ToolPresentation, ToolPresentationBody, ToolPresentationCategory, compact_text,
@@ -66,9 +66,10 @@ pub use tool_presentation::{
     web_search_query,
 };
 pub use workspace::{
-    Audience, DeliveryAttempt, DeliveryCursor, DeliveryMode, DeliveryState, HostAttachment,
-    HostIdentity, Participant, ParticipantKind, PresenceLease, RecipientDelivery,
-    SqliteWorkspaceStore, StructuredMention, Thread, Workspace, WorkspaceEvent, WorkspaceEventKind,
-    WorkspaceHost, WorkspaceHostCapabilities, WorkspaceMembership, WorkspaceMessage,
-    WorkspaceMessageBody, WorkspaceRole, WorkspaceStore,
+    AtomicWorkClaim, Audience, DeliveryAttempt, DeliveryCursor, DeliveryMode, DeliveryState,
+    HostAttachment, HostIdentity, Participant, ParticipantKind, PresenceLease, Provenance,
+    RecipientDelivery, SharedWork, SqliteWorkspaceStore, StructuredMention, Thread, WorkDependency,
+    WorkReview, Workspace, WorkspaceArtifact, WorkspaceDecision, WorkspaceEvent,
+    WorkspaceEventKind, WorkspaceHost, WorkspaceHostCapabilities, WorkspaceMembership,
+    WorkspaceMessage, WorkspaceMessageBody, WorkspaceReference, WorkspaceRole, WorkspaceStore,
 };

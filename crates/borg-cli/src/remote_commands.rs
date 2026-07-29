@@ -261,11 +261,17 @@ fn systemd_quote(value: &str) -> String {
 pub(crate) async fn run_local_agent(args: LocalAgentCliArgs) -> Result<()> {
     let agent_config = AgentConfig::load(args.config.as_deref())?;
     crate::updater::spawn_background(agent_config.updates.clone());
+    let ephemeral_sessions = args.ephemeral.then(tempfile::tempdir).transpose()?;
     let mut selected_session = None;
     let mut restored_prompt = None;
     loop {
-        let Some((next_session, next_prompt)) =
-            run_local_agent_session(&args, selected_session, restored_prompt.take()).await?
+        let Some((next_session, next_prompt)) = run_local_agent_session(
+            &args,
+            selected_session,
+            restored_prompt.take(),
+            ephemeral_sessions.as_ref().map(tempfile::TempDir::path),
+        )
+        .await?
         else {
             return Ok(());
         };
@@ -311,14 +317,20 @@ async fn run_local_agent_session(
     args: &LocalAgentCliArgs,
     selected_session: Option<Uuid>,
     restored_prompt: Option<(String, Vec<PathBuf>)>,
+    session_root_override: Option<&Path>,
 ) -> Result<Option<(Uuid, Option<(String, Vec<PathBuf>)>)>> {
     let agent_config = AgentConfig::load(args.config.as_deref())?;
     let mut editor_preferences = EditorPreferences::load()?;
     let host_config_path = default_host_config_path();
-    let sessions_dir = host_config_path
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join("sessions");
+    let sessions_dir = session_root_override.map_or_else(
+        || {
+            host_config_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join("sessions")
+        },
+        Path::to_path_buf,
+    );
     let sqlite_store =
         Arc::new(SqliteSessionStore::open(sessions_dir.join("sessions.sqlite3")).await?);
     let session_id = if let Some(session_id) = selected_session.or(args.resume) {
@@ -395,7 +407,7 @@ async fn run_local_agent_session(
         CodingProvider::OpenAiCompatible => None,
         CodingProvider::Claude | CodingProvider::OpenCode => None,
     });
-    let (recorded_cwd, provider, model, effort, fast, response_language, permission_mode) =
+    let (recorded_cwd, provider, model, mut effort, fast, response_language, permission_mode) =
         if let Some(recorded_config) = recorded_config {
             recorded_config
         } else {
@@ -420,6 +432,17 @@ async fn run_local_agent_session(
         "{provider:?} requires --model or BORG_OPENAI_COMPATIBLE_MODEL"
     );
     let cwd = requested_cwd.unwrap_or(recorded_cwd);
+    let capabilities = borg_remote::SessionCapabilities::from(&agent_config.capabilities);
+    let team_policy = agent_config.autonomous_team_policy(&capabilities, provider, session_id);
+    if !resuming
+        && args.effort.is_none()
+        && let Some(policy) = &team_policy
+        && let Some(director) = policy.topology.members.iter().find(|member| {
+            member.participant_id == session_id && member.role == borg_remote::TeamRole::Director
+        })
+    {
+        effort = director.profile.reasoning_effort.clone();
+    }
     let mut current_model = model.clone();
     let mut current_effort = effort.clone();
     let mut current_fast = fast.unwrap_or(false);
@@ -452,7 +475,12 @@ async fn run_local_agent_session(
     } else {
         LocalAgentTurnExecutor::with_settings(local_settings)
     }
-    .with_external_mcp_servers(agent_config.external_mcp_servers());
+    .with_external_mcp_servers({
+        let mut servers = agent_config.external_mcp_servers();
+        let (_, extension_servers) = crate::extensions::discover(&cwd, &agent_config.capabilities)?;
+        servers.extend(extension_servers);
+        servers
+    });
     local_executor.prewarm(provider);
     let executor: Arc<dyn AgentTurnExecutor> = Arc::new(local_executor);
     let mut rendered = HashMap::new();
@@ -492,6 +520,8 @@ async fn run_local_agent_session(
             .and_then(|value| value.to_str())
             .map(str::to_string),
         initial_prompt,
+        capabilities,
+        team_policy,
     };
     if session_access.is_attached() {
         let remote_launch = sessions_dir.join(format!("{session_id}.launch.json"));
@@ -511,6 +541,7 @@ async fn run_local_agent_session(
     let mut remote_open = !session_access.is_attached()
         && interactive
         && !args.local_only
+        && !args.ephemeral
         && host_config_path.is_file();
     let mut mirror_shutdown = None;
     let mut mirror_task = None;

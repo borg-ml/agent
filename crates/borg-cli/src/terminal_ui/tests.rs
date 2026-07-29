@@ -1,6 +1,33 @@
 use super::*;
 
 #[test]
+fn focused_child_transcript_round_trips_back_to_director() {
+    let child_id = Uuid::new_v4();
+    let mut displayed = Transcript::default();
+    displayed.order.push(TranscriptEntry::Activity {
+        text: "director event".to_string(),
+        time: "now".to_string(),
+    });
+    let mut child = Transcript::default();
+    child.order.push(TranscriptEntry::Activity {
+        text: "child event".to_string(),
+        time: "now".to_string(),
+    });
+    let mut director = None;
+    let mut children = HashMap::from([(child_id, child)]);
+
+    switch_to_child_transcript(&mut displayed, &mut director, &mut children, child_id);
+    assert_eq!(displayed.order.len(), 1);
+    assert!(director.is_some());
+    assert!(children.is_empty());
+
+    switch_to_director_transcript(&mut displayed, &mut director, &mut children, child_id);
+    assert_eq!(displayed.order.len(), 1);
+    assert!(director.is_none());
+    assert_eq!(children[&child_id].order.len(), 1);
+}
+
+#[test]
 fn model_and_effort_pickers_use_the_provider_catalog() {
     let catalog = CodingProvider::Codex
         .model_catalog()
@@ -908,6 +935,24 @@ fn actionable_inactive_goals_remain_in_the_status_line() {
 }
 
 #[test]
+fn status_path_uses_fish_style_parent_abbreviations() {
+    assert_eq!(
+        fish_style_path(Path::new("/home/shulgin/twilight")),
+        "/h/s/twilight"
+    );
+    assert_eq!(
+        fish_style_path(Path::new("/home/shulgin/.config/borg")),
+        "/h/s/.c/borg"
+    );
+    assert_eq!(fish_style_path(Path::new("/workspace")), "/workspace");
+    assert_eq!(
+        fish_style_path(Path::new("projects/borg-cli")),
+        "p/borg-cli"
+    );
+    assert_eq!(fish_style_path(Path::new("/")), "/");
+}
+
+#[test]
 fn completed_goal_crosses_out_only_its_objective() {
     let mut transcript = Transcript::default();
     let mut goal = SessionGoal::new("Ship the terminal polish".to_string(), None);
@@ -1660,6 +1705,64 @@ fn pending_steer_stays_visible_until_its_user_message_is_committed() {
 }
 
 #[test]
+fn admitted_queued_prompt_is_inserted_at_its_real_transcript_boundary() {
+    let session_id = Uuid::new_v4();
+    let queued_id = Uuid::new_v4();
+    let assistant_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::Message {
+            message_id: queued_id,
+            actor: EventActor::User,
+            text: "queued follow-up".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Queued,
+            delivery: Some(PromptDelivery::Steer),
+        },
+    ));
+    assert!(transcript.order.is_empty());
+    assert!(!transcript.messages.contains_key(&queued_id));
+
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::Message {
+            message_id: assistant_id,
+            actor: EventActor::Assistant,
+            text: "current turn output".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: None,
+        },
+    ));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        3,
+        SessionEventKind::Message {
+            message_id: queued_id,
+            actor: EventActor::User,
+            text: "queued follow-up".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: Some(PromptDelivery::Steer),
+        },
+    ));
+
+    let actors = transcript
+        .order
+        .iter()
+        .filter_map(|entry| match entry {
+            TranscriptEntry::Message { actor, .. } => Some(*actor),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(actors, [EventActor::Assistant, EventActor::User]);
+    assert_eq!(transcript.messages[&queued_id], 1);
+}
+
+#[test]
 fn committed_steer_does_not_hide_a_separate_next_turn_queue() {
     let queued_id = Uuid::new_v4();
     let steer_id = Uuid::new_v4();
@@ -2005,7 +2108,7 @@ fn projected_session_state_restores_status_config_outside_the_history_tail() {
         transcript.config_lines(),
         (
             "gpt-5.6-sol medium".to_string(),
-            "full access · /workspace/borg".to_string()
+            "full access · /w/borg".to_string()
         )
     );
     assert_eq!(transcript.context_remaining_percent, 77);

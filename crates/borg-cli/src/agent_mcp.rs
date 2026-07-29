@@ -31,23 +31,34 @@ enum AgentToolEndpoint {
     Unix {
         socket: PathBuf,
         provider: borg_remote::CodingProvider,
+        team_policy: Option<borg_remote::TeamPolicy>,
     },
     #[cfg(not(unix))]
     Loopback {
         address: std::net::SocketAddr,
         token: String,
         provider: borg_remote::CodingProvider,
+        team_policy: Option<borg_remote::TeamPolicy>,
     },
 }
 
 impl AgentToolEndpoint {
     fn from_env() -> Result<Self> {
         let provider = agent_tool_provider()?;
+        let team_policy = std::env::var("BORG_AGENT_TEAM_POLICY")
+            .ok()
+            .map(|policy| serde_json::from_str(&policy))
+            .transpose()
+            .context("BORG_AGENT_TEAM_POLICY must contain a valid team policy")?;
         #[cfg(unix)]
         {
             std::env::var_os("BORG_AGENT_TOOL_SOCKET")
                 .map(PathBuf::from)
-                .map(|socket| Self::Unix { socket, provider })
+                .map(|socket| Self::Unix {
+                    socket,
+                    provider,
+                    team_policy,
+                })
                 .context("BORG_AGENT_TOOL_SOCKET is required")
         }
         #[cfg(not(unix))]
@@ -66,6 +77,7 @@ impl AgentToolEndpoint {
                 address,
                 token,
                 provider,
+                team_policy,
             })
         }
     }
@@ -76,6 +88,15 @@ impl AgentToolEndpoint {
             Self::Unix { provider, .. } => *provider,
             #[cfg(not(unix))]
             Self::Loopback { provider, .. } => *provider,
+        }
+    }
+
+    fn team_policy(&self) -> Option<&borg_remote::TeamPolicy> {
+        match self {
+            #[cfg(unix)]
+            Self::Unix { team_policy, .. } => team_policy.as_ref(),
+            #[cfg(not(unix))]
+            Self::Loopback { team_policy, .. } => team_policy.as_ref(),
         }
     }
 }
@@ -95,7 +116,11 @@ async fn handle_line(endpoint: &AgentToolEndpoint, line: &str) -> Option<Value> 
         })),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({
-            "tools": borg_remote::agent_tool_specs(endpoint.provider())
+            "tools": borg_remote::agent_tool_specs_with_team_policy(
+                endpoint.provider(),
+                true,
+                endpoint.team_policy(),
+            )
         })),
         "tools/call" => {
             let params = request.get("params").cloned().unwrap_or_else(|| json!({}));
@@ -202,12 +227,14 @@ mod tests {
         let endpoint = AgentToolEndpoint::Unix {
             socket: Path::new("/unused").to_path_buf(),
             provider: borg_remote::CodingProvider::Codex,
+            team_policy: None,
         };
         #[cfg(not(unix))]
         let endpoint = AgentToolEndpoint::Loopback {
             address: "127.0.0.1:1".parse().unwrap(),
             token: "unused".to_string(),
             provider: borg_remote::CodingProvider::Codex,
+            team_policy: None,
         };
         let response = handle_line(
             &endpoint,

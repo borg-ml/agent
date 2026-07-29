@@ -8,11 +8,69 @@ use serde::Deserialize;
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct AgentConfig {
+    pub(crate) capabilities: CapabilityConfig,
+    pub(crate) team: TeamConfig,
     pub(crate) commands: CommandConfig,
     pub(crate) keybindings: KeybindingConfig,
     pub(crate) mcp: McpConfig,
     pub(crate) approvals: ApprovalConfig,
     pub(crate) updates: UpdateConfig,
+}
+
+/// Opt-in autonomous-team policy. Leaving `preset` unset keeps the existing
+/// manual subagent coordinator unchanged.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct TeamConfig {
+    pub(crate) preset: Option<borg_remote::TeamPreset>,
+    pub(crate) worker_concurrency: Option<u32>,
+    pub(crate) max_tokens: Option<u64>,
+    pub(crate) max_cost_microusd: Option<u64>,
+    pub(crate) max_wall_time_ms: Option<u64>,
+}
+
+/// Provider-neutral feature switches for optional Borg subsystems.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct CapabilityConfig {
+    pub(crate) multiplayer: bool,
+    pub(crate) subagents: bool,
+    pub(crate) autonomous_team: bool,
+    pub(crate) shared_work: bool,
+    pub(crate) presence: bool,
+    pub(crate) cloud_sync: bool,
+    pub(crate) web_relay: bool,
+    pub(crate) telemetry: bool,
+}
+
+impl Default for CapabilityConfig {
+    fn default() -> Self {
+        Self {
+            multiplayer: true,
+            subagents: true,
+            autonomous_team: true,
+            shared_work: true,
+            presence: true,
+            cloud_sync: true,
+            web_relay: true,
+            telemetry: false,
+        }
+    }
+}
+
+impl From<&CapabilityConfig> for borg_remote::SessionCapabilities {
+    fn from(value: &CapabilityConfig) -> Self {
+        Self {
+            multiplayer: value.multiplayer,
+            subagents: value.subagents,
+            autonomous_team: value.autonomous_team,
+            shared_work: value.shared_work,
+            presence: value.presence,
+            cloud_sync: value.cloud_sync,
+            web_relay: value.web_relay,
+            telemetry: value.telemetry,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -143,6 +201,19 @@ impl AgentConfig {
     }
 
     fn validate(&self) -> Result<()> {
+        if self.team.preset.is_some() {
+            anyhow::ensure!(
+                self.team.worker_concurrency.unwrap_or(1) > 0,
+                "team.worker_concurrency must be positive"
+            );
+            for (name, value) in [
+                ("team.max_tokens", self.team.max_tokens),
+                ("team.max_cost_microusd", self.team.max_cost_microusd),
+                ("team.max_wall_time_ms", self.team.max_wall_time_ms),
+            ] {
+                anyhow::ensure!(value != Some(0), "{name} must be positive when set");
+            }
+        }
         for (alias, target) in &self.commands.aliases {
             anyhow::ensure!(
                 valid_alias(alias),
@@ -208,6 +279,43 @@ impl AgentConfig {
             "updates.check_interval_hours must be between 1 and 720"
         );
         Ok(())
+    }
+
+    pub(crate) fn autonomous_team_policy(
+        &self,
+        capabilities: &borg_remote::SessionCapabilities,
+        provider: borg_remote::CodingProvider,
+        session_id: uuid::Uuid,
+    ) -> Option<borg_remote::TeamPolicy> {
+        let preset = self.team.preset?;
+        let effective = capabilities.effective();
+        if !effective
+            .active
+            .contains(&borg_remote::SessionCapability::AutonomousTeam)
+        {
+            return None;
+        }
+        let worker_concurrency = self.team.worker_concurrency.unwrap_or(1);
+        let mut policy = preset.policy(
+            session_id,
+            session_id,
+            session_id,
+            std::iter::empty(),
+            borg_remote::ProviderId(format!("{provider:?}").to_ascii_lowercase()),
+        );
+        policy.limits.max_concurrent_assignments = worker_concurrency;
+        policy.limits.max_total_assignments = worker_concurrency;
+        policy.limits.max_total_reports = worker_concurrency;
+        policy.limits.max_total_escalations = worker_concurrency;
+        policy.specialists.max_specialists = worker_concurrency;
+        policy.limits.per_role_concurrency = vec![borg_remote::RoleConcurrencyLimit {
+            role: borg_remote::TeamRole::Worker,
+            max_concurrent_assignments: worker_concurrency,
+        }];
+        policy.limits.budget.max_tokens = self.team.max_tokens;
+        policy.limits.budget.max_cost_microusd = self.team.max_cost_microusd;
+        policy.limits.budget.max_wall_time_ms = self.team.max_wall_time_ms;
+        Some(policy)
     }
 
     pub(crate) fn expand_command(&self, line: &str) -> String {
@@ -333,6 +441,96 @@ mod tests {
             toml::from_str(include_str!("../../../configs/agent.example.toml")).unwrap();
         config.validate().unwrap();
         assert_eq!(config.expand_command("/quick"), "/fast on");
+    }
+
+    #[test]
+    fn disabling_parent_capabilities_cascades_without_extra_config() {
+        let config: AgentConfig =
+            toml::from_str("[capabilities]\nmultiplayer = false\nsubagents = false\n").unwrap();
+        config.validate().expect("valid parent-only disablement");
+        let effective = borg_remote::SessionCapabilities::from(&config.capabilities).effective();
+        assert!(
+            effective
+                .inactive
+                .iter()
+                .any(|item| item.capability == borg_remote::SessionCapability::SharedWork)
+        );
+        assert!(
+            effective
+                .inactive
+                .iter()
+                .any(|item| item.capability == borg_remote::SessionCapability::AutonomousTeam)
+        );
+    }
+
+    #[test]
+    fn capabilities_default_to_full_runtime_with_private_telemetry() {
+        let config: AgentConfig = toml::from_str("").unwrap();
+        assert!(config.capabilities.multiplayer);
+        assert!(config.capabilities.subagents);
+        assert!(config.capabilities.autonomous_team);
+        assert!(!config.capabilities.telemetry);
+    }
+
+    #[test]
+    fn team_policy_is_opt_in_and_uses_the_existing_preset_limits() {
+        let disabled: AgentConfig = toml::from_str("").unwrap();
+        assert!(disabled
+            .autonomous_team_policy(
+                &borg_remote::SessionCapabilities::from(&disabled.capabilities),
+                borg_remote::CodingProvider::Codex,
+                uuid::Uuid::nil(),
+            )
+            .is_none());
+
+        let config: AgentConfig = toml::from_str(
+            r#"
+            [team]
+            preset = "xhigh_director_low_workers"
+            worker_concurrency = 2
+            max_tokens = 5000
+            max_cost_microusd = 120000
+            max_wall_time_ms = 30000
+            "#,
+        )
+        .unwrap();
+        config.validate().unwrap();
+        let policy = config
+            .autonomous_team_policy(
+                &borg_remote::SessionCapabilities::from(&config.capabilities),
+                borg_remote::CodingProvider::Codex,
+                uuid::Uuid::nil(),
+            )
+            .expect("opt-in policy");
+        assert_eq!(policy.limits.max_concurrent_assignments, 2);
+        assert_eq!(policy.limits.budget.max_tokens, Some(5000));
+        assert_eq!(policy.limits.budget.max_cost_microusd, Some(120000));
+        assert_eq!(policy.limits.budget.max_wall_time_ms, Some(30000));
+        assert_eq!(
+            policy.topology.members[0].profile.reasoning_effort.as_deref(),
+            Some("xhigh")
+        );
+    }
+
+    #[test]
+    fn team_policy_stays_off_when_autonomous_team_is_not_effective() {
+        let config: AgentConfig = toml::from_str(
+            r#"
+            [capabilities]
+            autonomous_team = false
+
+            [team]
+            preset = "xhigh_director_low_workers"
+            "#,
+        )
+        .unwrap();
+        assert!(config
+            .autonomous_team_policy(
+                &borg_remote::SessionCapabilities::from(&config.capabilities),
+                borg_remote::CodingProvider::Codex,
+                uuid::Uuid::nil(),
+            )
+            .is_none());
     }
 
     #[test]

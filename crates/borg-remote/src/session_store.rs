@@ -396,6 +396,15 @@ pub struct SessionSummary {
     pub state: SessionState,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionWorkspaceBinding {
+    pub session_id: Uuid,
+    pub workspace_id: Uuid,
+    pub participant_id: Uuid,
+    pub host_id: Option<Uuid>,
+    pub attached_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SessionRecovery {
     pub context_events: Vec<SessionEvent>,
@@ -466,6 +475,22 @@ pub trait SessionStore: Send + Sync {
         sequence: u64,
     ) -> Result<SessionStoreFork>;
     async fn list_sessions(&self, limit: usize) -> Result<Vec<SessionSummary>>;
+    async fn attach_workspace(
+        &self,
+        binding: SessionWorkspaceBinding,
+    ) -> Result<SessionWorkspaceBinding> {
+        anyhow::bail!(
+            "session store cannot attach session {} to workspace {}",
+            binding.session_id,
+            binding.workspace_id
+        )
+    }
+    async fn workspace_binding(
+        &self,
+        _session_id: Uuid,
+    ) -> Result<Option<SessionWorkspaceBinding>> {
+        Ok(None)
+    }
 }
 
 #[derive(Clone)]
@@ -697,6 +722,17 @@ impl SqliteSessionStore {
 
             create index if not exists idx_sessions_activity
                 on sessions (updated_at desc);
+
+            create table if not exists session_workspace_bindings (
+                session_id text primary key references sessions(id) on delete cascade,
+                workspace_id text not null,
+                participant_id text not null,
+                host_id text,
+                attached_at text not null
+            );
+
+            create index if not exists idx_session_workspace_bindings_workspace
+                on session_workspace_bindings (workspace_id, session_id);
             "#,
         )
         .execute(&self.pool)
@@ -744,6 +780,17 @@ impl SqliteSessionStore {
             "create index if not exists idx_sessions_root_activity \
              on sessions (owner_session_id, updated_at desc)",
         )
+        .execute(&self.pool)
+        .await?;
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "insert into session_workspace_bindings \
+             (session_id, workspace_id, participant_id, attached_at) \
+             select id, coalesce(owner_session_id, parent_session_id, id), id, ? from sessions \
+             where true \
+             on conflict(session_id) do nothing",
+        )
+        .bind(now)
         .execute(&self.pool)
         .await?;
         self.ensure_recovery_index().await?;
@@ -993,6 +1040,47 @@ impl SqliteSessionStore {
                 .execute(&self.pool)
                 .await?;
         }
+        let owner_workspace: Option<String> = sqlx::query_scalar(
+            "select workspace_id from session_workspace_bindings where session_id=?",
+        )
+        .bind(owner_session_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        let owner_workspace = owner_workspace
+            .with_context(|| format!("owner session {owner_session_id} has no workspace"))?;
+        sqlx::query(
+            "update session_workspace_bindings set workspace_id=?, participant_id=?, \
+             attached_at=? where session_id=? and workspace_id=session_id and participant_id=session_id",
+        )
+        .bind(&owner_workspace)
+        .bind(session_id.to_string())
+        .bind(Utc::now().to_rfc3339())
+        .bind(session_id.to_string())
+        .execute(&self.pool)
+        .await?;
+        // Legacy child journals are imported after the store migration has
+        // backfilled workspace bindings. Ensure those newly imported rows are
+        // attached before the resumed actor can accept durable team messages.
+        sqlx::query(
+            "insert into session_workspace_bindings \
+             (session_id, workspace_id, participant_id, attached_at) values (?, ?, ?, ?) \
+             on conflict(session_id) do nothing",
+        )
+        .bind(session_id.to_string())
+        .bind(&owner_workspace)
+        .bind(session_id.to_string())
+        .bind(Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        let binding = self
+            .workspace_binding(session_id)
+            .await?
+            .with_context(|| format!("child session {session_id} has no workspace"))?;
+        anyhow::ensure!(
+            binding.workspace_id.to_string() == owner_workspace
+                && binding.participant_id == session_id,
+            "child session {session_id} is attached outside owner workspace {owner_workspace}"
+        );
         Ok(())
     }
 
@@ -1375,6 +1463,17 @@ impl SessionStore for SqliteSessionStore {
         .bind(&now)
         .execute(&self.pool)
         .await?;
+        sqlx::query(
+            "insert into session_workspace_bindings \
+             (session_id, workspace_id, participant_id, attached_at) values (?, ?, ?, ?) \
+             on conflict(session_id) do nothing",
+        )
+        .bind(session_id.to_string())
+        .bind(session_id.to_string())
+        .bind(session_id.to_string())
+        .bind(Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -1601,6 +1700,22 @@ impl SessionStore for SqliteSessionStore {
         .bind(&now)
         .execute(&self.pool)
         .await?;
+        let parent_workspace: Option<String> = sqlx::query_scalar(
+            "select workspace_id from session_workspace_bindings where session_id=?",
+        )
+        .bind(parent_session_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        sqlx::query(
+            "insert into session_workspace_bindings \
+             (session_id, workspace_id, participant_id, attached_at) values (?, ?, ?, ?)",
+        )
+        .bind(session_id.to_string())
+        .bind(parent_workspace.unwrap_or_else(|| parent_session_id.to_string()))
+        .bind(session_id.to_string())
+        .bind(Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await?;
         Ok(SessionStoreFork {
             session_id,
             parent_session_id,
@@ -1638,6 +1753,67 @@ impl SessionStore for SqliteSessionStore {
                 })
             })
             .collect()
+    }
+
+    async fn attach_workspace(
+        &self,
+        binding: SessionWorkspaceBinding,
+    ) -> Result<SessionWorkspaceBinding> {
+        anyhow::ensure!(
+            self.contains_session(binding.session_id).await?,
+            "session {} does not exist",
+            binding.session_id
+        );
+        let existing = self.workspace_binding(binding.session_id).await?;
+        if let Some(existing) = &existing {
+            anyhow::ensure!(
+                existing.workspace_id == binding.workspace_id
+                    && existing.participant_id == binding.participant_id,
+                "session {} is already attached to workspace {} as participant {}",
+                binding.session_id,
+                existing.workspace_id,
+                existing.participant_id
+            );
+        }
+        sqlx::query(
+            "insert into session_workspace_bindings \
+             (session_id, workspace_id, participant_id, host_id, attached_at) \
+             values (?, ?, ?, ?, ?) \
+             on conflict(session_id) do update set host_id=excluded.host_id, \
+             attached_at=excluded.attached_at",
+        )
+        .bind(binding.session_id.to_string())
+        .bind(binding.workspace_id.to_string())
+        .bind(binding.participant_id.to_string())
+        .bind(binding.host_id.map(|id| id.to_string()))
+        .bind(binding.attached_at.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(binding)
+    }
+
+    async fn workspace_binding(&self, session_id: Uuid) -> Result<Option<SessionWorkspaceBinding>> {
+        let row = sqlx::query(
+            "select workspace_id, participant_id, host_id, attached_at \
+             from session_workspace_bindings where session_id=?",
+        )
+        .bind(session_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| {
+            Ok(SessionWorkspaceBinding {
+                session_id,
+                workspace_id: parse_uuid(row.try_get("workspace_id")?)?,
+                participant_id: parse_uuid(row.try_get("participant_id")?)?,
+                host_id: row
+                    .try_get::<Option<&str>, _>("host_id")?
+                    .map(parse_uuid)
+                    .transpose()?,
+                attached_at: DateTime::parse_from_rfc3339(row.try_get("attached_at")?)?
+                    .with_timezone(&Utc),
+            })
+        })
+        .transpose()
     }
 }
 
@@ -1831,6 +2007,61 @@ mod tests {
             .await
             .unwrap();
         (directory, store)
+    }
+
+    #[tokio::test]
+    async fn sessions_have_stable_workspace_bindings_and_children_inherit_the_team_workspace() {
+        let (directory, store) = store().await;
+        let root = Uuid::new_v4();
+        store.create_session(root).await.unwrap();
+        let root_binding = store.workspace_binding(root).await.unwrap().unwrap();
+        assert_eq!(root_binding.workspace_id, root);
+        assert_eq!(root_binding.participant_id, root);
+
+        let host_id = Uuid::new_v4();
+        let reattached = store
+            .attach_workspace(SessionWorkspaceBinding {
+                host_id: Some(host_id),
+                attached_at: Utc::now(),
+                ..root_binding.clone()
+            })
+            .await
+            .unwrap();
+        assert_eq!(reattached.host_id, Some(host_id));
+        assert_eq!(
+            store
+                .workspace_binding(root)
+                .await
+                .unwrap()
+                .unwrap()
+                .host_id,
+            Some(host_id)
+        );
+        assert!(
+            store
+                .attach_workspace(SessionWorkspaceBinding {
+                    workspace_id: Uuid::new_v4(),
+                    ..reattached
+                })
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("already attached")
+        );
+
+        let child = Uuid::new_v4();
+        let child_journal = directory
+            .path()
+            .join("subagents")
+            .join(format!("{child}.jsonl"));
+        let writer = crate::SessionWriterLease::acquire(&child_journal).unwrap();
+        store
+            .register_child_session(root, child, &child_journal, &writer)
+            .await
+            .unwrap();
+        let child_binding = store.workspace_binding(child).await.unwrap().unwrap();
+        assert_eq!(child_binding.workspace_id, root);
+        assert_eq!(child_binding.participant_id, child);
     }
 
     #[tokio::test]

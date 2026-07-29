@@ -1,0 +1,14 @@
+# Place manifests in .borg/extensions/*.toml (project) or
+# $XDG_CONFIG_HOME/borg/extensions/*.toml (user). They only declare skills and
+# stdio MCP servers; Borg does not execute shell hooks or lifecycle scripts.
+manifest_version = 1
+id = "docs"
+version = "1.0.0"
+enabled = true
+required_capabilities = ["multiplayer"]
+skill_roots = ["skills"]
+
+[mcp.search]
+command = "docs-mcp"
+args = ["serve"]
+allowed_tools = ["search", "read"]

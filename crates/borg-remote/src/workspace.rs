@@ -174,6 +174,60 @@ pub struct WorkspaceEvent {
     pub kind: WorkspaceEventKind,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedWork {
+    pub id: Uuid,
+    pub title: String,
+    pub detail: Option<String>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceArtifact {
+    pub id: Uuid,
+    pub work_id: Option<Uuid>,
+    pub name: String,
+    pub media_type: Option<String>,
+    pub uri: String,
+    pub content_hash: Option<String>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceDecision {
+    pub id: Uuid,
+    pub subject: String,
+    pub outcome: String,
+    pub rationale: Option<String>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AtomicWorkClaim {
+    pub work_id: Uuid,
+    pub claimant_id: Uuid,
+    /// The claim id observed by the claimant, or `None` when the work was unclaimed.
+    pub expected_claim_id: Option<Uuid>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkDependency {
+    pub work_id: Uuid,
+    pub depends_on_work_id: Uuid,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkReview {
+    pub work_id: Uuid,
+    pub reviewer_id: Uuid,
+    pub verdict: String,
+    pub detail: Option<String>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceReference {
+    pub id: Uuid,
+    pub label: String,
+    pub target: String,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Provenance {
+    pub subject_id: Uuid,
+    pub source_kind: String,
+    pub source_id: String,
+    pub detail: Option<String>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WorkspaceEventKind {
     Message {
@@ -184,6 +238,38 @@ pub enum WorkspaceEventKind {
         session_id: Uuid,
         session_event_id: Uuid,
         session_sequence: u64,
+        mode: DeliveryMode,
+    },
+    WorkCreated {
+        work: SharedWork,
+        mode: DeliveryMode,
+    },
+    ArtifactPublished {
+        artifact: WorkspaceArtifact,
+        mode: DeliveryMode,
+    },
+    DecisionRecorded {
+        decision: WorkspaceDecision,
+        mode: DeliveryMode,
+    },
+    WorkClaimed {
+        claim: AtomicWorkClaim,
+        mode: DeliveryMode,
+    },
+    DependencyDeclared {
+        dependency: WorkDependency,
+        mode: DeliveryMode,
+    },
+    ReviewRecorded {
+        review: WorkReview,
+        mode: DeliveryMode,
+    },
+    ReferenceAdded {
+        reference: WorkspaceReference,
+        mode: DeliveryMode,
+    },
+    ProvenanceRecorded {
+        provenance: Provenance,
         mode: DeliveryMode,
     },
 }
@@ -253,6 +339,137 @@ impl SqliteWorkspaceStore {
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
     }
+
+    /// Idempotently materialize the stable local identities for one execution
+    /// session. Session events remain authoritative; this only establishes the
+    /// workspace projection they attach to.
+    pub async fn ensure_execution_workspace(
+        &self,
+        workspace_id: Uuid,
+        workspace_name: &str,
+        human_participant_id: Uuid,
+        human_display_name: &str,
+        agent_participant_id: Uuid,
+        agent_display_name: &str,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let mut transaction = self.write().await?;
+        sqlx::query(
+            "insert into workspaces(id,name,created_at) values(?,?,?) \
+             on conflict(id) do nothing",
+        )
+        .bind(workspace_id.to_string())
+        .bind(workspace_name)
+        .bind(&now)
+        .execute(&mut *transaction)
+        .await?;
+        for (participant_id, display_name, kind) in [
+            (
+                human_participant_id,
+                human_display_name,
+                ParticipantKind::Human,
+            ),
+            (
+                agent_participant_id,
+                agent_display_name,
+                ParticipantKind::Agent,
+            ),
+        ] {
+            sqlx::query(
+                "insert into workspace_participants(id,display_name,kind,created_at) \
+                 values(?,?,?,?) on conflict(id) do update set display_name=excluded.display_name",
+            )
+            .bind(participant_id.to_string())
+            .bind(display_name)
+            .bind(serde_json::to_string(&kind)?)
+            .bind(&now)
+            .execute(&mut *transaction)
+            .await?;
+        }
+        for (participant_id, role) in [
+            (human_participant_id, WorkspaceRole::Owner),
+            (agent_participant_id, WorkspaceRole::Editor),
+        ] {
+            sqlx::query(
+                "insert into workspace_members(workspace_id,participant_id,role,joined_at) \
+                 values(?,?,?,?) on conflict(workspace_id,participant_id) \
+                 do update set role=excluded.role",
+            )
+            .bind(workspace_id.to_string())
+            .bind(participant_id.to_string())
+            .bind(serde_json::to_string(&role)?)
+            .bind(&now)
+            .execute(&mut *transaction)
+            .await?;
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub async fn transition_message_delivery(
+        &self,
+        workspace_id: Uuid,
+        message_id: Uuid,
+        recipient_id: Uuid,
+        state: DeliveryState,
+        attempt: Option<DeliveryAttempt>,
+    ) -> Result<Option<RecipientDelivery>> {
+        let sequence: Option<i64> = sqlx::query_scalar(
+            "select sequence from workspace_events \
+             where workspace_id=? and id=? \
+               and json_extract(event_json, '$.kind.type')='message'",
+        )
+        .bind(workspace_id.to_string())
+        .bind(message_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(sequence) = sequence else {
+            return Ok(None);
+        };
+        Ok(Some(
+            <Self as WorkspaceStore>::transition_delivery(
+                self,
+                workspace_id,
+                u64::try_from(sequence)?,
+                recipient_id,
+                state,
+                attempt,
+            )
+            .await?,
+        ))
+    }
+
+    pub async fn pending_message_events(
+        &self,
+        workspace_id: Uuid,
+        recipient_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<(WorkspaceEvent, RecipientDelivery)>> {
+        let deliveries =
+            <Self as WorkspaceStore>::deliveries_after(self, workspace_id, recipient_id, 0, limit)
+                .await?;
+        let mut result = Vec::with_capacity(deliveries.len());
+        for delivery in deliveries {
+            if delivery.state != DeliveryState::Pending {
+                continue;
+            }
+            let event_json: Option<String> = sqlx::query_scalar(
+                "select event_json from workspace_events where workspace_id=? and sequence=?",
+            )
+            .bind(workspace_id.to_string())
+            .bind(i64::try_from(delivery.sequence)?)
+            .fetch_optional(&self.pool)
+            .await?;
+            let Some(event_json) = event_json else {
+                continue;
+            };
+            let event: WorkspaceEvent = serde_json::from_str(&event_json)?;
+            if matches!(event.kind, WorkspaceEventKind::Message { .. }) {
+                result.push((event, delivery));
+            }
+        }
+        Ok(result)
+    }
     async fn write(&self) -> Result<Transaction<'static, Sqlite>, sqlx::Error> {
         self.pool.begin_with(WRITE_TRANSACTION).await
     }
@@ -263,6 +480,9 @@ impl SqliteWorkspaceStore {
       create table if not exists workspace_members (workspace_id text not null references workspaces(id) on delete cascade, participant_id text not null references workspace_participants(id), role text not null, joined_at text not null, primary key(workspace_id,participant_id));
       create table if not exists workspace_threads (id text primary key, workspace_id text not null references workspaces(id) on delete cascade, title text not null, created_at text not null);
       create table if not exists workspace_events (workspace_id text not null references workspaces(id) on delete cascade, sequence integer not null, id text not null, author_id text not null references workspace_participants(id), idempotency_key text not null, canonical_json text not null, event_json text not null, created_at text not null, primary key(workspace_id,sequence), unique(workspace_id,author_id,idempotency_key));
+      create table if not exists workspace_work_items (workspace_id text not null references workspaces(id) on delete cascade, work_id text not null, created_sequence integer not null, primary key(workspace_id,work_id));
+      create table if not exists workspace_work_claims (workspace_id text not null references workspaces(id) on delete cascade, work_id text not null, claim_id text not null, claimant_id text not null references workspace_participants(id), sequence integer not null, primary key(workspace_id,work_id));
+      create table if not exists workspace_work_dependencies (workspace_id text not null references workspaces(id) on delete cascade, work_id text not null, depends_on_work_id text not null, sequence integer not null, primary key(workspace_id,work_id,depends_on_work_id));
       create table if not exists workspace_deliveries (workspace_id text not null, sequence integer not null, recipient_id text not null references workspace_participants(id), mode text not null, state text not null, attempts integer not null default 0, last_attempt_json text, primary key(workspace_id,sequence,recipient_id), foreign key(workspace_id,sequence) references workspace_events(workspace_id,sequence) on delete cascade);
       create table if not exists workspace_presence_leases (workspace_id text not null references workspaces(id) on delete cascade, participant_id text not null references workspace_participants(id), client_id text not null, host_id text, expires_at text not null, primary key(workspace_id,participant_id,client_id));
       create index if not exists idx_workspace_delivery_recipient on workspace_deliveries(workspace_id,recipient_id,sequence);
@@ -306,6 +526,34 @@ impl SqliteWorkspaceStore {
             "audience contains a non-member"
         );
         Ok(ids)
+    }
+
+    async fn work_exists(
+        tx: &mut Transaction<'static, Sqlite>,
+        workspace_id: Uuid,
+        work_id: Uuid,
+    ) -> Result<bool> {
+        let found: i64 = sqlx::query_scalar(
+            "select exists(select 1 from workspace_work_items \
+             where workspace_id=? and work_id=?)",
+        )
+        .bind(workspace_id.to_string())
+        .bind(work_id.to_string())
+        .fetch_one(&mut **tx)
+        .await?;
+        Ok(found != 0)
+    }
+
+    fn canonical_event(mut event: WorkspaceEvent) -> Result<String> {
+        let epoch = DateTime::<Utc>::from_timestamp(0, 0).expect("Unix epoch is valid");
+        event.id = Uuid::nil();
+        event.sequence = 0;
+        event.created_at = epoch;
+        if let WorkspaceEventKind::Message { message, .. } = &mut event.kind {
+            message.id = Uuid::nil();
+            message.created_at = epoch;
+        }
+        Ok(serde_json::to_string(&event)?)
     }
 }
 
@@ -356,15 +604,93 @@ impl WorkspaceStore for SqliteWorkspaceStore {
             "idempotency key must not be empty"
         );
         let mut tx = self.write().await?;
-        let mut canonical = e.clone();
-        canonical.sequence = 0;
-        let canonical = serde_json::to_string(&canonical)?;
-        if let Some(row)=sqlx::query("select canonical_json,event_json from workspace_events where workspace_id=? and author_id=? and idempotency_key=?").bind(e.workspace_id.to_string()).bind(e.author_id.to_string()).bind(&e.idempotency_key).fetch_optional(&mut *tx).await?{if row.get::<String,_>("canonical_json")!=canonical {bail!("idempotency conflict: key was used with a different payload");}return Ok(serde_json::from_str(row.get("event_json"))?)}
+        let canonical = Self::canonical_event(e.clone())?;
+        if let Some(row) = sqlx::query(
+            "select canonical_json,event_json from workspace_events \
+             where workspace_id=? and author_id=? and idempotency_key=?",
+        )
+        .bind(e.workspace_id.to_string())
+        .bind(e.author_id.to_string())
+        .bind(&e.idempotency_key)
+        .fetch_optional(&mut *tx)
+        .await?
+        {
+            if row.get::<String, _>("canonical_json") != canonical {
+                bail!("idempotency conflict: key was used with a different payload");
+            }
+            return Ok(serde_json::from_str(row.get("event_json"))?);
+        }
         let members = self.members(&mut tx, e.workspace_id).await?;
         ensure!(
             members.iter().any(|(id, _)| *id == e.author_id),
             "author is not a workspace member"
         );
+        if let WorkspaceEventKind::WorkCreated { work, .. } = &e.kind {
+            ensure!(
+                !work.title.trim().is_empty(),
+                "work title must not be empty"
+            );
+            ensure!(
+                !Self::work_exists(&mut tx, e.workspace_id, work.id).await?,
+                "work already exists in workspace"
+            );
+        }
+        if let WorkspaceEventKind::ArtifactPublished { artifact, .. } = &e.kind
+            && let Some(work_id) = artifact.work_id
+        {
+            ensure!(
+                Self::work_exists(&mut tx, e.workspace_id, work_id).await?,
+                "artifact work item is not in workspace"
+            );
+        }
+        if let WorkspaceEventKind::WorkClaimed { claim, .. } = &e.kind {
+            ensure!(
+                Self::work_exists(&mut tx, e.workspace_id, claim.work_id).await?,
+                "claimed work item is not in workspace"
+            );
+            ensure!(
+                members.iter().any(|(id, _)| *id == claim.claimant_id),
+                "claimant is not a workspace member"
+            );
+            let current: Option<String> = sqlx::query_scalar(
+                "select claim_id from workspace_work_claims where workspace_id=? and work_id=?",
+            )
+            .bind(e.workspace_id.to_string())
+            .bind(claim.work_id.to_string())
+            .fetch_optional(&mut *tx)
+            .await?;
+            ensure!(
+                current.as_deref()
+                    == claim
+                        .expected_claim_id
+                        .as_ref()
+                        .map(Uuid::to_string)
+                        .as_deref(),
+                "atomic claim conflict"
+            );
+        }
+        if let WorkspaceEventKind::DependencyDeclared { dependency, .. } = &e.kind {
+            ensure!(
+                dependency.work_id != dependency.depends_on_work_id,
+                "work cannot depend on itself"
+            );
+            ensure!(
+                Self::work_exists(&mut tx, e.workspace_id, dependency.work_id).await?
+                    && Self::work_exists(&mut tx, e.workspace_id, dependency.depends_on_work_id,)
+                        .await?,
+                "dependency work item is not in workspace"
+            );
+        }
+        if let WorkspaceEventKind::ReviewRecorded { review, .. } = &e.kind {
+            ensure!(
+                Self::work_exists(&mut tx, e.workspace_id, review.work_id).await?,
+                "reviewed work item is not in workspace"
+            );
+            ensure!(
+                members.iter().any(|(id, _)| *id == review.reviewer_id),
+                "reviewer is not a workspace member"
+            );
+        }
         let (mode, audience) = match &e.kind {
             WorkspaceEventKind::Message { message, mode } => {
                 ensure!(
@@ -372,14 +698,66 @@ impl WorkspaceStore for SqliteWorkspaceStore {
                     "message workspace/author mismatch"
                 );
                 if let Some(thread) = message.thread_id {
-                    let found:i64=sqlx::query_scalar("select exists(select 1 from workspace_threads where id=? and workspace_id=?)").bind(thread.to_string()).bind(e.workspace_id.to_string()).fetch_one(&mut *tx).await?;
+                    let found: i64 = sqlx::query_scalar(
+                        "select exists(select 1 from workspace_threads \
+                         where id=? and workspace_id=?)",
+                    )
+                    .bind(thread.to_string())
+                    .bind(e.workspace_id.to_string())
+                    .fetch_one(&mut *tx)
+                    .await?;
                     ensure!(found != 0, "thread is not in workspace");
+                }
+                if let Some(reply_to) = message.reply_to_message_id {
+                    let found: i64 = sqlx::query_scalar(
+                        "select exists(\
+                            select 1 from workspace_events \
+                            where workspace_id=? \
+                              and json_extract(event_json, '$.kind.message.id')=?\
+                         )",
+                    )
+                    .bind(e.workspace_id.to_string())
+                    .bind(reply_to.to_string())
+                    .fetch_one(&mut *tx)
+                    .await?;
+                    ensure!(found != 0, "reply target is not in workspace");
                 }
                 (*mode, &message.audience)
             }
-            WorkspaceEventKind::SessionEvent { mode, .. } => (*mode, &Audience::Workspace),
+            WorkspaceEventKind::SessionEvent { mode, .. }
+            | WorkspaceEventKind::WorkCreated { mode, .. }
+            | WorkspaceEventKind::ArtifactPublished { mode, .. }
+            | WorkspaceEventKind::DecisionRecorded { mode, .. }
+            | WorkspaceEventKind::WorkClaimed { mode, .. }
+            | WorkspaceEventKind::DependencyDeclared { mode, .. }
+            | WorkspaceEventKind::ReviewRecorded { mode, .. }
+            | WorkspaceEventKind::ReferenceAdded { mode, .. }
+            | WorkspaceEventKind::ProvenanceRecorded { mode, .. } => (*mode, &Audience::Workspace),
         };
-        let recipients = Self::recipients(audience, &members)?;
+        let mut recipients = Self::recipients(audience, &members)?;
+        let visible_participants = recipients
+            .iter()
+            .copied()
+            .chain(std::iter::once(e.author_id))
+            .collect::<Vec<_>>();
+        if let WorkspaceEventKind::Message { message, .. } = &e.kind {
+            for mention in &message.body.mentions {
+                let start = usize::try_from(mention.start)?;
+                let end = usize::try_from(mention.end)?;
+                ensure!(
+                    start < end
+                        && end <= message.body.text.len()
+                        && message.body.text.is_char_boundary(start)
+                        && message.body.text.is_char_boundary(end),
+                    "mention range is not a valid UTF-8 text range"
+                );
+                ensure!(
+                    visible_participants.contains(&mention.participant_id),
+                    "mentioned participant is not visible in the message audience"
+                );
+            }
+        }
+        recipients.retain(|recipient| *recipient != e.author_id);
         let seq:i64=sqlx::query_scalar("update workspaces set next_sequence=next_sequence+1 where id=? returning next_sequence-1").bind(e.workspace_id.to_string()).fetch_one(&mut *tx).await?;
         e.sequence = u64::try_from(seq)?;
         let json = serde_json::to_string(&e)?;
@@ -394,6 +772,37 @@ impl WorkspaceStore for SqliteWorkspaceStore {
             .bind(e.created_at.to_rfc3339())
             .execute(&mut *tx)
             .await?;
+        if let WorkspaceEventKind::WorkCreated { work, .. } = &e.kind {
+            sqlx::query("insert into workspace_work_items values(?,?,?)")
+                .bind(e.workspace_id.to_string())
+                .bind(work.id.to_string())
+                .bind(seq)
+                .execute(&mut *tx)
+                .await?;
+        }
+        if let WorkspaceEventKind::WorkClaimed { claim, .. } = &e.kind {
+            sqlx::query(
+                "insert into workspace_work_claims values(?,?,?,?,?) \
+                 on conflict(workspace_id,work_id) do update set \
+                 claim_id=excluded.claim_id, claimant_id=excluded.claimant_id, sequence=excluded.sequence",
+            )
+            .bind(e.workspace_id.to_string())
+            .bind(claim.work_id.to_string())
+            .bind(e.id.to_string())
+            .bind(claim.claimant_id.to_string())
+            .bind(seq)
+            .execute(&mut *tx)
+            .await?;
+        }
+        if let WorkspaceEventKind::DependencyDeclared { dependency, .. } = &e.kind {
+            sqlx::query("insert into workspace_work_dependencies values(?,?,?,?)")
+                .bind(e.workspace_id.to_string())
+                .bind(dependency.work_id.to_string())
+                .bind(dependency.depends_on_work_id.to_string())
+                .bind(seq)
+                .execute(&mut *tx)
+                .await?;
+        }
         for recipient in recipients {
             sqlx::query("insert into workspace_deliveries(workspace_id,sequence,recipient_id,mode,state) values(?,?,?,?,?)").bind(e.workspace_id.to_string()).bind(seq).bind(recipient.to_string()).bind(serde_json::to_string(&mode)?).bind(serde_json::to_string(&DeliveryState::Pending)?).execute(&mut *tx).await?;
         }
@@ -407,9 +816,32 @@ impl WorkspaceStore for SqliteWorkspaceStore {
         after: u64,
         limit: usize,
     ) -> Result<Vec<WorkspaceEvent>> {
-        let member:i64=sqlx::query_scalar("select exists(select 1 from workspace_members where workspace_id=? and participant_id=?)").bind(w.to_string()).bind(viewer.to_string()).fetch_one(&self.pool).await?;
+        let member: i64 = sqlx::query_scalar(
+            "select exists(select 1 from workspace_members \
+             where workspace_id=? and participant_id=?)",
+        )
+        .bind(w.to_string())
+        .bind(viewer.to_string())
+        .fetch_one(&self.pool)
+        .await?;
         ensure!(member != 0, "viewer is not a workspace member");
-        let rows=sqlx::query("select e.event_json from workspace_events e join workspace_deliveries d on d.workspace_id=e.workspace_id and d.sequence=e.sequence where d.workspace_id=? and d.recipient_id=? and d.sequence>? order by d.sequence limit ?").bind(w.to_string()).bind(viewer.to_string()).bind(i64::try_from(after)?).bind(i64::try_from(limit)?).fetch_all(&self.pool).await?;
+        let rows = sqlx::query(
+            "select e.event_json from workspace_events e \
+             where e.workspace_id=? and e.sequence>? \
+               and (e.author_id=? or exists(\
+                    select 1 from workspace_deliveries d \
+                    where d.workspace_id=e.workspace_id and d.sequence=e.sequence \
+                      and d.recipient_id=?\
+               )) \
+             order by e.sequence limit ?",
+        )
+        .bind(w.to_string())
+        .bind(i64::try_from(after)?)
+        .bind(viewer.to_string())
+        .bind(viewer.to_string())
+        .bind(i64::try_from(limit)?)
+        .fetch_all(&self.pool)
+        .await?;
         rows.into_iter()
             .map(|r| Ok(serde_json::from_str(r.get("event_json"))?))
             .collect()
@@ -450,6 +882,21 @@ impl WorkspaceStore for SqliteWorkspaceStore {
         let mut tx = self.write().await?;
         let row=sqlx::query("select mode,state,attempts,last_attempt_json from workspace_deliveries where workspace_id=? and sequence=? and recipient_id=?").bind(w.to_string()).bind(i64::try_from(s)?).bind(p.to_string()).fetch_optional(&mut *tx).await?.context("recipient has no delivery")?;
         let current: DeliveryState = serde_json::from_str(row.get("state"))?;
+        if current == next {
+            tx.commit().await?;
+            return Ok(RecipientDelivery {
+                workspace_id: w,
+                sequence: s,
+                recipient_id: p,
+                mode: serde_json::from_str(row.get("mode"))?,
+                state: current,
+                attempts: u32::try_from(row.get::<i64, _>("attempts"))?,
+                last_attempt: row
+                    .get::<Option<String>, _>("last_attempt_json")
+                    .map(|value| serde_json::from_str(&value))
+                    .transpose()?,
+            });
+        }
         let allowed = matches!(
             (current, next),
             (
@@ -457,16 +904,10 @@ impl WorkspaceStore for SqliteWorkspaceStore {
                 DeliveryState::Admitted | DeliveryState::Failed | DeliveryState::Recalled
             ) | (
                 DeliveryState::Admitted,
-                DeliveryState::Acknowledged | DeliveryState::Failed | DeliveryState::Recalled
-            ) | (
-                DeliveryState::Failed,
-                DeliveryState::Pending | DeliveryState::Recalled
-            )
+                DeliveryState::Acknowledged | DeliveryState::Failed
+            ) | (DeliveryState::Failed, DeliveryState::Pending)
         );
-        ensure!(
-            allowed || current == next,
-            "invalid non-monotonic delivery transition"
-        );
+        ensure!(allowed, "invalid non-monotonic delivery transition");
         let attempts: i64 = row.get("attempts");
         let attempts = attempts + if attempt.is_some() { 1 } else { 0 };
         sqlx::query("update workspace_deliveries set state=?,attempts=?,last_attempt_json=coalesce(?,last_attempt_json) where workspace_id=? and sequence=? and recipient_id=?").bind(serde_json::to_string(&next)?).bind(attempts).bind(attempt.as_ref().map(serde_json::to_string).transpose()?).bind(w.to_string()).bind(i64::try_from(s)?).bind(p.to_string()).execute(&mut *tx).await?;
@@ -488,6 +929,18 @@ impl WorkspaceStore for SqliteWorkspaceStore {
         ensure!(
             l.expires_at > Utc::now(),
             "presence lease must expire in the future"
+        );
+        let member: i64 = sqlx::query_scalar(
+            "select exists(select 1 from workspace_members \
+             where workspace_id=? and participant_id=?)",
+        )
+        .bind(l.workspace_id.to_string())
+        .bind(l.participant_id.to_string())
+        .fetch_one(&self.pool)
+        .await?;
+        ensure!(
+            member != 0,
+            "presence participant is not a workspace member"
         );
         sqlx::query("insert into workspace_presence_leases values(?,?,?,?,?) on conflict(workspace_id,participant_id,client_id) do update set host_id=excluded.host_id,expires_at=excluded.expires_at").bind(l.workspace_id.to_string()).bind(l.participant_id.to_string()).bind(l.client_id.to_string()).bind(l.host_id.map(|x|x.to_string())).bind(l.expires_at.to_rfc3339()).execute(&self.pool).await?;
         Ok(())
@@ -614,20 +1067,95 @@ mod tests {
                 .contains("idempotency conflict")
         );
     }
+
+    #[tokio::test]
+    async fn mentions_and_replies_are_validated_by_the_single_workspace_authority() {
+        let (s, w, a, b, c) = fixture().await;
+        let first = s
+            .append(event(
+                w.id,
+                a.id,
+                Audience::Direct { participant: b.id },
+                "first",
+            ))
+            .await
+            .unwrap();
+        let WorkspaceEventKind::Message {
+            message: first_message,
+            ..
+        } = first.kind
+        else {
+            panic!("message event")
+        };
+        let mut reply = event(w.id, a.id, Audience::Direct { participant: b.id }, "reply");
+        let WorkspaceEventKind::Message { message, .. } = &mut reply.kind else {
+            panic!("message event")
+        };
+        message.reply_to_message_id = Some(first_message.id);
+        message.body = WorkspaceMessageBody {
+            text: "hé".into(),
+            mentions: vec![StructuredMention {
+                participant_id: b.id,
+                start: 0,
+                end: 3,
+            }],
+        };
+        s.append(reply).await.unwrap();
+
+        let mut invalid = event(
+            w.id,
+            a.id,
+            Audience::Direct { participant: b.id },
+            "invalid",
+        );
+        let WorkspaceEventKind::Message { message, .. } = &mut invalid.kind else {
+            panic!("message event")
+        };
+        message.body.mentions = vec![StructuredMention {
+            participant_id: c.id,
+            start: 1,
+            end: 2,
+        }];
+        assert!(s.append(invalid).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn exact_idempotent_retry_returns_the_original_event() {
+        let (s, w, a, b, _) = fixture().await;
+        let original = event(w.id, a.id, Audience::Direct { participant: b.id }, "same");
+        let first = s.append(original.clone()).await.unwrap();
+        let mut retry_envelope = event(w.id, a.id, Audience::Direct { participant: b.id }, "same");
+        retry_envelope.created_at = original.created_at + chrono::Duration::seconds(1);
+        if let WorkspaceEventKind::Message { message, .. } = &mut retry_envelope.kind {
+            message.created_at = retry_envelope.created_at;
+        }
+        let retry = s.append(retry_envelope).await.unwrap();
+        assert_eq!(retry, first);
+        assert_eq!(s.replay(w.id, a.id, 0, 10).await.unwrap().len(), 1);
+    }
+
     #[tokio::test]
     async fn delivery_outcomes_are_independent() {
-        let (s, w, a, b, _) = fixture().await;
+        let (s, w, a, b, c) = fixture().await;
+        s.add_member(WorkspaceMembership {
+            workspace_id: w.id,
+            participant_id: c.id,
+            role: WorkspaceRole::Contributor,
+            joined_at: Utc::now(),
+        })
+        .await
+        .unwrap();
         let e = s
             .append(event(w.id, a.id, Audience::Workspace, "k"))
             .await
             .unwrap();
-        s.transition_delivery(w.id, e.sequence, a.id, DeliveryState::Admitted, None)
+        s.transition_delivery(w.id, e.sequence, b.id, DeliveryState::Admitted, None)
             .await
             .unwrap();
         s.transition_delivery(
             w.id,
             e.sequence,
-            b.id,
+            c.id,
             DeliveryState::Failed,
             Some(DeliveryAttempt {
                 attempted_at: Utc::now(),
@@ -637,13 +1165,125 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            s.deliveries_after(w.id, a.id, 0, 2).await.unwrap()[0].state,
+            s.deliveries_after(w.id, b.id, 0, 2).await.unwrap()[0].state,
             DeliveryState::Admitted
         );
         assert_eq!(
-            s.deliveries_after(w.id, b.id, 0, 2).await.unwrap()[0].state,
+            s.deliveries_after(w.id, c.id, 0, 2).await.unwrap()[0].state,
             DeliveryState::Failed
         );
+        assert!(
+            s.transition_delivery(w.id, e.sequence, b.id, DeliveryState::Recalled, None)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn recalled_pending_message_is_not_redelivered() {
+        let (store, workspace, author, recipient, _) = fixture().await;
+        let event = store
+            .append(event(
+                workspace.id,
+                author.id,
+                Audience::Direct {
+                    participant: recipient.id,
+                },
+                "recall-before-admission",
+            ))
+            .await
+            .unwrap();
+        let message_id = match &event.kind {
+            WorkspaceEventKind::Message { message, .. } => message.id,
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            store
+                .pending_message_events(workspace.id, recipient.id, 10)
+                .await
+                .unwrap()[0]
+                .0
+                .id,
+            event.id
+        );
+        store
+            .transition_delivery(
+                workspace.id,
+                event.sequence,
+                recipient.id,
+                DeliveryState::Recalled,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .pending_message_events(workspace.id, recipient.id, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .deliveries_after(workspace.id, recipient.id, 0, 10)
+                .await
+                .unwrap()[0]
+                .state,
+            DeliveryState::Recalled
+        );
+        assert_ne!(message_id, Uuid::nil());
+    }
+
+    #[tokio::test]
+    async fn boundary_and_wake_messages_preserve_independent_order_and_ids() {
+        let (store, workspace, author, recipient, _) = fixture().await;
+        let mut boundary = event(
+            workspace.id,
+            author.id,
+            Audience::Direct {
+                participant: recipient.id,
+            },
+            "boundary",
+        );
+        let boundary_id = match &boundary.kind {
+            WorkspaceEventKind::Message { message, .. } => message.id,
+            _ => unreachable!(),
+        };
+        if let WorkspaceEventKind::Message { mode, .. } = &mut boundary.kind {
+            *mode = DeliveryMode::Boundary;
+        }
+        let mut wake = event(
+            workspace.id,
+            author.id,
+            Audience::Direct {
+                participant: recipient.id,
+            },
+            "wake",
+        );
+        let wake_id = match &wake.kind {
+            WorkspaceEventKind::Message { message, .. } => message.id,
+            _ => unreachable!(),
+        };
+        if let WorkspaceEventKind::Message { mode, .. } = &mut wake.kind {
+            *mode = DeliveryMode::Wake;
+        }
+        store.append(boundary).await.unwrap();
+        store.append(wake).await.unwrap();
+        let pending = store
+            .pending_message_events(workspace.id, recipient.id, 10)
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 2);
+        let ids = pending
+            .iter()
+            .map(|(event, _)| match &event.kind {
+                WorkspaceEventKind::Message { message, .. } => message.id,
+                _ => unreachable!(),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![boundary_id, wake_id]);
+        assert_eq!(pending[0].1.mode, DeliveryMode::Boundary);
+        assert_eq!(pending[1].1.mode, DeliveryMode::Wake);
     }
     #[tokio::test]
     async fn unauthorized_membership_and_replay_fail() {
@@ -671,7 +1311,8 @@ mod tests {
         ))
         .await
         .unwrap();
-        assert!(s.replay(w.id, a.id, 0, 10).await.unwrap().is_empty());
+        assert_eq!(s.replay(w.id, a.id, 0, 10).await.unwrap().len(), 1);
+        assert_eq!(s.replay(w.id, b.id, 0, 10).await.unwrap().len(), 1);
         assert!(s.replay(w.id, c.id, 0, 10).await.is_err());
     }
     #[tokio::test]
@@ -694,5 +1335,144 @@ mod tests {
         let mut q = vec![l.unwrap().sequence, r.unwrap().sequence];
         q.sort_unstable();
         assert_eq!(q, vec![1, 2]);
+    }
+
+    fn coordination_event(w: Uuid, a: Uuid, key: &str, kind: WorkspaceEventKind) -> WorkspaceEvent {
+        WorkspaceEvent {
+            id: Uuid::new_v4(),
+            workspace_id: w,
+            sequence: 0,
+            author_id: a,
+            idempotency_key: key.into(),
+            created_at: Utc::now(),
+            kind,
+        }
+    }
+
+    #[tokio::test]
+    async fn coordination_payloads_persist_and_replay() {
+        let (s, w, a, b, _) = fixture().await;
+        let work = SharedWork {
+            id: Uuid::new_v4(),
+            title: "implement kernel".into(),
+            detail: None,
+        };
+        let dependency_work = SharedWork {
+            id: Uuid::new_v4(),
+            title: "define contracts".into(),
+            detail: None,
+        };
+        let artifact = WorkspaceArtifact {
+            id: Uuid::new_v4(),
+            work_id: Some(work.id),
+            name: "design.md".into(),
+            media_type: Some("text/markdown".into()),
+            uri: "workspace://design.md".into(),
+            content_hash: Some("abc".into()),
+        };
+        let decision = WorkspaceDecision {
+            id: Uuid::new_v4(),
+            subject: "storage".into(),
+            outcome: "sqlite".into(),
+            rationale: Some("local durability".into()),
+        };
+        let variants = vec![
+            WorkspaceEventKind::WorkCreated {
+                work: work.clone(),
+                mode: DeliveryMode::Notify,
+            },
+            WorkspaceEventKind::WorkCreated {
+                work: dependency_work.clone(),
+                mode: DeliveryMode::Notify,
+            },
+            WorkspaceEventKind::ArtifactPublished {
+                artifact,
+                mode: DeliveryMode::Notify,
+            },
+            WorkspaceEventKind::DecisionRecorded {
+                decision,
+                mode: DeliveryMode::Notify,
+            },
+            WorkspaceEventKind::WorkClaimed {
+                claim: AtomicWorkClaim {
+                    work_id: work.id,
+                    claimant_id: b.id,
+                    expected_claim_id: None,
+                },
+                mode: DeliveryMode::Notify,
+            },
+            WorkspaceEventKind::DependencyDeclared {
+                dependency: WorkDependency {
+                    work_id: work.id,
+                    depends_on_work_id: dependency_work.id,
+                },
+                mode: DeliveryMode::Notify,
+            },
+            WorkspaceEventKind::ReviewRecorded {
+                review: WorkReview {
+                    work_id: work.id,
+                    reviewer_id: b.id,
+                    verdict: "approved".into(),
+                    detail: None,
+                },
+                mode: DeliveryMode::Notify,
+            },
+            WorkspaceEventKind::ReferenceAdded {
+                reference: WorkspaceReference {
+                    id: Uuid::new_v4(),
+                    label: "spec".into(),
+                    target: "https://example.invalid/spec".into(),
+                },
+                mode: DeliveryMode::Notify,
+            },
+            WorkspaceEventKind::ProvenanceRecorded {
+                provenance: Provenance {
+                    subject_id: work.id,
+                    source_kind: "import".into(),
+                    source_id: "legacy-7".into(),
+                    detail: None,
+                },
+                mode: DeliveryMode::Notify,
+            },
+        ];
+        for (index, kind) in variants.into_iter().enumerate() {
+            s.append(coordination_event(
+                w.id,
+                a.id,
+                &format!("coord-{index}"),
+                kind,
+            ))
+            .await
+            .unwrap();
+        }
+        let replay = s.replay(w.id, b.id, 0, 20).await.unwrap();
+        assert_eq!(replay.len(), 9);
+        assert!(matches!(
+            replay[0].kind,
+            WorkspaceEventKind::WorkCreated { .. }
+        ));
+        assert!(matches!(
+            replay[8].kind,
+            WorkspaceEventKind::ProvenanceRecorded { .. }
+        ));
+        assert!(
+            s.append(coordination_event(
+                w.id,
+                a.id,
+                "claim-conflict",
+                WorkspaceEventKind::WorkClaimed {
+                    claim: AtomicWorkClaim {
+                        work_id: work.id,
+                        claimant_id: b.id,
+                        expected_claim_id: None
+                    },
+                    mode: DeliveryMode::Notify
+                }
+            ))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("atomic claim conflict")
+        );
     }
 }

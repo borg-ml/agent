@@ -47,13 +47,25 @@ Copy [`configs/agent.example.toml`](configs/agent.example.toml) to
 `$XDG_CONFIG_HOME/borg/agent.toml` (normally
 `~/.config/borg/agent.toml`). The typed config supports slash-command aliases,
 keybindings, provider-neutral stdio MCP servers, and the model/effort used by
-native Auto approval review.
+native Auto approval review. Optional multiplayer, subagent, autonomous-team,
+shared-work, presence, cloud/web relay, and telemetry capabilities can be
+disabled independently; parent capability disablement cascades to dependent
+features. Run `borg capabilities` (or `borg capabilities --json`) to inspect
+the effective runtime.
+
+Telemetry is disabled by default, and this release does not initialize a
+telemetry exporter. Future telemetry support must document the exact emitted
+fields and retention rather than treating README disclosure as consent.
 
 Copy [`configs/editor.example.toml`](configs/editor.example.toml) to
 `$XDG_CONFIG_HOME/borg/editor.toml` to configure transcript presentation and
 active-turn input policy. `active_messages = "steer"` makes Enter inject at the
 next Codex boundary; `"queue"` makes Enter start a later turn. The dedicated
 queue keybinding remains available in either mode.
+
+Automated CLI/terminal checks should use `borg agent --ephemeral --local-only`.
+That creates a temporary session store and removes it when the process exits,
+so health checks do not pollute the user's resume history or Remote workspace.
 
 ## Extend Borg
 

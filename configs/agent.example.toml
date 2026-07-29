@@ -4,6 +4,36 @@
 # Aliases expand to built-in slash commands. They do not execute shell code,
 # load plugins, or register lifecycle hooks.
 
+# Optional Borg subsystems. Defaults preserve the current full-featured
+# experience. Disabling a parent automatically makes dependent features
+# inactive: autonomous_team depends on subagents; shared_work and presence
+# depend on multiplayer; web_relay depends on cloud_sync.
+[capabilities]
+multiplayer = true
+subagents = true
+autonomous_team = true
+shared_work = true
+presence = true
+cloud_sync = true
+web_relay = true
+telemetry = false
+# `shared_work`, `presence`, `cloud_sync`, `web_relay`, and `telemetry` are
+# reserved provider-neutral declarations in this CLI release. They do not
+# initialize a runtime or register tools yet.
+
+# Optional autonomous-team policy. Omit this entire table to preserve ordinary
+# manual subagent launches and their inherited model/effort settings.
+# The preset takes effect only while `autonomous_team` is effective. It gives
+# the root xhigh effort when no --effort was supplied, gives spawned workers
+# low effort unless their tool request overrides it, and bounds concurrent
+# workers. Cost is integer micro-USD to avoid floating-point ambiguity.
+# [team]
+# preset = "xhigh_director_low_workers"
+# worker_concurrency = 3
+# max_tokens = 200000
+# max_cost_microusd = 500000
+# max_wall_time_ms = 3600000
+
 [commands.aliases]
 quick = "/fast on"
 normal = "/fast off"

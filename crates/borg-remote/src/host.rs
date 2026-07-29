@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use chrono::Utc;
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
@@ -16,12 +17,13 @@ use uuid::Uuid;
 use crate::receipt::{ReceiptState, ReceiptStore, atomic_write_secure};
 use crate::{
     CodingProvider, HostCapabilities, HostCommand, HostCommandEnvelope, HostHeartbeat,
-    LaunchSession, ProviderCapability, REMOTE_PROTOCOL_VERSION, RemoteHost, SessionEvent,
-    SessionLiveEvent, SessionStore, SessionWriterLease, SqliteSessionStore,
-    WorkspaceCommandErrorCode, WorkspaceCommandOutcome, WorkspaceCommandRequest,
-    WorkspaceCommandResponse, WorkspaceFilesystemErrorCode, WorkspaceFilesystemOutcome,
-    WorkspaceFilesystemRequest, WorkspaceFilesystemResponse, execute_workspace_command,
-    execute_workspace_filesystem, run_agent_session_with_store_and_writer,
+    LaunchSession, ProviderCapability, REMOTE_PROTOCOL_VERSION, RemoteHost, RemoteHostIdentity,
+    SessionEvent, SessionLiveEvent, SessionStore, SessionWriterLease, SqliteSessionStore,
+    WorkspaceAttachment, WorkspaceCommandErrorCode, WorkspaceCommandOutcome,
+    WorkspaceCommandRequest, WorkspaceCommandResponse, WorkspaceFilesystemErrorCode,
+    WorkspaceFilesystemOutcome, WorkspaceFilesystemRequest, WorkspaceFilesystemResponse,
+    execute_workspace_command, execute_workspace_filesystem,
+    run_agent_session_with_store_and_writer,
 };
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -77,6 +79,32 @@ struct EventBatch<'a> {
 struct LiveStateBatch<'a> {
     session_id: Uuid,
     events: &'a [SessionLiveEvent],
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedLaunchMetadata {
+    request: LaunchSession,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    attachment: Option<WorkspaceAttachment>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StoredLaunchMetadata {
+    Current(PersistedLaunchMetadata),
+    Legacy(LaunchSession),
+}
+
+impl StoredLaunchMetadata {
+    fn into_current(self) -> PersistedLaunchMetadata {
+        match self {
+            Self::Current(metadata) => metadata,
+            Self::Legacy(request) => PersistedLaunchMetadata {
+                request,
+                attachment: None,
+            },
+        }
+    }
 }
 
 async fn upload_event_payloads(
@@ -267,6 +295,11 @@ async fn probe_capabilities_with_managed_kimi(
         providers,
         roots,
         can_launch: true,
+        workspace_attachment: Some(crate::WorkspaceAttachmentCapabilities {
+            presence_leases: true,
+            approval_provenance: true,
+            reconnect_sync_cursors: true,
+        }),
     }
 }
 
@@ -684,6 +717,11 @@ async fn heartbeat(
             hostname: hostname(),
             capabilities,
             acknowledged_command_sequence,
+            identity: Some(RemoteHostIdentity {
+                host_id: config.host_id,
+                hostname: hostname(),
+                platform: platform(),
+            }),
         })
         .send()
         .await
@@ -835,10 +873,13 @@ async fn dispatch(
     if let HostCommand::Launch {
         session_id,
         request,
+        attachment,
     } = command
     {
         let metadata_path = session_root.join(format!("{session_id}.launch.json"));
-        if let Err(error) = persist_launch_metadata(&metadata_path, &request) {
+        if let Err(error) = validate_workspace_attachment(&config, session_id, attachment.as_ref())
+            .and_then(|()| persist_launch_metadata(&metadata_path, &request, attachment.as_ref()))
+        {
             tracing::error!(%error, %session_id, "failed to persist remote session launch");
             return false;
         }
@@ -856,8 +897,17 @@ async fn dispatch(
                 let metadata_path = session_root.join(format!("{session_id}.launch.json"));
                 let request = fs::read(&metadata_path)
                     .ok()
-                    .and_then(|bytes| serde_json::from_slice::<LaunchSession>(&bytes).ok());
-                if let Some(request) = request {
+                    .and_then(|bytes| serde_json::from_slice::<StoredLaunchMetadata>(&bytes).ok())
+                    .map(StoredLaunchMetadata::into_current);
+                if let Some(metadata) = request {
+                    if let Err(error) = validate_workspace_attachment(
+                        &config,
+                        session_id,
+                        metadata.attachment.as_ref(),
+                    ) {
+                        tracing::error!(%error, %session_id, "stored launch attachment is invalid");
+                        return false;
+                    }
                     Some(
                         spawn_host_session(
                             client,
@@ -865,7 +915,7 @@ async fn dispatch(
                             session_root,
                             sessions,
                             session_id,
-                            request,
+                            metadata.request,
                         )
                         .await,
                     )
@@ -1019,13 +1069,48 @@ fn indeterminate_command_response(
     }
 }
 
-fn persist_launch_metadata(path: &Path, request: &LaunchSession) -> Result<()> {
+fn validate_workspace_attachment(
+    config: &HostConfig,
+    session_id: Uuid,
+    attachment: Option<&WorkspaceAttachment>,
+) -> Result<()> {
+    let Some(attachment) = attachment else {
+        return Ok(());
+    };
+    if attachment.workspace_id.is_some() != attachment.participant_id.is_some() {
+        bail!("workspace attachment requires workspace_id and participant_id together");
+    }
+    if let Some(identity) = &attachment.host_identity
+        && identity.host_id != config.host_id
+    {
+        bail!("workspace attachment host identity does not match enrolled host");
+    }
+    if let Some(lease) = &attachment.presence_lease
+        && lease.expires_at <= Utc::now()
+    {
+        bail!("workspace presence lease has expired");
+    }
+    if attachment.reconnect_sync_cursors.is_some() && session_id.is_nil() {
+        bail!("workspace reconnect cursors require a non-nil session id");
+    }
+    Ok(())
+}
+
+fn persist_launch_metadata(
+    path: &Path,
+    request: &LaunchSession,
+    attachment: Option<&WorkspaceAttachment>,
+) -> Result<()> {
+    let current = PersistedLaunchMetadata {
+        request: request.clone(),
+        attachment: attachment.cloned(),
+    };
     if path.exists() {
         let bytes = fs::read(path)
             .with_context(|| format!("failed to read launch metadata {}", path.display()))?;
-        let existing: LaunchSession = serde_json::from_slice(&bytes)
+        let existing: StoredLaunchMetadata = serde_json::from_slice(&bytes)
             .with_context(|| format!("invalid launch metadata {}", path.display()))?;
-        if serde_json::to_value(existing)? != serde_json::to_value(request)? {
+        if serde_json::to_value(existing.into_current())? != serde_json::to_value(&current)? {
             bail!(
                 "session launch metadata already exists for a different launch request: {}",
                 path.display()
@@ -1033,7 +1118,7 @@ fn persist_launch_metadata(path: &Path, request: &LaunchSession) -> Result<()> {
         }
         return Ok(());
     }
-    atomic_write_secure(path, &serde_json::to_vec_pretty(request)?)
+    atomic_write_secure(path, &serde_json::to_vec_pretty(&current)?)
         .with_context(|| format!("failed to atomically write {}", path.display()))
 }
 
@@ -1256,10 +1341,43 @@ fn platform() -> String {
 
 #[cfg(test)]
 mod tests {
+    use chrono::Duration as ChronoDuration;
     use tempfile::tempdir;
 
     use super::*;
     use crate::WorkspaceFilesystemOperation;
+
+    #[test]
+    fn workspace_attachment_requires_coherent_identity_and_live_lease() {
+        let root = tempdir().unwrap();
+        let config = test_config(root.path());
+        let attachment = WorkspaceAttachment {
+            workspace_id: Some(Uuid::new_v4()),
+            participant_id: Some(Uuid::new_v4()),
+            host_identity: Some(RemoteHostIdentity {
+                host_id: config.host_id,
+                hostname: "test".to_string(),
+                platform: "test".to_string(),
+            }),
+            host_capabilities: None,
+            presence_lease: Some(crate::RemotePresenceLease {
+                lease_id: Uuid::new_v4(),
+                expires_at: Utc::now() + ChronoDuration::minutes(1),
+            }),
+            approval_provenance: None,
+            reconnect_sync_cursors: Some(crate::RemoteReconnectSyncCursors {
+                command_cursor: 3,
+                event_cursor: 5,
+                live_revision: 8,
+            }),
+        };
+        assert!(validate_workspace_attachment(&config, Uuid::new_v4(), Some(&attachment)).is_ok());
+
+        let mut expired = attachment;
+        expired.presence_lease.as_mut().unwrap().expires_at =
+            Utc::now() - ChronoDuration::seconds(1);
+        assert!(validate_workspace_attachment(&config, Uuid::new_v4(), Some(&expired)).is_err());
+    }
 
     #[test]
     fn host_cwd_must_stay_inside_enrolled_root() {

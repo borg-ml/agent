@@ -2,6 +2,7 @@ mod agent_config;
 mod agent_mcp;
 mod cli;
 mod editor_preferences;
+mod extensions;
 mod remote_commands;
 mod sleep_inhibitor;
 mod terminal_ui;
@@ -13,7 +14,7 @@ use std::fs::{self, OpenOptions};
 use std::sync::Mutex;
 use tracing_subscriber::fmt::writer::BoxMakeWriter;
 
-use crate::cli::{Cli, Command, LocalAgentCliArgs};
+use crate::cli::{CapabilitiesArgs, Cli, Command, ExtensionsArgs, LocalAgentCliArgs};
 use crate::remote_commands::{run_local_agent, run_remote_command};
 
 #[tokio::main]
@@ -32,8 +33,53 @@ async fn main() -> Result<()> {
         Command::Resume { session } => run_local_agent(LocalAgentCliArgs::resume(session)).await,
         Command::Remote { command } => run_remote_command(command).await,
         Command::Update(args) => updater::run(args).await,
+        Command::Capabilities(args) => print_capabilities(args),
+        Command::Extensions(args) => print_extensions(args),
         Command::AgentMcp => agent_mcp::run().await,
     }
+}
+
+fn print_extensions(args: ExtensionsArgs) -> Result<()> {
+    let config = agent_config::AgentConfig::load(None)?;
+    let (catalog, _) = extensions::discover(&std::env::current_dir()?, &config.capabilities)?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&catalog)?);
+    } else {
+        for extension in catalog.extensions {
+            println!(
+                "{} {} — {}",
+                extension.id,
+                extension.version,
+                extension.reason.unwrap_or_else(|| "active".into())
+            );
+        }
+    }
+    Ok(())
+}
+
+fn print_capabilities(args: CapabilitiesArgs) -> Result<()> {
+    let configured = agent_config::AgentConfig::load(args.config.as_deref())?;
+    let effective = borg_remote::SessionCapabilities::from(&configured.capabilities).effective();
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&effective)?);
+        return Ok(());
+    }
+    println!("Active capabilities:");
+    for capability in effective.active {
+        println!(
+            "  {}",
+            serde_json::to_string(&capability)?.trim_matches('"')
+        );
+    }
+    println!("Inactive capabilities:");
+    for capability in effective.inactive {
+        println!(
+            "  {} — {}",
+            serde_json::to_string(&capability.capability)?.trim_matches('"'),
+            capability.reason
+        );
+    }
+    Ok(())
 }
 
 fn log_writer() -> BoxMakeWriter {

@@ -18,8 +18,9 @@ use crate::{
     PlanItem, PlanItemStatus, PromptDelivery, SessionEvent, SessionEventKind, SessionGoal,
     SessionGoalToolRequest, SessionGoalToolResponse, SessionState, SessionStatus, SessionStore,
     SessionTodoToolRequest, SessionTodoToolResponse, SessionWriterLease, SqliteSessionStore,
-    SubagentAction, SubagentActivity, SubagentActivityKind, SubagentControlOutcome,
-    SubagentCoordinator, TodoAction, TodoItemUpdate,
+    SqliteWorkspaceStore, SubagentAction, SubagentActivity, SubagentActivityKind,
+    SubagentControlOutcome, SubagentCoordinator, TodoAction, TodoItemUpdate, WorkspaceEvent,
+    WorkspaceEventKind, WorkspaceStore,
 };
 
 struct QueuedPrompt {
@@ -45,6 +46,91 @@ enum PendingSteerState {
 struct RuntimeSessionStore {
     store: Arc<dyn SessionStore>,
     context_events: Vec<SessionEvent>,
+    workspace_projection: Option<WorkspaceProjection>,
+}
+
+#[derive(Clone)]
+struct WorkspaceProjection {
+    store: SqliteWorkspaceStore,
+    workspace_id: Uuid,
+    agent_participant_id: Uuid,
+    human_participant_id: Uuid,
+}
+
+impl WorkspaceProjection {
+    async fn project(&self, event: &SessionEvent) -> Result<()> {
+        if event.sequence == 0 {
+            return Ok(());
+        }
+        match &event.kind {
+            SessionEventKind::Message {
+                message_id,
+                actor: EventActor::User,
+                status: MessageStatus::Complete,
+                ..
+            } => {
+                self.store
+                    .transition_message_delivery(
+                        self.workspace_id,
+                        *message_id,
+                        self.agent_participant_id,
+                        crate::DeliveryState::Admitted,
+                        Some(crate::DeliveryAttempt {
+                            attempted_at: event.created_at,
+                            detail: Some("admitted at session provider boundary".to_string()),
+                        }),
+                    )
+                    .await?;
+            }
+            SessionEventKind::PromptRecalled { message_id, .. } => {
+                self.store
+                    .transition_message_delivery(
+                        self.workspace_id,
+                        *message_id,
+                        self.agent_participant_id,
+                        crate::DeliveryState::Recalled,
+                        None,
+                    )
+                    .await?;
+            }
+            SessionEventKind::TurnCompleted { message_id, .. } => {
+                self.store
+                    .transition_message_delivery(
+                        self.workspace_id,
+                        *message_id,
+                        self.agent_participant_id,
+                        crate::DeliveryState::Acknowledged,
+                        None,
+                    )
+                    .await?;
+            }
+            _ => {}
+        }
+        let author_id = match &event.kind {
+            SessionEventKind::Message {
+                actor: EventActor::User,
+                ..
+            } => self.human_participant_id,
+            _ => self.agent_participant_id,
+        };
+        self.store
+            .append(WorkspaceEvent {
+                id: Uuid::new_v5(&event.id, b"borg-workspace-session-event"),
+                workspace_id: self.workspace_id,
+                sequence: 0,
+                author_id,
+                idempotency_key: format!("session-event:{}", event.id),
+                created_at: event.created_at,
+                kind: WorkspaceEventKind::SessionEvent {
+                    session_id: event.session_id,
+                    session_event_id: event.id,
+                    session_sequence: event.sequence,
+                    mode: crate::DeliveryMode::Notify,
+                },
+            })
+            .await?;
+        Ok(())
+    }
 }
 
 impl RuntimeSessionStore {
@@ -52,7 +138,13 @@ impl RuntimeSessionStore {
         Self {
             store,
             context_events,
+            workspace_projection: None,
         }
+    }
+
+    fn with_workspace_projection(mut self, projection: WorkspaceProjection) -> Self {
+        self.workspace_projection = Some(projection);
+        self
     }
 
     fn context_events(&self) -> &[SessionEvent] {
@@ -69,6 +161,16 @@ impl RuntimeSessionStore {
 
     async fn append(&mut self, event: SessionEvent) -> Result<SessionEvent> {
         let event = self.store.append(event).await?;
+        if let Some(projection) = &self.workspace_projection
+            && let Err(error) = projection.project(&event).await
+        {
+            tracing::warn!(
+                session_id = %event.session_id,
+                session_sequence = event.sequence,
+                error = %error,
+                "failed to update repairable workspace projection"
+            );
+        }
         if matches!(event.kind, SessionEventKind::ContextCleared) {
             self.context_events.clear();
         }
@@ -357,6 +459,48 @@ async fn run_agent_session_store_kernel(
     shared_team: Option<SubagentCoordinator>,
 ) -> Result<()> {
     store.create_session(session_id).await?;
+    let workspace_projection = if launch.capabilities.multiplayer {
+        let binding = store
+            .workspace_binding(session_id)
+            .await?
+            .with_context(|| format!("session {session_id} has no workspace binding"))?;
+        let workspace_store =
+            SqliteWorkspaceStore::open(session_root.join("workspaces.sqlite3")).await?;
+        let human_participant_id =
+            Uuid::new_v5(&binding.workspace_id, b"borg-local-human-participant");
+        let human_display_name = std::env::var("USER").unwrap_or_else(|_| "Local user".to_string());
+        let workspace_name = launch
+            .cwd
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or("Borg workspace");
+        let agent_display_name = launch.name.as_deref().unwrap_or("Borg");
+        workspace_store
+            .ensure_execution_workspace(
+                binding.workspace_id,
+                workspace_name,
+                human_participant_id,
+                &human_display_name,
+                binding.participant_id,
+                agent_display_name,
+            )
+            .await?;
+        let projection = WorkspaceProjection {
+            store: workspace_store,
+            workspace_id: binding.workspace_id,
+            agent_participant_id: binding.participant_id,
+            human_participant_id,
+        };
+        for event in store.read(session_id).await? {
+            if event.session_id == session_id {
+                projection.project(&event).await?;
+            }
+        }
+        Some(projection)
+    } else {
+        None
+    };
     let initial_state = store.state(session_id).await?;
     let fresh = initial_state.latest_sequence == 0;
     let recovery = if fresh {
@@ -366,6 +510,9 @@ async fn run_agent_session_store_kernel(
     };
     let subagent_store = Arc::clone(&store);
     let mut journal = RuntimeSessionStore::new(store, recovery.context_events);
+    if let Some(projection) = workspace_projection {
+        journal = journal.with_workspace_projection(projection);
+    }
     if fresh {
         record(
             &mut journal,
@@ -425,22 +572,37 @@ async fn run_agent_session_store_kernel(
     let todo_tools = SessionTodoTools {
         requests: todo_tool_tx,
     };
-    let owns_team = shared_team.is_none();
-    let subagents = match shared_team {
-        Some(team) => team,
-        None => crate::SubagentCoordinator::new_with_store_and_executor(
-            session_root,
-            session_id,
-            launch.clone(),
-            crate::DEFAULT_MAX_SUBAGENTS,
-            Arc::clone(&executor),
-            subagent_store,
-        )?,
+    let subagents_enabled = launch.capabilities.subagents;
+    let owns_team = shared_team.is_none() && subagents_enabled;
+    let subagents = if subagents_enabled {
+        Some(match shared_team {
+            Some(team) => team,
+            None => crate::SubagentCoordinator::new_with_store_and_executor(
+                session_root,
+                session_id,
+                launch.clone(),
+                subagent_concurrency_limit(&launch),
+                Arc::clone(&executor),
+                subagent_store,
+            )?,
+        })
+    } else {
+        None
     };
-    let mut subagent_activity_rx = subagents.subscribe();
-    let mut root_message_rx = subagents.subscribe_root_messages();
+    let (disabled_activity_tx, disabled_root_tx) =
+        (broadcast::channel(1).0, broadcast::channel(1).0);
+    let mut subagent_activity_rx = subagents
+        .as_ref()
+        .map(SubagentCoordinator::subscribe)
+        .unwrap_or_else(|| disabled_activity_tx.subscribe());
+    let mut root_message_rx = subagents
+        .as_ref()
+        .map(SubagentCoordinator::subscribe_root_messages)
+        .unwrap_or_else(|| disabled_root_tx.subscribe());
     if owns_team {
         subagents
+            .as_ref()
+            .expect("enabled team")
             .restore_from_events(&recovery.subagent_events)
             .await?;
     }
@@ -451,6 +613,8 @@ async fn run_agent_session_store_kernel(
         crate::LspService::new(&launch.cwd),
         launch.provider,
         session_id,
+        launch.capabilities.subagents,
+        launch.team_policy.clone(),
     );
     let agent_tool_server =
         crate::AgentToolServer::start(session_root, session_id, dispatcher.clone()).await?;
@@ -508,7 +672,7 @@ async fn run_agent_session_store_kernel(
                                 &mut journal,
                                 &events,
                                 session_id,
-                                &subagents,
+                                subagents.as_ref().expect("team activity requires coordinator"),
                                 activity,
                             ).await?;
                         }
@@ -522,7 +686,7 @@ async fn run_agent_session_store_kernel(
                                 text: message.text,
                                 attachments: Vec::new(),
                                 output_schema: None,
-                                delivery: PromptDelivery::Steer,
+                                delivery: message.delivery,
                             }),
                             Err(broadcast::error::RecvError::Lagged(_)) => continue,
                             Err(broadcast::error::RecvError::Closed) => continue,
@@ -542,11 +706,34 @@ async fn run_agent_session_store_kernel(
                         if journal.contains_message(session_id, message_id).await? {
                             continue;
                         }
-                        let text = if owns_team {
-                            subagents.prepend_root_inbox(text).await
-                        } else {
-                            text
-                        };
+                        if owns_team {
+                            let inbox = subagents
+                                .as_ref()
+                                .expect("team inbox requires coordinator")
+                                .take_root_inbox()
+                                .await;
+                            if !inbox.is_empty() {
+                                deferred_commands.push_front(HostCommand::Prompt {
+                                    session_id,
+                                    message_id,
+                                    text,
+                                    attachments,
+                                    output_schema,
+                                    delivery,
+                                });
+                                for message in inbox.into_iter().rev() {
+                                    deferred_commands.push_front(HostCommand::Prompt {
+                                        session_id,
+                                        message_id: message.message_id,
+                                        text: message.text,
+                                        attachments: Vec::new(),
+                                        output_schema: None,
+                                        delivery: message.delivery,
+                                    });
+                                }
+                                continue;
+                            }
+                        }
                         break Some(QueuedPrompt {
                             message_id,
                             text,
@@ -622,7 +809,9 @@ async fn run_agent_session_store_kernel(
                             &mut journal,
                             &events,
                             session_id,
-                            &subagents,
+                            subagents
+                                .as_ref()
+                                .expect("team activity requires coordinator"),
                             action,
                         )
                         .await?;
@@ -982,7 +1171,7 @@ async fn run_agent_session_store_kernel(
                             &mut journal,
                             &events,
                             session_id,
-                            &subagents,
+                            subagents.as_ref().expect("team activity requires coordinator"),
                             activity,
                         ).await?;
                     }
@@ -995,7 +1184,7 @@ async fn run_agent_session_store_kernel(
                             text: message.text,
                             attachments: Vec::new(),
                             output_schema: None,
-                            delivery: PromptDelivery::Steer,
+                            delivery: message.delivery,
                         }),
                         Err(broadcast::error::RecvError::Lagged(_)) => {}
                         Err(broadcast::error::RecvError::Closed) => {}
@@ -1328,7 +1517,7 @@ async fn run_agent_session_store_kernel(
                                 &mut journal,
                                 &events,
                                 session_id,
-                                &subagents,
+                                subagents.as_ref().expect("team activity requires coordinator"),
                                 action,
                             )
                             .await?;
@@ -1518,6 +1707,14 @@ async fn run_agent_session_store_kernel(
             continue;
         }
     }
+}
+
+fn subagent_concurrency_limit(launch: &LaunchSession) -> usize {
+    launch
+        .team_policy
+        .as_ref()
+        .map(|policy| policy.limits.max_concurrent_assignments as usize)
+        .unwrap_or(crate::DEFAULT_MAX_SUBAGENTS)
 }
 
 fn validate_session_state(session_id: Uuid, state: &SessionState) -> Result<()> {
@@ -2671,6 +2868,157 @@ mod tests {
     type RecordedPromptTurns = Arc<Mutex<Vec<(String, Vec<PathBuf>)>>>;
     type RecordedContextTurns = Arc<Mutex<Vec<(String, Option<String>)>>>;
 
+    #[tokio::test]
+    async fn durable_session_events_project_once_into_the_bound_workspace() {
+        let root = tempdir().unwrap();
+        let session_id = Uuid::new_v4();
+        let session_store = Arc::new(
+            SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+                .await
+                .unwrap(),
+        );
+        session_store.create_session(session_id).await.unwrap();
+        let binding = session_store
+            .workspace_binding(session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let workspace_store = SqliteWorkspaceStore::open(root.path().join("workspaces.sqlite3"))
+            .await
+            .unwrap();
+        let human_id = Uuid::new_v5(&binding.workspace_id, b"borg-local-human-participant");
+        workspace_store
+            .ensure_execution_workspace(
+                binding.workspace_id,
+                "test workspace",
+                human_id,
+                "Human",
+                binding.participant_id,
+                "Agent",
+            )
+            .await
+            .unwrap();
+        let projection = WorkspaceProjection {
+            store: workspace_store.clone(),
+            workspace_id: binding.workspace_id,
+            agent_participant_id: binding.participant_id,
+            human_participant_id: human_id,
+        };
+        let store: Arc<dyn SessionStore> = session_store.clone();
+        let mut runtime = RuntimeSessionStore::new(store.clone(), Vec::new())
+            .with_workspace_projection(projection.clone());
+        let message_id = Uuid::new_v4();
+        workspace_store
+            .append(WorkspaceEvent {
+                id: message_id,
+                workspace_id: binding.workspace_id,
+                sequence: 0,
+                author_id: human_id,
+                idempotency_key: format!("test-team-message:{message_id}"),
+                created_at: chrono::Utc::now(),
+                kind: WorkspaceEventKind::Message {
+                    message: crate::WorkspaceMessage {
+                        id: message_id,
+                        workspace_id: binding.workspace_id,
+                        thread_id: None,
+                        reply_to_message_id: None,
+                        author_id: human_id,
+                        body: crate::WorkspaceMessageBody {
+                            text: "coordinate this".to_string(),
+                            mentions: Vec::new(),
+                        },
+                        audience: crate::Audience::Direct {
+                            participant: binding.participant_id,
+                        },
+                        created_at: chrono::Utc::now(),
+                    },
+                    mode: crate::DeliveryMode::Boundary,
+                },
+            })
+            .await
+            .unwrap();
+        let queued = runtime
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::Message {
+                    message_id,
+                    actor: EventActor::User,
+                    text: "coordinate this".to_string(),
+                    attachments: Vec::new(),
+                    status: MessageStatus::Queued,
+                    delivery: Some(PromptDelivery::Steer),
+                },
+            ))
+            .await
+            .unwrap();
+        let pending = workspace_store
+            .deliveries_after(binding.workspace_id, binding.participant_id, 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(pending[0].state, crate::DeliveryState::Pending);
+        assert_eq!(pending[0].sequence, 1);
+        drop(runtime);
+        // A restarted actor reopens the durable session/workspace stores. The
+        // queued session event is not an admission acknowledgement.
+        let mut runtime = RuntimeSessionStore::new(store.clone(), Vec::new())
+            .with_workspace_projection(projection.clone());
+        let _admitted = runtime
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::Message {
+                    message_id,
+                    actor: EventActor::User,
+                    text: "coordinate this".to_string(),
+                    attachments: Vec::new(),
+                    status: MessageStatus::Complete,
+                    delivery: Some(PromptDelivery::Steer),
+                },
+            ))
+            .await
+            .unwrap();
+        let admitted_delivery = workspace_store
+            .deliveries_after(binding.workspace_id, binding.participant_id, 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(admitted_delivery[0].state, crate::DeliveryState::Admitted);
+        runtime
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::TurnCompleted {
+                    message_id,
+                    provider_session_id: Some("provider-session".to_string()),
+                    final_text: "done".to_string(),
+                    error: None,
+                },
+            ))
+            .await
+            .unwrap();
+        let acknowledged = workspace_store
+            .deliveries_after(binding.workspace_id, binding.participant_id, 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(acknowledged[0].state, crate::DeliveryState::Acknowledged);
+
+        let replay = workspace_store
+            .replay(binding.workspace_id, binding.participant_id, 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(replay.len(), 4, "repair replay must be idempotent");
+        assert_eq!(replay[1].author_id, human_id);
+        assert!(matches!(
+            replay[1].kind,
+            WorkspaceEventKind::SessionEvent {
+                session_id: projected_session,
+                session_event_id,
+                session_sequence: 1,
+                ..
+            } if projected_session == session_id && session_event_id == queued.id
+        ));
+    }
+
     struct RecordingExecutor {
         seen: RecordedTurns,
         called: Arc<Notify>,
@@ -3033,6 +3381,8 @@ mod tests {
                     permission_mode: PermissionMode::Manual,
                     name: None,
                     initial_prompt: None,
+                    capabilities: Default::default(),
+                    team_policy: None,
                 },
                 command_rx,
                 event_tx,
@@ -3144,6 +3494,8 @@ mod tests {
                     permission_mode: PermissionMode::Manual,
                     name: None,
                     initial_prompt: None,
+                    capabilities: Default::default(),
+                    team_policy: None,
                 },
                 command_rx,
                 event_tx,
@@ -3236,6 +3588,8 @@ mod tests {
                     permission_mode: PermissionMode::Manual,
                     name: None,
                     initial_prompt: None,
+                    capabilities: Default::default(),
+                    team_policy: None,
                 },
                 command_rx,
                 event_tx,
@@ -3324,6 +3678,8 @@ mod tests {
                     permission_mode: PermissionMode::Manual,
                     name: None,
                     initial_prompt: None,
+                    capabilities: Default::default(),
+                    team_policy: None,
                 },
                 command_rx,
                 event_tx,
@@ -3443,6 +3799,8 @@ mod tests {
                     permission_mode: PermissionMode::Manual,
                     name: None,
                     initial_prompt: None,
+                    capabilities: Default::default(),
+                    team_policy: None,
                 },
                 command_rx,
                 event_tx,
@@ -3563,6 +3921,8 @@ mod tests {
                     permission_mode: PermissionMode::Manual,
                     name: None,
                     initial_prompt: None,
+                    capabilities: Default::default(),
+                    team_policy: None,
                 },
                 command_rx,
                 event_tx,
@@ -3668,6 +4028,8 @@ mod tests {
             permission_mode: PermissionMode::FullAccess,
             name: None,
             initial_prompt: None,
+            capabilities: Default::default(),
+            team_policy: None,
         };
         let actor = tokio::spawn(async move {
             run_agent_session_with_executor(
@@ -3779,6 +4141,8 @@ mod tests {
                     permission_mode: PermissionMode::Manual,
                     name: None,
                     initial_prompt: None,
+                    capabilities: Default::default(),
+                    team_policy: None,
                 },
                 command_rx,
                 event_tx,
@@ -3870,6 +4234,8 @@ mod tests {
                 permission_mode: PermissionMode::Manual,
                 name: None,
                 initial_prompt: None,
+                capabilities: Default::default(),
+                team_policy: None,
             },
             command_rx,
             event_tx,
@@ -3953,6 +4319,8 @@ mod tests {
                 permission_mode: PermissionMode::Manual,
                 name: None,
                 initial_prompt: None,
+                capabilities: Default::default(),
+                team_policy: None,
             },
             command_rx,
             event_tx,

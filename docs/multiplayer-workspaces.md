@@ -221,6 +221,30 @@ Extensions cannot bypass membership checks, forge authorship, mutate committed
 audiences, weaken delivery idempotency, or obtain host capabilities not granted
 by the user.
 
+### Capability composition
+
+Optional subsystems are explicit session capabilities rather than build-time
+assumptions. `multiplayer`, `subagents`, `autonomous_team`, `shared_work`,
+`presence`, `cloud_sync`, `web_relay`, and `telemetry` can be configured in
+`agent.toml`. Disabling a parent capability cascades to its dependents:
+
+- `subagents = false` also makes autonomous teams inactive;
+- `multiplayer = false` also makes shared work and presence inactive;
+- `cloud_sync = false` also makes the web relay inactive.
+
+The core local agent, journal, goal/plan tools, replay, authorization, and
+provider adapters continue to work. A disabled capability must not initialize
+its database, coordinator, network client, background task, tool catalog, or UI
+queries. `borg capabilities` reports the effective state and dependency reason
+for every capability; `borg capabilities --json` exposes the same
+provider-neutral descriptor to scripts and extensions.
+
+Telemetry is disabled by default. Enabling it in a future build is not itself
+permission to collect arbitrary session content: each telemetry implementation
+must document its fields and purpose, minimize and redact data at the source,
+bound retention, avoid prompt/file content in crash payloads, and provide a
+working local disable control.
+
 ## Verification matrix
 
 Completion requires boundary-level tests for:

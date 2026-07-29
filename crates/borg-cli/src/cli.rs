@@ -33,8 +33,28 @@ pub(crate) enum Command {
     /// Check for or install the latest Borg CLI release.
     #[command(visible_alias = "install")]
     Update(UpdateArgs),
+    /// Show configured and effective optional runtime capabilities.
+    Capabilities(CapabilitiesArgs),
+    /// Discover effective project and user extension manifests.
+    Extensions(ExtensionsArgs),
     #[command(name = "__agent-mcp", hide = true)]
     AgentMcp,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ExtensionsArgs {
+    #[arg(long)]
+    pub(crate) json: bool,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct CapabilitiesArgs {
+    /// Read capabilities from this agent configuration file.
+    #[arg(long)]
+    pub(crate) config: Option<PathBuf>,
+    /// Emit the provider-neutral capability descriptor as JSON.
+    #[arg(long)]
+    pub(crate) json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -71,6 +91,9 @@ pub(crate) struct LocalAgentCliArgs {
     pub(crate) continue_latest: bool,
     #[arg(long)]
     pub(crate) local_only: bool,
+    /// Use a temporary local session store and discard it when this process exits.
+    #[arg(long, conflicts_with_all = ["resume", "continue_latest"])]
+    pub(crate) ephemeral: bool,
 }
 
 impl LocalAgentCliArgs {
@@ -88,6 +111,7 @@ impl LocalAgentCliArgs {
             resume: None,
             continue_latest: false,
             local_only: false,
+            ephemeral: false,
         }
     }
 
@@ -105,6 +129,7 @@ impl LocalAgentCliArgs {
             resume: session,
             continue_latest: session.is_none(),
             local_only: false,
+            ephemeral: false,
         }
     }
 }
@@ -125,6 +150,33 @@ mod tests {
         assert!(args.prompt.is_empty());
         assert!(!args.continue_latest);
         assert!(args.resume.is_none());
+    }
+
+    #[test]
+    fn capabilities_command_accepts_machine_readable_output() {
+        let command = Cli::try_parse_from(["borg", "capabilities", "--json"])
+            .expect("capabilities command parses")
+            .command_or_agent();
+        let Command::Capabilities(args) = command else {
+            panic!("capabilities command must not launch an agent");
+        };
+        assert!(args.json);
+        assert!(args.config.is_none());
+    }
+
+    #[test]
+    fn ephemeral_agents_cannot_claim_a_persistent_resume_target() {
+        assert!(Cli::try_parse_from(["borg", "agent", "--ephemeral"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "borg",
+                "agent",
+                "--ephemeral",
+                "--resume",
+                "00000000-0000-0000-0000-000000000000"
+            ])
+            .is_err()
+        );
     }
 }
 

@@ -22,10 +22,11 @@ use ts_rs::TS;
 use uuid::Uuid;
 
 use crate::{
-    ApprovalDecision, CodingProvider, EventActor, HostCommand, LaunchSession, MessageStatus,
-    ModelGoalStatus, PromptDelivery, SessionEvent, SessionEventKind, SessionGoalToolRequest,
-    SessionGoalTools, SessionStatus, SessionStore, SessionTodoToolRequest, SessionTodoTools,
-    TodoItemUpdate,
+    ApprovalDecision, Audience, CodingProvider, DeliveryMode, EventActor, HostCommand,
+    LaunchSession, MessageStatus, ModelGoalStatus, PromptDelivery, SessionEvent, SessionEventKind,
+    SessionGoalToolRequest, SessionGoalTools, SessionStatus, SessionStore, SessionTodoToolRequest,
+    SessionTodoTools, SqliteWorkspaceStore, StructuredMention, TodoItemUpdate, WorkspaceEvent,
+    WorkspaceEventKind, WorkspaceMessage, WorkspaceMessageBody, WorkspaceStore,
 };
 
 pub const DEFAULT_MAX_SUBAGENTS: usize = 3;
@@ -126,10 +127,12 @@ pub struct SpawnSubagent {
 pub struct AgentToolDispatcher {
     goals: SessionGoalTools,
     todos: SessionTodoTools,
-    subagents: SubagentCoordinator,
+    subagents: Option<SubagentCoordinator>,
+    subagents_enabled: bool,
     lsp: crate::LspService,
     provider: CodingProvider,
     actor_session_id: Uuid,
+    team_policy: Option<crate::TeamPolicy>,
 }
 
 #[derive(Debug)]
@@ -141,6 +144,8 @@ pub struct AgentToolServer {
     #[cfg(not(unix))]
     token: String,
     provider: CodingProvider,
+    subagents_enabled: bool,
+    team_policy: Option<crate::TeamPolicy>,
     cancel: CancellationToken,
 }
 
@@ -182,6 +187,8 @@ impl AgentToolServer {
         let server_cancel = cancel.clone();
         let cleanup_path = socket_path.clone();
         let provider = dispatcher.provider;
+        let subagents_enabled = dispatcher.subagents_enabled;
+        let team_policy = dispatcher.team_policy.clone();
         tokio::spawn(async move {
             loop {
                 let accepted = tokio::select! {
@@ -197,6 +204,8 @@ impl AgentToolServer {
         Ok(Self {
             socket_path,
             provider,
+            subagents_enabled,
+            team_policy,
             cancel,
         })
     }
@@ -217,6 +226,8 @@ impl AgentToolServer {
         let server_cancel = cancel.clone();
         let server_token = token.clone();
         let provider = dispatcher.provider;
+        let subagents_enabled = dispatcher.subagents_enabled;
+        let team_policy = dispatcher.team_policy.clone();
         tokio::spawn(async move {
             loop {
                 let accepted = tokio::select! {
@@ -238,6 +249,8 @@ impl AgentToolServer {
             tcp_addr,
             token,
             provider,
+            subagents_enabled,
+            team_policy,
             cancel,
         })
     }
@@ -248,6 +261,11 @@ impl AgentToolServer {
             "BORG_AGENT_TOOL_PROVIDER".to_string(),
             self.provider.catalog_backend().to_string(),
         );
+        if let Some(policy) = &self.team_policy {
+            if let Ok(policy) = serde_json::to_string(policy) {
+                env.insert("BORG_AGENT_TEAM_POLICY".to_string(), policy);
+            }
+        }
         #[cfg(unix)]
         env.insert(
             "BORG_AGENT_TOOL_SOCKET".to_string(),
@@ -266,7 +284,7 @@ impl AgentToolServer {
                 .into_owned(),
             args: vec!["__agent-mcp".to_string()],
             env,
-            allowed_tools: agent_tool_specs(self.provider)
+            allowed_tools: agent_tool_specs_with_subagents(self.provider, self.subagents_enabled)
                 .into_iter()
                 .filter_map(|tool| {
                     tool["name"]
@@ -331,23 +349,31 @@ impl AgentToolDispatcher {
     pub fn new(
         goals: SessionGoalTools,
         todos: SessionTodoTools,
-        subagents: SubagentCoordinator,
+        subagents: Option<SubagentCoordinator>,
         lsp: crate::LspService,
         provider: CodingProvider,
         actor_session_id: Uuid,
+        subagents_enabled: bool,
+        team_policy: Option<crate::TeamPolicy>,
     ) -> Self {
         Self {
             goals,
             todos,
             subagents,
+            subagents_enabled,
             lsp,
             provider,
             actor_session_id,
+            team_policy,
         }
     }
 
     pub fn specs(&self) -> Vec<Value> {
-        agent_tool_specs(self.provider)
+        agent_tool_specs_with_team_policy(
+            self.provider,
+            self.subagents_enabled,
+            self.team_policy.as_ref(),
+        )
     }
 
     pub async fn call(&self, name: &str, arguments: Value) -> Result<Value> {
@@ -422,7 +448,12 @@ impl AgentToolDispatcher {
                 self.lsp.workspace_symbols(&args.query).await
             }
             _ => {
+                if !self.subagents_enabled {
+                    bail!("subagent tools are disabled by session capabilities");
+                }
                 self.subagents
+                    .as_ref()
+                    .context("subagent coordinator is disabled")?
                     .call_tool_as(self.actor_session_id, name, arguments)
                     .await
             }
@@ -433,7 +464,7 @@ impl AgentToolDispatcher {
 struct SubagentEntry {
     snapshot: SubagentSnapshot,
     commands: Option<mpsc::Sender<HostCommand>>,
-    inbox: Vec<String>,
+    inbox: Vec<TeamInboxMessage>,
 }
 
 struct SubagentTable {
@@ -471,7 +502,6 @@ impl SubagentTable {
             updated_at: now,
             detail: None,
             final_text: None,
-            usage: SubagentUsage::default(),
             usage: SubagentUsage::default(),
         };
         self.task_names.insert(task_name, snapshot.session_id);
@@ -528,10 +558,17 @@ impl SubagentTable {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct TeamInboxMessage {
     pub message_id: Uuid,
     pub text: String,
+    pub delivery: PromptDelivery,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TeamMessageOptions {
+    pub mentions: Vec<StructuredMention>,
+    pub reply_to_message_id: Option<Uuid>,
 }
 
 /// Borg-native child sessions for one root CLI session.
@@ -594,17 +631,159 @@ impl SubagentCoordinator {
         std::mem::take(&mut *self.root_inbox.lock().await)
     }
 
-    pub(crate) async fn prepend_root_inbox(&self, text: String) -> String {
-        let inbox = self.take_root_inbox().await;
-        if inbox.is_empty() {
-            return text;
+    async fn persist_team_message(
+        &self,
+        actor_session_id: Uuid,
+        recipient_session_id: Uuid,
+        actor: &str,
+        message: &str,
+        prompt_delivery: PromptDelivery,
+        delivery_mode: DeliveryMode,
+        options: TeamMessageOptions,
+    ) -> Result<TeamInboxMessage> {
+        if !self.root_launch.capabilities.multiplayer {
+            return Ok(TeamInboxMessage {
+                message_id: Uuid::new_v4(),
+                text: attributed_team_message(actor, message),
+                delivery: prompt_delivery,
+            });
         }
-        let mut sections = inbox
+        let actor_binding = self
+            .store
+            .workspace_binding(actor_session_id)
+            .await?
+            .with_context(|| format!("team sender session {actor_session_id} has no workspace"))?;
+        let recipient_binding = self
+            .store
+            .workspace_binding(recipient_session_id)
+            .await?
+            .with_context(|| {
+                format!("team recipient session {recipient_session_id} has no workspace")
+            })?;
+        anyhow::ensure!(
+            actor_binding.workspace_id == recipient_binding.workspace_id,
+            "team participants are attached to different workspaces"
+        );
+        let text = attributed_team_message(actor, message);
+        let message_id = Uuid::new_v4();
+        let created_at = Utc::now();
+        let workspace_store =
+            SqliteWorkspaceStore::open(self.journal_root.join("workspaces.sqlite3")).await?;
+        workspace_store
+            .append(WorkspaceEvent {
+                id: message_id,
+                workspace_id: actor_binding.workspace_id,
+                sequence: 0,
+                author_id: actor_binding.participant_id,
+                idempotency_key: format!("team-message:{message_id}"),
+                created_at,
+                kind: WorkspaceEventKind::Message {
+                    message: WorkspaceMessage {
+                        id: message_id,
+                        workspace_id: actor_binding.workspace_id,
+                        thread_id: None,
+                        reply_to_message_id: options.reply_to_message_id,
+                        author_id: actor_binding.participant_id,
+                        body: WorkspaceMessageBody {
+                            text: text.clone(),
+                            mentions: options.mentions,
+                        },
+                        audience: Audience::Direct {
+                            participant: recipient_binding.participant_id,
+                        },
+                        created_at,
+                    },
+                    mode: delivery_mode,
+                },
+            })
+            .await?;
+        Ok(TeamInboxMessage {
+            message_id,
+            text,
+            delivery: prompt_delivery,
+        })
+    }
+
+    async fn pending_messages_for_session(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Vec<TeamInboxMessage>> {
+        if !self.root_launch.capabilities.multiplayer {
+            return Ok(Vec::new());
+        }
+        let binding = self
+            .store
+            .workspace_binding(session_id)
+            .await?
+            .with_context(|| format!("team session {session_id} has no workspace"))?;
+        let workspace_store =
+            SqliteWorkspaceStore::open(self.journal_root.join("workspaces.sqlite3")).await?;
+        let messages = workspace_store
+            .pending_message_events(binding.workspace_id, binding.participant_id, 10_000)
+            .await?
             .into_iter()
-            .map(|message| message.text)
+            .filter_map(|(event, delivery)| {
+                let WorkspaceEventKind::Message { message, .. } = event.kind else {
+                    return None;
+                };
+                Some(TeamInboxMessage {
+                    message_id: message.id,
+                    text: message.body.text,
+                    delivery: match delivery.mode {
+                        DeliveryMode::Boundary | DeliveryMode::Wake => PromptDelivery::Steer,
+                        DeliveryMode::NextTurn | DeliveryMode::Notify => PromptDelivery::Queue,
+                    },
+                })
+            })
             .collect::<Vec<_>>();
-        sections.push(text);
-        sections.join("\n\n")
+        Ok(messages)
+    }
+
+    pub(crate) async fn unread_messages_for_session(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Vec<TeamInboxMessage>> {
+        self.pending_messages_for_session(session_id).await
+    }
+
+    pub async fn acknowledge_message_for_session(
+        &self,
+        session_id: Uuid,
+        message_id: Uuid,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            self.root_launch.capabilities.multiplayer,
+            "team acknowledgements require multiplayer capability"
+        );
+        let binding = self
+            .store
+            .workspace_binding(session_id)
+            .await?
+            .context("team session has no workspace")?;
+        let store =
+            SqliteWorkspaceStore::open(self.journal_root.join("workspaces.sqlite3")).await?;
+        let _ = store.pending_message_events(binding.workspace_id, binding.participant_id, 10_000).await?
+            .into_iter().find(|(event, _)| matches!(&event.kind, WorkspaceEventKind::Message { message, .. } if message.id == message_id))
+            .context("unread team message not found")?;
+        store
+            .transition_message_delivery(
+                binding.workspace_id,
+                message_id,
+                binding.participant_id,
+                crate::DeliveryState::Admitted,
+                None,
+            )
+            .await?;
+        store
+            .transition_message_delivery(
+                binding.workspace_id,
+                message_id,
+                binding.participant_id,
+                crate::DeliveryState::Acknowledged,
+                None,
+            )
+            .await?;
+        Ok(())
     }
 
     /// Rebuild the coordinator projection from the durable parent event
@@ -700,6 +879,33 @@ impl SubagentCoordinator {
             launch.name = Some(snapshot.task_name.clone());
             self.start_reserved(snapshot, launch, false).await?;
         }
+        for message in self.pending_messages_for_session(root_session_id).await? {
+            if let Err(error) = self.root_message_tx.send(message) {
+                self.root_inbox.lock().await.push(error.0);
+            }
+        }
+        let child_ids = self
+            .table
+            .lock()
+            .await
+            .entries
+            .values()
+            .filter(|entry| !entry.snapshot.status.is_terminal())
+            .map(|entry| entry.snapshot.session_id)
+            .collect::<Vec<_>>();
+        for child_id in child_ids {
+            let messages = self.pending_messages_for_session(child_id).await?;
+            if messages.is_empty() {
+                continue;
+            }
+            let mut table = self.table.lock().await;
+            let Some(entry) = table.entries.get_mut(&child_id) else {
+                continue;
+            };
+            for message in messages {
+                send_prompt(entry, child_id, message).await?;
+            }
+        }
         Ok(())
     }
 
@@ -717,9 +923,7 @@ impl SubagentCoordinator {
         if request.model.is_some() {
             launch.model = request.model;
         }
-        if request.effort.is_some() {
-            launch.effort = request.effort;
-        }
+        launch.effort = effective_worker_effort(&launch, request.effort);
         launch.name = Some(canonical_task_name(&request.task_name)?);
 
         let snapshot = self
@@ -751,6 +955,35 @@ impl SubagentCoordinator {
                 &writer,
             )
             .await?;
+        if self.root_launch.capabilities.multiplayer {
+            let binding = self
+                .store
+                .workspace_binding(actor_session_id)
+                .await?
+                .with_context(|| {
+                    format!("subagent session {actor_session_id} has no workspace binding")
+                })?;
+            let workspace_store =
+                SqliteWorkspaceStore::open(self.journal_root.join("workspaces.sqlite3")).await?;
+            let human_participant_id =
+                Uuid::new_v5(&binding.workspace_id, b"borg-local-human-participant");
+            let human_display_name =
+                std::env::var("USER").unwrap_or_else(|_| "Local user".to_string());
+            workspace_store
+                .ensure_execution_workspace(
+                    binding.workspace_id,
+                    self.root_launch
+                        .cwd
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("Borg workspace"),
+                    human_participant_id,
+                    &human_display_name,
+                    binding.participant_id,
+                    &snapshot.task_name,
+                )
+                .await?;
+        }
         self.table
             .lock()
             .await
@@ -837,6 +1070,109 @@ impl SubagentCoordinator {
         self.send_message_as(root_session_id, target, message).await
     }
 
+    /// Append one workspace message and fan its single ID out to every visible team member.
+    pub async fn broadcast_message_as(
+        &self,
+        actor_session_id: Uuid,
+        message: &str,
+    ) -> Result<Uuid> {
+        anyhow::ensure!(
+            self.root_launch.capabilities.multiplayer,
+            "team broadcast requires multiplayer capability"
+        );
+        let message = required_message(message)?;
+        let (actor, recipients) =
+            {
+                let table = self.table.lock().await;
+                let actor = table.task_name(actor_session_id)?;
+                let mut recipients = vec![table.root_session_id];
+                recipients.extend(table.entries.iter().filter_map(|(id, entry)| {
+                    (!entry.snapshot.status.is_terminal()).then_some(*id)
+                }));
+                recipients.sort_unstable();
+                recipients.dedup();
+                (actor, recipients)
+            };
+        let sender = self
+            .store
+            .workspace_binding(actor_session_id)
+            .await?
+            .context("team sender has no workspace")?;
+        let mut participant_ids = Vec::with_capacity(recipients.len());
+        for recipient in &recipients {
+            let binding = self
+                .store
+                .workspace_binding(*recipient)
+                .await?
+                .context("team recipient has no workspace")?;
+            anyhow::ensure!(
+                binding.workspace_id == sender.workspace_id,
+                "team participants are attached to different workspaces"
+            );
+            participant_ids.push(binding.participant_id);
+        }
+        let message_id = Uuid::new_v4();
+        let created_at = Utc::now();
+        SqliteWorkspaceStore::open(self.journal_root.join("workspaces.sqlite3"))
+            .await?
+            .append(WorkspaceEvent {
+                id: message_id,
+                workspace_id: sender.workspace_id,
+                sequence: 0,
+                author_id: sender.participant_id,
+                idempotency_key: format!("team-broadcast:{message_id}"),
+                created_at,
+                kind: WorkspaceEventKind::Message {
+                    message: WorkspaceMessage {
+                        id: message_id,
+                        workspace_id: sender.workspace_id,
+                        thread_id: None,
+                        reply_to_message_id: None,
+                        author_id: sender.participant_id,
+                        body: WorkspaceMessageBody {
+                            text: attributed_team_message(&actor, &message),
+                            mentions: Vec::new(),
+                        },
+                        audience: Audience::Participants {
+                            participants: participant_ids,
+                        },
+                        created_at,
+                    },
+                    mode: DeliveryMode::NextTurn,
+                },
+            })
+            .await?;
+        let inbox = TeamInboxMessage {
+            message_id,
+            text: attributed_team_message(&actor, &message),
+            delivery: PromptDelivery::Queue,
+        };
+        let root_session_id = self.table.lock().await.root_session_id;
+        for recipient in recipients {
+            if recipient == actor_session_id {
+                continue;
+            }
+            if recipient == root_session_id {
+                self.root_inbox.lock().await.push(inbox.clone());
+            } else {
+                let mut table = self.table.lock().await;
+                if let Some(entry) = table.entries.get_mut(&recipient) {
+                    if matches!(
+                        entry.snapshot.status,
+                        SubagentStatus::Running
+                            | SubagentStatus::WaitingForApproval
+                            | SubagentStatus::Starting
+                    ) {
+                        send_prompt(entry, recipient, inbox.clone()).await?;
+                    } else {
+                        entry.inbox.push(inbox.clone());
+                    }
+                }
+            }
+        }
+        Ok(message_id)
+    }
+
     /// Queue a team-attributed message without waking an idle recipient.
     pub async fn send_message_as(
         &self,
@@ -844,19 +1180,49 @@ impl SubagentCoordinator {
         target: &str,
         message: &str,
     ) -> Result<()> {
+        self.send_message_with_options_as(
+            actor_session_id,
+            target,
+            message,
+            TeamMessageOptions::default(),
+        )
+        .await
+    }
+
+    pub async fn send_message_with_options_as(
+        &self,
+        actor_session_id: Uuid,
+        target: &str,
+        message: &str,
+        options: TeamMessageOptions,
+    ) -> Result<()> {
         let message = required_message(message)?;
-        let mut table = self.table.lock().await;
-        let actor = table.task_name(actor_session_id)?;
-        let id = table.resolve(target)?;
-        let text = attributed_team_message(&actor, &message);
-        if id == table.root_session_id {
-            drop(table);
-            self.root_inbox.lock().await.push(TeamInboxMessage {
-                message_id: Uuid::new_v4(),
-                text,
-            });
+        let (actor, id, root_session_id, status) = {
+            let table = self.table.lock().await;
+            let actor = table.task_name(actor_session_id)?;
+            let id = table.resolve(target)?;
+            let status = table.entries.get(&id).map(|entry| entry.snapshot.status);
+            (actor, id, table.root_session_id, status)
+        };
+        if status.is_some_and(SubagentStatus::is_terminal) {
+            bail!("subagent {target} is not running");
+        }
+        let inbox_message = self
+            .persist_team_message(
+                actor_session_id,
+                id,
+                &actor,
+                &message,
+                PromptDelivery::Queue,
+                DeliveryMode::NextTurn,
+                options,
+            )
+            .await?;
+        if id == root_session_id {
+            self.root_inbox.lock().await.push(inbox_message);
             return Ok(());
         }
+        let mut table = self.table.lock().await;
         let entry = table
             .entries
             .get_mut(&id)
@@ -868,9 +1234,9 @@ impl SubagentCoordinator {
             entry.snapshot.status,
             SubagentStatus::Running | SubagentStatus::WaitingForApproval | SubagentStatus::Starting
         ) {
-            send_prompt(entry, id, text, PromptDelivery::Queue).await
+            send_prompt(entry, id, inbox_message).await
         } else {
-            entry.inbox.push(text);
+            entry.inbox.push(inbox_message);
             Ok(())
         }
     }
@@ -889,29 +1255,59 @@ impl SubagentCoordinator {
         target: &str,
         message: &str,
     ) -> Result<()> {
+        self.followup_task_with_options_as(
+            actor_session_id,
+            target,
+            message,
+            TeamMessageOptions::default(),
+        )
+        .await
+    }
+
+    pub async fn followup_task_with_options_as(
+        &self,
+        actor_session_id: Uuid,
+        target: &str,
+        message: &str,
+        options: TeamMessageOptions,
+    ) -> Result<()> {
         let message = required_message(message)?;
-        let mut table = self.table.lock().await;
-        let actor = table.task_name(actor_session_id)?;
-        let id = table.resolve(target)?;
-        let text = attributed_team_message(&actor, &message);
-        if id == table.root_session_id {
-            drop(table);
+        let (actor, id, root_session_id, status) = {
+            let table = self.table.lock().await;
+            let actor = table.task_name(actor_session_id)?;
+            let id = table.resolve(target)?;
+            let status = table.entries.get(&id).map(|entry| entry.snapshot.status);
+            (actor, id, table.root_session_id, status)
+        };
+        if status.is_some_and(SubagentStatus::is_terminal) {
+            bail!("subagent {target} is not running");
+        }
+        let inbox_message = self
+            .persist_team_message(
+                actor_session_id,
+                id,
+                &actor,
+                &message,
+                PromptDelivery::Steer,
+                if status == Some(SubagentStatus::Ready) {
+                    DeliveryMode::Wake
+                } else {
+                    DeliveryMode::Boundary
+                },
+                options,
+            )
+            .await?;
+        if id == root_session_id {
             let mut messages = self.take_root_inbox().await;
-            messages.push(TeamInboxMessage {
-                message_id: Uuid::new_v4(),
-                text,
-            });
-            let merged = TeamInboxMessage {
-                message_id: Uuid::new_v4(),
-                text: messages
-                    .into_iter()
-                    .map(|message| message.text)
-                    .collect::<Vec<_>>()
-                    .join("\n\n"),
-            };
-            let _ = self.root_message_tx.send(merged);
+            messages.push(inbox_message);
+            for message in messages {
+                if let Err(error) = self.root_message_tx.send(message) {
+                    self.root_inbox.lock().await.push(error.0);
+                }
+            }
             return Ok(());
         }
+        let mut table = self.table.lock().await;
         let entry = table
             .entries
             .get_mut(&id)
@@ -920,8 +1316,11 @@ impl SubagentCoordinator {
             bail!("subagent {} is not running", entry.snapshot.task_name);
         }
         let mut messages = std::mem::take(&mut entry.inbox);
-        messages.push(text);
-        send_prompt(entry, id, messages.join("\n\n"), PromptDelivery::Steer).await
+        messages.push(inbox_message);
+        for message in messages {
+            send_prompt(entry, id, message).await?;
+        }
+        Ok(())
     }
 
     pub async fn interrupt(&self, target: &str) -> Result<()> {
@@ -1041,15 +1440,41 @@ impl SubagentCoordinator {
             }
             "send_message" => {
                 let args: MessageArgs = serde_json::from_value(arguments)?;
-                self.send_message_as(actor_session_id, &args.target, &args.message)
-                    .await?;
+                self.send_message_with_options_as(
+                    actor_session_id,
+                    &args.target,
+                    &args.message,
+                    args.options(),
+                )
+                .await?;
                 Ok(json!({ "queued": true }))
             }
             "followup_task" => {
                 let args: MessageArgs = serde_json::from_value(arguments)?;
-                self.followup_task_as(actor_session_id, &args.target, &args.message)
-                    .await?;
+                self.followup_task_with_options_as(
+                    actor_session_id,
+                    &args.target,
+                    &args.message,
+                    args.options(),
+                )
+                .await?;
                 Ok(json!({ "accepted": true }))
+            }
+            "broadcast_team" => {
+                let args: BroadcastArgs = serde_json::from_value(arguments)?;
+                let message_id = self
+                    .broadcast_message_as(actor_session_id, &args.message)
+                    .await?;
+                Ok(json!({ "message_id": message_id, "queued": true }))
+            }
+            "list_unread_team_messages" => Ok(serde_json::to_value(
+                self.unread_messages_for_session(actor_session_id).await?,
+            )?),
+            "acknowledge_team_message" => {
+                let args: AcknowledgeMessageArgs = serde_json::from_value(arguments)?;
+                self.acknowledge_message_for_session(actor_session_id, args.message_id)
+                    .await?;
+                Ok(json!({ "acknowledged": true }))
             }
             "interrupt_agent" => {
                 let args: TargetArgs = serde_json::from_value(arguments)?;
@@ -1141,6 +1566,21 @@ pub fn subagent_tool_specs(provider: CodingProvider) -> Vec<Value> {
         ),
         message_tool("followup_task", "Send a follow-up and wake an idle child."),
         tool(
+            "broadcast_team",
+            "Broadcast one durable team message to all visible team participants.",
+            json!({"type":"object","properties":{"message":{"type":"string"}},"required":["message"],"additionalProperties":false}),
+        ),
+        tool(
+            "list_unread_team_messages",
+            "List unread team messages for this participant.",
+            json!({"type":"object","properties":{},"additionalProperties":false}),
+        ),
+        tool(
+            "acknowledge_team_message",
+            "Acknowledge one unread team message.",
+            json!({"type":"object","properties":{"message_id":{"type":"string"}},"required":["message_id"],"additionalProperties":false}),
+        ),
+        tool(
             "interrupt_agent",
             "Interrupt a child agent's current turn.",
             target_schema(),
@@ -1226,7 +1666,30 @@ fn validate_subagent_overrides(
     Ok(())
 }
 
+fn effective_worker_effort(launch: &LaunchSession, requested_effort: Option<String>) -> Option<String> {
+    requested_effort.or_else(|| {
+        // The only opt-in preset assigns workers low effort. Without a policy,
+        // retain the existing inheritance from the root launch.
+        launch.team_policy.as_ref().map(|_| "low".to_string())
+    }).or_else(|| launch.effort.clone())
+}
+
 pub fn agent_tool_specs(provider: CodingProvider) -> Vec<Value> {
+    agent_tool_specs_with_subagents(provider, true)
+}
+
+pub fn agent_tool_specs_with_subagents(
+    provider: CodingProvider,
+    subagents_enabled: bool,
+) -> Vec<Value> {
+    agent_tool_specs_with_team_policy(provider, subagents_enabled, None)
+}
+
+pub fn agent_tool_specs_with_team_policy(
+    provider: CodingProvider,
+    subagents_enabled: bool,
+    team_policy: Option<&crate::TeamPolicy>,
+) -> Vec<Value> {
     let mut specs = vec![
         tool(
             "get_goal",
@@ -1350,7 +1813,24 @@ pub fn agent_tool_specs(provider: CodingProvider) -> Vec<Value> {
             }),
         ),
     ];
-    specs.extend(subagent_tool_specs(provider));
+    if subagents_enabled {
+        let mut subagent_specs = subagent_tool_specs(provider);
+        if let Some(policy) = team_policy {
+            let metadata = serde_json::to_string(policy)
+                .unwrap_or_else(|_| "autonomous team policy enabled".to_string());
+            if let Some(description) = subagent_specs
+                .first_mut()
+                .and_then(|spec| spec.get_mut("description"))
+                .and_then(|value| value.as_str())
+                .map(str::to_owned)
+            {
+                subagent_specs[0]["description"] = Value::String(format!(
+                    "{description} Effective autonomous-team policy: {metadata}"
+                ));
+            }
+        }
+        specs.extend(subagent_specs);
+    }
     specs
 }
 
@@ -1421,6 +1901,31 @@ struct ListAgentsArgs {
 struct MessageArgs {
     target: String,
     message: String,
+    #[serde(default)]
+    mentions: Vec<StructuredMention>,
+    #[serde(default)]
+    reply_to_message_id: Option<Uuid>,
+}
+
+impl MessageArgs {
+    fn options(&self) -> TeamMessageOptions {
+        TeamMessageOptions {
+            mentions: self.mentions.clone(),
+            reply_to_message_id: self.reply_to_message_id,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BroadcastArgs {
+    message: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AcknowledgeMessageArgs {
+    message_id: Uuid,
 }
 
 #[derive(Deserialize)]
@@ -1487,7 +1992,9 @@ fn message_tool(name: &str, description: &str) -> Value {
             "type": "object",
             "properties": {
                 "target": { "type": "string" },
-                "message": { "type": "string" }
+                "message": { "type": "string" },
+                "mentions": { "type": "array" },
+                "reply_to_message_id": { "type": "string" }
             },
             "required": ["target", "message"],
             "additionalProperties": false
@@ -1536,8 +2043,7 @@ fn child_journal_path(root: &Path, session_id: Uuid) -> PathBuf {
 async fn send_prompt(
     entry: &SubagentEntry,
     session_id: Uuid,
-    text: String,
-    delivery: PromptDelivery,
+    message: TeamInboxMessage,
 ) -> Result<()> {
     entry
         .commands
@@ -1545,11 +2051,11 @@ async fn send_prompt(
         .ok_or_else(|| anyhow::anyhow!("subagent {} is still starting", entry.snapshot.task_name))?
         .send(HostCommand::Prompt {
             session_id,
-            message_id: Uuid::new_v4(),
-            text,
+            message_id: message.message_id,
+            text: message.text,
             attachments: Vec::new(),
             output_schema: None,
-            delivery,
+            delivery: message.delivery,
         })
         .await
         .map_err(|_| anyhow::anyhow!("subagent command channel closed"))
@@ -1606,9 +2112,7 @@ async fn update_from_session_event(
                 .saturating_add(*total_tokens);
             entry.snapshot.usage.cost_microusd =
                 match (entry.snapshot.usage.cost_microusd, cost_microusd) {
-                    (Some(current), Some(additional)) => {
-                        Some(current.saturating_add(*additional))
-                    }
+                    (Some(current), Some(additional)) => Some(current.saturating_add(*additional)),
                     (None, Some(value)) => Some(*value),
                     (current, None) => current,
                 };
@@ -1720,6 +2224,36 @@ mod tests {
             permission_mode: PermissionMode::Manual,
             name: None,
             initial_prompt: None,
+            capabilities: Default::default(),
+            team_policy: None,
+        }
+    }
+
+    async fn bind_test_team(
+        directory: &Path,
+        store: &crate::SqliteSessionStore,
+        root: Uuid,
+        children: &[Uuid],
+    ) {
+        let workspace = crate::SqliteWorkspaceStore::open(directory.join("workspaces.sqlite3"))
+            .await
+            .unwrap();
+        let human = Uuid::new_v5(&root, b"borg-local-human-participant");
+        workspace
+            .ensure_execution_workspace(root, "test team", human, "Human", root, "Director")
+            .await
+            .unwrap();
+        for child in children {
+            let journal = child_journal_path(directory, *child);
+            let writer = crate::SessionWriterLease::acquire(&journal).unwrap();
+            store
+                .register_child_session(root, *child, &journal, &writer)
+                .await
+                .unwrap();
+            workspace
+                .ensure_execution_workspace(root, "test team", human, "Human", *child, "Worker")
+                .await
+                .unwrap();
         }
     }
 
@@ -1761,6 +2295,181 @@ mod tests {
         assert!(table.reserve("SECOND", &launch()).is_err());
     }
 
+    #[tokio::test]
+    async fn child_messages_are_team_scoped_and_can_report_to_root() {
+        let directory = tempdir().unwrap();
+        let root = Uuid::new_v4();
+        let store = Arc::new(
+            crate::SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
+                .await
+                .unwrap(),
+        );
+        store.create_session(root).await.unwrap();
+        let coordinator = SubagentCoordinator::new_with_store_and_executor(
+            directory.path(),
+            root,
+            launch(),
+            3,
+            Arc::new(crate::LocalAgentTurnExecutor::default()),
+            store.clone(),
+        )
+        .unwrap();
+        let worker = coordinator
+            .table
+            .lock()
+            .await
+            .reserve("worker", &launch())
+            .unwrap();
+        bind_test_team(directory.path(), store.as_ref(), root, &[worker.session_id]).await;
+        let mut wake = coordinator.subscribe_root_messages();
+
+        coordinator
+            .send_message_as(worker.session_id, "/root", "blocked on an API decision")
+            .await
+            .unwrap();
+        assert!(matches!(
+            wake.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+
+        coordinator
+            .followup_task_as(worker.session_id, "/root", "please review")
+            .await
+            .unwrap();
+        let queued = wake.recv().await.unwrap();
+        let followup = wake.recv().await.unwrap();
+        assert!(queued.text.contains("Team message from /root/worker"));
+        assert!(queued.text.contains("blocked on an API decision"));
+        assert!(followup.text.contains("please review"));
+        assert!(coordinator.take_root_inbox().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sibling_messages_use_the_shared_team_directory() {
+        let directory = tempdir().unwrap();
+        let root = Uuid::new_v4();
+        let store = Arc::new(
+            crate::SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
+                .await
+                .unwrap(),
+        );
+        store.create_session(root).await.unwrap();
+        let coordinator = SubagentCoordinator::new_with_store_and_executor(
+            directory.path(),
+            root,
+            launch(),
+            3,
+            Arc::new(crate::LocalAgentTurnExecutor::default()),
+            store.clone(),
+        )
+        .unwrap();
+        let mut table = coordinator.table.lock().await;
+        let sender = table.reserve("sender", &launch()).unwrap();
+        let recipient = table.reserve("recipient", &launch()).unwrap();
+        let (commands, mut received) = mpsc::channel(1);
+        let entry = table.entries.get_mut(&recipient.session_id).unwrap();
+        entry.snapshot.status = SubagentStatus::Running;
+        entry.commands = Some(commands);
+        drop(table);
+        bind_test_team(
+            directory.path(),
+            store.as_ref(),
+            root,
+            &[sender.session_id, recipient.session_id],
+        )
+        .await;
+
+        coordinator
+            .send_message_as(sender.session_id, "recipient", "share the benchmark")
+            .await
+            .unwrap();
+        let HostCommand::Prompt {
+            session_id,
+            text,
+            delivery,
+            ..
+        } = received.recv().await.unwrap()
+        else {
+            panic!("expected prompt");
+        };
+        assert_eq!(session_id, recipient.session_id);
+        assert_eq!(delivery, PromptDelivery::Queue);
+        assert!(text.contains("Team message from /root/sender"));
+        assert!(text.contains("share the benchmark"));
+
+        let broadcast_id = coordinator
+            .broadcast_message_as(sender.session_id, "team checkpoint")
+            .await
+            .unwrap();
+        let HostCommand::Prompt { message_id, .. } = received.recv().await.unwrap() else {
+            panic!("expected broadcast prompt");
+        };
+        assert_eq!(message_id, broadcast_id);
+        assert_eq!(
+            coordinator.take_root_inbox().await[0].message_id,
+            broadcast_id
+        );
+        let workspace =
+            crate::SqliteWorkspaceStore::open(directory.path().join("workspaces.sqlite3"))
+                .await
+                .unwrap();
+        let binding = store
+            .workspace_binding(recipient.session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            workspace
+                .deliveries_after(binding.workspace_id, binding.participant_id, 0, 10)
+                .await
+                .unwrap()
+                .iter()
+                .filter(|delivery| delivery.sequence > 0)
+                .count(),
+            2
+        );
+        coordinator
+            .acknowledge_message_for_session(recipient.session_id, broadcast_id)
+            .await
+            .unwrap();
+        assert!(
+            coordinator
+                .unread_messages_for_session(recipient.session_id)
+                .await
+                .unwrap()
+                .iter()
+                .all(|message| message.message_id != broadcast_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn broadcast_is_rejected_when_multiplayer_is_disabled() {
+        let directory = tempdir().unwrap();
+        let root = Uuid::new_v4();
+        let store = Arc::new(
+            crate::SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
+                .await
+                .unwrap(),
+        );
+        let mut disabled = launch();
+        disabled.capabilities.multiplayer = false;
+        let coordinator = SubagentCoordinator::new_with_store_and_executor(
+            directory.path(),
+            root,
+            disabled,
+            1,
+            Arc::new(crate::LocalAgentTurnExecutor::default()),
+            store,
+        )
+        .unwrap();
+        assert!(
+            coordinator
+                .broadcast_message_as(root, "blocked")
+                .await
+                .is_err()
+        );
+    }
+
     #[test]
     fn tool_catalog_exposes_one_complete_lifecycle() {
         let names = subagent_tool_specs(CodingProvider::Codex)
@@ -1774,10 +2483,64 @@ mod tests {
                 "list_agents",
                 "send_message",
                 "followup_task",
+                "broadcast_team",
+                "list_unread_team_messages",
+                "acknowledge_team_message",
                 "interrupt_agent",
                 "wait_agent"
             ]
         );
+    }
+
+    #[test]
+    fn autonomous_team_defaults_workers_to_low_without_overriding_tool_input() {
+        let mut team_launch = launch();
+        team_launch.team_policy = Some(TeamPreset::XhighDirectorLowWorkers.policy(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            std::iter::empty(),
+            crate::ProviderId("codex".into()),
+        ));
+        assert_eq!(effective_worker_effort(&team_launch, None).as_deref(), Some("low"));
+        assert_eq!(
+            effective_worker_effort(&team_launch, Some("high".into())).as_deref(),
+            Some("high")
+        );
+        team_launch.team_policy = None;
+        assert_eq!(
+            effective_worker_effort(&team_launch, None).as_deref(),
+            Some("high")
+        );
+    }
+
+    #[test]
+    fn autonomous_team_policy_is_visible_in_spawn_tool_metadata() {
+        let policy = TeamPreset::XhighDirectorLowWorkers.policy(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            std::iter::empty(),
+            crate::ProviderId("codex".into()),
+        );
+        let spawn = agent_tool_specs_with_team_policy(CodingProvider::Codex, true, Some(&policy))
+            .into_iter()
+            .find(|tool| tool["name"] == "spawn_agent")
+            .unwrap();
+        assert!(spawn["description"]
+            .as_str()
+            .unwrap()
+            .contains("Effective autonomous-team policy"));
+    }
+
+    #[test]
+    fn disabled_catalog_omits_subagent_tools() {
+        let names = agent_tool_specs_with_subagents(CodingProvider::Codex, false)
+            .into_iter()
+            .filter_map(|tool| tool["name"].as_str().map(str::to_string))
+            .collect::<Vec<_>>();
+        assert!(!names.iter().any(|name| name == "spawn_agent"));
+        assert!(!names.iter().any(|name| name == "send_message"));
     }
 
     #[test]
@@ -1824,6 +2587,7 @@ mod tests {
             updated_at: now,
             detail: None,
             final_text: None,
+            usage: SubagentUsage::default(),
         };
         let started = SessionEvent::new(
             root,

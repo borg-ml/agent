@@ -275,6 +275,61 @@ pub struct HostCapabilities {
     pub providers: Vec<ProviderCapability>,
     pub roots: Vec<PathBuf>,
     pub can_launch: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_attachment: Option<WorkspaceAttachmentCapabilities>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct WorkspaceAttachmentCapabilities {
+    pub presence_leases: bool,
+    pub approval_provenance: bool,
+    pub reconnect_sync_cursors: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct RemoteHostIdentity {
+    pub host_id: Uuid,
+    pub hostname: String,
+    pub platform: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct RemotePresenceLease {
+    pub lease_id: Uuid,
+    pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct RemoteApprovalProvenance {
+    pub approval_id: String,
+    pub approved_by_participant_id: Uuid,
+    pub approved_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct RemoteReconnectSyncCursors {
+    pub command_cursor: u64,
+    pub event_cursor: u64,
+    pub live_revision: u64,
+}
+
+/// Optional workspace attachment carried with a launch command. It is metadata
+/// for the existing session journal, never a second message/event log.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct WorkspaceAttachment {
+    pub workspace_id: Option<Uuid>,
+    pub participant_id: Option<Uuid>,
+    pub host_identity: Option<RemoteHostIdentity>,
+    pub host_capabilities: Option<WorkspaceAttachmentCapabilities>,
+    pub presence_lease: Option<RemotePresenceLease>,
+    pub approval_provenance: Option<RemoteApprovalProvenance>,
+    pub reconnect_sync_cursors: Option<RemoteReconnectSyncCursors>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -288,6 +343,8 @@ pub struct RemoteHost {
     pub capabilities: HostCapabilities,
     pub last_seen_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<RemoteHostIdentity>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -305,6 +362,121 @@ pub struct LaunchSession {
     pub permission_mode: PermissionMode,
     pub name: Option<String>,
     pub initial_prompt: Option<String>,
+    /// Provider-neutral runtime feature gates. Missing fields preserve legacy behavior.
+    #[serde(default)]
+    pub capabilities: SessionCapabilities,
+    /// Optional autonomous-team policy. Absent preserves ordinary manual
+    /// subagent behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "unknown")]
+    pub team_policy: Option<crate::TeamPolicy>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct SessionCapabilities {
+    pub multiplayer: bool,
+    pub subagents: bool,
+    pub autonomous_team: bool,
+    pub shared_work: bool,
+    pub presence: bool,
+    pub cloud_sync: bool,
+    pub web_relay: bool,
+    pub telemetry: bool,
+}
+
+impl Default for SessionCapabilities {
+    fn default() -> Self {
+        Self {
+            multiplayer: true,
+            subagents: true,
+            autonomous_team: true,
+            shared_work: true,
+            presence: true,
+            cloud_sync: true,
+            web_relay: true,
+            telemetry: false,
+        }
+    }
+}
+
+/// Provider-neutral runtime capability names exposed to hosts and clients.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum SessionCapability {
+    Multiplayer,
+    Subagents,
+    AutonomousTeam,
+    SharedWork,
+    Presence,
+    CloudSync,
+    WebRelay,
+    Telemetry,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct InactiveCapability {
+    pub capability: SessionCapability,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct EffectiveCapabilities {
+    pub active: Vec<SessionCapability>,
+    pub inactive: Vec<InactiveCapability>,
+}
+
+impl SessionCapabilities {
+    pub fn effective(&self) -> EffectiveCapabilities {
+        let states = [
+            (SessionCapability::Multiplayer, self.multiplayer, None),
+            (SessionCapability::Subagents, self.subagents, None),
+            (
+                SessionCapability::AutonomousTeam,
+                self.autonomous_team,
+                (!self.subagents).then_some("requires subagents"),
+            ),
+            (
+                SessionCapability::SharedWork,
+                self.shared_work,
+                (!self.multiplayer).then_some("requires multiplayer"),
+            ),
+            (
+                SessionCapability::Presence,
+                self.presence,
+                (!self.multiplayer).then_some("requires multiplayer"),
+            ),
+            (SessionCapability::CloudSync, self.cloud_sync, None),
+            (
+                SessionCapability::WebRelay,
+                self.web_relay,
+                (!self.cloud_sync).then_some("requires cloud_sync"),
+            ),
+            (SessionCapability::Telemetry, self.telemetry, None),
+        ];
+        let mut active = Vec::new();
+        let mut inactive = Vec::new();
+        for (capability, configured, dependency) in states {
+            if configured && dependency.is_none() {
+                active.push(capability);
+            } else {
+                inactive.push(InactiveCapability {
+                    capability,
+                    reason: if configured {
+                        dependency
+                            .unwrap_or("disabled by configuration")
+                            .to_string()
+                    } else {
+                        "disabled by configuration".to_string()
+                    },
+                });
+            }
+        }
+        EffectiveCapabilities { active, inactive }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -336,6 +508,8 @@ pub enum HostCommand {
     Launch {
         session_id: Uuid,
         request: LaunchSession,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attachment: Option<WorkspaceAttachment>,
     },
     Prompt {
         session_id: Uuid,
@@ -1151,6 +1325,27 @@ impl SessionEvent {
 mod tests {
     use serde_json::json;
 
+    #[test]
+    fn effective_capabilities_explain_dependency_inactivation() {
+        let capabilities = SessionCapabilities {
+            multiplayer: false,
+            shared_work: true,
+            presence: true,
+            ..Default::default()
+        };
+        let effective = capabilities.effective();
+        assert!(!effective.active.contains(&SessionCapability::Multiplayer));
+        assert_eq!(
+            effective
+                .inactive
+                .iter()
+                .find(|item| item.capability == SessionCapability::SharedWork)
+                .unwrap()
+                .reason,
+            "requires multiplayer"
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -1176,6 +1371,36 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[test]
+    fn workspace_attachment_fields_are_optional_for_legacy_host_payloads() {
+        let capabilities: HostCapabilities = serde_json::from_value(json!({
+            "protocol_version": 5,
+            "providers": [],
+            "roots": [],
+            "can_launch": true
+        }))
+        .unwrap();
+        assert!(capabilities.workspace_attachment.is_none());
+
+        let command: HostCommand = serde_json::from_value(json!({
+            "type": "launch",
+            "session_id": Uuid::new_v4(),
+            "request": {
+                "request_id": Uuid::new_v4(), "cwd": "/tmp", "provider": "codex",
+                "model": null, "effort": null, "permission_mode": "manual",
+                "name": null, "initial_prompt": null
+            }
+        }))
+        .unwrap();
+        assert!(matches!(
+            command,
+            HostCommand::Launch {
+                attachment: None,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1278,4 +1503,6 @@ pub struct HostHeartbeat {
     pub hostname: String,
     pub capabilities: HostCapabilities,
     pub acknowledged_command_sequence: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<RemoteHostIdentity>,
 }
