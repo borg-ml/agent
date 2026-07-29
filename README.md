@@ -1,6 +1,6 @@
 # Borg CLI
 
-Borg is a free and open-source agent harness and orchestrator written entirely
+Borg CLI is a free and open-source agent harness and orchestrator written entirely
 in Rust. It combines a responsive terminal UI, durable sessions, native tools,
 major AI subscriptions and APIs, and optional remote control through borg.ml.
 
