@@ -112,16 +112,16 @@ struct PersistedLaunchMetadata {
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum StoredLaunchMetadata {
-    Current(PersistedLaunchMetadata),
-    Legacy(LaunchSession),
+    Current(Box<PersistedLaunchMetadata>),
+    Legacy(Box<LaunchSession>),
 }
 
 impl StoredLaunchMetadata {
     fn into_current(self) -> PersistedLaunchMetadata {
         match self {
-            Self::Current(metadata) => metadata,
+            Self::Current(metadata) => *metadata,
             Self::Legacy(request) => PersistedLaunchMetadata {
-                request,
+                request: *request,
                 attachment: None,
             },
         }
@@ -915,7 +915,7 @@ async fn dispatch(
         if sessions.lock().await.contains_key(&session_id) {
             return true;
         }
-        spawn_host_session(client, config, session_root, sessions, session_id, request).await;
+        spawn_host_session(client, config, session_root, sessions, session_id, *request).await;
         return true;
     }
     if let Some(session_id) = command.session_id() {

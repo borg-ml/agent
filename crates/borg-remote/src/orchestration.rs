@@ -531,12 +531,10 @@ impl TeamPolicy {
                     PolicyDecision::Deny("specialist participant is already in the team")
                 } else if state.active_specialists >= self.specialists.max_specialists {
                     PolicyDecision::Deny("specialist limit reached")
-                } else if matches!(requester.role, TeamRole::Director)
-                    && self.specialists.director_may_spawn
-                {
-                    PolicyDecision::AllowSpecialistSpawn
-                } else if matches!(requester.role, TeamRole::Worker)
-                    && self.specialists.workers_may_spawn
+                } else if (matches!(requester.role, TeamRole::Director)
+                    && self.specialists.director_may_spawn)
+                    || (matches!(requester.role, TeamRole::Worker)
+                        && self.specialists.workers_may_spawn)
                 {
                     PolicyDecision::AllowSpecialistSpawn
                 } else {

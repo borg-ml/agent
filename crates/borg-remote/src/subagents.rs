@@ -290,10 +290,10 @@ impl AgentToolServer {
             "BORG_AGENT_TOOL_PROVIDER".to_string(),
             self.provider.catalog_backend().to_string(),
         );
-        if let Some(policy) = &self.team_policy {
-            if let Ok(policy) = serde_json::to_string(policy) {
-                env.insert("BORG_AGENT_TEAM_POLICY".to_string(), policy);
-            }
+        if let Some(policy) = &self.team_policy
+            && let Ok(policy) = serde_json::to_string(policy)
+        {
+            env.insert("BORG_AGENT_TEAM_POLICY".to_string(), policy);
         }
         env.insert(
             "BORG_AGENT_SHARED_WORK_ENABLED".to_string(),
@@ -384,6 +384,9 @@ async fn serve_agent_tool_connection<S>(
 }
 
 impl AgentToolDispatcher {
+    // The dispatcher deliberately receives each independently disableable
+    // service explicitly at its construction boundary.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         goals: SessionGoalTools,
         todos: SessionTodoTools,
@@ -911,6 +914,9 @@ impl SubagentCoordinator {
         std::mem::take(&mut *self.root_inbox.lock().await)
     }
 
+    // Message persistence keeps sender, recipient, admission, and audience
+    // metadata explicit so none can be inferred incorrectly during replay.
+    #[allow(clippy::too_many_arguments)]
     async fn persist_team_message(
         &self,
         actor_session_id: Uuid,

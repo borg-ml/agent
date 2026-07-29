@@ -2098,7 +2098,10 @@ fn up_recall_targets_all_queued_prompts_only_for_an_empty_composer() {
         delivery: PromptDelivery::Steer,
     };
 
-    assert!(has_recallable_queued_prompts("", &[queued.clone()]));
+    assert!(has_recallable_queued_prompts(
+        "",
+        std::slice::from_ref(&queued)
+    ));
     assert!(has_recallable_queued_prompts(
         "",
         &[queued.clone(), steer.clone()]
@@ -2129,8 +2132,14 @@ fn up_does_not_fake_recall_an_already_submitted_steer() {
         delivery: PromptDelivery::Steer,
     };
 
-    assert!(!has_recallable_queued_prompts("", &[steer.clone()]));
-    assert!(pending_steer_blocks_history_recall("", &[steer.clone()]));
+    assert!(!has_recallable_queued_prompts(
+        "",
+        std::slice::from_ref(&steer)
+    ));
+    assert!(pending_steer_blocks_history_recall(
+        "",
+        std::slice::from_ref(&steer)
+    ));
     assert!(!pending_steer_blocks_history_recall(
         "draft in progress",
         &[steer]

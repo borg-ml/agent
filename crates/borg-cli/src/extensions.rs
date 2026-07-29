@@ -221,8 +221,10 @@ mod tests {
         let (catalog, servers) = discover(dir.path(), &CapabilityConfig::default(), true).unwrap();
         assert!(catalog.extensions[0].active);
         assert_eq!(servers[0].name, "docs__docs");
-        let mut disabled = CapabilityConfig::default();
-        disabled.multiplayer = false;
+        let disabled = CapabilityConfig {
+            multiplayer: false,
+            ..CapabilityConfig::default()
+        };
         let (catalog, servers) = discover(dir.path(), &disabled, true).unwrap();
         assert!(!catalog.extensions[0].active);
         assert!(servers.is_empty());

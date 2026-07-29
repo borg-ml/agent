@@ -554,7 +554,7 @@ pub struct RemoteSession {
 pub enum HostCommand {
     Launch {
         session_id: Uuid,
-        request: LaunchSession,
+        request: Box<LaunchSession>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         attachment: Option<WorkspaceAttachment>,
     },
@@ -733,7 +733,7 @@ pub enum SubagentControlOutcome {
         agents: Vec<crate::SubagentSnapshot>,
     },
     Accepted {
-        agent: crate::SubagentSnapshot,
+        agent: Box<crate::SubagentSnapshot>,
     },
     Failed {
         message: String,

@@ -449,6 +449,9 @@ async fn run_agent_session_kernel(
     .await
 }
 
+// This is the single assembly boundary for the session actor's channels and
+// durable services; keeping the inputs explicit makes ownership unambiguous.
+#[allow(clippy::too_many_arguments)]
 async fn run_agent_session_store_kernel(
     session_root: &Path,
     session_id: Uuid,
@@ -2645,7 +2648,7 @@ async fn apply_subagent_action(
                     PromptDelivery::Steer => subagents.followup_task(&target, &message).await?,
                 }
                 Ok(SubagentControlOutcome::Accepted {
-                    agent: subagents.resolve_snapshot(&target).await?,
+                    agent: Box::new(subagents.resolve_snapshot(&target).await?),
                 })
             }
             SubagentAction::Prompt {
@@ -2660,7 +2663,7 @@ async fn apply_subagent_action(
                     .prompt_child(&target, message_id, text, attachments, delivery)
                     .await?;
                 Ok(SubagentControlOutcome::Accepted {
-                    agent: subagents.resolve_snapshot(&target).await?,
+                    agent: Box::new(subagents.resolve_snapshot(&target).await?),
                 })
             }
             SubagentAction::RecallPrompt {
@@ -2668,19 +2671,19 @@ async fn apply_subagent_action(
             } => {
                 subagents.recall_child_prompt(&target, message_id).await?;
                 Ok(SubagentControlOutcome::Accepted {
-                    agent: subagents.resolve_snapshot(&target).await?,
+                    agent: Box::new(subagents.resolve_snapshot(&target).await?),
                 })
             }
             SubagentAction::Interrupt { target, .. } => {
                 subagents.interrupt(&target).await?;
                 Ok(SubagentControlOutcome::Accepted {
-                    agent: subagents.resolve_snapshot(&target).await?,
+                    agent: Box::new(subagents.resolve_snapshot(&target).await?),
                 })
             }
             SubagentAction::Stop { target, .. } => {
                 subagents.stop(&target).await?;
                 Ok(SubagentControlOutcome::Accepted {
-                    agent: subagents.resolve_snapshot(&target).await?,
+                    agent: Box::new(subagents.resolve_snapshot(&target).await?),
                 })
             }
             SubagentAction::Approve {
@@ -2691,7 +2694,7 @@ async fn apply_subagent_action(
             } => {
                 subagents.approve(&target, approval_id, decision).await?;
                 Ok(SubagentControlOutcome::Accepted {
-                    agent: subagents.resolve_snapshot(&target).await?,
+                    agent: Box::new(subagents.resolve_snapshot(&target).await?),
                 })
             }
         }
