@@ -684,11 +684,12 @@ async fn run_local_agent_session(
         tokio::select! {
             _ = render_tick.tick(), if terminal.is_some() && terminal_dirty => {
                 let terminal = terminal.as_mut().expect("terminal");
+                let interaction_frame = terminal.has_pending_scroll_frame();
                 terminal.advance_scroll_frame();
                 let draw_started = std::time::Instant::now();
                 terminal.draw()?;
                 let next_interval =
-                    responsive_tui_frame_interval(tui_fps, draw_started.elapsed());
+                    responsive_tui_frame_interval(tui_fps, draw_started.elapsed(), interaction_frame);
                 if next_interval != render_frame_interval {
                     render_frame_interval = next_interval;
                     render_tick = tui_render_interval(render_frame_interval);
@@ -1245,7 +1246,19 @@ async fn run_local_agent_session(
                         continue;
                     }
                 };
+                let scroll_was_active = terminal
+                    .as_ref()
+                    .expect("terminal")
+                    .has_pending_scroll_frame();
                 let action = terminal.as_mut().expect("terminal").handle_event(terminal_event)?;
+                let scroll_is_active = terminal
+                    .as_ref()
+                    .expect("terminal")
+                    .has_pending_scroll_frame();
+                if scroll_is_active && !scroll_was_active {
+                    render_frame_interval = tui_frame_interval(tui_fps);
+                    render_tick = tui_render_interval(render_frame_interval);
+                }
                 let event_redraw_needed = terminal
                     .as_mut()
                     .expect("terminal")
@@ -2454,9 +2467,17 @@ fn tui_frame_interval(fps: u64) -> std::time::Duration {
     std::time::Duration::from_nanos(1_000_000_000 / fps.clamp(MIN_TUI_FPS, MAX_TUI_FPS))
 }
 
-fn responsive_tui_frame_interval(fps: u64, last_draw: std::time::Duration) -> std::time::Duration {
+fn responsive_tui_frame_interval(
+    fps: u64,
+    last_draw: std::time::Duration,
+    interaction_frame: bool,
+) -> std::time::Duration {
     tui_frame_interval(fps)
-        .max(last_draw.saturating_mul(3))
+        .max(if interaction_frame {
+            last_draw
+        } else {
+            last_draw.saturating_mul(3)
+        })
         .min(ACTIVITY_FRAME_INTERVAL)
 }
 
@@ -3379,16 +3400,20 @@ mod tests {
     #[test]
     fn expensive_draws_leave_time_for_input_and_animation_events() {
         assert_eq!(
-            responsive_tui_frame_interval(165, std::time::Duration::from_millis(5)),
+            responsive_tui_frame_interval(165, std::time::Duration::from_millis(5), false),
             std::time::Duration::from_millis(15)
         );
         assert_eq!(
-            responsive_tui_frame_interval(60, std::time::Duration::from_millis(40)),
+            responsive_tui_frame_interval(60, std::time::Duration::from_millis(40), false),
             ACTIVITY_FRAME_INTERVAL
         );
         assert_eq!(
-            responsive_tui_frame_interval(60, std::time::Duration::ZERO),
+            responsive_tui_frame_interval(60, std::time::Duration::ZERO, false),
             tui_frame_interval(60)
+        );
+        assert_eq!(
+            responsive_tui_frame_interval(60, std::time::Duration::from_millis(40), true),
+            std::time::Duration::from_millis(40)
         );
     }
 
