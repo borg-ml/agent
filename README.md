@@ -18,13 +18,13 @@ The installer detects the operating system and CPU, verifies the release
 checksum, installs to a user-local binary directory, and checks the installed
 binary with `borg --version`.
 
-Borg checks for verified stable releases in the background and installs them
+Borg CLI checks for verified stable releases in the background and installs them
 for the next launch without interrupting active work. Run `borg update`
 (`borg install` is an alias) to update immediately, or `borg update --check`
 to check without installing. Automatic updates and their check interval are
 configurable.
 
-## What Borg provides
+## What Borg CLI provides
 
 - a responsive terminal UI with durable resume, steering, compaction, image
   input, transcript selection, and configurable keybindings;
@@ -67,9 +67,9 @@ Automated CLI/terminal checks should use `borg agent --ephemeral --local-only`.
 That creates a temporary session store and removes it when the process exits,
 so health checks do not pollute the user's resume history or Remote workspace.
 
-## Extend Borg
+## Extend Borg CLI
 
-Borg uses composable, inspectable extension points instead of a private plugin
+Borg CLI uses composable, inspectable extension points instead of a private plugin
 runtime:
 
 - put `SKILL.md` packages in `.agents/skills`, `.borg/skills`,
