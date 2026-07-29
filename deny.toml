@@ -8,12 +8,12 @@ ignore = ["RUSTSEC-2025-0141"]
 confidence-threshold = 0.8
 allow = [
     "0BSD",
-    "AGPL-3.0-only",
     "Apache-2.0",
     "BSD-2-Clause",
     "BSD-3-Clause",
     "BSL-1.0",
     "CDLA-Permissive-2.0",
+    "GPL-3.0-or-later",
     "ISC",
     "MIT",
     "Unicode-3.0",

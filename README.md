@@ -130,4 +130,4 @@ Windows on x86-64 and ARM64. Each release archive contains the self-contained
 
 ---
 
-AGPL-3.0-only OR a separate Borg Commercial Licence.
+GPL-3.0-or-later.
