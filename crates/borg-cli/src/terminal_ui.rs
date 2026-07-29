@@ -956,7 +956,8 @@ impl BorgTerminal {
     }
 
     pub fn has_cache_idle_timer(&self) -> bool {
-        self.transcript.cache_diagnostics.needs_idle_timer()
+        self.transcript.active_turn.is_none()
+            && self.transcript.cache_diagnostics.needs_idle_timer()
     }
 
     pub fn apply_session_event(&mut self, event: &SessionEvent) -> bool {
@@ -2090,7 +2091,8 @@ impl BorgTerminal {
             .as_ref()
             .filter(|(_, warning)| *warning)
             .filter(|_| {
-                self.picker.is_none()
+                status == SessionStatus::Ready
+                    && self.picker.is_none()
                     && !self.composer.text.trim().is_empty()
                     && !showing_slash_suggestions
                     && notice.is_none()
@@ -3884,6 +3886,8 @@ enum TranscriptEntry {
         output_view: Option<(String, String)>,
         payload_refs: Vec<SessionPayloadRef>,
         time: String,
+        started_at: DateTime<Utc>,
+        completed_at: Option<DateTime<Utc>>,
         complete: bool,
         error: bool,
         user_interrupted: bool,
@@ -4214,7 +4218,7 @@ impl Transcript {
                     return;
                 }
                 if *actor == EventActor::Assistant {
-                    self.finish_reasoning();
+                    self.finish_reasoning(event.created_at);
                 }
                 if let Some(index) = self.messages.get(message_id).copied() {
                     self.message_markdown_cache
@@ -4282,7 +4286,7 @@ impl Transcript {
                 }
             }
             SessionEventKind::ReasoningDelta { text } => {
-                self.append_reasoning(text, local_event_time(event));
+                self.append_reasoning(text, event.created_at, local_event_time(event));
             }
             SessionEventKind::ToolStarted {
                 tool_call_id,
@@ -4290,7 +4294,7 @@ impl Transcript {
                 input,
                 input_ref,
             } => {
-                self.finish_reasoning();
+                self.finish_reasoning(event.created_at);
                 let presentation = project_tool_presentation(name, input, None, false);
                 let display_name = presentation.label;
                 let detail = presentation.detail;
@@ -4321,6 +4325,8 @@ impl Transcript {
                     output_view: None,
                     payload_refs: input_ref.iter().cloned().collect(),
                     time: local_event_time(event),
+                    started_at: event.created_at,
+                    completed_at: None,
                     complete: false,
                     error: false,
                     user_interrupted: false,
@@ -4347,6 +4353,7 @@ impl Transcript {
                         detail,
                         code_view,
                         output_view,
+                        completed_at,
                         complete,
                         error,
                         backgrounded,
@@ -4371,6 +4378,7 @@ impl Transcript {
                         *detail = format!("{detail} · {}", compact_text(message, 120));
                     }
                     *complete = true;
+                    *completed_at = Some(event.created_at);
                     *error = *is_error;
                     *backgrounded = !*is_error && tool_output_is_backgrounded(output);
                     let completion_presentation = project_tool_presentation(
@@ -4403,23 +4411,23 @@ impl Transcript {
                 status: SessionStatus::Ready,
                 detail: Some(detail),
             } if detail.eq_ignore_ascii_case("interrupted") => {
-                self.mark_running_tools_user_interrupted();
+                self.mark_running_tools_user_interrupted(event.created_at);
             }
             SessionEventKind::TurnCompleted {
                 error: Some(error), ..
             } if error.to_ascii_lowercase().contains("interrupted") => {
-                self.mark_running_tools_user_interrupted();
+                self.mark_running_tools_user_interrupted(event.created_at);
             }
             SessionEventKind::TurnCompleted {
                 error: Some(error), ..
             } => {
-                self.finish_running_tools(true, error);
+                self.finish_running_tools(event.created_at, true, error);
             }
             SessionEventKind::TurnCompleted { error: None, .. } => {
-                self.finish_running_tools(false, "");
+                self.finish_running_tools(event.created_at, false, "");
             }
             SessionEventKind::ApprovalRequested { title, detail, .. } => {
-                self.finish_reasoning();
+                self.finish_reasoning(event.created_at);
                 self.order.push(TranscriptEntry::Activity {
                     text: format!("approval · {title} · {detail}"),
                     time: local_event_time(event),
@@ -4431,7 +4439,7 @@ impl Transcript {
                 payload,
                 ..
             } => {
-                self.finish_reasoning();
+                self.finish_reasoning(event.created_at);
                 let options = provider_interaction_options(payload);
                 self.order.push(TranscriptEntry::Activity {
                     text: if options.is_empty() {
@@ -4460,7 +4468,7 @@ impl Transcript {
             SessionEventKind::ProviderEvent { kind, payload, .. }
                 if is_context_compaction(kind) =>
             {
-                self.finish_reasoning();
+                self.finish_reasoning(event.created_at);
                 self.cache_diagnostics.reset();
                 let summary = context_compaction_summary(payload);
                 if matches!(
@@ -4505,7 +4513,7 @@ impl Transcript {
                 }
             }
             SessionEventKind::Error { message } => {
-                self.finish_reasoning();
+                self.finish_reasoning(event.created_at);
                 self.order.push(TranscriptEntry::Activity {
                     text: format!("error · {message}"),
                     time: local_event_time(event),
@@ -4566,7 +4574,7 @@ impl Transcript {
         });
     }
 
-    fn append_reasoning(&mut self, text: &str, time: String) {
+    fn append_reasoning(&mut self, text: &str, started_at: DateTime<Utc>, time: String) {
         if let Some(index) = self.active_reasoning
             && let Some(TranscriptEntry::Tool {
                 code_view: Some((language, source)),
@@ -4591,6 +4599,8 @@ impl Transcript {
             output_view: None,
             payload_refs: Vec::new(),
             time,
+            started_at,
+            completed_at: None,
             complete: false,
             error: false,
             user_interrupted: false,
@@ -4600,48 +4610,61 @@ impl Transcript {
         self.active_reasoning = Some(index);
     }
 
-    fn finish_reasoning(&mut self) {
+    fn finish_reasoning(&mut self, completed_at: DateTime<Utc>) {
         let Some(index) = self.active_reasoning.take() else {
             return;
         };
         if let Some(TranscriptEntry::Tool {
-            complete, expanded, ..
+            complete,
+            expanded,
+            completed_at: stored_completed_at,
+            ..
         }) = self.order.get_mut(index)
         {
             *complete = true;
             *expanded = false;
+            *stored_completed_at = Some(completed_at);
         }
     }
 
-    fn mark_running_tools_user_interrupted(&mut self) {
-        self.finish_reasoning();
+    fn mark_running_tools_user_interrupted(&mut self, completed_at: DateTime<Utc>) {
+        self.finish_reasoning(completed_at);
         for entry in &mut self.order {
             if let TranscriptEntry::Tool {
                 complete,
                 user_interrupted,
+                completed_at: stored_completed_at,
                 ..
             } = entry
                 && !*complete
             {
                 *complete = true;
                 *user_interrupted = true;
+                *stored_completed_at = Some(completed_at);
             }
         }
     }
 
-    fn finish_running_tools(&mut self, failed: bool, error_detail: &str) {
-        self.finish_reasoning();
+    fn finish_running_tools(
+        &mut self,
+        completed_at: DateTime<Utc>,
+        failed: bool,
+        error_detail: &str,
+    ) {
+        self.finish_reasoning(completed_at);
         for entry in &mut self.order {
             if let TranscriptEntry::Tool {
                 detail,
                 complete,
                 error,
+                completed_at: stored_completed_at,
                 ..
             } = entry
                 && !*complete
             {
                 *complete = true;
                 *error = failed;
+                *stored_completed_at = Some(completed_at);
                 if failed && !error_detail.trim().is_empty() {
                     *detail = format!(
                         "{detail} · {}",
@@ -4737,15 +4760,10 @@ impl Transcript {
     }
 
     fn cache_status(&self, now: DateTime<Utc>) -> Option<(String, bool)> {
-        let signature = self
-            .active_turn
-            .as_ref()
-            .map(ActiveTurnDisplayConfig::cache_signature)
-            .or_else(|| {
-                self.config
-                    .as_ref()
-                    .map(SessionDisplayConfig::cache_signature)
-            })?;
+        if self.active_turn.is_some() {
+            return None;
+        }
+        let signature = self.config.as_ref()?.cache_signature();
         self.cache_diagnostics
             .status(now, &signature)
             .map(|status| (status.label, status.warning))
@@ -5220,6 +5238,8 @@ impl Transcript {
                     code_view,
                     output_view,
                     time,
+                    started_at,
+                    completed_at,
                     complete,
                     error,
                     user_interrupted,
@@ -5297,9 +5317,12 @@ impl Transcript {
                     if let Some(lifecycle) = lifecycle {
                         summary.push_str(&format!(" · {lifecycle}"));
                     }
-                    for (line_index, line) in wrap_display(&summary, width).into_iter().enumerate()
+                    let prefix = if tool_window.is_some() { "│ " } else { "  " };
+                    let elapsed = format_tool_elapsed(*started_at, *completed_at);
+                    for (line_index, line) in tool_summary_lines(&summary, &elapsed, prefix, width)
+                        .into_iter()
+                        .enumerate()
                     {
-                        let prefix = if tool_window.is_some() { "│ " } else { "  " };
                         if line_index == 0
                             && let Some(name_start) = line.find(name.as_str())
                         {
@@ -6283,6 +6306,64 @@ fn wrap_display(value: &str, width: usize) -> Vec<String> {
         .into_iter()
         .map(|(start, end)| value[start..end].to_string())
         .collect()
+}
+
+fn tool_summary_lines(summary: &str, elapsed: &str, prefix: &str, width: usize) -> Vec<String> {
+    let content_width = width.saturating_sub(UnicodeWidthStr::width(prefix));
+    let elapsed_width = UnicodeWidthStr::width(elapsed);
+    let reserved_width = elapsed_width.saturating_add(2);
+    if content_width <= reserved_width {
+        return wrap_display(&format!("{summary} · {elapsed}"), content_width.max(1));
+    }
+
+    let first_width = content_width - reserved_width;
+    let Some((first_start, first_end)) = display_ranges(summary, first_width, false)
+        .into_iter()
+        .next()
+    else {
+        return vec![format!("{:>content_width$}", elapsed)];
+    };
+    let mut lines = vec![summary[first_start..first_end].to_string()];
+    let remaining = summary[first_end..].trim_start();
+    if !remaining.is_empty() {
+        lines.extend(wrap_display(remaining, content_width));
+    }
+    if let Some(first) = lines.first_mut() {
+        let padding = content_width
+            .saturating_sub(UnicodeWidthStr::width(first.as_str()))
+            .saturating_sub(elapsed_width);
+        first.push_str(&" ".repeat(padding));
+        first.push_str(elapsed);
+    }
+    lines
+}
+
+fn format_tool_elapsed(started_at: DateTime<Utc>, completed_at: Option<DateTime<Utc>>) -> String {
+    let elapsed_ms = completed_at
+        .unwrap_or_else(Utc::now)
+        .signed_duration_since(started_at)
+        .num_milliseconds()
+        .max(0) as u64;
+    if elapsed_ms < 60_000 {
+        return format!("{:.1}s", elapsed_ms as f64 / 1_000.0);
+    }
+
+    let total_seconds = elapsed_ms / 1_000;
+    let seconds = total_seconds % 60;
+    let total_minutes = total_seconds / 60;
+    if total_minutes < 60 {
+        return format!("{total_minutes}m {seconds:02}s");
+    }
+
+    let minutes = total_minutes % 60;
+    let total_hours = total_minutes / 60;
+    if total_hours < 24 {
+        return format!("{total_hours}h {minutes:02}m");
+    }
+
+    let days = total_hours / 24;
+    let hours = total_hours % 24;
+    format!("{days}d {hours:02}h")
 }
 
 fn composer_cursor_position(value: &str, cursor: usize, width: usize) -> (usize, usize) {

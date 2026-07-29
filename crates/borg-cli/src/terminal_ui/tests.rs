@@ -209,6 +209,50 @@ fn running_tool_uses_animated_spinner() {
 }
 
 #[test]
+fn completed_tool_duration_is_frozen_at_the_right_edge() {
+    let session_id = Uuid::new_v4();
+    let started_at = DateTime::parse_from_rfc3339("2026-07-29T10:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let mut started = SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::ToolStarted {
+            tool_call_id: "timed-1".to_string(),
+            name: "command_execution".to_string(),
+            input: serde_json::json!({"command": "cargo check"}),
+            input_ref: None,
+        },
+    );
+    started.created_at = started_at;
+    let mut completed = SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::ToolCompleted {
+            tool_call_id: "timed-1".to_string(),
+            output: String::new(),
+            output_ref: None,
+            is_error: false,
+            input: None,
+            input_ref: None,
+        },
+    );
+    completed.created_at = started_at + chrono::Duration::milliseconds(12_345);
+
+    let mut transcript = Transcript::default();
+    transcript.apply(&started);
+    transcript.apply(&completed);
+    let line = transcript
+        .lines(80)
+        .into_iter()
+        .find(|line| line.to_string().contains("cargo check"))
+        .expect("tool summary");
+
+    assert_eq!(line.width(), 80);
+    assert!(line.to_string().ends_with("12.3s"));
+}
+
+#[test]
 fn a_new_edit_or_message_collapses_the_previous_diff() {
     let session_id = Uuid::new_v4();
     let mut transcript = Transcript::default();
@@ -582,10 +626,7 @@ fn effort_changes_do_not_relabel_usage_from_the_active_turn() {
     apply(&mut transcript, configured("high"));
     apply(&mut transcript, usage(9_000));
 
-    assert_eq!(
-        transcript.cache_status(Utc::now()).map(|(label, _)| label),
-        Some("cache 90% hit".to_string())
-    );
+    assert_eq!(transcript.cache_status(Utc::now()), None);
     assert_eq!(
         transcript
             .active_turn
@@ -611,10 +652,7 @@ fn effort_changes_do_not_relabel_usage_from_the_active_turn() {
 
     apply(&mut transcript, started(new_turn, "high"));
     apply(&mut transcript, usage(9_000));
-    assert_eq!(
-        transcript.cache_status(Utc::now()).map(|(label, _)| label),
-        Some("cache 90% hit".to_string())
-    );
+    assert_eq!(transcript.cache_status(Utc::now()), None);
 }
 
 #[test]
@@ -1758,6 +1796,8 @@ fn transcript_separates_labeled_groups_from_header_and_tool_activity() {
         output_view: None,
         payload_refs: Vec::new(),
         time: "12:01".to_string(),
+        started_at: Utc::now(),
+        completed_at: Some(Utc::now()),
         complete: true,
         error: false,
         user_interrupted: false,
@@ -1782,6 +1822,8 @@ fn transcript_separates_labeled_groups_from_header_and_tool_activity() {
         output_view: None,
         payload_refs: Vec::new(),
         time: "12:03".to_string(),
+        started_at: Utc::now(),
+        completed_at: Some(Utc::now()),
         complete: true,
         error: false,
         user_interrupted: false,
@@ -1923,6 +1965,8 @@ fn long_tool_runs_show_eight_lines_and_scroll_independently() {
             output_view: None,
             payload_refs: Vec::new(),
             time: "12:00".to_string(),
+            started_at: Utc::now(),
+            completed_at: Some(Utc::now()),
             complete: true,
             error: false,
             user_interrupted: false,
@@ -1967,6 +2011,8 @@ fn tool_run_scroll_only_consumes_wheel_events_while_it_can_move() {
             output_view: None,
             payload_refs: Vec::new(),
             time: "12:00".to_string(),
+            started_at: Utc::now(),
+            completed_at: Some(Utc::now()),
             complete: true,
             error: false,
             user_interrupted: false,
@@ -2045,6 +2091,8 @@ fn line_scrolling_preserves_expanded_actions() {
             output_view: None,
             payload_refs: Vec::new(),
             time: "12:00".to_string(),
+            started_at: Utc::now(),
+            completed_at: Some(Utc::now()),
             complete: true,
             error: false,
             user_interrupted: false,
@@ -2094,6 +2142,8 @@ fn scrolled_action_viewport_pins_the_current_tool_header() {
             output_view: None,
             payload_refs: Vec::new(),
             time: "12:00".to_string(),
+            started_at: Utc::now(),
+            completed_at: Some(Utc::now()),
             complete: true,
             error: false,
             user_interrupted: false,
@@ -2126,6 +2176,8 @@ fn expanding_an_action_preserves_the_current_line_anchor() {
             output_view: None,
             payload_refs: Vec::new(),
             time: "12:00".to_string(),
+            started_at: Utc::now(),
+            completed_at: Some(Utc::now()),
             complete: true,
             error: false,
             user_interrupted: false,
@@ -2309,6 +2361,8 @@ fn interrupted_tools_update_in_place_with_explicit_user_cause() {
         output_view: None,
         payload_refs: Vec::new(),
         time: "12:00".to_string(),
+        started_at: Utc::now(),
+        completed_at: None,
         complete: false,
         error: false,
         user_interrupted: false,
@@ -2316,7 +2370,7 @@ fn interrupted_tools_update_in_place_with_explicit_user_cause() {
         expanded: false,
     });
 
-    transcript.mark_running_tools_user_interrupted();
+    transcript.mark_running_tools_user_interrupted(Utc::now());
 
     assert!(matches!(
         transcript.order.first(),
