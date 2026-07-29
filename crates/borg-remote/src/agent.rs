@@ -132,6 +132,7 @@ pub trait AgentTurnExecutor: Send + Sync {
 pub struct LocalAgentTurnExecutor {
     codex_pool: CodexAppServerPool,
     native_harness: NativeHarness,
+    external_mcp_servers: Vec<borg_provider::mcp::ExternalMcpServer>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -162,6 +163,14 @@ impl LocalAgentTurnExecutor {
         }
     }
 
+    pub fn with_external_mcp_servers(
+        mut self,
+        servers: Vec<borg_provider::mcp::ExternalMcpServer>,
+    ) -> Self {
+        self.external_mcp_servers = servers;
+        self
+    }
+
     pub fn prewarm(&self, provider: CodingProvider) {
         if provider == CodingProvider::Codex {
             self.codex_pool.prewarm_local(true);
@@ -173,10 +182,12 @@ impl LocalAgentTurnExecutor {
 impl AgentTurnExecutor for LocalAgentTurnExecutor {
     async fn execute(
         &self,
-        turn: AgentTurn,
+        mut turn: AgentTurn,
         events: mpsc::Sender<SessionEventKind>,
         controls: Option<mpsc::Receiver<AgentTurnControl>>,
     ) -> Result<AgentTurnResult> {
+        turn.external_mcp_servers
+            .extend(self.external_mcp_servers.clone());
         if turn.provider.uses_native_harness() {
             return self.native_harness.run(turn, events, controls).await;
         }
@@ -280,6 +291,9 @@ async fn run_borg_provider_turn(
             request.working_directory = Some(turn.cwd.clone());
             request.session_id = turn.provider_session_id.clone().or(request.session_id);
             request.resume_unavailable_prompt = None;
+            request
+                .mcp_external_servers
+                .extend(turn.external_mcp_servers);
             request.mcp_external_servers.push(turn.agent_mcp_server);
             if let Some(instruction) = response_language_instruction {
                 request.system_prompt.push_str("\n\n");
@@ -287,31 +301,35 @@ async fn run_borg_provider_turn(
             }
             request
         }
-        None => ChatStreamRequest {
-            prompt: turn.prompt.clone(),
-            attachments: turn.attachments,
-            model: turn.model.clone(),
-            effort: turn.effort.clone(),
-            fast: turn.fast.unwrap_or(false),
-            system_prompt: match response_language_instruction {
-                Some(instruction) => format!("{CODING_SYSTEM_PROMPT}\n\n{instruction}"),
-                None => CODING_SYSTEM_PROMPT.to_string(),
-            },
-            output_schema: turn.output_schema,
-            mcp_owner_id: None,
-            mcp_allowed_scopes: Vec::new(),
-            mcp_user_id: None,
-            mcp_external_servers: vec![turn.agent_mcp_server],
-            mcp_api_token: None,
-            provider_auth: None,
-            git_credentials: Vec::new(),
-            working_directory: Some(turn.cwd.clone()),
-            session_id: turn.provider_session_id.clone(),
-            provider_channel: ProviderChannel::Direct,
-            persist_session: Some(true),
-            web_search_allowed: true,
-            resume_unavailable_prompt: None,
-        },
+        None => {
+            let mut mcp_external_servers = turn.external_mcp_servers;
+            mcp_external_servers.push(turn.agent_mcp_server);
+            ChatStreamRequest {
+                prompt: turn.prompt.clone(),
+                attachments: turn.attachments,
+                model: turn.model.clone(),
+                effort: turn.effort.clone(),
+                fast: turn.fast.unwrap_or(false),
+                system_prompt: match response_language_instruction {
+                    Some(instruction) => format!("{CODING_SYSTEM_PROMPT}\n\n{instruction}"),
+                    None => CODING_SYSTEM_PROMPT.to_string(),
+                },
+                output_schema: turn.output_schema,
+                mcp_owner_id: None,
+                mcp_allowed_scopes: Vec::new(),
+                mcp_user_id: None,
+                mcp_external_servers,
+                mcp_api_token: None,
+                provider_auth: None,
+                git_credentials: Vec::new(),
+                working_directory: Some(turn.cwd.clone()),
+                session_id: turn.provider_session_id.clone(),
+                provider_channel: ProviderChannel::Direct,
+                persist_session: Some(true),
+                web_search_allowed: true,
+                resume_unavailable_prompt: None,
+            }
+        }
     };
     let permission = local_permission(turn.permission_mode);
     let mut stream = match turn.provider {

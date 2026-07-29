@@ -240,6 +240,17 @@ mod tests {
     }
 
     #[test]
+    fn checked_in_example_matches_the_typed_editor_preferences() {
+        let preferences: EditorPreferences =
+            toml::from_str(include_str!("../../../configs/editor.example.toml")).unwrap();
+        preferences.validate().unwrap();
+        assert_eq!(
+            preferences.interaction.active_messages,
+            ActiveMessageBehavior::Steer
+        );
+    }
+
+    #[test]
     fn validation_protects_terminal_rendering_and_refresh_bounds() {
         let mut preferences = EditorPreferences::default();
         preferences.transcript.user_label = " user".to_string();

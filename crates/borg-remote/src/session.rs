@@ -33,7 +33,6 @@ struct QueuedPrompt {
 
 struct PendingSteer {
     prompt: QueuedPrompt,
-    acknowledgement: oneshot::Receiver<std::result::Result<(), String>>,
 }
 
 struct RuntimeSessionStore {
@@ -759,7 +758,9 @@ async fn run_agent_session_store_kernel(
         });
         let mut pending_approval: Option<String> = None;
         let mut pending_provider_interaction: Option<String> = None;
-        let mut pending_steer: Option<PendingSteer> = None;
+        let mut pending_steers = VecDeque::<PendingSteer>::new();
+        let (steer_result_tx, mut steer_results) =
+            mpsc::channel::<(Uuid, std::result::Result<(), String>)>(32);
         let mut provider_events_open = true;
         let mut interrupted = false;
         let mut interrupt_deadline: Option<Pin<Box<Sleep>>> = None;
@@ -771,6 +772,14 @@ async fn run_agent_session_store_kernel(
                         track_approval(&kind, &mut pending_approval);
                         track_provider_interaction(&kind, &mut pending_provider_interaction);
                         let usage = goal_token_usage(&kind);
+                        commit_codex_steer(
+                            &mut journal,
+                            &events,
+                            session_id,
+                            &mut pending_steers,
+                            &kind,
+                        )
+                        .await?;
                         record(&mut journal, &events, session_id, kind).await?;
                         if let Some(tokens) = usage {
                             account_goal_tokens(
@@ -798,16 +807,15 @@ async fn run_agent_session_store_kernel(
                         &mut pending_provider_interaction,
                     )
                     .await?;
-                    if let Some(steer) = pending_steer.take() {
-                        resolve_steer(
-                            &mut journal,
-                            &events,
-                            session_id,
-                            &mut pending,
-                            steer,
-                        )
-                        .await?;
-                    }
+                    promote_uncommitted_steers(
+                        &mut journal,
+                        &events,
+                        session_id,
+                        &mut pending,
+                        &mut pending_steers,
+                        interrupted,
+                    )
+                    .await?;
                     match result {
                         Ok(outcome) => {
                             goal_turn_failures.reset();
@@ -871,6 +879,14 @@ async fn run_agent_session_store_kernel(
                     track_approval(&kind, &mut pending_approval);
                     track_provider_interaction(&kind, &mut pending_provider_interaction);
                     let usage = goal_token_usage(&kind);
+                    commit_codex_steer(
+                        &mut journal,
+                        &events,
+                        session_id,
+                        &mut pending_steers,
+                        &kind,
+                    )
+                    .await?;
                     record(&mut journal, &events, session_id, kind).await?;
                     if let Some(tokens) = usage {
                         account_goal_tokens(
@@ -936,28 +952,33 @@ async fn run_agent_session_store_kernel(
                             error: Some("turn interrupted".to_string()),
                         },
                     ).await?;
-                    if let Some(steer) = pending_steer.take() {
-                        resolve_steer(
-                            &mut journal,
-                            &events,
-                            session_id,
-                            &mut pending,
-                            steer,
-                        )
-                        .await?;
-                    }
+                    promote_uncommitted_steers(
+                        &mut journal,
+                        &events,
+                        session_id,
+                        &mut pending,
+                        &mut pending_steers,
+                        true,
+                    )
+                    .await?;
                     break;
                 }
-                acknowledgement = async {
-                    let steer = pending_steer
-                        .as_mut()
-                        .expect("pending steer branch is guarded");
-                    (&mut steer.acknowledgement).await
-                }, if pending_steer.is_some() => {
-                    let steer = pending_steer
-                        .take()
-                        .expect("pending steer branch is guarded");
-                    if matches!(acknowledgement, Ok(Ok(()))) {
+                steer_result = steer_results.recv(), if !pending_steers.is_empty() => {
+                    let Some((message_id, acknowledgement)) = steer_result else {
+                        continue;
+                    };
+                    let Some(index) = pending_steers
+                        .iter()
+                        .position(|steer| steer.prompt.message_id == message_id)
+                    else {
+                        continue;
+                    };
+                    if acknowledgement.is_ok()
+                        && launch.provider != CodingProvider::Codex
+                    {
+                        let steer = pending_steers
+                            .remove(index)
+                            .expect("matching pending steer index exists");
                         record_prompt_status(
                             &mut journal,
                             &events,
@@ -967,13 +988,16 @@ async fn run_agent_session_store_kernel(
                             PromptDelivery::Steer,
                         )
                         .await?;
-                    } else {
-                        queue_failed_steer(
+                    } else if acknowledgement.is_err() {
+                        let prompt = &mut pending_steers[index].prompt;
+                        prompt.delivery = PromptDelivery::Queue;
+                        record_prompt_status(
                             &mut journal,
                             &events,
                             session_id,
-                            &mut pending,
-                            steer.prompt,
+                            prompt,
+                            MessageStatus::Queued,
+                            PromptDelivery::Queue,
                         )
                         .await?;
                     }
@@ -1002,11 +1026,7 @@ async fn run_agent_session_store_kernel(
                             output_schema,
                             delivery,
                             ..
-                        } if steers_active_codex_turn(
-                            launch.provider,
-                            delivery,
-                            !pending.is_empty() || pending_steer.is_some(),
-                        ) => {
+                        } if steers_active_codex_turn(launch.provider, delivery) => {
                             if journal.contains_message(session_id, message_id).await? {
                                 continue;
                             }
@@ -1015,7 +1035,7 @@ async fn run_agent_session_store_kernel(
                                 text,
                                 attachments,
                                 output_schema,
-                                delivery: PromptDelivery::Queue,
+                                delivery: PromptDelivery::Steer,
                                 visible: true,
                             };
                             record_prompt_status(
@@ -1038,19 +1058,32 @@ async fn run_agent_session_store_kernel(
                                 .await
                                 .is_ok();
                             if sent {
-                                pending_steer = Some(PendingSteer {
-                                    prompt,
-                                    acknowledgement: result,
+                                pending_steers.push_back(PendingSteer { prompt });
+                                let steer_result_tx = steer_result_tx.clone();
+                                tokio::spawn(async move {
+                                    let acknowledgement = result.await.unwrap_or_else(|_| {
+                                        Err(
+                                            "provider turn ended before the steer was acknowledged"
+                                                .to_string(),
+                                        )
+                                    });
+                                    let _ = steer_result_tx
+                                        .send((message_id, acknowledgement))
+                                        .await;
                                 });
                             } else {
-                                queue_failed_steer(
+                                let mut prompt = prompt;
+                                prompt.delivery = PromptDelivery::Queue;
+                                record_prompt_status(
                                     &mut journal,
                                     &events,
                                     session_id,
-                                    &mut pending,
-                                    prompt,
+                                    &prompt,
+                                    MessageStatus::Queued,
+                                    PromptDelivery::Queue,
                                 )
                                 .await?;
+                                pending_steers.push_back(PendingSteer { prompt });
                             }
                         }
                         HostCommand::Prompt {
@@ -1535,7 +1568,7 @@ fn recover_queued_prompts(events: &[SessionEvent]) -> VecDeque<QueuedPrompt> {
                 text,
                 attachments,
                 status: MessageStatus::Queued,
-                ..
+                delivery,
             } if !pending
                 .iter()
                 .any(|prompt: &QueuedPrompt| prompt.message_id == *message_id) =>
@@ -1545,9 +1578,38 @@ fn recover_queued_prompts(events: &[SessionEvent]) -> VecDeque<QueuedPrompt> {
                     text: text.clone(),
                     attachments: attachments.clone(),
                     output_schema: None,
-                    delivery: PromptDelivery::Queue,
+                    delivery: delivery.unwrap_or(PromptDelivery::Queue),
                     visible: true,
                 });
+            }
+            SessionEventKind::Message {
+                message_id,
+                actor: EventActor::User,
+                status: MessageStatus::Complete,
+                delivery,
+                ..
+            } => {
+                if let Some(admitted) = pending
+                    .iter()
+                    .position(|prompt| prompt.message_id == *message_id)
+                {
+                    if *delivery == Some(PromptDelivery::Queue) {
+                        let mut index = 0;
+                        pending.retain(|prompt| {
+                            let retain =
+                                index > admitted || prompt.delivery != PromptDelivery::Queue;
+                            index += 1;
+                            retain
+                        });
+                    } else {
+                        pending.remove(admitted);
+                    }
+                } else if *delivery == Some(PromptDelivery::Queue) {
+                    // A later prompt was admitted while older durable queue
+                    // entries remained. Queue admission is FIFO, but active
+                    // steers are allowed to bypass that queue.
+                    pending.retain(|prompt| prompt.delivery != PromptDelivery::Queue);
+                }
             }
             SessionEventKind::Message { message_id, .. }
             | SessionEventKind::PromptRecalled { message_id, .. } => {
@@ -1555,6 +1617,11 @@ fn recover_queued_prompts(events: &[SessionEvent]) -> VecDeque<QueuedPrompt> {
             }
             _ => {}
         }
+    }
+    for prompt in &mut pending {
+        // A resumed actor cannot reattach pending input to the old provider
+        // turn, so every surviving prompt becomes a next-turn queue entry.
+        prompt.delivery = PromptDelivery::Queue;
     }
     pending
 }
@@ -1625,13 +1692,8 @@ async fn prioritize_recall_at_turn_boundary(
     Ok(())
 }
 
-fn steers_active_codex_turn(
-    provider: CodingProvider,
-    delivery: PromptDelivery,
-    has_queued_prompts: bool,
-) -> bool {
+fn steers_active_codex_turn(provider: CodingProvider, delivery: PromptDelivery) -> bool {
     (provider == CodingProvider::Codex || provider.uses_native_harness())
-        && !has_queued_prompts
         && delivery == PromptDelivery::Steer
 }
 
@@ -1659,46 +1721,80 @@ async fn record_prompt_status(
     .await
 }
 
-async fn queue_failed_steer(
+fn committed_codex_user_message_id(kind: &SessionEventKind) -> Option<Uuid> {
+    let SessionEventKind::ProviderEvent {
+        provider: CodingProvider::Codex,
+        kind,
+        payload,
+    } = kind
+    else {
+        return None;
+    };
+    (kind == "item/completed:userMessage")
+        .then(|| payload.get("client_id").and_then(Value::as_str))
+        .flatten()
+        .and_then(|client_id| Uuid::parse_str(client_id).ok())
+}
+
+async fn commit_codex_steer(
     journal: &mut RuntimeSessionStore,
     events: &mpsc::Sender<SessionEvent>,
     session_id: Uuid,
-    pending: &mut VecDeque<QueuedPrompt>,
-    prompt: QueuedPrompt,
+    pending_steers: &mut VecDeque<PendingSteer>,
+    kind: &SessionEventKind,
 ) -> Result<()> {
+    let Some(message_id) = committed_codex_user_message_id(kind) else {
+        return Ok(());
+    };
+    let Some(index) = pending_steers.iter().position(|steer| {
+        steer.prompt.message_id == message_id && steer.prompt.delivery == PromptDelivery::Steer
+    }) else {
+        return Ok(());
+    };
+    let steer = pending_steers
+        .remove(index)
+        .expect("matching pending steer index exists");
     record_prompt_status(
         journal,
         events,
         session_id,
-        &prompt,
-        MessageStatus::Queued,
-        PromptDelivery::Queue,
+        &steer.prompt,
+        MessageStatus::Complete,
+        PromptDelivery::Steer,
     )
-    .await?;
-    pending.push_front(prompt);
-    Ok(())
+    .await
 }
 
-async fn resolve_steer(
+async fn promote_uncommitted_steers(
     journal: &mut RuntimeSessionStore,
     events: &mpsc::Sender<SessionEvent>,
     session_id: Uuid,
     pending: &mut VecDeque<QueuedPrompt>,
-    mut steer: PendingSteer,
+    pending_steers: &mut VecDeque<PendingSteer>,
+    _after_interrupt: bool,
 ) -> Result<()> {
-    if matches!(steer.acknowledgement.try_recv(), Ok(Ok(()))) {
-        record_prompt_status(
-            journal,
-            events,
-            session_id,
-            &steer.prompt,
-            MessageStatus::Complete,
-            PromptDelivery::Steer,
-        )
-        .await
-    } else {
-        queue_failed_steer(journal, events, session_id, pending, steer.prompt).await
+    let mut promoted = pending_steers
+        .drain(..)
+        .map(|steer| steer.prompt)
+        .collect::<Vec<_>>();
+    for prompt in &mut promoted {
+        if prompt.delivery == PromptDelivery::Steer {
+            record_prompt_status(
+                journal,
+                events,
+                session_id,
+                prompt,
+                MessageStatus::Queued,
+                PromptDelivery::Queue,
+            )
+            .await?;
+            prompt.delivery = PromptDelivery::Queue;
+        }
     }
+    for prompt in promoted.into_iter().rev() {
+        pending.push_front(prompt);
+    }
+    Ok(())
 }
 
 async fn apply_session_config(
@@ -2533,6 +2629,12 @@ mod tests {
         steer_seen: Arc<Notify>,
     }
 
+    struct CommittingSteerExecutor {
+        turn_started: Arc<Notify>,
+        steer_accepted: Arc<Notify>,
+        release_commit: Arc<Notify>,
+    }
+
     struct BoundaryQueueExecutor {
         turns: RecordedPromptTurns,
         first_started: Arc<Notify>,
@@ -2633,6 +2735,46 @@ mod tests {
                 }
                 drop(held_ack);
             }
+            Ok(AgentTurnResult {
+                provider_session_id: Some("provider-session".to_string()),
+                final_text: String::new(),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentTurnExecutor for CommittingSteerExecutor {
+        async fn execute(
+            &self,
+            _turn: AgentTurn,
+            events: mpsc::Sender<SessionEventKind>,
+            controls: Option<mpsc::Receiver<AgentTurnControl>>,
+        ) -> Result<AgentTurnResult> {
+            self.turn_started.notify_one();
+            let mut controls = controls.expect("active turn has controls");
+            if let Some(AgentTurnControl::Steer {
+                message_id, ack, ..
+            }) = controls.recv().await
+            {
+                let _ = ack.send(Ok(()));
+                self.steer_accepted.notify_one();
+                self.release_commit.notified().await;
+                events
+                    .send(SessionEventKind::ProviderEvent {
+                        provider: CodingProvider::Codex,
+                        kind: "item/completed:userMessage".to_string(),
+                        payload: json!({
+                            "item_type": "userMessage",
+                            "client_id": message_id.to_string(),
+                        }),
+                    })
+                    .await
+                    .unwrap();
+            }
+            while !matches!(
+                controls.recv().await,
+                Some(AgentTurnControl::Interrupt) | None
+            ) {}
             Ok(AgentTurnResult {
                 provider_session_id: Some("provider-session".to_string()),
                 final_text: String::new(),
@@ -2952,6 +3094,123 @@ mod tests {
         assert_eq!(turns[0], ("first".to_string(), Vec::new()));
         assert_eq!(turns[1].0, "inspect this [Image 1]");
         assert_eq!(turns[1].1, [image]);
+    }
+
+    #[tokio::test]
+    async fn accepted_codex_steer_stays_pending_until_the_user_message_commits() {
+        let root = tempdir().unwrap();
+        let journal_path = root.path().join("session.jsonl");
+        let session_id = Uuid::new_v4();
+        let followup_id = Uuid::new_v4();
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let turn_started = Arc::new(Notify::new());
+        let steer_accepted = Arc::new(Notify::new());
+        let release_commit = Arc::new(Notify::new());
+        let executor = Arc::new(CommittingSteerExecutor {
+            turn_started: Arc::clone(&turn_started),
+            steer_accepted: Arc::clone(&steer_accepted),
+            release_commit: Arc::clone(&release_commit),
+        });
+        let actor = tokio::spawn(async move {
+            run_agent_session_with_executor(
+                &journal_path,
+                session_id,
+                LaunchSession {
+                    request_id: Uuid::new_v4(),
+                    cwd: root.path().to_path_buf(),
+                    provider: CodingProvider::Codex,
+                    model: None,
+                    effort: None,
+                    fast: Some(false),
+                    response_language: crate::ResponseLanguage::Auto,
+                    permission_mode: PermissionMode::Manual,
+                    name: None,
+                    initial_prompt: None,
+                },
+                command_rx,
+                event_tx,
+                executor,
+            )
+            .await
+        });
+
+        command_tx
+            .send(HostCommand::Prompt {
+                session_id,
+                message_id: Uuid::new_v4(),
+                text: "first".to_string(),
+                attachments: Vec::new(),
+                output_schema: None,
+                delivery: PromptDelivery::Steer,
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), turn_started.notified())
+            .await
+            .expect("first turn starts");
+        command_tx
+            .send(HostCommand::Prompt {
+                session_id,
+                message_id: followup_id,
+                text: "steer at the next boundary".to_string(),
+                attachments: Vec::new(),
+                output_schema: None,
+                delivery: PromptDelivery::Steer,
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), steer_accepted.notified())
+            .await
+            .expect("provider accepts steer transport");
+
+        let mut transitions = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            if let SessionEventKind::Message {
+                message_id,
+                status,
+                delivery: Some(delivery),
+                ..
+            } = event.kind
+                && message_id == followup_id
+            {
+                transitions.push((status, delivery));
+            }
+        }
+        assert_eq!(
+            transitions,
+            [(MessageStatus::Queued, PromptDelivery::Steer)],
+            "transport acknowledgement must not hide an uncommitted steer"
+        );
+
+        release_commit.notify_one();
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+                .await
+                .expect("committed steer event arrives")
+                .expect("session remains open");
+            if matches!(
+                event.kind,
+                SessionEventKind::Message {
+                    message_id,
+                    status: MessageStatus::Complete,
+                    delivery: Some(PromptDelivery::Steer),
+                    ..
+                } if message_id == followup_id
+            ) {
+                break;
+            }
+        }
+
+        command_tx
+            .send(HostCommand::Interrupt { session_id })
+            .await
+            .unwrap();
+        command_tx
+            .send(HostCommand::Stop { session_id })
+            .await
+            .unwrap();
+        actor.await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -3646,24 +3905,20 @@ mod tests {
         assert!(steers_active_codex_turn(
             CodingProvider::Codex,
             PromptDelivery::Steer,
-            false,
         ));
         // Attachments use the same Codex `UserInput` contract as text and do
         // not change this decision.
         assert!(!steers_active_codex_turn(
             CodingProvider::Codex,
             PromptDelivery::Queue,
-            false,
         ));
         assert!(!steers_active_codex_turn(
             CodingProvider::Claude,
             PromptDelivery::Queue,
-            false,
         ));
-        assert!(!steers_active_codex_turn(
+        assert!(steers_active_codex_turn(
             CodingProvider::Codex,
             PromptDelivery::Steer,
-            true,
         ));
     }
 
@@ -3717,6 +3972,104 @@ mod tests {
         assert_eq!(recovered[0].message_id, pending_id);
         assert_eq!(recovered[0].text, "still pending");
         assert_eq!(recovered[0].attachments, [PathBuf::from("/tmp/image.png")]);
+        assert_eq!(recovered[0].delivery, PromptDelivery::Queue);
+    }
+
+    #[test]
+    fn queued_prompt_recovery_discards_entries_bypassed_by_later_admission() {
+        let session_id = Uuid::new_v4();
+        let stale_id = Uuid::new_v4();
+        let admitted_id = Uuid::new_v4();
+        let events = vec![
+            SessionEvent::new(
+                session_id,
+                1,
+                SessionEventKind::Message {
+                    message_id: stale_id,
+                    actor: EventActor::User,
+                    text: "stale".to_string(),
+                    attachments: Vec::new(),
+                    status: MessageStatus::Queued,
+                    delivery: Some(PromptDelivery::Queue),
+                },
+            ),
+            SessionEvent::new(
+                session_id,
+                2,
+                SessionEventKind::Message {
+                    message_id: admitted_id,
+                    actor: EventActor::User,
+                    text: "later".to_string(),
+                    attachments: Vec::new(),
+                    status: MessageStatus::Queued,
+                    delivery: Some(PromptDelivery::Queue),
+                },
+            ),
+            SessionEvent::new(
+                session_id,
+                3,
+                SessionEventKind::Message {
+                    message_id: admitted_id,
+                    actor: EventActor::User,
+                    text: "later".to_string(),
+                    attachments: Vec::new(),
+                    status: MessageStatus::Complete,
+                    delivery: Some(PromptDelivery::Queue),
+                },
+            ),
+        ];
+
+        assert!(recover_queued_prompts(&events).is_empty());
+    }
+
+    #[test]
+    fn committed_steer_does_not_consume_a_separate_next_turn_queue_on_resume() {
+        let session_id = Uuid::new_v4();
+        let queued_id = Uuid::new_v4();
+        let steer_id = Uuid::new_v4();
+        let events = vec![
+            SessionEvent::new(
+                session_id,
+                1,
+                SessionEventKind::Message {
+                    message_id: queued_id,
+                    actor: EventActor::User,
+                    text: "run next".to_string(),
+                    attachments: Vec::new(),
+                    status: MessageStatus::Queued,
+                    delivery: Some(PromptDelivery::Queue),
+                },
+            ),
+            SessionEvent::new(
+                session_id,
+                2,
+                SessionEventKind::Message {
+                    message_id: steer_id,
+                    actor: EventActor::User,
+                    text: "steer now".to_string(),
+                    attachments: Vec::new(),
+                    status: MessageStatus::Queued,
+                    delivery: Some(PromptDelivery::Steer),
+                },
+            ),
+            SessionEvent::new(
+                session_id,
+                3,
+                SessionEventKind::Message {
+                    message_id: steer_id,
+                    actor: EventActor::User,
+                    text: "steer now".to_string(),
+                    attachments: Vec::new(),
+                    status: MessageStatus::Complete,
+                    delivery: Some(PromptDelivery::Steer),
+                },
+            ),
+        ];
+
+        let recovered = recover_queued_prompts(&events);
+
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].message_id, queued_id);
         assert_eq!(recovered[0].delivery, PromptDelivery::Queue);
     }
 

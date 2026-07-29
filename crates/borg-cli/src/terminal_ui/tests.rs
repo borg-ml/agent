@@ -263,6 +263,29 @@ fn completed_tool_duration_is_frozen_at_the_right_edge() {
 }
 
 #[test]
+fn tool_duration_appears_only_from_one_tenth_of_a_second() {
+    let started_at = DateTime::parse_from_rfc3339("2026-07-29T10:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+
+    assert_eq!(format_tool_elapsed(started_at, Some(started_at)), None);
+    assert_eq!(
+        format_tool_elapsed(
+            started_at,
+            Some(started_at + chrono::Duration::milliseconds(99))
+        ),
+        None
+    );
+    assert_eq!(
+        format_tool_elapsed(
+            started_at,
+            Some(started_at + chrono::Duration::milliseconds(100))
+        ),
+        Some("0.1s".to_string())
+    );
+}
+
+#[test]
 fn a_new_edit_or_message_collapses_the_previous_diff() {
     let session_id = Uuid::new_v4();
     let mut transcript = Transcript::default();
@@ -1563,7 +1586,7 @@ fn picker_numbers_are_visible_and_select_immediately() {
 }
 
 #[test]
-fn completed_user_message_leaves_the_queue_projection() {
+fn pending_steer_stays_visible_until_its_user_message_is_committed() {
     let message_id = Uuid::new_v4();
     let mut queue = Vec::new();
     update_queued_prompts(
@@ -1577,20 +1600,14 @@ fn completed_user_message_leaves_the_queue_projection() {
             delivery: Some(PromptDelivery::Steer),
         },
     );
-    assert!(queue.is_empty());
-
-    update_queued_prompts(
-        &mut queue,
-        &SessionEventKind::Message {
+    assert_eq!(
+        queue,
+        vec![PendingPromptProjection {
             message_id,
-            actor: EventActor::User,
             text: "follow up".to_string(),
-            attachments: Vec::new(),
-            status: MessageStatus::Queued,
-            delivery: Some(PromptDelivery::Queue),
-        },
+            delivery: PromptDelivery::Steer,
+        }]
     );
-    assert_eq!(queue, vec![(message_id, "follow up".to_string())]);
 
     update_queued_prompts(
         &mut queue,
@@ -1600,10 +1617,128 @@ fn completed_user_message_leaves_the_queue_projection() {
             text: "follow up".to_string(),
             attachments: Vec::new(),
             status: MessageStatus::Complete,
-            delivery: None,
+            delivery: Some(PromptDelivery::Steer),
         },
     );
     assert!(queue.is_empty());
+}
+
+#[test]
+fn committed_steer_does_not_hide_a_separate_next_turn_queue() {
+    let queued_id = Uuid::new_v4();
+    let steer_id = Uuid::new_v4();
+    let mut queue = Vec::new();
+    for (message_id, text, status, delivery) in [
+        (
+            queued_id,
+            "run next",
+            MessageStatus::Queued,
+            PromptDelivery::Queue,
+        ),
+        (
+            steer_id,
+            "steer now",
+            MessageStatus::Queued,
+            PromptDelivery::Steer,
+        ),
+        (
+            steer_id,
+            "steer now",
+            MessageStatus::Complete,
+            PromptDelivery::Steer,
+        ),
+    ] {
+        update_queued_prompts(
+            &mut queue,
+            &SessionEventKind::Message {
+                message_id,
+                actor: EventActor::User,
+                text: text.to_string(),
+                attachments: Vec::new(),
+                status,
+                delivery: Some(delivery),
+            },
+        );
+    }
+
+    assert_eq!(
+        queue,
+        vec![PendingPromptProjection {
+            message_id: queued_id,
+            text: "run next".to_string(),
+            delivery: PromptDelivery::Queue,
+        }]
+    );
+}
+
+#[test]
+fn queue_projection_preserves_fifo_and_discards_bypassed_stale_entries() {
+    let first = Uuid::new_v4();
+    let second = Uuid::new_v4();
+    let queued = |message_id: Uuid, text: &str| SessionEventKind::Message {
+        message_id,
+        actor: EventActor::User,
+        text: text.to_string(),
+        attachments: Vec::new(),
+        status: MessageStatus::Queued,
+        delivery: Some(PromptDelivery::Queue),
+    };
+    let admitted = |message_id: Uuid, text: &str| SessionEventKind::Message {
+        message_id,
+        actor: EventActor::User,
+        text: text.to_string(),
+        attachments: Vec::new(),
+        status: MessageStatus::Complete,
+        delivery: Some(PromptDelivery::Queue),
+    };
+
+    let mut queue = Vec::new();
+    update_queued_prompts(&mut queue, &queued(first, "first"));
+    update_queued_prompts(&mut queue, &queued(second, "second"));
+    update_queued_prompts(&mut queue, &admitted(first, "first"));
+    assert_eq!(
+        queue,
+        vec![PendingPromptProjection {
+            message_id: second,
+            text: "second".to_string(),
+            delivery: PromptDelivery::Queue,
+        }]
+    );
+
+    update_queued_prompts(&mut queue, &queued(first, "stale first"));
+    update_queued_prompts(&mut queue, &admitted(first, "stale first"));
+    assert!(queue.is_empty());
+
+    update_queued_prompts(&mut queue, &queued(first, "bypassed"));
+    update_queued_prompts(&mut queue, &admitted(second, "later prompt"));
+    assert!(queue.is_empty());
+}
+
+#[test]
+fn one_queued_prompt_allocates_a_content_row_below_its_border() {
+    assert_eq!(queued_prompt_panel_height(0), 0);
+    assert_eq!(queued_prompt_panel_height(1), 2);
+    assert_eq!(queued_prompt_panel_height(6), 7);
+    assert_eq!(queued_prompt_panel_height(7), 8);
+
+    let area = Rect::new(0, 0, 60, queued_prompt_panel_height(1));
+    let mut buffer = ratatui::buffer::Buffer::empty(area);
+    let prompts = [PendingPromptProjection {
+        message_id: Uuid::new_v4(),
+        text: "visible follow-up".to_string(),
+        delivery: PromptDelivery::Queue,
+    }];
+    let widget = Paragraph::new(queued_prompt_lines(&prompts, area.width)).block(
+        Block::default()
+            .borders(Borders::TOP)
+            .border_style(Style::default().fg(Color::DarkGray)),
+    );
+    ratatui::widgets::Widget::render(widget, area, &mut buffer);
+    let content = (0..area.width)
+        .map(|x| buffer[(x, 1)].symbol())
+        .collect::<String>();
+    assert!(content.contains("Queued 1"));
+    assert!(content.contains("visible follow-up"));
 }
 
 #[test]
@@ -1961,6 +2096,26 @@ fn wheel_distance_advances_in_bounded_frames_and_stops_at_boundaries() {
     }
     assert_eq!(scroll, WHEEL_SCROLL_LINES_PER_EVENT as usize);
     assert_eq!(frames, WHEEL_SCROLL_LINES_PER_EVENT);
+}
+
+#[test]
+fn nested_wheel_motion_finishes_small_gestures_without_expensive_single_row_frames() {
+    let mut scroll = 0;
+    let mut motion = ScrollMotion::default();
+    motion.push(WHEEL_SCROLL_LINES_PER_EVENT);
+    let mut frames = 0;
+    while motion.is_active() {
+        scroll = motion.advance_with_limits(
+            scroll,
+            500,
+            MIN_NESTED_SCROLL_LINES_PER_FRAME,
+            MAX_NESTED_SCROLL_LINES_PER_FRAME,
+        );
+        frames += 1;
+    }
+
+    assert_eq!(scroll, WHEEL_SCROLL_LINES_PER_EVENT as usize);
+    assert_eq!(frames, 3);
 }
 
 #[test]

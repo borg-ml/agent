@@ -621,6 +621,12 @@ fn summarize_codex_provider_event(message: &JsonRpcMessage) -> Value {
             if let Some(item_id) = item.get("id").and_then(Value::as_str) {
                 out.insert("item_id".to_string(), Value::String(item_id.to_string()));
             }
+            if let Some(client_id) = item.get("clientId").and_then(Value::as_str) {
+                out.insert(
+                    "client_id".to_string(),
+                    Value::String(client_id.to_string()),
+                );
+            }
             for key in ["tool", "name", "toolName", "server", "serverName", "status"] {
                 if let Some(value) = item.get(key).and_then(Value::as_str) {
                     out.insert(key.to_string(), Value::String(value.to_string()));
@@ -700,6 +706,30 @@ mod tests {
 
         assert_eq!(summary["last"]["totalTokens"], 43_000);
         assert_eq!(summary["model_context_window"], 258_400);
+    }
+
+    #[test]
+    fn completed_user_messages_keep_the_client_id_used_to_commit_steers() {
+        let message: JsonRpcMessage = serde_json::from_value(json!({
+            "method": "item/completed",
+            "params": {
+                "item": {
+                    "type": "userMessage",
+                    "id": "user-1",
+                    "clientId": "4ff8407e-5dc5-4d72-828a-0d60ea12dc77",
+                    "content": [{
+                        "type": "text",
+                        "text": "steer at the next boundary"
+                    }]
+                }
+            }
+        }))
+        .expect("valid notification");
+
+        let summary = summarize_codex_provider_event(&message);
+
+        assert_eq!(summary["item_type"], "userMessage");
+        assert_eq!(summary["client_id"], "4ff8407e-5dc5-4d72-828a-0d60ea12dc77");
     }
 
     #[test]

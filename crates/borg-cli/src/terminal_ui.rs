@@ -79,6 +79,8 @@ const NESTED_SCROLL_GESTURE_GAP: Duration = Duration::from_millis(200);
 const WHEEL_SCROLL_LINES_PER_EVENT: isize = 5;
 const MAX_WHEEL_SCROLL_LINES_PER_FRAME: isize = 8;
 const WHEEL_SCROLL_EASING_DIVISOR: usize = 8;
+const MIN_NESTED_SCROLL_LINES_PER_FRAME: usize = 2;
+const MAX_NESTED_SCROLL_LINES_PER_FRAME: usize = 12;
 const MAX_PENDING_WHEEL_SCROLL_LINES: isize = 160;
 const TOOL_RUN_BOX_THRESHOLD: usize = 8;
 #[cfg(test)]
@@ -278,6 +280,13 @@ struct NestedScrollMotion {
     motion: ScrollMotion,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingPromptProjection {
+    message_id: Uuid,
+    text: String,
+    delivery: PromptDelivery,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct TranscriptPoint {
     row: usize,
@@ -376,6 +385,7 @@ pub enum UiAction {
         attachments: Vec<PathBuf>,
     },
     Queue {
+        message_id: Uuid,
         text: String,
         attachments: Vec<PathBuf>,
     },
@@ -397,7 +407,6 @@ pub enum UiAction {
     SetAutoExpandTools(bool),
     LoadPayloads(Vec<SessionPayloadRef>),
     Interrupt,
-    InterruptAndRecallQueued,
     Quit,
 }
 
@@ -450,7 +459,7 @@ pub struct BorgTerminal {
     clipboard_lease: Option<clipboard::ClipboardLease>,
     keyboard_enhancement: bool,
     last_ctrl_c: Option<Instant>,
-    queued_prompts: Vec<(Uuid, String)>,
+    queued_prompts: Vec<PendingPromptProjection>,
     replaying_history: bool,
     picker: Option<Picker>,
     keybindings_open: bool,
@@ -956,6 +965,27 @@ impl BorgTerminal {
 
     pub fn restore_composer(&mut self, text: String, attachments: Vec<PathBuf>) {
         self.composer.restore(text, attachments);
+    }
+
+    pub fn project_pending_prompt(
+        &mut self,
+        message_id: Uuid,
+        text: String,
+        delivery: PromptDelivery,
+    ) {
+        push_queued_prompt(&mut self.queued_prompts, message_id, text, delivery);
+    }
+
+    pub fn reject_optimistic_prompt(
+        &mut self,
+        message_id: Uuid,
+        text: String,
+        attachments: Vec<PathBuf>,
+    ) {
+        self.queued_prompts
+            .retain(|queued| queued.message_id != message_id);
+        self.composer.restore(text, attachments);
+        self.notice = Some("Could not send the prompt; it was returned to the composer".into());
     }
 
     pub fn is_launch_screen(&self) -> bool {
@@ -1691,7 +1721,12 @@ impl BorgTerminal {
             let current = self
                 .transcript
                 .tool_run_offset(nested.tool_run_start, nested.max_offset);
-            let next = nested.motion.advance(current, nested.max_offset);
+            let next = nested.motion.advance_with_limits(
+                current,
+                nested.max_offset,
+                MIN_NESTED_SCROLL_LINES_PER_FRAME,
+                MAX_NESTED_SCROLL_LINES_PER_FRAME,
+            );
             (nested.tool_run_start, nested.max_offset, current, next)
         });
         if let Some((start, max_offset, current, next)) = nested_update
@@ -2073,11 +2108,7 @@ impl BorgTerminal {
             });
         let (transcript, tool_rows, tool_run_rows, message_rows, entry_rows, link_rows) =
             transcript_render.as_ref();
-        let queued_prompts = self
-            .queued_prompts
-            .iter()
-            .map(|(_, text)| text.as_str())
-            .collect::<Vec<_>>();
+        let queued_prompts = &self.queued_prompts;
         // Keep the first draft anchored in the splash composition area. Moving
         // it to the chat footer on the first keystroke makes the whole screen
         // jump before the user has actually submitted anything.
@@ -2271,13 +2302,7 @@ impl BorgTerminal {
                 .direction(Direction::Vertical)
                 .constraints([
                     Constraint::Min(3),
-                    Constraint::Length(
-                        queued_prompts
-                            .len()
-                            .min(6)
-                            .saturating_add(usize::from(queued_prompts.len() > 6))
-                            .min(u16::MAX as usize) as u16,
-                    ),
+                    Constraint::Length(queued_prompt_panel_height(queued_prompts.len())),
                     Constraint::Length(2 * u16::from(!is_launch_screen)),
                     Constraint::Length(composer_height),
                     Constraint::Length(footer_height),
@@ -2565,35 +2590,12 @@ impl BorgTerminal {
                 next_jump_to_bottom_area = Some(button);
             }
             if !queued_prompts.is_empty() {
-                let visible = queued_prompts.len().min(6);
-                let queue_width = chunks[1].width.saturating_sub(14).max(1) as usize;
-                let mut queue_lines = queued_prompts
-                    .iter()
-                    .take(visible)
-                    .enumerate()
-                    .map(|(index, text)| {
-                        Line::from(vec![
-                            Span::styled(
-                                format!(" Queued {}  ", index + 1),
-                                Style::default()
-                                    .fg(BORG_ORANGE)
-                                    .add_modifier(Modifier::BOLD),
-                            ),
-                            Span::styled(
-                                compact_text(text, queue_width),
-                                Style::default().fg(Color::Gray),
-                            ),
-                        ])
-                    })
-                    .collect::<Vec<_>>();
-                if queued_prompts.len() > visible {
-                    queue_lines.push(Line::from(Span::styled(
-                        format!("           +{} more", queued_prompts.len() - visible),
-                        Style::default().fg(Color::DarkGray),
-                    )));
-                }
                 frame.render_widget(
-                    Paragraph::new(queue_lines).block(
+                    Paragraph::new(queued_prompt_lines(
+                        queued_prompts.as_slice(),
+                        chunks[1].width,
+                    ))
+                    .block(
                         Block::default()
                             .borders(Borders::TOP)
                             .border_style(Style::default().fg(Color::DarkGray)),
@@ -3107,7 +3109,18 @@ impl BorgTerminal {
                         | SessionStatus::Running
                         | SessionStatus::WaitingForApproval
                 ) {
-                    UiAction::Queue { text, attachments }
+                    let message_id = Uuid::new_v4();
+                    push_queued_prompt(
+                        &mut self.queued_prompts,
+                        message_id,
+                        text.clone(),
+                        PromptDelivery::Queue,
+                    );
+                    UiAction::Queue {
+                        message_id,
+                        text,
+                        attachments,
+                    }
                 } else {
                     UiAction::Submit { text, attachments }
                 },
@@ -3136,11 +3149,7 @@ impl BorgTerminal {
             return Ok(UiAction::None);
         }
         if self.keymap.matches(KeyAction::Interrupt, &key) {
-            return Ok(if !self.queued_prompts.is_empty() {
-                UiAction::InterruptAndRecallQueued
-            } else {
-                UiAction::Interrupt
-            });
+            return Ok(UiAction::Interrupt);
         }
         match key.code {
             KeyCode::Char(character) => {
@@ -5388,9 +5397,10 @@ impl Transcript {
                     }
                     let prefix = if tool_window.is_some() { "│ " } else { "  " };
                     let elapsed = format_tool_elapsed(*started_at, *completed_at);
-                    for (line_index, line) in tool_summary_lines(&summary, &elapsed, prefix, width)
-                        .into_iter()
-                        .enumerate()
+                    for (line_index, line) in
+                        tool_summary_lines(&summary, elapsed.as_deref(), prefix, width)
+                            .into_iter()
+                            .enumerate()
                     {
                         if line_index == 0
                             && let Some(name_start) = line.find(name.as_str())
@@ -5722,6 +5732,21 @@ impl ScrollMotion {
     }
 
     fn advance(&mut self, scroll_from_bottom: usize, scroll_max: usize) -> usize {
+        self.advance_with_limits(
+            scroll_from_bottom,
+            scroll_max,
+            1,
+            MAX_WHEEL_SCROLL_LINES_PER_FRAME as usize,
+        )
+    }
+
+    fn advance_with_limits(
+        &mut self,
+        scroll_from_bottom: usize,
+        scroll_max: usize,
+        minimum_step: usize,
+        maximum_step: usize,
+    ) -> usize {
         if self.remaining_lines == 0 {
             return scroll_from_bottom;
         }
@@ -5729,7 +5754,10 @@ impl ScrollMotion {
             .remaining_lines
             .unsigned_abs()
             .div_ceil(WHEEL_SCROLL_EASING_DIVISOR)
-            .clamp(1, MAX_WHEEL_SCROLL_LINES_PER_FRAME as usize);
+            .clamp(
+                minimum_step.min(self.remaining_lines.unsigned_abs()).max(1),
+                maximum_step.max(1),
+            );
         let requested = if self.remaining_lines > 0 {
             magnitude as isize
         } else {
@@ -5900,29 +5928,126 @@ fn normalize_terminal_capture_paste(value: &str) -> Cow<'_, str> {
     )
 }
 
-fn update_queued_prompts(queued_prompts: &mut Vec<(Uuid, String)>, event: &SessionEventKind) {
+fn update_queued_prompts(
+    queued_prompts: &mut Vec<PendingPromptProjection>,
+    event: &SessionEventKind,
+) {
     match event {
         SessionEventKind::Message {
             message_id,
             actor: EventActor::User,
             text,
             status: MessageStatus::Queued,
-            delivery: Some(PromptDelivery::Queue),
+            delivery: Some(delivery),
             ..
         } => {
-            if !queued_prompts
+            push_queued_prompt(queued_prompts, *message_id, text.clone(), *delivery);
+        }
+        SessionEventKind::Message {
+            message_id,
+            actor: EventActor::User,
+            status: MessageStatus::Complete,
+            delivery,
+            ..
+        } => {
+            if let Some(admitted) = queued_prompts
                 .iter()
-                .any(|(queued, _)| queued == message_id)
+                .position(|queued| queued.message_id == *message_id)
             {
-                queued_prompts.push((*message_id, text.clone()));
+                if *delivery == Some(PromptDelivery::Queue) {
+                    let mut index = 0;
+                    queued_prompts.retain(|queued| {
+                        let retain = index > admitted || queued.delivery != PromptDelivery::Queue;
+                        index += 1;
+                        retain
+                    });
+                } else {
+                    queued_prompts.remove(admitted);
+                }
+            } else if *delivery == Some(PromptDelivery::Queue) {
+                // A later user prompt was admitted while older projected queue
+                // entries remained. FIFO admission makes older queued entries
+                // stale, while active-turn steers are independent.
+                queued_prompts.retain(|queued| queued.delivery != PromptDelivery::Queue);
             }
         }
         SessionEventKind::Message { message_id, .. }
         | SessionEventKind::PromptRecalled { message_id, .. } => {
-            queued_prompts.retain(|(queued, _)| queued != message_id);
+            queued_prompts.retain(|queued| queued.message_id != *message_id);
         }
         _ => {}
     }
+}
+
+fn push_queued_prompt(
+    queued_prompts: &mut Vec<PendingPromptProjection>,
+    message_id: Uuid,
+    text: String,
+    delivery: PromptDelivery,
+) {
+    if let Some(queued) = queued_prompts
+        .iter_mut()
+        .find(|queued| queued.message_id == message_id)
+    {
+        queued.text = text;
+        queued.delivery = delivery;
+    } else {
+        queued_prompts.push(PendingPromptProjection {
+            message_id,
+            text,
+            delivery,
+        });
+    }
+}
+
+fn queued_prompt_panel_height(prompt_count: usize) -> u16 {
+    if prompt_count == 0 {
+        return 0;
+    }
+    prompt_count
+        .min(6)
+        .saturating_add(usize::from(prompt_count > 6))
+        // The queue paragraph has a top border, which needs its own row.
+        .saturating_add(1)
+        .min(u16::MAX as usize) as u16
+}
+
+fn queued_prompt_lines(
+    queued_prompts: &[PendingPromptProjection],
+    panel_width: u16,
+) -> Vec<Line<'static>> {
+    let visible = queued_prompts.len().min(6);
+    let queue_width = panel_width.saturating_sub(16).max(1) as usize;
+    let mut lines = queued_prompts
+        .iter()
+        .take(visible)
+        .enumerate()
+        .map(|(index, prompt)| {
+            let label = match prompt.delivery {
+                PromptDelivery::Steer => "Steering",
+                PromptDelivery::Queue => "Queued",
+            };
+            Line::from(vec![
+                Span::styled(
+                    format!(" {label} {}  ", index + 1),
+                    Style::default()
+                        .fg(BORG_ORANGE)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    compact_text(&prompt.text, queue_width),
+                    Style::default().fg(Color::Gray),
+                ),
+            ])
+        })
+        .collect::<Vec<_>>();
+    if queued_prompts.len() > visible {
+        lines.push(Line::from(Span::styled(
+            format!("           +{} more", queued_prompts.len() - visible),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    lines
 }
 
 fn local_event_time(event: &SessionEvent) -> String {
@@ -6378,8 +6503,16 @@ fn wrap_display(value: &str, width: usize) -> Vec<String> {
         .collect()
 }
 
-fn tool_summary_lines(summary: &str, elapsed: &str, prefix: &str, width: usize) -> Vec<String> {
+fn tool_summary_lines(
+    summary: &str,
+    elapsed: Option<&str>,
+    prefix: &str,
+    width: usize,
+) -> Vec<String> {
     let content_width = width.saturating_sub(UnicodeWidthStr::width(prefix));
+    let Some(elapsed) = elapsed else {
+        return wrap_display(summary, content_width.max(1));
+    };
     let elapsed_width = UnicodeWidthStr::width(elapsed);
     let reserved_width = elapsed_width.saturating_add(2);
     if content_width <= reserved_width {
@@ -6408,32 +6541,38 @@ fn tool_summary_lines(summary: &str, elapsed: &str, prefix: &str, width: usize) 
     lines
 }
 
-fn format_tool_elapsed(started_at: DateTime<Utc>, completed_at: Option<DateTime<Utc>>) -> String {
+fn format_tool_elapsed(
+    started_at: DateTime<Utc>,
+    completed_at: Option<DateTime<Utc>>,
+) -> Option<String> {
     let elapsed_ms = completed_at
         .unwrap_or_else(Utc::now)
         .signed_duration_since(started_at)
         .num_milliseconds()
         .max(0) as u64;
+    if elapsed_ms < 100 {
+        return None;
+    }
     if elapsed_ms < 60_000 {
-        return format!("{:.1}s", elapsed_ms as f64 / 1_000.0);
+        return Some(format!("{:.1}s", elapsed_ms as f64 / 1_000.0));
     }
 
     let total_seconds = elapsed_ms / 1_000;
     let seconds = total_seconds % 60;
     let total_minutes = total_seconds / 60;
     if total_minutes < 60 {
-        return format!("{total_minutes}m {seconds:02}s");
+        return Some(format!("{total_minutes}m {seconds:02}s"));
     }
 
     let minutes = total_minutes % 60;
     let total_hours = total_minutes / 60;
     if total_hours < 24 {
-        return format!("{total_hours}h {minutes:02}m");
+        return Some(format!("{total_hours}h {minutes:02}m"));
     }
 
     let days = total_hours / 24;
     let hours = total_hours % 24;
-    format!("{days}d {hours:02}h")
+    Some(format!("{days}d {hours:02}h"))
 }
 
 fn composer_cursor_position(value: &str, cursor: usize, width: usize) -> (usize, usize) {

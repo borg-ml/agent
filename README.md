@@ -31,6 +31,8 @@ configurable.
 - Codex, Claude, OpenCode, Kimi, OpenRouter, and OpenAI-compatible providers;
 - a native harness with bounded file tools, background
   processes, LSP, goals, plans, subagents, MCP, project guidance, and skills;
+- provider-neutral extensions through local/project skills and configurable
+  stdio MCP servers, plus configurable slash aliases and keybindings;
 - non-blocking, checksum-verified updates that take effect on the next launch;
 - **Full Access** (default), **Auto** model-reviewed commands, and **Manual**
   user-reviewed commands;
@@ -44,7 +46,30 @@ typed Rust.
 Copy [`configs/agent.example.toml`](configs/agent.example.toml) to
 `$XDG_CONFIG_HOME/borg/agent.toml` (normally
 `~/.config/borg/agent.toml`). The typed config supports slash-command aliases,
-keybindings, and the model/effort used by native Auto approval review.
+keybindings, provider-neutral stdio MCP servers, and the model/effort used by
+native Auto approval review.
+
+Copy [`configs/editor.example.toml`](configs/editor.example.toml) to
+`$XDG_CONFIG_HOME/borg/editor.toml` to configure transcript presentation and
+active-turn input policy. `active_messages = "steer"` makes Enter inject at the
+next Codex boundary; `"queue"` makes Enter start a later turn. The dedicated
+queue keybinding remains available in either mode.
+
+## Extend Borg
+
+Borg uses composable, inspectable extension points instead of a private plugin
+runtime:
+
+- put `SKILL.md` packages in `.agents/skills`, `.borg/skills`,
+  `~/.agents/skills`, `~/.borg/skills`, or `~/.codex/skills`;
+- add local stdio servers under `[mcp.servers.<name>]` in `agent.toml` to expose
+  arbitrary tools across Codex, Claude, OpenCode, and Borg's native providers;
+- define slash-command aliases and remap every primary TUI action in the same
+  typed config; and
+- keep project-specific agent instructions beside the code they govern.
+
+MCP extensions can be disabled per server and restricted with
+`allowed_tools`. See the checked-in config examples for the complete schema.
 
 ## Repository layout
 

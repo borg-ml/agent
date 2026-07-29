@@ -446,7 +446,8 @@ async fn run_local_agent_session(
         )
     } else {
         LocalAgentTurnExecutor::with_settings(local_settings)
-    };
+    }
+    .with_external_mcp_servers(agent_config.external_mcp_servers());
     local_executor.prewarm(provider);
     let executor: Arc<dyn AgentTurnExecutor> = Arc::new(local_executor);
     let mut rendered = HashMap::new();
@@ -1288,16 +1289,6 @@ async fn run_local_agent_session(
                             .await
                             .ok();
                     }
-                    UiAction::InterruptAndRecallQueued => {
-                        session_command_tx
-                            .send(HostCommand::RecallQueuedPrompt { session_id })
-                            .await
-                            .ok();
-                        session_command_tx
-                            .send(HostCommand::Interrupt { session_id })
-                            .await
-                            .ok();
-                    }
                     UiAction::Rewind {
                         sequence,
                         text,
@@ -1444,18 +1435,33 @@ async fn run_local_agent_session(
                         user_requested_exit = true;
                         session_command_tx.send(HostCommand::Stop { session_id }).await.ok();
                     }
-                    UiAction::Queue { text, attachments } => {
-                        session_command_tx
+                    UiAction::Queue {
+                        message_id,
+                        text,
+                        attachments,
+                    } => {
+                        if let Err(error) = session_command_tx
                             .send(HostCommand::Prompt {
                                 session_id,
-                                message_id: Uuid::new_v4(),
+                                message_id,
                                 text,
                                 attachments,
                                 output_schema: None,
                                 delivery: PromptDelivery::Queue,
                             })
                             .await
-                            .ok();
+                        {
+                            let HostCommand::Prompt {
+                                text, attachments, ..
+                            } = error.0
+                            else {
+                                unreachable!("queue submission always sends a prompt command");
+                            };
+                            terminal
+                                .as_mut()
+                                .expect("terminal")
+                                .reject_optimistic_prompt(message_id, text, attachments);
+                        }
                     }
                     UiAction::Submit { text, attachments } => {
                         if let Some((interaction_id, kind, payload)) =
@@ -2001,14 +2007,40 @@ async fn run_local_agent_session(
                                         idle_input(&text)
                                     };
                                     if !text.is_empty() || !attachments.is_empty() {
-                                        session_command_tx.send(HostCommand::Prompt {
+                                        let message_id = Uuid::new_v4();
+                                        if active {
+                                            terminal
+                                                .as_mut()
+                                                .expect("terminal")
+                                                .project_pending_prompt(
+                                                    message_id,
+                                                    text.clone(),
+                                                    delivery,
+                                                );
+                                        }
+                                        if let Err(error) = session_command_tx.send(HostCommand::Prompt {
                                             session_id,
-                                            message_id: Uuid::new_v4(),
+                                            message_id,
                                             text,
                                             attachments,
                                             output_schema: None,
                                             delivery,
-                                        }).await.ok();
+                                        }).await {
+                                            let HostCommand::Prompt {
+                                                text, attachments, ..
+                                            } = error.0
+                                            else {
+                                                unreachable!("submission always sends a prompt command");
+                                            };
+                                            terminal
+                                                .as_mut()
+                                                .expect("terminal")
+                                                .reject_optimistic_prompt(
+                                                    message_id,
+                                                    text,
+                                                    attachments,
+                                                );
+                                        }
                                     }
                                 }
                             }

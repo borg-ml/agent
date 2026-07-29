@@ -10,6 +10,7 @@ use serde::Deserialize;
 pub(crate) struct AgentConfig {
     pub(crate) commands: CommandConfig,
     pub(crate) keybindings: KeybindingConfig,
+    pub(crate) mcp: McpConfig,
     pub(crate) approvals: ApprovalConfig,
     pub(crate) updates: UpdateConfig,
 }
@@ -38,6 +39,37 @@ pub(crate) struct CommandConfig {
     /// User-defined slash-command aliases. The key omits the leading slash;
     /// the value is a built-in slash command and may include fixed arguments.
     pub(crate) aliases: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct McpConfig {
+    /// Local stdio MCP servers exposed as tools to every provider.
+    pub(crate) servers: BTreeMap<String, McpServerConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct McpServerConfig {
+    pub(crate) enabled: bool,
+    pub(crate) command: String,
+    pub(crate) args: Vec<String>,
+    pub(crate) env: BTreeMap<String, String>,
+    /// Optional allowlist of wire names (`search`) or namespaced tool names
+    /// (`mcp__docs__search`). Empty exposes every tool from the server.
+    pub(crate) allowed_tools: Vec<String>,
+}
+
+impl Default for McpServerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            command: String::new(),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            allowed_tools: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -135,6 +167,33 @@ impl AgentConfig {
                     .with_context(|| format!("invalid `{action}` keybinding `{binding}`"))?;
             }
         }
+        for (name, server) in &self.mcp.servers {
+            anyhow::ensure!(
+                valid_alias(name),
+                "MCP server name `{name}` must contain only ASCII letters, digits, `-`, or `_`"
+            );
+            anyhow::ensure!(
+                !server.enabled || !server.command.trim().is_empty(),
+                "enabled MCP server `{name}` must define a command"
+            );
+            anyhow::ensure!(
+                server.args.iter().all(|argument| !argument.contains('\0')),
+                "MCP server `{name}` arguments cannot contain NUL bytes"
+            );
+            anyhow::ensure!(
+                server.env.iter().all(|(key, value)| !key.is_empty()
+                    && !key.contains(['=', '\0'])
+                    && !value.contains('\0')),
+                "MCP server `{name}` has an invalid environment entry"
+            );
+            anyhow::ensure!(
+                server
+                    .allowed_tools
+                    .iter()
+                    .all(|tool| !tool.trim().is_empty() && !tool.contains('\0')),
+                "MCP server `{name}` has an invalid allowed tool"
+            );
+        }
         if let Some(model) = &self.approvals.reviewer_model {
             anyhow::ensure!(!model.trim().is_empty(), "reviewer_model must not be empty");
         }
@@ -162,6 +221,21 @@ impl AgentConfig {
             .get(name)
             .map(|target| format!("{target}{suffix}"))
             .unwrap_or_else(|| line.to_string())
+    }
+
+    pub(crate) fn external_mcp_servers(&self) -> Vec<borg_provider::mcp::ExternalMcpServer> {
+        self.mcp
+            .servers
+            .iter()
+            .filter(|(_, server)| server.enabled)
+            .map(|(name, server)| borg_provider::mcp::ExternalMcpServer {
+                name: name.clone(),
+                command: server.command.clone(),
+                args: server.args.clone(),
+                env: server.env.clone(),
+                allowed_tools: server.allowed_tools.clone(),
+            })
+            .collect()
     }
 }
 
@@ -274,5 +348,29 @@ mod tests {
         assert_eq!(config.keybindings.send, ["ctrl+s"]);
         assert_eq!(config.keybindings.queue, ["tab"]);
         assert_eq!(config.keybindings.interrupt, ["esc"]);
+    }
+
+    #[test]
+    fn enabled_mcp_servers_become_provider_neutral_tool_extensions() {
+        let config: AgentConfig = toml::from_str(
+            r#"
+            [mcp.servers.docs]
+            command = "docs-mcp"
+            args = ["--stdio"]
+            allowed_tools = ["search"]
+
+            [mcp.servers.disabled]
+            enabled = false
+            "#,
+        )
+        .expect("config");
+        config.validate().expect("valid config");
+
+        let servers = config.external_mcp_servers();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].name, "docs");
+        assert_eq!(servers[0].command, "docs-mcp");
+        assert_eq!(servers[0].args, ["--stdio"]);
+        assert_eq!(servers[0].allowed_tools, ["search"]);
     }
 }

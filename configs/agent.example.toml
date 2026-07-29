@@ -28,6 +28,21 @@ select_next = ["alt+down"]
 approve = ["y"]
 deny = ["n", "esc"]
 
+# Add any local stdio MCP server as a provider-neutral tool extension. Borg
+# starts enabled servers for the active session and exposes them to Codex,
+# Claude, OpenCode, and the native harness. Empty allowed_tools exposes every
+# tool advertised by the server.
+#
+# [mcp.servers.docs]
+# command = "npx"
+# args = ["-y", "@example/docs-mcp"]
+# env = { DOCS_TOKEN = "replace-me" }
+# allowed_tools = ["search", "read"]
+#
+# [mcp.servers.experimental]
+# enabled = false
+# command = "./target/debug/my-borg-tools"
+
 # Auto approval uses the active model by default. Set a dedicated reviewer to
 # trade model quality, latency, and cost independently from the acting agent.
 [approvals]
