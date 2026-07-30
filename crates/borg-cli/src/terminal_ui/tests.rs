@@ -2173,7 +2173,7 @@ fn one_queued_prompt_allocates_a_content_row_below_its_border() {
         Block::default()
             .borders(Borders::TOP | Borders::LEFT)
             .border_style(Style::default().fg(Color::DarkGray))
-            .title(" PENDING INPUT · 1 "),
+            .title(" Pending Input · 1 "),
     );
     ratatui::widgets::Widget::render(widget, area, &mut buffer);
     let content = (0..area.width)
@@ -2182,13 +2182,13 @@ fn one_queued_prompt_allocates_a_content_row_below_its_border() {
     let hint = (0..area.width)
         .map(|x| buffer[(x, 2)].symbol())
         .collect::<String>();
-    assert!(content.contains("NEXT TURN"));
+    assert!(content.contains("Next"));
     assert!(content.contains("visible follow-up"));
     assert!(hint.contains("↑ edit / recall queued"));
 }
 
 #[test]
-fn pending_steer_ui_names_the_tool_boundary_and_interrupt_action() {
+fn pending_steer_ui_uses_the_shared_next_label_and_interrupt_action() {
     let prompts = [PendingPromptProjection {
         message_id: Uuid::new_v4(),
         text: "focus on the failing test".to_string(),
@@ -2200,10 +2200,41 @@ fn pending_steer_ui_names_the_tool_boundary_and_interrupt_action() {
         .collect::<Vec<_>>()
         .join("\n");
 
-    assert!(rendered.contains("NEXT TOOL"));
+    assert!(rendered.contains("Next"));
+    assert!(!rendered.contains("NEXT TOOL"));
+    assert!(!rendered.contains("NEXT TURN"));
     assert!(rendered.contains("focus on the failing test"));
     assert!(rendered.contains("esc interrupt + send now"));
     assert!(rendered.contains("↑ edit / recall pending"));
+}
+
+#[test]
+fn recovered_idle_session_stops_orphaned_tool_spinner() {
+    let session_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::ToolStarted {
+            tool_call_id: "orphaned".to_string(),
+            name: "read_file".to_string(),
+            input: serde_json::json!({"path": "src/lib.rs"}),
+            input_ref: None,
+        },
+    ));
+    assert!(transcript.tool_spinner_cache_tick().is_some());
+
+    transcript.reconcile_session_status(&SessionState {
+        status: Some(SessionStatus::Ready),
+        activity_at: Some(Utc::now()),
+        ..SessionState::default()
+    });
+
+    assert!(transcript.tool_spinner_cache_tick().is_none());
+    assert!(matches!(
+        transcript.order.first(),
+        Some(TranscriptEntry::Tool { complete: true, .. })
+    ));
 }
 
 #[test]
@@ -2329,8 +2360,19 @@ fn splash_logo_shows_version_and_periodic_glitch_frames() {
         "B O R G"
     );
     let glitch = splash_logo_line(Duration::ZERO).to_string();
-    assert!(glitch.starts_with("B O R G"));
-    assert!(glitch.contains('░'));
+    assert_eq!(glitch, "界O R G");
+    assert_eq!(
+        UnicodeWidthStr::width(glitch.as_str()),
+        UnicodeWidthStr::width("B O R G")
+    );
+    assert_eq!(
+        splash_logo_line(Duration::from_millis(90)).to_string(),
+        "B カR G"
+    );
+    assert_eq!(
+        splash_logo_line(Duration::from_millis(180)).to_string(),
+        "B O 한G"
+    );
 }
 
 #[test]

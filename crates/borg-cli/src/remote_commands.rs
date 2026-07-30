@@ -37,6 +37,7 @@ const ACTIVITY_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_m
 /// Keep first paint bounded. The canonical store remains complete and indexed;
 /// a resumed actor recovers independently of this presentation-only tail.
 const RICH_TUI_HISTORY_EVENT_LIMIT: usize = 512;
+const RICH_TUI_HISTORY_PAGE_SIZE: usize = 1024;
 
 pub(crate) async fn run_remote_command(command: RemoteCommand) -> Result<()> {
     match command {
@@ -616,11 +617,12 @@ async fn run_local_agent_session(
     let has_initial_prompt = initial_prompt.is_some();
     let interactive = can_prompt;
     let fallback_terminal = can_prompt && BorgTerminal::fallback_requested();
-    let history = if can_prompt && !fallback_terminal {
+    let mut history = if can_prompt && !fallback_terminal {
         recent_tui_history(store.as_ref(), session_id, session_state.latest_sequence).await?
     } else {
         store.read(session_id).await?
     };
+    let mut history_start_reached = history.first().is_none_or(|event| event.sequence <= 1);
     let (team_history, team_snapshots, child_histories) = if can_prompt && !fallback_terminal {
         load_subagent_thread_state(store.as_ref(), &sessions_dir, session_id).await?
     } else {
@@ -866,6 +868,21 @@ async fn run_local_agent_session(
                 let terminal = terminal.as_mut().expect("terminal");
                 let interaction_frame = terminal.has_pending_scroll_frame();
                 terminal.advance_scroll_frame();
+                let should_load_history =
+                    terminal.is_near_history_start() && !history_start_reached;
+                if should_load_history {
+                    let before = history.first().expect("history has an unloaded prefix").sequence;
+                    let older = older_tui_history(store.as_ref(), session_id, before).await?;
+                    if older.is_empty() {
+                        history_start_reached = true;
+                    } else {
+                        history.splice(0..0, older);
+                        terminal.replace_history(&history);
+                        terminal.seed_session_state(&store.state(session_id).await?);
+                        history_start_reached =
+                            history.first().is_none_or(|event| event.sequence <= 1);
+                    }
+                }
                 let draw_started = std::time::Instant::now();
                 terminal.draw()?;
                 let next_interval =
@@ -984,6 +1001,12 @@ async fn run_local_agent_session(
                 }
                 if let Some(terminal) = terminal.as_mut() {
                     terminal_dirty |= terminal.apply_session_event(&event);
+                    if history
+                        .last()
+                        .is_none_or(|loaded| loaded.sequence < event.sequence)
+                    {
+                        history.push(event.clone());
+                    }
                 } else {
                     render_event(&event, args.json, &mut rendered)?;
                 }
@@ -2881,6 +2904,24 @@ async fn recent_tui_history(
         .await
 }
 
+async fn older_tui_history(
+    store: &dyn SessionStore,
+    session_id: Uuid,
+    before_sequence: u64,
+) -> Result<Vec<SessionEvent>> {
+    let Some(after_sequence) = older_tui_history_after(before_sequence) else {
+        return Ok(Vec::new());
+    };
+    store
+        .events_after(session_id, after_sequence, RICH_TUI_HISTORY_PAGE_SIZE)
+        .await
+}
+
+fn older_tui_history_after(before_sequence: u64) -> Option<u64> {
+    (before_sequence > 1)
+        .then(|| before_sequence.saturating_sub(RICH_TUI_HISTORY_PAGE_SIZE as u64 + 1))
+}
+
 fn child_pending_approval_ids(events: &[SessionEvent]) -> HashMap<Uuid, String> {
     let mut pending = HashMap::new();
     for event in events {
@@ -3828,6 +3869,14 @@ mod tests {
     use super::*;
     use std::time::{Duration, Instant};
     use tempfile::tempdir;
+
+    #[test]
+    fn older_history_pages_end_immediately_before_the_loaded_tail() {
+        assert_eq!(older_tui_history_after(1), None);
+        assert_eq!(older_tui_history_after(513), Some(0));
+        assert_eq!(older_tui_history_after(2_000), Some(975));
+        assert_eq!(975 + RICH_TUI_HISTORY_PAGE_SIZE as u64, 1_999);
+    }
 
     #[test]
     fn reinstalling_the_remote_host_restarts_it_on_the_new_binary() {

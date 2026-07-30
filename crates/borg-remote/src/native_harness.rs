@@ -375,6 +375,75 @@ impl NativeHarness {
                 },
             )
             .await;
+            if native_usage_needs_auto_compaction(&result.usage) {
+                let context_tokens = result.usage.context_tokens.unwrap_or_default();
+                let context_window_tokens = result.usage.context_window_tokens.unwrap_or_default();
+                let compacted = self
+                    .compact(
+                        turn.provider,
+                        &model,
+                        turn.effort.as_deref(),
+                        messages.clone(),
+                    )
+                    .await;
+                let (summary, compaction_usage) = match compacted {
+                    Ok(compacted) => compacted,
+                    Err(error) => {
+                        send(
+                            &events,
+                            SessionEventKind::ProviderEvent {
+                                provider: turn.provider,
+                                kind: "context_compaction_failed".to_string(),
+                                payload: json!({
+                                    "automatic": true,
+                                    "trigger": "tool_round_context_threshold",
+                                    "context_tokens_before": context_tokens,
+                                    "effective_context_window_tokens": context_window_tokens,
+                                    "error": error.to_string(),
+                                }),
+                            },
+                        )
+                        .await;
+                        return Err(error.context(
+                            "automatic compaction failed before the next native model round",
+                        ));
+                    }
+                };
+                absorb_usage(&mut usage, &compaction_usage);
+                send(
+                    &events,
+                    SessionEventKind::ProviderEvent {
+                        provider: turn.provider,
+                        kind: "context_compaction".to_string(),
+                        payload: json!({
+                            "summary": summary,
+                            "native": true,
+                            "automatic": true,
+                            "trigger": "tool_round_context_threshold",
+                            "context_tokens_before": context_tokens,
+                            "effective_context_window_tokens": context_window_tokens,
+                            "remaining_percent_threshold":
+                                NATIVE_AUTO_COMPACT_REMAINING_PERCENT,
+                            "provider_duration_ms": compaction_usage.duration_ms,
+                            "input_tokens": compaction_usage.input_tokens,
+                            "output_tokens": compaction_usage.output_tokens,
+                        }),
+                    },
+                )
+                .await;
+                send(
+                    &events,
+                    SessionEventKind::ContextWindowUpdated {
+                        context_tokens: 0,
+                        context_window_tokens,
+                    },
+                )
+                .await;
+                messages.truncate(1);
+                messages.push(ModelMessage::user(format!(
+                    "Previous conversation summary:\n\n{summary}"
+                )));
+            }
         }
         bail!("native provider exceeded the harness limit of {MAX_TOOL_ROUNDS} tool rounds")
     }
@@ -1262,6 +1331,20 @@ fn absorb_usage(total: &mut ProviderCallUsage, usage: &ProviderCallUsage) {
     };
 }
 
+const NATIVE_AUTO_COMPACT_REMAINING_PERCENT: u64 = 10;
+
+fn native_usage_needs_auto_compaction(usage: &ProviderCallUsage) -> bool {
+    let (Some(context_tokens), Some(context_window_tokens)) =
+        (usage.context_tokens, usage.context_window_tokens)
+    else {
+        return false;
+    };
+    context_window_tokens > 0
+        && u128::from(context_tokens).saturating_mul(100)
+            >= u128::from(context_window_tokens)
+                .saturating_mul(100 - u128::from(NATIVE_AUTO_COMPACT_REMAINING_PERCENT))
+}
+
 fn parse_tool_arguments(tool_call: &ModelToolCall) -> std::result::Result<Value, String> {
     let arguments = tool_call.function.arguments.trim();
     let value = if arguments.is_empty() {
@@ -1590,6 +1673,21 @@ mod tests {
         let bounded = bounded_tool_content(output);
         assert!(bounded.is_char_boundary(MAX_TOOL_RESULT_BYTES));
         assert!(bounded.contains("tool output truncated"));
+    }
+
+    #[test]
+    fn tool_round_auto_compaction_uses_ten_percent_effective_headroom() {
+        let usage = |context_tokens, context_window_tokens| ProviderCallUsage {
+            context_tokens: Some(context_tokens),
+            context_window_tokens: Some(context_window_tokens),
+            ..ProviderCallUsage::default()
+        };
+        assert!(!native_usage_needs_auto_compaction(&usage(89_999, 100_000)));
+        assert!(native_usage_needs_auto_compaction(&usage(90_000, 100_000)));
+        assert!(native_usage_needs_auto_compaction(&usage(95_000, 100_000)));
+        assert!(!native_usage_needs_auto_compaction(
+            &ProviderCallUsage::default()
+        ));
     }
 
     #[test]

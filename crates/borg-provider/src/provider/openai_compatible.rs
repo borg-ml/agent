@@ -1,5 +1,5 @@
-use std::collections::{BTreeMap, HashSet};
-use std::sync::OnceLock;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -19,6 +19,14 @@ use super::{
 };
 
 const KIMI_STREAM_MAX_BYTES: usize = 128 * 1024 * 1024;
+static OPENROUTER_MODEL_LIMITS: OnceLock<Mutex<HashMap<String, OpenRouterModelLimits>>> =
+    OnceLock::new();
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OpenRouterModelLimits {
+    context_window_tokens: u64,
+    max_completion_tokens: Option<u64>,
+}
 
 #[derive(Clone)]
 pub struct ModelGateway {
@@ -372,7 +380,7 @@ impl OpenAiCompatibleProvider {
         trace.stdout = streamed.raw.to_string();
         trace.exit_status = Some(0);
         let duration_ms = elapsed_millis_u64(started_at);
-        let usage = match profile {
+        let mut usage = match profile {
             OpenAiCompatibleProfile::Kimi => kimi_usage_from_response(&streamed.raw, duration_ms),
             OpenAiCompatibleProfile::OpenRouter => extract_chat_completions_usage(
                 &streamed.raw,
@@ -383,6 +391,19 @@ impl OpenAiCompatibleProvider {
                 extract_chat_completions_usage(&streamed.raw, duration_ms, None)
             }
         };
+        if profile == OpenAiCompatibleProfile::OpenRouter {
+            usage.context_tokens =
+                Some(usage.input_tokens.saturating_add(usage.cached_input_tokens));
+            if let Some(limits) =
+                openrouter_model_limits(&client, &endpoint, api_key.as_deref(), &self.model).await
+            {
+                usage.context_window_tokens = Some(
+                    limits
+                        .context_window_tokens
+                        .saturating_sub(limits.max_completion_tokens.unwrap_or(0)),
+                );
+            }
+        }
         Ok(ModelTurnResult {
             message: streamed.message,
             finish_reason: streamed.finish_reason,
@@ -604,6 +625,62 @@ impl OpenAiCompatibleProvider {
     fn is_kimi(&self) -> bool {
         self.model == crate::kimi_product_model()
     }
+}
+
+async fn openrouter_model_limits(
+    client: &reqwest::Client,
+    chat_endpoint: &str,
+    api_key: Option<&str>,
+    model: &str,
+) -> Option<OpenRouterModelLimits> {
+    if let Some(context_window_tokens) = nonempty_env("BORG_OPENROUTER_CONTEXT_WINDOW_TOKENS")
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        return Some(OpenRouterModelLimits {
+            context_window_tokens,
+            max_completion_tokens: nonempty_env("BORG_OPENROUTER_MAX_COMPLETION_TOKENS")
+                .and_then(|value| value.parse::<u64>().ok()),
+        });
+    }
+    let key = format!("{chat_endpoint}\n{model}");
+    if let Some(cached) = OPENROUTER_MODEL_LIMITS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&key).copied())
+    {
+        return Some(cached);
+    }
+    let base = chat_endpoint.strip_suffix("/chat/completions")?;
+    let mut request = client.get(format!("{base}/model/{model}"));
+    if let Some(api_key) = api_key {
+        request = request.bearer_auth(api_key);
+    }
+    let limits = match apply_provider_request_timeout(request).send().await {
+        Ok(response) if response.status().is_success() => response
+            .json::<Value>()
+            .await
+            .ok()
+            .and_then(|value| openrouter_model_limits_from_response(&value)),
+        _ => None,
+    };
+    if let Some(limits) = limits
+        && let Ok(mut cache) = OPENROUTER_MODEL_LIMITS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+    {
+        cache.insert(key, limits);
+    }
+    limits
+}
+
+fn openrouter_model_limits_from_response(raw: &Value) -> Option<OpenRouterModelLimits> {
+    Some(OpenRouterModelLimits {
+        context_window_tokens: raw.pointer("/data/context_length")?.as_u64()?,
+        max_completion_tokens: raw
+            .pointer("/data/top_provider/max_completion_tokens")
+            .and_then(Value::as_u64),
+    })
 }
 
 fn compatible_http_client() -> &'static reqwest::Client {
@@ -977,7 +1054,7 @@ pub fn kimi_usage_from_response(
     // occupancy so Borg can drive the same context UI and compaction warnings
     // as provider-native integrations.
     usage.context_tokens = Some(usage.input_tokens.saturating_add(usage.cached_input_tokens));
-    usage.context_window_tokens = Some(1_048_576);
+    usage.context_window_tokens = Some(1_048_576_u64.saturating_sub(kimi_max_completion_tokens()));
     usage
 }
 
@@ -1137,7 +1214,7 @@ mod tests {
         });
         let usage = kimi_usage_from_response(&raw, 5);
         assert_eq!(usage.context_tokens, Some(1_000));
-        assert_eq!(usage.context_window_tokens, Some(1_048_576));
+        assert_eq!(usage.context_window_tokens, Some(917_504));
     }
 
     #[test]
@@ -1411,5 +1488,29 @@ mod tests {
         assert_eq!(tool_calls[0].function.name, "read_file");
         assert_eq!(result.usage.total_tokens, 29);
         assert_eq!(result.usage.cost_microusd, Some(123));
+    }
+
+    #[test]
+    fn openrouter_model_metadata_exposes_effective_context_reserves() {
+        let limits = openrouter_model_limits_from_response(&json!({
+            "data": {
+                "context_length": 200_000,
+                "top_provider": { "max_completion_tokens": 32_000 }
+            }
+        }))
+        .expect("model limits");
+        assert_eq!(
+            limits,
+            OpenRouterModelLimits {
+                context_window_tokens: 200_000,
+                max_completion_tokens: Some(32_000),
+            }
+        );
+        assert_eq!(
+            limits
+                .context_window_tokens
+                .saturating_sub(limits.max_completion_tokens.unwrap_or(0)),
+            168_000
+        );
     }
 }

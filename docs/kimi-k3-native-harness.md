@@ -27,6 +27,28 @@ and replays that typed message unchanged on later turns and tool rounds.
 Interrupted incomplete tool rounds are discarded. Manual compaction replaces
 older replay context with a durable continuation summary.
 
+Automatic compaction is enabled for the native Kimi and OpenRouter harness.
+Borg compacts when 10% of the model's effective input context remains, both
+before a new user turn and after a completed tool round. The effective input
+window subtracts the provider's advertised maximum completion allowance from
+the raw context window, leaving room for the next response as well as the 10%
+working margin. Kimi uses its known 1M-token raw window and configured
+completion allowance. OpenRouter model limits are resolved from its live model
+metadata API, with `BORG_OPENROUTER_CONTEXT_WINDOW_TOKENS` and
+`BORG_OPENROUTER_MAX_COMPLETION_TOKENS` available for compatible gateways.
+
+Each successful automatic boundary durably records the continuation summary,
+trigger, pre-compaction occupancy, effective window, latency, and compaction
+token usage. Replay restarts from that boundary without rolling truncation.
+Failed compaction never replaces history and produces a normalized failure
+event; a failure between tool rounds stops before another oversized request.
+
+The 10% threshold follows Codex's current 90%-used auto-compaction ceiling.
+For comparison, pi reserves 16,384 tokens, while OpenCode reserves the model
+output allowance (or a 20,000-token compaction buffer). Borg uses an effective
+window so large-output models receive at least their advertised completion
+reserve rather than relying on a percentage alone.
+
 The native harness supports:
 
 - streaming text and reasoning;

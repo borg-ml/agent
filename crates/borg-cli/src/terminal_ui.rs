@@ -1016,8 +1016,41 @@ impl BorgTerminal {
         self.replaying_history = false;
     }
 
+    pub fn replace_history(&mut self, events: &[SessionEvent]) {
+        let previous_height = self.rendered_transcript_height;
+        let previous = &self.transcript;
+        let mut transcript = Transcript {
+            auto_expand_edits: previous.auto_expand_edits,
+            auto_expand_tools: previous.auto_expand_tools,
+            user_label: previous.user_label.clone(),
+            assistant_label: previous.assistant_label.clone(),
+            user_label_color: previous.user_label_color,
+            user_message_color: previous.user_message_color,
+            assistant_label_color: previous.assistant_label_color,
+            assistant_message_color: previous.assistant_message_color,
+            ..Transcript::default()
+        };
+        transcript.reserve_history(events.len());
+        for event in events {
+            transcript.apply(event);
+        }
+        self.transcript = transcript;
+        self.pending_scroll_anchor_height = Some(previous_height);
+        self.transcript_render_cache = None;
+    }
+
+    pub fn is_near_history_start(&self) -> bool {
+        let threshold = self
+            .transcript_viewport_area
+            .map_or(24, |area| usize::from(area.height).saturating_mul(2));
+        self.transcript_scroll_max
+            .saturating_sub(self.scroll_from_bottom.min(self.transcript_scroll_max))
+            <= threshold
+    }
+
     pub fn seed_session_state(&mut self, state: &SessionState) {
         self.transcript.seed_session_state(state);
+        self.transcript.reconcile_session_status(state);
         if let Some(status) = state.status {
             self.status = status;
         }
@@ -3019,7 +3052,7 @@ impl BorgTerminal {
                             .borders(Borders::TOP | Borders::LEFT)
                             .border_style(Style::default().fg(Color::DarkGray))
                             .title(Span::styled(
-                                format!(" PENDING INPUT · {} ", queued_prompts.len()),
+                                format!(" Pending Input · {} ", queued_prompts.len()),
                                 Style::default()
                                     .fg(BORG_ORANGE)
                                     .add_modifier(Modifier::BOLD),
@@ -4660,6 +4693,19 @@ impl Transcript {
         ) {
             self.context_remaining_percent =
                 context_remaining_percent(context_tokens, context_window_tokens);
+        }
+    }
+
+    fn reconcile_session_status(&mut self, state: &SessionState) {
+        if !matches!(
+            state.status,
+            Some(
+                SessionStatus::Starting
+                    | SessionStatus::Running
+                    | SessionStatus::WaitingForApproval
+            )
+        ) {
+            self.finish_running_tools(state.activity_at.unwrap_or_else(Utc::now), false, "");
         }
     }
 
@@ -6878,14 +6924,14 @@ fn queued_prompt_lines(
         .iter()
         .take(visible)
         .map(|prompt| {
-            let (label, label_color) = match prompt.delivery {
-                PromptDelivery::Steer => ("NEXT TOOL", BORG_ORANGE),
-                PromptDelivery::Queue => ("NEXT TURN", Color::Gray),
+            let label_color = match prompt.delivery {
+                PromptDelivery::Steer => BORG_ORANGE,
+                PromptDelivery::Queue => Color::Gray,
             };
             Line::from(vec![
                 Span::styled(" ↳ ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
-                    format!("{label:<9} "),
+                    "Next  ",
                     Style::default()
                         .fg(label_color)
                         .add_modifier(Modifier::BOLD),
@@ -7809,35 +7855,42 @@ fn composer_cursor_x_offset(is_launch_screen: bool) -> u16 {
 
 fn splash_logo_line(elapsed: Duration) -> Line<'static> {
     let bold = Modifier::BOLD;
-    match (elapsed.as_millis() / 90) % 30 {
-        0 => Line::from(vec![
-            Span::styled("B", Style::default().fg(Color::Cyan).add_modifier(bold)),
-            Span::styled(" O", Style::default().fg(Color::Red).add_modifier(bold)),
-            Span::styled(" R", Style::default().fg(BORG_ORANGE).add_modifier(bold)),
-            Span::styled(" G", Style::default().fg(Color::Cyan).add_modifier(bold)),
-            Span::styled("  ░", Style::default().fg(Color::DarkGray)),
-        ]),
-        1 => Line::from(vec![
-            Span::styled("B ", Style::default().fg(BORG_ORANGE).add_modifier(bold)),
-            Span::styled("O", Style::default().fg(Color::Cyan).add_modifier(bold)),
-            Span::styled("  R", Style::default().fg(Color::Red).add_modifier(bold)),
-            Span::styled(" G", Style::default().fg(Color::White).add_modifier(bold)),
-            Span::styled(" ▒", Style::default().fg(Color::Gray)),
-        ]),
-        2 => Line::from(vec![
-            Span::styled("B", Style::default().fg(Color::White).add_modifier(bold)),
-            Span::styled(" O", Style::default().fg(BORG_ORANGE).add_modifier(bold)),
-            Span::styled(" R ", Style::default().fg(Color::Cyan).add_modifier(bold)),
-            Span::styled("G", Style::default().fg(Color::Red).add_modifier(bold)),
-            Span::styled("  ▓", Style::default().fg(Color::DarkGray)),
-        ]),
-        _ => Line::from(Span::styled(
-            "B O R G",
+    const FLICKER: [[char; 4]; 8] = [
+        ['界', 'O', 'R', 'G'],
+        ['B', 'カ', 'R', 'G'],
+        ['B', 'O', '한', 'G'],
+        ['Ж', 'O', 'R', 'ก'],
+        ['B', 'あ', 'Я', 'G'],
+        ['ש', 'O', 'R', 'न'],
+        ['B', 'O', '東', 'Ω'],
+        ['ب', 'ท', 'R', 'G'],
+    ];
+    let phase = (elapsed.as_millis() / 90) % 40;
+    let cells = FLICKER
+        .get(phase as usize)
+        .copied()
+        .unwrap_or(['B', 'O', 'R', 'G']);
+    let colors = [Color::Cyan, BORG_ORANGE, Color::Red, Color::White];
+    let mut spans = Vec::with_capacity(4);
+    for (index, glyph) in cells.into_iter().enumerate() {
+        let mut cell = glyph.to_string();
+        if index < 3 {
+            cell.push_str(
+                &" ".repeat(2usize.saturating_sub(UnicodeWidthStr::width(cell.as_str()))),
+            );
+        }
+        spans.push(Span::styled(
+            cell,
             Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        )),
+                .fg(if phase < FLICKER.len() as u128 {
+                    colors[(index + phase as usize) % colors.len()]
+                } else {
+                    Color::White
+                })
+                .add_modifier(bold),
+        ));
     }
+    Line::from(spans)
 }
 
 fn splash_version() -> String {

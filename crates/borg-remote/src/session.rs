@@ -975,6 +975,21 @@ async fn run_agent_session_store_kernel(
                                     },
                                 )
                                 .await?;
+                                if launch.provider.uses_native_harness()
+                                    && let Some(context_window_tokens) =
+                                        journal.state(session_id).await?.usage.context_window_tokens
+                                {
+                                    record(
+                                        &mut journal,
+                                        &events,
+                                        session_id,
+                                        SessionEventKind::ContextWindowUpdated {
+                                            context_tokens: 0,
+                                            context_window_tokens,
+                                        },
+                                    )
+                                    .await?;
+                                }
                             }
                             Err(error) => {
                                 record(
@@ -1051,6 +1066,111 @@ async fn run_agent_session_store_kernel(
                 },
             )
             .await?;
+        }
+
+        if launch.provider.uses_native_harness() {
+            let state = journal.state(session_id).await?;
+            if native_auto_compaction_needed(&state) {
+                let context_tokens = state.usage.context_tokens.unwrap_or_default();
+                let context_window_tokens = state.usage.context_window_tokens.unwrap_or_default();
+                record(
+                    &mut journal,
+                    &events,
+                    session_id,
+                    SessionEventKind::StatusChanged {
+                        status: SessionStatus::Running,
+                        detail: Some("Automatically compacting context".to_string()),
+                    },
+                )
+                .await?;
+                let result = async {
+                    executor
+                        .compact_native(
+                            launch.provider,
+                            launch
+                                .model
+                                .as_deref()
+                                .context("native context compaction requires a model")?,
+                            launch.effort.as_deref(),
+                            native_conversation(journal.context_events(), launch.provider)?,
+                        )
+                        .await
+                }
+                .await;
+                match result {
+                    Ok(compaction) => {
+                        record(
+                            &mut journal,
+                            &events,
+                            session_id,
+                            native_usage_event(&compaction.usage),
+                        )
+                        .await?;
+                        record(
+                            &mut journal,
+                            &events,
+                            session_id,
+                            SessionEventKind::ProviderEvent {
+                                provider: launch.provider,
+                                kind: "context_compaction".to_string(),
+                                payload: serde_json::json!({
+                                    "summary": compaction.summary,
+                                    "native": true,
+                                    "automatic": true,
+                                    "trigger": "context_threshold",
+                                    "context_tokens_before": context_tokens,
+                                    "effective_context_window_tokens": context_window_tokens,
+                                    "remaining_percent_threshold":
+                                        NATIVE_AUTO_COMPACT_REMAINING_PERCENT,
+                                    "provider_duration_ms": compaction.usage.duration_ms,
+                                    "input_tokens": compaction.usage.input_tokens,
+                                    "output_tokens": compaction.usage.output_tokens,
+                                }),
+                            },
+                        )
+                        .await?;
+                        record(
+                            &mut journal,
+                            &events,
+                            session_id,
+                            SessionEventKind::ContextWindowUpdated {
+                                context_tokens: 0,
+                                context_window_tokens,
+                            },
+                        )
+                        .await?;
+                    }
+                    Err(error) => {
+                        let message = format!(
+                            "Automatic context compaction failed; continuing without discarding history: {error:#}"
+                        );
+                        record(
+                            &mut journal,
+                            &events,
+                            session_id,
+                            SessionEventKind::ProviderEvent {
+                                provider: launch.provider,
+                                kind: "context_compaction_failed".to_string(),
+                                payload: serde_json::json!({
+                                    "automatic": true,
+                                    "trigger": "context_threshold",
+                                    "context_tokens_before": context_tokens,
+                                    "effective_context_window_tokens": context_window_tokens,
+                                    "error": message,
+                                }),
+                            },
+                        )
+                        .await?;
+                        record(
+                            &mut journal,
+                            &events,
+                            session_id,
+                            SessionEventKind::Error { message },
+                        )
+                        .await?;
+                    }
+                }
+            }
         }
 
         let (provider_events_tx, mut provider_events) = mpsc::channel(128);
@@ -1964,6 +2084,21 @@ fn native_conversation(
         }
     }
     Ok(conversation)
+}
+
+const NATIVE_AUTO_COMPACT_REMAINING_PERCENT: u64 = 10;
+
+fn native_auto_compaction_needed(state: &SessionState) -> bool {
+    let (Some(context_tokens), Some(context_window_tokens)) = (
+        state.usage.context_tokens,
+        state.usage.context_window_tokens,
+    ) else {
+        return false;
+    };
+    context_window_tokens > 0
+        && u128::from(context_tokens).saturating_mul(100)
+            >= u128::from(context_window_tokens)
+                .saturating_mul(100 - u128::from(NATIVE_AUTO_COMPACT_REMAINING_PERCENT))
 }
 
 fn native_usage_event(usage: &borg_provider::ProviderCallUsage) -> SessionEventKind {
@@ -5792,6 +5927,67 @@ mod tests {
             ModelMessage::user("Previous conversation summary:\n\nkept decisions")
         );
         assert_eq!(replay[1], ModelMessage::user("new context"));
+    }
+
+    #[test]
+    fn native_replay_retains_provider_reasoning_without_text_reconstruction() {
+        use borg_provider::provider::{ModelMessage, ModelToolCall};
+
+        let session_id = Uuid::new_v4();
+        let assistant = ModelMessage::assistant(
+            Some("working".to_string()),
+            Some("private retained reasoning".to_string()),
+            Some(serde_json::json!([{
+                "type": "reasoning.text",
+                "text": "private retained reasoning"
+            }])),
+            vec![ModelToolCall::function(
+                "tool-1".to_string(),
+                "read_file".to_string(),
+                r#"{"path":"README.md"}"#.to_string(),
+            )],
+        );
+        let events = vec![
+            SessionEvent::new(
+                session_id,
+                1,
+                SessionEventKind::ProviderEvent {
+                    provider: CodingProvider::OpenRouter,
+                    kind: "native_model_message".to_string(),
+                    payload: serde_json::to_value(&assistant).unwrap(),
+                },
+            ),
+            SessionEvent::new(
+                session_id,
+                2,
+                SessionEventKind::ProviderEvent {
+                    provider: CodingProvider::OpenRouter,
+                    kind: "native_tool_round_completed".to_string(),
+                    payload: serde_json::json!({ "round": 1 }),
+                },
+            ),
+        ];
+
+        assert_eq!(
+            native_conversation(&events, CodingProvider::OpenRouter).unwrap(),
+            vec![assistant]
+        );
+    }
+
+    #[test]
+    fn native_auto_compaction_starts_at_ten_percent_effective_context_remaining() {
+        let state = |context_tokens, context_window_tokens| SessionState {
+            usage: crate::SessionUsage {
+                context_tokens: Some(context_tokens),
+                context_window_tokens: Some(context_window_tokens),
+                ..crate::SessionUsage::default()
+            },
+            ..SessionState::default()
+        };
+        assert!(!native_auto_compaction_needed(&state(89_999, 100_000)));
+        assert!(native_auto_compaction_needed(&state(90_000, 100_000)));
+        assert!(native_auto_compaction_needed(&state(100_000, 100_000)));
+        assert!(!native_auto_compaction_needed(&SessionState::default()));
     }
 
     #[tokio::test]
