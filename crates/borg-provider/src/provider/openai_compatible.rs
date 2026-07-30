@@ -45,7 +45,7 @@ impl OpenAiCompatibleProfile {
     fn endpoint(self) -> String {
         match self {
             Self::Kimi => chat_completions_endpoint(true),
-            Self::OpenRouter => "https://openrouter.ai/api/v1/chat/completions".to_string(),
+            Self::OpenRouter => openrouter_chat_completions_endpoint(),
             Self::Generic => chat_completions_endpoint(false),
         }
     }
@@ -643,6 +643,17 @@ fn chat_completions_endpoint(kimi: bool) -> String {
         nonempty_env("BORG_OPENAI_COMPATIBLE_BASE_URL")
             .unwrap_or_else(|| "http://127.0.0.1:8000/v1".to_string())
     };
+    let trimmed = base.trim_end_matches('/');
+    if trimmed.ends_with("/chat/completions") {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/chat/completions")
+    }
+}
+
+fn openrouter_chat_completions_endpoint() -> String {
+    let base = nonempty_env("BORG_OPENROUTER_BASE_URL")
+        .unwrap_or_else(|| "https://openrouter.ai/api/v1".to_string());
     let trimmed = base.trim_end_matches('/');
     if trimmed.ends_with("/chat/completions") {
         trimmed.to_string()

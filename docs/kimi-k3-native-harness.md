@@ -70,6 +70,8 @@ tools, images, reasoning, or schema constraints.
 
 Optional routing controls:
 
+- `BORG_OPENROUTER_BASE_URL`: OpenRouter-compatible API base, primarily for
+  gateways and deterministic integration testing;
 - `BORG_OPENROUTER_PROVIDER_ORDER`: comma-separated provider preference;
 - `BORG_OPENROUTER_ALLOW_FALLBACKS`: whether OpenRouter may use later
   providers;
