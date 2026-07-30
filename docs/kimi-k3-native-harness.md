@@ -1,4 +1,4 @@
-# Kimi K3 native harness launch contract
+# Kimi K3 and OpenRouter native harness launch contract
 
 Borg runs Kimi K3 through its provider-neutral native harness and the model's
 OpenAI-compatible chat-completions API.
@@ -41,3 +41,32 @@ The native harness supports:
 API credentials stay in the executing host environment. Enrolled hosts may
 also use Borg's managed Kimi gateway; raw credentials are not persisted in the
 thread journal.
+
+## OpenRouter
+
+Set `OPENROUTER_API_KEY`, then select any OpenRouter model slug:
+
+```console
+borg agent --provider open-router --model google/gemini-3-flash-preview
+```
+
+Borg does not force Kimi semantics onto OpenRouter models. It uses
+OpenRouter's normalized `reasoning` parameter only when an effort is selected,
+preserves both plain and provider-native reasoning blocks across tool rounds,
+and accepts arbitrary model IDs. When tools, reasoning, or structured output
+are requested, Borg asks OpenRouter to route only to endpoints supporting
+those parameters.
+
+The harness can launch every OpenRouter model, but agent actions inherently
+require a model whose OpenRouter metadata includes `tools`. Image attachments
+likewise require an image-capable model, and strict structured output requires
+`structured_outputs` or `response_format`. A model without a requested
+capability returns an actionable provider error; Borg does not silently drop
+tools, images, reasoning, or schema constraints.
+
+Optional routing controls:
+
+- `BORG_OPENROUTER_PROVIDER_ORDER`: comma-separated provider preference;
+- `BORG_OPENROUTER_ALLOW_FALLBACKS`: whether OpenRouter may use later
+  providers;
+- `BORG_OPENROUTER_RESPONSE_FORMAT`: `json_schema`, `json_object`, or `none`.
