@@ -24,6 +24,7 @@ struct ServerSpec {
     command: &'static str,
     args: &'static [&'static str],
     language_id: &'static str,
+    extensions: &'static [&'static str],
 }
 
 struct LspClient {
@@ -49,8 +50,12 @@ impl LspService {
         json!({
             "root": self.root,
             "active_servers": active,
-            "supported_servers": server_specs().iter().map(|spec| spec.id).collect::<Vec<_>>()
+            "supported_servers": supported_server_status()
         })
+    }
+
+    pub fn supported_status() -> Value {
+        json!(supported_server_status())
     }
 
     pub async fn diagnostics(&self, path: &Path) -> Result<Value> {
@@ -411,13 +416,33 @@ async fn ensure_client<'a>(
 
 fn spec_for_path(path: &Path) -> Option<&'static ServerSpec> {
     let extension = path.extension()?.to_str()?.to_ascii_lowercase();
-    server_specs().iter().find(|spec| match spec.id {
-        "rust-analyzer" => extension == "rs",
-        "typescript-language-server" => matches!(extension.as_str(), "ts" | "tsx" | "js" | "jsx"),
-        "pyright" => extension == "py",
-        "gopls" => extension == "go",
-        "clangd" => matches!(extension.as_str(), "c" | "h" | "cc" | "cpp" | "cxx" | "hpp"),
-        _ => false,
+    server_specs()
+        .iter()
+        .find(|spec| spec.extensions.contains(&extension.as_str()))
+}
+
+fn supported_server_status() -> Vec<Value> {
+    server_specs()
+        .iter()
+        .map(|spec| {
+            json!({
+                "id": spec.id,
+                "command": spec.command,
+                "language": spec.language_id,
+                "extensions": spec.extensions,
+                "available": command_available(spec.command),
+            })
+        })
+        .collect()
+}
+
+fn command_available(command: &str) -> bool {
+    let path = Path::new(command);
+    if path.components().count() > 1 {
+        return path.is_file();
+    }
+    std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths).any(|directory| directory.join(command).is_file())
     })
 }
 
@@ -428,30 +453,119 @@ fn server_specs() -> &'static [ServerSpec] {
             command: "rust-analyzer",
             args: &[],
             language_id: "rust",
+            extensions: &["rs"],
         },
         ServerSpec {
             id: "typescript-language-server",
             command: "typescript-language-server",
             args: &["--stdio"],
             language_id: "typescript",
+            extensions: &["ts", "tsx", "js", "jsx", "mjs", "cjs"],
         },
         ServerSpec {
             id: "pyright",
             command: "pyright-langserver",
             args: &["--stdio"],
             language_id: "python",
+            extensions: &["py", "pyi"],
         },
         ServerSpec {
             id: "gopls",
             command: "gopls",
             args: &[],
             language_id: "go",
+            extensions: &["go"],
         },
         ServerSpec {
             id: "clangd",
             command: "clangd",
             args: &[],
             language_id: "cpp",
+            extensions: &["c", "h", "cc", "cpp", "cxx", "hpp"],
+        },
+        ServerSpec {
+            id: "jdtls",
+            command: "jdtls",
+            args: &[],
+            language_id: "java",
+            extensions: &["java"],
+        },
+        ServerSpec {
+            id: "kotlin-language-server",
+            command: "kotlin-language-server",
+            args: &[],
+            language_id: "kotlin",
+            extensions: &["kt", "kts"],
+        },
+        ServerSpec {
+            id: "sourcekit-lsp",
+            command: "sourcekit-lsp",
+            args: &[],
+            language_id: "swift",
+            extensions: &["swift"],
+        },
+        ServerSpec {
+            id: "csharp-ls",
+            command: "csharp-ls",
+            args: &[],
+            language_id: "csharp",
+            extensions: &["cs"],
+        },
+        ServerSpec {
+            id: "solargraph",
+            command: "solargraph",
+            args: &["stdio"],
+            language_id: "ruby",
+            extensions: &["rb", "rake"],
+        },
+        ServerSpec {
+            id: "intelephense",
+            command: "intelephense",
+            args: &["--stdio"],
+            language_id: "php",
+            extensions: &["php"],
+        },
+        ServerSpec {
+            id: "lua-language-server",
+            command: "lua-language-server",
+            args: &[],
+            language_id: "lua",
+            extensions: &["lua"],
+        },
+        ServerSpec {
+            id: "bash-language-server",
+            command: "bash-language-server",
+            args: &["start"],
+            language_id: "shellscript",
+            extensions: &["sh", "bash", "zsh"],
+        },
+        ServerSpec {
+            id: "yaml-language-server",
+            command: "yaml-language-server",
+            args: &["--stdio"],
+            language_id: "yaml",
+            extensions: &["yaml", "yml"],
+        },
+        ServerSpec {
+            id: "vscode-json-language-server",
+            command: "vscode-json-language-server",
+            args: &["--stdio"],
+            language_id: "json",
+            extensions: &["json", "jsonc"],
+        },
+        ServerSpec {
+            id: "vscode-html-language-server",
+            command: "vscode-html-language-server",
+            args: &["--stdio"],
+            language_id: "html",
+            extensions: &["html", "htm"],
+        },
+        ServerSpec {
+            id: "vscode-css-language-server",
+            command: "vscode-css-language-server",
+            args: &["--stdio"],
+            language_id: "css",
+            extensions: &["css", "scss", "less"],
         },
     ]
 }
@@ -459,6 +573,39 @@ fn server_specs() -> &'static [ServerSpec] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn common_language_servers_are_advertised_before_startup() {
+        let supported = LspService::supported_status();
+        let languages = supported
+            .as_array()
+            .expect("server status is an array")
+            .iter()
+            .filter_map(|server| server.get("language").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+
+        for language in [
+            "rust",
+            "typescript",
+            "python",
+            "go",
+            "cpp",
+            "java",
+            "kotlin",
+            "swift",
+            "csharp",
+            "ruby",
+            "php",
+            "lua",
+            "shellscript",
+            "yaml",
+            "json",
+            "html",
+            "css",
+        ] {
+            assert!(languages.contains(&language), "missing {language}");
+        }
+    }
 
     #[tokio::test]
     async fn rust_analyzer_answers_a_real_diagnostic_request_when_available() {

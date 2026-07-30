@@ -653,6 +653,7 @@ impl HostCommand {
 pub enum SessionConfigAction {
     SetModel { model: String },
     SetEffort { effort: String },
+    SetPermissionMode { permission_mode: PermissionMode },
     SetFast { enabled: bool },
     SetResponseLanguage { language: ResponseLanguage },
 }

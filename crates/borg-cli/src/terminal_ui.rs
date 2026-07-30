@@ -335,6 +335,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/model", "choose the model"),
     ("/effort", "choose reasoning effort"),
     ("/language", "choose response and drafting language"),
+    ("/lsp", "view language server support"),
     ("/fast", "toggle provider priority/fast mode"),
     ("/followups", "choose steer current turn or queue next turn"),
     ("/refresh", "choose terminal refresh rate"),
@@ -419,6 +420,7 @@ pub enum UiAction {
     },
     SetModel(String),
     SetEffort(String),
+    SetPermissionMode(PermissionMode),
     SetResponseLanguage(ResponseLanguage),
     SetFast(bool),
     SetRefreshRate(u64),
@@ -486,6 +488,12 @@ pub struct BorgTerminal {
     goal_status_hovered: bool,
     agents_status_area: Option<Rect>,
     agents_status_hovered: bool,
+    model_status_area: Option<Rect>,
+    model_status_hovered: bool,
+    effort_status_area: Option<Rect>,
+    effort_status_hovered: bool,
+    permission_status_area: Option<Rect>,
+    permission_status_hovered: bool,
     nested_scroll_capture: Option<NestedScrollCapture>,
     nested_scroll_motion: Option<NestedScrollMotion>,
     text_selection: Option<TextSelection>,
@@ -510,6 +518,7 @@ pub struct BorgTerminal {
     pending_transcript_anchor: Option<TranscriptViewportAnchor>,
     event_redraw_needed: bool,
     cursor_blink_started_at: Instant,
+    splash_glitch_seed: u64,
     terminal_restored: bool,
 }
 
@@ -558,6 +567,7 @@ enum PickerKind {
     Resume,
     Model,
     Effort,
+    Permission,
     Language,
     Fast,
     RefreshRate,
@@ -955,6 +965,12 @@ impl BorgTerminal {
             goal_status_hovered: false,
             agents_status_area: None,
             agents_status_hovered: false,
+            model_status_area: None,
+            model_status_hovered: false,
+            effort_status_area: None,
+            effort_status_hovered: false,
+            permission_status_area: None,
+            permission_status_hovered: false,
             nested_scroll_capture: None,
             nested_scroll_motion: None,
             text_selection: None,
@@ -979,6 +995,7 @@ impl BorgTerminal {
             pending_transcript_anchor: None,
             event_redraw_needed: false,
             cursor_blink_started_at: Instant::now(),
+            splash_glitch_seed: Uuid::new_v4().as_u128() as u64,
             terminal_restored: false,
         })
     }
@@ -1480,6 +1497,7 @@ impl BorgTerminal {
             "Model".to_string(),
             "Reasoning effort".to_string(),
             "Response language".to_string(),
+            "Language servers".to_string(),
             "Provider fast mode".to_string(),
             "Active messages".to_string(),
             "Refresh rate".to_string(),
@@ -1494,6 +1512,7 @@ impl BorgTerminal {
             "/model",
             "/effort",
             "/language",
+            "/lsp",
             "/fast",
             "/followups",
             "/refresh",
@@ -1563,6 +1582,20 @@ impl BorgTerminal {
             "Choose effort",
             options.iter().copied(),
             current.as_deref(),
+        ));
+    }
+
+    pub fn open_permission_picker(&mut self) {
+        let current = self
+            .transcript
+            .config
+            .as_ref()
+            .map(|config| permission_mode_label(config.permission_mode));
+        self.picker = Some(Picker::new(
+            PickerKind::Permission,
+            "Choose access",
+            ["full access", "auto approvals", "manual approvals"],
+            current,
         ));
     }
 
@@ -1758,6 +1791,7 @@ impl BorgTerminal {
             || matches!(&event, Event::Key(key) if key.kind != KeyEventKind::Release)
         {
             self.cursor_blink_started_at = Instant::now();
+            self.splash_glitch_seed = Uuid::new_v4().as_u128() as u64;
         }
         self.event_redraw_needed = true;
         match event {
@@ -1827,6 +1861,15 @@ impl BorgTerminal {
                 self.agents_status_hovered = self
                     .agents_status_area
                     .is_some_and(|area| area.contains(pointer));
+                self.model_status_hovered = self
+                    .model_status_area
+                    .is_some_and(|area| area.contains(pointer));
+                self.effort_status_hovered = self
+                    .effort_status_area
+                    .is_some_and(|area| area.contains(pointer));
+                self.permission_status_hovered = self
+                    .permission_status_area
+                    .is_some_and(|area| area.contains(pointer));
                 self.hovered_team_roster =
                     team_roster_target_at(&self.team_roster_hit_areas, pointer)
                         .map(|(index, _)| index);
@@ -1865,6 +1908,27 @@ impl BorgTerminal {
                         .is_some_and(|area| area.contains(pointer))
                     {
                         self.team_switcher_open = !self.team_switcher_open;
+                        return Ok(UiAction::None);
+                    }
+                    if self
+                        .model_status_area
+                        .is_some_and(|area| area.contains(pointer))
+                    {
+                        self.open_model_picker();
+                        return Ok(UiAction::None);
+                    }
+                    if self
+                        .effort_status_area
+                        .is_some_and(|area| area.contains(pointer))
+                    {
+                        self.open_effort_picker();
+                        return Ok(UiAction::None);
+                    }
+                    if self
+                        .permission_status_area
+                        .is_some_and(|area| area.contains(pointer))
+                    {
+                        self.open_permission_picker();
                         return Ok(UiAction::None);
                     }
                     if self.team_switcher_open {
@@ -2428,6 +2492,14 @@ impl BorgTerminal {
             },
             PickerKind::Model => UiAction::SetModel(picker.selected_value()),
             PickerKind::Effort => UiAction::SetEffort(picker.selected_value()),
+            PickerKind::Permission => {
+                UiAction::SetPermissionMode(match picker.selected_value().as_str() {
+                    "full access" => PermissionMode::FullAccess,
+                    "auto approvals" => PermissionMode::Auto,
+                    "manual approvals" => PermissionMode::Manual,
+                    _ => unreachable!("permission picker values are canonical"),
+                })
+            }
             PickerKind::Language => UiAction::SetResponseLanguage(
                 ResponseLanguage::parse(&picker.selected_value())
                     .expect("language picker values are canonical"),
@@ -2565,7 +2637,8 @@ impl BorgTerminal {
             status_label(status)
         };
         let status_glyph = activity_glyph(status);
-        let (config_primary, config_secondary) = self.transcript.config_lines();
+        let (model_status, effort_status, permission_status, cwd_status) =
+            self.transcript.config_statuses();
         let cache_status = self.transcript.cache_status(Utc::now());
         let (context_status, context_imminent) = self.transcript.context_status();
         let team_transcript = self
@@ -2730,6 +2803,9 @@ impl BorgTerminal {
         let mut next_jump_to_bottom_area = None;
         let mut next_goal_status_area = None;
         let mut next_agents_status_area = None;
+        let mut next_model_status_area = None;
+        let mut next_effort_status_area = None;
+        let mut next_permission_status_area = None;
         let mut next_team_roster_hit_areas = Vec::new();
         let mut next_back_to_director_area = None;
         let mut next_keybindings_hint_area = None;
@@ -2771,7 +2847,10 @@ impl BorgTerminal {
                     .split(launch);
                 frame.render_widget(
                     Paragraph::new(vec![
-                        splash_logo_line(self.cursor_blink_started_at.elapsed()),
+                        splash_logo_line(
+                            self.cursor_blink_started_at.elapsed(),
+                            self.splash_glitch_seed,
+                        ),
                         Line::from(Span::styled(
                             splash_version(),
                             Style::default().fg(Color::DarkGray),
@@ -3174,7 +3253,34 @@ impl BorgTerminal {
                     Style::default().fg(Color::Yellow),
                 ));
             }
-            push_status_segment(&mut status_spans, config_primary, Color::Gray);
+            let model_status_start = status_spans.iter().map(|span| span.width()).sum::<usize>();
+            let model_status_width = model_status
+                .as_ref()
+                .map(|value| format!(" · {value}").width());
+            push_interactive_status_segment(
+                &mut status_spans,
+                model_status,
+                self.model_status_hovered,
+            );
+            let effort_status_start = status_spans.iter().map(|span| span.width()).sum::<usize>();
+            let effort_status_width = effort_status
+                .as_ref()
+                .map(|value| format!(" · {value}").width());
+            push_interactive_status_segment(
+                &mut status_spans,
+                effort_status,
+                self.effort_status_hovered,
+            );
+            let permission_status_start =
+                status_spans.iter().map(|span| span.width()).sum::<usize>();
+            let permission_status_width = permission_status
+                .as_ref()
+                .map(|value| format!(" · {value}").width());
+            push_interactive_status_segment(
+                &mut status_spans,
+                permission_status,
+                self.permission_status_hovered,
+            );
             push_status_segment(
                 &mut status_spans,
                 context_status,
@@ -3184,7 +3290,7 @@ impl BorgTerminal {
                     Color::Gray
                 },
             );
-            push_status_segment(&mut status_spans, config_secondary, Color::Gray);
+            push_status_segment(&mut status_spans, cwd_status, Color::Gray);
             let status_line = Line::from(status_spans);
             let alignment_offset = if is_launch_screen {
                 status_area.width.saturating_sub(status_line.width() as u16) / 2
@@ -3213,6 +3319,21 @@ impl BorgTerminal {
                     height: 1,
                 });
             }
+            let status_hit_area = |start: usize, width: usize| Rect {
+                x: status_area
+                    .x
+                    .saturating_add(alignment_offset)
+                    .saturating_add(start as u16),
+                y: status_area.y,
+                width: (width as u16).min(status_area.width),
+                height: 1,
+            };
+            next_model_status_area =
+                model_status_width.map(|width| status_hit_area(model_status_start, width));
+            next_effort_status_area =
+                effort_status_width.map(|width| status_hit_area(effort_status_start, width));
+            next_permission_status_area = permission_status_width
+                .map(|width| status_hit_area(permission_status_start, width));
             frame.render_widget(
                 Paragraph::new(status_line)
                     .style(
@@ -3492,6 +3613,9 @@ impl BorgTerminal {
         self.jump_to_bottom_area = next_jump_to_bottom_area;
         self.goal_status_area = next_goal_status_area;
         self.agents_status_area = next_agents_status_area;
+        self.model_status_area = next_model_status_area;
+        self.effort_status_area = next_effort_status_area;
+        self.permission_status_area = next_permission_status_area;
         self.team_roster_hit_areas = next_team_roster_hit_areas;
         self.back_to_director_area = next_back_to_director_area;
         self.keybindings_hint_area = next_keybindings_hint_area;
@@ -5506,34 +5630,23 @@ impl Transcript {
         }
     }
 
-    fn config_lines(&self) -> (String, String) {
+    fn config_statuses(&self) -> (Option<String>, Option<String>, Option<String>, String) {
         let Some(config) = self.config.as_ref() else {
-            return (String::new(), String::new());
+            return (None, None, None, String::new());
         };
-        let mut model_parts = Vec::new();
-        if let Some(model) = config.model.as_deref() {
-            model_parts.push(model.to_string());
-        }
-        if let Some(effort) = config.effort.as_deref() {
-            model_parts.push(effort.to_string());
-        }
-        if config.fast {
-            model_parts.push("fast".to_string());
-        }
-        let mut primary = Vec::new();
-        if !model_parts.is_empty() {
-            primary.push(model_parts.join(" "));
-        }
-        let secondary = [
-            match config.permission_mode {
-                PermissionMode::FullAccess => "full access",
-                PermissionMode::Auto => "auto approvals",
-                PermissionMode::Manual => "manual approvals",
+        let model = config.model.as_ref().map(|model| {
+            if config.fast {
+                format!("{model} fast")
+            } else {
+                model.clone()
             }
-            .to_string(),
+        });
+        (
+            model,
+            config.effort.clone(),
+            Some(permission_mode_label(config.permission_mode).to_string()),
             fish_style_path(&config.cwd),
-        ];
-        (primary.join(" · "), secondary.join(" · "))
+        )
     }
 
     fn context_status(&self) -> (String, bool) {
@@ -7853,23 +7966,41 @@ fn composer_cursor_x_offset(is_launch_screen: bool) -> u16 {
     u16::from(is_launch_screen) + 3
 }
 
-fn splash_logo_line(elapsed: Duration) -> Line<'static> {
+fn splash_logo_line(elapsed: Duration, seed: u64) -> Line<'static> {
     let bold = Modifier::BOLD;
-    const FLICKER: [[char; 4]; 8] = [
-        ['界', 'O', 'R', 'G'],
-        ['B', 'カ', 'R', 'G'],
-        ['B', 'O', '한', 'G'],
-        ['Ж', 'O', 'R', 'ก'],
-        ['B', 'あ', 'Я', 'G'],
-        ['ש', 'O', 'R', 'न'],
-        ['B', 'O', '東', 'Ω'],
-        ['ب', 'ท', 'R', 'G'],
+    const ORIGINAL: [char; 4] = ['B', 'O', 'R', 'G'];
+    const GLYPHS: [[char; 8]; 4] = [
+        ['界', 'Ж', 'ש', 'ب', 'ß', 'β', '฿', 'Б'],
+        ['カ', 'あ', 'ท', 'Ø', 'Ω', 'Ө', '〇', 'ओ'],
+        ['한', 'Я', '東', 'Я', '₹', '尺', 'र', 'Ř'],
+        ['ก', 'न', 'Ω', 'Ğ', 'Ԍ', 'Ǥ', 'Ǧ', 'ဂ'],
     ];
-    let phase = (elapsed.as_millis() / 90) % 40;
-    let cells = FLICKER
-        .get(phase as usize)
-        .copied()
-        .unwrap_or(['B', 'O', 'R', 'G']);
+    let phase = (elapsed.as_millis() / 110) as u64;
+    let mut random = splitmix64(seed ^ phase.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+    let roll = random % 100;
+    let changed_count = if roll < 76 {
+        1
+    } else if roll < 95 {
+        2
+    } else if roll < 99 {
+        3
+    } else {
+        4
+    };
+    let mut cells = ORIGINAL;
+    let mut changed = [false; 4];
+    if phase < 12 {
+        for _ in 0..changed_count {
+            random = splitmix64(random);
+            let mut index = (random % 4) as usize;
+            while changed[index] {
+                index = (index + 1) % 4;
+            }
+            changed[index] = true;
+            random = splitmix64(random);
+            cells[index] = GLYPHS[index][(random % GLYPHS[index].len() as u64) as usize];
+        }
+    }
     let colors = [Color::Cyan, BORG_ORANGE, Color::Red, Color::White];
     let mut spans = Vec::with_capacity(4);
     for (index, glyph) in cells.into_iter().enumerate() {
@@ -7882,8 +8013,9 @@ fn splash_logo_line(elapsed: Duration) -> Line<'static> {
         spans.push(Span::styled(
             cell,
             Style::default()
-                .fg(if phase < FLICKER.len() as u128 {
-                    colors[(index + phase as usize) % colors.len()]
+                .fg(if changed[index] {
+                    random = splitmix64(random);
+                    colors[(random % colors.len() as u64) as usize]
                 } else {
                     Color::White
                 })
@@ -7891,6 +8023,13 @@ fn splash_logo_line(elapsed: Duration) -> Line<'static> {
         ));
     }
     Line::from(spans)
+}
+
+fn splitmix64(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
 }
 
 fn splash_version() -> String {
@@ -8087,6 +8226,33 @@ fn push_status_segment(spans: &mut Vec<Span<'static>>, value: String, color: Col
         spans.push(Span::styled(
             format!(" · {value}"),
             Style::default().fg(color),
+        ));
+    }
+}
+
+fn permission_mode_label(mode: PermissionMode) -> &'static str {
+    match mode {
+        PermissionMode::FullAccess => "full access",
+        PermissionMode::Auto => "auto approvals",
+        PermissionMode::Manual => "manual approvals",
+    }
+}
+
+fn push_interactive_status_segment(
+    spans: &mut Vec<Span<'static>>,
+    value: Option<String>,
+    hovered: bool,
+) {
+    if let Some(value) = value {
+        spans.push(Span::styled(
+            format!(" · {value}"),
+            Style::default()
+                .fg(if hovered { Color::White } else { Color::Gray })
+                .add_modifier(if hovered {
+                    Modifier::BOLD | Modifier::UNDERLINED
+                } else {
+                    Modifier::empty()
+                }),
         ));
     }
 }

@@ -2572,6 +2572,9 @@ async fn apply_session_config(
             );
             launch.effort = Some(effort);
         }
+        crate::SessionConfigAction::SetPermissionMode { permission_mode } => {
+            launch.permission_mode = permission_mode;
+        }
         crate::SessionConfigAction::SetFast { enabled } => {
             anyhow::ensure!(
                 launch.provider.supports_fast(),

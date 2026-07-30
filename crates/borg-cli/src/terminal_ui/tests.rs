@@ -2353,25 +2353,21 @@ fn borging_roll_selects_exactly_one_percent_of_uniform_run_ids() {
 }
 
 #[test]
-fn splash_logo_shows_version_and_periodic_glitch_frames() {
+fn splash_logo_randomizes_glitches_and_then_settles() {
     assert_eq!(splash_version(), format!("v{}", env!("CARGO_PKG_VERSION")));
     assert_eq!(
-        splash_logo_line(Duration::from_millis(900)).to_string(),
+        splash_logo_line(Duration::from_millis(1_320), 7).to_string(),
         "B O R G"
     );
-    let glitch = splash_logo_line(Duration::ZERO).to_string();
-    assert_eq!(glitch, "界O R G");
+    let glitch = splash_logo_line(Duration::ZERO, 7).to_string();
+    assert_ne!(glitch, "B O R G");
     assert_eq!(
         UnicodeWidthStr::width(glitch.as_str()),
         UnicodeWidthStr::width("B O R G")
     );
-    assert_eq!(
-        splash_logo_line(Duration::from_millis(90)).to_string(),
-        "B カR G"
-    );
-    assert_eq!(
-        splash_logo_line(Duration::from_millis(180)).to_string(),
-        "B O 한G"
+    assert_ne!(
+        splash_logo_line(Duration::ZERO, 7).to_string(),
+        splash_logo_line(Duration::ZERO, 8).to_string()
     );
 }
 
@@ -2491,10 +2487,12 @@ fn projected_session_state_restores_status_config_outside_the_history_tail() {
     });
 
     assert_eq!(
-        transcript.config_lines(),
+        transcript.config_statuses(),
         (
-            "gpt-5.6-sol medium".to_string(),
-            "full access · /w/borg".to_string()
+            Some("gpt-5.6-sol".to_string()),
+            Some("medium".to_string()),
+            Some("full access".to_string()),
+            "/w/borg".to_string()
         )
     );
     assert_eq!(transcript.context_remaining_percent, 77);

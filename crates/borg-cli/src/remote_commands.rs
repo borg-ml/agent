@@ -1219,6 +1219,10 @@ async fn run_local_agent_session(
                     );
                     continue;
                 }
+                if line == "/lsp" {
+                    println!("\n{}\n", lsp_support_summary());
+                    continue;
+                }
                 if matches!(
                     line,
                     "/settings" | "/followups" | "/refresh" | "/sleep"
@@ -1578,16 +1582,23 @@ async fn run_local_agent_session(
                             })
                             .await
                             .ok();
-                        terminal
-                            .as_mut()
-                            .expect("terminal")
-                            .open_effort_picker();
                     }
                     UiAction::SetEffort(effort) => {
                         session_command_tx
                             .send(HostCommand::Configure {
                                 session_id,
                                 action: SessionConfigAction::SetEffort { effort },
+                            })
+                            .await
+                            .ok();
+                    }
+                    UiAction::SetPermissionMode(permission_mode) => {
+                        session_command_tx
+                            .send(HostCommand::Configure {
+                                session_id,
+                                action: SessionConfigAction::SetPermissionMode {
+                                    permission_mode,
+                                },
                             })
                             .await
                             .ok();
@@ -1880,6 +1891,11 @@ async fn run_local_agent_session(
                                     &editor_preferences.transcript.user_label,
                                     &editor_preferences.transcript.assistant_label,
                                 );
+                        } else if line == "/lsp" && attachments.is_empty() {
+                            terminal
+                                .as_mut()
+                                .expect("terminal")
+                                .set_notice(lsp_support_summary());
                         } else if line == "/colors" && attachments.is_empty() {
                             terminal.as_mut().expect("terminal").set_notice(
                                 transcript_colors_summary(&editor_preferences),
@@ -3601,6 +3617,53 @@ fn permission_name(permission: PermissionMode) -> &'static str {
         PermissionMode::Auto => "auto",
         PermissionMode::Manual => "manual",
     }
+}
+
+fn lsp_support_summary() -> String {
+    let servers = borg_remote::LspService::supported_status();
+    let mut available = Vec::new();
+    let mut missing = Vec::new();
+    for server in servers.as_array().into_iter().flatten() {
+        let language = server
+            .get("language")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let command = server
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("language server");
+        let extensions = server
+            .get("extensions")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let label = format!("{language} ({extensions}) · {command}");
+        if server
+            .get("available")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            available.push(label);
+        } else {
+            missing.push(label);
+        }
+    }
+    let available = if available.is_empty() {
+        "none detected".to_string()
+    } else {
+        available.join("; ")
+    };
+    let missing = if missing.is_empty() {
+        "none".to_string()
+    } else {
+        missing.join("; ")
+    };
+    format!(
+        "Language servers · available: {available}\nInstall on PATH to enable: {missing}\nServers start lazily when Borg inspects a matching source file."
+    )
 }
 
 fn render_event(
