@@ -2738,11 +2738,10 @@ impl BorgTerminal {
                     .split(launch);
                 frame.render_widget(
                     Paragraph::new(vec![
+                        splash_logo_line(self.cursor_blink_started_at.elapsed()),
                         Line::from(Span::styled(
-                            "B O R G",
-                            Style::default()
-                                .fg(Color::White)
-                                .add_modifier(Modifier::BOLD),
+                            splash_version(),
+                            Style::default().fg(Color::DarkGray),
                         )),
                         Line::from(""),
                         Line::from(Span::styled(
@@ -7806,6 +7805,43 @@ fn composer_cursor_position_in_ranges(
 
 fn composer_cursor_x_offset(is_launch_screen: bool) -> u16 {
     u16::from(is_launch_screen) + 3
+}
+
+fn splash_logo_line(elapsed: Duration) -> Line<'static> {
+    let bold = Modifier::BOLD;
+    match (elapsed.as_millis() / 90) % 30 {
+        0 => Line::from(vec![
+            Span::styled("B", Style::default().fg(Color::Cyan).add_modifier(bold)),
+            Span::styled(" O", Style::default().fg(Color::Red).add_modifier(bold)),
+            Span::styled(" R", Style::default().fg(BORG_ORANGE).add_modifier(bold)),
+            Span::styled(" G", Style::default().fg(Color::Cyan).add_modifier(bold)),
+            Span::styled("  ░", Style::default().fg(Color::DarkGray)),
+        ]),
+        1 => Line::from(vec![
+            Span::styled("B ", Style::default().fg(BORG_ORANGE).add_modifier(bold)),
+            Span::styled("O", Style::default().fg(Color::Cyan).add_modifier(bold)),
+            Span::styled("  R", Style::default().fg(Color::Red).add_modifier(bold)),
+            Span::styled(" G", Style::default().fg(Color::White).add_modifier(bold)),
+            Span::styled(" ▒", Style::default().fg(Color::Gray)),
+        ]),
+        2 => Line::from(vec![
+            Span::styled("B", Style::default().fg(Color::White).add_modifier(bold)),
+            Span::styled(" O", Style::default().fg(BORG_ORANGE).add_modifier(bold)),
+            Span::styled(" R ", Style::default().fg(Color::Cyan).add_modifier(bold)),
+            Span::styled("G", Style::default().fg(Color::Red).add_modifier(bold)),
+            Span::styled("  ▓", Style::default().fg(Color::DarkGray)),
+        ]),
+        _ => Line::from(Span::styled(
+            "B O R G",
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )),
+    }
+}
+
+fn splash_version() -> String {
+    format!("v{}", env!("CARGO_PKG_VERSION"))
 }
 
 fn provider_interaction_options(payload: &serde_json::Value) -> String {

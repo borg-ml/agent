@@ -2322,6 +2322,18 @@ fn borging_roll_selects_exactly_one_percent_of_uniform_run_ids() {
 }
 
 #[test]
+fn splash_logo_shows_version_and_periodic_glitch_frames() {
+    assert_eq!(splash_version(), format!("v{}", env!("CARGO_PKG_VERSION")));
+    assert_eq!(
+        splash_logo_line(Duration::from_millis(900)).to_string(),
+        "B O R G"
+    );
+    let glitch = splash_logo_line(Duration::ZERO).to_string();
+    assert!(glitch.starts_with("B O R G"));
+    assert!(glitch.contains('░'));
+}
+
+#[test]
 fn provider_compaction_events_become_status_cards() {
     let session_id = Uuid::new_v4();
     let mut transcript = Transcript::default();

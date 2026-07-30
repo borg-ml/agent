@@ -204,7 +204,15 @@ fn file_body_as_diff(path: &str, source: &str, added: bool) -> String {
 pub fn tool_code_view(name: &str, input: &Value) -> Option<(String, String)> {
     if matches!(
         tool_leaf_name(name).as_str(),
-        "update_plan" | "update_todo" | "update_todos" | "get_plan" | "get_todo" | "get_todos"
+        "update_plan"
+            | "update_todo"
+            | "update_todos"
+            | "get_plan"
+            | "get_todo"
+            | "get_todos"
+            | "get_goal"
+            | "create_goal"
+            | "update_goal"
     ) {
         return None;
     }
@@ -287,7 +295,7 @@ pub fn tool_call_summary(name: &str, input: &Value) -> (String, String) {
     }
 
     if tool == "get_goal" {
-        return ("Read goal".to_string(), "current status".to_string());
+        return ("Read goal".to_string(), String::new());
     }
 
     if tool == "create_goal" {
@@ -1262,6 +1270,16 @@ mod tests {
             true,
         );
         assert_eq!(missing_error.result, None);
+    }
+
+    #[test]
+    fn goal_controls_hide_empty_json_input_and_use_the_compact_result() {
+        let presentation =
+            project_tool_presentation("mcp__borg_agent__get_goal", &json!({}), None, false);
+        assert_eq!(presentation.label, "Read goal");
+        assert_eq!(presentation.detail, "");
+        assert_eq!(presentation.category, ToolPresentationCategory::Goal);
+        assert_eq!(presentation.input, None);
     }
 
     #[test]
