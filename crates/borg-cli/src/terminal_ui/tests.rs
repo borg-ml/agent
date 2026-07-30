@@ -2205,7 +2205,9 @@ fn pending_steer_ui_uses_the_shared_next_label_and_interrupt_action() {
     assert!(!rendered.contains("NEXT TURN"));
     assert!(rendered.contains("focus on the failing test"));
     assert!(rendered.contains("esc interrupt + send now"));
-    assert!(rendered.contains("↑ edit / recall pending"));
+    // ↑ refuses a steer the active turn already owns, so the panel must not
+    // offer recall next to one.
+    assert!(!rendered.contains("recall"));
 }
 
 #[test]

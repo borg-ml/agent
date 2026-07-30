@@ -98,6 +98,11 @@ const LARGE_PASTE_CHAR_THRESHOLD: usize = 1000;
 const SELECTION_AUTOSCROLL_LINES_PER_FRAME: usize = 2;
 type RowRange = (usize, usize, usize);
 type ToolRunRowRange = (usize, usize, usize, usize);
+/// (entry index, absolute start row, absolute end row, body row of `start`).
+/// `body row of start` is zero unless the entry is a tool clipped inside an
+/// actions accordion, in which case it is the body row currently shown at the
+/// top of the tool's visible slice.
+type SelectionRowRange = (usize, usize, usize, usize);
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct LinkRowRange {
     row: usize,
@@ -308,24 +313,28 @@ struct TranscriptPoint {
     column: usize,
 }
 
+/// A selection endpoint anchored to a transcript entry and a row within that
+/// entry's rendered body. Unlike an absolute transcript row, this survives
+/// reflows that move content between fixed row indices (the actions accordion
+/// window following new output, nested scrolling, streaming growth above or
+/// below, and so on).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SelectionPoint {
+    entry: usize,
+    row_in_entry: usize,
+    column: usize,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct TextSelection {
-    anchor: TranscriptPoint,
-    focus: TranscriptPoint,
+    anchor: SelectionPoint,
+    focus: SelectionPoint,
     dragging: bool,
     autoscroll: isize,
     pointer: Position,
 }
 
 impl TextSelection {
-    fn ordered(self) -> (TranscriptPoint, TranscriptPoint) {
-        if self.anchor <= self.focus {
-            (self.anchor, self.focus)
-        } else {
-            (self.focus, self.anchor)
-        }
-    }
-
     fn is_empty(self) -> bool {
         self.anchor == self.focus
     }
@@ -4003,16 +4012,19 @@ impl BorgTerminal {
                     &self.composer.text,
                     self.active_queued_prompts(),
                 ) {
-                    // A steer is already owned by the active provider turn and
-                    // cannot be truthfully withdrawn after turn/steer accepts
-                    // it. Do not fall through to ordinary composer history:
-                    // that makes the steer look recalled while its pending row
-                    // correctly remains visible.
+                    // Only the session knows whether the provider actually took
+                    // the steer. Ask: one it refused comes back and replaces
+                    // this notice, one it owns cannot be truthfully withdrawn
+                    // and the notice stands. Either way do not fall through to
+                    // composer history, which would make the steer look
+                    // recalled while its pending row correctly remains visible.
                     self.notice = Some(
                         "Steer already sent to the active turn · Esc interrupts and sends it next"
                             .to_string(),
                     );
-                    return Ok(UiAction::None);
+                    return Ok(UiAction::RecallQueuedPrompts {
+                        target: self.focused_child,
+                    });
                 }
                 if self.composer.history_index.is_some() || self.composer.text.is_empty() {
                     self.composer.history_previous();
@@ -7220,8 +7232,10 @@ fn queued_prompt_lines(
     let mut hints = Vec::new();
     if has_steers {
         hints.push("esc interrupt + send now");
-        hints.push("↑ edit / recall pending");
     }
+    // Only a queue entry is recallable: a steer belongs to the active turn
+    // until the provider rejects it, at which point the session re-records it
+    // as queued. Advertising recall for a steer promises what ↑ must refuse.
     if has_queue {
         hints.push("↑ edit / recall queued");
     }

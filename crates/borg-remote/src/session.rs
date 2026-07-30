@@ -24,6 +24,7 @@ use crate::{
     WorkspaceEventKind, WorkspaceStore,
 };
 
+#[derive(Clone)]
 struct QueuedPrompt {
     message_id: Uuid,
     text: String,
@@ -1501,6 +1502,10 @@ async fn run_agent_session_store_kernel(
                                 %error,
                                 "provider rejected active-turn steer; retaining it for the next boundary"
                             );
+                            // The rejection is transient and the steer retries
+                            // at the next boundary, so it keeps its steer
+                            // delivery. It is nonetheless unconsumed, which is
+                            // what makes it honestly recallable meanwhile.
                             pending_steers[index].state =
                                 PendingSteerState::RetryAtBoundary { error };
                         }
@@ -1601,9 +1606,13 @@ async fn run_agent_session_store_kernel(
                             });
                         }
                         HostCommand::RecallQueuedPrompt { message_id, .. } => {
-                            for recalled in
-                                recall_visible_queued_prompts(&mut pending, message_id)
-                            {
+                            let recalled = recall_visible_queued_prompts(&mut pending, message_id)
+                                .into_iter()
+                                .chain(recall_rejected_steers(
+                                    &mut pending_steers,
+                                    message_id,
+                                ));
+                            for recalled in recalled.collect::<Vec<_>>() {
                                 record(
                                     &mut journal,
                                     &events,
@@ -2245,6 +2254,32 @@ fn recall_visible_queued_prompts(
         }
     }
     *pending = retained;
+    recalled
+}
+
+/// Withdraw steers the provider refused.
+///
+/// A steer awaiting acknowledgement, or already accepted, is owned by the
+/// active turn and cannot be truthfully withdrawn: the provider has it whatever
+/// this session claims afterwards. A rejected one is only waiting for the next
+/// boundary, so nothing has consumed it and recall is honest.
+fn recall_rejected_steers(
+    pending_steers: &mut VecDeque<PendingSteer>,
+    message_id: Option<Uuid>,
+) -> Vec<QueuedPrompt> {
+    let mut recalled = Vec::new();
+    let mut retained = VecDeque::with_capacity(pending_steers.len());
+    while let Some(steer) = pending_steers.pop_front() {
+        let recallable = matches!(steer.state, PendingSteerState::RetryAtBoundary { .. })
+            && steer.prompt.visible
+            && message_id.is_none_or(|target| target == steer.prompt.message_id);
+        if recallable {
+            recalled.push(steer.prompt);
+        } else {
+            retained.push_back(steer);
+        }
+    }
+    *pending_steers = retained;
     recalled
 }
 
@@ -3613,7 +3648,8 @@ mod tests {
 
         let fork_id = Uuid::new_v4();
         let fork = store.fork_before(session_id, fork_id, 3).await.unwrap();
-        assert_eq!(fork.inherited_event_count, 2);
+        // The queue entry is not inheritable, so only the admission survives.
+        assert_eq!(fork.inherited_event_count, 1);
         let fork_binding = store.workspace_binding(fork_id).await.unwrap().unwrap();
         assert_eq!(fork_binding.workspace_id, binding.workspace_id);
         workspace_store
@@ -3637,12 +3673,12 @@ mod tests {
         // The hazard: a plain read renumbers the ancestry into the fork's own
         // identity, so filtering on session_id cannot separate the two.
         let read_back = store.read(fork_id).await.unwrap();
-        assert_eq!(read_back.len(), 2);
+        assert_eq!(read_back.len(), 1);
         assert!(read_back.iter().all(|event| event.session_id == fork_id));
 
         // Exactly what the session kernel does when it resumes the fork.
         let inherited = store.inherited_event_count(fork_id).await.unwrap();
-        assert_eq!(inherited, 2);
+        assert_eq!(inherited, 1);
         let replayed = store
             .events_after(fork_id, inherited, usize::MAX)
             .await
@@ -5615,6 +5651,58 @@ mod tests {
         assert_eq!(pending.len(), 2);
         assert_eq!(pending[0].message_id, internal_id);
         assert_eq!(pending[1].message_id, steer_id);
+    }
+
+    /// ↑ on an empty composer must give back exactly the pending work nothing
+    /// has consumed. A rejected steer qualifies; one the provider is holding
+    /// does not, however much the user wants it back.
+    #[test]
+    fn only_a_rejected_steer_is_withdrawable_from_the_active_turn() {
+        let rejected_id = Uuid::new_v4();
+        let awaiting_id = Uuid::new_v4();
+        let accepted_id = Uuid::new_v4();
+        let steer = |message_id: Uuid, state: PendingSteerState| PendingSteer {
+            prompt: QueuedPrompt {
+                message_id,
+                text: "steer".to_string(),
+                attachments: Vec::new(),
+                output_schema: None,
+                delivery: PromptDelivery::Steer,
+                visible: true,
+            },
+            state,
+        };
+        let mut pending_steers = VecDeque::from([
+            steer(awaiting_id, PendingSteerState::AwaitingAcknowledgement),
+            steer(
+                rejected_id,
+                PendingSteerState::RetryAtBoundary {
+                    error: "provider refused the steer".to_string(),
+                },
+            ),
+            steer(accepted_id, PendingSteerState::Accepted),
+        ]);
+
+        // Targeting one the turn owns withdraws nothing at all.
+        assert!(recall_rejected_steers(&mut pending_steers, Some(accepted_id)).is_empty());
+        assert_eq!(pending_steers.len(), 3);
+
+        let recalled = recall_rejected_steers(&mut pending_steers, None);
+        assert_eq!(
+            recalled
+                .iter()
+                .map(|prompt| prompt.message_id)
+                .collect::<Vec<_>>(),
+            [rejected_id]
+        );
+        assert_eq!(
+            pending_steers
+                .iter()
+                .map(|steer| steer.prompt.message_id)
+                .collect::<Vec<_>>(),
+            [awaiting_id, accepted_id],
+            "steers the provider holds keep their boundary retry"
+        );
     }
 
     #[test]

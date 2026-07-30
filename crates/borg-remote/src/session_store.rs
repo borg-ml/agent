@@ -24,6 +24,8 @@ const SESSION_PAYLOAD_PREVIEW_BYTES: usize = 4 * 1024;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const SQLITE_WRITE_TRANSACTION: &str = "BEGIN IMMEDIATE";
 pub const SESSION_PROJECTION_VERSION: i32 = 3;
+/// `pragma user_version` marking the queued-prompt inheritance backfill.
+const QUEUED_PROMPT_INHERITANCE_VERSION: i64 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventPersistence {
@@ -66,6 +68,15 @@ impl SessionEventKind {
                 | Self::StatusChanged { .. }
                 | Self::SubagentActivity { .. }
                 | Self::SubagentControl { .. }
+                // A fork cuts immediately before the admission of the prompt it
+                // rewinds to, which would otherwise leave that prompt's earlier
+                // queue entry inside the inherited history: the fork would then
+                // recover it as pending and immediately re-run the very prompt
+                // the rewind discarded. Only admitted history is inheritable.
+                | Self::Message {
+                    status: MessageStatus::Queued,
+                    ..
+                }
         )
     }
 
@@ -904,7 +915,34 @@ impl SqliteSessionStore {
         .execute(&self.pool)
         .await?;
         self.ensure_recovery_index().await?;
+        self.backfill_queued_prompt_inheritance().await?;
         self.rebuild_stale_projections().await?;
+        Ok(())
+    }
+
+    /// `fork_inheritable` caches [`SessionEventKind::is_fork_inheritable`] at
+    /// append time, so rows written before queued prompts became
+    /// non-inheritable still carry the old answer and would resurrect a
+    /// rewound prompt.  `user_version` keeps this to one pass per store.
+    async fn backfill_queued_prompt_inheritance(&self) -> Result<()> {
+        let version: i64 = sqlx::query_scalar("pragma user_version")
+            .fetch_one(&self.pool)
+            .await?;
+        if version >= QUEUED_PROMPT_INHERITANCE_VERSION {
+            return Ok(());
+        }
+        sqlx::query(
+            "update session_events set fork_inheritable = 0 \
+             where fork_inheritable = 1 and event_kind = 'message' \
+               and json_extract(event_json, '$.kind.status') = 'queued'",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::raw_sql(&format!(
+            "pragma user_version = {QUEUED_PROMPT_INHERITANCE_VERSION}"
+        ))
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -1407,13 +1445,31 @@ impl SqliteSessionStore {
         message_id: Uuid,
         before_or_at: Option<u64>,
     ) -> Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>> {
+        self.contains_message_in(session_id, message_id, before_or_at, false)
+    }
+
+    /// `inherited_only` restricts the search to what a descendant actually
+    /// inherits.  A session owns every event it appended, but a fork inherits
+    /// only the fork-inheritable ones, so a queue entry left below the cut is
+    /// not part of the fork's history.
+    fn contains_message_in<'a>(
+        &'a self,
+        session_id: Uuid,
+        message_id: Uuid,
+        before_or_at: Option<u64>,
+        inherited_only: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>> {
         Box::pin(async move {
             let session = self.session_row(session_id).await?;
             let limit = before_or_at.unwrap_or(session.next_sequence.saturating_sub(1));
-            let found: i64 = sqlx::query_scalar(
+            let found: i64 = sqlx::query_scalar(if inherited_only {
                 "select exists(select 1 from session_events \
-                 where session_id = ? and message_id = ? and sequence <= ?)",
-            )
+                 where session_id = ? and message_id = ? and sequence <= ? \
+                   and fork_inheritable = 1)"
+            } else {
+                "select exists(select 1 from session_events \
+                 where session_id = ? and message_id = ? and sequence <= ?)"
+            })
             .bind(session_id.to_string())
             .bind(message_id.to_string())
             .bind(i64::try_from(limit).unwrap_or(i64::MAX))
@@ -1431,9 +1487,9 @@ impl SqliteSessionStore {
             else {
                 return Ok(false);
             };
-            // Message events are always fork-inheritable. A cut within the
-            // compacted inherited prefix is uncommon; resolve that bounded
-            // prefix to preserve exact lineage semantics.
+            // A cut within the compacted inherited prefix is uncommon; resolve
+            // that bounded prefix to preserve exact lineage semantics. The
+            // composed view already drops what the fork did not inherit.
             if inherited_limit < session.inherited_event_count {
                 return Ok(self
                     .projected_events(session_id, Some(inherited_limit))
@@ -1449,7 +1505,7 @@ impl SqliteSessionStore {
                         )
                     }));
             }
-            self.contains_message_before(parent, message_id, Some(cut))
+            self.contains_message_in(parent, message_id, Some(cut), true)
                 .await
         })
     }
@@ -2613,6 +2669,73 @@ mod tests {
         let recovery = store.recovery(fork_id).await.unwrap();
         assert_eq!(recovery.context_events.len(), 1);
         assert_eq!(recovery.queue_events.len(), 1);
+    }
+
+    /// A rewind cuts immediately before the admission of the prompt it targets.
+    /// That prompt's earlier queue entry sits below the cut, so inheriting it
+    /// would hand the fork a pending prompt and re-run exactly what the user
+    /// just discarded.
+    #[tokio::test]
+    async fn a_rewind_does_not_inherit_the_queue_entry_of_the_discarded_prompt() {
+        let (directory, store) = store().await;
+        let parent_id = Uuid::new_v4();
+        let fork_id = Uuid::new_v4();
+        let discarded_message_id = Uuid::new_v4();
+        store.create_session(parent_id).await.unwrap();
+        for kind in [
+            SessionEventKind::SessionStarted,
+            configured(directory.path()),
+            SessionEventKind::Message {
+                message_id: discarded_message_id,
+                actor: EventActor::User,
+                text: "discard".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Queued,
+                delivery: Some(PromptDelivery::Queue),
+            },
+            SessionEventKind::Message {
+                message_id: discarded_message_id,
+                actor: EventActor::User,
+                text: "discard".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: Some(PromptDelivery::Queue),
+            },
+        ] {
+            store
+                .append(SessionEvent::new(parent_id, 0, kind))
+                .await
+                .unwrap();
+        }
+
+        // The UI rewinds to the admission at sequence 4; the queue entry it was
+        // admitted from is at sequence 3, below the cut.
+        store.fork_before(parent_id, fork_id, 4).await.unwrap();
+        assert!(
+            !store
+                .contains_message(fork_id, discarded_message_id)
+                .await
+                .unwrap()
+        );
+        let recovery = store.recovery(fork_id).await.unwrap();
+        assert!(
+            recovery.queue_events.is_empty(),
+            "the discarded prompt must not come back as pending work"
+        );
+        assert!(
+            store
+                .read(fork_id)
+                .await
+                .unwrap()
+                .iter()
+                .all(|event| !matches!(
+                    event.kind,
+                    SessionEventKind::Message {
+                        status: MessageStatus::Queued,
+                        ..
+                    }
+                ))
+        );
     }
 
     #[tokio::test]
