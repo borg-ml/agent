@@ -460,6 +460,13 @@ pub trait SessionStore: Send + Sync {
         limit: usize,
     ) -> Result<Vec<SessionEvent>>;
     async fn state(&self, session_id: Uuid) -> Result<SessionState>;
+    /// Number of leading events this session inherited from a fork parent.
+    ///
+    /// Reads renumber inherited events into the child's own sequence space, so
+    /// this is the only way to tell what the session actually authored.
+    async fn inherited_event_count(&self, _session_id: Uuid) -> Result<u64> {
+        Ok(0)
+    }
     async fn recovery(&self, session_id: Uuid) -> Result<SessionRecovery>;
     async fn live_events_after(
         &self,
@@ -1728,6 +1735,10 @@ impl SessionStore for SqliteSessionStore {
 
     async fn state(&self, session_id: Uuid) -> Result<SessionState> {
         Ok(self.session_row(session_id).await?.state)
+    }
+
+    async fn inherited_event_count(&self, session_id: Uuid) -> Result<u64> {
+        Ok(self.session_row(session_id).await?.inherited_event_count)
     }
 
     async fn recovery(&self, session_id: Uuid) -> Result<SessionRecovery> {

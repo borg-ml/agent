@@ -2560,6 +2560,7 @@ fn transcript_separates_labeled_groups_from_header_and_tool_activity() {
             status: PlanItemStatus::InProgress,
         }],
         time: "12:04".to_string(),
+        expanded: false,
     });
     transcript.user_label = "shulgin".to_string();
     transcript.assistant_label = "borg".to_string();
@@ -2720,6 +2721,27 @@ fn coalesced_wheel_bursts_preserve_viewport_scaled_distance() {
 }
 
 #[test]
+fn nested_wheel_distance_eases_in_quadratically_with_terminal_height() {
+    assert_eq!(nested_wheel_scroll_lines(1), 1);
+    assert_eq!(nested_wheel_scroll_lines(36), 1);
+    assert_eq!(nested_wheel_scroll_lines(48), 2);
+    assert_eq!(nested_wheel_scroll_lines(54), 4);
+    assert_eq!(nested_wheel_scroll_lines(60), 6);
+    assert_eq!(nested_wheel_scroll_lines(66), 9);
+    assert_eq!(nested_wheel_scroll_lines(72), 12);
+    assert_eq!(nested_wheel_scroll_lines(120), 12);
+}
+
+#[test]
+fn coalesced_nested_wheel_bursts_preserve_height_scaled_distance() {
+    let repetitions = 3;
+
+    assert_eq!(nested_wheel_scroll_distance(36, repetitions), 3);
+    assert_eq!(nested_wheel_scroll_distance(54, repetitions), 12);
+    assert_eq!(nested_wheel_scroll_distance(72, repetitions), 36);
+}
+
+#[test]
 fn long_tool_runs_show_eight_lines_and_scroll_independently() {
     let mut transcript = Transcript::default();
     for index in 0..20 {
@@ -2763,6 +2785,64 @@ fn long_tool_runs_show_eight_lines_and_scroll_independently() {
     assert!(rendered.contains("call-9"));
     assert!(rendered.contains("call-16"));
     assert!(!rendered.contains("call-17"));
+}
+
+#[test]
+fn expanded_tool_run_shows_every_action_and_collapses_again() {
+    let mut transcript = Transcript::default();
+    for index in 0..20 {
+        transcript.order.push(TranscriptEntry::Tool {
+            source_name: "Run".to_string(),
+            name: "Run".to_string(),
+            detail: format!("call-{index}"),
+            code_view: None,
+            output_view: None,
+            payload_refs: Vec::new(),
+            time: "12:00".to_string(),
+            started_at: Utc::now(),
+            completed_at: Some(Utc::now()),
+            complete: true,
+            error: false,
+            user_interrupted: false,
+            backgrounded: false,
+            expanded: false,
+        });
+    }
+    let render = |transcript: &Transcript| {
+        transcript
+            .lines(100)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    assert!(transcript.toggle_tool_run_expansion(0));
+    let expanded = render(&transcript);
+    assert!(expanded.contains("call-0"), "{expanded}");
+    assert!(expanded.contains("call-19"), "{expanded}");
+    assert!(expanded.contains("actions · 20"), "{expanded}");
+    assert!(!expanded.contains("↑ more"), "{expanded}");
+    assert!(!expanded.contains("↓ more"), "{expanded}");
+
+    assert!(!transcript.toggle_tool_run_expansion(0));
+    let collapsed = render(&transcript);
+    assert!(!collapsed.contains("call-11"), "{collapsed}");
+    assert!(collapsed.contains("call-12"), "{collapsed}");
+    assert!(collapsed.contains("actions · 20 · ↑ more"), "{collapsed}");
+}
+
+#[test]
+fn sticky_tool_run_header_row_covers_only_overflowing_boxes() {
+    let rows = vec![(0, 2, 10, 0), (12, 14, 30, 4)];
+
+    assert_eq!(sticky_tool_run_header_row(&rows, 0), None);
+    assert_eq!(sticky_tool_run_header_row(&rows, 2), None);
+    assert_eq!(sticky_tool_run_header_row(&rows, 3), Some((0, 2)));
+    assert_eq!(sticky_tool_run_header_row(&rows, 9), Some((0, 2)));
+    assert_eq!(sticky_tool_run_header_row(&rows, 10), None);
+    assert_eq!(sticky_tool_run_header_row(&rows, 20), Some((12, 14)));
+    assert_eq!(sticky_tool_run_header_row(&rows, 30), None);
 }
 
 #[test]
@@ -3280,6 +3360,7 @@ fn rich_plan_orders_active_work_first_and_mutes_completed_work() {
             },
         ],
         time: "12:00".to_string(),
+        expanded: false,
     });
 
     let lines = transcript.lines(80);
@@ -3340,12 +3421,81 @@ fn plan_cards_copy_the_complete_readable_todo_list() {
             },
         ],
         time: "12:00".to_string(),
+        expanded: false,
     };
 
     assert_eq!(
         entry.copy_text_owned().as_deref(),
         Some("✓ Inspect scrolling\n◌ Polish interactions")
     );
+}
+
+#[test]
+fn long_plans_clip_with_a_hint_and_expand_on_toggle() {
+    let mut transcript = Transcript::default();
+    transcript.order.push(TranscriptEntry::Plan {
+        items: (0..8)
+            .map(|index| PlanItem {
+                id: Uuid::new_v4(),
+                content: format!("Step {index}"),
+                status: PlanItemStatus::Pending,
+            })
+            .collect(),
+        time: "12:00".to_string(),
+        expanded: false,
+    });
+    let render = |transcript: &Transcript| {
+        transcript
+            .lines(80)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    assert!(transcript.plan_is_clippable(0));
+    let clipped = render(&transcript);
+    assert!(clipped.contains("Step 0"), "{clipped}");
+    assert!(clipped.contains("Step 4"), "{clipped}");
+    assert!(!clipped.contains("Step 5"), "{clipped}");
+    assert!(clipped.contains("+ 3 more · click to expand"), "{clipped}");
+
+    transcript.toggle_plan_expansion(0);
+    let expanded = render(&transcript);
+    assert!(expanded.contains("Step 7"), "{expanded}");
+    assert!(expanded.contains("− show less"), "{expanded}");
+    assert!(!expanded.contains("+ 3 more"), "{expanded}");
+
+    transcript.toggle_plan_expansion(0);
+    let reclipped = render(&transcript);
+    assert!(!reclipped.contains("Step 5"), "{reclipped}");
+}
+
+#[test]
+fn upserting_a_plan_preserves_its_expansion_state() {
+    let mut transcript = Transcript::default();
+    let items = |count: usize| {
+        (0..count)
+            .map(|index| PlanItem {
+                id: Uuid::new_v4(),
+                content: format!("Step {index}"),
+                status: PlanItemStatus::Pending,
+            })
+            .collect::<Vec<_>>()
+    };
+    transcript.upsert_plan(items(8), "12:00".to_string());
+    transcript.toggle_plan_expansion(transcript.order.len() - 1);
+
+    transcript.upsert_plan(items(9), "12:01".to_string());
+
+    assert!(matches!(
+        transcript.order.last(),
+        Some(TranscriptEntry::Plan {
+            expanded: true,
+            items,
+            ..
+        }) if items.len() == 9
+    ));
 }
 
 #[test]

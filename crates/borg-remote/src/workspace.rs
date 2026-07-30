@@ -536,6 +536,20 @@ impl SqliteWorkspaceStore {
         let Some(sequence) = sequence else {
             return Ok(None);
         };
+        // A participant outside the message's audience simply has nothing to
+        // transition; that is a quiet no-op, not a session-fatal error.
+        let addressed: i64 = sqlx::query_scalar(
+            "select exists(select 1 from workspace_deliveries \
+             where workspace_id=? and sequence=? and recipient_id=?)",
+        )
+        .bind(workspace_id.to_string())
+        .bind(sequence)
+        .bind(recipient_id.to_string())
+        .fetch_one(&self.pool)
+        .await?;
+        if addressed == 0 {
+            return Ok(None);
+        }
         Ok(Some(
             <Self as WorkspaceStore>::transition_delivery(
                 self,
@@ -547,6 +561,33 @@ impl SqliteWorkspaceStore {
             )
             .await?,
         ))
+    }
+
+    /// Highest session sequence already projected into this workspace.
+    ///
+    /// The projection is append-only and strictly ordered, so a restart only
+    /// has to replay above this watermark.  Walking the whole transcript to
+    /// re-prove idempotency costs one round trip per event, which on a long
+    /// session dominates startup.
+    pub async fn latest_projected_session_sequence(
+        &self,
+        workspace_id: Uuid,
+        session_id: Uuid,
+    ) -> Result<u64> {
+        let sequence: Option<i64> = sqlx::query_scalar(
+            "select max(json_extract(event_json, '$.kind.session_sequence')) \
+             from workspace_events \
+             where workspace_id=? \
+               and json_extract(event_json, '$.kind.type')='session_event' \
+               and json_extract(event_json, '$.kind.session_id')=?",
+        )
+        .bind(workspace_id.to_string())
+        .bind(session_id.to_string())
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(sequence
+            .and_then(|sequence| u64::try_from(sequence).ok())
+            .unwrap_or(0))
     }
 
     pub async fn contains_idempotent_event(
@@ -614,6 +655,7 @@ impl SqliteWorkspaceStore {
       create table if not exists workspace_deliveries (workspace_id text not null, sequence integer not null, recipient_id text not null references workspace_participants(id), mode text not null, state text not null, attempts integer not null default 0, last_attempt_json text, primary key(workspace_id,sequence,recipient_id), foreign key(workspace_id,sequence) references workspace_events(workspace_id,sequence) on delete cascade);
       create table if not exists workspace_presence_leases (workspace_id text not null references workspaces(id) on delete cascade, participant_id text not null references workspace_participants(id), client_id text not null, host_id text, expires_at text not null, primary key(workspace_id,participant_id,client_id));
       create index if not exists idx_workspace_delivery_recipient on workspace_deliveries(workspace_id,recipient_id,sequence);
+      create index if not exists idx_workspace_events_id on workspace_events(workspace_id,id);
     "#).execute(&self.pool).await?;
         Ok(())
     }

@@ -542,10 +542,20 @@ async fn run_agent_session_store_kernel(
             agent_participant_id: binding.participant_id,
             human_participant_id,
         };
-        for event in store.read(session_id).await? {
-            if event.session_id == session_id {
-                projection.project(&event).await?;
-            }
+        // Inherited events were already projected by the fork parent, and reads
+        // renumber them into this session's sequence space under fresh event
+        // ids, so replaying them would re-append the whole ancestry to the
+        // workspace under a participant that was never in its audiences.
+        let inherited = store.inherited_event_count(session_id).await?;
+        let projected = projection
+            .store
+            .latest_projected_session_sequence(binding.workspace_id, session_id)
+            .await?;
+        for event in store
+            .events_after(session_id, inherited.max(projected), usize::MAX)
+            .await?
+        {
+            projection.project(&event).await?;
         }
         Some(projection)
     } else {
@@ -3483,6 +3493,189 @@ mod tests {
                 ..
             } if projected_session == session_id && session_event_id == queued.id
         ));
+    }
+
+    /// A rewind forks the session into the parent's workspace under a brand new
+    /// participant.  Replaying the inherited ancestry there would re-append
+    /// every parent event and then fail on the first message the new
+    /// participant was never an audience of.
+    #[tokio::test]
+    async fn a_forked_session_never_reprojects_the_inherited_ancestry() {
+        let root = tempdir().unwrap();
+        let session_id = Uuid::new_v4();
+        let session_store = Arc::new(
+            SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+                .await
+                .unwrap(),
+        );
+        session_store.create_session(session_id).await.unwrap();
+        let binding = session_store
+            .workspace_binding(session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let workspace_store = SqliteWorkspaceStore::open(root.path().join("workspaces.sqlite3"))
+            .await
+            .unwrap();
+        let human_id = crate::local_human_participant_id("Human");
+        workspace_store
+            .ensure_execution_workspace(
+                binding.workspace_id,
+                "test workspace",
+                human_id,
+                "Human",
+                binding.participant_id,
+                "Agent",
+            )
+            .await
+            .unwrap();
+        let projection = WorkspaceProjection {
+            store: workspace_store.clone(),
+            workspace_id: binding.workspace_id,
+            agent_participant_id: binding.participant_id,
+            human_participant_id: human_id,
+        };
+        let store: Arc<dyn SessionStore> = session_store.clone();
+        let mut runtime = RuntimeSessionStore::new(store.clone(), Vec::new())
+            .with_workspace_projection(projection.clone());
+
+        // A team message the parent participant is addressed by, mirrored into
+        // the session transcript under the same message id.
+        let message_id = Uuid::new_v4();
+        workspace_store
+            .append(WorkspaceEvent {
+                id: message_id,
+                workspace_id: binding.workspace_id,
+                sequence: 0,
+                author_id: human_id,
+                idempotency_key: format!("test-team-message:{message_id}"),
+                created_at: chrono::Utc::now(),
+                kind: WorkspaceEventKind::Message {
+                    message: crate::WorkspaceMessage {
+                        id: message_id,
+                        workspace_id: binding.workspace_id,
+                        thread_id: None,
+                        reply_to_message_id: None,
+                        author_id: human_id,
+                        body: crate::WorkspaceMessageBody {
+                            text: "coordinate this".to_string(),
+                            mentions: Vec::new(),
+                        },
+                        audience: crate::Audience::Direct {
+                            participant: binding.participant_id,
+                        },
+                        created_at: chrono::Utc::now(),
+                    },
+                    mode: crate::DeliveryMode::Boundary,
+                },
+            })
+            .await
+            .unwrap();
+        for status in [MessageStatus::Queued, MessageStatus::Complete] {
+            runtime
+                .append(SessionEvent::new(
+                    session_id,
+                    0,
+                    SessionEventKind::Message {
+                        message_id,
+                        actor: EventActor::User,
+                        text: "coordinate this".to_string(),
+                        attachments: Vec::new(),
+                        status,
+                        delivery: Some(PromptDelivery::Steer),
+                    },
+                ))
+                .await
+                .unwrap();
+        }
+        let parent_events = workspace_store
+            .replay(binding.workspace_id, binding.participant_id, 0, 64)
+            .await
+            .unwrap()
+            .len();
+
+        // Restarting the parent itself resumes from the watermark instead of
+        // re-walking the transcript to re-prove idempotency.
+        assert_eq!(
+            workspace_store
+                .latest_projected_session_sequence(binding.workspace_id, session_id)
+                .await
+                .unwrap(),
+            2
+        );
+        assert!(
+            store
+                .events_after(session_id, 2, usize::MAX)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let fork_id = Uuid::new_v4();
+        let fork = store.fork_before(session_id, fork_id, 3).await.unwrap();
+        assert_eq!(fork.inherited_event_count, 2);
+        let fork_binding = store.workspace_binding(fork_id).await.unwrap().unwrap();
+        assert_eq!(fork_binding.workspace_id, binding.workspace_id);
+        workspace_store
+            .ensure_execution_workspace(
+                fork_binding.workspace_id,
+                "test workspace",
+                human_id,
+                "Human",
+                fork_binding.participant_id,
+                "Agent",
+            )
+            .await
+            .unwrap();
+        let fork_projection = WorkspaceProjection {
+            store: workspace_store.clone(),
+            workspace_id: fork_binding.workspace_id,
+            agent_participant_id: fork_binding.participant_id,
+            human_participant_id: human_id,
+        };
+
+        // The hazard: a plain read renumbers the ancestry into the fork's own
+        // identity, so filtering on session_id cannot separate the two.
+        let read_back = store.read(fork_id).await.unwrap();
+        assert_eq!(read_back.len(), 2);
+        assert!(read_back.iter().all(|event| event.session_id == fork_id));
+
+        // Exactly what the session kernel does when it resumes the fork.
+        let inherited = store.inherited_event_count(fork_id).await.unwrap();
+        assert_eq!(inherited, 2);
+        let replayed = store
+            .events_after(fork_id, inherited, usize::MAX)
+            .await
+            .unwrap();
+        assert!(replayed.is_empty(), "a fresh fork has authored nothing");
+        for event in replayed {
+            fork_projection.project(&event).await.unwrap();
+        }
+        assert_eq!(
+            workspace_store
+                .replay(binding.workspace_id, binding.participant_id, 0, 64)
+                .await
+                .unwrap()
+                .len(),
+            parent_events,
+            "resuming a fork must not re-append the ancestry"
+        );
+
+        // Even so, a participant outside a message's audience transitions
+        // nothing instead of failing the session.
+        assert!(
+            workspace_store
+                .transition_message_delivery(
+                    fork_binding.workspace_id,
+                    message_id,
+                    fork_binding.participant_id,
+                    crate::DeliveryState::Recalled,
+                    None,
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     struct RecordingExecutor {

@@ -83,8 +83,10 @@ const MAX_WHEEL_SCROLL_LINES_PER_FRAME: isize = 8;
 const WHEEL_SCROLL_EASING_DIVISOR: usize = 8;
 const MIN_NESTED_SCROLL_LINES_PER_FRAME: usize = 2;
 const MAX_NESTED_SCROLL_LINES_PER_FRAME: usize = 12;
+const NESTED_WHEEL_SCROLL_FULL_HEIGHT_ROWS: usize = 72;
 const MAX_PENDING_WHEEL_SCROLL_LINES: isize = 160;
 const TOOL_RUN_BOX_THRESHOLD: usize = 8;
+const MAX_COLLAPSED_PLAN_ITEMS: usize = 5;
 const MAX_TERMINAL_AGENTS_IN_ROSTER: usize = 4;
 #[cfg(test)]
 const DEFAULT_TOOL_RUN_VIEWPORT_HEIGHT: usize = 8;
@@ -474,12 +476,14 @@ pub struct BorgTerminal {
     keybindings_hovered: bool,
     tool_hit_areas: Vec<(Rect, usize)>,
     tool_run_hit_areas: Vec<(Rect, usize, usize)>,
+    tool_run_header_hit_areas: Vec<(Rect, usize)>,
     entry_hit_areas: Vec<(Rect, usize)>,
     message_hit_areas: Vec<(Rect, usize)>,
     link_hit_areas: Vec<(Rect, String)>,
     picker_hit_areas: Vec<(Rect, usize)>,
     hovered_tool: Option<usize>,
     hovered_tool_run: Option<(usize, usize)>,
+    hovered_tool_run_header: Option<usize>,
     hovered_entry: Option<usize>,
     hovered_message: Option<usize>,
     hovered_link: Option<String>,
@@ -951,12 +955,14 @@ impl BorgTerminal {
             keybindings_hovered: false,
             tool_hit_areas: Vec::new(),
             tool_run_hit_areas: Vec::new(),
+            tool_run_header_hit_areas: Vec::new(),
             entry_hit_areas: Vec::new(),
             message_hit_areas: Vec::new(),
             link_hit_areas: Vec::new(),
             picker_hit_areas: Vec::new(),
             hovered_tool: None,
             hovered_tool_run: None,
+            hovered_tool_run_header: None,
             hovered_entry: None,
             hovered_message: None,
             hovered_link: None,
@@ -1209,6 +1215,7 @@ impl BorgTerminal {
                 self.scroll_from_bottom = 0;
                 self.hovered_tool = None;
                 self.hovered_tool_run = None;
+                self.hovered_tool_run_header = None;
                 self.hovered_entry = None;
                 self.hovered_message = None;
             }
@@ -1437,6 +1444,7 @@ impl BorgTerminal {
         self.hovered_message = None;
         self.hovered_tool = None;
         self.hovered_tool_run = None;
+        self.hovered_tool_run_header = None;
     }
 
     pub fn set_notice(&mut self, notice: impl Into<String>) {
@@ -1839,6 +1847,10 @@ impl BorgTerminal {
                         .find_map(|(area, start, max_offset)| {
                             area.contains(pointer).then_some((*start, *max_offset))
                         });
+                self.hovered_tool_run_header = self
+                    .tool_run_header_hit_areas
+                    .iter()
+                    .find_map(|(area, start)| area.contains(pointer).then_some(*start));
                 self.hovered_entry = self
                     .entry_hit_areas
                     .iter()
@@ -1973,20 +1985,15 @@ impl BorgTerminal {
                     .tool_run_hit_areas
                     .iter()
                     .find_map(|(area, start, max_offset)| {
-                        area.contains(pointer)
-                            .then_some((*start, *max_offset, area.height))
+                        area.contains(pointer).then_some((*start, *max_offset))
                     })
                     .or_else(|| {
                         self.hovered_tool
                             .and_then(|index| self.transcript.tool_run_start_containing(index))
                             .and_then(|start| {
                                 self.tool_run_hit_areas.iter().find_map(
-                                    |(area, candidate, max_offset)| {
-                                        (*candidate == start).then_some((
-                                            start,
-                                            *max_offset,
-                                            area.height,
-                                        ))
+                                    |(_, candidate, max_offset)| {
+                                        (*candidate == start).then_some((start, *max_offset))
                                     },
                                 )
                             })
@@ -2047,13 +2054,24 @@ impl BorgTerminal {
                             self.notice = Some(format!("Could not open link: {error}"));
                         }
                     }
+                    MouseEventKind::Down(MouseButton::Left)
+                        if self.hovered_tool_run_header.is_some() =>
+                    {
+                        let start = self.hovered_tool_run_header.expect("checked above");
+                        if self.transcript.tool_run_expanded(start) {
+                            self.capture_transcript_anchor_for_collapse();
+                        }
+                        self.nested_scroll_motion = None;
+                        self.transcript.toggle_tool_run_expansion(start);
+                        self.transcript_render_cache = None;
+                    }
                     MouseEventKind::Down(MouseButton::Left) if self.hovered_tool.is_some() => {
                         self.nested_scroll_motion = None;
                         let tool_index = self.hovered_tool.expect("checked above");
                         if self.transcript.tool_is_expanded(tool_index) {
                             self.capture_transcript_anchor_for_collapse();
                         }
-                        if let Some((start, max_offset, _)) = hovered_tool_run {
+                        if let Some((start, max_offset)) = hovered_tool_run {
                             self.transcript.anchor_tool_run(start, max_offset);
                         }
                         let payloads = self.transcript.toggle_tool(tool_index);
@@ -2066,7 +2084,13 @@ impl BorgTerminal {
                         self.open_entry_actions(self.hovered_message.expect("checked above"));
                     }
                     MouseEventKind::Down(MouseButton::Left) if self.hovered_entry.is_some() => {
-                        self.open_entry_actions(self.hovered_entry.expect("checked above"));
+                        let index = self.hovered_entry.expect("checked above");
+                        if self.transcript.plan_is_clippable(index) {
+                            self.transcript.toggle_plan_expansion(index);
+                            self.transcript_render_cache = None;
+                        } else {
+                            self.open_entry_actions(index);
+                        }
                     }
                     MouseEventKind::Down(MouseButton::Left) => {
                         self.transcript.selected = None;
@@ -2091,15 +2115,18 @@ impl BorgTerminal {
                         }
                     }
                     MouseEventKind::ScrollUp => {
-                        let consumed = if let Some((start, max_offset, viewport_height)) =
-                            hovered_tool_run
-                        {
+                        let consumed = if let Some((start, max_offset)) = hovered_tool_run {
                             let can_move = self.transcript.tool_run_offset(start, max_offset) > 0;
                             if can_move {
+                                let terminal_height =
+                                    self.terminal.size().map(|size| size.height).unwrap_or(1);
                                 self.queue_nested_wheel_scroll(
                                     start,
                                     max_offset,
-                                    -wheel_scroll_distance(viewport_height, scroll_repetitions),
+                                    -nested_wheel_scroll_distance(
+                                        terminal_height,
+                                        scroll_repetitions,
+                                    ),
                                 );
                             }
                             nested_scroll_consumed(
@@ -2123,28 +2150,32 @@ impl BorgTerminal {
                         }
                     }
                     MouseEventKind::ScrollDown => {
-                        let consumed =
-                            if let Some((start, max_offset, viewport_height)) = hovered_tool_run {
-                                let can_move =
-                                    self.transcript.tool_run_offset(start, max_offset) < max_offset;
-                                if can_move {
-                                    self.queue_nested_wheel_scroll(
-                                        start,
-                                        max_offset,
-                                        wheel_scroll_distance(viewport_height, scroll_repetitions),
-                                    );
-                                }
-                                nested_scroll_consumed(
-                                    &mut self.nested_scroll_capture,
+                        let consumed = if let Some((start, max_offset)) = hovered_tool_run {
+                            let can_move =
+                                self.transcript.tool_run_offset(start, max_offset) < max_offset;
+                            if can_move {
+                                let terminal_height =
+                                    self.terminal.size().map(|size| size.height).unwrap_or(1);
+                                self.queue_nested_wheel_scroll(
                                     start,
-                                    1,
-                                    can_move,
-                                    Instant::now(),
-                                )
-                            } else {
-                                self.nested_scroll_capture = None;
-                                false
-                            };
+                                    max_offset,
+                                    nested_wheel_scroll_distance(
+                                        terminal_height,
+                                        scroll_repetitions,
+                                    ),
+                                );
+                            }
+                            nested_scroll_consumed(
+                                &mut self.nested_scroll_capture,
+                                start,
+                                1,
+                                can_move,
+                                Instant::now(),
+                            )
+                        } else {
+                            self.nested_scroll_capture = None;
+                            false
+                        };
                         if !consumed {
                             let viewport_height =
                                 self.transcript_viewport_area.map_or(1, |area| area.height);
@@ -2796,6 +2827,7 @@ impl BorgTerminal {
         let mut next_scroll_max = 0;
         let mut next_tool_hit_areas = Vec::new();
         let mut next_tool_run_hit_areas = Vec::new();
+        let mut next_tool_run_header_hit_areas = Vec::new();
         let mut next_message_hit_areas = Vec::new();
         let mut next_link_hit_areas = Vec::new();
         let mut next_entry_hit_areas = Vec::new();
@@ -2938,12 +2970,19 @@ impl BorgTerminal {
                 };
                 let scroll_start = scroll;
                 let visible_height = content_area.height as usize;
+                let sticky_tool_run_header =
+                    sticky_tool_run_header_row(&tool_run_rows, scroll_start)
+                        .map(|(index, row)| (index, transcript[row].clone()));
                 let sticky_index = tool_rows.partition_point(|(_, start, _)| *start < scroll_start);
-                let sticky_tool_header = sticky_index
-                    .checked_sub(1)
-                    .and_then(|index| tool_rows.get(index))
-                    .filter(|(_, _, end)| *end > scroll_start)
-                    .map(|(index, start, _)| (*index, transcript[*start].clone()));
+                let sticky_tool_header = if sticky_tool_run_header.is_some() {
+                    None
+                } else {
+                    sticky_index
+                        .checked_sub(1)
+                        .and_then(|index| tool_rows.get(index))
+                        .filter(|(_, _, end)| *end > scroll_start)
+                        .map(|(index, start, _)| (*index, transcript[*start].clone()))
+                };
                 let visible_transcript = transcript
                     .iter()
                     .skip(scroll_start)
@@ -2974,10 +3013,29 @@ impl BorgTerminal {
                     .iter()
                     .filter(|(_, start, end, _)| *end > scroll_start && *start < visible_end)
                 {
+                    if self.hovered_tool_run_header == Some(*start_index) {
+                        apply_viewport_background(
+                            &mut visible_transcript,
+                            *start,
+                            start.saturating_add(1),
+                            scroll_start,
+                            content_area.width as usize,
+                            MESSAGE_HOVER_BG,
+                        );
+                    }
                     next_tool_run_hit_areas.push((
                         viewport_hit_area(content_area, scroll_start, *start, *end),
                         *start_index,
                         *max_offset,
+                    ));
+                    next_tool_run_header_hit_areas.push((
+                        viewport_hit_area(
+                            content_area,
+                            scroll_start,
+                            *start,
+                            start.saturating_add(1),
+                        ),
+                        *start_index,
                     ));
                 }
                 for (index, start, end) in
@@ -3038,7 +3096,23 @@ impl BorgTerminal {
                         ));
                     }
                 }
-                if let Some((index, mut header)) = sticky_tool_header {
+                if let Some((index, mut header)) = sticky_tool_run_header {
+                    apply_line_background(
+                        &mut header,
+                        content_area.width as usize,
+                        if self.hovered_tool_run_header == Some(index) {
+                            MESSAGE_HOVER_BG
+                        } else {
+                            MESSAGE_BG
+                        },
+                    );
+                    let sticky_area = Rect {
+                        height: 1,
+                        ..content_area
+                    };
+                    frame.render_widget(Paragraph::new(header), sticky_area);
+                    next_tool_run_header_hit_areas.push((sticky_area, index));
+                } else if let Some((index, mut header)) = sticky_tool_header {
                     apply_line_background(
                         &mut header,
                         content_area.width as usize,
@@ -3606,6 +3680,7 @@ impl BorgTerminal {
         self.transcript_scroll_max = next_scroll_max;
         self.tool_hit_areas = next_tool_hit_areas;
         self.tool_run_hit_areas = next_tool_run_hit_areas;
+        self.tool_run_header_hit_areas = next_tool_run_header_hit_areas;
         self.message_hit_areas = next_message_hit_areas;
         self.link_hit_areas = next_link_hit_areas;
         self.entry_hit_areas = next_entry_hit_areas;
@@ -4635,6 +4710,7 @@ struct Transcript {
     context_remaining_percent: u8,
     cache_diagnostics: CacheDiagnostics,
     tool_run_offsets: HashMap<usize, usize>,
+    expanded_tool_runs: HashSet<usize>,
     active_reasoning: Option<usize>,
     last_edit: Option<usize>,
     next_image_number: usize,
@@ -4690,6 +4766,7 @@ impl Default for Transcript {
             context_remaining_percent: 100,
             cache_diagnostics: CacheDiagnostics::default(),
             tool_run_offsets: HashMap::new(),
+            expanded_tool_runs: HashSet::new(),
             active_reasoning: None,
             last_edit: None,
             next_image_number: 1,
@@ -4754,6 +4831,7 @@ enum TranscriptEntry {
     Plan {
         items: Vec<PlanItem>,
         time: String,
+        expanded: bool,
     },
     Goal {
         goal: SessionGoal,
@@ -4839,6 +4917,7 @@ impl Transcript {
         self.tools.clear();
         self.subagent_entries.clear();
         self.tool_run_offsets.clear();
+        self.expanded_tool_runs.clear();
         self.active_reasoning = None;
         self.last_edit = None;
         self.message_markdown_cache.get_mut().messages.clear();
@@ -4876,15 +4955,39 @@ impl Transcript {
     }
 
     fn upsert_plan(&mut self, items: Vec<PlanItem>, time: String) {
+        let mut expanded = false;
         if let Some(index) = self
             .order
             .iter()
             .rposition(|entry| matches!(entry, TranscriptEntry::Plan { .. }))
         {
+            if let Some(TranscriptEntry::Plan {
+                expanded: previous, ..
+            }) = self.order.get(index)
+            {
+                expanded = *previous;
+            }
             self.order.remove(index);
             self.reindex_after_removal(index);
         }
-        self.order.push(TranscriptEntry::Plan { items, time });
+        self.order.push(TranscriptEntry::Plan {
+            items,
+            time,
+            expanded,
+        });
+    }
+
+    fn toggle_plan_expansion(&mut self, index: usize) {
+        if let Some(TranscriptEntry::Plan { expanded, .. }) = self.order.get_mut(index) {
+            *expanded = !*expanded;
+        }
+    }
+
+    fn plan_is_clippable(&self, index: usize) -> bool {
+        matches!(
+            self.order.get(index),
+            Some(TranscriptEntry::Plan { items, .. }) if items.len() > MAX_COLLAPSED_PLAN_ITEMS
+        )
     }
 
     fn toggle_tool(&mut self, index: usize) -> Vec<SessionPayloadRef> {
@@ -4996,6 +5099,20 @@ impl Transcript {
             .copied()
             .unwrap_or(max_offset)
             .min(max_offset)
+    }
+
+    fn toggle_tool_run_expansion(&mut self, start: usize) -> bool {
+        if self.expanded_tool_runs.contains(&start) {
+            self.expanded_tool_runs.remove(&start);
+            false
+        } else {
+            self.expanded_tool_runs.insert(start);
+            true
+        }
+    }
+
+    fn tool_run_expanded(&self, start: usize) -> bool {
+        self.expanded_tool_runs.contains(&start)
     }
 
     fn tool_run_start_containing(&self, index: usize) -> Option<usize> {
@@ -5471,6 +5588,11 @@ impl Transcript {
             .filter_map(|(start, offset)| {
                 (start != index).then_some((start - usize::from(start > index), offset))
             })
+            .collect();
+        self.expanded_tool_runs = self
+            .expanded_tool_runs
+            .drain()
+            .filter_map(|start| (start != index).then_some(start - usize::from(start > index)))
             .collect();
         self.active_reasoning = self.active_reasoning.and_then(|reasoning| {
             if reasoning == index {
@@ -6050,7 +6172,11 @@ impl Transcript {
                         )));
                     }
                 }
-                TranscriptEntry::Plan { items, time } => {
+                TranscriptEntry::Plan {
+                    items,
+                    time,
+                    expanded,
+                } => {
                     let time = display_local_time(time, today);
                     let done = items
                         .iter()
@@ -6076,7 +6202,13 @@ impl Transcript {
                                 .iter()
                                 .filter(|item| item.status == PlanItemStatus::Completed),
                         );
+                    let clipped = !*expanded && items.len() > MAX_COLLAPSED_PLAN_ITEMS;
+                    let mut shown = 0usize;
                     for item in display_items {
+                        if clipped && shown >= MAX_COLLAPSED_PLAN_ITEMS {
+                            break;
+                        }
+                        shown += 1;
                         let (glyph, marker_style, text_style) = match item.status {
                             PlanItemStatus::Completed => (
                                 "✓",
@@ -6115,6 +6247,20 @@ impl Transcript {
                                 Span::styled(line, text_style),
                             ]));
                         }
+                    }
+                    if clipped {
+                        lines.push(Line::from(Span::styled(
+                            format!(
+                                "    + {} more · click to expand",
+                                items.len() - MAX_COLLAPSED_PLAN_ITEMS
+                            ),
+                            Style::default().fg(Color::DarkGray),
+                        )));
+                    } else if *expanded && items.len() > MAX_COLLAPSED_PLAN_ITEMS {
+                        lines.push(Line::from(Span::styled(
+                            "    − show less",
+                            Style::default().fg(Color::DarkGray),
+                        )));
                     }
                     if hovered_entry == Some(index) {
                         for line in &mut lines[entry_start..] {
@@ -6427,16 +6573,19 @@ impl Transcript {
                         let content_start = header_row + 1;
                         let content_end = lines.len();
                         let total_lines = content_end.saturating_sub(content_start);
-                        let max_offset = total_lines.saturating_sub(tool_run_viewport_height);
+                        let viewport_height = if self.tool_run_expanded(window.start) {
+                            total_lines
+                        } else {
+                            tool_run_viewport_height
+                        };
+                        let max_offset = total_lines.saturating_sub(viewport_height);
                         let offset = self
                             .tool_run_offsets
                             .get(&window.start)
                             .copied()
                             .unwrap_or(max_offset)
                             .min(max_offset);
-                        let visible_end = offset
-                            .saturating_add(tool_run_viewport_height)
-                            .min(total_lines);
+                        let visible_end = offset.saturating_add(viewport_height).min(total_lines);
                         let viewport_start = content_start + offset;
                         let sticky_tool_header = tool_rows[first_tool_row..]
                             .iter()
@@ -7592,6 +7741,31 @@ fn wheel_scroll_distance(viewport_height: u16, repetitions: usize) -> isize {
         .saturating_mul(isize::try_from(repetitions).unwrap_or(isize::MAX))
 }
 
+fn nested_wheel_scroll_lines(terminal_height: u16) -> isize {
+    let full = NESTED_WHEEL_SCROLL_FULL_HEIGHT_ROWS;
+    let half = full / 2;
+    let span = full - half;
+    let t = usize::from(terminal_height).clamp(half, full) - half;
+    let range = MAX_WHEEL_SCROLL_LINES_PER_EVENT - MIN_WHEEL_SCROLL_LINES_PER_EVENT;
+    (MIN_WHEEL_SCROLL_LINES_PER_EVENT + (range * t * t + span * span / 2) / (span * span)) as isize
+}
+
+fn nested_wheel_scroll_distance(terminal_height: u16, repetitions: usize) -> isize {
+    nested_wheel_scroll_lines(terminal_height)
+        .saturating_mul(isize::try_from(repetitions).unwrap_or(isize::MAX))
+}
+
+fn sticky_tool_run_header_row(
+    tool_run_rows: &[ToolRunRowRange],
+    scroll_start: usize,
+) -> Option<(usize, usize)> {
+    tool_run_rows
+        .iter()
+        .rev()
+        .find(|(_, start, end, _)| *start < scroll_start && *end > scroll_start)
+        .map(|(index, start, _, _)| (*index, *start))
+}
+
 fn visible_row_ranges(
     rows: &[(usize, usize, usize)],
     scroll_start: usize,
@@ -7975,7 +8149,9 @@ fn splash_logo_line(elapsed: Duration, seed: u64) -> Line<'static> {
         ['한', 'Я', '東', 'Я', '₹', '尺', 'र', 'Ř'],
         ['ก', 'न', 'Ω', 'Ğ', 'Ԍ', 'Ǥ', 'Ǧ', 'ဂ'],
     ];
+    // Repeat the short glitch phase while the launch screen is visible.
     let phase = (elapsed.as_millis() / 110) as u64;
+    let cycle_phase = phase % 45;
     let mut random = splitmix64(seed ^ phase.wrapping_mul(0x9e37_79b9_7f4a_7c15));
     let roll = random % 100;
     let changed_count = if roll < 76 {
@@ -7989,7 +8165,7 @@ fn splash_logo_line(elapsed: Duration, seed: u64) -> Line<'static> {
     };
     let mut cells = ORIGINAL;
     let mut changed = [false; 4];
-    if phase < 12 {
+    if cycle_phase < 12 {
         for _ in 0..changed_count {
             random = splitmix64(random);
             let mut index = (random % 4) as usize;

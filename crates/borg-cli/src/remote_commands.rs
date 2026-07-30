@@ -898,7 +898,7 @@ async fn run_local_agent_session(
                     terminal.has_expiring_notice(),
                     terminal.has_blinking_cursor(),
                     status,
-                )
+                ) || terminal.is_launch_screen()
             }) => {
                 terminal_dirty = true;
             }
