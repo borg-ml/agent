@@ -1,13 +1,16 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use borg_provider::ProviderChannel;
 use borg_provider::provider::{
-    ChatApprovalDecision, ChatStreamControl, ChatStreamEvent, ChatStreamRequest,
-    CodexAppServerPool, LocalAgentPermission, run_claude_chat_stream, run_claude_local_chat_stream,
-    run_codex_chat_stream_with_control, run_codex_local_chat_stream,
-    run_opencode_local_chat_stream, run_pooled_codex_local_chat_stream,
+    ChatApprovalDecision, ChatStreamControl, ChatStreamEvent, ChatStreamRequest, ClaudeSdkPool,
+    CodexAppServerPool, LocalAgentPermission, run_claude_chat_stream_with_control,
+    run_claude_local_chat_stream, run_codex_chat_stream_with_control, run_codex_local_chat_stream,
+    run_opencode_local_chat_stream, run_pooled_claude_local_chat_stream,
+    run_pooled_codex_local_chat_stream,
 };
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -133,8 +136,17 @@ pub trait AgentTurnExecutor: Send + Sync {
 #[derive(Clone, Default)]
 pub struct LocalAgentTurnExecutor {
     codex_pool: CodexAppServerPool,
+    claude_pool: ClaudeSdkPool,
+    claude_sessions: Arc<Mutex<HashMap<String, ClaudeSessionSnapshot>>>,
     native_harness: NativeHarness,
     external_mcp_servers: Vec<borg_provider::mcp::ExternalMcpServer>,
+}
+
+#[derive(Clone)]
+struct ClaudeSessionSnapshot {
+    request: ChatStreamRequest,
+    permission: LocalAgentPermission,
+    pool: Option<ClaudeSdkPool>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -207,16 +219,27 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
             None,
             true,
             Some(self.codex_pool.clone()),
+            Some(self.claude_pool.clone()),
+            Some(self.claude_sessions.clone()),
         )
         .await
     }
 
     async fn compact(&self, provider: CodingProvider, provider_session_id: &str) -> Result<()> {
-        anyhow::ensure!(
-            provider == CodingProvider::Codex,
-            "manual context compaction is currently supported for Codex sessions"
-        );
-        self.codex_pool.compact(provider_session_id)
+        match provider {
+            CodingProvider::Codex => self.codex_pool.compact(provider_session_id),
+            CodingProvider::Claude => {
+                let snapshot = self
+                    .claude_sessions
+                    .lock()
+                    .expect("Claude session registry lock poisoned")
+                    .get(provider_session_id)
+                    .cloned()
+                    .context("Claude context is not available until the current turn finishes")?;
+                compact_claude_session(snapshot, provider_session_id).await
+            }
+            _ => bail!("manual context compaction is not supported by this provider"),
+        }
     }
 
     async fn compact_native(
@@ -260,7 +283,7 @@ pub async fn run_agent_turn_controlled(
         .ok();
     match turn.provider {
         CodingProvider::Codex | CodingProvider::Claude | CodingProvider::OpenCode => {
-            run_borg_provider_turn(turn, events, controls, None, true, None).await
+            run_borg_provider_turn(turn, events, controls, None, true, None, None, None).await
         }
         CodingProvider::Kimi | CodingProvider::OpenRouter | CodingProvider::OpenAiCompatible => {
             NativeHarness::default().run(turn, events, controls).await
@@ -275,6 +298,8 @@ async fn run_borg_provider_turn(
     request_template: Option<ChatStreamRequest>,
     local: bool,
     codex_pool: Option<CodexAppServerPool>,
+    claude_pool: Option<ClaudeSdkPool>,
+    claude_sessions: Option<Arc<Mutex<HashMap<String, ClaudeSessionSnapshot>>>>,
 ) -> Result<AgentTurnResult> {
     let provider_turn_started = Instant::now();
     let ttft_session_id = turn.session_id;
@@ -334,6 +359,12 @@ async fn run_borg_provider_turn(
         }
     };
     let permission = local_permission(turn.permission_mode);
+    let claude_snapshot =
+        (turn.provider == CodingProvider::Claude).then(|| ClaudeSessionSnapshot {
+            request: request.clone(),
+            permission,
+            pool: claude_pool.clone(),
+        });
     let mut stream = match turn.provider {
         CodingProvider::Codex => {
             let control_rx = map_controls(controls);
@@ -345,8 +376,20 @@ async fn run_borg_provider_turn(
                 run_codex_chat_stream_with_control(request, control_rx)
             }
         }
-        CodingProvider::Claude if local => run_claude_local_chat_stream(request, permission),
-        CodingProvider::Claude => run_claude_chat_stream(request),
+        CodingProvider::Claude if local && request_can_use_claude_pool(&request) => {
+            run_pooled_claude_local_chat_stream(
+                request,
+                map_controls(controls),
+                permission,
+                claude_pool.unwrap_or_default(),
+            )
+        }
+        CodingProvider::Claude if local => {
+            run_claude_local_chat_stream(request, map_controls(controls), permission)
+        }
+        CodingProvider::Claude => {
+            run_claude_chat_stream_with_control(request, map_controls(controls))
+        }
         CodingProvider::OpenCode if local => run_opencode_local_chat_stream(request, permission),
         CodingProvider::OpenCode => {
             bail!("OpenCode execution is only supported on an enrolled host")
@@ -651,6 +694,16 @@ async fn run_borg_provider_turn(
         },
     )
     .await;
+    if let (Some(session_id), Some(snapshot), Some(registry)) = (
+        provider_session_id.as_ref(),
+        claude_snapshot,
+        claude_sessions,
+    ) {
+        registry
+            .lock()
+            .expect("Claude session registry lock poisoned")
+            .insert(session_id.clone(), snapshot);
+    }
     Ok(AgentTurnResult {
         provider_session_id,
         final_text: if final_output.is_empty() {
@@ -659,6 +712,37 @@ async fn run_borg_provider_turn(
             final_output
         },
     })
+}
+
+fn request_can_use_claude_pool(request: &ChatStreamRequest) -> bool {
+    request.provider_auth.is_none() && request.git_credentials.is_empty()
+}
+
+async fn compact_claude_session(
+    snapshot: ClaudeSessionSnapshot,
+    provider_session_id: &str,
+) -> Result<()> {
+    let mut request = snapshot.request;
+    request.prompt = "/compact".to_string();
+    request.attachments.clear();
+    request.output_schema = None;
+    request.session_id = Some(provider_session_id.to_string());
+    request.resume_unavailable_prompt = None;
+    let mut stream = if let Some(pool) = snapshot.pool
+        && request_can_use_claude_pool(&request)
+    {
+        run_pooled_claude_local_chat_stream(request, None, snapshot.permission, pool)
+    } else {
+        run_claude_local_chat_stream(request, None, snapshot.permission)
+    };
+    while let Some(event) = stream.recv().await {
+        match event {
+            ChatStreamEvent::Done { .. } => return Ok(()),
+            ChatStreamEvent::Failed { error } => bail!("Claude context compaction failed: {error}"),
+            _ => {}
+        }
+    }
+    bail!("Claude context compaction ended without confirmation")
 }
 
 fn provider_event_is_transient(kind: &str) -> bool {
@@ -686,6 +770,12 @@ struct LiveContextUsage {
 }
 
 fn live_context_usage(kind: &str, payload: &serde_json::Value) -> Option<LiveContextUsage> {
+    if kind == "claude.context_usage" {
+        return Some(LiveContextUsage {
+            total_tokens: payload.get("total_tokens")?.as_u64()?,
+            context_window_tokens: payload.get("context_window_tokens")?.as_u64()?,
+        });
+    }
     if kind != "thread/tokenUsage/updated" {
         return None;
     }
@@ -724,6 +814,19 @@ fn user_facing_provider_error(provider: CodingProvider, error: &str) -> String {
             || normalized.contains("401 unauthorized"))
     {
         return "Codex sign-in required. Run /login to reconnect, then retry your message."
+            .to_string();
+    }
+    if provider == CodingProvider::Claude
+        && (normalized.contains("not logged in")
+            || normalized.contains("authentication required")
+            || normalized.contains("authentication_error")
+            || normalized.contains("invalid x-api-key")
+            || normalized.contains("oauth token")
+            || normalized.contains("please run /login")
+            || normalized.contains("please sign in")
+            || normalized.contains("401 unauthorized"))
+    {
+        return "Claude sign-in required. Run /login to reconnect, then retry your message."
             .to_string();
     }
     error.to_string()
@@ -895,6 +998,21 @@ mod tests {
     }
 
     #[test]
+    fn claude_context_usage_is_available_before_turn_completion() {
+        let usage = live_context_usage(
+            "claude.context_usage",
+            &serde_json::json!({
+                "total_tokens": 91_000,
+                "context_window_tokens": 200_000,
+            }),
+        )
+        .expect("Claude context usage");
+
+        assert_eq!(usage.total_tokens, 91_000);
+        assert_eq!(usage.context_window_tokens, 200_000);
+    }
+
+    #[test]
     fn codex_auth_failures_have_one_actionable_terminal_message() {
         let message = user_facing_provider_error(
             CodingProvider::Codex,
@@ -905,5 +1023,18 @@ mod tests {
             "Codex sign-in required. Run /login to reconnect, then retry your message."
         );
         assert!(!message.contains("401"));
+    }
+
+    #[test]
+    fn claude_auth_failures_have_one_actionable_terminal_message() {
+        let message = user_facing_provider_error(
+            CodingProvider::Claude,
+            "claude SDK error: authentication_error: invalid x-api-key",
+        );
+        assert_eq!(
+            message,
+            "Claude sign-in required. Run /login to reconnect, then retry your message."
+        );
+        assert!(!message.contains("x-api-key"));
     }
 }

@@ -206,9 +206,6 @@ impl OpenAiCompatibleProvider {
                 if let Some(reasoning) = compatible_reasoning(self.effort.as_deref()) {
                     body["reasoning"] = reasoning;
                 }
-                if let Some(provider) = compatible_openrouter_provider_preferences() {
-                    body["provider"] = provider;
-                }
             }
             OpenAiCompatibleProfile::Generic => {
                 if let Some(max_tokens) = openai_compatible_max_tokens() {
@@ -266,6 +263,15 @@ impl OpenAiCompatibleProvider {
                 }
                 None => {}
             }
+        }
+        if profile == OpenAiCompatibleProfile::OpenRouter
+            && let Some(provider) = compatible_openrouter_provider_preferences(
+                !request.tools.is_empty()
+                    || body.get("reasoning").is_some()
+                    || body.get("response_format").is_some(),
+            )
+        {
+            body["provider"] = provider;
         }
 
         let client = compatible_http_client();
@@ -839,8 +845,9 @@ async fn read_kimi_model_stream(
 fn kimi_reasoning_effort(effort: Option<&str>) -> &'static str {
     match effort.map(str::trim) {
         Some("low") => "low",
+        Some("high") => "high",
         Some("max") | Some("xhigh") | Some("ultra") => "max",
-        _ => "high",
+        _ => "max",
     }
 }
 
@@ -897,23 +904,30 @@ fn compatible_reasoning(effort: Option<&str>) -> Option<Value> {
     }
 }
 
-fn compatible_openrouter_provider_preferences() -> Option<Value> {
-    let order = nonempty_env("BORG_OPENROUTER_PROVIDER_ORDER")?
-        .split(',')
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-        .collect::<Vec<_>>();
-    if order.is_empty() {
-        return None;
-    }
+fn compatible_openrouter_provider_preferences(require_parameters: bool) -> Option<Value> {
+    let order = nonempty_env("BORG_OPENROUTER_PROVIDER_ORDER")
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     let allow_fallbacks = nonempty_env("BORG_OPENROUTER_ALLOW_FALLBACKS")
         .and_then(|value| value.parse::<bool>().ok())
         .unwrap_or(true);
-    Some(json!({
-        "order": order,
-        "allow_fallbacks": allow_fallbacks,
-    }))
+    (require_parameters || !order.is_empty()).then(|| {
+        let mut provider = json!({
+            "allow_fallbacks": allow_fallbacks,
+            "require_parameters": require_parameters,
+        });
+        if !order.is_empty() {
+            provider["order"] = json!(order);
+        }
+        provider
+    })
 }
 
 fn openrouter_cost_microusd(raw: &Value) -> Option<u64> {
@@ -939,7 +953,7 @@ fn kimi_retry_delay_without_response(attempt: u32) -> std::time::Duration {
 fn kimi_max_completion_tokens() -> u64 {
     nonempty_env("BORG_KIMI_MAX_COMPLETION_TOKENS")
         .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(32_768)
+        .unwrap_or(131_072)
         .clamp(1, 1_048_576)
 }
 
@@ -947,7 +961,13 @@ pub fn kimi_usage_from_response(
     raw: &Value,
     duration_ms: u64,
 ) -> crate::runtime::ProviderCallUsage {
-    extract_chat_completions_usage(raw, duration_ms, Some(kimi_cost_microusd(raw)))
+    let mut usage = extract_chat_completions_usage(raw, duration_ms, Some(kimi_cost_microusd(raw)));
+    // Kimi K3 exposes a 1M-token context window. Report the provider's prompt
+    // occupancy so Borg can drive the same context UI and compaction warnings
+    // as provider-native integrations.
+    usage.context_tokens = Some(usage.input_tokens.saturating_add(usage.cached_input_tokens));
+    usage.context_window_tokens = Some(1_048_576);
+    usage
 }
 
 pub fn kimi_cost_microusd(raw: &Value) -> u64 {
@@ -1063,6 +1083,28 @@ mod tests {
             }
         });
         assert_eq!(kimi_cost_microusd(&raw), 3_960_000);
+    }
+
+    #[test]
+    fn kimi_usage_reports_k3_context_occupancy() {
+        let raw = json!({
+            "usage": {
+                "prompt_tokens": 1_000,
+                "prompt_tokens_details": { "cached_tokens": 200 },
+                "completion_tokens": 100
+            }
+        });
+        let usage = kimi_usage_from_response(&raw, 5);
+        assert_eq!(usage.context_tokens, Some(1_000));
+        assert_eq!(usage.context_window_tokens, Some(1_048_576));
+    }
+
+    #[test]
+    fn kimi_effort_matches_the_k3_wire_contract() {
+        assert_eq!(kimi_reasoning_effort(Some("low")), "low");
+        assert_eq!(kimi_reasoning_effort(Some("high")), "high");
+        assert_eq!(kimi_reasoning_effort(Some("max")), "max");
+        assert_eq!(kimi_reasoning_effort(None), "max");
     }
 
     #[test]

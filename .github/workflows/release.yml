@@ -52,6 +52,13 @@ jobs:
           targets: ${{ matrix.target }}
       - name: Build CLI
         run: cargo build --locked --release --target ${{ matrix.target }} -p borg
+      - name: Build Claude Agent SDK adapter
+        shell: bash
+        run: |
+          npm --prefix packages/borg-claude-sdk ci
+          npm --prefix packages/borg-claude-sdk run check
+          npm --prefix packages/borg-claude-sdk run build
+          npm --prefix packages/borg-claude-sdk prune --omit=dev
       - name: Package Unix archive
         if: matrix.archive == 'tar'
         shell: bash
@@ -60,8 +67,10 @@ jobs:
           package_dir="borg-${{ matrix.target }}"
           mkdir "$package_dir"
           cp "target/${{ matrix.target }}/release/borg" "$package_dir/"
+          mkdir -p "$package_dir/providers"
+          cp -R packages/borg-claude-sdk "$package_dir/providers/claude-sdk"
           cp LICENSE NOTICE.md README.md "$package_dir/"
-          tar -C "$package_dir" -czf "$PWD/$asset" borg LICENSE NOTICE.md README.md
+          tar -C "$package_dir" -czf "$PWD/$asset" borg providers LICENSE NOTICE.md README.md
           if command -v sha256sum >/dev/null 2>&1; then
             sha256sum "$asset" >"$asset.sha256"
           else
@@ -75,6 +84,8 @@ jobs:
           $packageDir = "borg-${{ matrix.target }}"
           New-Item -ItemType Directory -Path $packageDir
           Copy-Item "target/${{ matrix.target }}/release/borg.exe" $packageDir
+          New-Item -ItemType Directory -Path "$packageDir/providers"
+          Copy-Item -Recurse "packages/borg-claude-sdk" "$packageDir/providers/claude-sdk"
           Copy-Item LICENSE, NOTICE.md, README.md $packageDir
           Compress-Archive -Path "$packageDir/*" -DestinationPath $asset
           $hash = (Get-FileHash -Algorithm SHA256 $asset).Hash.ToLowerInvariant()

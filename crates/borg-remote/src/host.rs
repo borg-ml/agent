@@ -335,9 +335,9 @@ async fn probe_provider(provider: CodingProvider, managed_kimi: bool) -> Provide
         .ok()
         .filter(|value| !value.is_empty());
     let auth = match provider {
-        CodingProvider::Codex => command_output("codex", &["login", "status"]).await,
-        CodingProvider::Claude => command_output("claude", &["auth", "status"]).await,
-        CodingProvider::OpenCode => command_output("opencode", &["providers", "list"]).await,
+        CodingProvider::Codex | CodingProvider::Claude | CodingProvider::OpenCode => {
+            provider_auth_status(provider).await
+        }
         CodingProvider::Kimi if managed_kimi => {
             Ok("Borg gateway credentials available".to_string())
         }
@@ -351,6 +351,7 @@ async fn probe_provider(provider: CodingProvider, managed_kimi: bool) -> Provide
         CodingProvider::OpenAiCompatible => Ok("OpenAI-compatible endpoint available".to_string()),
     };
     let authenticated = auth.as_ref().is_ok_and(|output| match provider {
+        CodingProvider::Claude => claude_auth_status_authenticated(output),
         // OpenCode prints a non-empty table header even with zero credentials.
         // A bullet represents either a stored credential or a usable provider
         // environment variable.
@@ -363,6 +364,31 @@ async fn probe_provider(provider: CodingProvider, managed_kimi: bool) -> Provide
         version,
         authenticated,
         auth_detail: authenticated.then(|| "Provider credentials available".to_string()),
+    }
+}
+
+async fn provider_auth_status(provider: CodingProvider) -> Result<String> {
+    match provider {
+        CodingProvider::Codex => command_output("codex", &["login", "status"]).await,
+        CodingProvider::Claude => command_output("claude", &["auth", "status", "--json"]).await,
+        CodingProvider::OpenCode => command_output("opencode", &["providers", "list"]).await,
+        _ => bail!("{provider:?} does not use an interactive provider login"),
+    }
+}
+
+fn claude_auth_status_authenticated(output: &str) -> bool {
+    match serde_json::from_str::<serde_json::Value>(output) {
+        Ok(value) => value
+            .get("loggedIn")
+            .or_else(|| value.get("logged_in"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        Err(_) => {
+            let normalized = output.to_ascii_lowercase();
+            !normalized.trim().is_empty()
+                && !normalized.contains("not logged in")
+                && !normalized.contains("logged out")
+        }
     }
 }
 
@@ -408,6 +434,21 @@ pub async fn login_provider(provider: CodingProvider) -> Result<()> {
     if !status.success() {
         bail!("{} login exited with {status}", provider.executable());
     }
+    let auth = provider_auth_status(provider).await.with_context(|| {
+        format!(
+            "{} login completed but auth status failed",
+            provider.executable()
+        )
+    })?;
+    anyhow::ensure!(
+        match provider {
+            CodingProvider::Claude => claude_auth_status_authenticated(&auth),
+            CodingProvider::OpenCode => auth.lines().any(|line| line.contains('●')),
+            _ => !auth.trim().is_empty(),
+        },
+        "{} login completed but no authenticated session is available",
+        provider.executable()
+    );
     Ok(())
 }
 
@@ -1702,6 +1743,27 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn claude_auth_status_requires_an_authenticated_json_state() {
+        assert!(claude_auth_status_authenticated(
+            r#"{"loggedIn":true,"authMethod":"claude.ai"}"#
+        ));
+        assert!(!claude_auth_status_authenticated(
+            r#"{"loggedIn":false,"authMethod":null}"#
+        ));
+        assert!(!claude_auth_status_authenticated("{}"));
+        assert!(!claude_auth_status_authenticated("Not logged in"));
+    }
+
+    #[test]
+    fn claude_auth_status_accepts_legacy_positive_text_only() {
+        assert!(claude_auth_status_authenticated(
+            "Logged in with a Claude account"
+        ));
+        assert!(!claude_auth_status_authenticated(""));
+        assert!(!claude_auth_status_authenticated("Logged out"));
     }
 
     fn test_config(root: &Path) -> HostConfig {

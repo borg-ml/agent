@@ -1342,7 +1342,7 @@ async fn run_agent_session_store_kernel(
                             output_schema,
                             delivery,
                             ..
-                        } if steers_active_codex_turn(launch.provider, delivery) => {
+                        } if steers_active_provider_turn(launch.provider, delivery) => {
                             if journal.contains_message(session_id, message_id).await? {
                                 continue;
                             }
@@ -1525,8 +1525,7 @@ async fn run_agent_session_store_kernel(
                                     .filter(|goal| goal.status == GoalStatus::Active)
                             {
                                 let text = objective_updated_prompt(active_goal);
-                                if launch.provider == CodingProvider::Codex
-                                    || launch.provider.uses_native_harness()
+                                if provider_supports_active_turn_control(launch.provider)
                                 {
                                     let (ack, _result) = oneshot::channel();
                                     control_tx
@@ -1561,7 +1560,9 @@ async fn run_agent_session_store_kernel(
                             )
                             .await?;
                         }
-                        HostCommand::Interrupt { .. } if launch.provider == CodingProvider::Codex => {
+                        HostCommand::Interrupt { .. }
+                            if provider_supports_active_turn_control(launch.provider) =>
+                        {
                             pause_active_goal(
                                 &mut journal,
                                 &events,
@@ -1727,13 +1728,13 @@ async fn run_agent_session_store_kernel(
         .await?;
         at_turn_boundary = true;
         if interrupted {
-            // Codex interruption is scoped to the active turn. The app-server
-            // returns the same durable thread id after `turn/interrupt`, so
-            // discarding it here silently forks the conversation, loses the
-            // provider cache, and replaces native thread history with Borg's
-            // lossy retained-context projection. Only providers whose stream
-            // is aborted without a resumable turn contract need that fallback.
-            if launch.provider != CodingProvider::Codex {
+            // Codex and Claude interruption is scoped to the active turn and
+            // preserves the provider thread/session. Discarding that id here
+            // silently forks the conversation and loses provider-side cache.
+            if !matches!(
+                launch.provider,
+                CodingProvider::Codex | CodingProvider::Claude
+            ) {
                 provider_session_id = None;
                 retained_context = if launch.provider.uses_native_harness() {
                     None
@@ -2171,9 +2172,13 @@ async fn collect_input_at_turn_boundary(
     Ok(interrupted)
 }
 
-fn steers_active_codex_turn(provider: CodingProvider, delivery: PromptDelivery) -> bool {
-    (provider == CodingProvider::Codex || provider.uses_native_harness())
-        && delivery == PromptDelivery::Steer
+fn provider_supports_active_turn_control(provider: CodingProvider) -> bool {
+    matches!(provider, CodingProvider::Codex | CodingProvider::Claude)
+        || provider.uses_native_harness()
+}
+
+fn steers_active_provider_turn(provider: CodingProvider, delivery: PromptDelivery) -> bool {
+    provider_supports_active_turn_control(provider) && delivery == PromptDelivery::Steer
 }
 
 fn is_executor_lifecycle_status(kind: &SessionEventKind) -> bool {
@@ -5290,23 +5295,25 @@ mod tests {
     }
 
     #[test]
-    fn active_codex_steer_uses_native_turn_control_with_or_without_attachments() {
-        assert!(steers_active_codex_turn(
+    fn active_provider_steer_uses_turn_control_for_codex_and_claude() {
+        assert!(steers_active_provider_turn(
             CodingProvider::Codex,
             PromptDelivery::Steer,
         ));
-        // Attachments use the same Codex `UserInput` contract as text and do
-        // not change this decision.
-        assert!(!steers_active_codex_turn(
+        assert!(steers_active_provider_turn(
+            CodingProvider::Claude,
+            PromptDelivery::Steer,
+        ));
+        assert!(!steers_active_provider_turn(
             CodingProvider::Codex,
             PromptDelivery::Queue,
         ));
-        assert!(!steers_active_codex_turn(
+        assert!(!steers_active_provider_turn(
             CodingProvider::Claude,
             PromptDelivery::Queue,
         ));
-        assert!(steers_active_codex_turn(
-            CodingProvider::Codex,
+        assert!(!steers_active_provider_turn(
+            CodingProvider::OpenCode,
             PromptDelivery::Steer,
         ));
     }

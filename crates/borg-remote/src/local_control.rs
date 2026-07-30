@@ -196,6 +196,7 @@ pub async fn run_attached_session(
 
     let mut refresh = tokio::time::interval(std::time::Duration::from_millis(100));
     let mut live_revision = 0_u64;
+    let mut reasoning_snapshot = String::new();
     loop {
         tokio::select! {
             command = commands.recv() => {
@@ -245,6 +246,14 @@ pub async fn run_attached_session(
             _ = refresh.tick() => {
                 for event in store.events_after(session_id, last_sequence, 1_000).await? {
                     last_sequence = event.sequence;
+                    if event
+                        .kind
+                        .cleared_live_state_keys()
+                        .iter()
+                        .any(|key| key == "reasoning")
+                    {
+                        reasoning_snapshot.clear();
+                    }
                     let stopped = matches!(
                         event.kind,
                         SessionEventKind::StatusChanged {
@@ -258,14 +267,10 @@ pub async fn run_attached_session(
                 }
                 for live in store.live_events_after(session_id, live_revision).await? {
                     live_revision = live_revision.max(live.revision);
-                    // Reasoning live state is an accumulated snapshot, while
-                    // the public event remains a delta for the owning TUI.
-                    // Attached terminals resume at the next durable boundary
-                    // rather than appending repeated snapshots.
-                    if matches!(live.event.kind, SessionEventKind::ReasoningDelta { .. }) {
-                        continue;
-                    }
-                    if events.send(live.event).await.is_err() {
+                    if let Some(event) =
+                        reasoning_delta_from_snapshot(live.event, &mut reasoning_snapshot)
+                        && events.send(event).await.is_err()
+                    {
                         return Ok(());
                     }
                 }
@@ -279,6 +284,25 @@ pub async fn run_attached_session(
             }
         }
     }
+}
+
+fn reasoning_delta_from_snapshot(
+    mut event: SessionEvent,
+    previous_snapshot: &mut String,
+) -> Option<SessionEvent> {
+    let SessionEventKind::ReasoningDelta { text } = &mut event.kind else {
+        return Some(event);
+    };
+    let delta = text
+        .strip_prefix(previous_snapshot.as_str())
+        .unwrap_or(text)
+        .to_string();
+    *previous_snapshot = text.clone();
+    if delta.is_empty() {
+        return None;
+    }
+    *text = delta;
+    Some(event)
 }
 
 fn writer_is_active(journal_path: &Path) -> Result<bool> {
@@ -416,5 +440,57 @@ mod tests {
                 .unwrap();
         assert!(tokio::net::UnixStream::connect(&socket_path).await.is_ok());
         drop(server);
+    }
+
+    #[test]
+    fn attached_reasoning_snapshots_become_incremental_deltas() {
+        let session_id = Uuid::new_v4();
+        let mut previous = String::new();
+        let snapshot = |text: &str| {
+            SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::ReasoningDelta {
+                    text: text.to_string(),
+                },
+            )
+        };
+
+        let first = reasoning_delta_from_snapshot(snapshot("thinking "), &mut previous).unwrap();
+        let second =
+            reasoning_delta_from_snapshot(snapshot("thinking carefully"), &mut previous).unwrap();
+        let duplicate =
+            reasoning_delta_from_snapshot(snapshot("thinking carefully"), &mut previous);
+
+        assert!(matches!(
+            first.kind,
+            SessionEventKind::ReasoningDelta { ref text } if text == "thinking "
+        ));
+        assert!(matches!(
+            second.kind,
+            SessionEventKind::ReasoningDelta { ref text } if text == "carefully"
+        ));
+        assert!(duplicate.is_none());
+    }
+
+    #[test]
+    fn attached_reasoning_accepts_a_new_snapshot_after_live_state_reset() {
+        let session_id = Uuid::new_v4();
+        let mut previous = "old reasoning".to_string();
+        let event = SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::ReasoningDelta {
+                text: "new reasoning".to_string(),
+            },
+        );
+
+        let delta = reasoning_delta_from_snapshot(event, &mut previous).unwrap();
+
+        assert!(matches!(
+            delta.kind,
+            SessionEventKind::ReasoningDelta { ref text } if text == "new reasoning"
+        ));
+        assert_eq!(previous, "new reasoning");
     }
 }

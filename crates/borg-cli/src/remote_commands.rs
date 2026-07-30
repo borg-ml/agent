@@ -477,7 +477,10 @@ async fn run_local_agent_session(
     });
     let requested_effort = args.effort.clone().or_else(|| match requested_provider {
         CodingProvider::Codex => Some(borg_provider::codex_default_effort().to_string()),
-        CodingProvider::Kimi | CodingProvider::OpenRouter => Some("high".to_string()),
+        CodingProvider::Kimi => Some(borg_provider::kimi_default_effort().to_string()),
+        // OpenRouter spans reasoning and non-reasoning models. Only send its
+        // optional reasoning parameter after an explicit user selection.
+        CodingProvider::OpenRouter => None,
         CodingProvider::OpenAiCompatible => None,
         CodingProvider::Claude | CodingProvider::OpenCode => None,
     });
@@ -3128,7 +3131,9 @@ fn running_input(
     }
     if let Some(text) = line.strip_prefix("/steer ") {
         return (
-            if provider == CodingProvider::Codex || provider.uses_native_harness() {
+            if matches!(provider, CodingProvider::Codex | CodingProvider::Claude)
+                || provider.uses_native_harness()
+            {
                 PromptDelivery::Steer
             } else {
                 PromptDelivery::Queue
@@ -3137,7 +3142,8 @@ fn running_input(
         );
     }
     (
-        if (provider == CodingProvider::Codex || provider.uses_native_harness())
+        if (matches!(provider, CodingProvider::Codex | CodingProvider::Claude)
+            || provider.uses_native_harness())
             && steer_active_turn
         {
             PromptDelivery::Steer
@@ -3213,7 +3219,7 @@ fn print_agent_help() {
   /color TARGET HEX set a transcript colour
   /usage            show real Codex weekly limit and session tokens
   /clear            clear the conversation context
-  /compact          compact the current Codex context
+  /compact          compact the current provider context
   /goal             show the durable session goal
   /goal OBJECTIVE   set the goal and begin working
   /goal pause       pause automatic continuation
@@ -3953,7 +3959,11 @@ mod tests {
         );
         assert_eq!(
             running_input("plain", CodingProvider::Claude, true).0,
-            PromptDelivery::Queue
+            PromptDelivery::Steer
+        );
+        assert_eq!(
+            running_input("/steer now", CodingProvider::Claude, false).0,
+            PromptDelivery::Steer
         );
     }
 

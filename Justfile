@@ -3,6 +3,22 @@ set shell := ["bash", "-eu", "-o", "pipefail", "-c"]
 default:
     @just --list
 
+# Install the pinned Claude Agent SDK adapter used by local and remote sessions.
+claude-sdk:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    source_dir="$PWD/packages/borg-claude-sdk"
+    install_dir="${BORG_HOME:-$HOME/.borg}/providers/claude-sdk"
+    test -f "$source_dir/package-lock.json"
+    mkdir -p "$install_dir"
+    cp "$source_dir/package.json" "$source_dir/package-lock.json" "$source_dir/tsconfig.json" "$install_dir/"
+    mkdir -p "$install_dir/src"
+    cp "$source_dir/src/provider.ts" "$install_dir/src/provider.ts"
+    npm --prefix "$install_dir" ci
+    npm --prefix "$install_dir" run check
+    npm --prefix "$install_dir" run build
+    npm --prefix "$install_dir" prune --omit=dev
+
 # Validate a release without changing the repository.
 release-check version="":
     ./scripts/release.sh --check {{ quote(version) }}

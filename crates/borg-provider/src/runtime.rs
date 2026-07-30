@@ -49,7 +49,7 @@ pub const CLAUDE_MODEL_CATALOG: ProviderModelCatalog = ProviderModelCatalog {
 };
 
 pub const KIMI_SELECTABLE_MODELS: [(&str, &str); 1] = [("kimi-k3", "Kimi K3")];
-pub const KIMI_EFFORT_LEVELS: [&str; 3] = ["low", "medium", "high"];
+pub const KIMI_EFFORT_LEVELS: [&str; 3] = ["low", "high", "max"];
 pub const KIMI_MODEL_CATALOG: ProviderModelCatalog = ProviderModelCatalog {
     backend: "kimi",
     default_model: "kimi-k3",
@@ -175,7 +175,7 @@ pub fn kimi_product_model() -> &'static str {
 }
 
 pub fn kimi_default_effort() -> &'static str {
-    "low"
+    "max"
 }
 
 pub fn kimi_effort_levels() -> Vec<String> {

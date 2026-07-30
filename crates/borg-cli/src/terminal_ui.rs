@@ -3113,11 +3113,12 @@ impl BorgTerminal {
                 ));
             }
             let agents_status_start = status_spans.iter().map(|span| span.width()).sum::<usize>();
-            let agents_status_width =
-                (total_subagents > 0).then(|| format!(" · {team_agent_count} agents").width());
+            let agents_status = (total_subagents > 0)
+                .then(|| agents_status_label(team_agent_count, active_subagents));
+            let agents_status_width = agents_status.as_ref().map(|status| status.width());
             if total_subagents > 0 {
                 status_spans.push(Span::styled(
-                    format!(" · {team_agent_count} agents"),
+                    agents_status.expect("agent status exists when subagents are present"),
                     Style::default()
                         .fg(if self.agents_status_hovered || self.team_switcher_open {
                             Color::White
@@ -7276,9 +7277,8 @@ fn slash_help(matches: &[&(&str, &str)]) -> String {
 
 fn primary_controls_line(keymap: &KeyMap) -> String {
     format!(
-        "send {} · queue {} · commands / · keybindings {}",
+        "send {} · commands / · keybindings {}",
         keymap.label(KeyAction::Send),
-        keymap.label(KeyAction::Queue),
         keymap.label(KeyAction::Keybindings)
     )
 }
@@ -8045,6 +8045,17 @@ fn activity_glyph(status: SessionStatus) -> &'static str {
     }
     const FRAMES: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
     FRAMES[spinner_frame_index()]
+}
+
+fn agents_status_label(team_agent_count: usize, active_subagents: usize) -> String {
+    if active_subagents > 0 {
+        format!(
+            " · {} {team_agent_count} agents",
+            activity_glyph(SessionStatus::Running)
+        )
+    } else {
+        format!(" · {team_agent_count} agents")
+    }
 }
 
 fn spinner_frame_index() -> usize {
