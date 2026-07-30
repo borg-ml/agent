@@ -50,7 +50,14 @@ impl CleanShellEnv {
             "-c".to_string(),
             "shell_environment_policy.experimental_use_profile=false".to_string(),
             "-c".to_string(),
-            "shell_environment_policy.inherit=\"core\"".to_string(),
+            // The point of this policy is a predictable *shell*, not a
+            // stripped environment: `core` keeps only HOME/PATH/USER and the
+            // like, so an agent cannot see the credentials and settings the
+            // user exported for it. Inherit everything and keep the shell
+            // itself clean through the `set` overrides below.
+            "shell_environment_policy.inherit=\"all\"".to_string(),
+            "-c".to_string(),
+            "shell_environment_policy.ignore_default_excludes=true".to_string(),
             "-c".to_string(),
             format!("shell_environment_policy.set.SHELL=\"{CLEAN_BASH_PATH}\""),
             "-c".to_string(),
@@ -105,7 +112,24 @@ mod tests {
         assert!(
             args.contains(&"shell_environment_policy.experimental_use_profile=false".to_string())
         );
-        assert!(args.contains(&"shell_environment_policy.inherit=\"core\"".to_string()));
         assert!(args.contains(&"shell_environment_policy.set.SHELL=\"/bin/bash\"".to_string()));
+    }
+
+    /// The clean shell must not double as a credential filter: an agent runs
+    /// what the user exported for it, and `core` silently hid all of it.
+    #[test]
+    fn codex_config_args_inherit_the_whole_environment() {
+        let env = CleanShellEnv::new().expect("clean shell env");
+        let args = env.codex_config_args();
+        assert!(args.contains(&"shell_environment_policy.inherit=\"all\"".to_string()));
+        assert!(
+            args.contains(&"shell_environment_policy.ignore_default_excludes=true".to_string())
+        );
+        assert!(!args.contains(&"shell_environment_policy.inherit=\"core\"".to_string()));
+        // Each config value is preceded by its own `-c`.
+        assert_eq!(
+            args.iter().filter(|arg| *arg == "-c").count(),
+            args.len() / 2
+        );
     }
 }

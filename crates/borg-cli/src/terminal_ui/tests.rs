@@ -128,7 +128,7 @@ fn keybinding_help_is_action_first_and_uses_configuration() {
     let keymap = KeyMap::from_config(&config).expect("keymap");
     assert_eq!(
         primary_controls_line(&keymap),
-        "send ctrl+s · commands / · keybindings ?"
+        "send ctrl+s · commands / · palette tab or ?"
     );
     let help = keybinding_lines(&keymap, 60)
         .into_iter()
@@ -1006,6 +1006,123 @@ fn actionable_inactive_goals_remain_in_the_status_line() {
     assert_eq!(transcript.goal_status(), None);
 }
 
+/// Clicking the goal segment must submit exactly the slash command the user
+/// would type, and must stay inert where there is no run state to flip.
+#[test]
+fn the_goal_status_segment_toggles_only_what_it_can() {
+    let mut goal = SessionGoal::new("Ship the terminal polish".to_string(), None);
+
+    goal.status = GoalStatus::Active;
+    assert_eq!(goal_toggle_command(&goal), Some("/goal pause"));
+    assert_eq!(goal_tooltip_title(&goal), " Goal · click to pause ");
+
+    for status in [
+        GoalStatus::Paused,
+        GoalStatus::Blocked,
+        GoalStatus::UsageLimited,
+    ] {
+        goal.status = status;
+        assert_eq!(goal_toggle_command(&goal), Some("/goal resume"));
+        assert_eq!(goal_tooltip_title(&goal), " Goal · click to resume ");
+    }
+
+    for status in [GoalStatus::BudgetLimited, GoalStatus::Complete] {
+        goal.status = status;
+        assert_eq!(goal_toggle_command(&goal), None);
+        assert_eq!(goal_tooltip_title(&goal), " Goal ");
+    }
+}
+
+/// The click is only honest if the command it submits is one the parser
+/// accepts; a rename on either side must break this.
+#[test]
+fn every_goal_toggle_command_round_trips_through_the_parser() {
+    use borg_remote::GoalAction;
+
+    let mut goal = SessionGoal::new("Ship the terminal polish".to_string(), None);
+    for (status, expected) in [
+        (GoalStatus::Active, GoalAction::Pause),
+        (GoalStatus::Paused, GoalAction::Resume),
+        (GoalStatus::Blocked, GoalAction::Resume),
+        (GoalStatus::UsageLimited, GoalAction::Resume),
+    ] {
+        goal.status = status;
+        let command = goal_toggle_command(&goal).expect("status is toggleable");
+        assert_eq!(
+            crate::remote_commands::parse_goal_action(command).expect("parser accepts the click"),
+            expected
+        );
+    }
+}
+
+/// An edit with no diff on screen yet has nothing for the user to watch, and
+/// edits take a while. The row says one is coming until the diff itself lands.
+#[test]
+fn an_edit_reads_as_preparing_until_its_diff_is_on_screen() {
+    let session_id = Uuid::new_v4();
+    let rendered = |transcript: &Transcript| {
+        transcript
+            .lines(120)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let started = |name: &str, input: serde_json::Value| {
+        let mut transcript = Transcript::default();
+        transcript.apply(&SessionEvent::new(
+            session_id,
+            1,
+            SessionEventKind::ToolStarted {
+                tool_call_id: "tool-1".to_string(),
+                name: name.to_string(),
+                input,
+                input_ref: None,
+            },
+        ));
+        transcript
+    };
+
+    // Nothing at all yet: the payload has not hydrated.
+    let bodyless = rendered(&started("apply_patch", serde_json::Value::Null));
+    assert!(bodyless.contains("preparing edit"), "{bodyless}");
+    assert!(!bodyless.contains("· running"), "{bodyless}");
+
+    // A body, but not a diff: the patch is still being assembled, so there is
+    // still nothing to look at.
+    let no_diff_yet = rendered(&started(
+        "apply_patch",
+        serde_json::json!({ "file_path": "src/main.rs" }),
+    ));
+    assert!(no_diff_yet.contains("preparing edit"), "{no_diff_yet}");
+    assert!(!no_diff_yet.contains("· running"), "{no_diff_yet}");
+
+    // The diff is on screen and speaks for itself.
+    let with_diff = started(
+        "apply_patch",
+        serde_json::json!({
+            "file_path": "src/main.rs",
+            "patch": "--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1 +1 @@\n-one\n+two\n",
+        }),
+    );
+    assert!(
+        matches!(
+            &with_diff.order[0],
+            TranscriptEntry::Tool { code_view: Some((language, _)), .. }
+                if is_diff_language(language)
+        ),
+        "the fixture must actually produce a diff body"
+    );
+    let with_diff = rendered(&with_diff);
+    assert!(!with_diff.contains("preparing edit"), "{with_diff}");
+    assert!(with_diff.contains("running"), "{with_diff}");
+
+    // A bodyless non-edit tool is never described as preparing one.
+    let read = rendered(&started("read_file", serde_json::Value::Null));
+    assert!(!read.contains("preparing edit"), "{read}");
+    assert!(read.contains("running"), "{read}");
+}
+
 #[test]
 fn status_path_uses_fish_style_parent_abbreviations() {
     assert_eq!(
@@ -1844,6 +1961,75 @@ fn assistant_message_actions_stay_out_of_the_transcript() {
 }
 
 #[test]
+fn fuzzy_match_accepts_subsequences_and_rejects_reordering() {
+    assert!(fuzzy_matches("/goal", "gl"));
+    assert!(fuzzy_matches("/expand-tools", "expt"));
+    assert!(fuzzy_matches("/EXPAND-TOOLS", "expand"));
+    assert!(fuzzy_matches("scroll transcript    ctrl+u", "scroll"));
+    // Spaces in the query span the gap between label and key.
+    assert!(fuzzy_matches("send                 enter", "send ent"));
+    assert!(!fuzzy_matches("/goal", "lg"));
+    assert!(!fuzzy_matches("/goal", "goalx"));
+}
+
+/// The palette is one list over two sources, and filtering it must not strip a
+/// section off the rows that survive.
+#[test]
+fn the_command_palette_filters_across_commands_and_keybindings() {
+    let keymap = KeyMap::from_config(&crate::agent_config::KeybindingConfig::default())
+        .expect("default keymap");
+    let mut picker = Picker {
+        kind: PickerKind::Commands,
+        title: "Commands and keybindings",
+        options: command_palette_options(&keymap),
+        selected: 0,
+        query: Some(String::new()),
+    };
+    let rendered = |picker: &Picker| picker.display(72);
+
+    let all = rendered(&picker);
+    assert!(all.contains("COMMANDS"), "{all}");
+    assert!(all.contains("KEYBINDINGS"), "{all}");
+    assert!(all.contains("/goal"), "{all}");
+
+    // A query matching only keybinding rows keeps their heading.
+    picker.set_query("scroll".to_string());
+    let scroll = rendered(&picker);
+    assert!(scroll.contains("KEYBINDINGS"), "{scroll}");
+    assert!(scroll.contains("scroll transcript"), "{scroll}");
+    assert!(!scroll.contains("COMMANDS"), "{scroll}");
+    assert!(
+        scroll.contains("· scroll"),
+        "header echoes the query: {scroll}"
+    );
+
+    // The selection follows the filter instead of pointing at a hidden row.
+    let selected = picker.options[picker.selected].label.clone();
+    assert!(selected.contains("scroll"), "{selected}");
+
+    picker.set_query("zzzz".to_string());
+    let empty = rendered(&picker);
+    assert!(empty.contains("no match"), "{empty}");
+}
+
+/// Only commands whose bare form is not a command need finishing by hand;
+/// everything else must run outright or the palette is just a typing aid.
+#[test]
+fn only_argument_taking_commands_are_inserted_rather_than_run() {
+    assert!(slash_command_needs_argument("/queue"));
+    assert!(slash_command_needs_argument("/steer"));
+    for (command, _) in SLASH_COMMANDS
+        .iter()
+        .filter(|(command, _)| !matches!(*command, "/queue" | "/steer"))
+    {
+        assert!(
+            !slash_command_needs_argument(command),
+            "{command} would be inserted instead of run"
+        );
+    }
+}
+
+#[test]
 fn resume_picker_uses_a_balanced_two_column_layout() {
     let picker = Picker {
             kind: PickerKind::Resume,
@@ -1866,6 +2052,7 @@ fn resume_picker_uses_a_balanced_two_column_layout() {
                 },
             ],
             selected: 0,
+            query: None,
         };
 
     let rendered = picker.display(112);
@@ -3643,31 +3830,21 @@ fn transcript_text_selection_uses_stable_document_rows() {
         Line::from("three four"),
         Line::from("five"),
     ];
-    let selection = TextSelection {
-        anchor: TranscriptPoint { row: 1, column: 4 },
-        focus: TranscriptPoint { row: 3, column: 2 },
-        dragging: false,
-        autoscroll: 0,
-        pointer: Position::new(0, 0),
-    };
+    let start = TranscriptPoint { row: 1, column: 4 };
+    let end = TranscriptPoint { row: 3, column: 2 };
 
     assert_eq!(
-        selected_transcript_text(&lines, selection).as_deref(),
+        selected_transcript_text(&lines, start, end).as_deref(),
         Some("two\nthree four\nfi")
     );
 }
 
 #[test]
 fn selection_highlight_survives_a_changed_viewport_offset() {
-    let selection = TextSelection {
-        anchor: TranscriptPoint { row: 5, column: 1 },
-        focus: TranscriptPoint { row: 6, column: 2 },
-        dragging: true,
-        autoscroll: 1,
-        pointer: Position::new(0, 0),
-    };
+    let start = TranscriptPoint { row: 5, column: 1 };
+    let end = TranscriptPoint { row: 6, column: 2 };
     let mut first_view = vec![Line::from("abcd"), Line::from("efgh")];
-    apply_text_selection(&mut first_view, 5, selection);
+    apply_text_selection(&mut first_view, 5, start, end);
     assert!(
         first_view[0]
             .spans
@@ -3676,7 +3853,7 @@ fn selection_highlight_survives_a_changed_viewport_offset() {
     );
 
     let mut scrolled_view = vec![Line::from("xxxx"), Line::from("abcd")];
-    apply_text_selection(&mut scrolled_view, 4, selection);
+    apply_text_selection(&mut scrolled_view, 4, start, end);
     assert!(
         scrolled_view[0]
             .spans
@@ -3708,27 +3885,105 @@ fn incoming_transcript_lines_move_selection_with_live_content() {
 
     assert_eq!(next_scroll_start, previous_scroll_start + 1);
 
-    let selection = TextSelection {
-        anchor: TranscriptPoint {
-            row: previous_scroll_start + 2,
-            column: 1,
-        },
-        focus: TranscriptPoint {
-            row: previous_scroll_start + 2,
-            column: 2,
-        },
-        dragging: false,
-        autoscroll: 0,
-        pointer: Position::new(0, 0),
+    let start = TranscriptPoint {
+        row: previous_scroll_start + 2,
+        column: 1,
+    };
+    let end = TranscriptPoint {
+        row: previous_scroll_start + 2,
+        column: 2,
     };
     let mut viewport = vec![
         Line::from("line 16"),
         Line::from("selected"),
         Line::from("line 18"),
     ];
-    apply_text_selection(&mut viewport, next_scroll_start, selection);
+    apply_text_selection(&mut viewport, next_scroll_start, start, end);
     assert!(viewport[1].spans.iter().any(|span| span.style.bg.is_some()));
     assert!(viewport[2].spans.iter().all(|span| span.style.bg.is_none()));
     assert!(should_preserve_transcript_viewport(3, false));
     assert!(!should_preserve_transcript_viewport(3, true));
+}
+
+#[test]
+fn selection_points_resolve_through_accordion_body_offsets() {
+    // Entry 1 is a boxed tool whose visible slice starts at body row 3.
+    let ranges = vec![(0, 2, 10, 0), (1, 10, 18, 3)];
+
+    // Absolute row 12 inside the slice anchors to body row 5 of entry 1.
+    let anchor = selection_point_for_row(&ranges, 12, 4);
+    assert_eq!(
+        anchor,
+        SelectionPoint {
+            entry: 1,
+            row_in_entry: 5,
+            column: 4,
+        }
+    );
+
+    // The window shifts down by one: the slice now starts at body row 4.
+    let shifted = vec![(0, 2, 10, 0), (1, 10, 18, 4)];
+    let resolved = resolve_selection_point(anchor, &shifted);
+    assert_eq!(resolved, Some(TranscriptPoint { row: 11, column: 4 }));
+
+    // Body rows that scroll out of the slice clamp to its nearest edge.
+    let clamped = resolve_selection_point(
+        SelectionPoint {
+            entry: 1,
+            row_in_entry: 0,
+            column: 4,
+        },
+        &shifted,
+    );
+    assert_eq!(clamped, Some(TranscriptPoint { row: 10, column: 4 }));
+}
+
+#[test]
+fn selection_anchors_follow_content_when_the_actions_window_shifts() {
+    let tool = |index: usize| TranscriptEntry::Tool {
+        source_name: "Run".to_string(),
+        name: "Run".to_string(),
+        detail: format!("call-{index}"),
+        code_view: None,
+        output_view: None,
+        payload_refs: Vec::new(),
+        time: "12:00".to_string(),
+        started_at: Utc::now(),
+        completed_at: Some(Utc::now()),
+        complete: true,
+        error: false,
+        user_interrupted: false,
+        backgrounded: false,
+        expanded: false,
+    };
+    let mut transcript = Transcript::default();
+    for index in 0..20 {
+        transcript.order.push(tool(index));
+    }
+
+    let before = transcript.render(100, None, None, None);
+    let target_row = before
+        .0
+        .iter()
+        .position(|line| line.to_string().contains("call-15"))
+        .expect("call-15 is visible before the window shifts");
+    let anchor = selection_point_for_row(&before.6, target_row, 3);
+
+    // A new tool line pushes the accordion window up under the selection.
+    transcript.order.push(tool(20));
+
+    let after = transcript.render(100, None, None, None);
+    let resolved = resolve_selection_point(anchor, &after.6).expect("anchor resolves");
+    let rendered = after
+        .0
+        .iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        after.0[resolved.row].to_string().contains("call-15"),
+        "anchor must track call-15 to row {}:\n{rendered}",
+        resolved.row,
+    );
+    assert_eq!(resolved.row, target_row - 1);
 }

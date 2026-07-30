@@ -23,7 +23,7 @@ use borg_remote::{
     PlanItem, PlanItemStatus, PromptDelivery, ResponseLanguage, SessionEvent, SessionEventKind,
     SessionGoal, SessionPayloadKind, SessionPayloadRef, SessionState, SessionStatus,
     SubagentActivityKind, SubagentSnapshot, SubagentStatus, ToolPresentationCategory, compact_text,
-    is_diff_language, is_subagent_tool, project_tool_presentation, tool_has_rich_ui,
+    is_diff_language, is_edit_tool, is_subagent_tool, project_tool_presentation, tool_has_rich_ui,
     tool_output_code_view, tool_output_is_backgrounded, web_search_query,
 };
 #[cfg(test)]
@@ -117,6 +117,7 @@ type TranscriptRender = (
     Vec<RowRange>,
     Vec<RowRange>,
     Vec<LinkRowRange>,
+    Vec<SelectionRowRange>,
 );
 type CachedTranscriptRender = (
     usize,
@@ -547,6 +548,9 @@ struct Picker {
     title: &'static str,
     options: Vec<PickerOption>,
     selected: usize,
+    /// Live filter text for pickers the user types into. `None` leaves the
+    /// picker on its number-key shortcuts, which typing would otherwise eat.
+    query: Option<String>,
 }
 
 struct PickerOption {
@@ -590,6 +594,7 @@ enum PickerKind {
     AutoExpandTools,
     Rewind,
     MessageActions,
+    Commands,
 }
 
 impl Picker {
@@ -611,25 +616,75 @@ impl Picker {
             title,
             options,
             selected,
+            query: None,
         }
+    }
+
+    /// Indices of the options the current filter admits, in display order.
+    /// Every navigation and render path goes through this so a filtered-out
+    /// row can never be selected or counted.
+    fn matches(&self) -> Vec<usize> {
+        let Some(query) = self
+            .query
+            .as_deref()
+            .map(str::trim)
+            .filter(|q| !q.is_empty())
+        else {
+            return (0..self.options.len()).collect();
+        };
+        self.options
+            .iter()
+            .enumerate()
+            .filter(|(_, option)| fuzzy_matches(&option.label, query))
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    fn selected_position(&self) -> Option<usize> {
+        self.matches()
+            .iter()
+            .position(|index| *index == self.selected)
     }
 
     fn previous(&mut self) {
-        self.selected = self
-            .selected
-            .checked_sub(1)
-            .unwrap_or(self.options.len() - 1);
+        let matches = self.matches();
+        if matches.is_empty() {
+            return;
+        }
+        let position = self
+            .selected_position()
+            .and_then(|position| position.checked_sub(1))
+            .unwrap_or(matches.len() - 1);
+        self.selected = matches[position];
     }
 
     fn next(&mut self) {
-        self.selected = (self.selected + 1) % self.options.len();
+        let matches = self.matches();
+        if matches.is_empty() {
+            return;
+        }
+        let position = self
+            .selected_position()
+            .map_or(0, |position| (position + 1) % matches.len());
+        self.selected = matches[position];
+    }
+
+    /// Retarget the filter, keeping the selection on a row that still matches.
+    fn set_query(&mut self, query: String) {
+        self.query = Some(query);
+        let matches = self.matches();
+        if !matches.contains(&self.selected)
+            && let Some(first) = matches.first()
+        {
+            self.selected = *first;
+        }
     }
 
     fn select_index(&mut self, index: usize) -> bool {
-        if index >= self.options.len() {
+        let Some(&option) = self.matches().get(index) else {
             return false;
-        }
-        self.selected = index;
+        };
+        self.selected = option;
         true
     }
 
@@ -641,10 +696,13 @@ impl Picker {
     }
 
     fn scroll(&mut self, delta: isize) -> bool {
-        let next = self
-            .selected
+        let matches = self.matches();
+        let Some(position) = self.selected_position() else {
+            return false;
+        };
+        let next = matches[position
             .saturating_add_signed(delta)
-            .min(self.options.len().saturating_sub(1));
+            .min(matches.len().saturating_sub(1))];
         if next == self.selected {
             return false;
         }
@@ -657,6 +715,10 @@ impl Picker {
     }
 
     fn select_number(&mut self, number: char) -> bool {
+        // A filterable picker spends its digits on the filter.
+        if self.query.is_some() {
+            return false;
+        }
         let Some(index) = number
             .to_digit(10)
             .and_then(|number| usize::try_from(number).ok())
@@ -664,19 +726,49 @@ impl Picker {
         else {
             return false;
         };
-        if index >= self.options.len() {
-            return false;
+        self.select_index(index)
+    }
+
+    /// Header line, echoing the live filter so the user can see what is
+    /// narrowing the list without a separate input row.
+    fn header(&self) -> String {
+        match self
+            .query
+            .as_deref()
+            .map(str::trim)
+            .filter(|q| !q.is_empty())
+        {
+            Some(query) => format!("> {} · {query}", self.title),
+            None => format!("> {}", self.title),
         }
-        self.selected = index;
-        true
     }
 
     fn styled_option_rows(&self) -> Vec<(String, Style)> {
-        let mut rows = Vec::with_capacity(self.options.len() + 2);
-        for (index, option) in self.options.iter().enumerate() {
-            if let Some(section) = option.section.as_deref() {
+        // A section heading is carried by the first option in its group, so a
+        // filter that removes that option must not take the heading with it.
+        let mut owner = None;
+        let sections = self
+            .options
+            .iter()
+            .map(|option| {
+                if option.section.is_some() {
+                    owner.clone_from(&option.section);
+                }
+                owner.clone()
+            })
+            .collect::<Vec<_>>();
+        let matches = self.matches();
+        let mut rows = Vec::with_capacity(matches.len() + 2);
+        let mut heading: Option<String> = None;
+        for (position, index) in matches.into_iter().enumerate() {
+            let option = &self.options[index];
+            if sections[index].is_some() && sections[index] != heading {
+                heading.clone_from(&sections[index]);
                 rows.push((
-                    format!("  {}", section.to_ascii_uppercase()),
+                    format!(
+                        "  {}",
+                        heading.as_deref().unwrap_or_default().to_ascii_uppercase()
+                    ),
                     Style::default()
                         .fg(Color::DarkGray)
                         .add_modifier(Modifier::BOLD),
@@ -686,8 +778,12 @@ impl Picker {
             rows.push((
                 format!(
                     "  {} {}",
-                    if selected { "›" } else { " " },
-                    numbered_picker_option(index, &option.label),
+                    if selected { "\u{203a}" } else { " " },
+                    if self.query.is_some() {
+                        option.label.clone()
+                    } else {
+                        numbered_picker_option(position, &option.label)
+                    },
                 ),
                 if selected {
                     Style::default()
@@ -708,15 +804,22 @@ impl Picker {
         preview_message_color: Color,
     ) -> Vec<Line<'static>> {
         if !matches!(self.kind, PickerKind::Resume) || width < 60 {
+            let rows = self.styled_option_rows();
+            let empty = rows.is_empty().then(|| {
+                (
+                    "  no match".to_string(),
+                    Style::default().fg(Color::DarkGray),
+                )
+            });
             return std::iter::once(Line::from(Span::styled(
-                format!("> {}", self.title),
+                self.header(),
                 Style::default()
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
             )))
             .chain(
-                self.styled_option_rows()
-                    .into_iter()
+                rows.into_iter()
+                    .chain(empty)
                     .map(|(row, style)| Line::from(Span::styled(row, style))),
             )
             .collect();
@@ -1067,6 +1170,7 @@ impl BorgTerminal {
             transcript.apply(event);
         }
         self.transcript = transcript;
+        self.text_selection = None;
         self.pending_scroll_anchor_height = Some(previous_height);
         self.transcript_render_cache = None;
     }
@@ -1237,15 +1341,22 @@ impl BorgTerminal {
             }
             _ => {}
         }
-        let transcript = self
-            .director_transcript
-            .as_deref_mut()
-            .unwrap_or(&mut self.transcript);
-        let transcript_entries_before = transcript.order.len();
-        let transcript_changed = session_event_changes_transcript(&event.kind);
-        transcript.apply(event);
-        let transcript_changed =
-            transcript_changed || transcript.order.len() != transcript_entries_before;
+        let (removed_entry, transcript_changed) = {
+            let transcript = self
+                .director_transcript
+                .as_deref_mut()
+                .unwrap_or(&mut self.transcript);
+            let entries_before = transcript.order.len();
+            let changed = session_event_changes_transcript(&event.kind);
+            let removed_entry = transcript.apply(event);
+            (
+                removed_entry,
+                changed || transcript.order.len() != entries_before,
+            )
+        };
+        if let Some(removed) = removed_entry {
+            self.remap_selection_after_entry_removal(removed);
+        }
         if transcript_changed {
             if should_preserve_transcript_viewport(
                 self.scroll_from_bottom,
@@ -1302,7 +1413,9 @@ impl BorgTerminal {
             _ => {}
         }
         if self.focused_child == Some(agent.session_id) {
-            self.transcript.apply(child_event);
+            if let Some(removed) = self.transcript.apply(child_event) {
+                self.remap_selection_after_entry_removal(removed);
+            }
         } else {
             self.child_transcripts
                 .entry(child_id)
@@ -1469,14 +1582,32 @@ impl BorgTerminal {
 
     pub fn show_goal(&mut self, goal: Option<&SessionGoal>) {
         self.notice = None;
-        self.transcript.show_goal(goal);
+        if let Some(removed) = self.transcript.show_goal(goal) {
+            self.remap_selection_after_entry_removal(removed);
+        }
         self.transcript_render_cache = None;
     }
 
     pub fn show_plan(&mut self, items: &[PlanItem]) {
         self.notice = None;
-        self.transcript.show_plan(items);
+        if let Some(removed) = self.transcript.show_plan(items) {
+            self.remap_selection_after_entry_removal(removed);
+        }
         self.transcript_render_cache = None;
+    }
+
+    fn remap_selection_after_entry_removal(&mut self, removed: usize) {
+        let Some(mut selection) = self.text_selection else {
+            return;
+        };
+        if selection.anchor.entry == removed || selection.focus.entry == removed {
+            self.text_selection = None;
+            return;
+        }
+        for point in [&mut selection.anchor, &mut selection.focus] {
+            point.entry -= usize::from(point.entry > removed);
+        }
+        self.text_selection = Some(selection);
     }
 
     pub fn show_info(&mut self, title: impl Into<String>, text: impl Into<String>) {
@@ -1549,6 +1680,7 @@ impl BorgTerminal {
                 .map(|(label, value)| PickerOption::new(label, value))
                 .collect(),
             selected: 0,
+            query: None,
         });
     }
 
@@ -1579,6 +1711,7 @@ impl BorgTerminal {
                 })
                 .collect(),
             selected: 0,
+            query: None,
         });
     }
 
@@ -1639,6 +1772,22 @@ impl BorgTerminal {
                         .position(|language| language.code() == current)
                 })
                 .unwrap_or(0),
+            query: None,
+        });
+    }
+
+    /// One palette over both slash commands and keybindings, filtered as the
+    /// user types. Enter runs a command outright unless it needs an argument,
+    /// in which case it lands in the composer ready to finish.
+    pub fn open_command_palette(&mut self) {
+        self.keybindings_open = false;
+        self.notice = None;
+        self.picker = Some(Picker {
+            kind: PickerKind::Commands,
+            title: "Commands and keybindings",
+            options: command_palette_options(&self.keymap),
+            selected: 0,
+            query: Some(String::new()),
         });
     }
 
@@ -1772,6 +1921,7 @@ impl BorgTerminal {
                 .map(|option| PickerOption::new(option.clone(), option))
                 .collect(),
             selected: 0,
+            query: None,
         });
     }
 
@@ -1932,6 +2082,24 @@ impl BorgTerminal {
                         return Ok(UiAction::None);
                     }
                     if self
+                        .goal_status_area
+                        .is_some_and(|area| area.contains(pointer))
+                    {
+                        // The segment round-trips the same slash command a user
+                        // would type, so the click has no privileged path of
+                        // its own to keep in step with the parser.
+                        return Ok(
+                            match self.transcript.goal.as_ref().and_then(goal_toggle_command) {
+                                Some(command) => UiAction::Submit {
+                                    target: self.focused_child,
+                                    text: command.to_string(),
+                                    attachments: Vec::new(),
+                                },
+                                None => UiAction::None,
+                            },
+                        );
+                    }
+                    if self
                         .model_status_area
                         .is_some_and(|area| area.contains(pointer))
                     {
@@ -2045,7 +2213,7 @@ impl BorgTerminal {
                     MouseEventKind::Down(MouseButton::Left)
                         if mouse.modifiers.contains(KeyModifiers::SHIFT) =>
                     {
-                        if let Some(point) = self.transcript_point_at(pointer) {
+                        if let Some(point) = self.selection_point_at(pointer) {
                             self.text_selection = Some(TextSelection {
                                 anchor: point,
                                 focus: point,
@@ -2313,6 +2481,16 @@ impl BorgTerminal {
             .then(|| self.transcript_point_for_pointer(area, pointer))
     }
 
+    fn selection_point_at(&self, pointer: Position) -> Option<SelectionPoint> {
+        let point = self.transcript_point_at(pointer)?;
+        let ranges = self
+            .transcript_render_cache
+            .as_ref()
+            .map(|(.., render)| render.6.as_slice())
+            .unwrap_or(&[]);
+        Some(selection_point_for_row(ranges, point.row, point.column))
+    }
+
     fn transcript_point_for_pointer(&self, area: Rect, pointer: Position) -> TranscriptPoint {
         let scroll_start = self
             .transcript_scroll_max
@@ -2358,22 +2536,29 @@ impl BorgTerminal {
             pointer.y.clamp(area.y, area.bottom().saturating_sub(1)),
         );
         let point = self.transcript_point_for_pointer(area, clamped);
+        let ranges = self
+            .transcript_render_cache
+            .as_ref()
+            .map(|(.., render)| render.6.as_slice())
+            .unwrap_or(&[]);
+        let point = selection_point_for_row(ranges, point.row, point.column);
         if let Some(selection) = self.text_selection.as_mut() {
             selection.focus = point;
         }
     }
 
     fn copy_text_selection(&mut self) -> bool {
-        let Some(selection) = self
-            .text_selection
-            .filter(|selection| !selection.is_empty())
-        else {
-            return false;
-        };
         let Some((_, _, _, _, _, render)) = self.transcript_render_cache.as_ref() else {
             return false;
         };
-        let Some(text) = selected_transcript_text(&render.0, selection) else {
+        let Some((start, end)) = self
+            .text_selection
+            .filter(|selection| !selection.is_empty())
+            .and_then(|selection| resolved_selection(selection, &render.6))
+        else {
+            return false;
+        };
+        let Some(text) = selected_transcript_text(&render.0, start, end) else {
             return false;
         };
         match clipboard::copy(&text) {
@@ -2519,7 +2704,25 @@ impl BorgTerminal {
                 attachments: target.attachments,
             });
         }
+        if matches!(picker.kind, PickerKind::Commands) {
+            let command = picker.selected_value();
+            // Keybinding rows carry no command; selecting one just dismisses.
+            if command.is_empty() {
+                return Ok(UiAction::None);
+            }
+            if slash_command_needs_argument(&command) {
+                self.composer.restore(format!("{command} "), Vec::new());
+                self.notice = Some(format!("{command} · add the message, then send"));
+                return Ok(UiAction::None);
+            }
+            return Ok(UiAction::Submit {
+                target: self.focused_child,
+                text: command,
+                attachments: Vec::new(),
+            });
+        }
         Ok(match picker.kind {
+            PickerKind::Commands => unreachable!("handled above"),
             PickerKind::Settings => UiAction::Submit {
                 target: None,
                 text: picker.selected_value(),
@@ -2633,8 +2836,15 @@ impl BorgTerminal {
                 ));
                 render
             });
-        let (transcript, tool_rows, tool_run_rows, message_rows, entry_rows, link_rows) =
-            transcript_render.as_ref();
+        let (
+            transcript,
+            tool_rows,
+            tool_run_rows,
+            message_rows,
+            entry_rows,
+            link_rows,
+            selection_rows,
+        ) = transcript_render.as_ref();
         let queued_prompts = self.active_queued_prompts().to_vec();
         // Keep the first draft anchored in the splash composition area. Moving
         // it to the chat footer on the first keystroke makes the whole screen
@@ -2701,6 +2911,12 @@ impl BorgTerminal {
         let team_agent_count = total_subagents.saturating_add(1);
         let session_is_active = matches!(status, SessionStatus::Starting | SessionStatus::Running);
         let goal_status = self.transcript.goal_status();
+        let goal_is_toggleable = self
+            .transcript
+            .goal
+            .as_ref()
+            .and_then(goal_toggle_command)
+            .is_some();
         let slash_suggestions = (self.picker.is_none())
             .then(|| slash_suggestion_lines(&self.composer.text, self.slash_selection))
             .filter(|lines| !lines.is_empty());
@@ -3083,8 +3299,16 @@ impl BorgTerminal {
                         *index,
                     ));
                 }
-                if let Some(selection) = self.text_selection {
-                    apply_text_selection(&mut visible_transcript, scroll_start, selection);
+                if let Some((selection_start, selection_end)) = self
+                    .text_selection
+                    .and_then(|selection| resolved_selection(selection, selection_rows))
+                {
+                    apply_text_selection(
+                        &mut visible_transcript,
+                        scroll_start,
+                        selection_start,
+                        selection_end,
+                    );
                 }
                 frame.render_widget(Paragraph::new(visible_transcript), content_area);
                 for link in link_rows.iter().filter(|link| {
@@ -3331,9 +3555,23 @@ impl BorgTerminal {
                 .as_ref()
                 .map(|status| format!(" · {status}").width());
             if let Some(goal_status) = goal_status.clone() {
+                // Only light up when the click would do something: a
+                // budget-limited goal is hoverable for its tooltip but has no
+                // run state to flip.
+                let highlight = goal_is_toggleable && self.goal_status_hovered;
                 status_spans.push(Span::styled(
                     format!(" · {goal_status}"),
-                    Style::default().fg(Color::Yellow),
+                    Style::default()
+                        .fg(if highlight {
+                            Color::White
+                        } else {
+                            Color::Yellow
+                        })
+                        .add_modifier(if highlight {
+                            Modifier::BOLD | Modifier::UNDERLINED
+                        } else {
+                            Modifier::empty()
+                        }),
                 ));
             }
             let model_status_start = status_spans.iter().map(|span| span.width()).sum::<usize>();
@@ -3542,7 +3780,7 @@ impl BorgTerminal {
                             Block::default()
                                 .borders(Borders::ALL)
                                 .border_style(Style::default().fg(Color::Yellow))
-                                .title(" Goal "),
+                                .title(goal_tooltip_title(goal)),
                         ),
                     tooltip,
                 );
@@ -3712,6 +3950,49 @@ impl BorgTerminal {
     fn handle_key(&mut self, key: KeyEvent) -> Result<UiAction> {
         if matches!(
             self.picker.as_ref().map(|picker| picker.kind),
+            Some(PickerKind::Commands)
+        ) {
+            // Typing filters, so this runs ahead of every other key path: the
+            // palette owns the keyboard while it is open.
+            let picker = self.picker.as_mut().expect("checked above");
+            let edit_query = |picker: &mut Picker, edit: &dyn Fn(&mut String)| {
+                let mut query = picker.query.clone().unwrap_or_default();
+                edit(&mut query);
+                picker.set_query(query);
+            };
+            return match key.code {
+                KeyCode::Up => {
+                    picker.previous();
+                    Ok(UiAction::None)
+                }
+                KeyCode::Down | KeyCode::Tab => {
+                    picker.next();
+                    Ok(UiAction::None)
+                }
+                KeyCode::Enter => self.run_selected_picker(),
+                KeyCode::Esc => {
+                    self.picker = None;
+                    Ok(UiAction::None)
+                }
+                KeyCode::Backspace => {
+                    edit_query(picker, &|query| {
+                        query.pop();
+                    });
+                    Ok(UiAction::None)
+                }
+                KeyCode::Char(character)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    edit_query(picker, &|query| query.push(character));
+                    Ok(UiAction::None)
+                }
+                _ => Ok(UiAction::None),
+            };
+        }
+        if matches!(
+            self.picker.as_ref().map(|picker| picker.kind),
             Some(PickerKind::MessageActions)
         ) {
             return Ok(match key.code {
@@ -3772,8 +4053,7 @@ impl BorgTerminal {
             });
         }
         if self.keymap.matches(KeyAction::Keybindings, &key) && self.composer.text.is_empty() {
-            self.keybindings_open = !self.keybindings_open;
-            self.notice = None;
+            self.open_command_palette();
             return Ok(UiAction::None);
         }
         if self.keybindings_open && self.keymap.matches(KeyAction::Interrupt, &key) {
@@ -4052,6 +4332,10 @@ impl BorgTerminal {
             }
             KeyCode::Tab => {
                 let matches = slash_matches(&self.composer.text);
+                if matches.is_empty() && self.composer.text.is_empty() {
+                    self.open_command_palette();
+                    return Ok(UiAction::None);
+                }
                 if let Some((command, help)) = matches.get(self.slash_selection) {
                     self.composer.replace_text(*command);
                     self.notice = Some(format!("{command} · {help}"));
@@ -4938,41 +5222,45 @@ impl Transcript {
         self.follow_tail = true;
     }
 
-    fn show_goal(&mut self, goal: Option<&SessionGoal>) {
+    fn show_goal(&mut self, goal: Option<&SessionGoal>) -> Option<usize> {
         let time = canonical_local_time(Local::now());
         match goal {
             Some(goal) => self.upsert_goal(goal.clone(), time),
-            None => self.order.push(TranscriptEntry::Activity {
-                text: "No durable goal is set. Use /goal OBJECTIVE to start one.".to_string(),
-                time,
-            }),
+            None => {
+                self.order.push(TranscriptEntry::Activity {
+                    text: "No durable goal is set. Use /goal OBJECTIVE to start one.".to_string(),
+                    time,
+                });
+                None
+            }
         }
     }
 
-    fn show_plan(&mut self, items: &[PlanItem]) {
+    fn show_plan(&mut self, items: &[PlanItem]) -> Option<usize> {
         let time = canonical_local_time(Local::now());
-        self.upsert_plan(items.to_vec(), time);
+        self.upsert_plan(items.to_vec(), time)
     }
 
-    fn upsert_goal(&mut self, goal: SessionGoal, time: String) {
-        if let Some(index) = self
+    fn upsert_goal(&mut self, goal: SessionGoal, time: String) -> Option<usize> {
+        let removed = self
             .order
             .iter()
-            .rposition(|entry| matches!(entry, TranscriptEntry::Goal { .. }))
-        {
+            .rposition(|entry| matches!(entry, TranscriptEntry::Goal { .. }));
+        if let Some(index) = removed {
             self.order.remove(index);
             self.reindex_after_removal(index);
         }
         self.order.push(TranscriptEntry::Goal { goal, time });
+        removed
     }
 
-    fn upsert_plan(&mut self, items: Vec<PlanItem>, time: String) {
+    fn upsert_plan(&mut self, items: Vec<PlanItem>, time: String) -> Option<usize> {
         let mut expanded = false;
-        if let Some(index) = self
+        let removed = self
             .order
             .iter()
-            .rposition(|entry| matches!(entry, TranscriptEntry::Plan { .. }))
-        {
+            .rposition(|entry| matches!(entry, TranscriptEntry::Plan { .. }));
+        if let Some(index) = removed {
             if let Some(TranscriptEntry::Plan {
                 expanded: previous, ..
             }) = self.order.get(index)
@@ -4987,6 +5275,7 @@ impl Transcript {
             time,
             expanded,
         });
+        removed
     }
 
     fn toggle_plan_expansion(&mut self, index: usize) {
@@ -5134,7 +5423,7 @@ impl Transcript {
         self.tool_run_windows()[index].map(|window| window.start)
     }
 
-    fn apply(&mut self, event: &SessionEvent) {
+    fn apply(&mut self, event: &SessionEvent) -> Option<usize> {
         if let SessionEventKind::TurnCompleted { message_id, .. } = &event.kind
             && self
                 .active_turn
@@ -5143,6 +5432,7 @@ impl Transcript {
         {
             self.active_turn = None;
         }
+        let mut removed_entry = None;
         match &event.kind {
             SessionEventKind::SessionConfigured {
                 cwd,
@@ -5235,7 +5525,7 @@ impl Transcript {
                 self.cache_diagnostics.reset();
             }
             SessionEventKind::PromptRecalled { message_id, .. } => {
-                self.remove_message(*message_id);
+                removed_entry = self.remove_message(*message_id);
             }
             SessionEventKind::Message {
                 message_id,
@@ -5250,11 +5540,11 @@ impl Transcript {
                 // eventual admitted message to its enqueue position instead of
                 // the real provider-boundary chronology.
                 if *status == MessageStatus::Queued {
-                    return;
+                    return removed_entry;
                 }
                 if *actor == EventActor::Assistant && text.trim().is_empty() {
-                    self.remove_message(*message_id);
-                    return;
+                    removed_entry = self.remove_message(*message_id);
+                    return removed_entry;
                 }
                 if *actor == EventActor::Assistant {
                     self.finish_reasoning(event.created_at);
@@ -5519,7 +5809,7 @@ impl Transcript {
                         ..
                     }) if previous == &summary
                 ) {
-                    return;
+                    return removed_entry;
                 }
                 self.order.push(TranscriptEntry::Compaction {
                     summary,
@@ -5564,14 +5854,14 @@ impl Transcript {
             }
             _ => {}
         }
+        removed_entry
     }
 
-    fn remove_message(&mut self, message_id: Uuid) {
-        let Some(index) = self.messages.remove(&message_id) else {
-            return;
-        };
+    fn remove_message(&mut self, message_id: Uuid) -> Option<usize> {
+        let index = self.messages.remove(&message_id)?;
         self.order.remove(index);
         self.reindex_after_removal(index);
+        Some(index)
     }
 
     fn reindex_after_removal(&mut self, index: usize) {
@@ -6008,6 +6298,7 @@ impl Transcript {
         let mut message_rows = Vec::new();
         let mut entry_rows = Vec::new();
         let mut link_rows = Vec::new();
+        let mut selection_rows = Vec::new();
         let mut tool_run_starts = HashMap::new();
         let tool_run_windows = self.tool_run_windows();
         for (index, entry) in self.order.iter().enumerate() {
@@ -6172,6 +6463,7 @@ impl Transcript {
                     if matches!(actor, EventActor::User | EventActor::Assistant) && *complete {
                         message_rows.push((index, entry_start, lines.len()));
                     }
+                    selection_rows.push((index, entry_start, lines.len(), 0));
                     lines.push(Line::default());
                 }
                 TranscriptEntry::Activity { text, time } => {
@@ -6183,6 +6475,7 @@ impl Transcript {
                             Style::default().fg(Color::DarkGray),
                         )));
                     }
+                    selection_rows.push((index, entry_start, lines.len(), 0));
                 }
                 TranscriptEntry::Plan {
                     items,
@@ -6280,6 +6573,7 @@ impl Transcript {
                         }
                     }
                     entry_rows.push((index, entry_start, lines.len()));
+                    selection_rows.push((index, entry_start, lines.len(), 0));
                     lines.push(Line::default());
                 }
                 TranscriptEntry::Goal { goal, time } => {
@@ -6328,6 +6622,7 @@ impl Transcript {
                         }
                     }
                     entry_rows.push((index, entry_start, lines.len()));
+                    selection_rows.push((index, entry_start, lines.len(), 0));
                     lines.push(Line::default());
                 }
                 TranscriptEntry::Info { title, text, time } => {
@@ -6353,6 +6648,7 @@ impl Transcript {
                         }
                     }
                     entry_rows.push((index, entry_start, lines.len()));
+                    selection_rows.push((index, entry_start, lines.len(), 0));
                     lines.push(Line::default());
                 }
                 TranscriptEntry::Compaction { summary, time } => {
@@ -6366,9 +6662,11 @@ impl Transcript {
                         ),
                         Span::styled(format!("  {time}"), Style::default().fg(Color::DarkGray)),
                     ]));
+                    selection_rows.push((index, entry_start, lines.len(), 0));
                     lines.push(Line::default());
                 }
                 TranscriptEntry::Tool {
+                    source_name,
                     name,
                     detail,
                     code_view,
@@ -6441,7 +6739,21 @@ impl Transcript {
                     } else if *backgrounded {
                         Some("backgrounded")
                     } else if !*complete && !is_reasoning {
-                        Some("running")
+                        // Say an edit is coming for as long as there is no diff
+                        // to look at — a payload that has not hydrated, or a
+                        // patch still being assembled. Edits take a while, and
+                        // a bare "running" over nothing gives the user no sign
+                        // of what to wait for. Once the diff is on screen it
+                        // speaks for itself.
+                        let awaiting_diff = is_edit_tool(source_name, name)
+                            && !code_view
+                                .as_ref()
+                                .is_some_and(|(language, _)| is_diff_language(language));
+                        Some(if awaiting_diff {
+                            "preparing edit"
+                        } else {
+                            "running"
+                        })
                     } else {
                         None
                     };
@@ -6575,6 +6887,9 @@ impl Transcript {
                         lines.push(tool_run_separator(tool_window.is_some()));
                     }
                     tool_rows.push((index, summary_start, lines.len()));
+                    if tool_window.is_none() {
+                        selection_rows.push((index, summary_start, lines.len(), 0));
+                    }
                     if let Some(window) = tool_window
                         && index + 1 == window.end
                     {
@@ -6644,6 +6959,12 @@ impl Transcript {
                                     content_start + visible_start - offset,
                                     content_start + visible_tool_end - offset,
                                 ));
+                                selection_rows.push((
+                                    tool_index,
+                                    content_start + visible_start - offset,
+                                    content_start + visible_tool_end - offset,
+                                    visible_start - start,
+                                ));
                             }
                         }
                         tool_run_rows.push((window.start, header_row, lines.len(), max_offset));
@@ -6658,6 +6979,7 @@ impl Transcript {
             message_rows,
             entry_rows,
             link_rows,
+            selection_rows,
         )
     }
 
@@ -7335,11 +7657,13 @@ fn apply_line_background(line: &mut Line<'static>, width: usize, background: Col
 fn apply_text_selection(
     visible_lines: &mut [Line<'static>],
     scroll_start: usize,
-    selection: TextSelection,
+    selection_start: TranscriptPoint,
+    selection_end: TranscriptPoint,
 ) {
     for (viewport_row, line) in visible_lines.iter_mut().enumerate() {
         let row = scroll_start.saturating_add(viewport_row);
-        let Some((start, end)) = selection_columns_for_row(selection, row) else {
+        let Some((start, end)) = selection_columns_for_row(selection_start, selection_end, row)
+        else {
             continue;
         };
         let mut column = 0usize;
@@ -7368,8 +7692,11 @@ fn action_run_bridge(entry: &TranscriptEntry) -> bool {
     )
 }
 
-fn selected_transcript_text(lines: &[Line<'static>], selection: TextSelection) -> Option<String> {
-    let (start, end) = selection.ordered();
+fn selected_transcript_text(
+    lines: &[Line<'static>],
+    start: TranscriptPoint,
+    end: TranscriptPoint,
+) -> Option<String> {
     if start == end || start.row >= lines.len() {
         return None;
     }
@@ -7408,8 +7735,11 @@ fn selected_transcript_text(lines: &[Line<'static>], selection: TextSelection) -
     (!text.is_empty()).then_some(text)
 }
 
-fn selection_columns_for_row(selection: TextSelection, row: usize) -> Option<(usize, usize)> {
-    let (start, end) = selection.ordered();
+fn selection_columns_for_row(
+    start: TranscriptPoint,
+    end: TranscriptPoint,
+    row: usize,
+) -> Option<(usize, usize)> {
     if row < start.row || row > end.row {
         return None;
     }
@@ -7422,6 +7752,72 @@ fn selection_columns_for_row(selection: TextSelection, row: usize) -> Option<(us
     } else {
         (0, usize::MAX)
     })
+}
+
+fn resolve_selection_point(
+    point: SelectionPoint,
+    ranges: &[SelectionRowRange],
+) -> Option<TranscriptPoint> {
+    let (_, start, end, body_start) = ranges.iter().find(|(entry, ..)| *entry == point.entry)?;
+    let last = end.saturating_sub(1).max(*start);
+    let row = (*start as isize + point.row_in_entry as isize - *body_start as isize)
+        .clamp(*start as isize, last as isize) as usize;
+    Some(TranscriptPoint {
+        row,
+        column: point.column,
+    })
+}
+
+fn resolved_selection(
+    selection: TextSelection,
+    ranges: &[SelectionRowRange],
+) -> Option<(TranscriptPoint, TranscriptPoint)> {
+    let anchor = resolve_selection_point(selection.anchor, ranges)?;
+    let focus = resolve_selection_point(selection.focus, ranges)?;
+    if anchor == focus {
+        return None;
+    }
+    Some(if anchor <= focus {
+        (anchor, focus)
+    } else {
+        (focus, anchor)
+    })
+}
+
+fn selection_point_for_row(
+    ranges: &[SelectionRowRange],
+    row: usize,
+    column: usize,
+) -> SelectionPoint {
+    if let Some((entry, start, _, body_start)) = ranges
+        .iter()
+        .find(|(_, start, end, _)| row >= *start && row < *end)
+    {
+        return SelectionPoint {
+            entry: *entry,
+            row_in_entry: body_start + (row - start),
+            column,
+        };
+    }
+    if let Some((entry, ..)) = ranges.iter().find(|(_, start, _, _)| *start > row) {
+        return SelectionPoint {
+            entry: *entry,
+            row_in_entry: 0,
+            column,
+        };
+    }
+    if let Some((entry, start, end, body_start)) = ranges.last() {
+        return SelectionPoint {
+            entry: *entry,
+            row_in_entry: body_start + end.saturating_sub(1).saturating_sub(*start),
+            column,
+        };
+    }
+    SelectionPoint {
+        entry: 0,
+        row_in_entry: row,
+        column,
+    }
 }
 
 fn tool_run_separator(in_tool_run: bool) -> Line<'static> {
@@ -7570,6 +7966,47 @@ fn abbreviated_path(path: &Path) -> String {
     shortened.display().to_string()
 }
 
+/// Subsequence match, case-insensitive: "gl" finds "/goal", "expt" finds
+/// "/expand-tools". Deliberately not scored — the palette keeps source order so
+/// a row never moves out from under the key the user is about to press.
+fn fuzzy_matches(haystack: &str, needle: &str) -> bool {
+    let mut haystack = haystack.chars().flat_map(char::to_lowercase);
+    needle
+        .chars()
+        .flat_map(char::to_lowercase)
+        .filter(|character| !character.is_whitespace())
+        .all(|wanted| haystack.any(|character| character == wanted))
+}
+
+/// Commands whose bare form is not a command at all: submitting `/steer` with
+/// no message would send the literal word to the model, so the palette puts
+/// them in the composer for the user to finish.
+fn slash_command_needs_argument(command: &str) -> bool {
+    matches!(command, "/queue" | "/steer")
+}
+
+/// Every row of the unified palette: the slash commands, then the keybindings
+/// as reference rows that insert nothing.
+fn command_palette_options(keymap: &KeyMap) -> Vec<PickerOption> {
+    let mut options = Vec::with_capacity(SLASH_COMMANDS.len() + 12);
+    for (index, (command, help)) in SLASH_COMMANDS.iter().enumerate() {
+        let mut option = PickerOption::new(format!("{command:<16}{help}"), *command);
+        if index == 0 {
+            option.section = Some("Commands".to_string());
+        }
+        options.push(option);
+    }
+    for (index, (action, chord)) in keybinding_reference(keymap).into_iter().enumerate() {
+        // An empty value marks a row with nothing to run; Enter just closes.
+        let mut option = PickerOption::new(format!("{action:<16}{chord}"), String::new());
+        if index == 0 {
+            option.section = Some("Keybindings".to_string());
+        }
+        options.push(option);
+    }
+    options
+}
+
 fn slash_matches(value: &str) -> Vec<&'static (&'static str, &'static str)> {
     let value = value.trim();
     if !value.starts_with('/') || value.contains(char::is_whitespace) {
@@ -7598,7 +8035,7 @@ fn slash_help(matches: &[&(&str, &str)]) -> String {
 
 fn primary_controls_line(keymap: &KeyMap) -> String {
     format!(
-        "send {} · commands / · keybindings {}",
+        "send {} · commands / · palette tab or {}",
         keymap.label(KeyAction::Send),
         keymap.label(KeyAction::Keybindings)
     )
@@ -7611,8 +8048,10 @@ fn inset_control_lines(mut lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
     lines
 }
 
-fn keybinding_lines(keymap: &KeyMap, width: usize) -> Vec<Line<'static>> {
-    let bindings = [
+/// The one list of bindings, shared by the tooltip and the command palette so
+/// the two can never drift.
+fn keybinding_reference(keymap: &KeyMap) -> Vec<(&'static str, String)> {
+    vec![
         ("send", keymap.label(KeyAction::Send)),
         ("queue next turn", keymap.label(KeyAction::Queue)),
         ("newline", keymap.label(KeyAction::Newline)),
@@ -7639,7 +8078,11 @@ fn keybinding_lines(keymap: &KeyMap, width: usize) -> Vec<Line<'static>> {
             ),
         ),
         ("select terminal text", "shift+drag".to_string()),
-    ];
+    ]
+}
+
+fn keybinding_lines(keymap: &KeyMap, width: usize) -> Vec<Line<'static>> {
+    let bindings = keybinding_reference(keymap);
     let binding = |(action, key): &(&str, String)| format!("{action:<26} {key}");
     let mut lines = Vec::new();
     if width >= 76 {
@@ -8425,6 +8868,27 @@ fn permission_mode_label(mode: PermissionMode) -> &'static str {
         PermissionMode::FullAccess => "full access",
         PermissionMode::Auto => "auto approvals",
         PermissionMode::Manual => "manual approvals",
+    }
+}
+
+/// Name the click while the pointer is already on the segment, so the only
+/// affordance for pause/resume is not a slash command the user has to know.
+fn goal_tooltip_title(goal: &SessionGoal) -> String {
+    match goal_toggle_command(goal) {
+        Some("/goal pause") => " Goal · click to pause ".to_string(),
+        Some(_) => " Goal · click to resume ".to_string(),
+        None => " Goal ".to_string(),
+    }
+}
+
+/// The slash command that flips a goal's run state, or `None` where there is
+/// nothing to flip: a completed goal is finished, and a budget-limited one
+/// needs a new budget rather than a resume.
+fn goal_toggle_command(goal: &SessionGoal) -> Option<&'static str> {
+    match goal.status {
+        GoalStatus::Active => Some("/goal pause"),
+        GoalStatus::Paused | GoalStatus::Blocked | GoalStatus::UsageLimited => Some("/goal resume"),
+        GoalStatus::BudgetLimited | GoalStatus::Complete => None,
     }
 }
 

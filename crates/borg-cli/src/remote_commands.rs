@@ -3344,7 +3344,7 @@ fn print_agent_help() {
     );
 }
 
-fn parse_goal_action(line: &str) -> Result<GoalAction> {
+pub(crate) fn parse_goal_action(line: &str) -> Result<GoalAction> {
     let value = line
         .strip_prefix("/goal ")
         .context("usage: /goal [OBJECTIVE|pause|resume|clear]")?

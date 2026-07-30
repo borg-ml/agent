@@ -268,6 +268,14 @@ pub fn is_subagent_tool(display_name: &str) -> bool {
     )
 }
 
+/// Whether a tool edits files, decided from the raw tool name and its display
+/// label alone. Unlike a diff body this is known the moment the call starts,
+/// which is what lets the transcript describe an edit before its patch has
+/// arrived.
+pub fn is_edit_tool(name: &str, display_name: &str) -> bool {
+    tool_category(name, display_name) == ToolPresentationCategory::Edit
+}
+
 pub fn is_diff_language(language: &str) -> bool {
     language == "diff" || language.starts_with("diff:")
 }

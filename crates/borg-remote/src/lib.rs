@@ -63,7 +63,7 @@ pub use subagents::{
 };
 pub use tool_presentation::{
     ToolPresentation, ToolPresentationBody, ToolPresentationCategory, compact_text,
-    is_diff_language, is_subagent_tool, project_tool_presentation, tool_call_summary,
+    is_diff_language, is_edit_tool, is_subagent_tool, project_tool_presentation, tool_call_summary,
     tool_code_view, tool_has_rich_ui, tool_output_code_view, tool_output_is_backgrounded,
     web_search_query,
 };
