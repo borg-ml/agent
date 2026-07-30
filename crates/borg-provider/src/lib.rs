@@ -16,5 +16,5 @@ pub use runtime::{
     KIMI_SELECTABLE_MODELS, MODEL_CATALOGS, ProviderCallUsage, ProviderChannel,
     ProviderModelCatalog, codex_default_effort, codex_effort_levels, codex_effort_supported,
     codex_product_model, kimi_default_effort, kimi_effort_levels, kimi_product_model,
-    model_catalog_for_backend,
+    model_catalog_for_backend, openrouter_product_model,
 };

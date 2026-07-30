@@ -2098,6 +2098,31 @@ for await (const line of createInterface({ input: process.stdin })) {
     }
 
     #[test]
+    fn pooled_claude_config_preserves_resume_attachments_schema_and_permissions() {
+        let root = tempfile::tempdir().unwrap();
+        let attachment = root.path().join("screen.png");
+        fs::write(&attachment, b"image").unwrap();
+        let mut request = test_claude_request(root.path());
+        request.attachments = vec![attachment.clone()];
+        request.session_id = Some("claude-session-1".to_string());
+        request.output_schema = Some(json!({
+            "type": "object",
+            "properties": { "ok": { "type": "boolean" } },
+            "required": ["ok"]
+        }));
+
+        let config =
+            build_pooled_claude_config(&request, root.path(), LocalAgentPermission::Manual)
+                .expect("Claude config");
+
+        assert_eq!(config["attachments"], json!([attachment]));
+        assert_eq!(config["resume"], "claude-session-1");
+        assert_eq!(config["permission_mode"], "default");
+        assert_eq!(config["persist_session"], false);
+        assert_eq!(config["output_schema"]["required"], json!(["ok"]));
+    }
+
+    #[test]
     fn claude_adapter_permission_request_maps_to_provider_neutral_approval() {
         let event = claude_adapter_event(&json!({
             "type": "borg_permission_request",

@@ -50,6 +50,10 @@ Set `OPENROUTER_API_KEY`, then select any OpenRouter model slug:
 borg agent --provider open-router --model google/gemini-3-flash-preview
 ```
 
+Borg defaults to OpenRouter's capability-aware `openrouter/auto` router when
+`--model` is omitted. It does not maintain a stale allowlist: any current or
+future OpenRouter `author/model` slug can be supplied with `--model`.
+
 Borg does not force Kimi semantics onto OpenRouter models. It uses
 OpenRouter's normalized `reasoning` parameter only when an effort is selected,
 preserves both plain and provider-native reasoning blocks across tool rounds,

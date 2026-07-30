@@ -134,6 +134,15 @@ pub(crate) struct LocalAgentCliArgs {
     pub(crate) model: Option<String>,
     #[arg(long)]
     pub(crate) effort: Option<String>,
+    /// Start one provider peer in the same durable team thread.
+    #[arg(long, value_enum, requires = "prompt", conflicts_with_all = ["resume", "continue_latest"])]
+    pub(crate) peer_provider: Option<RemoteProviderArg>,
+    /// Model override for --peer-provider.
+    #[arg(long, requires = "peer_provider")]
+    pub(crate) peer_model: Option<String>,
+    /// Reasoning effort override for --peer-provider.
+    #[arg(long, requires = "peer_provider")]
+    pub(crate) peer_effort: Option<String>,
     #[arg(long)]
     pub(crate) fast: bool,
     #[arg(long)]
@@ -164,6 +173,9 @@ impl LocalAgentCliArgs {
             provider: RemoteProviderArg::Codex,
             model: None,
             effort: None,
+            peer_provider: None,
+            peer_model: None,
+            peer_effort: None,
             fast: false,
             config: None,
             permission: RemotePermissionArg::FullAccess,
@@ -183,6 +195,9 @@ impl LocalAgentCliArgs {
             provider: RemoteProviderArg::Codex,
             model: None,
             effort: None,
+            peer_provider: None,
+            peer_model: None,
+            peer_effort: None,
             fast: false,
             config: None,
             permission: RemotePermissionArg::FullAccess,
@@ -307,6 +322,67 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn mixed_provider_peer_requires_a_new_thread_prompt() {
+        let command = Cli::try_parse_from([
+            "borg",
+            "agent",
+            "--provider",
+            "codex",
+            "--peer-provider",
+            "claude",
+            "compare",
+            "approaches",
+        ])
+        .expect("mixed-provider launch parses")
+        .command_or_agent();
+        let Command::Agent(args) = command else {
+            panic!("agent command expected");
+        };
+        assert!(matches!(args.provider, RemoteProviderArg::Codex));
+        assert!(matches!(
+            args.peer_provider,
+            Some(RemoteProviderArg::Claude)
+        ));
+        assert_eq!(args.prompt, ["compare", "approaches"]);
+
+        assert!(
+            Cli::try_parse_from([
+                "borg",
+                "agent",
+                "--peer-provider",
+                "claude",
+                "--resume",
+                "00000000-0000-0000-0000-000000000000"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn openrouter_accepts_arbitrary_root_and_peer_model_slugs() {
+        let command = Cli::try_parse_from([
+            "borg",
+            "agent",
+            "--provider",
+            "open-router",
+            "--model",
+            "vendor/future-model",
+            "--peer-provider",
+            "open-router",
+            "--peer-model",
+            "another/vendor-model",
+            "compare",
+        ])
+        .expect("arbitrary OpenRouter slugs parse")
+        .command_or_agent();
+        let Command::Agent(args) = command else {
+            panic!("agent command expected");
+        };
+        assert_eq!(args.model.as_deref(), Some("vendor/future-model"));
+        assert_eq!(args.peer_model.as_deref(), Some("another/vendor-model"));
     }
 }
 

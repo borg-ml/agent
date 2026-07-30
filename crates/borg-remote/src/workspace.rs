@@ -549,6 +549,24 @@ impl SqliteWorkspaceStore {
         ))
     }
 
+    pub async fn contains_idempotent_event(
+        &self,
+        workspace_id: Uuid,
+        author_id: Uuid,
+        idempotency_key: &str,
+    ) -> Result<bool> {
+        let exists: i64 = sqlx::query_scalar(
+            "select exists(select 1 from workspace_events \
+             where workspace_id=? and author_id=? and idempotency_key=?)",
+        )
+        .bind(workspace_id.to_string())
+        .bind(author_id.to_string())
+        .bind(idempotency_key)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(exists != 0)
+    }
+
     pub async fn pending_message_events(
         &self,
         workspace_id: Uuid,

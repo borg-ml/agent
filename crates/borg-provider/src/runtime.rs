@@ -185,3 +185,9 @@ pub fn kimi_effort_levels() -> Vec<String> {
         .map(|effort| (*effort).to_string())
         .collect()
 }
+
+/// OpenRouter's capability-aware router. Individual OpenRouter model slugs
+/// remain valid overrides; this default avoids coupling Borg to one vendor.
+pub fn openrouter_product_model() -> &'static str {
+    "openrouter/auto"
+}

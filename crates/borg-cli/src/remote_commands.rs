@@ -10,10 +10,11 @@ use borg_remote::{
     HostCommand, HostConfig, JsonlSessionStore, LaunchSession, LocalAgentSettings,
     LocalAgentTurnExecutor, LocalSessionControlServer, MessageStatus, PermissionMode, PlanItem,
     PlanItemStatus, PromptDelivery, ResponseLanguage, SessionConfigAction, SessionEvent,
-    SessionEventKind, SessionGoal, SessionStatus, SessionStore, SessionWriterLease,
+    SessionEventKind, SessionGoal, SessionStatus, SessionStore, SessionWriterLease, SpawnSubagent,
     SqliteSessionStore, SqliteWorkspaceStore, SubagentAction, SubagentSnapshot, TodoAction,
     default_host_config_path, enroll_host, login_provider, mirror_local_session,
-    probe_capabilities, run_agent_session_with_store_and_writer, run_attached_session, run_host,
+    probe_capabilities, run_agent_session_with_store_and_writer,
+    run_agent_session_with_store_writer_and_peers, run_attached_session, run_host,
     session_control_socket_path,
 };
 use chrono::{Local, Utc};
@@ -469,7 +470,7 @@ async fn run_local_agent_session(
     let requested_model = args.model.clone().or_else(|| match requested_provider {
         CodingProvider::Codex => Some(borg_provider::codex_product_model().to_string()),
         CodingProvider::Kimi => Some(borg_provider::kimi_product_model().to_string()),
-        CodingProvider::OpenRouter => Some("moonshotai/kimi-k3".to_string()),
+        CodingProvider::OpenRouter => Some(borg_provider::openrouter_product_model().to_string()),
         CodingProvider::OpenAiCompatible => std::env::var("BORG_OPENAI_COMPATIBLE_MODEL")
             .ok()
             .filter(|model| !model.trim().is_empty()),
@@ -573,7 +574,7 @@ async fn run_local_agent_session(
     let mut rendered = HashMap::new();
     let stdin_is_terminal = io::stdin().is_terminal();
     let can_prompt = stdin_is_terminal && !args.json;
-    let initial_prompt = if !args.prompt.is_empty() {
+    let mut initial_prompt = if !args.prompt.is_empty() {
         Some(args.prompt.join(" "))
     } else if !stdin_is_terminal {
         let mut piped = String::new();
@@ -581,6 +582,36 @@ async fn run_local_agent_session(
         (!piped.trim().is_empty()).then(|| piped.trim().to_string())
     } else {
         None
+    };
+    let initial_peers = if let Some(peer_arg) = args.peer_provider {
+        let topic = initial_prompt
+            .as_deref()
+            .context("--peer-provider requires an initial prompt")?
+            .to_string();
+        let peer_provider: CodingProvider = peer_arg.into();
+        let task_name = format!("peer_{}", provider_name(peer_provider).replace('-', "_"));
+        initial_prompt = Some(format!(
+            "{topic}\n\nYou are the lead participant in a mixed-provider Borg thread. \
+             Your peer `{task_name}` is already working on the same problem. Use the \
+             team messaging tools to exchange arguments and evidence, coordinate any \
+             workspace edits, and synthesize a final answer that incorporates both \
+             participants' work."
+        ));
+        vec![SpawnSubagent {
+            task_name: task_name.clone(),
+            message: format!(
+                "{topic}\n\nYou are `{task_name}`, a peer participant in a mixed-provider \
+                 Borg thread. Investigate independently, then use send_message or \
+                 followup_task to discuss findings with `/root`. Coordinate before \
+                 editing shared files and keep working until the lead can synthesize \
+                 the joint result."
+            ),
+            provider: Some(peer_provider),
+            model: args.peer_model.clone(),
+            effort: args.peer_effort.clone(),
+        }]
+    } else {
+        Vec::new()
     };
     let has_initial_prompt = initial_prompt.is_some();
     let interactive = can_prompt;
@@ -733,17 +764,32 @@ async fn run_local_agent_session(
         let actor_store = Arc::clone(&sqlite_store);
         let actor_session_root = sessions_dir.clone();
         tokio::spawn(async move {
-            run_agent_session_with_store_and_writer(
-                &actor_session_root,
-                session_id,
-                launch,
-                session_commands,
-                session_event_tx,
-                executor,
-                actor_store,
-                writer,
-            )
-            .await
+            if initial_peers.is_empty() {
+                run_agent_session_with_store_and_writer(
+                    &actor_session_root,
+                    session_id,
+                    launch,
+                    session_commands,
+                    session_event_tx,
+                    executor,
+                    actor_store,
+                    writer,
+                )
+                .await
+            } else {
+                run_agent_session_with_store_writer_and_peers(
+                    &actor_session_root,
+                    session_id,
+                    launch,
+                    session_commands,
+                    session_event_tx,
+                    executor,
+                    actor_store,
+                    writer,
+                    initial_peers,
+                )
+                .await
+            }
         })
     };
     let mut shutdown_signals =

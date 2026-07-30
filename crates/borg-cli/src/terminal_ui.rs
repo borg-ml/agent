@@ -784,7 +784,7 @@ fn model_picker_options(provider: Option<CodingProvider>, current: Option<&str>)
     }
     match provider {
         Some(CodingProvider::OpenRouter) => {
-            let mut options = vec!["moonshotai/kimi-k3"];
+            let mut options = vec![borg_provider::openrouter_product_model()];
             if let Some(current) = current
                 && !options.contains(&current)
             {

@@ -220,69 +220,76 @@ impl ClaudeStreamState {
                     }
                 }
             }
-            "result" => match value
-                .get("subtype")
-                .and_then(Value::as_str)
-                .unwrap_or("success")
-            {
-                "success" => {
-                    // When the caller passed `outputFormat: { type: "json_schema", ... }`,
-                    // the Agent SDK validates the final assistant output against the
-                    // schema and emits the parsed object on `structured_output`. That
-                    // value is authoritative. The free-text `result` field may still
-                    // carry the raw model output and is only a presentation transcript.
-                    if let Some(structured) = value.get("structured_output")
-                        && !structured.is_null()
-                    {
-                        self.final_text = Some(structured.to_string());
-                    } else {
-                        self.final_text = value
+            "result" => {
+                let usage = super::super::extract_claude_usage(value);
+                if usage.duration_ms > 0 || usage.total_tokens > 0 || usage.cost_microusd.is_some()
+                {
+                    self.final_usage = Some(usage);
+                }
+                match value
+                    .get("subtype")
+                    .and_then(Value::as_str)
+                    .unwrap_or("success")
+                {
+                    "success" => {
+                        // When the caller passed `outputFormat: { type: "json_schema", ... }`,
+                        // the Agent SDK validates the final assistant output against the
+                        // schema and emits the parsed object on `structured_output`. That
+                        // value is authoritative. The free-text `result` field may still
+                        // carry the raw model output and is only a presentation transcript.
+                        if let Some(structured) = value.get("structured_output")
+                            && !structured.is_null()
+                        {
+                            self.final_text = Some(structured.to_string());
+                        } else {
+                            self.final_text = value
+                                .get("result")
+                                .and_then(Value::as_str)
+                                .map(ToString::to_string)
+                                .or_else(|| {
+                                    value.get("content").and_then(Value::as_array).map(|items| {
+                                        items.iter().filter_map(extract_text_block).collect()
+                                    })
+                                });
+                        }
+                    }
+                    subtype => {
+                        // Non-success SDK result subtypes: error_during_execution,
+                        // error_max_turns, error_max_budget_usd, error_max_structured_output_retries.
+                        // Collect whatever diagnostic strings the SDK included.
+                        let explicit_errors = value
+                            .get("errors")
+                            .and_then(Value::as_array)
+                            .map(|items| {
+                                items
+                                    .iter()
+                                    .filter_map(Value::as_str)
+                                    .collect::<Vec<_>>()
+                                    .join("; ")
+                            })
+                            .filter(|joined| !joined.is_empty());
+                        let error = value
                             .get("result")
                             .and_then(Value::as_str)
                             .map(ToString::to_string)
+                            .or(explicit_errors)
                             .or_else(|| {
-                                value.get("content").and_then(Value::as_array).map(|items| {
-                                    items.iter().filter_map(extract_text_block).collect()
-                                })
-                            });
+                                value
+                                    .get("error")
+                                    .and_then(Value::as_str)
+                                    .map(ToString::to_string)
+                            })
+                            .unwrap_or_else(|| format!("claude SDK returned subtype={subtype}"));
+                        self.emitted_failure = true;
+                        let _ = tx
+                            .send(ChatStreamEvent::Failed {
+                                error: format!("claude SDK {subtype}: {error}"),
+                            })
+                            .await;
+                        return Ok(true);
                     }
                 }
-                subtype => {
-                    // Non-success SDK result subtypes: error_during_execution,
-                    // error_max_turns, error_max_budget_usd, error_max_structured_output_retries.
-                    // Collect whatever diagnostic strings the SDK included.
-                    let explicit_errors = value
-                        .get("errors")
-                        .and_then(Value::as_array)
-                        .map(|items| {
-                            items
-                                .iter()
-                                .filter_map(Value::as_str)
-                                .collect::<Vec<_>>()
-                                .join("; ")
-                        })
-                        .filter(|joined| !joined.is_empty());
-                    let error = value
-                        .get("result")
-                        .and_then(Value::as_str)
-                        .map(ToString::to_string)
-                        .or(explicit_errors)
-                        .or_else(|| {
-                            value
-                                .get("error")
-                                .and_then(Value::as_str)
-                                .map(ToString::to_string)
-                        })
-                        .unwrap_or_else(|| format!("claude SDK returned subtype={subtype}"));
-                    self.emitted_failure = true;
-                    let _ = tx
-                        .send(ChatStreamEvent::Failed {
-                            error: format!("claude SDK {subtype}: {error}"),
-                        })
-                        .await;
-                    return Ok(true);
-                }
-            },
+            }
             "error" => {
                 // Surface the structured `kind` / `status` fields the TS
                 // wrapper attaches so `classify_provider_failure` can pick

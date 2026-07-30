@@ -48,7 +48,7 @@ pub use orchestration::*;
 pub use session::{
     SessionGoalTools, SessionTodoTools, run_agent_session, run_agent_session_with_executor,
     run_agent_session_with_executor_and_writer, run_agent_session_with_store_and_writer,
-    run_agent_session_with_writer,
+    run_agent_session_with_store_writer_and_peers, run_agent_session_with_writer,
 };
 pub use session_store::{
     EventPersistence, JsonlSessionStore, SESSION_PROJECTION_VERSION, SessionConfiguration,

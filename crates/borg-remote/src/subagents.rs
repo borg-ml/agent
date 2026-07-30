@@ -1225,16 +1225,31 @@ impl SubagentCoordinator {
         let mut launch = self.root_launch.clone();
         launch.request_id = Uuid::new_v4();
         launch.initial_prompt = Some(message);
-        launch.provider = request.provider.unwrap_or(launch.provider);
+        let parent_provider = launch.provider;
+        launch.provider = request.provider.unwrap_or(parent_provider);
         validate_subagent_overrides(
             launch.provider,
             request.model.as_deref(),
             request.effort.as_deref(),
         )?;
-        if request.model.is_some() {
-            launch.model = request.model;
+        if launch.provider != parent_provider {
+            launch.model = request
+                .model
+                .or_else(|| default_model_for_cross_provider_peer(launch.provider));
+            launch.effort = request
+                .effort
+                .or_else(|| default_effort_for_cross_provider_peer(launch.provider));
+        } else {
+            if request.model.is_some() {
+                launch.model = request.model;
+            }
+            launch.effort = effective_worker_effort(&launch, request.effort);
         }
-        launch.effort = effective_worker_effort(&launch, request.effort);
+        anyhow::ensure!(
+            !launch.provider.uses_native_harness() || launch.model.is_some(),
+            "{:?} peer requires an explicit model",
+            launch.provider
+        );
         launch.name = Some(canonical_task_name(&request.task_name)?);
 
         let snapshot = self
@@ -1881,6 +1896,27 @@ impl SubagentCoordinator {
             }
             other => bail!("unknown subagent tool: {other}"),
         }
+    }
+}
+
+fn default_model_for_cross_provider_peer(provider: CodingProvider) -> Option<String> {
+    match provider {
+        CodingProvider::Codex => Some(borg_provider::codex_product_model().to_string()),
+        CodingProvider::Claude | CodingProvider::OpenCode => None,
+        CodingProvider::Kimi => Some(borg_provider::kimi_product_model().to_string()),
+        CodingProvider::OpenRouter => Some(borg_provider::openrouter_product_model().to_string()),
+        CodingProvider::OpenAiCompatible => None,
+    }
+}
+
+fn default_effort_for_cross_provider_peer(provider: CodingProvider) -> Option<String> {
+    match provider {
+        CodingProvider::Codex => Some(borg_provider::codex_default_effort().to_string()),
+        CodingProvider::Kimi => Some(borg_provider::kimi_default_effort().to_string()),
+        CodingProvider::Claude
+        | CodingProvider::OpenCode
+        | CodingProvider::OpenRouter
+        | CodingProvider::OpenAiCompatible => None,
     }
 }
 
@@ -2956,6 +2992,38 @@ mod tests {
         assert_eq!(child.model.as_deref(), Some("gpt-test"));
         assert_eq!(table.resolve("review_api").unwrap(), child.session_id);
         assert_eq!(table.resolve("/root/review_api").unwrap(), child.session_id);
+    }
+
+    #[test]
+    fn cross_provider_peer_does_not_inherit_an_incompatible_model_or_effort() {
+        assert_eq!(
+            default_model_for_cross_provider_peer(CodingProvider::Claude),
+            None
+        );
+        assert_eq!(
+            default_effort_for_cross_provider_peer(CodingProvider::Claude),
+            None
+        );
+        assert_eq!(
+            default_model_for_cross_provider_peer(CodingProvider::Codex).as_deref(),
+            Some(borg_provider::codex_product_model())
+        );
+        assert_eq!(
+            default_model_for_cross_provider_peer(CodingProvider::Kimi).as_deref(),
+            Some(borg_provider::kimi_product_model())
+        );
+        assert_eq!(
+            default_effort_for_cross_provider_peer(CodingProvider::Kimi).as_deref(),
+            Some(borg_provider::kimi_default_effort())
+        );
+        assert_eq!(
+            default_model_for_cross_provider_peer(CodingProvider::OpenRouter).as_deref(),
+            Some(borg_provider::openrouter_product_model())
+        );
+        assert_eq!(
+            default_effort_for_cross_provider_peer(CodingProvider::OpenRouter),
+            None
+        );
     }
 
     #[test]

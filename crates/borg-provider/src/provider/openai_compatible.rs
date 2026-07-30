@@ -1108,6 +1108,31 @@ mod tests {
     }
 
     #[test]
+    fn openrouter_is_model_neutral_and_only_requests_reasoning_explicitly() {
+        assert_eq!(crate::openrouter_product_model(), "openrouter/auto");
+        assert_eq!(compatible_reasoning(None), None);
+        assert_eq!(
+            compatible_reasoning(Some("low")),
+            Some(json!({ "effort": "low" }))
+        );
+        assert_eq!(
+            compatible_reasoning(Some("high")),
+            Some(json!({ "effort": "high" }))
+        );
+        assert_eq!(
+            compatible_reasoning(Some("ultra")),
+            Some(json!({ "effort": "max" }))
+        );
+    }
+
+    #[test]
+    fn openrouter_requires_endpoint_support_for_agent_parameters() {
+        let preferences =
+            compatible_openrouter_provider_preferences(true).expect("routing preferences");
+        assert_eq!(preferences["require_parameters"], true);
+    }
+
+    #[test]
     fn kimi_retries_only_rate_limits_and_server_failures() {
         assert!(kimi_retryable_status(
             reqwest::StatusCode::TOO_MANY_REQUESTS

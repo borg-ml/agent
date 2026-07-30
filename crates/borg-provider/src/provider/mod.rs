@@ -551,7 +551,13 @@ pub fn default_effort_for_backend(backend: &str) -> Option<String> {
 /// usage / cost off the streamed `assistant` envelope. Public so it can
 /// be called across modules in this crate.
 pub(crate) fn extract_claude_usage(envelope: &Value) -> ProviderCallUsage {
-    let usage = envelope.get("usage");
+    // SDK assistant envelopes keep Anthropic usage under `message.usage`,
+    // while terminal result envelopes expose cumulative usage at the top
+    // level. Accept both shapes so final turn telemetry is never replaced by
+    // an all-zero fallback.
+    let usage = envelope
+        .get("usage")
+        .or_else(|| envelope.pointer("/message/usage"));
     let input_tokens = usage
         .and_then(|value| value.get("input_tokens"))
         .and_then(Value::as_u64)
@@ -889,8 +895,8 @@ mod tests {
     use super::{
         CLAUDE_DEFAULT_MODEL, CLAUDE_SELECTABLE_MODELS, PROVIDER_HTTP_ERROR_BODY_MAX_BYTES,
         PROVIDER_MCP_CONFIG_MAX_BYTES, estimate_openai_cache_miss_microusd,
-        estimate_openai_cost_microusd, extract_chat_completions_usage, microusd_for_tokens,
-        parse_chat_completion_json_text, provider_cost_usd_to_microusd,
+        estimate_openai_cost_microusd, extract_chat_completions_usage, extract_claude_usage,
+        microusd_for_tokens, parse_chat_completion_json_text, provider_cost_usd_to_microusd,
         provider_response_body_would_exceed_limit, read_provider_mcp_config_text,
         truncate_provider_text,
     };
@@ -1009,6 +1015,42 @@ mod tests {
         assert_eq!(usage.total_tokens, 130);
         assert_eq!(usage.duration_ms, 250);
         assert_eq!(usage.cost_microusd, Some(1234));
+    }
+
+    #[test]
+    fn claude_usage_accepts_assistant_and_result_envelopes() {
+        let assistant = json!({
+            "type": "assistant",
+            "message": {
+                "usage": {
+                    "input_tokens": 11,
+                    "cache_read_input_tokens": 7,
+                    "cache_creation_input_tokens": 5,
+                    "output_tokens": 3
+                }
+            }
+        });
+        let assistant_usage = extract_claude_usage(&assistant);
+        assert_eq!(assistant_usage.input_tokens, 11);
+        assert_eq!(assistant_usage.cached_input_tokens, 7);
+        assert_eq!(assistant_usage.cache_creation_input_tokens, 5);
+        assert_eq!(assistant_usage.output_tokens, 3);
+        assert_eq!(assistant_usage.total_tokens, 26);
+
+        let result = json!({
+            "type": "result",
+            "duration_ms": 250,
+            "total_cost_usd": 0.012345,
+            "usage": {
+                "input_tokens": 20,
+                "cache_read_input_tokens": 10,
+                "output_tokens": 4
+            }
+        });
+        let result_usage = extract_claude_usage(&result);
+        assert_eq!(result_usage.total_tokens, 34);
+        assert_eq!(result_usage.duration_ms, 250);
+        assert_eq!(result_usage.cost_microusd, Some(12_345));
     }
 
     #[test]

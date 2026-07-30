@@ -63,6 +63,22 @@ impl WorkspaceProjection {
         if event.sequence == 0 {
             return Ok(());
         }
+        let projection_id = Uuid::new_v5(&event.id, b"borg-workspace-session-event");
+        let author_id = match &event.kind {
+            SessionEventKind::Message {
+                actor: EventActor::User,
+                ..
+            } => self.human_participant_id,
+            _ => self.agent_participant_id,
+        };
+        let idempotency_key = format!("session-event:{}", event.id);
+        if self
+            .store
+            .contains_idempotent_event(self.workspace_id, author_id, &idempotency_key)
+            .await?
+        {
+            return Ok(());
+        }
         match &event.kind {
             SessionEventKind::Message {
                 message_id,
@@ -107,20 +123,13 @@ impl WorkspaceProjection {
             }
             _ => {}
         }
-        let author_id = match &event.kind {
-            SessionEventKind::Message {
-                actor: EventActor::User,
-                ..
-            } => self.human_participant_id,
-            _ => self.agent_participant_id,
-        };
         self.store
             .append(WorkspaceEvent {
-                id: Uuid::new_v5(&event.id, b"borg-workspace-session-event"),
+                id: projection_id,
                 workspace_id: self.workspace_id,
                 sequence: 0,
                 author_id,
-                idempotency_key: format!("session-event:{}", event.id),
+                idempotency_key,
                 created_at: event.created_at,
                 kind: WorkspaceEventKind::SessionEvent {
                     session_id: event.session_id,
@@ -365,6 +374,40 @@ pub async fn run_agent_session_with_store_and_writer(
         executor,
         store,
         None,
+        Vec::new(),
+    )
+    .await
+}
+
+/// Run a root session and deterministically create its initial mixed-provider
+/// teammates before admitting the root's first prompt.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_agent_session_with_store_writer_and_peers(
+    session_root: &Path,
+    session_id: Uuid,
+    launch: LaunchSession,
+    commands: mpsc::Receiver<HostCommand>,
+    events: mpsc::Sender<SessionEvent>,
+    executor: Arc<dyn AgentTurnExecutor>,
+    store: Arc<dyn SessionStore>,
+    _writer: SessionWriterLease,
+    initial_peers: Vec<crate::SpawnSubagent>,
+) -> Result<()> {
+    anyhow::ensure!(
+        !launch.fast.unwrap_or(false) || launch.provider.supports_fast(),
+        "fast mode is not supported by the {:?} transport",
+        launch.provider
+    );
+    run_agent_session_store_kernel(
+        session_root,
+        session_id,
+        launch,
+        commands,
+        events,
+        executor,
+        store,
+        None,
+        initial_peers,
     )
     .await
 }
@@ -395,6 +438,7 @@ pub(crate) async fn run_agent_session_with_store_and_writer_and_team(
         executor,
         store,
         Some(team),
+        Vec::new(),
     )
     .await
 }
@@ -445,6 +489,7 @@ async fn run_agent_session_kernel(
         executor,
         runtime_store,
         None,
+        Vec::new(),
     )
     .await
 }
@@ -461,6 +506,7 @@ async fn run_agent_session_store_kernel(
     executor: Arc<dyn AgentTurnExecutor>,
     store: Arc<dyn SessionStore>,
     shared_team: Option<SubagentCoordinator>,
+    initial_peers: Vec<crate::SpawnSubagent>,
 ) -> Result<()> {
     validate_launch_session(&mut launch)?;
     store.create_session(session_id).await?;
@@ -600,6 +646,18 @@ async fn run_agent_session_store_kernel(
             .expect("enabled team")
             .restore_from_events(&recovery.subagent_events)
             .await?;
+    }
+    if fresh && !initial_peers.is_empty() {
+        let team = subagents
+            .as_ref()
+            .context("initial peers require the subagent capability")?;
+        anyhow::ensure!(
+            launch.capabilities.multiplayer,
+            "initial peers require the multiplayer capability"
+        );
+        for peer in initial_peers {
+            team.spawn(peer).await?;
+        }
     }
     let shared_work = launch
         .capabilities
@@ -3123,6 +3181,8 @@ mod tests {
     type RecordedTurns = Arc<Mutex<Vec<(PathBuf, Option<serde_json::Value>)>>>;
     type RecordedPromptTurns = Arc<Mutex<Vec<(String, Vec<PathBuf>)>>>;
     type RecordedContextTurns = Arc<Mutex<Vec<(String, Option<String>)>>>;
+    type RecordedProviderTurns =
+        Arc<Mutex<Vec<(CodingProvider, Option<String>, Option<String>, String)>>>;
 
     #[tokio::test]
     async fn durable_session_events_project_once_into_the_bound_workspace() {
@@ -3258,6 +3318,18 @@ mod tests {
             .unwrap();
         assert_eq!(acknowledged[0].state, crate::DeliveryState::Acknowledged);
 
+        for event in store.read(session_id).await.unwrap() {
+            projection.project(&event).await.unwrap();
+        }
+        let acknowledged_after_restart = workspace_store
+            .deliveries_after(binding.workspace_id, binding.participant_id, 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            acknowledged_after_restart[0].state,
+            crate::DeliveryState::Acknowledged
+        );
+
         let replay = workspace_store
             .replay(binding.workspace_id, binding.participant_id, 0, 10)
             .await
@@ -3282,6 +3354,11 @@ mod tests {
 
     struct ContextRecordingExecutor {
         seen: RecordedContextTurns,
+    }
+
+    struct ProviderRecordingExecutor {
+        seen: RecordedProviderTurns,
+        called: Arc<Notify>,
     }
 
     #[async_trait::async_trait]
@@ -3329,6 +3406,26 @@ mod tests {
                 .push((turn.prompt, turn.provider_session_id));
             Ok(AgentTurnResult {
                 provider_session_id: Some("provider-session".to_string()),
+                final_text: "done".to_string(),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentTurnExecutor for ProviderRecordingExecutor {
+        async fn execute(
+            &self,
+            turn: AgentTurn,
+            _events: mpsc::Sender<SessionEventKind>,
+            _controls: Option<mpsc::Receiver<AgentTurnControl>>,
+        ) -> Result<AgentTurnResult> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((turn.provider, turn.model, turn.effort, turn.prompt));
+            self.called.notify_waiters();
+            Ok(AgentTurnResult {
+                provider_session_id: Some(format!("{:?}-session", turn.provider)),
                 final_text: "done".to_string(),
             })
         }
@@ -4838,6 +4935,96 @@ mod tests {
             store.state(session_id).await.unwrap().status,
             Some(SessionStatus::Stopped)
         );
+    }
+
+    #[tokio::test]
+    async fn initial_mixed_provider_peer_starts_with_isolated_provider_configuration() {
+        let root = tempdir().unwrap();
+        let session_id = Uuid::new_v4();
+        let journal =
+            SessionJournal::open(root.path().join(format!("{session_id}.jsonl"))).unwrap();
+        let writer = journal.acquire_writer().unwrap();
+        let store = Arc::new(
+            SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+                .await
+                .unwrap(),
+        );
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let called = Arc::new(Notify::new());
+        let executor = Arc::new(ProviderRecordingExecutor {
+            seen: Arc::clone(&seen),
+            called: Arc::clone(&called),
+        });
+        let (command_tx, command_rx) = mpsc::channel(4);
+        let (event_tx, _event_rx) = mpsc::channel(256);
+        let actor_root = root.path().to_path_buf();
+        let actor_store = store.clone();
+        let actor = tokio::spawn(async move {
+            run_agent_session_with_store_writer_and_peers(
+                &actor_root,
+                session_id,
+                LaunchSession {
+                    request_id: Uuid::new_v4(),
+                    cwd: actor_root.clone(),
+                    provider: CodingProvider::Codex,
+                    model: Some("gpt-test".to_string()),
+                    effort: Some("low".to_string()),
+                    fast: Some(false),
+                    response_language: crate::ResponseLanguage::Auto,
+                    permission_mode: PermissionMode::FullAccess,
+                    name: None,
+                    initial_prompt: Some("root topic".to_string()),
+                    capabilities: Default::default(),
+                    subagent_concurrency_limit: None,
+                    extension_skill_roots: Vec::new(),
+                    team_policy: None,
+                },
+                command_rx,
+                event_tx,
+                executor,
+                actor_store,
+                writer,
+                vec![crate::SpawnSubagent {
+                    task_name: "peer_claude".to_string(),
+                    message: "peer topic".to_string(),
+                    provider: Some(CodingProvider::Claude),
+                    model: None,
+                    effort: None,
+                }],
+            )
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if seen.lock().unwrap().len() >= 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("root and peer turns start");
+
+        let turns = seen.lock().unwrap().clone();
+        assert!(turns.iter().any(|(provider, model, effort, prompt)| {
+            *provider == CodingProvider::Codex
+                && model.as_deref() == Some("gpt-test")
+                && effort.as_deref() == Some("low")
+                && prompt == "root topic"
+        }));
+        assert!(turns.iter().any(|(provider, model, effort, prompt)| {
+            *provider == CodingProvider::Claude
+                && model.is_none()
+                && effort.is_none()
+                && prompt == "peer topic"
+        }));
+
+        command_tx
+            .send(HostCommand::Stop { session_id })
+            .await
+            .unwrap();
+        actor.await.unwrap().unwrap();
     }
 
     #[tokio::test]

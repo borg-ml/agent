@@ -139,6 +139,51 @@ mode, concurrency, budgets, retry limits, and escalation thresholds are
 configuration. An `xhigh` Codex director with `low` Codex workers is a preset,
 not a protocol requirement.
 
+### Mixed-provider thread launch
+
+A root agent and one provider peer can be launched into the same durable team
+thread explicitly:
+
+```console
+borg agent --provider codex --peer-provider claude \
+  "Compare the two approaches, challenge each other's assumptions, and implement the agreed solution."
+```
+
+`--peer-model` and `--peer-effort` override the peer independently. Borg
+creates the peer before admitting the root prompt, assigns each a distinct
+durable participant/session identity, and gives both the same team directory,
+workspace tools, goal/plan state, and direct-message channel. Provider changes
+do not inherit an incompatible model or reasoning effort from the root.
+
+The root and peer exchange attributed messages through the canonical workspace
+delivery stream. Their provider/tool transcripts remain separate session
+streams and are projected into the root team UI, preventing disconnected
+histories while retaining unambiguous ownership, usage, approvals, and
+interrupt controls.
+
+### Launch-readiness checks
+
+The mixed-provider path is covered at the provider-neutral session boundary,
+so CI does not require paid Codex or Claude calls:
+
+- a fresh root creates its configured peer before the root turn is admitted;
+- cross-provider children do not inherit incompatible model or effort values;
+- child-to-root and sibling messages retain attributed canonical identities;
+- concurrent work claims are atomic, idempotent, and reject conflicting reuse;
+- child interruption, durable topology restoration, and queued-turn recovery
+  use the same tested session machinery as single-provider threads;
+- parent projection retains each child's complete transcript and final result.
+
+A release smoke should additionally run one credentialed thread:
+
+```console
+borg agent --provider codex --peer-provider claude --permission full-access \
+  "Exchange one attributed finding, wait for each other, then synthesize one final answer."
+```
+
+The smoke passes only when both provider turns complete, the root observes the
+Claude-attributed team message, and the root produces a joint final response.
+
 Borg admits up to 16 live child agents by default for both manual and
 autonomous teams. Users can lower that ceiling with
 `[team].worker_concurrency` without enabling an autonomous preset. Total
