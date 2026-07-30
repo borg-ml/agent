@@ -1053,6 +1053,7 @@ fn merge_object(target: &mut Value, extra: Map<String, Value>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     #[test]
     fn native_images_use_chat_completions_multimodal_blocks() {
@@ -1073,6 +1074,35 @@ mod tests {
         );
     }
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    static OPENROUTER_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct TestEnvGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl TestEnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            // SAFETY: tests that mutate these OpenRouter variables serialize
+            // through OPENROUTER_ENV_LOCK and restore them on drop.
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for TestEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: see TestEnvGuard::set.
+            unsafe {
+                match self.previous.as_deref() {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
 
     #[test]
     fn product_kimi_model_selects_the_direct_route() {
@@ -1245,5 +1275,141 @@ mod tests {
         assert_eq!(tool_calls[0].function.name, "read_file");
         assert_eq!(tool_calls[0].function.arguments, r#"{"path":"src/lib.rs"}"#);
         assert_eq!(streamed.raw["usage"]["prompt_tokens"], 10);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn openrouter_arbitrary_model_runs_the_complete_native_wire_contract() {
+        let _lock = OPENROUTER_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind OpenRouter test server");
+        let address = listener.local_addr().expect("test server address");
+        let base_url = format!("http://{address}/api/v1");
+        let _base = TestEnvGuard::set("BORG_OPENROUTER_BASE_URL", &base_url);
+        let _key = TestEnvGuard::set("OPENROUTER_API_KEY", "test-openrouter-key");
+
+        let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+        let response_body = [
+            r#"data: {"model":"vendor/future-model","choices":[{"delta":{"reasoning":"inspect ","reasoning_details":[{"type":"reasoning.text","text":"inspect "}]},"finish_reason":null}]}"#,
+            r#"data: {"choices":[{"delta":{"content":"{\"ok\":true}","tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"README.md\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":21,"completion_tokens":8,"total_tokens":29,"cost":0.000123}}"#,
+            "data: [DONE]",
+            "",
+        ]
+        .join("\n");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept request");
+            let mut request = Vec::new();
+            let expected_len = loop {
+                let mut chunk = [0_u8; 8192];
+                let read = socket.read(&mut chunk).await.expect("read request");
+                assert!(read > 0, "request closed before headers");
+                request.extend_from_slice(&chunk[..read]);
+                let Some(header_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_len = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(str::trim)
+                            .and_then(|value| value.parse::<usize>().ok())
+                    })
+                    .expect("content-length header");
+                break header_end + 4 + content_len;
+            };
+            while request.len() < expected_len {
+                let mut chunk = [0_u8; 8192];
+                let read = socket.read(&mut chunk).await.expect("read request body");
+                assert!(read > 0, "request closed before body");
+                request.extend_from_slice(&chunk[..read]);
+            }
+            request_tx
+                .send(request)
+                .expect("return captured OpenRouter request");
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        response_body.len(),
+                        response_body
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("write OpenRouter response");
+        });
+
+        let provider = OpenAiCompatibleProvider {
+            model: "vendor/future-model".to_string(),
+            effort: Some("high".to_string()),
+            system_prompt: "",
+        };
+        let result = provider
+            .model_turn_via_profile(
+                ModelTurnRequest {
+                    request_id: Some("openrouter-test".to_string()),
+                    messages: vec![ModelMessage::user("inspect the repository")],
+                    tools: vec![
+                        super::super::ModelToolDefinition::new(
+                            "read_file",
+                            "Read a file.",
+                            json!({
+                                "type": "object",
+                                "properties": {"path": {"type": "string"}},
+                                "required": ["path"]
+                            }),
+                        )
+                        .unwrap(),
+                    ],
+                    output_schema: Some(json!({
+                        "type": "object",
+                        "properties": {"ok": {"type": "boolean"}},
+                        "required": ["ok"]
+                    })),
+                },
+                None,
+                None,
+                OpenAiCompatibleProfile::OpenRouter,
+            )
+            .await
+            .expect("OpenRouter native turn");
+        server.await.expect("OpenRouter test server task");
+
+        let request = request_rx.await.expect("captured request");
+        let header_end = request
+            .windows(4)
+            .position(|bytes| bytes == b"\r\n\r\n")
+            .expect("request headers");
+        let headers = String::from_utf8_lossy(&request[..header_end]).to_ascii_lowercase();
+        assert!(headers.contains("authorization: bearer test-openrouter-key"));
+        assert!(headers.contains("x-borg-request-id: openrouter-test"));
+        let body: Value =
+            serde_json::from_slice(&request[header_end + 4..]).expect("request JSON body");
+        assert_eq!(body["model"], "vendor/future-model");
+        assert_eq!(body["reasoning"]["effort"], "high");
+        assert_eq!(body["tool_choice"], "auto");
+        assert_eq!(body["response_format"]["type"], "json_schema");
+        assert_eq!(body["provider"]["require_parameters"], true);
+
+        let ModelMessage::Assistant {
+            content,
+            reasoning_content,
+            reasoning_details,
+            tool_calls,
+        } = result.message
+        else {
+            panic!("assistant response expected");
+        };
+        assert_eq!(content.as_deref(), Some(r#"{"ok":true}"#));
+        assert_eq!(reasoning_content.as_deref(), Some("inspect "));
+        assert!(reasoning_details.is_some());
+        assert_eq!(tool_calls[0].function.name, "read_file");
+        assert_eq!(result.usage.total_tokens, 29);
+        assert_eq!(result.usage.cost_microusd, Some(123));
     }
 }
