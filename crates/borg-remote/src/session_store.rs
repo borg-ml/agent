@@ -2170,6 +2170,10 @@ async fn preserve_journal_backup(path: &Path, bytes: &[u8], fingerprint: &str) -
                 temporary.display()
             )
         })?;
+    // Directory fsync is not supported by Windows. The file itself has
+    // already been flushed before the atomic rename; Unix additionally
+    // flushes the containing directory so the rename survives a crash.
+    #[cfg(not(windows))]
     if let Some(parent) = backup_path.parent() {
         let directory = tokio::fs::OpenOptions::new()
             .read(true)

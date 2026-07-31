@@ -1255,26 +1255,27 @@ fn an_edit_reads_as_preparing_until_its_diff_is_on_screen() {
 
 #[test]
 fn status_path_uses_fish_style_parent_abbreviations() {
+    let separator = std::path::MAIN_SEPARATOR;
     assert_eq!(
         fish_style_path_with_home(
             Path::new("/home/shulgin/borg-cli"),
             Some(Path::new("/home/shulgin"))
         ),
-        "~/borg-cli"
+        format!("~{separator}borg-cli")
     );
     assert_eq!(
         fish_style_path_with_home(
             Path::new("/home/shulgin/projects/borg-cli"),
             Some(Path::new("/home/shulgin"))
         ),
-        "~/p/borg-cli"
+        format!("~{separator}p{separator}borg-cli")
     );
     assert_eq!(
         fish_style_path_with_home(
             Path::new("/home/shulgin/.config/borg"),
             Some(Path::new("/home/shulgin"))
         ),
-        "~/.c/borg"
+        format!("~{separator}.c{separator}borg")
     );
     assert_eq!(
         fish_style_path_with_home(Path::new("/home/shulgin"), Some(Path::new("/home/shulgin"))),
@@ -2906,6 +2907,7 @@ fn low_context_status_announces_imminent_compaction() {
 
 #[test]
 fn projected_session_state_restores_status_config_outside_the_history_tail() {
+    let separator = std::path::MAIN_SEPARATOR;
     let mut transcript = Transcript::default();
     transcript.seed_session_state(&SessionState {
         configuration: Some(borg_remote::SessionConfiguration {
@@ -2932,7 +2934,7 @@ fn projected_session_state_restores_status_config_outside_the_history_tail() {
             Some("medium".to_string()),
             None,
             Some("full access".to_string()),
-            "/w/borg".to_string()
+            format!("{separator}w{separator}borg")
         )
     );
     assert_eq!(transcript.context_remaining_percent, 77);
