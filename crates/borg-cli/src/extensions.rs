@@ -349,13 +349,14 @@ mod tests {
             manifest("docs", "multiplayer"),
         )
         .unwrap();
+        let canonical_manifest_dir = manifest_dir.canonicalize().unwrap();
         let (untrusted, _) = discover(dir.path(), &CapabilityConfig::default(), false).unwrap();
         assert!(!untrusted.extensions[0].active);
         assert!(
             untrusted.extensions[0]
                 .skill_roots
                 .iter()
-                .all(|root| root.starts_with(&manifest_dir))
+                .all(|root| root.starts_with(&canonical_manifest_dir))
         );
         let (trusted, _) = discover(dir.path(), &CapabilityConfig::default(), true).unwrap();
         assert!(trusted.extensions[0].active);
