@@ -104,19 +104,41 @@ fn model_and_effort_pickers_use_the_provider_catalog() {
     let catalog = CodingProvider::Codex
         .model_catalog()
         .expect("Codex catalog");
+    let options = model_picker_options(Some(CodingProvider::Codex), None);
+    let values = options
+        .iter()
+        .map(|option| option.value.as_str())
+        .collect::<Vec<_>>();
+    // Codex leads the canonical catalog order, and every other catalog-backed
+    // provider is still selectable below it.
     assert_eq!(
-        model_picker_options(Some(CodingProvider::Codex), None),
+        values[..catalog.selectable_models.len()],
         catalog
             .selectable_models
             .iter()
             .map(|(model, _)| *model)
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>()[..]
     );
     assert_eq!(
         effort_picker_options(Some(CodingProvider::Codex)),
         catalog.effort_levels
     );
-    assert!(model_picker_options(Some(CodingProvider::Codex), None).contains(&"gpt-5.6-luna"));
+    assert!(values.contains(&"gpt-5.6-luna"));
+    for (model, _) in borg_provider::CLAUDE_SELECTABLE_MODELS {
+        assert!(values.contains(&model), "{model} missing from picker");
+    }
+
+    let claude_options = model_picker_options(Some(CodingProvider::Claude), None);
+    assert_eq!(claude_options[0].section.as_deref(), Some("Codex"));
+    assert!(
+        claude_options
+            .iter()
+            .any(|option| option.section.as_deref() == Some("Claude"))
+    );
+    assert_eq!(
+        effort_picker_options(Some(CodingProvider::Claude)),
+        &["low", "medium", "high", "xhigh", "max"]
+    );
 }
 
 #[test]
@@ -1006,6 +1028,36 @@ fn actionable_inactive_goals_remain_in_the_status_line() {
     assert_eq!(transcript.goal_status(), None);
 }
 
+#[test]
+fn todo_status_counts_open_items_and_tooltip_keeps_the_full_plan() {
+    let mut transcript = Transcript::default();
+    transcript.todos = vec![
+        PlanItem {
+            id: Uuid::new_v4(),
+            content: "Ship the hover affordance".to_string(),
+            status: PlanItemStatus::InProgress,
+        },
+        PlanItem {
+            id: Uuid::new_v4(),
+            content: "Keep the completed item visible".to_string(),
+            status: PlanItemStatus::Completed,
+        },
+        PlanItem {
+            id: Uuid::new_v4(),
+            content: "Run the regression tests".to_string(),
+            status: PlanItemStatus::Pending,
+        },
+    ];
+
+    assert_eq!(transcript.todo_status().as_deref(), Some("2 open to-dos"));
+    let rows = transcript.todo_tooltip_rows();
+    assert_eq!(rows.len(), 3);
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("Keep the completed item visible"))
+    );
+}
+
 /// Clicking the goal segment must submit exactly the slash command the user
 /// would type, and must stay inert where there is no run state to flip.
 #[test]
@@ -1451,6 +1503,23 @@ fn markdown_math_uses_a_real_terminal_layout() {
 }
 
 #[test]
+fn markdown_currency_does_not_become_terminal_math() {
+    let rendered = markdown_lines(
+        "It costs only $0.1667/hour (~$4/day) and currently holds:",
+        80,
+        Some(Color::White),
+    );
+    let text = rendered
+        .iter()
+        .map(Line::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(text.contains("$0.1667/hour (~$4/day)"), "{text}");
+    assert!(!text.contains('─'), "{text}");
+}
+
+#[test]
 fn quoted_pasted_text_keeps_gutter_without_code_line_numbers() {
     let markdown = "> ```text\n> pasted first line\n> pasted second line\n> ```";
     let rendered = markdown_lines(markdown, 80, None)
@@ -1762,7 +1831,7 @@ fn agents_status_spins_only_while_a_child_is_working() {
             .iter()
             .any(|frame| working.contains(frame))
     );
-    assert_eq!(idle, " · 7 agents");
+    assert_eq!(idle, "7 agents");
 }
 
 #[test]
@@ -2136,6 +2205,24 @@ fn picker_hover_selects_the_option_without_a_click() {
 }
 
 #[test]
+fn picker_hover_uses_actual_option_indices_after_filtering() {
+    let mut picker = Picker {
+        kind: PickerKind::Effort,
+        title: "Choose effort",
+        options: ["low", "medium", "high"]
+            .into_iter()
+            .map(|value| PickerOption::new(value, value))
+            .collect(),
+        selected: 0,
+        query: Some("high".to_string()),
+    };
+
+    assert_eq!(picker.option_row_offsets(), vec![(2, 1)]);
+    assert!(picker.select_hovered(&MouseEventKind::Moved, Some(2)));
+    assert_eq!(picker.selected_value(), "high");
+}
+
+#[test]
 fn picker_numbers_are_visible_and_select_immediately() {
     let mut picker = Picker::new(
         PickerKind::Effort,
@@ -2349,12 +2436,12 @@ fn one_queued_prompt_allocates_a_content_row_below_its_border() {
     }];
     let six = (0..6).map(|_| prompts[0].clone()).collect::<Vec<_>>();
     let seven = (0..7).map(|_| prompts[0].clone()).collect::<Vec<_>>();
-    assert_eq!(queued_prompt_panel_height(&[]), 0);
-    assert_eq!(queued_prompt_panel_height(&prompts), 3);
-    assert_eq!(queued_prompt_panel_height(&six), 8);
-    assert_eq!(queued_prompt_panel_height(&seven), 9);
+    assert_eq!(queued_prompt_panel_height(&[], 60), 0);
+    assert_eq!(queued_prompt_panel_height(&prompts, 60), 3);
+    assert_eq!(queued_prompt_panel_height(&six, 60), 8);
+    assert_eq!(queued_prompt_panel_height(&seven, 60), 9);
 
-    let area = Rect::new(0, 0, 60, queued_prompt_panel_height(&prompts));
+    let area = Rect::new(0, 0, 60, queued_prompt_panel_height(&prompts, 60));
     let mut buffer = ratatui::buffer::Buffer::empty(area);
     let widget = Paragraph::new(queued_prompt_lines(&prompts, area.width)).block(
         Block::default()
@@ -2371,7 +2458,27 @@ fn one_queued_prompt_allocates_a_content_row_below_its_border() {
         .collect::<String>();
     assert!(content.contains("Next"));
     assert!(content.contains("visible follow-up"));
-    assert!(hint.contains("↑ edit / recall queued"));
+    assert!(hint.contains("↑ edit / recall pending"));
+}
+
+#[test]
+fn pending_input_wraps_the_entire_prompt_instead_of_compacting_it() {
+    let text = "a very long pending prompt that continues beyond the panel width";
+    let prompts = [PendingPromptProjection {
+        message_id: Uuid::new_v4(),
+        text: text.to_string(),
+        delivery: PromptDelivery::Queue,
+    }];
+    let lines = queued_prompt_lines(&prompts, 44);
+    let rendered = lines
+        .iter()
+        .map(Line::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        rendered.contains("beyond") && rendered.contains("panel") && rendered.contains("width")
+    );
+    assert!(!rendered.contains('…'));
 }
 
 #[test]
@@ -2392,9 +2499,9 @@ fn pending_steer_ui_uses_the_shared_next_label_and_interrupt_action() {
     assert!(!rendered.contains("NEXT TURN"));
     assert!(rendered.contains("focus on the failing test"));
     assert!(rendered.contains("esc interrupt + send now"));
-    // ↑ refuses a steer the active turn already owns, so the panel must not
-    // offer recall next to one.
-    assert!(!rendered.contains("recall"));
+    // ↑ asks the session to recall the steer; it decides whether the provider
+    // has acknowledged it yet.
+    assert!(rendered.contains("recall pending"));
 }
 
 #[test]

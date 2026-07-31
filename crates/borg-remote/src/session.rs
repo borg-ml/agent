@@ -601,6 +601,9 @@ async fn run_agent_session_store_kernel(
     let state = journal.state(session_id).await?;
     validate_session_state(session_id, &state)?;
     let mut provider_session_id = state.provider_session_id;
+    // Set when a provider switch lands mid-turn; drained at the next turn
+    // boundary once the in-flight turn has reported its own session id.
+    let mut provider_switch_pending = false;
     let mut retained_context = (provider_session_id.is_none()
         && !launch.provider.uses_native_harness())
     .then(|| retained_conversation_context(journal.context_events()))
@@ -844,7 +847,7 @@ async fn run_agent_session_store_kernel(
                     }
                     Some(HostCommand::RecallQueuedPrompt { .. }) => {}
                     Some(HostCommand::Configure { action, .. }) => {
-                        if let Err(error) = apply_session_config(
+                        match apply_session_config(
                             &mut journal,
                             &events,
                             session_id,
@@ -853,15 +856,30 @@ async fn run_agent_session_store_kernel(
                         )
                         .await
                         {
-                            record(
-                                &mut journal,
-                                &events,
-                                session_id,
-                                SessionEventKind::Error {
-                                    message: error.to_string(),
-                                },
-                            )
-                            .await?;
+                            Ok(provider_switched) => {
+                                if provider_switched {
+                                    // The provider session id belongs to the
+                                    // provider we just left, so the next turn
+                                    // replays retained context instead.
+                                    provider_session_id = None;
+                                    retained_context = if launch.provider.uses_native_harness() {
+                                        None
+                                    } else {
+                                        retained_conversation_context(journal.context_events())
+                                    };
+                                }
+                            }
+                            Err(error) => {
+                                record(
+                                    &mut journal,
+                                    &events,
+                                    session_id,
+                                    SessionEventKind::Error {
+                                        message: error.to_string(),
+                                    },
+                                )
+                                .await?;
+                            }
                         }
                     }
                     Some(HostCommand::Goal {
@@ -1246,6 +1264,7 @@ async fn run_agent_session_store_kernel(
         let mut pending_approval: Option<String> = None;
         let mut pending_provider_interaction: Option<String> = None;
         let mut pending_steers = VecDeque::<PendingSteer>::new();
+        let mut context_compaction_in_progress = false;
         let (steer_result_tx, mut steer_results) =
             mpsc::channel::<(Uuid, std::result::Result<(), String>)>(32);
         let mut provider_events_open = true;
@@ -1366,7 +1385,14 @@ async fn run_agent_session_store_kernel(
                     if is_executor_lifecycle_status(&kind) {
                         continue;
                     }
-                    let retry_steers = provider_event_is_steer_boundary(&kind);
+                    let compaction_status = context_compaction_status(&kind);
+                    if compaction_status == Some("started") {
+                        context_compaction_in_progress = true;
+                    } else if compaction_status == Some("completed") {
+                        context_compaction_in_progress = false;
+                    }
+                    let retry_steers = provider_event_is_steer_boundary(&kind)
+                        || compaction_status == Some("completed");
                     track_approval(&kind, &mut pending_approval);
                     track_provider_interaction(&kind, &mut pending_provider_interaction);
                     let usage = goal_token_usage(&kind);
@@ -1379,7 +1405,7 @@ async fn run_agent_session_store_kernel(
                     )
                     .await?;
                     record(&mut journal, &events, session_id, kind).await?;
-                    if retry_steers {
+                    if retry_steers && !context_compaction_in_progress {
                         retry_pending_steers(
                             &control_tx,
                             &steer_result_tx,
@@ -1556,19 +1582,22 @@ async fn run_agent_session_store_kernel(
                                 PromptDelivery::Steer,
                             )
                             .await?;
-                            let sent = dispatch_steer(
-                                &control_tx,
-                                &steer_result_tx,
-                                &prompt,
-                            )
-                            .await;
+                            let sent = if context_compaction_in_progress {
+                                false
+                            } else {
+                                dispatch_steer(&control_tx, &steer_result_tx, &prompt).await
+                            };
                             pending_steers.push_back(PendingSteer {
                                 prompt,
                                 state: if sent {
                                     PendingSteerState::AwaitingAcknowledgement
                                 } else {
                                     PendingSteerState::RetryAtBoundary {
-                                        error: "provider turn control was unavailable".to_string(),
+                                        error: if context_compaction_in_progress {
+                                            "provider is compacting context".to_string()
+                                        } else {
+                                            "provider turn control was unavailable".to_string()
+                                        },
                                     }
                                 },
                             });
@@ -1608,7 +1637,7 @@ async fn run_agent_session_store_kernel(
                         HostCommand::RecallQueuedPrompt { message_id, .. } => {
                             let recalled = recall_visible_queued_prompts(&mut pending, message_id)
                                 .into_iter()
-                                .chain(recall_rejected_steers(
+                                .chain(recall_withdrawable_steers(
                                     &mut pending_steers,
                                     message_id,
                                 ));
@@ -1627,7 +1656,7 @@ async fn run_agent_session_store_kernel(
                             }
                         }
                         HostCommand::Configure { action, .. } => {
-                            if let Err(error) = apply_session_config(
+                            match apply_session_config(
                                 &mut journal,
                                 &events,
                                 session_id,
@@ -1636,15 +1665,24 @@ async fn run_agent_session_store_kernel(
                             )
                             .await
                             {
-                                record(
-                                    &mut journal,
-                                    &events,
-                                    session_id,
-                                    SessionEventKind::Error {
-                                        message: error.to_string(),
-                                    },
-                                )
-                                .await?;
+                                // The in-flight turn still belongs to the old
+                                // provider and reports its session id when it
+                                // finishes, so the switch is applied at the
+                                // turn boundary instead of here.
+                                Ok(provider_switched) => {
+                                    provider_switch_pending |= provider_switched;
+                                }
+                                Err(error) => {
+                                    record(
+                                        &mut journal,
+                                        &events,
+                                        session_id,
+                                        SessionEventKind::Error {
+                                            message: error.to_string(),
+                                        },
+                                    )
+                                    .await?;
+                                }
                             }
                         }
                         HostCommand::Approve {
@@ -1924,6 +1962,14 @@ async fn run_agent_session_store_kernel(
         )
         .await?;
         at_turn_boundary = true;
+        if std::mem::take(&mut provider_switch_pending) {
+            provider_session_id = None;
+            retained_context = if launch.provider.uses_native_harness() {
+                None
+            } else {
+                retained_conversation_context(journal.context_events())
+            };
+        }
         if interrupted {
             // Codex and Claude interruption is scoped to the active turn and
             // preserves the provider thread/session. Discarding that id here
@@ -2257,21 +2303,25 @@ fn recall_visible_queued_prompts(
     recalled
 }
 
-/// Withdraw steers the provider refused.
+/// Withdraw steers that the provider has not acknowledged yet.
 ///
-/// A steer awaiting acknowledgement, or already accepted, is owned by the
-/// active turn and cannot be truthfully withdrawn: the provider has it whatever
-/// this session claims afterwards. A rejected one is only waiting for the next
-/// boundary, so nothing has consumed it and recall is honest.
-fn recall_rejected_steers(
+/// The acknowledgement is the session's acceptance boundary. Before that
+/// point the request may still be sitting in the provider-control queue, so a
+/// recall removes it from the visible pending work. Once the provider has
+/// acknowledged it, the active turn owns it and recall must not pretend it was
+/// withdrawn. A rejected one remains withdrawable while it waits for retry at
+/// the next boundary.
+fn recall_withdrawable_steers(
     pending_steers: &mut VecDeque<PendingSteer>,
     message_id: Option<Uuid>,
 ) -> Vec<QueuedPrompt> {
     let mut recalled = Vec::new();
     let mut retained = VecDeque::with_capacity(pending_steers.len());
     while let Some(steer) = pending_steers.pop_front() {
-        let recallable = matches!(steer.state, PendingSteerState::RetryAtBoundary { .. })
-            && steer.prompt.visible
+        let recallable = matches!(
+            steer.state,
+            PendingSteerState::AwaitingAcknowledgement | PendingSteerState::RetryAtBoundary { .. }
+        ) && steer.prompt.visible
             && message_id.is_none_or(|target| target == steer.prompt.message_id);
         if recallable {
             recalled.push(steer.prompt);
@@ -2443,6 +2493,16 @@ fn provider_event_is_steer_boundary(kind: &SessionEventKind) -> bool {
     )
 }
 
+fn context_compaction_status(kind: &SessionEventKind) -> Option<&str> {
+    let SessionEventKind::ProviderEvent { kind, payload, .. } = kind else {
+        return None;
+    };
+    if kind != "context_compaction" {
+        return None;
+    }
+    payload.get("status").and_then(serde_json::Value::as_str)
+}
+
 async fn dispatch_steer(
     control_tx: &mpsc::Sender<AgentTurnControl>,
     steer_result_tx: &mpsc::Sender<(Uuid, std::result::Result<(), String>)>,
@@ -2599,12 +2659,42 @@ async fn apply_session_config(
     session_id: Uuid,
     launch: &mut LaunchSession,
     action: crate::SessionConfigAction,
-) -> Result<()> {
+) -> Result<bool> {
+    let mut provider_switched = false;
     match action {
         crate::SessionConfigAction::SetModel { model } => {
             let model = model.trim();
             anyhow::ensure!(!model.is_empty(), "model cannot be empty");
             launch.model = Some(model.to_string());
+        }
+        crate::SessionConfigAction::SetProvider { provider, model } => {
+            let model = model.map(|model| model.trim().to_string());
+            anyhow::ensure!(
+                model.as_deref().is_none_or(|model| !model.is_empty()),
+                "model cannot be empty"
+            );
+            if provider != launch.provider {
+                provider_switched = true;
+                launch.provider = provider;
+                // Effort and fast vocabularies are per provider; anything the
+                // new provider does not understand is dropped rather than
+                // forwarded and rejected at turn time.
+                if !provider.supports_fast() {
+                    launch.fast = None;
+                }
+                if let Some(effort) = launch.effort.take() {
+                    launch.effort = provider
+                        .model_catalog()
+                        .filter(|catalog| catalog.supports_effort(&effort))
+                        .map(|_| effort);
+                }
+            }
+            launch.model = model.or_else(|| {
+                launch
+                    .provider
+                    .model_catalog()
+                    .map(|catalog| catalog.default_model.to_string())
+            });
         }
         crate::SessionConfigAction::SetEffort { effort } => {
             let effort = effort.trim().to_ascii_lowercase();
@@ -2647,7 +2737,7 @@ async fn apply_session_config(
         },
     )
     .await?;
-    Ok(())
+    Ok(provider_switched)
 }
 
 async fn apply_model_todo_request(
@@ -4947,6 +5037,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recalling_unacknowledged_active_steer_emits_prompt_recalled() {
+        let root = tempdir().unwrap();
+        let journal_path = root.path().join("session.jsonl");
+        let session_id = Uuid::new_v4();
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(32);
+        let turns = Arc::new(Mutex::new(Vec::new()));
+        let turn_started = Arc::new(Notify::new());
+        let steer_seen = Arc::new(Notify::new());
+        let executor = Arc::new(HoldingSteerExecutor {
+            turns,
+            turn_started: Arc::clone(&turn_started),
+            steer_seen: Arc::clone(&steer_seen),
+        });
+        let actor = tokio::spawn(async move {
+            run_agent_session_with_executor(
+                &journal_path,
+                session_id,
+                LaunchSession {
+                    request_id: Uuid::new_v4(),
+                    cwd: root.path().to_path_buf(),
+                    provider: CodingProvider::Codex,
+                    model: None,
+                    effort: None,
+                    fast: Some(false),
+                    response_language: crate::ResponseLanguage::Auto,
+                    permission_mode: PermissionMode::Manual,
+                    name: None,
+                    initial_prompt: None,
+                    capabilities: Default::default(),
+                    subagent_concurrency_limit: None,
+                    extension_skill_roots: Vec::new(),
+                    team_policy: None,
+                },
+                command_rx,
+                event_tx,
+                executor,
+            )
+            .await
+        });
+
+        command_tx
+            .send(HostCommand::Prompt {
+                session_id,
+                message_id: Uuid::new_v4(),
+                text: "first".to_string(),
+                attachments: Vec::new(),
+                output_schema: None,
+                delivery: PromptDelivery::Steer,
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), turn_started.notified())
+            .await
+            .expect("first turn starts");
+
+        let followup_id = Uuid::new_v4();
+        command_tx
+            .send(HostCommand::Prompt {
+                session_id,
+                message_id: followup_id,
+                text: "recall this follow-up".to_string(),
+                attachments: Vec::new(),
+                output_schema: None,
+                delivery: PromptDelivery::Steer,
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), steer_seen.notified())
+            .await
+            .expect("provider has received the unacknowledged steer");
+
+        command_tx
+            .send(HostCommand::RecallQueuedPrompt {
+                session_id,
+                message_id: Some(followup_id),
+            })
+            .await
+            .unwrap();
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+                .await
+                .expect("recall event arrives")
+                .expect("session remains open");
+            if matches!(
+                event.kind,
+                SessionEventKind::PromptRecalled { message_id, .. } if message_id == followup_id
+            ) {
+                break;
+            }
+        }
+
+        command_tx
+            .send(HostCommand::Interrupt { session_id })
+            .await
+            .unwrap();
+        command_tx
+            .send(HostCommand::Stop { session_id })
+            .await
+            .unwrap();
+        actor.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn session_semantics_are_independent_of_turn_execution_location() {
         let root = tempdir().unwrap();
         let journal_path = root.path().join("session.jsonl");
@@ -5653,11 +5847,11 @@ mod tests {
         assert_eq!(pending[1].message_id, steer_id);
     }
 
-    /// ↑ on an empty composer must give back exactly the pending work nothing
-    /// has consumed. A rejected steer qualifies; one the provider is holding
-    /// does not, however much the user wants it back.
+    /// ↑ on an empty composer must give back exactly the pending work the
+    /// provider has not acknowledged. An in-flight steer is still recallable;
+    /// one the provider has acknowledged is not.
     #[test]
-    fn only_a_rejected_steer_is_withdrawable_from_the_active_turn() {
+    fn only_an_unacknowledged_steer_is_withdrawable_from_the_active_turn() {
         let rejected_id = Uuid::new_v4();
         let awaiting_id = Uuid::new_v4();
         let accepted_id = Uuid::new_v4();
@@ -5684,24 +5878,24 @@ mod tests {
         ]);
 
         // Targeting one the turn owns withdraws nothing at all.
-        assert!(recall_rejected_steers(&mut pending_steers, Some(accepted_id)).is_empty());
+        assert!(recall_withdrawable_steers(&mut pending_steers, Some(accepted_id)).is_empty());
         assert_eq!(pending_steers.len(), 3);
 
-        let recalled = recall_rejected_steers(&mut pending_steers, None);
+        let recalled = recall_withdrawable_steers(&mut pending_steers, None);
         assert_eq!(
             recalled
                 .iter()
                 .map(|prompt| prompt.message_id)
                 .collect::<Vec<_>>(),
-            [rejected_id]
+            [awaiting_id, rejected_id]
         );
         assert_eq!(
             pending_steers
                 .iter()
                 .map(|steer| steer.prompt.message_id)
                 .collect::<Vec<_>>(),
-            [awaiting_id, accepted_id],
-            "steers the provider holds keep their boundary retry"
+            [accepted_id],
+            "only provider-accepted steers remain owned by the active turn"
         );
     }
 

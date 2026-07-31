@@ -185,6 +185,32 @@ impl CodingProvider {
         borg_provider::model_catalog_for_backend(self.catalog_backend())
     }
 
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Codex => "Codex",
+            Self::Claude => "Claude",
+            Self::OpenCode => "OpenCode",
+            Self::Kimi => "Kimi",
+            Self::OpenRouter => "OpenRouter",
+            Self::OpenAiCompatible => "OpenAI-compatible",
+        }
+    }
+
+    /// Every provider that publishes a fixed model catalog, in picker order.
+    pub const CATALOG_PROVIDERS: [Self; 3] = [Self::Codex, Self::Claude, Self::Kimi];
+
+    /// The provider whose catalog lists `model`, if any. Model ids are unique
+    /// across catalogs, so this is what lets the model picker offer models
+    /// from providers other than the session's current one.
+    pub fn for_model(model: &str) -> Option<Self> {
+        let model = model.trim();
+        Self::CATALOG_PROVIDERS.into_iter().find(|provider| {
+            provider
+                .model_catalog()
+                .is_some_and(|catalog| catalog.selectable_models.iter().any(|(id, _)| *id == model))
+        })
+    }
+
     pub fn executable(self) -> &'static str {
         match self {
             Self::Codex => "codex",
@@ -651,11 +677,29 @@ impl HostCommand {
 #[serde(tag = "type", rename_all = "snake_case")]
 #[ts(export)]
 pub enum SessionConfigAction {
-    SetModel { model: String },
-    SetEffort { effort: String },
-    SetPermissionMode { permission_mode: PermissionMode },
-    SetFast { enabled: bool },
-    SetResponseLanguage { language: ResponseLanguage },
+    SetModel {
+        model: String,
+    },
+    /// Repoints the live session at another provider without relaunching it.
+    /// The turn loop reads `launch.provider` fresh each turn, so the switch
+    /// takes effect on the next prompt; the caller-side handler drops the
+    /// provider session id, which belongs to the provider being left.
+    SetProvider {
+        provider: CodingProvider,
+        model: Option<String>,
+    },
+    SetEffort {
+        effort: String,
+    },
+    SetPermissionMode {
+        permission_mode: PermissionMode,
+    },
+    SetFast {
+        enabled: bool,
+    },
+    SetResponseLanguage {
+        language: ResponseLanguage,
+    },
 }
 
 /// Typed control plane for child sessions owned by one parent session actor.
@@ -1399,6 +1443,19 @@ impl SessionEvent {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+
+    #[test]
+    fn models_resolve_back_to_the_provider_that_serves_them() {
+        assert_eq!(
+            CodingProvider::for_model("claude-opus-5"),
+            Some(CodingProvider::Claude)
+        );
+        assert_eq!(
+            CodingProvider::for_model("gpt-5.6-sol"),
+            Some(CodingProvider::Codex)
+        );
+        assert_eq!(CodingProvider::for_model("some/openrouter-model"), None);
+    }
 
     #[test]
     fn effective_capabilities_explain_dependency_inactivation() {

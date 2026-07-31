@@ -598,6 +598,15 @@ async fn run_claude_sdk_inner(
         // lets the SDK discover concrete tools on demand when supported.
         command.env("ENABLE_TOOL_SEARCH", "auto:5");
     }
+    if std::env::var_os("ANTHROPIC_API_KEY").is_none()
+        && let Some(key) =
+            crate::credentials::stored_api_key(crate::credentials::ApiKeyCredential::Anthropic)
+    {
+        // Key auth for users who chose "add an API key" over a subscription
+        // sign-in; the bundled SDK reads it from the environment we hand the
+        // subprocess, and never from a file it could leak elsewhere.
+        command.env("ANTHROPIC_API_KEY", key);
+    }
     apply_claude_channel_env(&mut command, req.provider_channel)?;
 
     let mut child = command
@@ -2337,7 +2346,7 @@ for await (const line of createInterface({ input: process.stdin })) {
     }
 
     #[test]
-    fn mapper_surfaces_context_compaction_as_phase_once() {
+    fn mapper_surfaces_context_compaction_start_and_completion_phases() {
         let (tx, mut rx) = mpsc::channel(8);
         let mut mapper = CodexStreamMapper::default();
         let started = JsonRpcMessage {
@@ -2374,18 +2383,22 @@ for await (const line of createInterface({ input: process.stdin })) {
         mapper.handle(&completed, &tx).unwrap();
         drop(tx);
 
-        let mut phase_count = 0;
+        let mut phases = Vec::new();
         while let Ok(event) = rx.try_recv() {
             if let ChatStreamEvent::Phase { name, input } = event {
-                phase_count += 1;
-                assert_eq!(name, "context_compaction");
-                assert_eq!(
-                    input.get("summary").and_then(Value::as_str),
-                    Some("Earlier conversation was compacted")
-                );
+                phases.push((name, input));
             }
         }
-        assert_eq!(phase_count, 1);
+        assert_eq!(phases.len(), 2);
+        assert_eq!(phases[0].0, "context_compaction");
+        assert_eq!(
+            phases[0].1.get("status").and_then(Value::as_str),
+            Some("started")
+        );
+        assert_eq!(
+            phases[1].1.get("status").and_then(Value::as_str),
+            Some("completed")
+        );
     }
 
     #[test]

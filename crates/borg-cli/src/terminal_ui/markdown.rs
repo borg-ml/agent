@@ -149,24 +149,35 @@ pub(super) fn markdown_lines(
                 }
             }
             MarkdownEvent::InlineMath(source) => {
-                let math = terminal_math_lines(&source);
                 if let Some(table) = table.as_mut() {
-                    table.push_text(&math.join(" "));
-                } else if let [line] = math.as_slice() {
-                    current.push(Span::styled(
-                        line.clone(),
-                        markdown_style(&styles).fg(Color::LightCyan),
-                    ));
+                    if currency_math_source(&source) {
+                        table.push_text(&format!("${source}$"));
+                    } else {
+                        table.push_text(&terminal_math_lines(&source).join(" "));
+                    }
+                } else if currency_math_source(&source) {
+                    // pulldown-cmark treats a currency expression such as
+                    // `$0.1667/hour (~$4/day)` as math because the second
+                    // dollar sign closes the first pair. Keep it literal.
+                    current.push(Span::styled(format!("${source}$"), markdown_style(&styles)));
                 } else {
-                    flush_markdown_line(&mut lines, &mut current, width, quote_depth);
-                    push_terminal_math_lines(
-                        &mut lines,
-                        &mut current,
-                        math,
-                        width,
-                        quote_depth,
-                        markdown_style(&styles),
-                    );
+                    let math = terminal_math_lines(&source);
+                    if let [line] = math.as_slice() {
+                        current.push(Span::styled(
+                            line.clone(),
+                            markdown_style(&styles).fg(Color::LightCyan),
+                        ));
+                    } else {
+                        flush_markdown_line(&mut lines, &mut current, width, quote_depth);
+                        push_terminal_math_lines(
+                            &mut lines,
+                            &mut current,
+                            math,
+                            width,
+                            quote_depth,
+                            markdown_style(&styles),
+                        );
+                    }
                 }
             }
             MarkdownEvent::DisplayMath(source) => {
@@ -334,6 +345,17 @@ fn terminal_math_lines(source: &str) -> Vec<String> {
         .lines()
         .map(|line| line.trim_end().to_string())
         .collect()
+}
+
+fn currency_math_source(source: &str) -> bool {
+    let lower = source.to_ascii_lowercase();
+    source
+        .chars()
+        .next()
+        .is_some_and(|character| character.is_ascii_digit())
+        && ["/hour", "/day", "/month", " per hour", " per day"]
+            .iter()
+            .any(|suffix| lower.contains(suffix))
 }
 
 fn push_terminal_math_lines(

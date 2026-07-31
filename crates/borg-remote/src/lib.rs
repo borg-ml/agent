@@ -36,7 +36,7 @@ pub use contract::*;
 pub use filesystem::execute_workspace_filesystem;
 pub use host::{
     HostConfig, default_host_config_path, enroll_host, login_provider, mirror_local_session,
-    probe_capabilities, run_host,
+    probe_capabilities, provider_credentials_present, run_host,
 };
 pub use journal::{SessionJournal, SessionWriterLease};
 pub use local_control::{

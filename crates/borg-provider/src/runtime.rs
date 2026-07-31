@@ -41,11 +41,12 @@ pub const CLAUDE_SELECTABLE_MODELS: [(&str, &str); 3] = [
     ("claude-sonnet-5", "Sonnet 5"),
     ("claude-fable-5", "Fable 5"),
 ];
+pub const CLAUDE_EFFORT_LEVELS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 pub const CLAUDE_MODEL_CATALOG: ProviderModelCatalog = ProviderModelCatalog {
     backend: "claude",
     default_model: "claude-sonnet-5",
     selectable_models: &CLAUDE_SELECTABLE_MODELS,
-    effort_levels: &[],
+    effort_levels: &CLAUDE_EFFORT_LEVELS,
 };
 
 pub const KIMI_SELECTABLE_MODELS: [(&str, &str); 1] = [("kimi-k3", "Kimi K3")];

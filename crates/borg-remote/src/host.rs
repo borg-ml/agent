@@ -411,6 +411,25 @@ async fn command_output_from(command: &mut Command, executable: &str) -> Result<
     Ok(if stdout.is_empty() { stderr } else { stdout })
 }
 
+/// Whether `provider` already has credentials on this machine — an OAuth
+/// session file written by its CLI, or an API key borg holds. Providers whose
+/// credentials come from the environment are treated as configured; they fail
+/// loudly at call time with their own message.
+pub fn provider_credentials_present(provider: CodingProvider) -> bool {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    match provider {
+        CodingProvider::Claude => {
+            borg_provider::credentials::api_key(
+                borg_provider::credentials::ApiKeyCredential::Anthropic,
+            )
+            .is_some()
+                || home.is_some_and(|home| home.join(".claude/.credentials.json").is_file())
+        }
+        CodingProvider::Codex => home.is_some_and(|home| home.join(".codex/auth.json").is_file()),
+        _ => true,
+    }
+}
+
 pub async fn login_provider(provider: CodingProvider) -> Result<()> {
     if provider.uses_native_harness() {
         bail!(

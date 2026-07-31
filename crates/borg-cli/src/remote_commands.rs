@@ -13,7 +13,7 @@ use borg_remote::{
     SessionEventKind, SessionGoal, SessionStatus, SessionStore, SessionWriterLease, SpawnSubagent,
     SqliteSessionStore, SqliteWorkspaceStore, SubagentAction, SubagentSnapshot, TodoAction,
     default_host_config_path, enroll_host, login_provider, mirror_local_session,
-    probe_capabilities, run_agent_session_with_store_and_writer,
+    probe_capabilities, provider_credentials_present, run_agent_session_with_store_and_writer,
     run_agent_session_with_store_writer_and_peers, run_attached_session, run_host,
     session_control_socket_path,
 };
@@ -29,7 +29,9 @@ use crate::agent_config::AgentConfig;
 use crate::cli::{LocalAgentCliArgs, RemoteCommand};
 use crate::editor_preferences::{ActiveMessageBehavior, EditorPreferences};
 use crate::sleep_inhibitor::SleepInhibitor;
-use crate::terminal_ui::{BorgTerminal, ResumeSessionOption, TerminalInputEvent, UiAction};
+use crate::terminal_ui::{
+    BorgTerminal, ProviderAuthChoice, ResumeSessionOption, TerminalInputEvent, UiAction,
+};
 
 const MIN_TUI_FPS: u64 = 15;
 const MAX_TUI_FPS: u64 = 240;
@@ -1575,13 +1577,110 @@ async fn run_local_agent_session(
                         }
                     }
                     UiAction::SetModel(model) => {
-                        session_command_tx
-                            .send(HostCommand::Configure {
+                        let active = terminal
+                            .as_ref()
+                            .and_then(BorgTerminal::session_provider)
+                            .unwrap_or(provider);
+                        let target = CodingProvider::for_model(&model).unwrap_or(active);
+                        if !provider_credentials_present(target) {
+                            terminal
+                                .as_mut()
+                                .expect("terminal")
+                                .open_provider_auth_picker(target, model);
+                        } else {
+                            send_model_selection(
+                                &session_command_tx,
                                 session_id,
-                                action: SessionConfigAction::SetModel { model },
-                            })
-                            .await
-                            .ok();
+                                active,
+                                target,
+                                model,
+                            )
+                            .await;
+                            terminal
+                                .as_mut()
+                                .expect("terminal")
+                                .open_effort_picker_for(Some(target));
+                        }
+                    }
+                    UiAction::AuthenticateProvider {
+                        provider: target,
+                        model,
+                        choice,
+                    } => {
+                        if matches!(
+                            status,
+                            SessionStatus::Starting
+                                | SessionStatus::Running
+                                | SessionStatus::WaitingForApproval
+                        ) {
+                            terminal.as_mut().expect("terminal").set_notice(
+                                "Interrupt the current turn before connecting a provider."
+                                    .to_string(),
+                            );
+                        } else {
+                            // Both flows need a plain terminal: the subscription
+                            // sign-in runs the provider's own device flow, and the
+                            // key prompt reads from stdin with echo disabled.
+                            shutdown_terminal(&mut terminal).await;
+                            let outcome = match choice {
+                                ProviderAuthChoice::Subscription => {
+                                    login_provider(target).await.map(|()| {
+                                        format!("Connected {}.", target.label())
+                                    })
+                                }
+                                ProviderAuthChoice::ApiKey => {
+                                    prompt_and_store_api_key(target).map(|path| {
+                                        format!(
+                                            "{} API key saved to {}.",
+                                            target.label(),
+                                            path.display()
+                                        )
+                                    })
+                                }
+                            };
+                            let latest_state = store.state(session_id).await?;
+                            let latest = recent_tui_history(
+                                store.as_ref(),
+                                session_id,
+                                latest_state.latest_sequence,
+                            )
+                            .await?;
+                            let mut restored = BorgTerminal::enter(
+                                &sessions_dir,
+                                session_id,
+                                cwd.clone(),
+                                &agent_config.keybindings,
+                            )?;
+                            restored.seed_history(&latest);
+                            let (_, agents, histories) = load_subagent_thread_state(
+                                store.as_ref(),
+                                &sessions_dir,
+                                session_id,
+                            )
+                            .await?;
+                            seed_terminal_subagent_threads(&mut restored, &agents, &histories);
+                            restored.seed_session_state(&latest_state);
+                            let active = restored.session_provider().unwrap_or(provider);
+                            restored.set_notice(match &outcome {
+                                Ok(message) => format!("{message} Switching to {model}."),
+                                Err(error) => format!("Provider not connected: {error:#}"),
+                            });
+                            terminal = Some(restored);
+                            if outcome.is_ok() {
+                                send_model_selection(
+                                    &session_command_tx,
+                                    session_id,
+                                    active,
+                                    target,
+                                    model,
+                                )
+                                .await;
+                                terminal
+                                    .as_mut()
+                                    .expect("terminal")
+                                    .open_effort_picker_for(Some(target));
+                            }
+                        }
                     }
                     UiAction::SetEffort(effort) => {
                         session_command_tx
@@ -2577,6 +2676,82 @@ async fn start_collaboration_host(session_id: Uuid) -> Result<(Child, String, St
         .context("collaboration host returned an invalid control link")?
         .to_string();
     Ok((child, view, control))
+}
+
+/// Applies a model choice, switching the session's provider first when the
+/// model belongs to a different one. The switch is live: the session keeps
+/// running and the next turn goes to the new provider.
+async fn send_model_selection(
+    session_command_tx: &mpsc::Sender<HostCommand>,
+    session_id: Uuid,
+    active: CodingProvider,
+    target: CodingProvider,
+    model: String,
+) {
+    let action = if target == active {
+        SessionConfigAction::SetModel { model }
+    } else {
+        SessionConfigAction::SetProvider {
+            provider: target,
+            model: Some(model),
+        }
+    };
+    session_command_tx
+        .send(HostCommand::Configure { session_id, action })
+        .await
+        .ok();
+}
+
+/// Reads an API key from the terminal without echoing it and stores it in the
+/// borg credential store. Must run with the TUI torn down.
+fn prompt_and_store_api_key(provider: CodingProvider) -> Result<PathBuf> {
+    let credential = match provider {
+        CodingProvider::Claude => borg_provider::credentials::ApiKeyCredential::Anthropic,
+        other => anyhow::bail!("{} does not use a borg-managed API key", other.label()),
+    };
+    println!(
+        "Paste your {} API key (input hidden), then press Enter:",
+        provider.label()
+    );
+    io::stdout().flush().ok();
+    let key = read_hidden_line().context("failed to read API key")?;
+    borg_provider::credentials::store_api_key(credential, &key)
+}
+
+/// Line editor with echo suppressed. Only printable characters, backspace and
+/// Enter are honoured; Esc and Ctrl-C abort so a mistyped key is never stored.
+fn read_hidden_line() -> Result<String> {
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+
+    enable_raw_mode().context("failed to enter raw mode for hidden input")?;
+    let result = (|| -> Result<String> {
+        let mut key = String::new();
+        loop {
+            match crossterm::event::read()? {
+                Event::Key(KeyEvent {
+                    code, modifiers, ..
+                }) => match code {
+                    KeyCode::Enter => break,
+                    KeyCode::Backspace => {
+                        key.pop();
+                    }
+                    KeyCode::Esc => anyhow::bail!("cancelled"),
+                    KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
+                        anyhow::bail!("cancelled");
+                    }
+                    KeyCode::Char(character) => key.push(character),
+                    _ => {}
+                },
+                Event::Paste(text) => key.push_str(&text),
+                _ => {}
+            }
+        }
+        Ok(key)
+    })();
+    disable_raw_mode().ok();
+    println!();
+    result
 }
 
 async fn shutdown_terminal(terminal: &mut Option<BorgTerminal>) {

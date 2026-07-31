@@ -343,14 +343,23 @@ impl CodexStreamMapper {
 
     fn emit_context_compaction(&mut self, item: &Value, tx: &mpsc::Sender<ChatStreamEvent>) {
         let id = codex_item_id(item);
-        if !id.is_empty() && !self.emitted_phase_item_ids.insert(id) {
+        let status = item
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("updated");
+        let dedupe_key = format!("{id}:{status}");
+        if !id.is_empty() && !self.emitted_phase_item_ids.insert(dedupe_key) {
             return;
+        }
+        let mut input = codex_context_compaction_input(item);
+        if let Some(object) = input.as_object_mut() {
+            object.insert("status".to_string(), Value::String(status.to_string()));
         }
         let _ = send_stream_event(
             tx,
             ChatStreamEvent::Phase {
                 name: "context_compaction".to_string(),
-                input: codex_context_compaction_input(item),
+                input,
             },
         );
     }
