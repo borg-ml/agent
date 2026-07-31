@@ -136,6 +136,7 @@ pub struct AgentToolDispatcher {
     provider: CodingProvider,
     actor_session_id: Uuid,
     team_policy: Option<crate::TeamPolicy>,
+    self_service: crate::self_service::SelfServiceContext,
 }
 
 #[derive(Debug)]
@@ -397,6 +398,7 @@ impl AgentToolDispatcher {
         subagents_enabled: bool,
         shared_work: Option<SharedWorkToolContext>,
         team_policy: Option<crate::TeamPolicy>,
+        cwd: PathBuf,
     ) -> Self {
         Self {
             goals,
@@ -408,6 +410,7 @@ impl AgentToolDispatcher {
             provider,
             actor_session_id,
             team_policy,
+            self_service: crate::self_service::SelfServiceContext::new(cwd),
         }
     }
 
@@ -498,6 +501,7 @@ impl AgentToolDispatcher {
                     .call(name, arguments)
                     .await
             }
+            name if crate::self_service::is_tool(name) => self.self_service.call(name, arguments),
             _ => {
                 if !self.subagents_enabled {
                     bail!("subagent tools are disabled by session capabilities");
@@ -2255,6 +2259,7 @@ pub fn agent_tool_specs_with_capabilities(
             }),
         ),
     ];
+    specs.extend(crate::self_service::tool_specs());
     if shared_work_enabled {
         specs.extend(shared_work_tool_specs());
     }
@@ -3328,6 +3333,40 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(enabled.iter().any(|name| name == "create_shared_work"));
         assert!(enabled.iter().any(|name| name == "request_work_review"));
+    }
+
+    #[test]
+    fn every_execution_lane_exposes_the_same_borg_control_plane() {
+        let common = [
+            "get_goal",
+            "get_plan",
+            "update_plan",
+            "lsp_diagnostics",
+            "list_plugins",
+            "read_plugin",
+            "get_agent_settings",
+            "update_agent_settings",
+            "create_plugin",
+        ];
+        for provider in [
+            CodingProvider::Codex,
+            CodingProvider::Claude,
+            CodingProvider::OpenCode,
+            CodingProvider::Kimi,
+            CodingProvider::OpenRouter,
+            CodingProvider::OpenAiCompatible,
+        ] {
+            let names = agent_tool_specs_with_capabilities(provider, false, false, None)
+                .into_iter()
+                .filter_map(|tool| tool["name"].as_str().map(str::to_owned))
+                .collect::<Vec<_>>();
+            for required in common {
+                assert!(
+                    names.iter().any(|name| name == required),
+                    "{provider:?} lane is missing Borg tool {required}"
+                );
+            }
+        }
     }
 
     #[tokio::test]

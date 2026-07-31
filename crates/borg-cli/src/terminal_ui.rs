@@ -78,6 +78,7 @@ const COMMAND_PANEL_BG: Color = Color::Rgb(31, 24, 27);
 const STATUS_SEPARATOR: &str = " · ";
 const STEER_SENT_NOTICE: &str =
     "Steer already sent to the active turn · Esc interrupts and sends it next";
+const DIRECTOR_CONTEXT_BOUNDARY: &str = "— context provided by director agent —";
 const DOUBLE_CTRL_C_WINDOW: Duration = Duration::from_secs(1);
 const COPY_NOTICE_DURATION: Duration = Duration::from_secs(5);
 const NESTED_SCROLL_GESTURE_GAP: Duration = Duration::from_millis(200);
@@ -514,12 +515,15 @@ pub struct BorgTerminal {
     goal_status_hovered: bool,
     todo_status_area: Option<Rect>,
     todo_status_hovered: bool,
+    todo_status_expanded: bool,
     agents_status_area: Option<Rect>,
     agents_status_hovered: bool,
     model_status_area: Option<Rect>,
     model_status_hovered: bool,
     effort_status_area: Option<Rect>,
     effort_status_hovered: bool,
+    fast_status_area: Option<Rect>,
+    fast_status_hovered: bool,
     permission_status_area: Option<Rect>,
     permission_status_hovered: bool,
     nested_scroll_capture: Option<NestedScrollCapture>,
@@ -596,7 +600,7 @@ pub struct ResumeSessionOption {
     pub current_directory: bool,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum PickerKind {
     Settings,
     Resume,
@@ -614,6 +618,7 @@ enum PickerKind {
     MessageActions,
     Commands,
     ProviderAuth,
+    Goal,
 }
 
 /// How the user chose to authenticate a provider they selected a model from.
@@ -729,10 +734,7 @@ impl Picker {
         hovered.is_some_and(|index| self.select_option(index))
     }
 
-    /// Returns the rendered content-line offset for each visible option.
-    /// Section headings occupy a line of their own, while the picker header
-    /// is always line zero.
-    fn option_row_offsets(&self) -> Vec<(usize, usize)> {
+    fn displayed_option_rows(&self) -> Vec<(Option<usize>, String, Style)> {
         let mut owner = None;
         let sections = self
             .options
@@ -745,17 +747,60 @@ impl Picker {
             })
             .collect::<Vec<_>>();
         let mut heading = None;
-        let mut line = 1;
         let mut rows = Vec::new();
         for index in self.matches() {
             if sections[index].is_some() && sections[index] != heading {
                 heading.clone_from(&sections[index]);
-                line += 1;
+                rows.push((
+                    None,
+                    format!(
+                        "  {}",
+                        heading.as_deref().unwrap_or_default().to_ascii_uppercase()
+                    ),
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD),
+                ));
             }
-            rows.push((index, line));
-            line += 1;
+            let option = &self.options[index];
+            let selected = index == self.selected;
+            rows.push((
+                Some(index),
+                format!(
+                    "  {} {}",
+                    if selected { "\u{203a}" } else { " " },
+                    if self.query.is_some() {
+                        option.label.clone()
+                    } else {
+                        numbered_picker_option(
+                            rows.iter().filter(|(index, _, _)| index.is_some()).count(),
+                            &option.label,
+                        )
+                    },
+                ),
+                if selected {
+                    Style::default()
+                        .fg(BORG_ORANGE)
+                        .bg(MESSAGE_HOVER_BG)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Gray)
+                },
+            ));
         }
         rows
+    }
+
+    /// Returns the rendered content-line offset for each visible option.
+    /// Section headings occupy a line of their own, while the picker header
+    /// is always line zero. Derive these offsets from the same rows rendered
+    /// by `styled_option_rows` so hitboxes cannot drift from the highlight.
+    fn option_row_offsets(&self) -> Vec<(usize, usize)> {
+        self.displayed_option_rows()
+            .into_iter()
+            .enumerate()
+            .filter_map(|(line, (index, _, _))| index.map(|index| (index, line + 1)))
+            .collect()
     }
 
     fn scroll(&mut self, delta: isize) -> bool {
@@ -807,58 +852,10 @@ impl Picker {
     }
 
     fn styled_option_rows(&self) -> Vec<(String, Style)> {
-        // A section heading is carried by the first option in its group, so a
-        // filter that removes that option must not take the heading with it.
-        let mut owner = None;
-        let sections = self
-            .options
-            .iter()
-            .map(|option| {
-                if option.section.is_some() {
-                    owner.clone_from(&option.section);
-                }
-                owner.clone()
-            })
-            .collect::<Vec<_>>();
-        let matches = self.matches();
-        let mut rows = Vec::with_capacity(matches.len() + 2);
-        let mut heading: Option<String> = None;
-        for (position, index) in matches.into_iter().enumerate() {
-            let option = &self.options[index];
-            if sections[index].is_some() && sections[index] != heading {
-                heading.clone_from(&sections[index]);
-                rows.push((
-                    format!(
-                        "  {}",
-                        heading.as_deref().unwrap_or_default().to_ascii_uppercase()
-                    ),
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::BOLD),
-                ));
-            }
-            let selected = index == self.selected;
-            rows.push((
-                format!(
-                    "  {} {}",
-                    if selected { "\u{203a}" } else { " " },
-                    if self.query.is_some() {
-                        option.label.clone()
-                    } else {
-                        numbered_picker_option(position, &option.label)
-                    },
-                ),
-                if selected {
-                    Style::default()
-                        .fg(BORG_ORANGE)
-                        .bg(MESSAGE_HOVER_BG)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(Color::Gray)
-                },
-            ));
-        }
-        rows
+        self.displayed_option_rows()
+            .into_iter()
+            .map(|(_, row, style)| (row, style))
+            .collect()
     }
 
     fn styled_lines(
@@ -957,6 +954,19 @@ fn numbered_picker_option(index: usize, option: &str) -> String {
     } else {
         format!("   {option}")
     }
+}
+
+/// Keep plan presentation consistent across the transcript and the statusline
+/// tooltip: actionable items first, completed history last.
+fn ordered_plan_items(items: &[PlanItem]) -> Vec<&PlanItem> {
+    [
+        PlanItemStatus::InProgress,
+        PlanItemStatus::Pending,
+        PlanItemStatus::Completed,
+    ]
+    .into_iter()
+    .flat_map(|status| items.iter().filter(move |item| item.status == status))
+    .collect()
 }
 
 fn pad_display(value: &str, width: usize) -> String {
@@ -1185,12 +1195,15 @@ impl BorgTerminal {
             goal_status_hovered: false,
             todo_status_area: None,
             todo_status_hovered: false,
+            todo_status_expanded: false,
             agents_status_area: None,
             agents_status_hovered: false,
             model_status_area: None,
             model_status_hovered: false,
             effort_status_area: None,
             effort_status_hovered: false,
+            fast_status_area: None,
+            fast_status_hovered: false,
             permission_status_area: None,
             permission_status_hovered: false,
             nested_scroll_capture: None,
@@ -1233,6 +1246,15 @@ impl BorgTerminal {
         self.input = TerminalInput::spawn();
         self.notice = Some(notice.into());
         self.event_redraw_needed = true;
+    }
+
+    /// Replace the live keymap after the agent config is edited by a Borg
+    /// self-service tool. Parsing happens before the map is swapped, so an
+    /// invalid update leaves the current terminal controls intact.
+    pub fn reload_keybindings(&mut self, keybindings: &KeybindingConfig) -> Result<()> {
+        self.keymap = KeyMap::from_config(keybindings)?;
+        self.event_redraw_needed = true;
+        Ok(())
     }
 
     pub fn handle_external_interrupt(&mut self) {
@@ -1401,6 +1423,12 @@ impl BorgTerminal {
             SessionEventKind::ProviderEvent { .. }
                 | SessionEventKind::Message {
                     actor: EventActor::User,
+                    status: MessageStatus::InProgress,
+                    delivery: Some(PromptDelivery::Steer),
+                    ..
+                }
+                | SessionEventKind::Message {
+                    actor: EventActor::User,
                     status: MessageStatus::Complete,
                     delivery: Some(PromptDelivery::Steer),
                     ..
@@ -1549,11 +1577,16 @@ impl BorgTerminal {
                 self.remap_selection_after_entry_removal(removed);
             }
         } else {
-            self.child_transcripts
-                .entry(child_id)
-                .or_default()
-                .apply(child_event);
+            self.child_transcript_mut(child_id).apply(child_event);
         }
+    }
+
+    fn child_transcript_mut(&mut self, child_id: Uuid) -> &mut Transcript {
+        self.child_transcripts.entry(child_id).or_insert_with(|| {
+            let mut transcript = Transcript::default();
+            transcript.show_director_context_boundary();
+            transcript
+        })
     }
 
     fn focus_child_transcript(&mut self, child_id: Uuid) {
@@ -1618,6 +1651,8 @@ impl BorgTerminal {
         // replace that partial projection instead of appending duplicates.
         self.child_transcripts
             .insert(child_id, Transcript::default());
+        self.child_transcript_mut(child_id)
+            .show_director_context_boundary();
         self.child_queued_prompts.remove(&child_id);
         self.child_pending_approvals.remove(&child_id);
         for event in events {
@@ -2125,6 +2160,26 @@ impl BorgTerminal {
         ));
     }
 
+    fn open_goal_picker(&mut self) {
+        let Some(goal) = self.active_goal().cloned() else {
+            return;
+        };
+        self.picker = Some(Picker {
+            kind: PickerKind::Goal,
+            title: "Goal",
+            options: goal_picker_options(&goal),
+            selected: 0,
+            query: None,
+        });
+    }
+
+    fn active_goal(&self) -> Option<&SessionGoal> {
+        self.director_transcript
+            .as_deref()
+            .and_then(|transcript| transcript.goal.as_ref())
+            .or(self.transcript.goal.as_ref())
+    }
+
     pub fn handle_event(&mut self, input: TerminalInputEvent) -> Result<UiAction> {
         let TerminalInputEvent {
             event,
@@ -2216,6 +2271,9 @@ impl BorgTerminal {
                 self.effort_status_hovered = self
                     .effort_status_area
                     .is_some_and(|area| area.contains(pointer));
+                self.fast_status_hovered = self
+                    .fast_status_area
+                    .is_some_and(|area| area.contains(pointer));
                 self.permission_status_hovered = self
                     .permission_status_area
                     .is_some_and(|area| area.contains(pointer));
@@ -2263,24 +2321,16 @@ impl BorgTerminal {
                         .goal_status_area
                         .is_some_and(|area| area.contains(pointer))
                     {
-                        // The segment round-trips the same slash command a user
-                        // would type, so the click has no privileged path of
-                        // its own to keep in step with the parser.
-                        return Ok(
-                            match self.transcript.goal.as_ref().and_then(goal_toggle_command) {
-                                Some(command) => UiAction::Submit {
-                                    target: self.focused_child,
-                                    text: command.to_string(),
-                                    attachments: Vec::new(),
-                                },
-                                None => UiAction::None,
-                            },
-                        );
+                        self.open_goal_picker();
+                        return Ok(UiAction::None);
                     }
                     if self
                         .todo_status_area
                         .is_some_and(|area| area.contains(pointer))
                     {
+                        if !self.transcript.todos.is_empty() {
+                            self.todo_status_expanded = !self.todo_status_expanded;
+                        }
                         return Ok(UiAction::None);
                     }
                     if self
@@ -2298,6 +2348,13 @@ impl BorgTerminal {
                         return Ok(UiAction::None);
                     }
                     if self
+                        .fast_status_area
+                        .is_some_and(|area| area.contains(pointer))
+                    {
+                        self.open_fast_picker(true);
+                        return Ok(UiAction::None);
+                    }
+                    if self
                         .permission_status_area
                         .is_some_and(|area| area.contains(pointer))
                     {
@@ -2311,7 +2368,7 @@ impl BorgTerminal {
                 }
                 if let Some(picker) = self.picker.as_mut() {
                     picker.select_hovered(&mouse.kind, self.hovered_picker_option);
-                    if !matches!(picker.kind, PickerKind::MessageActions)
+                    if !matches!(picker.kind, PickerKind::MessageActions | PickerKind::Goal)
                         && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
                         && let Some(option) = self.hovered_picker_option
                     {
@@ -2329,7 +2386,7 @@ impl BorgTerminal {
                 }
                 if matches!(
                     self.picker.as_ref().map(|picker| picker.kind),
-                    Some(PickerKind::MessageActions)
+                    Some(PickerKind::MessageActions | PickerKind::Goal)
                 ) {
                     if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
                         if let Some(option) = self.hovered_picker_option {
@@ -2337,7 +2394,14 @@ impl BorgTerminal {
                                 .as_mut()
                                 .expect("checked above")
                                 .select_option(option);
-                            return Ok(self.run_selected_message_action());
+                            return if matches!(
+                                self.picker.as_ref().map(|picker| picker.kind),
+                                Some(PickerKind::Goal)
+                            ) {
+                                self.run_selected_picker()
+                            } else {
+                                Ok(self.run_selected_message_action())
+                            };
                         }
                         self.picker = None;
                         self.transcript.selected = None;
@@ -2975,6 +3039,20 @@ impl BorgTerminal {
             PickerKind::AutoExpandTools => {
                 UiAction::SetAutoExpandTools(picker.selected_value() == "On")
             }
+            PickerKind::Goal => {
+                let value = picker.selected_value();
+                match value.as_str() {
+                    "/goal pause" | "/goal resume" | "/goal clear" => UiAction::Submit {
+                        // Goals are owned by the director session. A focused
+                        // child remains a viewing context, not a different goal
+                        // command endpoint.
+                        target: None,
+                        text: value,
+                        attachments: Vec::new(),
+                    },
+                    _ => UiAction::None,
+                }
+            }
             PickerKind::Rewind => unreachable!("handled above"),
             PickerKind::MessageActions => unreachable!("handled separately"),
         })
@@ -3067,9 +3145,9 @@ impl BorgTerminal {
                 preserve_scroll_anchor(self.scroll_from_bottom, previous_height, transcript_height);
         }
         self.rendered_transcript_height = transcript_height;
-        let message_actions_open = matches!(
+        let modal_picker_open = matches!(
             self.picker.as_ref().map(|picker| picker.kind),
-            Some(PickerKind::MessageActions)
+            Some(PickerKind::MessageActions | PickerKind::Goal)
         );
         let resume_picker_open = self
             .picker
@@ -3098,7 +3176,7 @@ impl BorgTerminal {
             status_label(status)
         };
         let status_glyph = activity_glyph(status);
-        let (model_status, effort_status, permission_status, cwd_status) =
+        let (model_status, effort_status, fast_status, permission_status, cwd_status) =
             self.transcript.config_statuses();
         let cache_status = self.transcript.cache_status(Utc::now());
         let (context_status, context_imminent) = self.transcript.context_status();
@@ -3121,14 +3199,13 @@ impl BorgTerminal {
         let total_subagents = agent_roster_entries.len().saturating_sub(1);
         let team_agent_count = total_subagents.saturating_add(1);
         let session_is_active = matches!(status, SessionStatus::Starting | SessionStatus::Running);
-        let goal_status = self.transcript.goal_status();
+        let active_goal = self.active_goal().cloned();
+        let goal_status = self
+            .director_transcript
+            .as_deref()
+            .unwrap_or(&self.transcript)
+            .goal_status();
         let todo_status = self.transcript.todo_status();
-        let goal_is_toggleable = self
-            .transcript
-            .goal
-            .as_ref()
-            .and_then(goal_toggle_command)
-            .is_some();
         let slash_suggestions = (self.picker.is_none())
             .then(|| slash_suggestion_lines(&self.composer.text, self.slash_selection))
             .filter(|lines| !lines.is_empty());
@@ -3214,7 +3291,7 @@ impl BorgTerminal {
             .filter(|picker| {
                 !matches!(
                     picker.kind,
-                    PickerKind::MessageActions | PickerKind::Commands
+                    PickerKind::MessageActions | PickerKind::Commands | PickerKind::Goal
                 )
             })
             .map(|picker| {
@@ -3232,7 +3309,7 @@ impl BorgTerminal {
         } else {
             " > "
         };
-        let composer_render_lines = if self.picker.as_ref().is_some_and(|_| !message_actions_open) {
+        let composer_render_lines = if self.picker.as_ref().is_some_and(|_| !modal_picker_open) {
             Vec::new()
         } else if self.composer.text.is_empty() {
             let placeholder = if pending_provider_interaction {
@@ -3264,7 +3341,10 @@ impl BorgTerminal {
         let composer_scroll = if let Some(picker) = self.picker.as_ref().filter(|picker| {
             !matches!(
                 picker.kind,
-                PickerKind::Commands | PickerKind::MessageActions | PickerKind::Resume
+                PickerKind::Commands
+                    | PickerKind::MessageActions
+                    | PickerKind::Goal
+                    | PickerKind::Resume
             )
         }) {
             let content_height = usize::from(composer_height.saturating_sub(2));
@@ -3297,6 +3377,7 @@ impl BorgTerminal {
         let mut next_agents_status_area = None;
         let mut next_model_status_area = None;
         let mut next_effort_status_area = None;
+        let mut next_fast_status_area = None;
         let mut next_permission_status_area = None;
         let mut next_team_roster_hit_areas = Vec::new();
         let mut next_back_to_director_area = None;
@@ -3732,7 +3813,10 @@ impl BorgTerminal {
             if let Some(picker) = self.picker.as_ref().filter(|picker| {
                 !matches!(
                     picker.kind,
-                    PickerKind::MessageActions | PickerKind::Commands | PickerKind::Resume
+                    PickerKind::MessageActions
+                        | PickerKind::Commands
+                        | PickerKind::Goal
+                        | PickerKind::Resume
                 )
             }) {
                 for (index, line) in picker.option_row_offsets() {
@@ -3870,13 +3954,14 @@ impl BorgTerminal {
             let goal_status_start = status_spans.iter().map(|span| span.width()).sum::<usize>();
             // The separator is rendered unstyled, so the hover target is the
             // value alone.
-            let goal_status_start = goal_status_start.saturating_add(STATUS_SEPARATOR.width());
+            let goal_status_start = goal_status_start
+                .saturating_add(usize::from(goal_status.is_some()) * STATUS_SEPARATOR.width());
             let goal_status_width = goal_status.as_ref().map(|value| value.width());
             if let Some(goal_status) = goal_status.clone() {
-                // Only light up when the click would do something: a
-                // budget-limited goal is hoverable for its tooltip but has no
-                // run state to flip.
-                let highlight = goal_is_toggleable && self.goal_status_hovered;
+                // Every durable goal can be managed from the modal, including
+                // completed or budget-limited goals where only "clear" is
+                // available.
+                let highlight = self.goal_status_hovered;
                 status_spans.push(Span::styled(
                     STATUS_SEPARATOR,
                     Style::default().fg(Color::Gray),
@@ -3899,7 +3984,8 @@ impl BorgTerminal {
             let todo_status_start = status_spans.iter().map(|span| span.width()).sum::<usize>();
             // The separator is rendered unstyled, so the hover target is the
             // value alone.
-            let todo_status_start = todo_status_start.saturating_add(STATUS_SEPARATOR.width());
+            let todo_status_start = todo_status_start
+                .saturating_add(usize::from(todo_status.is_some()) * STATUS_SEPARATOR.width());
             let todo_status_width = todo_status.as_ref().map(|value| value.width());
             if let Some(todo_status) = todo_status.clone() {
                 status_spans.push(Span::styled(
@@ -3924,7 +4010,8 @@ impl BorgTerminal {
             let model_status_start = status_spans.iter().map(|span| span.width()).sum::<usize>();
             // The separator is rendered unstyled, so the hover target is the
             // value alone.
-            let model_status_start = model_status_start.saturating_add(STATUS_SEPARATOR.width());
+            let model_status_start = model_status_start
+                .saturating_add(usize::from(model_status.is_some()) * STATUS_SEPARATOR.width());
             let model_status_width = model_status.as_ref().map(|value| value.width());
             push_interactive_status_segment(
                 &mut status_spans,
@@ -3934,35 +4021,36 @@ impl BorgTerminal {
             let effort_status_start = status_spans.iter().map(|span| span.width()).sum::<usize>();
             // The separator is rendered unstyled, so the hover target is the
             // value alone.
-            let effort_status_start = effort_status_start.saturating_add(STATUS_SEPARATOR.width());
+            let effort_status_start = effort_status_start
+                .saturating_add(usize::from(effort_status.is_some()) * STATUS_SEPARATOR.width());
             let effort_status_width = effort_status.as_ref().map(|value| value.width());
             push_interactive_status_segment(
                 &mut status_spans,
                 effort_status,
                 self.effort_status_hovered,
             );
+            let fast_status_start = status_spans.iter().map(|span| span.width()).sum::<usize>();
+            let fast_status_start = fast_status_start
+                .saturating_add(usize::from(fast_status.is_some()) * STATUS_SEPARATOR.width());
+            let fast_status_width = fast_status.as_ref().map(|value| value.width());
+            push_interactive_status_segment(
+                &mut status_spans,
+                fast_status,
+                self.fast_status_hovered,
+            );
             let permission_status_start =
                 status_spans.iter().map(|span| span.width()).sum::<usize>();
             // The separator is rendered unstyled, so the hover target is the
             // value alone.
-            let permission_status_start =
-                permission_status_start.saturating_add(STATUS_SEPARATOR.width());
+            let permission_status_start = permission_status_start.saturating_add(
+                usize::from(permission_status.is_some()) * STATUS_SEPARATOR.width(),
+            );
             let permission_status_width = permission_status.as_ref().map(|value| value.width());
             push_interactive_status_segment(
                 &mut status_spans,
                 permission_status,
                 self.permission_status_hovered,
             );
-            push_status_segment(
-                &mut status_spans,
-                context_status,
-                if context_imminent {
-                    Color::Yellow
-                } else {
-                    Color::Gray
-                },
-            );
-            push_status_segment(&mut status_spans, cwd_status, Color::Gray);
             let status_line = Line::from(status_spans);
             let alignment_offset = if is_launch_screen {
                 status_area.width.saturating_sub(status_line.width() as u16) / 2
@@ -4015,6 +4103,8 @@ impl BorgTerminal {
                 model_status_width.map(|width| status_hit_area(model_status_start, width));
             next_effort_status_area =
                 effort_status_width.map(|width| status_hit_area(effort_status_start, width));
+            next_fast_status_area =
+                fast_status_width.map(|width| status_hit_area(fast_status_start, width));
             next_permission_status_area = permission_status_width
                 .map(|width| status_hit_area(permission_status_start, width));
             frame.render_widget(
@@ -4114,7 +4204,7 @@ impl BorgTerminal {
                 next_back_to_director_area = Some(button);
             }
             if self.goal_status_hovered
-                && let Some(goal) = self.transcript.goal.as_ref()
+                && let Some(goal) = active_goal.as_ref()
             {
                 let tooltip_width = (goal.objective.width() as u16)
                     .saturating_add(4)
@@ -4148,7 +4238,7 @@ impl BorgTerminal {
                 );
             }
             if self.todo_status_hovered && !self.transcript.todos.is_empty() {
-                let rows = self.transcript.todo_tooltip_rows();
+                let rows = self.transcript.todo_tooltip_rows(self.todo_status_expanded);
                 let tooltip_width = rows
                     .iter()
                     .map(|row| row.width() as u16)
@@ -4192,11 +4282,53 @@ impl BorgTerminal {
                 );
             }
             if !is_launch_screen {
+                let footer_metadata = showing_primary_controls.then(|| {
+                    [
+                        (!context_status.is_empty()).then_some(context_status.as_str()),
+                        (!cwd_status.is_empty()).then_some(cwd_status.as_str()),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+                    .join("  ·  ")
+                });
+                let metadata_width = footer_metadata
+                    .as_ref()
+                    .map(|value| value.width() as u16)
+                    .filter(|width| *width + 3 < footer_area.width)
+                    .map(|width| width.min(footer_area.width / 2))
+                    .unwrap_or(0);
+                let controls_area = Rect {
+                    width: footer_area.width.saturating_sub(metadata_width),
+                    ..footer_area
+                };
                 frame.render_widget(
                     Paragraph::new(controls)
                         .style(Style::default().fg(Color::DarkGray).bg(COMMAND_PANEL_BG)),
-                    footer_area,
+                    controls_area,
                 );
+                if let Some(metadata) = footer_metadata.filter(|_| metadata_width > 0) {
+                    frame.render_widget(
+                        Paragraph::new(Line::from(Span::styled(
+                            truncate_table_cell(
+                                &metadata,
+                                metadata_width.saturating_sub(2) as usize,
+                            ),
+                            Style::default().fg(if context_imminent {
+                                Color::Yellow
+                            } else {
+                                Color::Gray
+                            }),
+                        )))
+                        .alignment(Alignment::Right)
+                        .style(Style::default().bg(COMMAND_PANEL_BG)),
+                        Rect {
+                            x: footer_area.right().saturating_sub(metadata_width),
+                            width: metadata_width,
+                            ..footer_area
+                        },
+                    );
+                }
             }
             if showing_primary_controls {
                 let (controls_x, controls_y, controls_width) = if is_launch_screen {
@@ -4212,7 +4344,7 @@ impl BorgTerminal {
                     (
                         footer_area.x.saturating_add(1),
                         footer_area.y,
-                        primary_controls.width() as u16,
+                        primary_controls.width().min(footer_area.width as usize) as u16,
                     )
                 };
                 let hint_width = keybindings_hint.width() as u16;
@@ -4266,12 +4398,14 @@ impl BorgTerminal {
                     tooltip,
                 );
             }
-            if let Some(picker) = self
-                .picker
-                .as_ref()
-                .filter(|picker| matches!(picker.kind, PickerKind::MessageActions))
-            {
-                let popup = centered_popup(frame.area(), 48, 6);
+            if let Some(picker) = self.picker.as_ref().filter(|picker| {
+                matches!(picker.kind, PickerKind::MessageActions | PickerKind::Goal)
+            }) {
+                let popup = centered_popup(
+                    frame.area(),
+                    52,
+                    (picker.options.len() as u16).saturating_add(3).max(6),
+                );
                 frame.render_widget(Clear, popup);
                 frame.render_widget(
                     Block::default()
@@ -4306,7 +4440,9 @@ impl BorgTerminal {
                     frame.render_widget(
                         Paragraph::new(format!(
                             " {}  {}",
-                            if option.label.starts_with("Revert") {
+                            if matches!(picker.kind, PickerKind::Goal) {
+                                "›"
+                            } else if option.label.starts_with("Revert") {
                                 "↶"
                             } else {
                                 "⧉"
@@ -4344,6 +4480,7 @@ impl BorgTerminal {
         self.agents_status_area = next_agents_status_area;
         self.model_status_area = next_model_status_area;
         self.effort_status_area = next_effort_status_area;
+        self.fast_status_area = next_fast_status_area;
         self.permission_status_area = next_permission_status_area;
         self.team_roster_hit_areas = next_team_roster_hit_areas;
         self.back_to_director_area = next_back_to_director_area;
@@ -4401,7 +4538,7 @@ impl BorgTerminal {
         }
         if matches!(
             self.picker.as_ref().map(|picker| picker.kind),
-            Some(PickerKind::MessageActions)
+            Some(PickerKind::MessageActions | PickerKind::Goal)
         ) {
             return Ok(match key.code {
                 KeyCode::Up | KeyCode::Left => {
@@ -4417,7 +4554,16 @@ impl BorgTerminal {
                     self.transcript.selected = None;
                     UiAction::None
                 }
-                KeyCode::Enter => self.run_selected_message_action(),
+                KeyCode::Enter => {
+                    if matches!(
+                        self.picker.as_ref().map(|picker| picker.kind),
+                        Some(PickerKind::Goal)
+                    ) {
+                        self.run_selected_picker()?
+                    } else {
+                        self.run_selected_message_action()
+                    }
+                }
                 _ => UiAction::None,
             });
         }
@@ -4811,7 +4957,11 @@ fn switch_to_child_transcript(
     child_transcripts: &mut HashMap<Uuid, Transcript>,
     child_id: Uuid,
 ) {
-    let child = child_transcripts.remove(&child_id).unwrap_or_default();
+    let child = child_transcripts.remove(&child_id).unwrap_or_else(|| {
+        let mut transcript = Transcript::default();
+        transcript.show_director_context_boundary();
+        transcript
+    });
     *director_transcript = Some(Box::new(std::mem::replace(transcript, child)));
 }
 
@@ -4821,7 +4971,11 @@ fn switch_between_child_transcripts(
     previous_child: Uuid,
     next_child: Uuid,
 ) {
-    let next = child_transcripts.remove(&next_child).unwrap_or_default();
+    let next = child_transcripts.remove(&next_child).unwrap_or_else(|| {
+        let mut transcript = Transcript::default();
+        transcript.show_director_context_boundary();
+        transcript
+    });
     child_transcripts.insert(previous_child, std::mem::replace(transcript, next));
 }
 
@@ -5647,6 +5801,13 @@ impl Transcript {
         }
     }
 
+    fn show_director_context_boundary(&mut self) {
+        self.order.push(TranscriptEntry::Activity {
+            text: DIRECTOR_CONTEXT_BOUNDARY.to_string(),
+            time: canonical_local_time(Local::now()),
+        });
+    }
+
     fn show_plan(&mut self, items: &[PlanItem]) -> Option<usize> {
         let time = canonical_local_time(Local::now());
         self.upsert_plan(items.to_vec(), time)
@@ -5951,6 +6112,10 @@ impl Transcript {
                 // eventual admitted message to its enqueue position instead of
                 // the real provider-boundary chronology.
                 if *status == MessageStatus::Queued {
+                    // An accepted steer may have briefly materialized as an
+                    // in-progress transcript row. If the turn is interrupted,
+                    // its later queue transition must withdraw that row again.
+                    removed_entry = self.remove_message(*message_id);
                     return removed_entry;
                 }
                 if *actor == EventActor::Assistant && text.trim().is_empty() {
@@ -6465,20 +6630,23 @@ impl Transcript {
         }
     }
 
-    fn config_statuses(&self) -> (Option<String>, Option<String>, Option<String>, String) {
+    fn config_statuses(
+        &self,
+    ) -> (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        String,
+    ) {
         let Some(config) = self.config.as_ref() else {
-            return (None, None, None, String::new());
+            return (None, None, None, None, String::new());
         };
-        let model = config.model.as_ref().map(|model| {
-            if config.fast {
-                format!("{model} fast")
-            } else {
-                model.clone()
-            }
-        });
+        let model = config.model.clone();
         (
             model,
             config.effort.clone(),
+            config.fast.then(|| "fast".to_string()),
             Some(permission_mode_label(config.permission_mode).to_string()),
             fish_style_path(&config.cwd),
         )
@@ -6622,12 +6790,19 @@ impl Transcript {
         (open > 0).then(|| format!("{open} open to-do{}", if open == 1 { "" } else { "s" }))
     }
 
-    fn todo_tooltip_rows(&self) -> Vec<String> {
+    fn todo_tooltip_rows(&self, expanded: bool) -> Vec<String> {
         if self.todos.is_empty() {
             return vec!["No to-dos in the current plan".to_string()];
         }
-        self.todos
+        let ordered = ordered_plan_items(&self.todos);
+        let clipped = !expanded && ordered.len() > MAX_COLLAPSED_PLAN_ITEMS;
+        let mut rows = ordered
             .iter()
+            .take(if clipped {
+                MAX_COLLAPSED_PLAN_ITEMS
+            } else {
+                ordered.len()
+            })
             .map(|item| {
                 let glyph = match item.status {
                     PlanItemStatus::Completed => "✓",
@@ -6636,7 +6811,16 @@ impl Transcript {
                 };
                 format!("{glyph}  {}", item.content)
             })
-            .collect()
+            .collect::<Vec<_>>();
+        if clipped {
+            rows.push(format!(
+                "    + {} more · click to expand",
+                ordered.len() - MAX_COLLAPSED_PLAN_ITEMS
+            ));
+        } else if expanded && ordered.len() > MAX_COLLAPSED_PLAN_ITEMS {
+            rows.push("    − click to show less".to_string());
+        }
+        rows
     }
 
     fn active_goal_cache_tick(&self) -> Option<i64> {
@@ -6936,14 +7120,7 @@ impl Transcript {
                             Style::default().fg(Color::DarkGray),
                         ),
                     ]));
-                    let display_items = [PlanItemStatus::InProgress, PlanItemStatus::Pending]
-                        .into_iter()
-                        .flat_map(|status| items.iter().filter(move |item| item.status == status))
-                        .chain(
-                            items
-                                .iter()
-                                .filter(|item| item.status == PlanItemStatus::Completed),
-                        );
+                    let display_items = ordered_plan_items(items);
                     let clipped = !*expanded && items.len() > MAX_COLLAPSED_PLAN_ITEMS;
                     let mut shown = 0usize;
                     for item in display_items {
@@ -7847,6 +8024,13 @@ fn update_queued_prompts(
     event: &SessionEventKind,
 ) {
     match event {
+        SessionEventKind::Message {
+            message_id,
+            actor: EventActor::User,
+            status: MessageStatus::InProgress,
+            delivery: Some(PromptDelivery::Steer),
+            ..
+        } => queued_prompts.retain(|queued| queued.message_id != *message_id),
         SessionEventKind::Message {
             message_id,
             actor: EventActor::User,
@@ -9307,15 +9491,6 @@ fn status_label(status: SessionStatus) -> &'static str {
     }
 }
 
-fn push_status_segment(spans: &mut Vec<Span<'static>>, value: String, color: Color) {
-    if !value.is_empty() {
-        spans.push(Span::styled(
-            format!(" · {value}"),
-            Style::default().fg(color),
-        ));
-    }
-}
-
 fn permission_mode_label(mode: PermissionMode) -> &'static str {
     match mode {
         PermissionMode::FullAccess => "full access",
@@ -9324,13 +9499,12 @@ fn permission_mode_label(mode: PermissionMode) -> &'static str {
     }
 }
 
-/// Name the click while the pointer is already on the segment, so the only
-/// affordance for pause/resume is not a slash command the user has to know.
+/// Name the click while the pointer is already on the segment, so goal
+/// management is discoverable without requiring slash-command knowledge.
 fn goal_tooltip_title(goal: &SessionGoal) -> String {
     match goal_toggle_command(goal) {
-        Some("/goal pause") => " Goal · click to pause ".to_string(),
-        Some(_) => " Goal · click to resume ".to_string(),
-        None => " Goal ".to_string(),
+        Some(_) => " Goal · click to manage ".to_string(),
+        None => " Goal · click to manage ".to_string(),
     }
 }
 
@@ -9343,6 +9517,21 @@ fn goal_toggle_command(goal: &SessionGoal) -> Option<&'static str> {
         GoalStatus::Paused | GoalStatus::Blocked | GoalStatus::UsageLimited => Some("/goal resume"),
         GoalStatus::BudgetLimited | GoalStatus::Complete => None,
     }
+}
+
+fn goal_picker_options(goal: &SessionGoal) -> Vec<PickerOption> {
+    let mut options = Vec::with_capacity(3);
+    if let Some(toggle) = goal_toggle_command(goal) {
+        let toggle_label = if toggle == "/goal pause" {
+            "Pause automatic continuation"
+        } else {
+            "Resume automatic continuation"
+        };
+        options.push(PickerOption::new(toggle_label, toggle));
+    }
+    options.push(PickerOption::new("Clear goal", "/goal clear"));
+    options.push(PickerOption::new("Cancel", "cancel"));
+    options
 }
 
 fn push_interactive_status_segment(

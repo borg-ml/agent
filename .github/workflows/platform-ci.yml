@@ -1,0 +1,112 @@
+name: Borg CLI platform CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: borg-cli-platform-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native:
+    name: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            archive: tar
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            archive: tar
+          - os: macos-15
+            target: aarch64-apple-darwin
+            archive: tar
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            archive: zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: "1.94.0"
+          targets: ${{ matrix.target }}
+      - name: Build CLI
+        run: cargo build --locked --release --target ${{ matrix.target }} -p borg
+      - name: Run native CLI core-flow tests
+        run: cargo test --locked --target ${{ matrix.target }} -p borg --no-fail-fast
+      - name: Smoke-test the native CLI binary
+        shell: bash
+        run: |
+          binary="target/${{ matrix.target }}/release/borg"
+          if [[ "${{ matrix.archive }}" == "zip" ]]; then
+            binary="${binary}.exe"
+          fi
+          "$binary" --version
+          "$binary" --help >/dev/null
+      - name: Package and extract-smoke the Unix archive
+        if: matrix.archive == 'tar'
+        shell: bash
+        run: |
+          asset="borg-${{ matrix.target }}.tar.gz"
+          stage="$(mktemp -d)"
+          extract="$(mktemp -d)"
+          trap 'rm -rf "$stage" "$extract"' EXIT
+          mkdir "$stage/borg-${{ matrix.target }}"
+          cp "target/${{ matrix.target }}/release/borg" "$stage/borg-${{ matrix.target }}/"
+          tar -C "$stage" -czf "$asset" "borg-${{ matrix.target }}"
+          tar -xzf "$asset" -C "$extract"
+          "$extract/borg-${{ matrix.target }}/borg" --version
+      - name: Package and extract-smoke the Windows archive
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $asset = "borg-${{ matrix.target }}.zip"
+          $stage = Join-Path $env:RUNNER_TEMP "borg-package-stage"
+          $extract = Join-Path $env:RUNNER_TEMP "borg-package-extract"
+          if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
+          if (Test-Path $extract) { Remove-Item -Recurse -Force $extract }
+          New-Item -ItemType Directory -Path $stage | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/borg.exe" $stage
+          Compress-Archive -Path "$stage/*" -DestinationPath $asset
+          Expand-Archive -Path $asset -DestinationPath $extract
+          $binary = Get-ChildItem -Path $extract -Filter "borg.exe" | Select-Object -First 1
+          if (-not $binary) { throw "packaged borg.exe was not found" }
+          & $binary.FullName --version
+
+  provider-parity:
+    name: Provider parity and Claude adapter
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: "1.94.0"
+      - name: Run deterministic provider parity contracts
+        shell: bash
+        run: |
+          cargo test --locked -p borg-provider provider::chat_stream::tests::codex_and_claude_normalize_mcp_tool_lifecycle_identically
+          cargo test --locked -p borg-provider provider::chat_stream::tests::codex_and_claude_usage_maps_share_billing_buckets
+          cargo test --locked -p borg-remote subagents::tests::every_execution_lane_exposes_the_same_borg_control_plane
+          cargo test --locked -p borg-remote session::tests::active_provider_steer_uses_turn_control_across_provider_lanes
+      - name: Check and build Claude Agent SDK adapter
+        shell: bash
+        run: |
+          npm --prefix packages/borg-claude-sdk ci
+          npm --prefix packages/borg-claude-sdk run check
+          npm --prefix packages/borg-claude-sdk run build

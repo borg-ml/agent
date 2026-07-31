@@ -696,6 +696,7 @@ async fn run_agent_session_store_kernel(
         launch.capabilities.subagents,
         shared_work,
         launch.team_policy.clone(),
+        launch.cwd.clone(),
     );
     let agent_tool_server =
         crate::AgentToolServer::start(session_root, session_id, dispatcher.clone()).await?;
@@ -1521,6 +1522,22 @@ async fn run_agent_session_store_kernel(
                         }
                         Ok(()) => {
                             pending_steers[index].state = PendingSteerState::Accepted;
+                            // Codex has accepted ownership of this prompt even
+                            // though its user-message completion notification
+                            // arrives later. Surface that admission now so the
+                            // UI does not leave the steer in the pending panel;
+                            // retain the in-memory entry for interruption
+                            // fallback until the provider commits it.
+                            let prompt = pending_steers[index].prompt.clone();
+                            record_prompt_status(
+                                &mut journal,
+                                &events,
+                                session_id,
+                                &prompt,
+                                MessageStatus::InProgress,
+                                PromptDelivery::Steer,
+                            )
+                            .await?;
                         }
                         Err(error) => {
                             tracing::warn!(
@@ -4485,6 +4502,124 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn multiple_queue_mode_prompts_drain_fifo_after_a_natural_turn_boundary() {
+        let root = tempdir().unwrap();
+        let journal_path = root.path().join("session.jsonl");
+        let session_id = Uuid::new_v4();
+        let queued_message_ids = [Uuid::new_v4(), Uuid::new_v4()];
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let turns = Arc::new(Mutex::new(Vec::new()));
+        let first_started = Arc::new(Notify::new());
+        let release_first = Arc::new(Notify::new());
+        let executor = Arc::new(BoundaryQueueExecutor {
+            turns: Arc::clone(&turns),
+            first_started: Arc::clone(&first_started),
+            release_first: Arc::clone(&release_first),
+        });
+        let actor = tokio::spawn(async move {
+            run_agent_session_with_executor(
+                &journal_path,
+                session_id,
+                LaunchSession {
+                    request_id: Uuid::new_v4(),
+                    cwd: root.path().to_path_buf(),
+                    provider: CodingProvider::Codex,
+                    model: None,
+                    effort: None,
+                    fast: Some(false),
+                    response_language: crate::ResponseLanguage::Auto,
+                    permission_mode: PermissionMode::Manual,
+                    name: None,
+                    initial_prompt: None,
+                    capabilities: Default::default(),
+                    subagent_concurrency_limit: None,
+                    extension_skill_roots: Vec::new(),
+                    team_policy: None,
+                },
+                command_rx,
+                event_tx,
+                executor,
+            )
+            .await
+        });
+
+        command_tx
+            .send(HostCommand::Prompt {
+                session_id,
+                message_id: Uuid::new_v4(),
+                text: "first".to_string(),
+                attachments: Vec::new(),
+                output_schema: None,
+                delivery: PromptDelivery::Steer,
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), first_started.notified())
+            .await
+            .expect("first turn starts");
+
+        for (message_id, text) in queued_message_ids.iter().copied().zip(["second", "third"]) {
+            command_tx
+                .send(HostCommand::Prompt {
+                    session_id,
+                    message_id,
+                    text: text.to_string(),
+                    attachments: Vec::new(),
+                    output_schema: None,
+                    delivery: PromptDelivery::Queue,
+                })
+                .await
+                .unwrap();
+        }
+        let mut queued = Vec::new();
+        while queued.len() < queued_message_ids.len() {
+            let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+                .await
+                .expect("queued event arrives")
+                .expect("session event stream remains open");
+            if let SessionEventKind::Message {
+                message_id,
+                status: MessageStatus::Queued,
+                ..
+            } = event.kind
+                && queued_message_ids.contains(&message_id)
+            {
+                queued.push(message_id);
+            }
+        }
+
+        // Releasing the first turn must let the natural boundary loop run every
+        // queued prompt in FIFO order; no interrupt/coalescing path is involved.
+        release_first.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if turns.lock().unwrap().len() == 3 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all queued turns drain");
+        assert_eq!(
+            turns
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(text, _)| text.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "second", "third"]
+        );
+
+        command_tx
+            .send(HostCommand::Stop { session_id })
+            .await
+            .unwrap();
+        actor.await.unwrap().unwrap();
+    }
+
     #[tokio::test]
     async fn interrupted_turn_reaches_fifo_drain_boundary() {
         let root = tempdir().unwrap();
@@ -4674,7 +4809,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accepted_codex_steer_stays_pending_until_the_user_message_commits() {
+    async fn accepted_codex_steer_is_admitted_before_the_user_message_commits() {
         let root = tempdir().unwrap();
         let journal_path = root.path().join("session.jsonl");
         let session_id = Uuid::new_v4();
@@ -4746,7 +4881,14 @@ mod tests {
             .expect("provider accepts steer transport");
 
         let mut transitions = Vec::new();
-        while let Ok(event) = event_rx.try_recv() {
+        while !transitions
+            .iter()
+            .any(|(status, _)| *status == MessageStatus::InProgress)
+        {
+            let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+                .await
+                .expect("accepted steer event arrives")
+                .expect("session remains open");
             if let SessionEventKind::Message {
                 message_id,
                 status,
@@ -4760,8 +4902,11 @@ mod tests {
         }
         assert_eq!(
             transitions,
-            [(MessageStatus::Queued, PromptDelivery::Steer)],
-            "transport acknowledgement must not hide an uncommitted steer"
+            [
+                (MessageStatus::Queued, PromptDelivery::Steer),
+                (MessageStatus::InProgress, PromptDelivery::Steer),
+            ],
+            "transport acknowledgement should admit the steer without waiting for provider commit"
         );
 
         release_commit.notify_one();
@@ -6095,23 +6240,20 @@ mod tests {
     }
 
     #[test]
-    fn active_provider_steer_uses_turn_control_for_codex_and_claude() {
-        assert!(steers_active_provider_turn(
+    fn active_provider_steer_uses_turn_control_across_provider_lanes() {
+        for provider in [
             CodingProvider::Codex,
-            PromptDelivery::Steer,
-        ));
-        assert!(steers_active_provider_turn(
             CodingProvider::Claude,
-            PromptDelivery::Steer,
-        ));
-        assert!(!steers_active_provider_turn(
-            CodingProvider::Codex,
-            PromptDelivery::Queue,
-        ));
-        assert!(!steers_active_provider_turn(
-            CodingProvider::Claude,
-            PromptDelivery::Queue,
-        ));
+            CodingProvider::Kimi,
+            CodingProvider::OpenRouter,
+            CodingProvider::OpenAiCompatible,
+        ] {
+            assert!(steers_active_provider_turn(provider, PromptDelivery::Steer));
+            assert!(!steers_active_provider_turn(
+                provider,
+                PromptDelivery::Queue
+            ));
+        }
         assert!(!steers_active_provider_turn(
             CodingProvider::OpenCode,
             PromptDelivery::Steer,

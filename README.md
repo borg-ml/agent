@@ -98,6 +98,16 @@ metadata, and stdio MCP servers, but no shell or lifecycle hooks. Skill roots
 are catalog metadata only in this release. Inspect the effective catalog with
 `borg extensions` or `borg extensions --json`.
 
+Agents can maintain this setup through the built-in
+`get_agent_settings`, `update_agent_settings`, `list_plugins`, `read_plugin`,
+and `create_plugin` tools.
+Settings writes are atomic; slash aliases and keybindings reload in a running
+TUI, while provider, capability, and MCP changes intentionally take effect on
+the next session. `create_plugin` writes a project
+`.borg/skills/<id>/SKILL.md`; the live list/read tools see it immediately, and
+the native skill context rescans it at the start of the next native turn
+without a restart.
+
 ## Local multiplayer workspaces
 
 Run `borg workspaces` to list the current OS user's durable local workspaces.

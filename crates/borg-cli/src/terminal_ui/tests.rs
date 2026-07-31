@@ -28,6 +28,17 @@ fn focused_child_transcript_round_trips_back_to_director() {
 }
 
 #[test]
+fn child_transcript_starts_with_a_director_context_boundary() {
+    let mut transcript = Transcript::default();
+    transcript.show_director_context_boundary();
+
+    assert!(matches!(
+        transcript.order.first(),
+        Some(TranscriptEntry::Activity { text, .. }) if text == DIRECTOR_CONTEXT_BOUNDARY
+    ));
+}
+
+#[test]
 fn focused_transcript_can_switch_directly_between_children() {
     let first_id = Uuid::new_v4();
     let second_id = Uuid::new_v4();
@@ -54,6 +65,25 @@ fn focused_transcript_can_switch_directly_between_children() {
         TranscriptEntry::Activity { text, .. } if text == "first child"
     ));
     assert!(!children.contains_key(&second_id));
+}
+
+#[test]
+fn focusing_a_new_child_still_shows_the_director_context_boundary() {
+    let child_id = Uuid::new_v4();
+    let mut displayed = Transcript::default();
+    displayed.order.push(TranscriptEntry::Activity {
+        text: "director event".to_string(),
+        time: "now".to_string(),
+    });
+    let mut director = None;
+    let mut children = HashMap::new();
+
+    switch_to_child_transcript(&mut displayed, &mut director, &mut children, child_id);
+
+    assert!(matches!(
+        displayed.order.first(),
+        Some(TranscriptEntry::Activity { text, .. }) if text == DIRECTOR_CONTEXT_BOUNDARY
+    ));
 }
 
 #[test]
@@ -1029,7 +1059,7 @@ fn actionable_inactive_goals_remain_in_the_status_line() {
 }
 
 #[test]
-fn todo_status_counts_open_items_and_tooltip_keeps_the_full_plan() {
+fn todo_status_counts_open_items_and_tooltip_matches_plan_order_and_clipping() {
     let mut transcript = Transcript::default();
     transcript.todos = vec![
         PlanItem {
@@ -1047,15 +1077,39 @@ fn todo_status_counts_open_items_and_tooltip_keeps_the_full_plan() {
             content: "Run the regression tests".to_string(),
             status: PlanItemStatus::Pending,
         },
+        PlanItem {
+            id: Uuid::new_v4(),
+            content: "Document the reload boundary".to_string(),
+            status: PlanItemStatus::Pending,
+        },
+        PlanItem {
+            id: Uuid::new_v4(),
+            content: "Archive the old screenshot".to_string(),
+            status: PlanItemStatus::Completed,
+        },
+        PlanItem {
+            id: Uuid::new_v4(),
+            content: "Publish the release notes".to_string(),
+            status: PlanItemStatus::Pending,
+        },
     ];
 
-    assert_eq!(transcript.todo_status().as_deref(), Some("2 open to-dos"));
-    let rows = transcript.todo_tooltip_rows();
-    assert_eq!(rows.len(), 3);
+    assert_eq!(transcript.todo_status().as_deref(), Some("4 open to-dos"));
+    let rows = transcript.todo_tooltip_rows(false);
+    assert_eq!(rows.len(), MAX_COLLAPSED_PLAN_ITEMS + 1);
+    assert!(rows[0].contains("Ship the hover affordance"));
+    assert!(rows[1].contains("Run the regression tests"));
     assert!(
-        rows.iter()
+        rows.last()
+            .is_some_and(|row| row.contains("click to expand"))
+    );
+    let expanded = transcript.todo_tooltip_rows(true);
+    assert!(
+        expanded
+            .iter()
             .any(|row| row.contains("Keep the completed item visible"))
     );
+    assert!(expanded.last().is_some_and(|row| row.contains("show less")));
 }
 
 /// Clicking the goal segment must submit exactly the slash command the user
@@ -1066,7 +1120,7 @@ fn the_goal_status_segment_toggles_only_what_it_can() {
 
     goal.status = GoalStatus::Active;
     assert_eq!(goal_toggle_command(&goal), Some("/goal pause"));
-    assert_eq!(goal_tooltip_title(&goal), " Goal · click to pause ");
+    assert_eq!(goal_tooltip_title(&goal), " Goal · click to manage ");
 
     for status in [
         GoalStatus::Paused,
@@ -1075,13 +1129,13 @@ fn the_goal_status_segment_toggles_only_what_it_can() {
     ] {
         goal.status = status;
         assert_eq!(goal_toggle_command(&goal), Some("/goal resume"));
-        assert_eq!(goal_tooltip_title(&goal), " Goal · click to resume ");
+        assert_eq!(goal_tooltip_title(&goal), " Goal · click to manage ");
     }
 
     for status in [GoalStatus::BudgetLimited, GoalStatus::Complete] {
         goal.status = status;
         assert_eq!(goal_toggle_command(&goal), None);
-        assert_eq!(goal_tooltip_title(&goal), " Goal ");
+        assert_eq!(goal_tooltip_title(&goal), " Goal · click to manage ");
     }
 }
 
@@ -1105,6 +1159,30 @@ fn every_goal_toggle_command_round_trips_through_the_parser() {
             expected
         );
     }
+}
+
+#[test]
+fn goal_management_modal_contains_toggle_clear_and_cancel() {
+    let mut goal = SessionGoal::new("Ship the terminal polish".to_string(), None);
+    goal.status = GoalStatus::Active;
+    let options = goal_picker_options(&goal);
+    assert_eq!(
+        options
+            .iter()
+            .map(|option| option.value.as_str())
+            .collect::<Vec<_>>(),
+        ["/goal pause", "/goal clear", "cancel"]
+    );
+
+    goal.status = GoalStatus::Complete;
+    let options = goal_picker_options(&goal);
+    assert_eq!(
+        options
+            .iter()
+            .map(|option| option.value.as_str())
+            .collect::<Vec<_>>(),
+        ["/goal clear", "cancel"]
+    );
 }
 
 /// An edit with no diff on screen yet has nothing for the user to watch, and
@@ -2223,6 +2301,44 @@ fn picker_hover_uses_actual_option_indices_after_filtering() {
 }
 
 #[test]
+fn picker_hit_offsets_match_rendered_rows_with_sections() {
+    let picker = Picker {
+        kind: PickerKind::Model,
+        title: "Choose model",
+        options: vec![
+            PickerOption {
+                label: "codex-1".to_string(),
+                value: "codex-1".to_string(),
+                preview: None,
+                section: Some("Codex".to_string()),
+            },
+            PickerOption {
+                label: "codex-2".to_string(),
+                value: "codex-2".to_string(),
+                preview: None,
+                section: None,
+            },
+            PickerOption {
+                label: "claude-1".to_string(),
+                value: "claude-1".to_string(),
+                preview: None,
+                section: Some("Claude".to_string()),
+            },
+        ],
+        selected: 2,
+        query: None,
+    };
+    let lines = picker.styled_lines(80, Color::White, Color::White);
+    for (index, line) in picker.option_row_offsets() {
+        assert!(
+            lines[line]
+                .to_string()
+                .contains(&picker.options[index].label)
+        );
+    }
+}
+
+#[test]
 fn picker_numbers_are_visible_and_select_immediately() {
     let mut picker = Picker::new(
         PickerKind::Effort,
@@ -2241,7 +2357,7 @@ fn picker_numbers_are_visible_and_select_immediately() {
 }
 
 #[test]
-fn pending_steer_stays_visible_until_its_user_message_is_committed() {
+fn accepted_steer_leaves_pending_projection_before_user_message_commit() {
     let message_id = Uuid::new_v4();
     let mut queue = Vec::new();
     update_queued_prompts(
@@ -2263,6 +2379,19 @@ fn pending_steer_stays_visible_until_its_user_message_is_committed() {
             delivery: PromptDelivery::Steer,
         }]
     );
+
+    update_queued_prompts(
+        &mut queue,
+        &SessionEventKind::Message {
+            message_id,
+            actor: EventActor::User,
+            text: "follow up".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::InProgress,
+            delivery: Some(PromptDelivery::Steer),
+        },
+    );
+    assert!(queue.is_empty());
 
     update_queued_prompts(
         &mut queue,
@@ -2787,11 +2916,34 @@ fn projected_session_state_restores_status_config_outside_the_history_tail() {
         (
             Some("gpt-5.6-sol".to_string()),
             Some("medium".to_string()),
+            None,
             Some("full access".to_string()),
             "/w/borg".to_string()
         )
     );
     assert_eq!(transcript.context_remaining_percent, 77);
+}
+
+#[test]
+fn fast_mode_gets_its_own_status_segment_only_when_enabled() {
+    let mut transcript = Transcript::default();
+    transcript.seed_session_state(&SessionState {
+        configuration: Some(borg_remote::SessionConfiguration {
+            cwd: PathBuf::from("/workspace/borg"),
+            provider: CodingProvider::Codex,
+            model: Some("gpt-5.6-sol".to_string()),
+            effort: Some("high".to_string()),
+            fast: true,
+            response_language: ResponseLanguage::Auto,
+            permission_mode: PermissionMode::FullAccess,
+        }),
+        ..Default::default()
+    });
+
+    let (model, effort, fast, _, _) = transcript.config_statuses();
+    assert_eq!(model.as_deref(), Some("gpt-5.6-sol"));
+    assert_eq!(effort.as_deref(), Some("high"));
+    assert_eq!(fast.as_deref(), Some("fast"));
 }
 
 #[test]

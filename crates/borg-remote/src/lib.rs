@@ -21,6 +21,7 @@ mod native_mcp;
 mod native_process;
 mod orchestration;
 mod receipt;
+mod self_service;
 mod session;
 mod session_store;
 mod subagents;

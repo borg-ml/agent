@@ -391,7 +391,9 @@ async fn run_local_agent_session(
     restored_prompt: Option<(String, Vec<PathBuf>)>,
     session_root_override: Option<&Path>,
 ) -> Result<Option<(Uuid, Option<(String, Vec<PathBuf>)>)>> {
-    let agent_config = AgentConfig::load(args.config.as_deref())?;
+    let mut agent_config = AgentConfig::load(args.config.as_deref())?;
+    let agent_config_path = AgentConfig::path(args.config.as_deref());
+    let mut agent_config_signature = agent_config_file_signature(agent_config_path.as_deref());
     let mut editor_preferences = EditorPreferences::load()?;
     let host_config_path = default_host_config_path();
     let sessions_dir = session_root_override.map_or_else(
@@ -848,6 +850,7 @@ async fn run_local_agent_session(
     let mut stop_sent = false;
     let mut user_requested_exit = false;
     let mut exit_notice = None;
+    let mut detached_from_terminal = false;
     let mut last_ctrl_c = None;
     let mut terminal_dirty = false;
     let mut tui_fps = tui_refresh_rate(u64::from(editor_preferences.presentation.refresh_rate_fps));
@@ -863,6 +866,8 @@ async fn run_local_agent_session(
     activity_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut cache_tick = tokio::time::interval(std::time::Duration::from_secs(30));
     cache_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut agent_config_tick = tokio::time::interval(std::time::Duration::from_millis(500));
+    agent_config_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut shutdown_signal_open = true;
     loop {
         tokio::select! {
@@ -908,6 +913,37 @@ async fn run_local_agent_session(
                 crate::terminal_ui::BorgTerminal::has_cache_idle_timer
             ) => {
                 terminal_dirty = true;
+            }
+            _ = agent_config_tick.tick(), if interactive => {
+                let signature = agent_config_file_signature(agent_config_path.as_deref());
+                if signature != agent_config_signature {
+                    match AgentConfig::load(args.config.as_deref()) {
+                        Ok(next) => {
+                            let keybindings_changed = next.keybindings != agent_config.keybindings;
+                            agent_config = next;
+                            agent_config_signature = signature;
+                            if let Some(terminal) = terminal.as_mut() {
+                                if keybindings_changed {
+                                    if let Err(error) = terminal.reload_keybindings(&agent_config.keybindings) {
+                                        terminal.set_notice(format!("Settings changed, but keybindings were invalid: {error:#}"));
+                                    } else {
+                                        terminal.set_notice("Agent settings reloaded · aliases and keybindings are live".to_string());
+                                    }
+                                } else {
+                                    terminal.set_notice("Agent settings changed · provider/MCP/capability changes apply next session".to_string());
+                                }
+                                terminal_dirty = true;
+                            }
+                        }
+                        Err(error) => {
+                            agent_config_signature = signature;
+                            if let Some(terminal) = terminal.as_mut() {
+                                terminal.set_notice(format!("Agent settings not reloaded: {error:#}"));
+                                terminal_dirty = true;
+                            }
+                        }
+                    }
+                }
             }
             event = session_events.recv() => {
                 let Some(event) = event else {
@@ -1009,7 +1045,7 @@ async fn run_local_agent_session(
                     {
                         history.push(event.clone());
                     }
-                } else {
+                } else if !detached_from_terminal {
                     render_event(&event, args.json, &mut rendered)?;
                 }
                 if pending_approval.is_some() && !can_prompt {
@@ -1019,7 +1055,8 @@ async fn run_local_agent_session(
                         approval_id,
                         decision: ApprovalDecision::Deny,
                     }).await.ok();
-                } else if pending_provider_interaction
+                } else if !detached_from_terminal
+                    && pending_provider_interaction
                     .as_ref()
                     .is_some_and(|(_, _, payload)| {
                         terminal.is_none() && provider_interaction_payload_contains_secret(payload)
@@ -1051,10 +1088,19 @@ async fn run_local_agent_session(
                         })
                         .await
                         .ok();
-                } else if pending_approval.is_some() && !args.json && terminal.is_none() {
+                } else if !detached_from_terminal
+                    && pending_approval.is_some()
+                    && !args.json
+                    && terminal.is_none()
+                {
                     print!("\n  Allow · y   Deny · n › ");
                     io::stdout().flush()?;
-                } else if interactive && status == SessionStatus::Ready && !args.json && terminal.is_none() {
+                } else if !detached_from_terminal
+                    && interactive
+                    && status == SessionStatus::Ready
+                    && !args.json
+                    && terminal.is_none()
+                {
                     print!("> ");
                     io::stdout().flush()?;
                 }
@@ -1868,11 +1914,11 @@ async fn run_local_agent_session(
                     } => {
                         if let Some(target) = target {
                             let message_id = Uuid::new_v4();
-                            let delivery = if steer_active_codex {
-                                PromptDelivery::Steer
-                            } else {
-                                PromptDelivery::Queue
-                            };
+                            let active_provider = terminal
+                                .as_ref()
+                                .and_then(BorgTerminal::session_provider)
+                                .unwrap_or(provider);
+                            let delivery = default_active_delivery(active_provider, steer_active_codex);
                             terminal
                                 .as_mut()
                                 .expect("terminal")
@@ -2516,8 +2562,12 @@ async fn run_local_agent_session(
                                             | SessionStatus::Running
                                             | SessionStatus::WaitingForApproval
                                     );
+                                    let active_provider = terminal
+                                        .as_ref()
+                                        .and_then(BorgTerminal::session_provider)
+                                        .unwrap_or(provider);
                                     let (delivery, text) = if active {
-                                        running_input(&text, provider, steer_active_codex)
+                                        running_input(&text, active_provider, steer_active_codex)
                                     } else {
                                         idle_input(&text)
                                     };
@@ -2596,6 +2646,19 @@ async fn run_local_agent_session(
                 let signal = signal.context("failed to listen for a process shutdown signal")?;
                 tracing::warn!(%session_id, %signal, "restoring terminal before process shutdown");
                 shutdown_terminal(&mut terminal).await;
+                if should_detach_on_terminal_hangup(signal, status) {
+                    // A terminal emulator can disappear independently of Borg (for
+                    // example, a GPU/renderer crash). Keep the durable actor and
+                    // control socket alive so a new `borg resume` can attach to the
+                    // in-flight turn instead of cancelling it.
+                    detached_from_terminal = true;
+                    tracing::warn!(
+                        %session_id,
+                        %signal,
+                        "terminal disappeared during an active turn; detached UI and preserved session"
+                    );
+                    continue;
+                }
                 stop_sent = true;
                 user_requested_exit = true;
                 exit_notice = Some(format!(
@@ -2808,6 +2871,14 @@ fn resume_instructions(session_id: Uuid, active_elsewhere: bool) -> String {
         Default::default()
     };
     format!("{warning}Copy and paste the line below to resume:\nborg resume {session_id}")
+}
+
+fn should_detach_on_terminal_hangup(signal: &str, status: SessionStatus) -> bool {
+    signal == "SIGHUP"
+        && matches!(
+            status,
+            SessionStatus::Starting | SessionStatus::Running | SessionStatus::WaitingForApproval
+        )
 }
 
 fn repeated_ctrl_c(last: &mut Option<std::time::Instant>, now: std::time::Instant) -> bool {
@@ -3177,7 +3248,7 @@ async fn load_subagent_thread_state(
     let team_snapshots = latest_subagent_snapshots(&team_history);
     let mut child_histories = HashMap::new();
     for agent in &team_snapshots {
-        match store.read(agent.session_id).await {
+        match child_authored_history(store, agent.session_id).await {
             Ok(events) => {
                 child_histories.insert(agent.session_id, events);
             }
@@ -3220,6 +3291,19 @@ async fn load_subagent_thread_state(
         }
     }
     Ok((team_history, team_snapshots, child_histories))
+}
+
+/// Return only the child's authored events for presentation. Forked session
+/// storage can project a director prefix into a child session so the provider
+/// retains its execution context, but that prefix must not be shown as if it
+/// were the child's conversation. The child composer still receives the
+/// director's task through the child session's own initial prompt.
+async fn child_authored_history(
+    store: &dyn SessionStore,
+    child_id: Uuid,
+) -> Result<Vec<SessionEvent>> {
+    let inherited = store.inherited_event_count(child_id).await?;
+    store.events_after(child_id, inherited, usize::MAX).await
 }
 
 async fn recent_sessions_summary(
@@ -3389,6 +3473,11 @@ async fn recv_terminal_event(
     }
 }
 
+fn agent_config_file_signature(path: Option<&Path>) -> Option<(std::time::SystemTime, u64)> {
+    let metadata = fs::metadata(path?).ok()?;
+    Some((metadata.modified().ok()?, metadata.len()))
+}
+
 fn idle_input(line: &str) -> (PromptDelivery, String) {
     if let Some(text) = line.strip_prefix("/queue ") {
         return (PromptDelivery::Queue, text.trim().to_string());
@@ -3420,16 +3509,20 @@ fn running_input(
         );
     }
     (
-        if (matches!(provider, CodingProvider::Codex | CodingProvider::Claude)
-            || provider.uses_native_harness())
-            && steer_active_turn
-        {
-            PromptDelivery::Steer
-        } else {
-            PromptDelivery::Queue
-        },
+        default_active_delivery(provider, steer_active_turn),
         line.to_string(),
     )
+}
+
+fn default_active_delivery(provider: CodingProvider, steer_active_turn: bool) -> PromptDelivery {
+    if steer_active_turn
+        && (matches!(provider, CodingProvider::Codex | CodingProvider::Claude)
+            || provider.uses_native_harness())
+    {
+        PromptDelivery::Steer
+    } else {
+        PromptDelivery::Queue
+    }
 }
 
 async fn session_id_if_present(
@@ -4116,6 +4209,45 @@ mod tests {
         assert_eq!(975 + RICH_TUI_HISTORY_PAGE_SIZE as u64, 1_999);
     }
 
+    #[tokio::test]
+    async fn child_history_excludes_fork_inherited_director_events() {
+        let directory = tempdir().expect("tempdir");
+        let store = SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
+            .await
+            .expect("session store");
+        let parent = Uuid::new_v4();
+        let child = Uuid::new_v4();
+        store.create_session(parent).await.expect("parent");
+        store
+            .append(SessionEvent::new(
+                parent,
+                0,
+                SessionEventKind::SessionStarted,
+            ))
+            .await
+            .expect("director event");
+        store.fork_before(parent, child, 2).await.expect("fork");
+        store
+            .append(SessionEvent::new(
+                child,
+                0,
+                SessionEventKind::Error {
+                    message: "child authored event".to_string(),
+                },
+            ))
+            .await
+            .expect("child event");
+
+        let history = child_authored_history(&store, child)
+            .await
+            .expect("authored history");
+        assert_eq!(history.len(), 1);
+        assert!(matches!(
+            history[0].kind,
+            SessionEventKind::Error { ref message } if message == "child authored event"
+        ));
+    }
+
     #[test]
     fn reinstalling_the_remote_host_restarts_it_on_the_new_binary() {
         assert_eq!(
@@ -4321,6 +4453,26 @@ mod tests {
                 .to_string()
                 .contains("Interrupt the current turn")
         );
+    }
+
+    #[test]
+    fn active_session_survives_terminal_hangup_but_idle_session_stops() {
+        assert!(should_detach_on_terminal_hangup(
+            "SIGHUP",
+            SessionStatus::Running
+        ));
+        assert!(should_detach_on_terminal_hangup(
+            "SIGHUP",
+            SessionStatus::WaitingForApproval
+        ));
+        assert!(!should_detach_on_terminal_hangup(
+            "SIGHUP",
+            SessionStatus::Ready
+        ));
+        assert!(!should_detach_on_terminal_hangup(
+            "SIGTERM",
+            SessionStatus::Running
+        ));
     }
 
     #[test]

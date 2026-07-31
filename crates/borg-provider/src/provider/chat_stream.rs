@@ -16,6 +16,7 @@ use tokio::sync::mpsc;
 use super::codex_app_server::CodexAppServerClient;
 #[cfg(test)]
 use super::codex_app_server::JsonRpcMessage;
+mod claude_native;
 mod claude_stream;
 mod codex_items;
 mod codex_stream;
@@ -294,9 +295,14 @@ fn run_claude_stream(
 ) -> mpsc::Receiver<ChatStreamEvent> {
     let (tx, rx) = mpsc::channel::<ChatStreamEvent>(64);
     tokio::spawn(async move {
-        if let Err(err) =
+        // Native path talks to the `claude` binary directly; the sidecar path
+        // goes through packages/borg-claude-sdk. Both emit identical events.
+        let result = if claude_native::native_enabled() {
+            claude_native::run(req, tx.clone(), control_rx, local_auth, permission).await
+        } else {
             run_claude_sdk_inner(req, tx.clone(), control_rx, local_auth, permission).await
-        {
+        };
+        if let Err(err) = result {
             let _ = tx
                 .send(ChatStreamEvent::Failed {
                     error: format!("{err:#}"),
@@ -2399,6 +2405,155 @@ for await (const line of createInterface({ input: process.stdin })) {
             phases[1].1.get("status").and_then(Value::as_str),
             Some("completed")
         );
+    }
+
+    #[test]
+    fn codex_and_claude_normalize_mcp_tool_lifecycle_identically() {
+        let (codex_tx, mut codex_rx) = mpsc::channel(16);
+        let mut codex = CodexStreamMapper::default();
+        for message in [
+            JsonRpcMessage {
+                id: None,
+                method: Some("item/started".to_string()),
+                message: None,
+                result: None,
+                error: None,
+                params: Some(json!({
+                    "item": {
+                        "type": "mcpToolCall",
+                        "id": "tool-1",
+                        "serverName": "borg",
+                        "toolName": "read_file",
+                        "input": {"path": "README.md"}
+                    }
+                })),
+            },
+            JsonRpcMessage {
+                id: None,
+                method: Some("item/completed".to_string()),
+                message: None,
+                result: None,
+                error: None,
+                params: Some(json!({
+                    "item": {
+                        "type": "mcpToolCall",
+                        "id": "tool-1",
+                        "serverName": "borg",
+                        "toolName": "read_file",
+                        "input": {"path": "README.md"},
+                        "output": "contents"
+                    }
+                })),
+            },
+        ] {
+            codex.handle(&message, &codex_tx).unwrap();
+        }
+        drop(codex_tx);
+        let codex_events = {
+            let mut events = Vec::new();
+            while let Ok(event) = codex_rx.try_recv() {
+                if !matches!(event, ChatStreamEvent::ProviderEvent { .. }) {
+                    events.push(event);
+                }
+            }
+            events
+        };
+
+        let claude_events = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (claude_tx, mut claude_rx) = mpsc::channel(16);
+                let mut claude = ClaudeStreamState::default();
+                claude
+                    .handle_message(
+                        &json!({
+                            "type": "assistant",
+                            "message": {"content": [{
+                                "type": "tool_use",
+                                "id": "tool-1",
+                                "name": "mcp__borg__read_file",
+                                "input": {"path": "README.md"}
+                            }]}
+                        }),
+                        &claude_tx,
+                    )
+                    .await
+                    .unwrap();
+                claude
+                    .handle_message(
+                        &json!({
+                            "type": "user",
+                            "message": {"content": [{
+                                "type": "tool_result",
+                                "tool_use_id": "tool-1",
+                                "content": "contents",
+                                "is_error": false
+                            }]}
+                        }),
+                        &claude_tx,
+                    )
+                    .await
+                    .unwrap();
+                drop(claude_tx);
+                let mut events = Vec::new();
+                while let Ok(event) = claude_rx.try_recv() {
+                    events.push(event);
+                }
+                events
+            });
+
+        assert!(
+            matches!(codex_events.first(), Some(ChatStreamEvent::ToolCall { id, name, input }) if id == "tool-1" && name == "mcp__borg__read_file" && input["path"] == "README.md")
+        );
+        assert!(
+            matches!(claude_events.first(), Some(ChatStreamEvent::ToolCall { id, name, input }) if id == "tool-1" && name == "mcp__borg__read_file" && input["path"] == "README.md")
+        );
+        assert!(
+            matches!(codex_events.get(1), Some(ChatStreamEvent::ToolResult { tool_use_id, output, is_error: false, .. }) if tool_use_id == "tool-1" && output == "contents")
+        );
+        assert!(
+            matches!(claude_events.get(1), Some(ChatStreamEvent::ToolResult { tool_use_id, output, is_error: false, .. }) if tool_use_id == "tool-1" && output == "contents")
+        );
+    }
+
+    #[test]
+    fn codex_and_claude_usage_maps_share_billing_buckets() {
+        let claude = super::super::extract_claude_usage(&json!({
+            "usage": {
+                "input_tokens": 12,
+                "cache_read_input_tokens": 3,
+                "cache_creation_input_tokens": 2,
+                "output_tokens": 4
+            },
+            "duration_ms": 23
+        }));
+        let codex = codex_turn_usage(
+            Some(&super::super::TokenUsage {
+                input_tokens: 17,
+                cached_input_tokens: 3,
+                cache_write_input_tokens: 2,
+                output_tokens: 4,
+                total_tokens: 21,
+                ..Default::default()
+            }),
+            None,
+            None,
+            None,
+            23,
+        )
+        .expect("Codex usage");
+
+        assert_eq!(claude.duration_ms, codex.duration_ms);
+        assert_eq!(claude.input_tokens, codex.input_tokens);
+        assert_eq!(claude.cached_input_tokens, codex.cached_input_tokens);
+        assert_eq!(
+            claude.cache_creation_input_tokens,
+            codex.cache_creation_input_tokens
+        );
+        assert_eq!(claude.output_tokens, codex.output_tokens);
+        assert_eq!(claude.total_tokens, codex.total_tokens);
     }
 
     #[test]

@@ -4,6 +4,7 @@ set -euo pipefail
 test_root="$(mktemp -d "${TMPDIR:-/tmp}/borg-release-tests.XXXXXX")"
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 release_script="$script_dir/release.sh"
+repo_root="$(cd -- "$script_dir/.." && pwd)"
 
 cleanup() {
   local status="$?"
@@ -17,6 +18,20 @@ fail() {
   echo "release test: $*" >&2
   exit 1
 }
+
+# Keep the tag workflow aligned with the binary-only Borg package and the
+# provider-parity gate. Fixture copies used below do not contain workflows, so
+# only enforce this contract when running from the real checkout.
+if [[ -f "$repo_root/.github/workflows/release.yml" ]]; then
+  release_workflow="$repo_root/.github/workflows/release.yml"
+  if grep -Eq -- 'cargo test.*-p borg --lib' "$release_workflow"; then
+    fail "release workflow still invokes --lib for the binary-only borg package"
+  fi
+  grep -Fq 'provider-parity:' "$release_workflow" ||
+    fail "release workflow is missing the provider-parity gate"
+  grep -Fq 'needs: [validate, provider-parity]' "$release_workflow" ||
+    fail "release build does not depend on provider parity"
+fi
 
 assert_equal() {
   local expected="$1"

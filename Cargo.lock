@@ -513,6 +513,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
+ "toml",
  "tracing",
  "ts-rs",
  "url",

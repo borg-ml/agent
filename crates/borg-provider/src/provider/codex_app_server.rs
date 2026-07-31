@@ -46,6 +46,7 @@ pub struct CodexAppServerClient {
     workspace_id: Option<String>,
     network_access: bool,
     web_search_allowed: bool,
+    deferred_notifications: Vec<JsonRpcMessage>,
     _shell_env: crate::shell_env::CleanShellEnv,
     _managed_codex_home: Option<tempfile::TempDir>,
 }
@@ -197,6 +198,7 @@ impl CodexAppServerClient {
             workspace_id: None,
             network_access,
             web_search_allowed,
+            deferred_notifications: Vec::new(),
             _shell_env: shell_env,
             _managed_codex_home: managed_codex_home,
         };
@@ -741,6 +743,11 @@ impl CodexAppServerClient {
                         }
                         Err(err) => {
                             let _ = ack.send(Err(format!("{err:#}")));
+                            if let Some(result) =
+                                self.drain_deferred_notifications(state, on_notification)?
+                            {
+                                return Ok(Some(result));
+                            }
                         }
                     }
                 }
@@ -757,8 +764,37 @@ impl CodexAppServerClient {
                         "threadId": workspace_id,
                         "turnId": turn_id,
                     });
-                    let (_response, notifications) =
-                        self.send_request_inner("turn/interrupt", Some(params), true)?;
+                    let (_, notifications) =
+                        match self.send_request_inner("turn/interrupt", Some(params), true) {
+                            Ok(result) => result,
+                            Err(error) if expected_inactive_turn_interrupt(&error) => {
+                                // The provider can finish between the session actor
+                                // receiving Interrupt and this request reaching the
+                                // app-server. In that race there is no active turn
+                                // left to interrupt; ending this stream is the
+                                // correct idempotent result, not a provider failure.
+                                tracing::debug!(
+                                    %error,
+                                    turn_id,
+                                    "Codex turn was already inactive when interrupt arrived"
+                                );
+                                if let Some(result) =
+                                    self.drain_deferred_notifications(state, on_notification)?
+                                {
+                                    return Ok(Some(result));
+                                }
+                                return Ok(Some(TurnResult {
+                                    workspace_id: state.workspace_id.clone(),
+                                    output_text: state.output_text.clone(),
+                                    reasoning_text: state.reasoning_text.clone(),
+                                    raw_notifications: state.raw_notifications.clone(),
+                                    turn_token_usage: state.turn_token_usage.clone(),
+                                    total_token_usage: state.total_token_usage.clone(),
+                                    model_context_window: state.model_context_window,
+                                }));
+                            }
+                            Err(error) => return Err(error),
+                        };
                     for msg in notifications {
                         if let Some(result) = state.handle_message(msg, on_notification)? {
                             return Ok(Some(result));
@@ -767,6 +803,23 @@ impl CodexAppServerClient {
                 }
             }
         }
+    }
+
+    fn drain_deferred_notifications<F>(
+        &mut self,
+        state: &mut TurnState,
+        on_notification: &mut F,
+    ) -> Result<Option<TurnResult>>
+    where
+        F: FnMut(&JsonRpcMessage) -> Result<()>,
+    {
+        let notifications = std::mem::take(&mut self.deferred_notifications);
+        for message in notifications {
+            if let Some(result) = state.handle_message(message, on_notification)? {
+                return Ok(Some(result));
+            }
+        }
+        Ok(None)
     }
 
     pub fn shutdown(&mut self) -> Result<()> {
@@ -818,6 +871,9 @@ impl CodexAppServerClient {
             let msg = self.read_message()?;
             if msg.id == Some(id) {
                 if let Some(error) = msg.error {
+                    if collect_notifications && matches!(method, "turn/interrupt" | "turn/steer") {
+                        self.deferred_notifications.extend(notifications);
+                    }
                     // Preserve the structured JSON-RPC error so callers can
                     // classify rate-limit / overload / auth without string
                     // matching. The wrapper's classifier looks for
@@ -1399,6 +1455,13 @@ fn codex_error_message(message: &JsonRpcMessage) -> String {
     "codex app-server emitted an error notification".to_string()
 }
 
+fn expected_inactive_turn_interrupt(error: &anyhow::Error) -> bool {
+    let text = error.to_string().to_ascii_lowercase();
+    text.contains("codex app-server error for turn/interrupt")
+        && text.contains("\"code\":-32600")
+        && text.contains("expected active turn id")
+}
+
 fn error_value_text(value: &Value) -> Option<String> {
     if let Some(text) = value.as_str().filter(|text| !text.trim().is_empty()) {
         return Some(text.to_string());
@@ -1585,6 +1648,19 @@ mod tests {
         .expect_err("five-hour bucket must not be presented as weekly");
 
         assert!(error.to_string().contains("seven-day"));
+    }
+
+    #[test]
+    fn an_interrupt_for_a_turn_that_already_finished_is_idempotent() {
+        let race = anyhow::anyhow!(
+            "codex app-server error for turn/interrupt: {{\"code\":-32600,\"message\":\"expected active turn id\"}}"
+        );
+        assert!(expected_inactive_turn_interrupt(&race));
+
+        let unrelated = anyhow::anyhow!(
+            "codex app-server error for turn/interrupt: {{\"code\":-32000,\"message\":\"permission denied\"}}"
+        );
+        assert!(!expected_inactive_turn_interrupt(&unrelated));
     }
 
     fn test_turn_state() -> TurnState {

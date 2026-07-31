@@ -43,7 +43,7 @@ pub(crate) struct TeamConfig {
 }
 
 /// Provider-neutral feature switches for optional Borg subsystems.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct CapabilityConfig {
     pub(crate) multiplayer: bool,
@@ -143,7 +143,7 @@ impl Default for McpServerConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct KeybindingConfig {
     pub(crate) send: Vec<String>,
@@ -195,8 +195,12 @@ pub(crate) struct ApprovalConfig {
 }
 
 impl AgentConfig {
+    pub(crate) fn path(explicit: Option<&Path>) -> Option<PathBuf> {
+        explicit.map(Path::to_path_buf).or_else(default_path)
+    }
+
     pub(crate) fn load(explicit: Option<&Path>) -> Result<Self> {
-        let path = explicit.map(Path::to_path_buf).or_else(default_path);
+        let path = Self::path(explicit);
         let Some(path) = path else {
             return Ok(Self::default());
         };
