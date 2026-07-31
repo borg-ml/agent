@@ -2962,6 +2962,11 @@ async fn recent_session_ids(sessions_dir: &Path, store: &SqliteSessionStore) -> 
                 continue;
             };
             if let Err(error) = store.import_jsonl(&path).await {
+                #[cfg(test)]
+                eprintln!(
+                    "legacy session import failed for {session_id} at {}: {error:#}",
+                    path.display()
+                );
                 tracing::warn!(
                     %session_id,
                     path = %path.display(),
