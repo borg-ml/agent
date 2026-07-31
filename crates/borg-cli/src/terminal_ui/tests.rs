@@ -1296,6 +1296,20 @@ fn status_path_uses_fish_style_parent_abbreviations() {
 }
 
 #[test]
+fn footer_metadata_preserves_the_full_working_directory_path() {
+    let metadata = footer_metadata_text("94% context left", "~/borg-cli", 18);
+    assert_eq!(metadata, "94…  ·  ~/borg-cli");
+    assert!(
+        metadata.ends_with("~/borg-cli"),
+        "footer metadata must keep the complete path: {metadata}"
+    );
+    assert_eq!(
+        footer_metadata_text("", "~/a/very-long-directory", 8),
+        "~/a/very-long-directory"
+    );
+}
+
+#[test]
 fn completed_goal_crosses_out_only_its_objective() {
     let mut transcript = Transcript::default();
     let mut goal = SessionGoal::new("Ship the terminal polish".to_string(), None);

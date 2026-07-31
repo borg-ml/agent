@@ -33,6 +33,29 @@ if [[ -f "$repo_root/.github/workflows/release.yml" ]]; then
     fail "release build does not depend on provider parity"
 fi
 
+# Keep the manually dispatchable platform matrix honest even before a hosted
+# run is available. This guards the six requested native targets and the
+# binary-only test invocation against accidental workflow drift.
+if [[ -f "$repo_root/.github/workflows/platform-ci.yml" ]]; then
+  platform_workflow="$repo_root/.github/workflows/platform-ci.yml"
+  for target in \
+    x86_64-unknown-linux-gnu \
+    aarch64-unknown-linux-gnu \
+    x86_64-apple-darwin \
+    aarch64-apple-darwin \
+    x86_64-pc-windows-msvc \
+    aarch64-pc-windows-msvc
+  do
+    grep -Fq "target: $target" "$platform_workflow" ||
+      fail "platform workflow is missing native target $target"
+  done
+  grep -Fq 'cargo test --locked --target ${{ matrix.target }} -p borg --no-fail-fast' \
+    "$platform_workflow" ||
+    fail "platform workflow is missing the binary-only native test matrix"
+  grep -Fq 'provider-parity:' "$platform_workflow" ||
+    fail "platform workflow is missing the provider-parity job"
+fi
+
 assert_equal() {
   local expected="$1"
   local actual="$2"

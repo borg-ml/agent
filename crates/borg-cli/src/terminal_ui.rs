@@ -4282,21 +4282,16 @@ impl BorgTerminal {
                 );
             }
             if !is_launch_screen {
-                let footer_metadata = showing_primary_controls.then(|| {
-                    [
-                        (!context_status.is_empty()).then_some(context_status.as_str()),
-                        (!cwd_status.is_empty()).then_some(cwd_status.as_str()),
-                    ]
-                    .into_iter()
-                    .flatten()
-                    .collect::<Vec<_>>()
-                    .join("  ·  ")
-                });
-                let metadata_width = footer_metadata
+                let footer_metadata = showing_primary_controls
+                    .then(|| footer_metadata_text(&context_status, &cwd_status, usize::MAX))
+                    .filter(|value| !value.is_empty());
+                let desired_metadata_width = footer_metadata
                     .as_ref()
                     .map(|value| value.width() as u16)
-                    .filter(|width| *width + 3 < footer_area.width)
-                    .map(|width| width.min(footer_area.width / 2))
+                    .unwrap_or(0);
+                let metadata_width = footer_metadata
+                    .as_ref()
+                    .map(|_| desired_metadata_width.min(footer_area.width))
                     .unwrap_or(0);
                 let controls_area = Rect {
                     width: footer_area.width.saturating_sub(metadata_width),
@@ -4307,12 +4302,13 @@ impl BorgTerminal {
                         .style(Style::default().fg(Color::DarkGray).bg(COMMAND_PANEL_BG)),
                     controls_area,
                 );
-                if let Some(metadata) = footer_metadata.filter(|_| metadata_width > 0) {
+                if footer_metadata.is_some() && metadata_width > 0 {
                     frame.render_widget(
                         Paragraph::new(Line::from(Span::styled(
-                            truncate_table_cell(
-                                &metadata,
-                                metadata_width.saturating_sub(2) as usize,
+                            footer_metadata_text(
+                                &context_status,
+                                &cwd_status,
+                                metadata_width as usize,
                             ),
                             Style::default().fg(if context_imminent {
                                 Color::Yellow
@@ -8813,6 +8809,38 @@ fn centered_content_area(area: Rect) -> Rect {
         width,
         height: area.height,
     }
+}
+
+/// Keep the working directory readable in the footer. Context telemetry is
+/// the expendable part of this compact line; the path is always appended in
+/// full so it never receives an ellipsis or loses its final directory name.
+fn footer_metadata_text(context_status: &str, cwd_status: &str, max_width: usize) -> String {
+    let context_status = context_status.trim();
+    let cwd_status = cwd_status.trim();
+    if cwd_status.is_empty() {
+        return truncate_table_cell(context_status, max_width);
+    }
+    if context_status.is_empty() {
+        return cwd_status.to_string();
+    }
+    let separator = "  ·  ";
+    let cwd_width = cwd_status.width();
+    let separator_width = separator.width();
+    let context_width = context_status.width();
+    let required_width = context_width
+        .saturating_add(separator_width)
+        .saturating_add(cwd_width);
+    if required_width <= max_width {
+        return format!("{context_status}{separator}{cwd_status}");
+    }
+    if cwd_width.saturating_add(separator_width) > max_width {
+        return cwd_status.to_string();
+    }
+    let context_width = max_width.saturating_sub(cwd_width + separator_width);
+    format!(
+        "{}{separator}{cwd_status}",
+        truncate_table_cell(context_status, context_width)
+    )
 }
 
 fn tool_run_viewport_height(viewport_height: usize) -> usize {
