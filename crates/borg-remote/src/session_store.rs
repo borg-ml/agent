@@ -2161,6 +2161,7 @@ async fn preserve_journal_backup(path: &Path, bytes: &[u8], fingerprint: &str) -
         .open(&temporary)
         .await?;
     file.sync_all().await?;
+    drop(file);
     tokio::fs::rename(&temporary, &backup_path)
         .await
         .with_context(|| {

@@ -1286,14 +1286,17 @@ fn status_path_uses_fish_style_parent_abbreviations() {
             Path::new("/srv/workspace"),
             Some(Path::new("/home/shulgin"))
         ),
-        "/s/workspace"
+        format!("{separator}s{separator}workspace")
     );
-    assert_eq!(fish_style_path(Path::new("/workspace")), "/workspace");
+    assert_eq!(
+        fish_style_path(Path::new("/workspace")),
+        format!("{separator}workspace")
+    );
     assert_eq!(
         fish_style_path(Path::new("projects/borg-cli")),
-        "p/borg-cli"
+        format!("p{separator}borg-cli")
     );
-    assert_eq!(fish_style_path(Path::new("/")), "/");
+    assert_eq!(fish_style_path(Path::new("/")), separator.to_string());
 }
 
 #[test]
