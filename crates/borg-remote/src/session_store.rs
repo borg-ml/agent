@@ -2158,9 +2158,15 @@ async fn preserve_journal_backup(path: &Path, bytes: &[u8], fingerprint: &str) -
         .with_context(|| format!("failed to write backup {}", temporary.display()))?;
     let file = tokio::fs::OpenOptions::new()
         .read(true)
+        // Windows requires write access for FlushFileBuffers, which backs
+        // `sync_all`; keep the handle writable even though the bytes were
+        // already written by the preceding operation.
+        .write(true)
         .open(&temporary)
         .await?;
-    file.sync_all().await?;
+    file.sync_all()
+        .await
+        .with_context(|| format!("failed to flush backup {}", temporary.display()))?;
     drop(file);
     tokio::fs::rename(&temporary, &backup_path)
         .await
