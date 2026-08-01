@@ -381,6 +381,134 @@ impl CodexAppServerClient {
         working_directory: &str,
         permission: LocalAgentPermission,
     ) -> Result<String> {
+        self.thread_resume_request(
+            thread_id,
+            developer_instructions,
+            model,
+            reasoning_effort,
+            mcp_config_path,
+            fast,
+            working_directory,
+            permission,
+        )
+        .map(|(workspace_id, _)| workspace_id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn thread_resume_with_permission_streaming<F>(
+        &mut self,
+        thread_id: &str,
+        developer_instructions: &str,
+        model: Option<&str>,
+        reasoning_effort: Option<&str>,
+        mcp_config_path: Option<&str>,
+        fast: bool,
+        working_directory: &str,
+        permission: LocalAgentPermission,
+        output_schema_requested: bool,
+        mut on_notification: F,
+    ) -> Result<(String, Option<TurnResult>)>
+    where
+        F: FnMut(&JsonRpcMessage) -> Result<()>,
+    {
+        let params = self.thread_resume_params(
+            thread_id,
+            developer_instructions,
+            model,
+            reasoning_effort,
+            mcp_config_path,
+            fast,
+            working_directory,
+            permission,
+        );
+        let mut resumed_turn: Option<TurnState> = None;
+        let mut completed_turn: Option<TurnResult> = None;
+        let (response, _) = self.send_request_inner_with_timeout_observing(
+            "thread/resume",
+            Some(params),
+            false,
+            REQUEST_TIMEOUT,
+            |message| {
+                on_notification(message)?;
+                if completed_turn.is_some() {
+                    return Ok(());
+                }
+                let Some(turn_id) = notification_turn_id(message) else {
+                    return Ok(());
+                };
+                let state = resumed_turn.get_or_insert_with(|| {
+                    TurnState::new(
+                        thread_id.to_string(),
+                        turn_id.to_string(),
+                        output_schema_requested,
+                    )
+                });
+                if state.turn_id != turn_id {
+                    return Ok(());
+                }
+                if let Some(result) = state.handle_message(message.clone(), &mut |_| Ok(()))? {
+                    completed_turn = Some(result);
+                }
+                Ok(())
+            },
+        )?;
+        validate_reasoning_effort(&response, reasoning_effort)?;
+        let workspace_id = response
+            .get("threadId")
+            .and_then(Value::as_str)
+            .or_else(|| response.pointer("/thread/id").and_then(Value::as_str))
+            .unwrap_or(thread_id)
+            .to_string();
+        self.workspace_id = Some(workspace_id.clone());
+        Ok((workspace_id, completed_turn))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn thread_resume_request(
+        &mut self,
+        thread_id: &str,
+        developer_instructions: &str,
+        model: Option<&str>,
+        reasoning_effort: Option<&str>,
+        mcp_config_path: Option<&str>,
+        fast: bool,
+        working_directory: &str,
+        permission: LocalAgentPermission,
+    ) -> Result<(String, Option<TurnResult>)> {
+        let params = self.thread_resume_params(
+            thread_id,
+            developer_instructions,
+            model,
+            reasoning_effort,
+            mcp_config_path,
+            fast,
+            working_directory,
+            permission,
+        );
+        let response = self.send_request("thread/resume", Some(params))?;
+        validate_reasoning_effort(&response, reasoning_effort)?;
+        let workspace_id = response
+            .get("threadId")
+            .and_then(Value::as_str)
+            .or_else(|| response.pointer("/thread/id").and_then(Value::as_str))
+            .unwrap_or(thread_id)
+            .to_string();
+        self.workspace_id = Some(workspace_id.clone());
+        Ok((workspace_id, None))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn thread_resume_params(
+        &self,
+        thread_id: &str,
+        developer_instructions: &str,
+        model: Option<&str>,
+        reasoning_effort: Option<&str>,
+        mcp_config_path: Option<&str>,
+        fast: bool,
+        working_directory: &str,
+        permission: LocalAgentPermission,
+    ) -> Value {
         let (approval_policy, sandbox, sandbox_policy, approvals_reviewer) =
             permission.codex_policy();
         let mut params = serde_json::json!({
@@ -405,17 +533,7 @@ impl CodexAppServerClient {
             params["serviceTier"] = Value::String("fast".to_string());
         }
         inject_mcp_servers_config(&mut params, mcp_config_path);
-
-        let response = self.send_request("thread/resume", Some(params))?;
-        validate_reasoning_effort(&response, reasoning_effort)?;
-        let workspace_id = response
-            .get("threadId")
-            .and_then(Value::as_str)
-            .or_else(|| response.pointer("/thread/id").and_then(Value::as_str))
-            .unwrap_or(thread_id)
-            .to_string();
-        self.workspace_id = Some(workspace_id.clone());
-        Ok(workspace_id)
+        params
     }
 
     pub fn thread_compact(&mut self, thread_id: &str) -> Result<()> {
@@ -513,20 +631,11 @@ impl CodexAppServerClient {
         let turn_id = extract_turn_id(&turn_start_result)
             .context("Codex turn/start response did not include an active turn id")?;
 
-        let mut state = TurnState {
-            workspace_id: workspace_id.clone(),
-            turn_id: turn_id.clone(),
-            output_text: String::new(),
-            reasoning_text: String::new(),
-            raw_notifications: Vec::new(),
-            turn_token_usage: None,
-            total_token_usage: None,
-            model_context_window: None,
-            agent_message_text: HashMap::new(),
-            emitted_agent_message_ids: HashSet::new(),
-            emitted_any_agent_message: false,
-            output_schema_requested: output_schema.is_some(),
-        };
+        let mut state = TurnState::new(
+            workspace_id.clone(),
+            turn_id.clone(),
+            output_schema.is_some(),
+        );
 
         for msg in early_notifications {
             if let Some(result) = state.handle_message(msg, &mut on_notification)? {
@@ -959,6 +1068,26 @@ impl CodexAppServerClient {
         collect_notifications: bool,
         timeout: Duration,
     ) -> Result<(Value, Vec<JsonRpcMessage>)> {
+        self.send_request_inner_with_timeout_observing(
+            method,
+            params,
+            collect_notifications,
+            timeout,
+            |_| Ok(()),
+        )
+    }
+
+    fn send_request_inner_with_timeout_observing<F>(
+        &mut self,
+        method: &str,
+        params: Option<Value>,
+        collect_notifications: bool,
+        timeout: Duration,
+        mut observe_notification: F,
+    ) -> Result<(Value, Vec<JsonRpcMessage>)>
+    where
+        F: FnMut(&JsonRpcMessage) -> Result<()>,
+    {
         self.ensure_not_cancelled()?;
         let id = self.next_id;
         self.next_id += 1;
@@ -1012,6 +1141,7 @@ impl CodexAppServerClient {
                         format!("Borg does not provide the optional host service {server_method}"),
                     )?;
                 }
+                observe_notification(&msg)?;
                 if collect_notifications {
                     notifications.push(msg);
                 }
@@ -1037,6 +1167,7 @@ impl CodexAppServerClient {
                 self.quarantine_response(msg, method, id);
                 continue;
             }
+            observe_notification(&msg)?;
             if collect_notifications {
                 notifications.push(msg);
             }
@@ -1373,6 +1504,23 @@ struct TurnState {
 }
 
 impl TurnState {
+    fn new(workspace_id: String, turn_id: String, output_schema_requested: bool) -> Self {
+        Self {
+            workspace_id,
+            turn_id,
+            output_text: String::new(),
+            reasoning_text: String::new(),
+            raw_notifications: Vec::new(),
+            turn_token_usage: None,
+            total_token_usage: None,
+            model_context_window: None,
+            agent_message_text: HashMap::new(),
+            emitted_agent_message_ids: HashSet::new(),
+            emitted_any_agent_message: false,
+            output_schema_requested,
+        }
+    }
+
     fn accepts_message(&self, message: &JsonRpcMessage) -> bool {
         match notification_turn_id(message) {
             Some(turn_id) => turn_id == self.turn_id,
@@ -1799,6 +1947,52 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"matched":true}}'"#,
             .expect_err("unterminated frame must time out");
 
         assert!(error.to_string().contains("timed out after 25 ms"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resume_streams_notifications_from_the_resume_request() {
+        let mut client = scripted_client(
+            r#"read request
+printf '%s\n' '{"jsonrpc":"2.0","method":"turn/started","params":{"turn":{"id":"turn-1"}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"item/reasoning/summaryTextDelta","params":{"turnId":"turn-1","delta":"thinking"}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"turnId":"turn-1","itemId":"message-1","delta":"reply"}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"turnId":"turn-1","status":"completed"}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"threadId":"thread-1"}}'"#,
+        );
+        let mut seen = Vec::new();
+
+        let (workspace_id, result) = client
+            .thread_resume_with_permission_streaming(
+                "thread-1",
+                "",
+                None,
+                None,
+                None,
+                false,
+                "/tmp",
+                LocalAgentPermission::FullAccess,
+                false,
+                |message| {
+                    seen.push(message.method.clone().unwrap_or_default());
+                    Ok(())
+                },
+            )
+            .expect("resume response");
+
+        assert_eq!(workspace_id, "thread-1");
+        let result = result.expect("resumed turn result");
+        assert_eq!(result.output_text, "reply");
+        assert_eq!(result.reasoning_text, "thinking");
+        assert_eq!(
+            seen,
+            [
+                "turn/started",
+                "item/reasoning/summaryTextDelta",
+                "item/agentMessage/delta",
+                "turn/completed",
+            ]
+        );
     }
 
     #[cfg(unix)]

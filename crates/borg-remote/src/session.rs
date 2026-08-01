@@ -3203,11 +3203,21 @@ async fn record_subagent_activity(
     subagents: &SubagentCoordinator,
     activity: SubagentActivity,
 ) -> Result<()> {
+    // A child's assistant message is a mutable live projection until its
+    // Complete boundary. Marking the first in-progress snapshot as projected
+    // suppresses every later snapshot with the same ID, including the durable
+    // complete message. Only terminal reports participate in root-inbox
+    // deduplication.
     let projected_message_id = match &activity {
         SubagentActivity::SessionEvent {
             event:
                 SessionEvent {
-                    kind: SessionEventKind::Message { message_id, .. },
+                    kind:
+                        SessionEventKind::Message {
+                            message_id,
+                            status: MessageStatus::Complete,
+                            ..
+                        },
                     ..
                 },
             ..
@@ -7452,7 +7462,7 @@ mod tests {
 
         let store: Arc<dyn SessionStore> = sqlite;
         let mut journal = RuntimeSessionStore::new(store, Vec::new());
-        let (events, mut event_rx) = mpsc::channel(2);
+        let (events, mut event_rx) = mpsc::channel(4);
         let child_event = SessionEvent::new(
             child_id,
             7,
@@ -7493,5 +7503,83 @@ mod tests {
                 } if tool_call_id == "call-1" && name == "exec"
             )
         ));
+
+        let message_id = Uuid::new_v4();
+        let child_message = |sequence, text: &str, status| SubagentActivity::SessionEvent {
+            parent_session_id: parent_id,
+            task_name: "/root/worker".to_string(),
+            event: SessionEvent::new(
+                child_id,
+                sequence,
+                SessionEventKind::Message {
+                    message_id,
+                    actor: EventActor::Assistant,
+                    text: text.to_string(),
+                    attachments: Vec::new(),
+                    status,
+                    delivery: None,
+                },
+            ),
+        };
+        record_subagent_activity(
+            &mut journal,
+            &events,
+            parent_id,
+            &coordinator,
+            child_message(0, "I", MessageStatus::InProgress),
+        )
+        .await
+        .unwrap();
+        record_subagent_activity(
+            &mut journal,
+            &events,
+            parent_id,
+            &coordinator,
+            child_message(8, "I am complete", MessageStatus::Complete),
+        )
+        .await
+        .unwrap();
+
+        let partial = event_rx.recv().await.unwrap();
+        let complete = event_rx.recv().await.unwrap();
+        assert!(matches!(
+            partial.kind,
+            SessionEventKind::SubagentActivity {
+                event: Some(child_event),
+                ..
+            } if matches!(
+                child_event.kind,
+                SessionEventKind::Message {
+                    ref text,
+                    status: MessageStatus::InProgress,
+                    ..
+                } if text == "I"
+            )
+        ));
+        assert!(matches!(
+            complete.kind,
+            SessionEventKind::SubagentActivity {
+                event: Some(child_event),
+                ..
+            } if matches!(
+                child_event.kind,
+                SessionEventKind::Message {
+                    ref text,
+                    status: MessageStatus::Complete,
+                    ..
+                } if text == "I am complete"
+            )
+        ));
+
+        record_subagent_activity(
+            &mut journal,
+            &events,
+            parent_id,
+            &coordinator,
+            child_message(8, "I am complete", MessageStatus::Complete),
+        )
+        .await
+        .unwrap();
+        assert!(event_rx.try_recv().is_err());
     }
 }

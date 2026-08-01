@@ -42,7 +42,8 @@ pub use host::{
 pub use journal::{SessionJournal, SessionWriterLease};
 pub use local_control::{
     LocalSessionControlServer, local_session_owner_uses_current_binary, run_attached_session,
-    send_local_session_command, session_control_presence_socket_path, session_control_socket_path,
+    run_owned_session_projection, send_local_session_command, session_control_presence_socket_path,
+    session_control_socket_path,
 };
 pub use lsp::LspService;
 pub use orchestration::*;

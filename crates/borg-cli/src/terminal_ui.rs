@@ -69,6 +69,7 @@ const BORG_ORANGE: Color = Color::Rgb(255, 142, 36);
 const BORG_ORANGE_HOVER: Color = Color::Rgb(255, 184, 92);
 const RUNNING_STATUS_PEACH: Color = Color::Rgb(255, 132, 112);
 const SUBAGENT_PINK: Color = Color::Rgb(255, 105, 180);
+const SUBAGENT_PINK_HOVER: Color = Color::Rgb(255, 170, 215);
 const USER_LABEL_BLUE: Color = Color::Rgb(74, 163, 255);
 const USER_TEXT: Color = Color::Rgb(198, 228, 255);
 const MESSAGE_BG: Color = Color::Rgb(33, 25, 29);
@@ -556,6 +557,9 @@ pub struct BorgTerminal {
     transcript: Transcript,
     director_transcript: Option<Box<Transcript>>,
     child_transcripts: HashMap<Uuid, Transcript>,
+    child_unhydrated_events: HashMap<Uuid, Vec<SessionEvent>>,
+    hydrated_children: HashSet<Uuid>,
+    child_history_hydration_complete: bool,
     child_queued_prompts: HashMap<Uuid, Vec<PendingPromptProjection>>,
     child_statuses: HashMap<Uuid, SessionStatus>,
     child_pending_approvals: HashSet<Uuid>,
@@ -1376,6 +1380,9 @@ impl BorgTerminal {
             transcript: Transcript::default(),
             director_transcript: None,
             child_transcripts: HashMap::new(),
+            child_unhydrated_events: HashMap::new(),
+            hydrated_children: HashSet::new(),
+            child_history_hydration_complete: false,
             child_queued_prompts: HashMap::new(),
             child_statuses: HashMap::new(),
             child_pending_approvals: HashSet::new(),
@@ -1526,23 +1533,12 @@ impl BorgTerminal {
 
     pub fn replace_history(&mut self, events: &[SessionEvent]) {
         let previous_height = self.rendered_transcript_height;
-        let previous = &self.transcript;
-        let mut transcript = Transcript {
-            auto_expand_edits: previous.auto_expand_edits,
-            auto_expand_tools: previous.auto_expand_tools,
-            user_label: previous.user_label.clone(),
-            assistant_label: previous.assistant_label.clone(),
-            user_label_color: previous.user_label_color,
-            user_message_color: previous.user_message_color,
-            assistant_label_color: previous.assistant_label_color,
-            assistant_message_color: previous.assistant_message_color,
-            ..Transcript::default()
-        };
-        transcript.reserve_history(events.len());
-        for event in events {
-            transcript.apply(event);
-        }
-        self.transcript = transcript;
+        let replaced_displayed = replace_root_transcript_history(
+            &mut self.transcript,
+            &mut self.director_transcript,
+            self.focused_child.is_some(),
+            events,
+        );
         if let Some(sequence) = events
             .iter()
             .map(|event| event.sequence)
@@ -1550,6 +1546,9 @@ impl BorgTerminal {
             .max()
         {
             self.session_state_sequence = self.session_state_sequence.max(sequence);
+        }
+        if !replaced_displayed {
+            return;
         }
         self.text_selection = None;
         self.pending_scroll_anchor_height = Some(previous_height);
@@ -1561,6 +1560,10 @@ impl BorgTerminal {
     /// must never hydrate historical pages behind a user who is following the
     /// live tail.
     pub fn take_history_page_request(&mut self) -> bool {
+        if self.focused_child.is_some() {
+            self.history_page_requested = false;
+            return false;
+        }
         let viewport_height = self.transcript_viewport_area.map_or(12, |area| area.height);
         let should_load = should_load_history_page(
             self.history_page_requested,
@@ -1589,8 +1592,12 @@ impl BorgTerminal {
         if session_state_snapshot_is_stale(self.session_state_sequence, state) {
             return;
         }
-        self.transcript.seed_session_state(state);
-        self.transcript.reconcile_session_status(state);
+        let root_transcript = self
+            .director_transcript
+            .as_deref_mut()
+            .unwrap_or(&mut self.transcript);
+        root_transcript.seed_session_state(state);
+        root_transcript.reconcile_session_status(state);
         if let Some(status) = state.status {
             self.status = status;
         }
@@ -1870,9 +1877,18 @@ impl BorgTerminal {
         let child_id = agent.session_id;
         self.child_statuses
             .insert(child_id, subagent_session_status(agent.status));
+        if !self.hydrated_children.contains(&child_id) && self.child_history_hydration_complete {
+            self.hydrated_children.insert(child_id);
+        }
         let Some(child_event) = child_event else {
             return false;
         };
+        if !self.hydrated_children.contains(&child_id) {
+            self.child_unhydrated_events
+                .entry(child_id)
+                .or_default()
+                .push(child_event.as_ref().clone());
+        }
         if let SessionEventKind::StatusChanged { status, .. } = child_event.kind {
             self.child_statuses.insert(child_id, status);
         }
@@ -1975,15 +1991,27 @@ impl BorgTerminal {
         let was_replaying = self.replaying_history;
         self.replaying_history = true;
         // The root journal may contain a recent nested copy of these events.
-        // The child's own journal is authoritative for its full thread, so
-        // replace that partial projection instead of appending duplicates.
-        self.child_transcripts
-            .insert(child_id, Transcript::default());
-        self.child_transcript_mut(child_id)
-            .show_director_context_boundary();
+        // Merge anything that arrived while the child query was in flight,
+        // then atomically replace whichever projection is currently holding
+        // this child (including the focused transcript).
+        let buffered = self
+            .child_unhydrated_events
+            .remove(&child_id)
+            .unwrap_or_default();
+        let events = merge_child_history(events, buffered);
+        let previous = if self.focused_child == Some(child_id) {
+            &self.transcript
+        } else {
+            self.child_transcripts
+                .get(&child_id)
+                .unwrap_or(&self.transcript)
+        };
+        let mut transcript = fresh_transcript_like(previous);
+        transcript.show_director_context_boundary();
+        transcript.reserve_history(events.len());
         self.child_queued_prompts.remove(&child_id);
         self.child_pending_approvals.remove(&child_id);
-        for event in events {
+        for event in &events {
             if let SessionEventKind::StatusChanged { status, .. } = event.kind {
                 self.child_statuses.insert(child_id, status);
             }
@@ -2000,12 +2028,27 @@ impl BorgTerminal {
                 }
                 _ => {}
             }
-            self.child_transcripts
-                .entry(child_id)
-                .or_default()
-                .apply(event);
+            transcript.apply(event);
         }
+        if self.focused_child == Some(child_id) {
+            self.transcript = transcript;
+            self.text_selection = None;
+            self.transcript_render_cache = None;
+        } else {
+            self.child_transcripts.insert(child_id, transcript);
+        }
+        self.hydrated_children.insert(child_id);
         self.replaying_history = was_replaying;
+    }
+
+    /// Finish the one-time resumed-team hydration pass. Children discovered
+    /// after this point are live-only and do not need an authoritative history
+    /// query before their nested events can be projected directly.
+    pub fn finish_child_history_hydration(&mut self) {
+        self.child_history_hydration_complete = true;
+        self.hydrated_children
+            .extend(self.child_unhydrated_events.keys().copied());
+        self.child_unhydrated_events.clear();
     }
 
     pub fn seed_team_roster(&mut self, agents: &[SubagentSnapshot]) {
@@ -2018,6 +2061,26 @@ impl BorgTerminal {
             transcript
                 .subagent_snapshots
                 .insert(agent.session_id, agent.clone());
+            if let Some(summary) = hydrated_subagent_activity_summary(agent) {
+                let time = canonical_local_time(agent.updated_at.with_timezone(&Local));
+                if let Some(index) = transcript.subagent_entries.get(&agent.session_id).copied()
+                    && let Some(TranscriptEntry::Activity {
+                        text: existing,
+                        time: existing_time,
+                    }) = transcript.order.get_mut(index)
+                {
+                    *existing = summary;
+                    *existing_time = time;
+                } else {
+                    transcript
+                        .subagent_entries
+                        .insert(agent.session_id, transcript.order.len());
+                    transcript.order.push(TranscriptEntry::Activity {
+                        text: summary,
+                        time,
+                    });
+                }
+            }
             self.child_statuses
                 .insert(agent.session_id, subagent_session_status(agent.status));
         }
@@ -3842,7 +3905,7 @@ impl BorgTerminal {
                 footer_height,
                 is_launch_screen,
             );
-            let status_color = session_status_color(status);
+            let status_color = focused_subagent_status_color(status, self.focused_child.is_some());
             let (status_area, transcript_area, composer_area, footer_area) = if is_launch_screen {
                 let launch_width = composer_area_width.min(chunks[0].width);
                 let launch_height = composer_height
@@ -4158,7 +4221,13 @@ impl BorgTerminal {
                             Line::from(Span::styled(
                                 " ▊",
                                 Style::default().fg(if in_thumb {
-                                    if self.scrollbar_hovered || self.dragging_scrollbar {
+                                    if self.focused_child.is_some() {
+                                        if self.scrollbar_hovered || self.dragging_scrollbar {
+                                            SUBAGENT_PINK_HOVER
+                                        } else {
+                                            SUBAGENT_PINK
+                                        }
+                                    } else if self.scrollbar_hovered || self.dragging_scrollbar {
                                         BORG_ORANGE_HOVER
                                     } else {
                                         BORG_ORANGE
@@ -4210,6 +4279,7 @@ impl BorgTerminal {
                     Paragraph::new(queued_prompt_lines(
                         queued_prompts.as_slice(),
                         chunks[1].width,
+                        self.focused_child.is_some().then_some(SUBAGENT_PINK),
                     ))
                     .block(
                         Block::default()
@@ -4218,7 +4288,11 @@ impl BorgTerminal {
                             .title(Span::styled(
                                 format!(" Pending Input · {} ", queued_prompts.len()),
                                 Style::default()
-                                    .fg(BORG_ORANGE)
+                                    .fg(if self.focused_child.is_some() {
+                                        SUBAGENT_PINK
+                                    } else {
+                                        BORG_ORANGE
+                                    })
                                     .add_modifier(Modifier::BOLD),
                             )),
                     ),
@@ -4451,7 +4525,7 @@ impl BorgTerminal {
                 &mut status_spans,
                 fast_status,
                 self.fast_status_hovered,
-                Color::Gray,
+                Color::LightYellow,
             );
             let permission_status_start =
                 status_spans.iter().map(|span| span.width()).sum::<usize>();
@@ -4579,7 +4653,7 @@ impl BorgTerminal {
                         let focused = *child_id == self.focused_child;
                         let hovered = self.hovered_team_roster == Some(index);
                         Line::from(format!("{} {row}", if focused { "›" } else { " " }))
-                            .style(team_roster_row_style(focused, hovered))
+                            .style(team_roster_row_style(focused, hovered, child_id.is_some()))
                     })
                     .collect::<Vec<_>>();
                 frame.render_widget(
@@ -4589,7 +4663,12 @@ impl BorgTerminal {
                             Block::default()
                                 .borders(Borders::ALL)
                                 .border_style(Style::default().fg(SUBAGENT_PINK))
-                                .title(format!(" Team · {active_subagents} working ")),
+                                .title(Span::styled(
+                                    format!(" Team · {active_subagents} working "),
+                                    Style::default()
+                                        .fg(SUBAGENT_PINK)
+                                        .add_modifier(Modifier::BOLD),
+                                )),
                         ),
                     tooltip,
                 );
@@ -4614,13 +4693,20 @@ impl BorgTerminal {
                     height: 1,
                 };
                 frame.render_widget(
-                    Paragraph::new(label).style(Style::default().fg(Color::White).bg(
-                        if self.back_to_director_hovered {
-                            MESSAGE_HOVER_BG
-                        } else {
-                            COMMAND_PANEL_BG
-                        },
-                    )),
+                    Paragraph::new(label).style(
+                        Style::default()
+                            .fg(if self.back_to_director_hovered {
+                                Color::White
+                            } else {
+                                SUBAGENT_PINK
+                            })
+                            .bg(if self.back_to_director_hovered {
+                                MESSAGE_HOVER_BG
+                            } else {
+                                COMMAND_PANEL_BG
+                            })
+                            .add_modifier(Modifier::BOLD),
+                    ),
                     button,
                 );
                 next_back_to_director_area = Some(button);
@@ -4733,18 +4819,12 @@ impl BorgTerminal {
                 );
                 if footer_metadata.is_some() && metadata_width > 0 {
                     frame.render_widget(
-                        Paragraph::new(Line::from(Span::styled(
-                            footer_metadata_text(
-                                &context_status,
-                                &cwd_status,
-                                metadata_width as usize,
-                            ),
-                            Style::default().fg(if context_imminent {
-                                Color::Yellow
-                            } else {
-                                Color::Gray
-                            }),
-                        )))
+                        Paragraph::new(footer_metadata_line(
+                            &context_status,
+                            &cwd_status,
+                            context_imminent,
+                            metadata_width as usize,
+                        ))
                         .alignment(Alignment::Right)
                         .style(Style::default().bg(COMMAND_PANEL_BG)),
                         Rect {
@@ -5533,6 +5613,90 @@ impl BorgTerminal {
     }
 }
 
+fn fresh_transcript_like(previous: &Transcript) -> Transcript {
+    Transcript {
+        auto_expand_edits: previous.auto_expand_edits,
+        auto_expand_tools: previous.auto_expand_tools,
+        user_label: previous.user_label.clone(),
+        assistant_label: previous.assistant_label.clone(),
+        user_label_color: previous.user_label_color,
+        user_message_color: previous.user_message_color,
+        assistant_label_color: previous.assistant_label_color,
+        assistant_message_color: previous.assistant_message_color,
+        ..Transcript::default()
+    }
+}
+
+fn replace_root_transcript_history(
+    transcript: &mut Transcript,
+    director_transcript: &mut Option<Box<Transcript>>,
+    child_is_focused: bool,
+    events: &[SessionEvent],
+) -> bool {
+    let previous = if child_is_focused {
+        director_transcript.as_deref().unwrap_or(&*transcript)
+    } else {
+        &*transcript
+    };
+    let mut replacement = fresh_transcript_like(previous);
+    replacement.reserve_history(events.len());
+    for event in events {
+        replacement.apply(event);
+    }
+    if child_is_focused {
+        *director_transcript = Some(Box::new(replacement));
+        false
+    } else {
+        *transcript = replacement;
+        true
+    }
+}
+
+fn merge_child_history(
+    authoritative: &[SessionEvent],
+    buffered: Vec<SessionEvent>,
+) -> Vec<SessionEvent> {
+    let mut seen = HashSet::new();
+    let mut events = authoritative
+        .iter()
+        .cloned()
+        .chain(buffered)
+        .filter(|event| seen.insert(event.id))
+        .collect::<Vec<_>>();
+
+    // A completed message supersedes all transport snapshots of the same
+    // message. This remains true even if a delayed coalesced snapshot carries
+    // a later timestamp than the durable terminal event.
+    let completed_messages = events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            SessionEventKind::Message {
+                message_id,
+                status: MessageStatus::Complete,
+                ..
+            } => Some(*message_id),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    events.retain(|event| {
+        !matches!(
+            &event.kind,
+            SessionEventKind::Message {
+                message_id,
+                status: MessageStatus::InProgress | MessageStatus::Queued,
+                ..
+            } if completed_messages.contains(message_id)
+        )
+    });
+    events.sort_by(|left, right| {
+        left.created_at
+            .cmp(&right.created_at)
+            .then_with(|| left.sequence.cmp(&right.sequence))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    events
+}
+
 fn switch_to_child_transcript(
     transcript: &mut Transcript,
     director_transcript: &mut Option<Box<Transcript>>,
@@ -5591,7 +5755,7 @@ fn display_agent_name(task_name: &str) -> String {
         .to_string()
 }
 
-fn team_roster_row_style(focused: bool, hovered: bool) -> Style {
+fn team_roster_row_style(focused: bool, hovered: bool, is_subagent: bool) -> Style {
     if hovered {
         Style::default()
             .fg(Color::Black)
@@ -5602,6 +5766,8 @@ fn team_roster_row_style(focused: bool, hovered: bool) -> Style {
             .fg(SUBAGENT_PINK)
             .bg(COMMAND_PANEL_BG)
             .add_modifier(Modifier::BOLD)
+    } else if is_subagent {
+        Style::default().fg(SUBAGENT_PINK).bg(COMMAND_PANEL_BG)
     } else {
         Style::default().fg(Color::White).bg(COMMAND_PANEL_BG)
     }
@@ -5660,7 +5826,14 @@ impl Composer {
                 continue;
             };
             if seen.insert(*message_id) {
-                self.next_image_number += attachments.len();
+                if !attachments.is_empty() {
+                    if let Some(highest) = image_numbers_in_text(text).into_iter().max() {
+                        self.next_image_number = self.next_image_number.max(highest);
+                    } else {
+                        self.next_image_number =
+                            self.next_image_number.saturating_add(attachments.len());
+                    }
+                }
                 if !text.trim().is_empty()
                     && self.history.last().is_none_or(|previous| previous != text)
                 {
@@ -6012,6 +6185,12 @@ impl Composer {
                 });
             if let Some((start, end)) = token {
                 let label = self.text[start + 1..end - 1].to_string();
+                if let Some(number) = label
+                    .strip_prefix("Image ")
+                    .and_then(|number| number.parse::<usize>().ok())
+                {
+                    self.next_image_number = self.next_image_number.max(number);
+                }
                 self.attachments.push(ComposerAttachment {
                     path,
                     label,
@@ -6805,9 +6984,20 @@ impl Transcript {
                         .get_mut()
                         .messages
                         .remove(&index);
+                    let numbered_attachments = matches!(
+                        &self.order[index],
+                        TranscriptEntry::Message {
+                            attachments: stored,
+                            ..
+                        } if stored.is_empty() && !attachments.is_empty()
+                    )
+                    .then(|| {
+                        number_message_attachments(text, attachments, &mut self.next_image_number)
+                    });
                     if let TranscriptEntry::Message {
                         actor: stored_actor,
                         text: stored_text,
+                        attachments: stored_attachments,
                         status: stored_status,
                         complete,
                         ..
@@ -6817,17 +7007,13 @@ impl Transcript {
                         *stored_text = text.clone();
                         *stored_status = *status;
                         *complete = *status == MessageStatus::Complete;
+                        if let Some(attachments) = numbered_attachments {
+                            *stored_attachments = attachments;
+                        }
                     }
                 } else {
-                    let first_image = self.next_image_number;
-                    self.next_image_number =
-                        self.next_image_number.saturating_add(attachments.len());
-                    let attachments = attachments
-                        .iter()
-                        .cloned()
-                        .enumerate()
-                        .map(|(offset, path)| (first_image + offset, path))
-                        .collect();
+                    let attachments =
+                        number_message_attachments(text, attachments, &mut self.next_image_number);
                     self.messages.insert(*message_id, self.order.len());
                     let (model, effort) = if *actor == EventActor::Assistant {
                         self.active_turn
@@ -6913,11 +7099,6 @@ impl Transcript {
                 if is_edit_diff {
                     self.last_edit = Some(tool_index);
                 }
-                // Providers can finish a narration segment before asking for
-                // the next tool. That segment is complete as text, but the
-                // turn is not complete; keep the action stream together and
-                // render the segment after the work it introduced.
-                self.defer_active_assistant_segments();
             }
             SessionEventKind::ToolCompleted {
                 tool_call_id,
@@ -6987,7 +7168,17 @@ impl Transcript {
                                 .or_else(|| {
                                     borg_lsp_diagnostics_view(source_name, input.as_ref(), output)
                                 })
-                                .map(|text| ("command".to_string(), text))
+                                .map(|text| {
+                                    (
+                                        if is_subagent_tool(source_name) {
+                                            "subagent"
+                                        } else {
+                                            "command"
+                                        }
+                                        .to_string(),
+                                        text,
+                                    )
+                                })
                                 .or_else(|| tool_output_code_view(name, output))
                         };
                     }
@@ -7166,92 +7357,6 @@ impl Transcript {
                 Some(edit - usize::from(edit > index))
             }
         });
-    }
-
-    fn defer_active_assistant_segments(&mut self) {
-        let Some(prompt_index) = self
-            .active_turn
-            .as_ref()
-            .and_then(|turn| self.messages.get(&turn.message_id).copied())
-        else {
-            return;
-        };
-        let deferred_indices = self
-            .order
-            .iter()
-            .enumerate()
-            .skip(prompt_index.saturating_add(1))
-            .filter_map(|(index, entry)| {
-                matches!(
-                    entry,
-                    TranscriptEntry::Message {
-                        actor: EventActor::Assistant,
-                        ..
-                    }
-                )
-                .then_some(index)
-            })
-            .collect::<Vec<_>>();
-        if deferred_indices.is_empty() {
-            return;
-        }
-
-        for index in &deferred_indices {
-            if let TranscriptEntry::Message {
-                status, complete, ..
-            } = &mut self.order[*index]
-            {
-                *status = MessageStatus::Complete;
-                *complete = true;
-                self.message_markdown_cache.get_mut().messages.remove(index);
-            }
-        }
-
-        let mut deferred = Vec::with_capacity(deferred_indices.len());
-        let deferred_set = deferred_indices.into_iter().collect::<HashSet<_>>();
-        let old_order = std::mem::take(&mut self.order);
-        let mut remap = vec![0; old_order.len()];
-        let mut new_order = Vec::with_capacity(old_order.len());
-        for (old_index, entry) in old_order.into_iter().enumerate() {
-            if deferred_set.contains(&old_index) {
-                deferred.push((old_index, entry));
-            } else {
-                remap[old_index] = new_order.len();
-                new_order.push(entry);
-            }
-        }
-        for (old_index, entry) in deferred {
-            remap[old_index] = new_order.len();
-            new_order.push(entry);
-        }
-        self.order = new_order;
-        self.remap_order_indices(&remap);
-    }
-
-    fn remap_order_indices(&mut self, remap: &[usize]) {
-        for index in self
-            .messages
-            .values_mut()
-            .chain(self.tools.values_mut())
-            .chain(self.subagent_entries.values_mut())
-        {
-            *index = remap[*index];
-        }
-        self.selected = self.selected.map(|index| remap[index]);
-        self.tool_run_offsets = self
-            .tool_run_offsets
-            .drain()
-            .map(|(start, offset)| (remap[start], offset))
-            .collect();
-        self.expanded_tool_runs = self
-            .expanded_tool_runs
-            .drain()
-            .map(|start| remap[start])
-            .collect();
-        self.active_reasoning = self.active_reasoning.map(|index| remap[index]);
-        self.last_edit = self.last_edit.map(|index| remap[index]);
-        self.message_markdown_cache.get_mut().messages.clear();
-        self.tool_body_cache.get_mut().lines.clear();
     }
 
     fn append_reasoning(&mut self, text: &str, started_at: DateTime<Utc>, time: String) {
@@ -7863,11 +7968,19 @@ impl Transcript {
                 TranscriptEntry::Activity { text, time } => {
                     let time = display_local_time(time, today);
                     let prefix = if tool_window.is_some() { "│ " } else { "  " };
+                    let activity_color = if text.starts_with("agent · ") {
+                        SUBAGENT_PINK
+                    } else {
+                        Color::DarkGray
+                    };
                     for line in wrap_display(text, width.saturating_sub(8)) {
-                        lines.push(Line::from(Span::styled(
-                            format!("{prefix}{time}  {line}"),
-                            Style::default().fg(Color::DarkGray),
-                        )));
+                        lines.push(Line::from(vec![
+                            Span::styled(
+                                format!("{prefix}{time}  "),
+                                Style::default().fg(Color::DarkGray),
+                            ),
+                            Span::styled(line, Style::default().fg(activity_color)),
+                        ]));
                     }
                     selection_rows.push((index, entry_start, lines.len(), 0));
                 }
@@ -8321,7 +8434,11 @@ impl Transcript {
                             format!(
                                 "┌─ actions · {}{}",
                                 window.total,
-                                if offset > 0 { " · ↑ more" } else { "" }
+                                if offset > 0 {
+                                    " · click to expand · ↑ scroll"
+                                } else {
+                                    " · click to expand"
+                                }
                             ),
                             Style::default().fg(Color::DarkGray),
                         ));
@@ -8667,6 +8784,19 @@ fn session_status_color(status: SessionStatus) -> Color {
     }
 }
 
+fn focused_subagent_status_color(status: SessionStatus, focused_subagent: bool) -> Color {
+    if focused_subagent
+        && !matches!(
+            status,
+            SessionStatus::WaitingForApproval | SessionStatus::Failed | SessionStatus::Stopped
+        )
+    {
+        SUBAGENT_PINK
+    } else {
+        session_status_color(status)
+    }
+}
+
 /// Whether applying an event can change the cached transcript layout.
 ///
 /// Footer/projection and provider-lifecycle updates still trigger a frame when
@@ -8785,12 +8915,90 @@ pub(crate) fn subagent_activity_summary(
     }
 }
 
+fn hydrated_subagent_activity_summary(agent: &SubagentSnapshot) -> Option<String> {
+    let task = &agent.task_name;
+    match agent.status {
+        SubagentStatus::Failed => Some(format!(
+            "agent · {task} · failed{}",
+            agent
+                .detail
+                .as_deref()
+                .filter(|detail| !detail.trim().is_empty())
+                .map(|detail| format!(" · {}", compact_text(detail, 120)))
+                .unwrap_or_default()
+        )),
+        SubagentStatus::Stopped => Some(terminal_agent_summary(
+            task,
+            "stopped",
+            agent.final_text.as_deref(),
+        )),
+        _ => agent
+            .final_text
+            .as_deref()
+            .filter(|text| !text.trim().is_empty())
+            .map(|text| format!("agent · {task} · report · {}", compact_text(text, 120))),
+    }
+}
+
 fn terminal_agent_summary(task: &str, outcome: &str, final_text: Option<&str>) -> String {
     let result = final_text
         .and_then(|text| text.lines().find(|line| !line.trim().is_empty()))
         .map(|text| format!(" · {}", compact_text(text, 120)))
         .unwrap_or_default();
     format!("agent · {task} · {outcome}{result}")
+}
+
+fn number_message_attachments(
+    text: &str,
+    attachments: &[PathBuf],
+    next_image_number: &mut usize,
+) -> Vec<(usize, PathBuf)> {
+    let explicit = image_numbers_in_text(text);
+    let explicit = &explicit[explicit.len().saturating_sub(attachments.len())..];
+    let mut used = explicit.iter().copied().collect::<HashSet<_>>();
+    let mut fallback = *next_image_number;
+    let numbered = attachments
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(index, path)| {
+            let number = explicit.get(index).copied().unwrap_or_else(|| {
+                while used.contains(&fallback) {
+                    fallback = fallback.saturating_add(1);
+                }
+                let number = fallback;
+                used.insert(number);
+                fallback = fallback.saturating_add(1);
+                number
+            });
+            (number, path)
+        })
+        .collect::<Vec<_>>();
+    if let Some(highest) = numbered.iter().map(|(number, _)| *number).max() {
+        *next_image_number = (*next_image_number).max(highest.saturating_add(1));
+    }
+    numbered
+}
+
+fn image_numbers_in_text(text: &str) -> Vec<usize> {
+    let mut numbers = Vec::new();
+    let mut remaining = text;
+    while let Some(start) = remaining.find("[Image ") {
+        let value = &remaining[start + "[Image ".len()..];
+        let Some(end) = value.find(']') else {
+            break;
+        };
+        let candidate = &value[..end];
+        if !candidate.is_empty()
+            && candidate.bytes().all(|byte| byte.is_ascii_digit())
+            && let Ok(number) = candidate.parse::<usize>()
+            && number > 0
+        {
+            numbers.push(number);
+        }
+        remaining = &value[end + 1..];
+    }
+    numbers
 }
 
 fn normalize_terminal_capture_paste(value: &str) -> Cow<'_, str> {
@@ -8947,6 +9155,7 @@ fn wrapped_pending_prompt_lines(text: &str, width: usize) -> Vec<String> {
 fn queued_prompt_lines(
     queued_prompts: &[PendingPromptProjection],
     panel_width: u16,
+    subagent_accent: Option<Color>,
 ) -> Vec<Line<'static>> {
     let visible = queued_prompts.len().min(6);
     let queue_width = panel_width.saturating_sub(26).max(1) as usize;
@@ -8954,10 +9163,10 @@ fn queued_prompt_lines(
         .iter()
         .take(visible)
         .flat_map(|prompt| {
-            let label_color = match prompt.delivery {
+            let label_color = subagent_accent.unwrap_or(match prompt.delivery {
                 PromptDelivery::Steer => BORG_ORANGE,
                 PromptDelivery::Queue => Color::Gray,
-            };
+            });
             wrapped_pending_prompt_lines(&prompt.text, queue_width)
                 .into_iter()
                 .enumerate()
@@ -9752,6 +9961,33 @@ fn footer_metadata_text(context_status: &str, cwd_status: &str, max_width: usize
         "{}{separator}{cwd_display}",
         truncate_table_cell(context_status, context_width)
     )
+}
+
+fn footer_metadata_line(
+    context_status: &str,
+    cwd_status: &str,
+    context_imminent: bool,
+    max_width: usize,
+) -> Line<'static> {
+    let metadata = footer_metadata_text(context_status, cwd_status, max_width);
+    let context_color = if context_imminent {
+        Color::Yellow
+    } else {
+        Color::Gray
+    };
+    let Some((context, cwd)) = metadata.split_once(STATUS_SEPARATOR) else {
+        let cwd_only =
+            !cwd_status.trim().is_empty() && metadata == format!("{} ", cwd_status.trim());
+        return Line::from(Span::styled(
+            metadata,
+            Style::default().fg(if cwd_only { Color::Gray } else { context_color }),
+        ));
+    };
+    Line::from(vec![
+        Span::styled(context.to_string(), Style::default().fg(context_color)),
+        Span::styled(STATUS_SEPARATOR, Style::default().fg(Color::Gray)),
+        Span::styled(cwd.to_string(), Style::default().fg(Color::Gray)),
+    ])
 }
 
 fn tool_run_viewport_height(viewport_height: usize) -> usize {

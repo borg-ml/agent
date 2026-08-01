@@ -16,10 +16,11 @@ use borg_remote::{
     PlanItemStatus, PromptDelivery, ResponseLanguage, SessionConfigAction, SessionEvent,
     SessionEventKind, SessionGoal, SessionState, SessionStatus, SessionStore, SessionWriterLease,
     SpawnSubagent, SqliteSessionStore, SqliteWorkspaceStore, SubagentAction, SubagentSnapshot,
-    TodoAction, default_host_config_path, enroll_host, local_session_owner_uses_current_binary,
-    login_provider, mirror_local_session, probe_capabilities, provider_credentials_present,
-    run_agent_session_with_store_and_writer, run_agent_session_with_store_writer_and_peers,
-    run_attached_session, run_host, send_local_session_command, session_control_socket_path,
+    SubagentStatus, TodoAction, default_host_config_path, enroll_host,
+    local_session_owner_uses_current_binary, login_provider, mirror_local_session,
+    probe_capabilities, provider_credentials_present, run_agent_session_with_store_and_writer,
+    run_agent_session_with_store_writer_and_peers, run_attached_session, run_host,
+    run_owned_session_projection, send_local_session_command, session_control_socket_path,
 };
 use chrono::{Local, Utc};
 use futures_util::FutureExt;
@@ -985,6 +986,7 @@ async fn run_local_agent_session(
             Some(Arc::clone(&local_prompt_admissions)),
         )?)
     };
+    let mut owner_projection_task = None;
     let actor = if session_access.is_attached() {
         tokio::spawn(run_attached_session(
             Arc::clone(&store),
@@ -996,6 +998,14 @@ async fn run_local_agent_session(
             session_event_tx,
         ))
     } else {
+        let (actor_event_tx, actor_events) = mpsc::channel(256);
+        owner_projection_task = Some(tokio::spawn(run_owned_session_projection(
+            Arc::clone(&store),
+            session_id,
+            session_state.latest_sequence,
+            actor_events,
+            session_event_tx,
+        )));
         let writer = writer.expect("session owner holds writer lease");
         let actor_store = Arc::clone(&sqlite_store);
         let actor_session_root = sessions_dir.clone();
@@ -1006,7 +1016,7 @@ async fn run_local_agent_session(
                     session_id,
                     launch,
                     session_commands,
-                    session_event_tx,
+                    actor_event_tx,
                     executor,
                     actor_store,
                     writer,
@@ -1018,7 +1028,7 @@ async fn run_local_agent_session(
                     session_id,
                     launch,
                     session_commands,
-                    session_event_tx,
+                    actor_event_tx,
                     executor,
                     actor_store,
                     writer,
@@ -1084,6 +1094,11 @@ async fn run_local_agent_session(
             load_subagent_thread_state(team_store.as_ref(), &team_sessions_dir, session_id).await
         })
     });
+    if team_state_task.is_none()
+        && let Some(terminal) = terminal.as_mut()
+    {
+        terminal.finish_child_history_hydration();
+    }
     let mut history_page_task: Option<tokio::task::JoinHandle<Result<Vec<SessionEvent>>>> = None;
     let mut input = (can_prompt && terminal.is_none()).then(spawn_terminal_input);
     let mut input_open = can_prompt && terminal.is_none();
@@ -1148,9 +1163,15 @@ async fn run_local_agent_session(
                     }
                     Ok(Err(error)) => {
                         tracing::warn!(%error, "could not hydrate subagent history after first paint");
+                        if let Some(terminal) = terminal.as_mut() {
+                            terminal.finish_child_history_hydration();
+                        }
                     }
                     Err(error) => {
                         tracing::warn!(%error, "subagent history hydration task failed");
+                        if let Some(terminal) = terminal.as_mut() {
+                            terminal.finish_child_history_hydration();
+                        }
                     }
                 }
             }
@@ -3223,6 +3244,7 @@ async fn run_local_agent_session(
     }
     let tui_was_active = crash_context.tui_active.load(Ordering::Acquire);
     shutdown_terminal(&mut terminal, &crash_context.tui_active).await;
+    drop(session_events);
     let actor_error = match actor.await {
         Ok(result) => result.err(),
         Err(join_error) if join_error.is_panic() && tui_was_active => {
@@ -3231,7 +3253,17 @@ async fn run_local_agent_session(
         }
         Err(join_error) => Some(anyhow::anyhow!("agent session task failed: {join_error}")),
     };
-    if let Some(error) = actor_error {
+    let owner_projection_error = if let Some(task) = owner_projection_task {
+        match task.await {
+            Ok(result) => result.err(),
+            Err(error) => Some(anyhow::anyhow!(
+                "owned session projection task failed: {error}"
+            )),
+        }
+    } else {
+        None
+    };
+    if let Some(error) = actor_error.or(owner_projection_error) {
         if tui_was_active {
             tracing::error!(%session_id, error = %error, "local agent session crashed");
             println!("{}", resume_instructions(session_id, false));
@@ -3842,6 +3874,7 @@ fn seed_terminal_subagent_threads(
     for (child_id, events) in histories {
         terminal.seed_child_history(*child_id, events);
     }
+    terminal.finish_child_history_hydration();
 }
 
 async fn load_subagent_thread_state(
@@ -3854,9 +3887,12 @@ async fn load_subagent_thread_state(
     HashMap<Uuid, Vec<SessionEvent>>,
 )> {
     let team_history = store.recovery(session_id).await?.subagent_events;
-    let team_snapshots = latest_subagent_snapshots(&team_history);
+    let mut team_snapshots = latest_subagent_snapshots(&team_history);
     let mut child_histories = HashMap::new();
-    for agent in &team_snapshots {
+    for agent in &mut team_snapshots {
+        if let Ok(state) = store.state(agent.session_id).await {
+            reconcile_subagent_snapshot(agent, &state);
+        }
         match child_authored_history(store, agent.session_id).await {
             Ok(events) => {
                 child_histories.insert(agent.session_id, events);
@@ -3900,6 +3936,28 @@ async fn load_subagent_thread_state(
         }
     }
     Ok((team_history, team_snapshots, child_histories))
+}
+
+fn reconcile_subagent_snapshot(agent: &mut SubagentSnapshot, state: &SessionState) {
+    if let Some(status) = state.status {
+        agent.status = match status {
+            SessionStatus::Starting => SubagentStatus::Starting,
+            SessionStatus::Running => SubagentStatus::Running,
+            SessionStatus::WaitingForApproval => SubagentStatus::WaitingForApproval,
+            SessionStatus::Ready | SessionStatus::Completed => SubagentStatus::Ready,
+            SessionStatus::Failed => SubagentStatus::Failed,
+            SessionStatus::Stopped => SubagentStatus::Stopped,
+        };
+        agent.detail = state.status_detail.clone();
+    }
+    if let Some(updated_at) = state.activity_at {
+        agent.updated_at = updated_at;
+    }
+    agent.final_text = state.latest_response.clone();
+    agent.usage.input_tokens = state.usage.input_tokens;
+    agent.usage.output_tokens = state.usage.output_tokens;
+    agent.usage.total_tokens = state.usage.total_tokens;
+    agent.usage.cost_microusd = state.usage.cost_microusd;
 }
 
 /// Return only the child's authored events for presentation. Forked session

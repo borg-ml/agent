@@ -28,6 +28,91 @@ fn focused_child_transcript_round_trips_back_to_director() {
 }
 
 #[test]
+fn root_history_page_cannot_replace_a_focused_child_transcript() {
+    let session_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    let mut displayed = Transcript::default();
+    displayed.order.push(TranscriptEntry::Activity {
+        text: "focused child event".to_string(),
+        time: "now".to_string(),
+    });
+    let mut director = Some(Box::new(Transcript::default()));
+    let root_event = SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::Message {
+            message_id,
+            actor: EventActor::User,
+            text: "older root history".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: Some(PromptDelivery::Steer),
+        },
+    );
+
+    assert!(!replace_root_transcript_history(
+        &mut displayed,
+        &mut director,
+        true,
+        &[root_event],
+    ));
+    assert!(matches!(
+        &displayed.order[0],
+        TranscriptEntry::Activity { text, .. } if text == "focused child event"
+    ));
+    assert!(
+        director
+            .as_deref()
+            .is_some_and(|transcript| transcript.messages.contains_key(&message_id))
+    );
+}
+
+#[test]
+fn child_history_merge_prefers_completion_over_a_late_partial_snapshot() {
+    let session_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    let now = Utc::now();
+    let mut complete = SessionEvent::new(
+        session_id,
+        8,
+        SessionEventKind::Message {
+            message_id,
+            actor: EventActor::Assistant,
+            text: "I am complete".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: None,
+        },
+    );
+    complete.created_at = now;
+    let mut stale_partial = SessionEvent::new(
+        session_id,
+        0,
+        SessionEventKind::Message {
+            message_id,
+            actor: EventActor::Assistant,
+            text: "I".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::InProgress,
+            delivery: None,
+        },
+    );
+    stale_partial.created_at = now + chrono::Duration::seconds(1);
+
+    let merged = merge_child_history(&[complete], vec![stale_partial]);
+
+    assert_eq!(merged.len(), 1);
+    assert!(matches!(
+        &merged[0].kind,
+        SessionEventKind::Message {
+            text,
+            status: MessageStatus::Complete,
+            ..
+        } if text == "I am complete"
+    ));
+}
+
+#[test]
 fn child_transcript_starts_with_a_director_context_boundary() {
     let mut transcript = Transcript::default();
     transcript.show_director_context_boundary();
@@ -88,17 +173,109 @@ fn focusing_a_new_child_still_shows_the_director_context_boundary() {
 
 #[test]
 fn team_roster_hover_is_visually_distinct_from_focus_and_idle() {
-    let hovered = team_roster_row_style(false, true);
-    let focused = team_roster_row_style(true, false);
-    let idle = team_roster_row_style(false, false);
+    let hovered = team_roster_row_style(false, true, true);
+    let focused = team_roster_row_style(true, false, true);
+    let idle_subagent = team_roster_row_style(false, false, true);
+    let idle_director = team_roster_row_style(false, false, false);
 
     assert_eq!(hovered.bg, Some(SUBAGENT_PINK));
     assert_eq!(hovered.fg, Some(Color::Black));
     assert!(hovered.add_modifier.contains(Modifier::BOLD));
     assert_eq!(focused.fg, Some(SUBAGENT_PINK));
-    assert_eq!(idle.fg, Some(Color::White));
+    assert_eq!(idle_subagent.fg, Some(SUBAGENT_PINK));
+    assert_eq!(idle_director.fg, Some(Color::White));
     assert_ne!(hovered, focused);
-    assert_ne!(hovered, idle);
+    assert_ne!(hovered, idle_subagent);
+}
+
+#[test]
+fn transcript_attachments_preserve_the_explicit_image_number() {
+    let path = PathBuf::from("9619ebf5-b115-43af-9fa1-feea11842109.png");
+    let mut next_image_number = 1;
+
+    let numbered = number_message_attachments(
+        "the focused view looks wrong [Image 6]",
+        std::slice::from_ref(&path),
+        &mut next_image_number,
+    );
+
+    assert_eq!(numbered, [(6, path)]);
+    assert_eq!(next_image_number, 7);
+}
+
+#[test]
+fn subagent_activity_rows_use_the_shared_hot_pink_identity_colour() {
+    let mut transcript = Transcript::default();
+    transcript.order.push(TranscriptEntry::Activity {
+        text: "agent · /root/worker · report · complete".to_string(),
+        time: "2026-08-01 20:40".to_string(),
+    });
+
+    let line = transcript
+        .lines(100)
+        .into_iter()
+        .find(|line| line.to_string().contains("/root/worker"))
+        .expect("subagent activity row");
+
+    assert_eq!(line.spans.last().unwrap().style.fg, Some(SUBAGENT_PINK));
+}
+
+#[test]
+fn focused_subagent_status_preserves_semantic_failures_and_uses_pink_for_work() {
+    assert_eq!(
+        focused_subagent_status_color(SessionStatus::Running, true),
+        SUBAGENT_PINK
+    );
+    assert_eq!(
+        focused_subagent_status_color(SessionStatus::Ready, true),
+        SUBAGENT_PINK
+    );
+    assert_eq!(
+        focused_subagent_status_color(SessionStatus::Failed, true),
+        Color::LightRed
+    );
+    assert_eq!(
+        focused_subagent_status_color(SessionStatus::Running, false),
+        RUNNING_STATUS_PEACH
+    );
+}
+
+#[test]
+fn a_late_message_snapshot_can_supply_the_attachment_without_renumbering_it() {
+    let session_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::Message {
+            message_id,
+            actor: EventActor::User,
+            text: "upload follows".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::InProgress,
+            delivery: None,
+        },
+    ));
+    let path = PathBuf::from("capture.png");
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::Message {
+            message_id,
+            actor: EventActor::User,
+            text: "upload follows [Image 6]".to_string(),
+            attachments: vec![path.clone()],
+            status: MessageStatus::Complete,
+            delivery: None,
+        },
+    ));
+
+    assert!(matches!(
+        transcript.order.first(),
+        Some(TranscriptEntry::Message { attachments, .. })
+            if attachments == &vec![(6, path)]
+    ));
 }
 
 #[test]
@@ -1427,6 +1604,29 @@ fn footer_metadata_preserves_the_full_working_directory_path() {
 }
 
 #[test]
+fn footer_metadata_highlights_only_imminent_compaction() {
+    let line = footer_metadata_line(
+        "compaction imminent (20% left)",
+        "~/borg-cli",
+        true,
+        usize::MAX,
+    );
+
+    assert_eq!(line.spans[0].style.fg, Some(Color::Yellow));
+    assert_eq!(line.spans[1].content, STATUS_SEPARATOR);
+    assert_eq!(line.spans[1].style.fg, Some(Color::Gray));
+    assert_eq!(line.spans[2].style.fg, Some(Color::Gray));
+
+    let cwd_only = footer_metadata_line(
+        "compaction imminent (20% left)",
+        "~/a/very-long-directory",
+        true,
+        8,
+    );
+    assert_eq!(cwd_only.spans[0].style.fg, Some(Color::Gray));
+}
+
+#[test]
 fn git_worktree_status_is_compact_and_includes_divergence_and_dirty_state() {
     let status = parse_git_worktree_status(
         "## feature/ui...origin/feature/ui [ahead 2, behind 1]\n M src/main.rs\n",
@@ -1609,6 +1809,39 @@ fn composer_history_rehydrates_completed_user_prompts_from_the_session_journal()
     composer.history_previous();
     assert_eq!(composer.text, "persistent prompt");
     assert_eq!(composer.history.len(), 1);
+}
+
+#[test]
+fn composer_rehydration_advances_past_persisted_image_labels() {
+    let session_id = Uuid::new_v4();
+    let mut composer = Composer::default();
+    composer.seed_session_events(&[SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::Message {
+            message_id: Uuid::new_v4(),
+            actor: EventActor::User,
+            text: "existing [Image 6]".to_string(),
+            attachments: vec![PathBuf::from("existing.png")],
+            status: MessageStatus::Complete,
+            delivery: None,
+        },
+    )]);
+
+    assert_eq!(
+        composer.insert_attachment(PathBuf::from("next.png")),
+        "Image 7"
+    );
+
+    let mut restored = Composer::default();
+    restored.restore(
+        "queued [Image 6]".to_string(),
+        vec![PathBuf::from("queued.png")],
+    );
+    assert_eq!(
+        restored.insert_attachment(PathBuf::from("after-queue.png")),
+        "Image 7"
+    );
 }
 
 #[test]
@@ -2244,6 +2477,15 @@ fn value_colored_status_segments_keep_hover_styling() {
     assert_eq!(hovered[1].style.fg, Some(Color::White));
     assert!(hovered[1].style.add_modifier.contains(Modifier::BOLD));
     assert!(hovered[1].style.add_modifier.contains(Modifier::UNDERLINED));
+
+    let mut fast = Vec::new();
+    push_interactive_status_segment(
+        &mut fast,
+        Some("fast".to_string()),
+        false,
+        Color::LightYellow,
+    );
+    assert_eq!(fast[1].style.fg, Some(Color::LightYellow));
 }
 
 #[test]
@@ -2945,7 +3187,7 @@ fn in_progress_steer_never_materializes_as_a_responding_message() {
 }
 
 #[test]
-fn active_turn_assistant_segments_follow_tool_actions() {
+fn active_turn_assistant_segments_preserve_event_order() {
     let session_id = Uuid::new_v4();
     let prompt_id = Uuid::new_v4();
     let assistant_id = Uuid::new_v4();
@@ -3002,7 +3244,7 @@ fn active_turn_assistant_segments_follow_tool_actions() {
 
     let tool_index = transcript.tools[&tool_call_id];
     let assistant_index = transcript.messages[&assistant_id];
-    assert!(tool_index < assistant_index);
+    assert!(assistant_index < tool_index);
     assert!(matches!(
         &transcript.order[assistant_index],
         TranscriptEntry::Message {
@@ -3039,6 +3281,82 @@ fn active_turn_assistant_segments_follow_tool_actions() {
     ));
 
     assert!(transcript.tools["tool-1"] < transcript.messages[&final_id]);
+}
+
+#[test]
+fn active_partial_assistant_message_stays_before_later_tool_activity() {
+    let session_id = Uuid::new_v4();
+    let prompt_id = Uuid::new_v4();
+    let assistant_id = Uuid::new_v4();
+    let tool_call_id = "tool-after-partial".to_string();
+    let mut transcript = Transcript::default();
+
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::Message {
+            message_id: prompt_id,
+            actor: EventActor::User,
+            text: "investigate this".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: Some(PromptDelivery::Steer),
+        },
+    ));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::TurnStarted {
+            message_id: prompt_id,
+            provider: CodingProvider::Codex,
+            model: None,
+            effort: None,
+            fast: false,
+        },
+    ));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        3,
+        SessionEventKind::Message {
+            message_id: assistant_id,
+            actor: EventActor::Assistant,
+            text: "I".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::InProgress,
+            delivery: None,
+        },
+    ));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        4,
+        SessionEventKind::ToolStarted {
+            tool_call_id: tool_call_id.clone(),
+            name: "shell".to_string(),
+            input: serde_json::json!({"command": "trace"}),
+            input_ref: None,
+        },
+    ));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        5,
+        SessionEventKind::ReasoningDelta {
+            text: "checking the trace".to_string(),
+        },
+    ));
+
+    let assistant_index = transcript.messages[&assistant_id];
+    let tool_index = transcript.tools[&tool_call_id];
+    let reasoning_index = transcript.active_reasoning.expect("active reasoning row");
+    assert!(assistant_index < tool_index);
+    assert!(tool_index < reasoning_index);
+    assert!(matches!(
+        &transcript.order[assistant_index],
+        TranscriptEntry::Message {
+            status: MessageStatus::InProgress,
+            complete: false,
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -3462,7 +3780,7 @@ fn one_queued_prompt_allocates_a_content_row_below_its_border() {
 
     let area = Rect::new(0, 0, 60, queued_prompt_panel_height(&prompts, 60));
     let mut buffer = ratatui::buffer::Buffer::empty(area);
-    let widget = Paragraph::new(queued_prompt_lines(&prompts, area.width)).block(
+    let widget = Paragraph::new(queued_prompt_lines(&prompts, area.width, None)).block(
         Block::default()
             .borders(Borders::TOP | Borders::LEFT)
             .border_style(Style::default().fg(Color::DarkGray))
@@ -3488,7 +3806,7 @@ fn pending_input_wraps_the_entire_prompt_instead_of_compacting_it() {
         text: text.to_string(),
         delivery: PromptDelivery::Queue,
     }];
-    let lines = queued_prompt_lines(&prompts, 44);
+    let lines = queued_prompt_lines(&prompts, 44, None);
     let rendered = lines
         .iter()
         .map(Line::to_string)
@@ -3507,7 +3825,7 @@ fn pending_steer_ui_uses_the_shared_next_label_and_interrupt_action() {
         text: "focus on the failing test".to_string(),
         delivery: PromptDelivery::Steer,
     }];
-    let rendered = queued_prompt_lines(&prompts, 80)
+    let rendered = queued_prompt_lines(&prompts, 80, None)
         .into_iter()
         .map(|line| line.to_string())
         .collect::<Vec<_>>()
@@ -4155,7 +4473,7 @@ fn long_tool_runs_show_eight_lines_and_scroll_independently() {
     assert!(!rendered.contains("call-11"));
     assert!(rendered.contains("call-12"));
     assert!(rendered.contains("call-19"));
-    assert!(rendered.contains("actions · 20 · ↑ more"));
+    assert!(rendered.contains("actions · 20 · click to expand · ↑ scroll"));
     assert!(!rendered.contains("scroll for older/newer"));
 
     transcript.scroll_tool_run(0, 12, -3);
@@ -4212,7 +4530,10 @@ fn expanded_tool_run_shows_every_action_and_collapses_again() {
     let collapsed = render(&transcript);
     assert!(!collapsed.contains("call-11"), "{collapsed}");
     assert!(collapsed.contains("call-12"), "{collapsed}");
-    assert!(collapsed.contains("actions · 20 · ↑ more"), "{collapsed}");
+    assert!(
+        collapsed.contains("actions · 20 · click to expand · ↑ scroll"),
+        "{collapsed}"
+    );
 }
 
 #[test]

@@ -17,9 +17,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
-use super::codex_app_server::CodexAppServerClient;
-#[cfg(test)]
-use super::codex_app_server::JsonRpcMessage;
+use super::codex_app_server::{CodexAppServerClient, JsonRpcMessage};
 mod claude_native;
 mod claude_stream;
 mod codex_items;
@@ -1358,6 +1356,21 @@ async fn run_codex_app_server_inner(
         }
         let persist_session = req.persist_session.unwrap_or(true);
         let mut turn_prompt = req.prompt.clone();
+        let mut first_notification = true;
+        let mut on_notification = |message: &JsonRpcMessage| {
+            if first_notification {
+                first_notification = false;
+                tracing::debug!(
+                    target: "borg_ttft",
+                    stage = "codex_first_notification",
+                    elapsed_ms = started_at.elapsed().as_millis(),
+                    method = message.method.as_deref().unwrap_or_default(),
+                    "Codex request stage"
+                );
+            }
+            mapper.handle(message, &tx)
+        };
+        let mut resumed_turn_result = None;
         let resumed = if can_reuse {
             true
         } else if let Some(session_id) = req.session_id.as_deref()
@@ -1366,7 +1379,7 @@ async fn run_codex_app_server_inner(
             if cancellation.load(Ordering::Acquire) {
                 return Ok(());
             }
-            match client.thread_resume_with_permission(
+            match client.thread_resume_with_permission_streaming(
                 session_id,
                 &req.system_prompt,
                 model.as_deref(),
@@ -1375,8 +1388,13 @@ async fn run_codex_app_server_inner(
                 req.fast,
                 &working_directory,
                 permission,
+                req.output_schema.is_some(),
+                |message| on_notification(message),
             ) {
-                Ok(_) => true,
+                Ok((_, result)) => {
+                    resumed_turn_result = result;
+                    true
+                }
                 Err(error) => {
                     if cancellation.load(Ordering::Acquire) {
                         return Ok(());
@@ -1436,29 +1454,20 @@ async fn run_codex_app_server_inner(
             return Ok(());
         }
 
-        let mut first_notification = true;
-        let result = client
-            .turn_execute_streaming_with_schema_steering_and_attachments(
-                &turn_prompt,
-                &req.attachments,
-                &working_directory,
-                req.output_schema.as_ref(),
-                control_rx.as_mut(),
-                |message| {
-                    if first_notification {
-                        first_notification = false;
-                        tracing::debug!(
-                            target: "borg_ttft",
-                            stage = "codex_first_notification",
-                            elapsed_ms = started_at.elapsed().as_millis(),
-                            method = message.method.as_deref().unwrap_or_default(),
-                            "Codex request stage"
-                        );
-                    }
-                    mapper.handle(message, &tx)
-                },
-            )
-            .context("codex app-server turn failed")?;
+        let result = if let Some(result) = resumed_turn_result {
+            result
+        } else {
+            client
+                .turn_execute_streaming_with_schema_steering_and_attachments(
+                    &turn_prompt,
+                    &req.attachments,
+                    &working_directory,
+                    req.output_schema.as_ref(),
+                    control_rx.as_mut(),
+                    |message| on_notification(message),
+                )
+                .context("codex app-server turn failed")?
+        };
         if cancellation.load(Ordering::Acquire) {
             return Ok(());
         }

@@ -1184,7 +1184,11 @@ impl SubagentCoordinator {
             {
                 latest.insert(agent.session_id, agent.clone());
                 if let Some(child_event) = child_event
-                    && let SessionEventKind::Message { message_id, .. } = &child_event.kind
+                    && let SessionEventKind::Message {
+                        message_id,
+                        status: MessageStatus::Complete,
+                        ..
+                    } = &child_event.kind
                 {
                     projected_root_messages.insert(*message_id);
                 }
@@ -3817,6 +3821,59 @@ mod tests {
             SubagentStatus::Stopped
         );
         assert_eq!(coordinator.list(None).await.len(), 1);
+
+        let message_id = Uuid::new_v4();
+        let partial = SessionEvent::new(
+            root,
+            3,
+            SessionEventKind::SubagentActivity {
+                activity: SubagentActivityKind::Updated,
+                agent: snapshot.clone(),
+                event: Some(Box::new(SessionEvent::new(
+                    child_id,
+                    0,
+                    SessionEventKind::Message {
+                        message_id,
+                        actor: crate::EventActor::Assistant,
+                        text: "I".into(),
+                        attachments: Vec::new(),
+                        status: MessageStatus::InProgress,
+                        delivery: None,
+                    },
+                ))),
+            },
+        );
+        coordinator
+            .restore_from_events(std::slice::from_ref(&partial))
+            .await
+            .unwrap();
+        assert!(!coordinator.root_message_is_projected(message_id).await);
+
+        let completed = SessionEvent::new(
+            root,
+            4,
+            SessionEventKind::SubagentActivity {
+                activity: SubagentActivityKind::Completed,
+                agent: snapshot,
+                event: Some(Box::new(SessionEvent::new(
+                    child_id,
+                    8,
+                    SessionEventKind::Message {
+                        message_id,
+                        actor: crate::EventActor::Assistant,
+                        text: "I am complete".into(),
+                        attachments: Vec::new(),
+                        status: MessageStatus::Complete,
+                        delivery: None,
+                    },
+                ))),
+            },
+        );
+        coordinator
+            .restore_from_events(&[partial, completed])
+            .await
+            .unwrap();
+        assert!(coordinator.root_message_is_projected(message_id).await);
     }
 
     #[tokio::test]

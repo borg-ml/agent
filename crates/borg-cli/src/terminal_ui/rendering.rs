@@ -30,6 +30,7 @@ pub(super) fn code_block_lines(language: &str, source: &str, width: usize) -> Ve
         "diagnostic" | "diagnostics" | "lsp" => diagnostic_lines(source, width),
         "reasoning" => reasoning_lines(source, width),
         "command" => plain_lines(source, width),
+        "subagent" => colored_plain_lines(source, width, super::SUBAGENT_PINK),
         _ => syntax_lines(language, source, width),
     }
 }
@@ -125,6 +126,10 @@ fn bold_reasoning_thoughts(mut source: &str) -> Option<Vec<&str>> {
 }
 
 fn plain_lines(source: &str, width: usize) -> Vec<Line<'static>> {
+    colored_plain_lines(source, width, Color::White)
+}
+
+fn colored_plain_lines(source: &str, width: usize, color: Color) -> Vec<Line<'static>> {
     let lines = source.lines().collect::<Vec<_>>();
     if lines.is_empty() {
         return vec![Line::default()];
@@ -134,7 +139,7 @@ fn plain_lines(source: &str, width: usize) -> Vec<Line<'static>> {
         .map(|line| {
             Line::from(Span::styled(
                 truncate_cells(line, width),
-                Style::default().fg(Color::White),
+                Style::default().fg(color),
             ))
         })
         .collect()
@@ -707,6 +712,16 @@ mod tests {
         let lines = code_block_lines("command", "just cli\ncargo check", 80);
         assert_eq!(lines[0].to_string(), "just cli");
         assert_eq!(lines[1].to_string(), "cargo check");
+    }
+
+    #[test]
+    fn subagent_renderer_uses_the_shared_identity_colour() {
+        let lines = code_block_lines("subagent", "TEAM · 1 subagent", 80);
+
+        assert_eq!(
+            lines[0].spans[0].style.fg,
+            Some(super::super::SUBAGENT_PINK)
+        );
     }
 
     #[test]
