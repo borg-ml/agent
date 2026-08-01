@@ -11,6 +11,7 @@ use crate::{
 };
 
 const MAX_CONTROL_COMMAND_BYTES: u64 = 1024 * 1024;
+const ATTACHED_SESSION_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
 
 /// Path used by additional local terminals to attach to a session owner.
 pub fn session_control_socket_path(sessions_dir: &Path, session_id: Uuid) -> PathBuf {
@@ -194,7 +195,7 @@ pub async fn run_attached_session(
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::UnixStream;
 
-    let mut refresh = tokio::time::interval(std::time::Duration::from_millis(100));
+    let mut refresh = tokio::time::interval(ATTACHED_SESSION_REFRESH_INTERVAL);
     let mut live_revision = 0_u64;
     let mut reasoning_snapshot = String::new();
     loop {

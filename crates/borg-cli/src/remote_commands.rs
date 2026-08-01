@@ -10,9 +10,9 @@ use borg_remote::{
     HostCommand, HostConfig, JsonlSessionStore, LaunchSession, LocalAgentSettings,
     LocalAgentTurnExecutor, LocalSessionControlServer, MessageStatus, PermissionMode, PlanItem,
     PlanItemStatus, PromptDelivery, ResponseLanguage, SessionConfigAction, SessionEvent,
-    SessionEventKind, SessionGoal, SessionStatus, SessionStore, SessionWriterLease, SpawnSubagent,
-    SqliteSessionStore, SqliteWorkspaceStore, SubagentAction, SubagentSnapshot, TodoAction,
-    default_host_config_path, enroll_host, login_provider, mirror_local_session,
+    SessionEventKind, SessionGoal, SessionState, SessionStatus, SessionStore, SessionWriterLease,
+    SpawnSubagent, SqliteSessionStore, SqliteWorkspaceStore, SubagentAction, SubagentSnapshot,
+    TodoAction, default_host_config_path, enroll_host, login_provider, mirror_local_session,
     probe_capabilities, provider_credentials_present, run_agent_session_with_store_and_writer,
     run_agent_session_with_store_writer_and_peers, run_attached_session, run_host,
     session_control_socket_path,
@@ -38,8 +38,8 @@ const MAX_TUI_FPS: u64 = 240;
 const ACTIVITY_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(120);
 /// Keep first paint bounded. The canonical store remains complete and indexed;
 /// a resumed actor recovers independently of this presentation-only tail.
-const RICH_TUI_HISTORY_EVENT_LIMIT: usize = 512;
-const RICH_TUI_HISTORY_PAGE_SIZE: usize = 1024;
+const RICH_TUI_HISTORY_EVENT_LIMIT: usize = 64;
+const RICH_TUI_HISTORY_PAGE_SIZE: usize = 256;
 
 pub(crate) async fn run_remote_command(command: RemoteCommand) -> Result<()> {
     match command {
@@ -627,10 +627,10 @@ async fn run_local_agent_session(
         store.read(session_id).await?
     };
     let mut history_start_reached = history.first().is_none_or(|event| event.sequence <= 1);
-    let (team_history, team_snapshots, child_histories) = if can_prompt && !fallback_terminal {
-        load_subagent_thread_state(store.as_ref(), &sessions_dir, session_id).await?
+    let (team_history, team_snapshots) = if can_prompt && !fallback_terminal {
+        subagent_state_from_history(&history)
     } else {
-        (Vec::new(), Vec::new(), HashMap::new())
+        (Vec::new(), Vec::new())
     };
     let request_id = initial_prompt
         .as_ref()
@@ -821,7 +821,7 @@ async fn run_local_agent_session(
     };
     if let Some(terminal) = terminal.as_mut() {
         terminal.seed_history(&history);
-        seed_terminal_subagent_threads(terminal, &team_snapshots, &child_histories);
+        terminal.seed_team_roster(&team_snapshots);
         terminal.seed_session_state(&session_state);
         terminal.set_auto_expand_edits(editor_preferences.presentation.auto_expand_edits);
         terminal.set_auto_expand_tools(editor_preferences.presentation.auto_expand_tools);
@@ -835,6 +835,19 @@ async fn run_local_agent_session(
         }
         terminal.draw()?;
     }
+    // Team recovery can involve the entire root projection plus one child-tail
+    // query per roster entry. Start it only after the latest root tail is on
+    // screen so it can never delay the first frame.
+    let mut team_state_task = (resuming && terminal.is_some()).then(|| {
+        let team_store = Arc::clone(&store);
+        let team_sessions_dir = sessions_dir.clone();
+        tokio::spawn(async move {
+            load_subagent_thread_state(team_store.as_ref(), &team_sessions_dir, session_id).await
+        })
+    });
+    let mut history_page_task: Option<
+        tokio::task::JoinHandle<Result<(Vec<SessionEvent>, SessionState)>>,
+    > = None;
     let mut input = (can_prompt && terminal.is_none()).then(spawn_terminal_input);
     let mut input_open = can_prompt && terminal.is_none();
     let mut status = session_state.status.unwrap_or(SessionStatus::Starting);
@@ -871,24 +884,81 @@ async fn run_local_agent_session(
     let mut shutdown_signal_open = true;
     loop {
         tokio::select! {
+            team_state_result = async {
+                team_state_task
+                    .as_mut()
+                    .expect("team-state task branch is guarded")
+                    .await
+            }, if team_state_task.is_some() => {
+                team_state_task = None;
+                match team_state_result {
+                    Ok(Ok((team_history, team_snapshots, child_histories))) => {
+                        child_pending_approvals = child_pending_approval_ids(&team_history);
+                        if let Some(terminal) = terminal.as_mut() {
+                            seed_terminal_subagent_threads(
+                                terminal,
+                                &team_snapshots,
+                                &child_histories,
+                            );
+                            terminal_dirty = true;
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        tracing::warn!(%error, "could not hydrate subagent history after first paint");
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "subagent history hydration task failed");
+                    }
+                }
+            }
+            history_page_result = async {
+                history_page_task
+                    .as_mut()
+                    .expect("history-page task branch is guarded")
+                    .await
+            }, if history_page_task.is_some() => {
+                history_page_task = None;
+                match history_page_result {
+                    Ok(Ok((older, latest_state))) if older.is_empty() => {
+                        history_start_reached = true;
+                        if let Some(terminal) = terminal.as_mut() {
+                            terminal.seed_session_state(&latest_state);
+                        }
+                    }
+                    Ok(Ok((older, latest_state))) => {
+                        history.splice(0..0, older);
+                        history_start_reached =
+                            history.first().is_none_or(|event| event.sequence <= 1);
+                        if let Some(terminal) = terminal.as_mut() {
+                            terminal.replace_history(&history);
+                            terminal.seed_session_state(&latest_state);
+                            terminal_dirty = true;
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        tracing::warn!(%error, "could not load an older transcript page");
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "older transcript page task failed");
+                    }
+                }
+            }
             _ = render_tick.tick(), if terminal.is_some() && terminal_dirty => {
                 let terminal = terminal.as_mut().expect("terminal");
                 let interaction_frame = terminal.has_pending_scroll_frame();
                 terminal.advance_scroll_frame();
-                let should_load_history =
-                    terminal.is_near_history_start() && !history_start_reached;
+                let should_load_history = terminal.take_history_page_request()
+                    && !history_start_reached
+                    && history_page_task.is_none();
                 if should_load_history {
                     let before = history.first().expect("history has an unloaded prefix").sequence;
-                    let older = older_tui_history(store.as_ref(), session_id, before).await?;
-                    if older.is_empty() {
-                        history_start_reached = true;
-                    } else {
-                        history.splice(0..0, older);
-                        terminal.replace_history(&history);
-                        terminal.seed_session_state(&store.state(session_id).await?);
-                        history_start_reached =
-                            history.first().is_none_or(|event| event.sequence <= 1);
-                    }
+                    let history_store = Arc::clone(&store);
+                    history_page_task = Some(tokio::spawn(async move {
+                        let older =
+                            older_tui_history(history_store.as_ref(), session_id, before).await?;
+                        let state = history_store.state(session_id).await?;
+                        Ok((older, state))
+                    }));
                 }
                 let draw_started = std::time::Instant::now();
                 terminal.draw()?;
@@ -3160,10 +3230,14 @@ async fn recent_tui_history(
     store
         .events_after(
             session_id,
-            latest_sequence.saturating_sub(RICH_TUI_HISTORY_EVENT_LIMIT as u64),
+            recent_tui_history_after(latest_sequence),
             RICH_TUI_HISTORY_EVENT_LIMIT,
         )
         .await
+}
+
+fn recent_tui_history_after(latest_sequence: u64) -> u64 {
+    latest_sequence.saturating_sub(RICH_TUI_HISTORY_EVENT_LIMIT as u64)
 }
 
 async fn older_tui_history(
@@ -3174,14 +3248,19 @@ async fn older_tui_history(
     let Some(after_sequence) = older_tui_history_after(before_sequence) else {
         return Ok(Vec::new());
     };
-    store
-        .events_after(session_id, after_sequence, RICH_TUI_HISTORY_PAGE_SIZE)
-        .await
+    let limit = older_tui_history_limit(before_sequence, after_sequence);
+    store.events_after(session_id, after_sequence, limit).await
 }
 
 fn older_tui_history_after(before_sequence: u64) -> Option<u64> {
     (before_sequence > 1)
         .then(|| before_sequence.saturating_sub(RICH_TUI_HISTORY_PAGE_SIZE as u64 + 1))
+}
+
+fn older_tui_history_limit(before_sequence: u64, after_sequence: u64) -> usize {
+    usize::try_from(before_sequence.saturating_sub(after_sequence.saturating_add(1)))
+        .unwrap_or(RICH_TUI_HISTORY_PAGE_SIZE)
+        .min(RICH_TUI_HISTORY_PAGE_SIZE)
 }
 
 fn child_pending_approval_ids(events: &[SessionEvent]) -> HashMap<Uuid, String> {
@@ -3222,6 +3301,18 @@ fn latest_subagent_snapshots(events: &[SessionEvent]) -> Vec<SubagentSnapshot> {
     let mut agents = latest.into_values().collect::<Vec<_>>();
     agents.sort_by(|left, right| left.task_name.cmp(&right.task_name));
     agents
+}
+
+fn subagent_state_from_history(
+    events: &[SessionEvent],
+) -> (Vec<SessionEvent>, Vec<SubagentSnapshot>) {
+    let team_history = events
+        .iter()
+        .filter(|event| matches!(&event.kind, SessionEventKind::SubagentActivity { .. }))
+        .cloned()
+        .collect::<Vec<_>>();
+    let team_snapshots = latest_subagent_snapshots(&team_history);
+    (team_history, team_snapshots)
 }
 
 fn seed_terminal_subagent_threads(
@@ -3567,6 +3658,9 @@ fn print_history(events: &[SessionEvent]) {
             ..
         } = &event.kind
         {
+            if *actor == EventActor::System {
+                continue;
+            }
             if !messages.contains_key(message_id) {
                 order.push(*message_id);
             }
@@ -4212,16 +4306,67 @@ mod tests {
     #[test]
     fn older_history_pages_end_immediately_before_the_loaded_tail() {
         assert_eq!(older_tui_history_after(1), None);
-        assert_eq!(older_tui_history_after(513), Some(0));
-        assert_eq!(older_tui_history_after(2_000), Some(975));
-        assert_eq!(975 + RICH_TUI_HISTORY_PAGE_SIZE as u64, 1_999);
+        assert_eq!(older_tui_history_after(513), Some(256));
+        assert_eq!(older_tui_history_limit(513, 256), 256);
+        assert_eq!(older_tui_history_after(2_000), Some(1_743));
+        assert_eq!(older_tui_history_limit(2_000, 1_743), 256);
+        assert_eq!(1_743 + RICH_TUI_HISTORY_PAGE_SIZE as u64, 1_999);
+        assert_eq!(older_tui_history_after(37), Some(0));
+        assert_eq!(older_tui_history_limit(37, 0), 36);
+    }
+
+    #[test]
+    fn first_resume_frame_uses_only_the_small_latest_tail() {
+        assert_eq!(recent_tui_history_after(10), 0);
+        assert_eq!(recent_tui_history_after(100), 36);
+        assert_eq!(recent_tui_history_after(60_000), 59_936);
     }
 
     #[test]
     fn child_history_tail_stays_bounded_after_long_runs_and_forks() {
-        assert_eq!(recent_child_history_after(0, 100), 0);
-        assert_eq!(recent_child_history_after(0, 60_000), 59_488);
-        assert_eq!(recent_child_history_after(59_900, 60_000), 59_900);
+        assert_eq!(recent_child_history_after(0, 100), 36);
+        assert_eq!(recent_child_history_after(0, 60_000), 59_936);
+        assert_eq!(recent_child_history_after(59_980, 60_000), 59_980);
+    }
+
+    #[test]
+    fn initial_subagent_state_uses_only_the_loaded_root_tail() {
+        let root = Uuid::new_v4();
+        let child = Uuid::new_v4();
+        let now = Utc::now();
+        let snapshot = SubagentSnapshot {
+            session_id: child,
+            parent_session_id: root,
+            task_name: "/root/worker".to_string(),
+            status: borg_remote::SubagentStatus::Ready,
+            provider: CodingProvider::Codex,
+            model: Some("gpt-test".to_string()),
+            effort: Some("low".to_string()),
+            cwd: PathBuf::from("/workspace"),
+            created_at: now,
+            updated_at: now,
+            detail: None,
+            final_text: None,
+            usage: borg_remote::SubagentUsage::default(),
+        };
+        let events = vec![
+            SessionEvent::new(root, 1, SessionEventKind::SessionStarted),
+            SessionEvent::new(
+                root,
+                2,
+                SessionEventKind::SubagentActivity {
+                    activity: borg_remote::SubagentActivityKind::Completed,
+                    agent: snapshot,
+                    event: None,
+                },
+            ),
+        ];
+
+        let (team_history, team_snapshots) = subagent_state_from_history(&events);
+
+        assert_eq!(team_history.len(), 1);
+        assert_eq!(team_snapshots.len(), 1);
+        assert_eq!(team_snapshots[0].session_id, child);
     }
 
     #[tokio::test]

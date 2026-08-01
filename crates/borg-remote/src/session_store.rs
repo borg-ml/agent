@@ -86,9 +86,13 @@ impl SessionEventKind {
                 actor: crate::EventActor::User | crate::EventActor::Assistant,
                 status: MessageStatus::Complete,
                 ..
-            }
-            | Self::TurnCompleted { .. }
-            | Self::ContextCleared => true,
+            } => true,
+            Self::Message {
+                actor: crate::EventActor::System,
+                status: MessageStatus::Complete,
+                ..
+            } => true,
+            Self::TurnCompleted { .. } | Self::ContextCleared => true,
             Self::ProviderEvent { provider, kind, .. } if provider.uses_native_harness() => {
                 matches!(
                     kind.as_str(),
@@ -100,13 +104,18 @@ impl SessionEventKind {
     }
 
     pub fn is_queue_relevant(&self) -> bool {
-        matches!(
-            self,
+        match self {
             Self::Message {
                 actor: crate::EventActor::User,
                 ..
-            } | Self::PromptRecalled { .. }
-        )
+            }
+            | Self::PromptRecalled { .. } => true,
+            Self::Message {
+                actor: crate::EventActor::System,
+                ..
+            } => true,
+            _ => false,
+        }
     }
 
     pub fn is_subagent_relevant(&self) -> bool {

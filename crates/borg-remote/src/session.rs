@@ -24,10 +24,13 @@ use crate::{
     WorkspaceEventKind, WorkspaceStore,
 };
 
+const ROOT_INBOX_REFRESH_INTERVAL: Duration = Duration::from_millis(50);
+
 #[derive(Clone)]
 struct QueuedPrompt {
     message_id: Uuid,
     text: String,
+    actor: EventActor,
     attachments: Vec<std::path::PathBuf>,
     output_schema: Option<serde_json::Value>,
     delivery: PromptDelivery,
@@ -87,10 +90,10 @@ impl WorkspaceProjection {
         match &event.kind {
             SessionEventKind::Message {
                 message_id,
-                actor: EventActor::User,
+                actor,
                 status: MessageStatus::Complete,
                 ..
-            } => {
+            } if matches!(actor, EventActor::User | EventActor::System) => {
                 self.store
                     .transition_message_delivery(
                         self.workspace_id,
@@ -659,6 +662,8 @@ async fn run_agent_session_store_kernel(
         .as_ref()
         .map(SubagentCoordinator::subscribe_root_messages)
         .unwrap_or_else(|| disabled_root_tx.subscribe());
+    let mut root_inbox_tick = tokio::time::interval(ROOT_INBOX_REFRESH_INTERVAL);
+    root_inbox_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     if owns_team {
         subagents
             .as_ref()
@@ -718,6 +723,7 @@ async fn run_agent_session_store_kernel(
         pending.push_back(QueuedPrompt {
             message_id: launch.request_id,
             text: prompt,
+            actor: EventActor::User,
             attachments: Vec::new(),
             output_schema: None,
             delivery: PromptDelivery::Steer,
@@ -758,6 +764,7 @@ async fn run_agent_session_store_kernel(
             Some(QueuedPrompt {
                 message_id: Uuid::new_v4(),
                 text: continuation_prompt(active_goal),
+                actor: EventActor::System,
                 attachments: Vec::new(),
                 output_schema: None,
                 delivery: PromptDelivery::Queue,
@@ -808,6 +815,15 @@ async fn run_agent_session_store_kernel(
                         }
                         continue;
                     }
+                    _ = root_inbox_tick.tick(), if owns_team => {
+                        refresh_durable_root_inbox(
+                            &mut journal,
+                            &events,
+                            session_id,
+                            subagents.as_ref().expect("team inbox requires coordinator"),
+                        ).await?;
+                        continue;
+                    }
                 };
                 match command {
                     Some(HostCommand::Prompt {
@@ -850,14 +866,20 @@ async fn run_agent_session_store_kernel(
                                 continue;
                             }
                         }
+                        let actor = if team_message_ids.remove(&message_id) {
+                            EventActor::System
+                        } else {
+                            EventActor::User
+                        };
                         break Some(QueuedPrompt {
                             message_id,
                             text,
+                            actor,
                             attachments,
                             output_schema,
                             delivery,
                             visible: true,
-                            interrupt_batch: !team_message_ids.remove(&message_id),
+                            interrupt_batch: actor == EventActor::User,
                         });
                     }
                     Some(HostCommand::RecallQueuedPrompt { .. }) => {}
@@ -919,6 +941,7 @@ async fn run_agent_session_store_kernel(
                                 text: continuation_prompt(
                                     goal.as_ref().expect("active goal exists"),
                                 ),
+                                actor: EventActor::System,
                                 attachments: Vec::new(),
                                 output_schema: None,
                                 delivery: PromptDelivery::Queue,
@@ -1103,7 +1126,7 @@ async fn run_agent_session_store_kernel(
                 session_id,
                 SessionEventKind::Message {
                     message_id: prompt.message_id,
-                    actor: EventActor::User,
+                    actor: prompt.actor,
                     text: prompt.text.clone(),
                     attachments: prompt.attachments.clone(),
                     status: MessageStatus::Complete,
@@ -1469,6 +1492,14 @@ async fn run_agent_session_store_kernel(
                         Err(broadcast::error::RecvError::Closed) => {}
                     }
                 }
+                _ = root_inbox_tick.tick(), if owns_team => {
+                    refresh_durable_root_inbox(
+                        &mut journal,
+                        &events,
+                        session_id,
+                        subagents.as_ref().expect("team inbox requires coordinator"),
+                    ).await?;
+                }
                 _ = async {
                     if let Some(deadline) = interrupt_deadline.as_mut() {
                         deadline.as_mut().await;
@@ -1540,22 +1571,6 @@ async fn run_agent_session_store_kernel(
                         }
                         Ok(()) => {
                             pending_steers[index].state = PendingSteerState::Accepted;
-                            // Codex has accepted ownership of this prompt even
-                            // though its user-message completion notification
-                            // arrives later. Surface that admission now so the
-                            // UI does not leave the steer in the pending panel;
-                            // retain the in-memory entry for interruption
-                            // fallback until the provider commits it.
-                            let prompt = pending_steers[index].prompt.clone();
-                            record_prompt_status(
-                                &mut journal,
-                                &events,
-                                session_id,
-                                &prompt,
-                                MessageStatus::InProgress,
-                                PromptDelivery::Steer,
-                            )
-                            .await?;
                         }
                         Err(error) => {
                             tracing::warn!(
@@ -1600,14 +1615,20 @@ async fn run_agent_session_store_kernel(
                             if journal.contains_message(session_id, message_id).await? {
                                 continue;
                             }
+                            let actor = if team_message_ids.remove(&message_id) {
+                                EventActor::System
+                            } else {
+                                EventActor::User
+                            };
                             let prompt = QueuedPrompt {
                                 message_id,
                                 text,
+                                actor,
                                 attachments,
                                 output_schema,
                                 delivery: PromptDelivery::Steer,
                                 visible: true,
-                                interrupt_batch: !team_message_ids.remove(&message_id),
+                                interrupt_batch: actor == EventActor::User,
                             };
                             record_prompt_status(
                                 &mut journal,
@@ -1648,13 +1669,18 @@ async fn run_agent_session_store_kernel(
                             if journal.contains_message(session_id, message_id).await? {
                                 continue;
                             }
+                            let actor = if team_message_ids.remove(&message_id) {
+                                EventActor::System
+                            } else {
+                                EventActor::User
+                            };
                             record(
                                 &mut journal,
                                 &events,
                                 session_id,
                                 SessionEventKind::Message {
                                     message_id,
-                                    actor: EventActor::User,
+                                    actor,
                                     text: text.clone(),
                                     attachments: attachments.clone(),
                                     status: MessageStatus::Queued,
@@ -1668,7 +1694,8 @@ async fn run_agent_session_store_kernel(
                                 output_schema,
                                 delivery: PromptDelivery::Queue,
                                 visible: true,
-                                interrupt_batch: !team_message_ids.remove(&message_id),
+                                actor,
+                                interrupt_batch: actor == EventActor::User,
                             });
                         }
                         HostCommand::RecallQueuedPrompt { message_id, .. } => {
@@ -2228,14 +2255,20 @@ fn retained_conversation_context(events: &[SessionEvent]) -> Option<String> {
                 text,
                 status: MessageStatus::Complete,
                 ..
-            } if matches!(actor, EventActor::User | EventActor::Assistant) => Some(format!(
-                "{}: {text}",
-                if *actor == EventActor::User {
-                    "User"
-                } else {
-                    "Assistant"
-                }
-            )),
+            } if matches!(
+                actor,
+                EventActor::User | EventActor::Assistant | EventActor::System
+            ) =>
+            {
+                Some(format!(
+                    "{}: {text}",
+                    if *actor == EventActor::Assistant {
+                        "Assistant"
+                    } else {
+                        "User"
+                    }
+                ))
+            }
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -2248,32 +2281,34 @@ fn recover_queued_prompts(events: &[SessionEvent]) -> VecDeque<QueuedPrompt> {
         match &event.kind {
             SessionEventKind::Message {
                 message_id,
-                actor: EventActor::User,
+                actor,
                 text,
                 attachments,
                 status: MessageStatus::Queued,
                 delivery,
-            } if !pending
-                .iter()
-                .any(|prompt: &QueuedPrompt| prompt.message_id == *message_id) =>
+            } if matches!(actor, EventActor::User | EventActor::System)
+                && !pending
+                    .iter()
+                    .any(|prompt: &QueuedPrompt| prompt.message_id == *message_id) =>
             {
                 pending.push_back(QueuedPrompt {
                     message_id: *message_id,
                     text: text.clone(),
+                    actor: *actor,
                     attachments: attachments.clone(),
                     output_schema: None,
                     delivery: delivery.unwrap_or(PromptDelivery::Queue),
                     visible: true,
-                    interrupt_batch: !is_attributed_team_message(text),
+                    interrupt_batch: *actor == EventActor::User,
                 });
             }
             SessionEventKind::Message {
                 message_id,
-                actor: EventActor::User,
+                actor,
                 status: MessageStatus::Complete,
                 delivery,
                 ..
-            } => {
+            } if matches!(actor, EventActor::User | EventActor::System) => {
                 if let Some(admitted) = pending
                     .iter()
                     .position(|prompt| prompt.message_id == *message_id)
@@ -2418,10 +2453,6 @@ fn coalesce_queued_prompts(pending: &mut VecDeque<QueuedPrompt>) {
     pending.append(&mut retained);
 }
 
-fn is_attributed_team_message(text: &str) -> bool {
-    text.starts_with("Team message from /")
-}
-
 async fn next_host_command(
     deferred: &mut VecDeque<HostCommand>,
     commands: &mut mpsc::Receiver<HostCommand>,
@@ -2464,14 +2495,20 @@ async fn collect_input_at_turn_boundary(
                 if journal.contains_message(session_id, message_id).await? {
                     continue;
                 }
+                let actor = if team_message_ids.remove(&message_id) {
+                    EventActor::System
+                } else {
+                    EventActor::User
+                };
                 let prompt = QueuedPrompt {
                     message_id,
                     text,
+                    actor,
                     attachments,
                     output_schema,
                     delivery: PromptDelivery::Queue,
                     visible: true,
-                    interrupt_batch: !team_message_ids.remove(&message_id),
+                    interrupt_batch: actor == EventActor::User,
                 };
                 record_prompt_status(
                     journal,
@@ -2624,7 +2661,7 @@ async fn record_prompt_status(
         session_id,
         SessionEventKind::Message {
             message_id: prompt.message_id,
-            actor: EventActor::User,
+            actor: prompt.actor,
             text: prompt.text.clone(),
             attachments: prompt.attachments.clone(),
             status,
@@ -2992,6 +3029,22 @@ async fn record_subagent_activity(
     subagents: &SubagentCoordinator,
     activity: SubagentActivity,
 ) -> Result<()> {
+    let projected_message_id = match &activity {
+        SubagentActivity::SessionEvent {
+            event:
+                SessionEvent {
+                    kind: SessionEventKind::Message { message_id, .. },
+                    ..
+                },
+            ..
+        } => Some(*message_id),
+        _ => None,
+    };
+    if let Some(message_id) = projected_message_id
+        && subagents.root_message_is_projected(message_id).await
+    {
+        return Ok(());
+    }
     let (kind, agent, event) = match activity {
         SubagentActivity::Started { agent } => (SubagentActivityKind::Started, agent, None),
         SubagentActivity::Completed { agent } => (SubagentActivityKind::Completed, agent, None),
@@ -3014,7 +3067,23 @@ async fn record_subagent_activity(
             event,
         },
     )
-    .await
+    .await?;
+    if let Some(message_id) = projected_message_id {
+        subagents.mark_root_message_projected(message_id).await;
+    }
+    Ok(())
+}
+
+async fn refresh_durable_root_inbox(
+    journal: &mut RuntimeSessionStore,
+    events: &mpsc::Sender<SessionEvent>,
+    session_id: Uuid,
+    subagents: &SubagentCoordinator,
+) -> Result<()> {
+    for (_, activity) in subagents.refresh_root_inbox_reports().await? {
+        record_subagent_activity(journal, events, session_id, subagents, activity).await?;
+    }
+    Ok(())
 }
 
 async fn apply_subagent_action(
@@ -4849,7 +4918,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accepted_codex_steer_is_admitted_before_the_user_message_commits() {
+    async fn accepted_codex_steer_stays_pending_until_the_user_message_commits() {
         let root = tempdir().unwrap();
         let journal_path = root.path().join("session.jsonl");
         let session_id = Uuid::new_v4();
@@ -4921,14 +4990,7 @@ mod tests {
             .expect("provider accepts steer transport");
 
         let mut transitions = Vec::new();
-        while !transitions
-            .iter()
-            .any(|(status, _)| *status == MessageStatus::InProgress)
-        {
-            let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
-                .await
-                .expect("accepted steer event arrives")
-                .expect("session remains open");
+        while let Ok(event) = event_rx.try_recv() {
             if let SessionEventKind::Message {
                 message_id,
                 status,
@@ -4942,11 +5004,8 @@ mod tests {
         }
         assert_eq!(
             transitions,
-            [
-                (MessageStatus::Queued, PromptDelivery::Steer),
-                (MessageStatus::InProgress, PromptDelivery::Steer),
-            ],
-            "transport acknowledgement should admit the steer without waiting for provider commit"
+            [(MessageStatus::Queued, PromptDelivery::Steer)],
+            "transport acknowledgement must not hide an uncommitted steer"
         );
 
         release_commit.notify_one();
@@ -5972,6 +6031,7 @@ mod tests {
             QueuedPrompt {
                 message_id: first_visible_id,
                 text: "first".to_string(),
+                actor: EventActor::User,
                 attachments: Vec::new(),
                 output_schema: None,
                 delivery: PromptDelivery::Queue,
@@ -5981,6 +6041,7 @@ mod tests {
             QueuedPrompt {
                 message_id: internal_id,
                 text: "internal continuation".to_string(),
+                actor: EventActor::System,
                 attachments: Vec::new(),
                 output_schema: None,
                 delivery: PromptDelivery::Queue,
@@ -5990,6 +6051,7 @@ mod tests {
             QueuedPrompt {
                 message_id: second_visible_id,
                 text: "second".to_string(),
+                actor: EventActor::User,
                 attachments: Vec::new(),
                 output_schema: None,
                 delivery: PromptDelivery::Queue,
@@ -5999,6 +6061,7 @@ mod tests {
             QueuedPrompt {
                 message_id: Uuid::new_v4(),
                 text: "pending steer".to_string(),
+                actor: EventActor::User,
                 attachments: Vec::new(),
                 output_schema: None,
                 delivery: PromptDelivery::Steer,
@@ -6048,6 +6111,7 @@ mod tests {
             prompt: QueuedPrompt {
                 message_id,
                 text: "steer".to_string(),
+                actor: EventActor::User,
                 attachments: Vec::new(),
                 output_schema: None,
                 delivery: PromptDelivery::Steer,
@@ -6098,6 +6162,7 @@ mod tests {
             QueuedPrompt {
                 message_id: Uuid::new_v4(),
                 text: "first [Image 1]".to_string(),
+                actor: EventActor::User,
                 attachments: vec![first_image.clone()],
                 output_schema: None,
                 delivery: PromptDelivery::Queue,
@@ -6107,6 +6172,7 @@ mod tests {
             QueuedPrompt {
                 message_id: Uuid::new_v4(),
                 text: "second".to_string(),
+                actor: EventActor::User,
                 attachments: Vec::new(),
                 output_schema: None,
                 delivery: PromptDelivery::Queue,
@@ -6116,6 +6182,7 @@ mod tests {
             QueuedPrompt {
                 message_id: last_id,
                 text: "last [Image 2]".to_string(),
+                actor: EventActor::User,
                 attachments: vec![last_image.clone()],
                 output_schema: None,
                 delivery: PromptDelivery::Queue,
@@ -6141,6 +6208,11 @@ mod tests {
         let prompt = |text: &str, interrupt_batch| QueuedPrompt {
             message_id: Uuid::new_v4(),
             text: text.to_string(),
+            actor: if interrupt_batch {
+                EventActor::User
+            } else {
+                EventActor::System
+            },
             attachments: Vec::new(),
             output_schema: None,
             delivery: PromptDelivery::Queue,
@@ -6403,7 +6475,7 @@ mod tests {
             1,
             SessionEventKind::Message {
                 message_id: Uuid::new_v4(),
-                actor: EventActor::User,
+                actor: EventActor::System,
                 text: "Team message from /root/worker:\n\ninternal report".to_string(),
                 attachments: Vec::new(),
                 status: MessageStatus::Queued,

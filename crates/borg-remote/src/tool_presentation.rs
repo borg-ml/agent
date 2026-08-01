@@ -815,9 +815,10 @@ fn format_mcp_tool_name(name: &str) -> String {
             .map(|action| (service, action))
     })
     .unwrap_or((server, action));
+    let service = service.replace(['_', '-'], " ");
     format!(
         "{} · {}",
-        title_case(service),
+        title_case(&service),
         action.replace(['_', '-'], " ")
     )
 }
@@ -1300,6 +1301,19 @@ mod tests {
         assert_eq!(activity.label, "Agent interrupted");
         assert_eq!(activity.detail, "capability_architecture_rank");
         assert_eq!(activity.category, ToolPresentationCategory::Agent);
+    }
+
+    #[test]
+    fn humanizes_underscored_mcp_server_names() {
+        let decision = project_tool_presentation(
+            "mcp__borg_agent__record_workspace_decision",
+            &json!({"decision":"opaque IO close state on host failure"}),
+            None,
+            false,
+        );
+
+        assert_eq!(decision.label, "Borg agent · record workspace decision");
+        assert!(!decision.label.contains('_'));
     }
 
     #[test]

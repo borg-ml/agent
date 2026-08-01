@@ -1145,7 +1145,9 @@ fn todo_status_counts_open_items_and_tooltip_matches_plan_order_and_clipping() {
     assert_eq!(transcript.todo_status().as_deref(), Some("4 open to-dos"));
     let rows = transcript.todo_tooltip_rows(false);
     assert_eq!(rows.len(), MAX_COLLAPSED_PLAN_ITEMS + 1);
+    assert!(rows[0].starts_with("●  "));
     assert!(rows[0].contains("Ship the hover affordance"));
+    assert!(rows[1].starts_with("○  "));
     assert!(rows[1].contains("Run the regression tests"));
     assert!(
         rows.last()
@@ -2447,7 +2449,7 @@ fn picker_numbers_are_visible_and_select_immediately() {
 }
 
 #[test]
-fn accepted_steer_leaves_pending_projection_before_user_message_commit() {
+fn accepted_steer_stays_pending_until_user_message_commit() {
     let message_id = Uuid::new_v4();
     let mut queue = Vec::new();
     update_queued_prompts(
@@ -2481,7 +2483,8 @@ fn accepted_steer_leaves_pending_projection_before_user_message_commit() {
             delivery: Some(PromptDelivery::Steer),
         },
     );
-    assert!(queue.is_empty());
+    assert_eq!(queue.len(), 1);
+    assert_eq!(queue[0].message_id, message_id);
 
     update_queued_prompts(
         &mut queue,
@@ -2495,6 +2498,93 @@ fn accepted_steer_leaves_pending_projection_before_user_message_commit() {
         },
     );
     assert!(queue.is_empty());
+}
+
+#[test]
+fn in_progress_steer_never_materializes_as_a_responding_message() {
+    let session_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    let message = |sequence, status| {
+        SessionEvent::new(
+            session_id,
+            sequence,
+            SessionEventKind::Message {
+                message_id,
+                actor: EventActor::User,
+                text: "follow up".to_string(),
+                attachments: Vec::new(),
+                status,
+                delivery: Some(PromptDelivery::Steer),
+            },
+        )
+    };
+    let mut transcript = Transcript::default();
+
+    transcript.apply(&message(1, MessageStatus::Queued));
+    transcript.apply(&message(2, MessageStatus::InProgress));
+    assert!(transcript.order.is_empty());
+
+    transcript.apply(&message(3, MessageStatus::Complete));
+    assert_eq!(transcript.order.len(), 1);
+    assert!(matches!(
+        &transcript.order[0],
+        TranscriptEntry::Message {
+            actor: EventActor::User,
+            text,
+            complete: true,
+            ..
+        } if text == "follow up"
+    ));
+}
+
+#[test]
+fn internal_team_delivery_never_renders_or_enters_user_prompt_history() {
+    let session_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    let text = "Team message from /root/worker:\n\nchild result".to_string();
+    let current = SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::Message {
+            message_id,
+            actor: EventActor::System,
+            text: text.clone(),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: Some(PromptDelivery::Queue),
+        },
+    );
+
+    let mut transcript = Transcript::default();
+    transcript.apply(&current);
+    assert!(transcript.order.is_empty());
+
+    let mut composer = Composer::default();
+    composer.seed_session_events(std::slice::from_ref(&current));
+    assert!(composer.history.is_empty());
+
+    let mut pending = Vec::new();
+    update_queued_prompts(
+        &mut pending,
+        &SessionEventKind::Message {
+            message_id,
+            actor: EventActor::System,
+            text,
+            attachments: Vec::new(),
+            status: MessageStatus::Queued,
+            delivery: Some(PromptDelivery::Queue),
+        },
+    );
+    assert!(pending.is_empty());
+}
+
+#[test]
+fn historical_pages_require_explicit_upward_navigation() {
+    assert!(!should_load_history_page(false, 100, 100, 24));
+    assert!(!should_load_history_page(false, 0, 0, 24));
+    assert!(!should_load_history_page(true, 0, 1_000, 24));
+    assert!(should_load_history_page(true, 960, 1_000, 24));
+    assert!(should_load_history_page(true, 0, 0, 24));
 }
 
 #[test]
@@ -3913,6 +4003,18 @@ fn rich_plan_orders_active_work_first_and_mutes_completed_work() {
     let pending = find("Still to do");
     let completed = find("Already done");
     assert!(in_progress < pending && pending < completed);
+    let in_progress_marker = lines[in_progress]
+        .spans
+        .iter()
+        .find(|span| span.content.contains('●'))
+        .expect("in-progress plan marker");
+    assert!(!in_progress_marker.content.contains('◌'));
+    let pending_marker = lines[pending]
+        .spans
+        .iter()
+        .find(|span| span.content.contains('○'))
+        .expect("pending plan marker");
+    assert!(!pending_marker.content.contains('●'));
     assert!(
         lines
             .iter()
@@ -3965,7 +4067,7 @@ fn plan_cards_copy_the_complete_readable_todo_list() {
 
     assert_eq!(
         entry.copy_text_owned().as_deref(),
-        Some("✓ Inspect scrolling\n◌ Polish interactions")
+        Some("✓ Inspect scrolling\n● Polish interactions")
     );
 }
 

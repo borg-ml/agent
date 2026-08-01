@@ -537,6 +537,7 @@ pub struct BorgTerminal {
     last_ctrl_c: Option<Instant>,
     queued_prompts: Vec<PendingPromptProjection>,
     replaying_history: bool,
+    history_page_requested: bool,
     picker: Option<Picker>,
     /// Model the user picked from a provider that still needs credentials;
     /// applied once the auth picker resolves.
@@ -1217,6 +1218,7 @@ impl BorgTerminal {
             last_ctrl_c: None,
             queued_prompts: Vec::new(),
             replaying_history: false,
+            history_page_requested: false,
             picker: None,
             pending_auth_model: None,
             keybindings_open: false,
@@ -1269,6 +1271,14 @@ impl BorgTerminal {
     }
 
     pub fn seed_history(&mut self, events: &[SessionEvent]) {
+        // A newly resumed terminal always opens at the live tail. Historical
+        // hydration is presentation state, never a reason to inherit or
+        // animate an older viewport position.
+        self.scroll_from_bottom = 0;
+        self.scroll_motion.cancel();
+        self.history_page_requested = false;
+        self.pending_scroll_anchor_height = None;
+        self.pending_transcript_anchor = None;
         self.transcript.reserve_history(events.len());
         self.rewind_targets.reserve(events.len() / 4);
         self.composer.seed_session_events(events);
@@ -1276,6 +1286,7 @@ impl BorgTerminal {
         for event in events {
             let _ = self.apply_session_event(event);
         }
+        self.transcript.follow_tail = true;
         self.replaying_history = false;
     }
 
@@ -1303,13 +1314,22 @@ impl BorgTerminal {
         self.transcript_render_cache = None;
     }
 
-    pub fn is_near_history_start(&self) -> bool {
-        let threshold = self
-            .transcript_viewport_area
-            .map_or(24, |area| usize::from(area.height).saturating_mul(2));
-        self.transcript_scroll_max
-            .saturating_sub(self.scroll_from_bottom.min(self.transcript_scroll_max))
-            <= threshold
+    /// Consume one explicit upward-navigation request once the loaded
+    /// transcript is near its oldest edge. Ordinary redraw/activity ticks
+    /// must never hydrate historical pages behind a user who is following the
+    /// live tail.
+    pub fn take_history_page_request(&mut self) -> bool {
+        let viewport_height = self.transcript_viewport_area.map_or(12, |area| area.height);
+        let should_load = should_load_history_page(
+            self.history_page_requested,
+            self.scroll_from_bottom,
+            self.transcript_scroll_max,
+            usize::from(viewport_height),
+        );
+        if should_load {
+            self.history_page_requested = false;
+        }
+        should_load
     }
 
     pub fn seed_session_state(&mut self, state: &SessionState) {
@@ -2578,6 +2598,7 @@ impl BorgTerminal {
                             false
                         };
                         if !consumed {
+                            self.history_page_requested = true;
                             let viewport_height =
                                 self.transcript_viewport_area.map_or(1, |area| area.height);
                             self.queue_wheel_scroll(wheel_scroll_distance(
@@ -2614,6 +2635,7 @@ impl BorgTerminal {
                             false
                         };
                         if !consumed {
+                            self.history_page_requested = false;
                             let viewport_height =
                                 self.transcript_viewport_area.map_or(1, |area| area.height);
                             self.queue_wheel_scroll(-wheel_scroll_distance(
@@ -4783,10 +4805,12 @@ impl BorgTerminal {
             });
         }
         if self.keymap.matches(KeyAction::ScrollUp, &key) {
+            self.history_page_requested = true;
             self.scroll_from_bottom = self.scroll_from_bottom.saturating_add(8);
             return Ok(UiAction::None);
         }
         if self.keymap.matches(KeyAction::ScrollDown, &key) {
+            self.history_page_requested = false;
             self.scroll_from_bottom = self.scroll_from_bottom.saturating_sub(8);
             return Ok(UiAction::None);
         }
@@ -6104,8 +6128,17 @@ impl Transcript {
                 text,
                 status,
                 attachments,
-                ..
+                delivery,
             } => {
+                // Team delivery is provider input, not a human-authored chat
+                // message. Its child-authored report is projected separately
+                // through SubagentActivity with the correct agent identity.
+                // System delivery is provider input, not a chat row. The
+                // child-authored report is rendered through SubagentActivity.
+                if *actor == EventActor::System {
+                    removed_entry = self.remove_message(*message_id);
+                    return removed_entry;
+                }
                 // Queued prompts belong to the pending-input projection only.
                 // Materializing an invisible transcript row here would pin the
                 // eventual admitted message to its enqueue position instead of
@@ -6115,6 +6148,17 @@ impl Transcript {
                     // in-progress transcript row. If the turn is interrupted,
                     // its later queue transition must withdraw that row again.
                     removed_entry = self.remove_message(*message_id);
+                    return removed_entry;
+                }
+                // A transport-level Codex acknowledgement is not yet a real
+                // user-message boundary. Keep an acknowledged steer in the
+                // pending-input panel until its correlated provider commit;
+                // this also suppresses stale InProgress events written by
+                // older runtimes when resuming a session.
+                if *actor == EventActor::User
+                    && *status == MessageStatus::InProgress
+                    && *delivery == Some(PromptDelivery::Steer)
+                {
                     return removed_entry;
                 }
                 if *actor == EventActor::Assistant && text.trim().is_empty() {
@@ -6805,7 +6849,7 @@ impl Transcript {
             .map(|item| {
                 let glyph = match item.status {
                     PlanItemStatus::Completed => "✓",
-                    PlanItemStatus::InProgress => "◌",
+                    PlanItemStatus::InProgress => "●",
                     PlanItemStatus::Pending => "○",
                 };
                 format!("{glyph}  {}", item.content)
@@ -7136,7 +7180,7 @@ impl Transcript {
                                     .add_modifier(Modifier::CROSSED_OUT),
                             ),
                             PlanItemStatus::InProgress => (
-                                "◌",
+                                "●",
                                 Style::default()
                                     .fg(Color::LightGreen)
                                     .add_modifier(Modifier::BOLD),
@@ -8037,12 +8081,11 @@ fn update_queued_prompts(
 ) {
     match event {
         SessionEventKind::Message {
-            message_id,
             actor: EventActor::User,
             status: MessageStatus::InProgress,
             delivery: Some(PromptDelivery::Steer),
             ..
-        } => queued_prompts.retain(|queued| queued.message_id != *message_id),
+        } => {}
         SessionEventKind::Message {
             message_id,
             actor: EventActor::User,
@@ -8270,7 +8313,7 @@ impl TranscriptEntry {
                     .map(|item| {
                         let marker = match item.status {
                             PlanItemStatus::Completed => "✓",
-                            PlanItemStatus::InProgress => "◌",
+                            PlanItemStatus::InProgress => "●",
                             PlanItemStatus::Pending => "○",
                         };
                         format!("{marker} {}", item.content)
@@ -8491,6 +8534,17 @@ fn preserve_scroll_anchor(
 
 fn should_preserve_transcript_viewport(scroll_from_bottom: usize, selection_active: bool) -> bool {
     scroll_from_bottom > 0 && !selection_active
+}
+
+fn should_load_history_page(
+    explicitly_requested: bool,
+    scroll_from_bottom: usize,
+    scroll_max: usize,
+    viewport_height: usize,
+) -> bool {
+    explicitly_requested
+        && scroll_max.saturating_sub(scroll_from_bottom.min(scroll_max))
+            <= viewport_height.saturating_mul(2)
 }
 
 fn transcript_viewport_anchor(

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -16,7 +16,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader
 use tokio::net::TcpListener;
 #[cfg(unix)]
 use tokio::net::UnixListener;
-use tokio::sync::{Mutex, broadcast, mpsc};
+use tokio::sync::{Mutex, OnceCell, broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 use ts_rs::TS;
 use uuid::Uuid;
@@ -849,6 +849,8 @@ impl SubagentTable {
 pub(crate) struct TeamInboxMessage {
     pub message_id: Uuid,
     pub text: String,
+    pub report_text: String,
+    pub sender_session_id: Uuid,
     pub delivery: PromptDelivery,
 }
 
@@ -869,10 +871,12 @@ pub struct SubagentCoordinator {
     root_launch: LaunchSession,
     executor: Arc<dyn crate::AgentTurnExecutor>,
     store: Arc<dyn SessionStore>,
+    workspace_store: Arc<OnceCell<SqliteWorkspaceStore>>,
     table: Arc<Mutex<SubagentTable>>,
     activity_tx: broadcast::Sender<SubagentActivity>,
     root_inbox: Arc<Mutex<Vec<TeamInboxMessage>>>,
     root_message_tx: broadcast::Sender<TeamInboxMessage>,
+    projected_root_messages: Arc<Mutex<HashSet<Uuid>>>,
 }
 
 impl SubagentCoordinator {
@@ -894,6 +898,7 @@ impl SubagentCoordinator {
             root_launch,
             executor,
             store,
+            workspace_store: Arc::new(OnceCell::new()),
             table: Arc::new(Mutex::new(SubagentTable {
                 root_session_id,
                 max_children,
@@ -903,6 +908,7 @@ impl SubagentCoordinator {
             activity_tx,
             root_inbox: Arc::new(Mutex::new(Vec::new())),
             root_message_tx,
+            projected_root_messages: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 
@@ -916,6 +922,86 @@ impl SubagentCoordinator {
 
     pub(crate) async fn take_root_inbox(&self) -> Vec<TeamInboxMessage> {
         std::mem::take(&mut *self.root_inbox.lock().await)
+    }
+
+    async fn workspace_store(&self) -> Result<&SqliteWorkspaceStore> {
+        let path = self.journal_root.join("workspaces.sqlite3");
+        self.workspace_store
+            .get_or_try_init(|| async move { SqliteWorkspaceStore::open(path).await })
+            .await
+    }
+
+    /// Reconcile durable workspace deliveries into the director's local
+    /// inbox and return any queued child reports that still need a root
+    /// transcript projection. This is deliberately pollable: agent MCP calls
+    /// may run outside the director process, where an in-memory broadcast
+    /// cannot wake the root session.
+    pub(crate) async fn refresh_root_inbox_reports(&self) -> Result<Vec<(Uuid, SubagentActivity)>> {
+        let root_session_id = self.table.lock().await.root_session_id;
+        let pending = self.pending_messages_for_session(root_session_id).await?;
+        let projected = self.projected_root_messages.lock().await.clone();
+        let mut reports = Vec::new();
+        for message in pending {
+            if self
+                .store
+                .contains_message(root_session_id, message.message_id)
+                .await?
+            {
+                self.acknowledge_message_for_session(root_session_id, message.message_id)
+                    .await?;
+                continue;
+            }
+            {
+                let mut inbox = self.root_inbox.lock().await;
+                if !inbox
+                    .iter()
+                    .any(|queued| queued.message_id == message.message_id)
+                {
+                    inbox.push(message.clone());
+                }
+            }
+            if message.delivery != PromptDelivery::Queue || projected.contains(&message.message_id)
+            {
+                continue;
+            }
+            let Some(agent) = self.get(message.sender_session_id).await else {
+                continue;
+            };
+            if agent.session_id == root_session_id {
+                continue;
+            }
+            reports.push((
+                message.message_id,
+                SubagentActivity::SessionEvent {
+                    parent_session_id: root_session_id,
+                    task_name: agent.task_name.clone(),
+                    event: SessionEvent::new(
+                        agent.session_id,
+                        0,
+                        SessionEventKind::Message {
+                            message_id: message.message_id,
+                            actor: crate::EventActor::Assistant,
+                            text: message.report_text.clone(),
+                            attachments: Vec::new(),
+                            status: MessageStatus::Complete,
+                            delivery: None,
+                        },
+                    ),
+                },
+            ));
+        }
+        Ok(reports)
+    }
+
+    pub(crate) async fn mark_root_message_projected(&self, message_id: Uuid) {
+        self.projected_root_messages.lock().await.insert(message_id);
+    }
+
+    pub(crate) async fn root_message_is_projected(&self, message_id: Uuid) -> bool {
+        self.projected_root_messages
+            .lock()
+            .await
+            .contains(&message_id)
     }
 
     // Message persistence keeps sender, recipient, admission, and audience
@@ -935,6 +1021,8 @@ impl SubagentCoordinator {
             return Ok(TeamInboxMessage {
                 message_id: Uuid::new_v4(),
                 text: attributed_team_message(actor, message),
+                report_text: message.to_string(),
+                sender_session_id: actor_session_id,
                 delivery: prompt_delivery,
             });
         }
@@ -957,8 +1045,7 @@ impl SubagentCoordinator {
         let text = attributed_team_message(actor, message);
         let message_id = Uuid::new_v4();
         let created_at = Utc::now();
-        let workspace_store =
-            SqliteWorkspaceStore::open(self.journal_root.join("workspaces.sqlite3")).await?;
+        let workspace_store = self.workspace_store().await?;
         workspace_store
             .append(WorkspaceEvent {
                 id: message_id,
@@ -975,7 +1062,7 @@ impl SubagentCoordinator {
                         reply_to_message_id: options.reply_to_message_id,
                         author_id: actor_binding.participant_id,
                         body: WorkspaceMessageBody {
-                            text: text.clone(),
+                            text: message.to_string(),
                             mentions: options.mentions,
                         },
                         audience: Audience::Direct {
@@ -990,6 +1077,8 @@ impl SubagentCoordinator {
         Ok(TeamInboxMessage {
             message_id,
             text,
+            report_text: message.to_string(),
+            sender_session_id: actor_session_id,
             delivery: prompt_delivery,
         })
     }
@@ -1006,26 +1095,29 @@ impl SubagentCoordinator {
             .workspace_binding(session_id)
             .await?
             .with_context(|| format!("team session {session_id} has no workspace"))?;
-        let workspace_store =
-            SqliteWorkspaceStore::open(self.journal_root.join("workspaces.sqlite3")).await?;
-        let messages = workspace_store
+        let workspace_store = self.workspace_store().await?;
+        let pending = workspace_store
             .pending_message_events(binding.workspace_id, binding.participant_id, 10_000)
-            .await?
-            .into_iter()
-            .filter_map(|(event, delivery)| {
-                let WorkspaceEventKind::Message { message, .. } = event.kind else {
-                    return None;
-                };
-                Some(TeamInboxMessage {
-                    message_id: message.id,
-                    text: message.body.text,
-                    delivery: match delivery.mode {
-                        DeliveryMode::Boundary | DeliveryMode::Wake => PromptDelivery::Steer,
-                        DeliveryMode::NextTurn | DeliveryMode::Notify => PromptDelivery::Queue,
-                    },
-                })
-            })
-            .collect::<Vec<_>>();
+            .await?;
+        let mut messages = Vec::with_capacity(pending.len());
+        for (event, delivery) in pending {
+            let WorkspaceEventKind::Message { message, .. } = event.kind else {
+                continue;
+            };
+            let Ok(actor) = self.task_name_for_session(message.author_id).await else {
+                continue;
+            };
+            messages.push(TeamInboxMessage {
+                message_id: message.id,
+                text: attributed_team_message(&actor, &message.body.text),
+                report_text: message.body.text,
+                sender_session_id: message.author_id,
+                delivery: match delivery.mode {
+                    DeliveryMode::Boundary | DeliveryMode::Wake => PromptDelivery::Steer,
+                    DeliveryMode::NextTurn | DeliveryMode::Notify => PromptDelivery::Queue,
+                },
+            });
+        }
         Ok(messages)
     }
 
@@ -1050,8 +1142,7 @@ impl SubagentCoordinator {
             .workspace_binding(session_id)
             .await?
             .context("team session has no workspace")?;
-        let store =
-            SqliteWorkspaceStore::open(self.journal_root.join("workspaces.sqlite3")).await?;
+        let store = self.workspace_store().await?;
         let _ = store.pending_message_events(binding.workspace_id, binding.participant_id, 10_000).await?
             .into_iter().find(|(event, _)| matches!(&event.kind, WorkspaceEventKind::Message { message, .. } if message.id == message_id))
             .context("unread team message not found")?;
@@ -1083,11 +1174,23 @@ impl SubagentCoordinator {
     /// projections only supply each child actor's conversational state.
     pub async fn restore_from_events(&self, events: &[SessionEvent]) -> Result<()> {
         let mut latest = HashMap::<Uuid, SubagentSnapshot>::new();
+        let mut projected_root_messages = HashSet::new();
         for event in events {
-            if let SessionEventKind::SubagentActivity { agent, .. } = &event.kind {
+            if let SessionEventKind::SubagentActivity {
+                agent,
+                event: child_event,
+                ..
+            } = &event.kind
+            {
                 latest.insert(agent.session_id, agent.clone());
+                if let Some(child_event) = child_event
+                    && let SessionEventKind::Message { message_id, .. } = &child_event.kind
+                {
+                    projected_root_messages.insert(*message_id);
+                }
             }
         }
+        *self.projected_root_messages.lock().await = projected_root_messages;
         let mut resumable = Vec::new();
         let mut recovery_failures = Vec::new();
         let root_session_id = self.table.lock().await.root_session_id;
@@ -1179,8 +1282,12 @@ impl SubagentCoordinator {
                     .await?;
                 continue;
             }
-            if let Err(error) = self.root_message_tx.send(message) {
-                self.root_inbox.lock().await.push(error.0);
+            if message.delivery == PromptDelivery::Steer {
+                if let Err(error) = self.root_message_tx.send(message) {
+                    self.root_inbox.lock().await.push(error.0);
+                }
+            } else {
+                self.root_inbox.lock().await.push(message);
             }
         }
         let child_ids = self
@@ -1293,8 +1400,7 @@ impl SubagentCoordinator {
                 .with_context(|| {
                     format!("subagent session {actor_session_id} has no workspace binding")
                 })?;
-            let workspace_store =
-                SqliteWorkspaceStore::open(self.journal_root.join("workspaces.sqlite3")).await?;
+            let workspace_store = self.workspace_store().await?;
             let human_display_name =
                 std::env::var("USER").unwrap_or_else(|_| "Local user".to_string());
             let human_participant_id = crate::local_human_participant_id(&human_display_name);
@@ -1380,6 +1486,10 @@ impl SubagentCoordinator {
             .entries
             .get(&session_id)
             .map(|entry| entry.snapshot.clone())
+    }
+
+    async fn task_name_for_session(&self, session_id: Uuid) -> Result<String> {
+        self.table.lock().await.task_name(session_id)
     }
 
     pub async fn resolve_snapshot(&self, target: &str) -> Result<SubagentSnapshot> {
@@ -1524,7 +1634,7 @@ impl SubagentCoordinator {
         }
         let message_id = Uuid::new_v4();
         let created_at = Utc::now();
-        SqliteWorkspaceStore::open(self.journal_root.join("workspaces.sqlite3"))
+        self.workspace_store()
             .await?
             .append(WorkspaceEvent {
                 id: message_id,
@@ -1541,7 +1651,7 @@ impl SubagentCoordinator {
                         reply_to_message_id: None,
                         author_id: sender.participant_id,
                         body: WorkspaceMessageBody {
-                            text: attributed_team_message(&actor, &message),
+                            text: message.clone(),
                             mentions: Vec::new(),
                         },
                         audience: Audience::Participants {
@@ -1556,6 +1666,8 @@ impl SubagentCoordinator {
         let inbox = TeamInboxMessage {
             message_id,
             text: attributed_team_message(&actor, &message),
+            report_text: message,
+            sender_session_id: actor_session_id,
             delivery: PromptDelivery::Queue,
         };
         let root_session_id = self.table.lock().await.root_session_id;
@@ -3138,6 +3250,66 @@ mod tests {
         assert!(queued.text.contains("blocked on an API decision"));
         assert!(followup.text.contains("please review"));
         assert!(coordinator.take_root_inbox().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn durable_root_inbox_poll_recovers_a_report_without_a_process_local_receiver() {
+        let directory = tempdir().unwrap();
+        let root = Uuid::new_v4();
+        let store = Arc::new(
+            crate::SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
+                .await
+                .unwrap(),
+        );
+        store.create_session(root).await.unwrap();
+        let coordinator = SubagentCoordinator::new_with_store_and_executor(
+            directory.path(),
+            root,
+            launch(),
+            3,
+            Arc::new(crate::LocalAgentTurnExecutor::default()),
+            store.clone(),
+        )
+        .unwrap();
+        let worker = coordinator
+            .table
+            .lock()
+            .await
+            .reserve("worker", &launch())
+            .unwrap();
+        bind_test_team(directory.path(), store.as_ref(), root, &[worker.session_id]).await;
+
+        // No activity receiver exists. The immediate in-memory projection is
+        // therefore lost exactly as it would be across an MCP process boundary.
+        coordinator
+            .send_message_as(worker.session_id, "/root", "durable result")
+            .await
+            .unwrap();
+
+        let reports = coordinator.refresh_root_inbox_reports().await.unwrap();
+        assert_eq!(reports.len(), 1);
+        let (message_id, SubagentActivity::SessionEvent { event, .. }) = &reports[0] else {
+            panic!("expected a recovered child report");
+        };
+        assert!(matches!(
+            &event.kind,
+            SessionEventKind::Message {
+                actor: crate::EventActor::Assistant,
+                text,
+                status: MessageStatus::Complete,
+                ..
+            } if text == "durable result"
+        ));
+        coordinator.mark_root_message_projected(*message_id).await;
+        assert!(
+            coordinator
+                .refresh_root_inbox_reports()
+                .await
+                .unwrap()
+                .is_empty(),
+            "a projected durable report must not repeat on every poll"
+        );
+        assert_eq!(coordinator.take_root_inbox().await.len(), 1);
     }
 
     #[tokio::test]
