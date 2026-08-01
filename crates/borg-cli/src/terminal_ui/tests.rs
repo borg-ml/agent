@@ -102,6 +102,37 @@ fn team_roster_hover_is_visually_distinct_from_focus_and_idle() {
 }
 
 #[test]
+fn hover_redraw_gate_ignores_motion_inside_one_target() {
+    let idle = HoverState {
+        hovered_tool: None,
+        hovered_tool_run_header: None,
+        hovered_entry: None,
+        hovered_message: None,
+        hovered_picker_option: None,
+        hovered_team_roster: None,
+        status_hovered: false,
+        goal_status_hovered: false,
+        todo_status_hovered: false,
+        agents_status_hovered: false,
+        model_status_hovered: false,
+        effort_status_hovered: false,
+        fast_status_hovered: false,
+        permission_status_hovered: false,
+        back_to_director_hovered: false,
+        scrollbar_hovered: false,
+        jump_to_bottom_hovered: false,
+        keybindings_hovered: false,
+    };
+    let running = HoverState {
+        status_hovered: true,
+        ..idle
+    };
+
+    assert!(!hover_state_changed(idle, idle));
+    assert!(hover_state_changed(idle, running));
+}
+
+#[test]
 fn team_roster_hit_testing_selects_each_exact_agent_row() {
     let first = Uuid::new_v4();
     let second = Uuid::new_v4();
@@ -2068,6 +2099,33 @@ fn agents_status_hover_underlines_only_the_label() {
 }
 
 #[test]
+fn model_effort_and_permission_hover_show_bottom_interaction_hints() {
+    let hint = |agents, model, effort, permission| {
+        bottom_interaction_hint(
+            false, false, false, false, agents, model, effort, permission,
+        )
+    };
+
+    assert_eq!(
+        hint(true, false, false, false),
+        Some("left click to open agents menu")
+    );
+    assert_eq!(
+        hint(false, true, false, false),
+        Some("left click change model")
+    );
+    assert_eq!(
+        hint(false, false, true, false),
+        Some("left click change effort")
+    );
+    assert_eq!(
+        hint(false, false, false, true),
+        Some("left click change permissions")
+    );
+    assert_eq!(hint(false, false, false, false), None);
+}
+
+#[test]
 fn subagent_activity_collapses_chatter_and_keeps_terminal_result() {
     let parent_id = Uuid::new_v4();
     let child_id = Uuid::new_v4();
@@ -3314,6 +3372,7 @@ fn borging_roll_selects_exactly_one_percent_of_uniform_run_ids() {
 #[test]
 fn splash_logo_randomizes_glitches_and_then_settles() {
     assert_eq!(splash_version(), format!("v{}", env!("CARGO_PKG_VERSION")));
+    assert_eq!(splash_alpha_line().to_string(), "αlphα");
     assert_eq!(
         splash_logo_line(Duration::from_millis(1_320), 7).to_string(),
         "B O R G"

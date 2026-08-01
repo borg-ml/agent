@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -365,9 +366,10 @@ async fn run_borg_provider_turn(
             permission,
             pool: claude_pool.clone(),
         });
+    let interrupted = Arc::new(AtomicBool::new(false));
     let mut stream = match turn.provider {
         CodingProvider::Codex => {
-            let control_rx = map_controls(controls);
+            let control_rx = map_controls(controls, Arc::clone(&interrupted));
             if local && let Some(pool) = codex_pool {
                 run_pooled_codex_local_chat_stream(request, control_rx, permission, pool)
             } else if local {
@@ -379,17 +381,20 @@ async fn run_borg_provider_turn(
         CodingProvider::Claude if local && request_can_use_claude_pool(&request) => {
             run_pooled_claude_local_chat_stream(
                 request,
-                map_controls(controls),
+                map_controls(controls, Arc::clone(&interrupted)),
                 permission,
                 claude_pool.unwrap_or_default(),
             )
         }
-        CodingProvider::Claude if local => {
-            run_claude_local_chat_stream(request, map_controls(controls), permission)
-        }
-        CodingProvider::Claude => {
-            run_claude_chat_stream_with_control(request, map_controls(controls))
-        }
+        CodingProvider::Claude if local => run_claude_local_chat_stream(
+            request,
+            map_controls(controls, Arc::clone(&interrupted)),
+            permission,
+        ),
+        CodingProvider::Claude => run_claude_chat_stream_with_control(
+            request,
+            map_controls(controls, Arc::clone(&interrupted)),
+        ),
         CodingProvider::OpenCode if local => run_opencode_local_chat_stream(request, permission),
         CodingProvider::OpenCode => {
             bail!("OpenCode execution is only supported on an enrolled host")
@@ -661,20 +666,24 @@ async fn run_borg_provider_turn(
                 // message id for the final segment. Complete the current
                 // segment independently of earlier narration; otherwise its
                 // last in-progress snapshot survives the terminal boundary.
-                let terminal_text =
-                    match terminal_assistant_text(&final_output, &text, completed_segment) {
-                        Ok(text) => text,
-                        Err(error) => {
-                            send(
-                                &events,
-                                SessionEventKind::Error {
-                                    message: error.to_string(),
-                                },
-                            )
-                            .await;
-                            return Err(error);
-                        }
-                    };
+                let terminal_text = match terminal_assistant_text(
+                    &final_output,
+                    &text,
+                    completed_segment,
+                    interrupted.load(Ordering::Acquire),
+                ) {
+                    Ok(text) => text,
+                    Err(error) => {
+                        send(
+                            &events,
+                            SessionEventKind::Error {
+                                message: error.to_string(),
+                            },
+                        )
+                        .await;
+                        return Err(error);
+                    }
+                };
                 if let Some(terminal_text) = terminal_text {
                     text = terminal_text.clone();
                     send(
@@ -754,6 +763,7 @@ fn terminal_assistant_text(
     final_output: &str,
     current_text: &str,
     completed_segment: bool,
+    interrupted: bool,
 ) -> Result<Option<String>> {
     let text = if completed_segment {
         // `final_output` is the provider's aggregate answer. Narration has
@@ -767,7 +777,7 @@ fn terminal_assistant_text(
     };
     if text.trim().is_empty() {
         anyhow::ensure!(
-            completed_segment,
+            completed_segment || interrupted,
             "provider completed without a visible response (empty result)"
         );
         Ok(None)
@@ -896,6 +906,7 @@ fn user_facing_provider_error(provider: CodingProvider, error: &str) -> String {
 
 fn map_controls(
     controls: Option<mpsc::Receiver<AgentTurnControl>>,
+    interrupted: Arc<AtomicBool>,
 ) -> Option<mpsc::Receiver<ChatStreamControl>> {
     controls.map(|mut controls| {
         let (tx, rx) = mpsc::channel(32);
@@ -958,6 +969,7 @@ fn map_controls(
                         .await
                         .is_ok(),
                     AgentTurnControl::Interrupt => {
+                        interrupted.store(true, Ordering::Release);
                         tx.send(ChatStreamControl::Interrupt).await.is_ok()
                     }
                 };
@@ -989,7 +1001,9 @@ mod tests {
     #[tokio::test]
     async fn pending_steer_acknowledgement_does_not_block_interrupt() {
         let (control_tx, control_rx) = mpsc::channel(4);
-        let mut provider_controls = map_controls(Some(control_rx)).expect("mapped controls");
+        let interrupted = Arc::new(AtomicBool::new(false));
+        let mut provider_controls =
+            map_controls(Some(control_rx), Arc::clone(&interrupted)).expect("mapped controls");
         let (ack, acknowledgement) = tokio::sync::oneshot::channel();
 
         control_tx
@@ -1011,6 +1025,7 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(1), provider_controls.recv()).await,
             Ok(Some(ChatStreamControl::Interrupt))
         ));
+        assert!(interrupted.load(Ordering::Acquire));
 
         provider_ack.send(Ok(())).unwrap();
         assert!(matches!(acknowledgement.await, Ok(Ok(()))));
@@ -1114,26 +1129,27 @@ mod tests {
     #[test]
     fn terminal_result_completes_the_current_segment_after_narration() {
         assert_eq!(
-            terminal_assistant_text("aggregate response", "partial response", true).unwrap(),
+            terminal_assistant_text("aggregate response", "partial response", true, false).unwrap(),
             Some("partial response".to_string())
         );
         assert_eq!(
-            terminal_assistant_text("aggregate response", "", true).unwrap(),
+            terminal_assistant_text("aggregate response", "", true, false).unwrap(),
             None
         );
         assert_eq!(
-            terminal_assistant_text("final response", "partial response", false).unwrap(),
+            terminal_assistant_text("final response", "partial response", false, false).unwrap(),
             Some("final response".to_string())
         );
         assert_eq!(
-            terminal_assistant_text("", "partial response", false).unwrap(),
+            terminal_assistant_text("", "partial response", false, false).unwrap(),
             Some("partial response".to_string())
         );
         assert_eq!(
-            terminal_assistant_text("", "", false)
+            terminal_assistant_text("", "", false, false)
                 .unwrap_err()
                 .to_string(),
             "provider completed without a visible response (empty result)"
         );
+        assert_eq!(terminal_assistant_text("", "", false, true).unwrap(), None);
     }
 }

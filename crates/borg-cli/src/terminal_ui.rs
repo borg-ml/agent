@@ -568,6 +568,60 @@ pub struct BorgTerminal {
     terminal_restored: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HoverState {
+    hovered_tool: Option<usize>,
+    hovered_tool_run_header: Option<usize>,
+    hovered_entry: Option<usize>,
+    hovered_message: Option<usize>,
+    hovered_picker_option: Option<usize>,
+    hovered_team_roster: Option<usize>,
+    status_hovered: bool,
+    goal_status_hovered: bool,
+    todo_status_hovered: bool,
+    agents_status_hovered: bool,
+    model_status_hovered: bool,
+    effort_status_hovered: bool,
+    fast_status_hovered: bool,
+    permission_status_hovered: bool,
+    back_to_director_hovered: bool,
+    scrollbar_hovered: bool,
+    jump_to_bottom_hovered: bool,
+    keybindings_hovered: bool,
+}
+
+impl BorgTerminal {
+    /// Mouse motion is high-volume input. Keep the redraw gate tied to visual
+    /// hover state so moving inside one control does not rebuild the whole
+    /// transcript for every terminal cell crossed.
+    fn hover_state(&self) -> HoverState {
+        HoverState {
+            hovered_tool: self.hovered_tool,
+            hovered_tool_run_header: self.hovered_tool_run_header,
+            hovered_entry: self.hovered_entry,
+            hovered_message: self.hovered_message,
+            hovered_picker_option: self.hovered_picker_option,
+            hovered_team_roster: self.hovered_team_roster,
+            status_hovered: self.status_hovered,
+            goal_status_hovered: self.goal_status_hovered,
+            todo_status_hovered: self.todo_status_hovered,
+            agents_status_hovered: self.agents_status_hovered,
+            model_status_hovered: self.model_status_hovered,
+            effort_status_hovered: self.effort_status_hovered,
+            fast_status_hovered: self.fast_status_hovered,
+            permission_status_hovered: self.permission_status_hovered,
+            back_to_director_hovered: self.back_to_director_hovered,
+            scrollbar_hovered: self.scrollbar_hovered,
+            jump_to_bottom_hovered: self.jump_to_bottom_hovered,
+            keybindings_hovered: self.keybindings_hovered,
+        }
+    }
+}
+
+fn hover_state_changed(previous: HoverState, current: HoverState) -> bool {
+    previous != current
+}
+
 fn session_state_snapshot_is_stale(projected_sequence: u64, state: &SessionState) -> bool {
     state.latest_sequence < projected_sequence
 }
@@ -2398,7 +2452,10 @@ impl BorgTerminal {
         {
             self.cursor_blink_started_at = Instant::now();
         }
-        self.event_redraw_needed = true;
+        self.event_redraw_needed = !matches!(
+            &event,
+            Event::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Moved)
+        );
         match event {
             Event::Resize(width, height) => {
                 let area = Rect::new(0, 0, width, height);
@@ -2432,6 +2489,7 @@ impl BorgTerminal {
                 Ok(UiAction::None)
             }
             Event::Mouse(mouse) => {
+                let previous_hover = self.hover_state();
                 self.last_ctrl_c = None;
                 let pointer = Position::new(mouse.column, mouse.row);
                 let background_hover_suppressed = overlay_suppresses_background_hover(
@@ -2512,6 +2570,7 @@ impl BorgTerminal {
                 } else {
                     None
                 };
+                self.event_redraw_needed |= hover_state_changed(previous_hover, self.hover_state());
                 if !background_hover_suppressed
                     && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right))
                     && self
@@ -2615,7 +2674,9 @@ impl BorgTerminal {
                     }
                 }
                 if let Some(picker) = self.picker.as_mut() {
+                    let selected_before = picker.selected;
                     picker.select_hovered(&mouse.kind, self.hovered_picker_option);
+                    self.event_redraw_needed |= picker.selected != selected_before;
                     if !matches!(picker.kind, PickerKind::MessageActions | PickerKind::Goal)
                         && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
                         && let Some(option) = self.hovered_picker_option
@@ -3500,13 +3561,16 @@ impl BorgTerminal {
         } else {
             primary_controls_line(&self.keymap)
         };
-        let interaction_hint = if self.status_hovered && status_is_interruptible {
-            Some("left click interrupt")
-        } else if self.goal_status_hovered && active_goal.is_some() {
-            Some("left click toggle goal · right click open menu")
-        } else {
-            None
-        };
+        let interaction_hint = bottom_interaction_hint(
+            self.status_hovered,
+            status_is_interruptible,
+            self.goal_status_hovered,
+            active_goal.is_some(),
+            self.agents_status_hovered,
+            self.model_status_hovered,
+            self.effort_status_hovered,
+            self.permission_status_hovered,
+        );
         let primary_controls_display = interaction_hint.map_or_else(
             || primary_controls.clone(),
             |hint| format!("{hint} · {primary_controls}"),
@@ -3680,7 +3744,7 @@ impl BorgTerminal {
             let (status_area, transcript_area, composer_area, footer_area) = if is_launch_screen {
                 let launch_width = composer_area_width.min(chunks[0].width);
                 let launch_height = composer_height
-                    .saturating_add(5)
+                    .saturating_add(6)
                     .saturating_add(controls_height)
                     .min(chunks[0].height);
                 let launch = Rect {
@@ -3692,7 +3756,7 @@ impl BorgTerminal {
                 let launch_chunks = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([
-                        Constraint::Length(4),
+                        Constraint::Length(5),
                         Constraint::Length(composer_height),
                         Constraint::Length(controls_height),
                     ])
@@ -3700,6 +3764,7 @@ impl BorgTerminal {
                 frame.render_widget(
                     Paragraph::new(vec![
                         splash_logo_line(self.splash_started_at.elapsed(), self.splash_glitch_seed),
+                        splash_alpha_line(),
                         Line::from(Span::styled(
                             splash_version(),
                             Style::default().fg(Color::DarkGray),
@@ -4133,64 +4198,6 @@ impl BorgTerminal {
                         height: 1,
                     };
                     if row.y < composer_area.bottom() {
-                        next_picker_hit_areas.push((row, index));
-                    }
-                }
-            }
-            if let Some(picker) = self
-                .picker
-                .as_ref()
-                .filter(|picker| matches!(picker.kind, PickerKind::Commands))
-            {
-                let popup = centered_popup(
-                    frame.area(),
-                    frame.area().width.saturating_sub(4),
-                    frame.area().height.saturating_sub(4),
-                );
-                let lines = picker.styled_lines(
-                    popup.width.saturating_sub(2).max(1) as usize,
-                    self.transcript.assistant_label_color,
-                    self.transcript.assistant_message_color,
-                );
-                let content_height = popup.height.saturating_sub(2) as usize;
-                let max_scroll = lines.len().saturating_sub(content_height);
-                let selected_line = picker
-                    .option_row_offsets()
-                    .iter()
-                    .find_map(|(index, line)| (*index == picker.selected).then_some(*line))
-                    .unwrap_or(1);
-                let scroll = selected_line
-                    .saturating_sub(content_height.saturating_sub(2))
-                    .min(max_scroll);
-                frame.render_widget(Clear, popup);
-                frame.render_widget(
-                    Paragraph::new(lines)
-                        .style(Style::default().bg(COMMAND_PANEL_BG))
-                        .scroll((scroll as u16, 0))
-                        .block(
-                            Block::default()
-                                .borders(Borders::ALL)
-                                .border_style(Style::default().fg(BORG_ORANGE))
-                                .title(Span::styled(
-                                    " Command palette ",
-                                    Style::default()
-                                        .fg(Color::White)
-                                        .add_modifier(Modifier::BOLD),
-                                )),
-                        ),
-                    popup,
-                );
-                for (index, line) in picker.option_row_offsets() {
-                    let Some(line) = line.checked_sub(scroll) else {
-                        continue;
-                    };
-                    let row = Rect {
-                        x: popup.x.saturating_add(1),
-                        y: popup.y.saturating_add(1 + line as u16),
-                        width: popup.width.saturating_sub(2),
-                        height: 1,
-                    };
-                    if row.y < popup.bottom().saturating_sub(1) {
                         next_picker_hit_areas.push((row, index));
                     }
                 }
@@ -4696,6 +4703,66 @@ impl BorgTerminal {
                         ),
                     tooltip,
                 );
+            }
+            // Render the command palette with the other overlays, after the
+            // status line and footer, so background chrome cannot cover it.
+            if let Some(picker) = self
+                .picker
+                .as_ref()
+                .filter(|picker| matches!(picker.kind, PickerKind::Commands))
+            {
+                let popup = centered_popup(
+                    frame.area(),
+                    frame.area().width.saturating_sub(4),
+                    frame.area().height.saturating_sub(4),
+                );
+                let lines = picker.styled_lines(
+                    popup.width.saturating_sub(2).max(1) as usize,
+                    self.transcript.assistant_label_color,
+                    self.transcript.assistant_message_color,
+                );
+                let content_height = popup.height.saturating_sub(2) as usize;
+                let max_scroll = lines.len().saturating_sub(content_height);
+                let selected_line = picker
+                    .option_row_offsets()
+                    .iter()
+                    .find_map(|(index, line)| (*index == picker.selected).then_some(*line))
+                    .unwrap_or(1);
+                let scroll = selected_line
+                    .saturating_sub(content_height.saturating_sub(2))
+                    .min(max_scroll);
+                frame.render_widget(Clear, popup);
+                frame.render_widget(
+                    Paragraph::new(lines)
+                        .style(Style::default().bg(COMMAND_PANEL_BG))
+                        .scroll((scroll as u16, 0))
+                        .block(
+                            Block::default()
+                                .borders(Borders::ALL)
+                                .border_style(Style::default().fg(BORG_ORANGE))
+                                .title(Span::styled(
+                                    " Command palette ",
+                                    Style::default()
+                                        .fg(Color::White)
+                                        .add_modifier(Modifier::BOLD),
+                                )),
+                        ),
+                    popup,
+                );
+                for (index, line) in picker.option_row_offsets() {
+                    let Some(line) = line.checked_sub(scroll) else {
+                        continue;
+                    };
+                    let row = Rect {
+                        x: popup.x.saturating_add(1),
+                        y: popup.y.saturating_add(1 + line as u16),
+                        width: popup.width.saturating_sub(2),
+                        height: 1,
+                    };
+                    if row.y < popup.bottom().saturating_sub(1) {
+                        next_picker_hit_areas.push((row, index));
+                    }
+                }
             }
             if let Some(picker) = self.picker.as_ref().filter(|picker| {
                 matches!(picker.kind, PickerKind::MessageActions | PickerKind::Goal)
@@ -9890,6 +9957,10 @@ fn splash_logo_line(elapsed: Duration, seed: u64) -> Line<'static> {
     Line::from(spans)
 }
 
+fn splash_alpha_line() -> Line<'static> {
+    Line::from(Span::styled("αlphα", Style::default().fg(BORG_ORANGE)))
+}
+
 fn splitmix64(mut value: u64) -> u64 {
     value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
     value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -10145,6 +10216,33 @@ fn overlay_suppresses_background_hover(
     keybindings_open: bool,
 ) -> bool {
     picker_open || team_switcher_open || keybindings_open
+}
+
+fn bottom_interaction_hint(
+    status_hovered: bool,
+    status_is_interruptible: bool,
+    goal_status_hovered: bool,
+    goal_available: bool,
+    agents_status_hovered: bool,
+    model_status_hovered: bool,
+    effort_status_hovered: bool,
+    permission_status_hovered: bool,
+) -> Option<&'static str> {
+    if status_hovered && status_is_interruptible {
+        Some("left click interrupt")
+    } else if goal_status_hovered && goal_available {
+        Some("left click toggle goal · right click open menu")
+    } else if agents_status_hovered {
+        Some("left click to open agents menu")
+    } else if model_status_hovered {
+        Some("left click change model")
+    } else if effort_status_hovered {
+        Some("left click change effort")
+    } else if permission_status_hovered {
+        Some("left click change permissions")
+    } else {
+        None
+    }
 }
 
 fn permission_mode_label(mode: PermissionMode) -> &'static str {

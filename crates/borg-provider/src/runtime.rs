@@ -31,7 +31,7 @@ pub const CODEX_SELECTABLE_MODELS: [(&str, &str); 3] = [
 pub const CODEX_EFFORT_LEVELS: [&str; 6] = ["low", "medium", "high", "xhigh", "max", "ultra"];
 pub const CODEX_MODEL_CATALOG: ProviderModelCatalog = ProviderModelCatalog {
     backend: "codex",
-    default_model: "gpt-5.6-sol",
+    default_model: "gpt-5.6-luna",
     selectable_models: &CODEX_SELECTABLE_MODELS,
     effort_levels: &CODEX_EFFORT_LEVELS,
 };
@@ -156,7 +156,7 @@ pub fn codex_product_model() -> &'static str {
 }
 
 pub fn codex_default_effort() -> &'static str {
-    "low"
+    "max"
 }
 
 pub fn codex_effort_levels() -> Vec<String> {
@@ -191,4 +191,16 @@ pub fn kimi_effort_levels() -> Vec<String> {
 /// remain valid overrides; this default avoids coupling Borg to one vendor.
 pub fn openrouter_product_model() -> &'static str {
     "openrouter/auto"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codex_defaults_use_luna_at_max_effort() {
+        assert_eq!(codex_product_model(), "gpt-5.6-luna");
+        assert_eq!(codex_default_effort(), "max");
+        assert!(codex_effort_supported(codex_default_effort()));
+    }
 }

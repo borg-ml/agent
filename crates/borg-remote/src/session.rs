@@ -4775,7 +4775,7 @@ mod tests {
         let journal_path = root.path().join("session.jsonl");
         let session_id = Uuid::new_v4();
         let (command_tx, command_rx) = mpsc::channel(8);
-        let (event_tx, _event_rx) = mpsc::channel(32);
+        let (event_tx, mut event_rx) = mpsc::channel(32);
         let seen = Arc::new(Mutex::new(Vec::new()));
         let provider_sessions = Arc::new(Mutex::new(Vec::new()));
         let called = Arc::new(Notify::new());
@@ -4847,6 +4847,20 @@ mod tests {
             .await
             .unwrap();
         actor.await.unwrap().unwrap();
+
+        let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(events.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::TurnCompleted {
+                error: Some(error),
+                ..
+            } if error == "turn interrupted"
+        )));
+        assert!(!events.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::Error { message }
+                if message.contains("provider completed without a visible response")
+        )));
 
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 2);
