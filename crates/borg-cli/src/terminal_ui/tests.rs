@@ -1400,10 +1400,10 @@ fn status_path_uses_fish_style_parent_abbreviations() {
 fn footer_metadata_preserves_the_full_working_directory_path() {
     assert_eq!(
         footer_metadata_text("94% context left", "~/borg-cli", usize::MAX),
-        "94% context left  ·  ~/borg-cli "
+        "94% context left · ~/borg-cli "
     );
     let metadata = footer_metadata_text("94% context left", "~/borg-cli", 18);
-    assert_eq!(metadata, "9…  ·  ~/borg-cli ");
+    assert_eq!(metadata, "94%… · ~/borg-cli ");
     assert!(
         metadata.ends_with("~/borg-cli "),
         "footer metadata must keep the complete path: {metadata}"
@@ -1423,7 +1423,7 @@ fn git_worktree_status_is_compact_and_includes_divergence_and_dirty_state() {
 
     assert_eq!(status.branch, "feature/ui");
     assert!(status.dirty);
-    assert_eq!(status.compact_label(), "git:feature/ui ↑2 ↓1*");
+    assert_eq!(status.compact_label(), "git:feature/ui · ↑2 · ↓1 · dirty");
     assert_eq!(
         parse_git_worktree_status("## HEAD (no branch)\n")
             .expect("detached status")

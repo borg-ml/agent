@@ -475,17 +475,17 @@ struct GitWorktreeStatus {
 
 impl GitWorktreeStatus {
     fn compact_label(&self) -> String {
-        let mut label = format!("git:{}", self.branch);
+        let mut segments = vec![format!("git:{}", self.branch)];
         if self.ahead > 0 {
-            label.push_str(&format!(" ↑{}", self.ahead));
+            segments.push(format!("↑{}", self.ahead));
         }
         if self.behind > 0 {
-            label.push_str(&format!(" ↓{}", self.behind));
+            segments.push(format!("↓{}", self.behind));
         }
         if self.dirty {
-            label.push('*');
+            segments.push("dirty".to_string());
         }
-        label
+        segments.join(STATUS_SEPARATOR)
     }
 }
 
@@ -9638,7 +9638,7 @@ fn footer_metadata_text(context_status: &str, cwd_status: &str, max_width: usize
     if context_status.is_empty() {
         return cwd_display;
     }
-    let separator = "  ·  ";
+    let separator = STATUS_SEPARATOR;
     let cwd_width = cwd_display.width();
     let separator_width = separator.width();
     let context_width = context_status.width();

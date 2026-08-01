@@ -476,15 +476,22 @@ fn run_codex_stream(
 ) -> mpsc::Receiver<ChatStreamEvent> {
     let (tx, rx) = mpsc::channel::<ChatStreamEvent>(64);
     tokio::spawn(async move {
-        if let Err(err) =
-            run_codex_app_server_inner(req, tx.clone(), control_rx, local_auth, permission, pool)
-                .await
-        {
-            let _ = tx
-                .send(ChatStreamEvent::Failed {
-                    error: format!("{err:#}"),
-                })
-                .await;
+        let provider =
+            run_codex_app_server_inner(req, tx.clone(), control_rx, local_auth, permission, pool);
+        tokio::pin!(provider);
+        tokio::select! {
+            result = &mut provider => {
+                if let Err(err) = result {
+                    let _ = tx
+                        .send(ChatStreamEvent::Failed {
+                            error: format!("{err:#}"),
+                        })
+                        .await;
+                }
+            }
+            _ = tx.closed() => {
+                tracing::debug!("Codex stream receiver closed; cancelling provider worker");
+            }
         }
     });
     rx

@@ -534,6 +534,34 @@ fn stale_local_owner_can_handoff(status: Option<SessionStatus>) -> bool {
     matches!(status, Some(SessionStatus::Ready | SessionStatus::Stopped))
 }
 
+fn owner_shutdown_should_handoff_to_viewer(
+    access: LocalSessionAccess,
+    status: SessionStatus,
+    prompt_submission_pending: bool,
+    control_server: Option<&LocalSessionControlServer>,
+) -> bool {
+    access == LocalSessionAccess::Owned
+        && (prompt_submission_pending
+            || matches!(
+                status,
+                SessionStatus::Starting
+                    | SessionStatus::Running
+                    | SessionStatus::WaitingForApproval
+            ))
+        && control_server.is_some_and(LocalSessionControlServer::has_attached_viewers)
+}
+
+fn local_prompt_submission_pending(
+    pending_prompt_ids: &HashSet<Uuid>,
+    local_prompt_admissions: &Mutex<HashSet<Uuid>>,
+) -> bool {
+    !pending_prompt_ids.is_empty()
+        || !local_prompt_admissions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty()
+}
+
 async fn stop_stale_local_owner_and_acquire(
     journal_path: &Path,
     control_socket_path: &Path,
@@ -1078,6 +1106,7 @@ async fn run_local_agent_session(
     let mut user_requested_exit = false;
     let mut exit_notice = None;
     let mut detached_from_terminal = false;
+    let mut handoff_on_safe_boundary = false;
     let mut last_ctrl_c = None;
     let mut terminal_dirty = false;
     let mut tui_fps = tui_refresh_rate(u64::from(editor_preferences.presentation.refresh_rate_fps));
@@ -1475,6 +1504,17 @@ async fn run_local_agent_session(
                     stop_sent = true;
                     session_command_tx.send(HostCommand::Stop { session_id }).await.ok();
                 }
+                if handoff_on_safe_boundary
+                    && status == SessionStatus::Ready
+                    && !stop_sent
+                {
+                    // The owner has been asked to leave, but a viewer is
+                    // attached. Let the in-flight turn finish before closing
+                    // this actor so the viewer can acquire the writer lease
+                    // without observing an interrupted turn.
+                    stop_sent = true;
+                    session_command_tx.send(HostCommand::Stop { session_id }).await.ok();
+                }
             }
             line = recv_terminal_line(&mut input), if input_open => {
                 let Some(line) = line else {
@@ -1828,9 +1868,22 @@ async fn run_local_agent_session(
                         println!("  Signed in. Retry your message.");
                     }
                     "/quit" | "/exit" => {
-                        stop_sent = true;
                         user_requested_exit = true;
-                        session_command_tx.send(HostCommand::Stop { session_id }).await.ok();
+                        if owner_shutdown_should_handoff_to_viewer(
+                            session_access,
+                            status,
+                            local_prompt_submission_pending(
+                                &pending_prompt_ids,
+                                &local_prompt_admissions,
+                            ),
+                            control_server.as_ref(),
+                        ) {
+                            handoff_on_safe_boundary = true;
+                            detached_from_terminal = true;
+                        } else {
+                            stop_sent = true;
+                            session_command_tx.send(HostCommand::Stop { session_id }).await.ok();
+                        }
                     }
                     "/interrupt" | "/stop" => {
                         session_command_tx.send(HostCommand::Interrupt { session_id }).await.ok();
@@ -2232,9 +2285,24 @@ async fn run_local_agent_session(
                         }
                     }
                     UiAction::Quit => {
-                        stop_sent = true;
                         user_requested_exit = true;
-                        session_command_tx.send(HostCommand::Stop { session_id }).await.ok();
+                        if owner_shutdown_should_handoff_to_viewer(
+                            session_access,
+                            status,
+                            local_prompt_submission_pending(
+                                &pending_prompt_ids,
+                                &local_prompt_admissions,
+                            ),
+                            control_server.as_ref(),
+                        ) {
+                            handoff_on_safe_boundary = true;
+                            detached_from_terminal = true;
+                            shutdown_terminal(&mut terminal, &crash_context.tui_active).await;
+                        } else {
+                            stop_sent = true;
+                            shutdown_terminal(&mut terminal, &crash_context.tui_active).await;
+                            session_command_tx.send(HostCommand::Stop { session_id }).await.ok();
+                        }
                     }
                     UiAction::Queue {
                         target,
@@ -2936,9 +3004,29 @@ async fn run_local_agent_session(
                                     }
                                 }
                                 "/quit" | "/exit" if attachments.is_empty() => {
-                                    stop_sent = true;
                                     user_requested_exit = true;
-                                    session_command_tx.send(HostCommand::Stop { session_id }).await.ok();
+                                    if owner_shutdown_should_handoff_to_viewer(
+                                        session_access,
+                                        status,
+                                        local_prompt_submission_pending(
+                                            &pending_prompt_ids,
+                                            &local_prompt_admissions,
+                                        ),
+                                        control_server.as_ref(),
+                                    ) {
+                                        handoff_on_safe_boundary = true;
+                                        detached_from_terminal = true;
+                                        shutdown_terminal(&mut terminal, &crash_context.tui_active)
+                                            .await;
+                                    } else {
+                                        stop_sent = true;
+                                        shutdown_terminal(&mut terminal, &crash_context.tui_active)
+                                            .await;
+                                        session_command_tx
+                                            .send(HostCommand::Stop { session_id })
+                                            .await
+                                            .ok();
+                                    }
                                 }
                                 "/interrupt" | "/stop" if attachments.is_empty() => {
                                     session_command_tx.send(HostCommand::Interrupt { session_id }).await.ok();
@@ -3051,9 +3139,24 @@ async fn run_local_agent_session(
             }
             _ = tokio::signal::ctrl_c(), if interactive => {
                 if repeated_ctrl_c(&mut last_ctrl_c, std::time::Instant::now()) {
-                    stop_sent = true;
                     user_requested_exit = true;
-                    session_command_tx.send(HostCommand::Stop { session_id }).await.ok();
+                    if owner_shutdown_should_handoff_to_viewer(
+                        session_access,
+                        status,
+                        local_prompt_submission_pending(
+                            &pending_prompt_ids,
+                            &local_prompt_admissions,
+                        ),
+                        control_server.as_ref(),
+                    ) {
+                        handoff_on_safe_boundary = true;
+                        detached_from_terminal = true;
+                        shutdown_terminal(&mut terminal, &crash_context.tui_active).await;
+                    } else {
+                        stop_sent = true;
+                        shutdown_terminal(&mut terminal, &crash_context.tui_active).await;
+                        session_command_tx.send(HostCommand::Stop { session_id }).await.ok();
+                    }
                 } else if let Some(terminal) = terminal.as_mut() {
                     terminal.handle_external_interrupt();
                     terminal_dirty = true;
@@ -3065,25 +3168,44 @@ async fn run_local_agent_session(
                 shutdown_signal_open = false;
                 let signal = signal.context("failed to listen for a process shutdown signal")?;
                 tracing::warn!(%session_id, %signal, "restoring terminal before process shutdown");
+                let attached_prompt_pending = local_prompt_submission_pending(
+                    &pending_prompt_ids,
+                    &local_prompt_admissions,
+                );
+                let handoff_to_viewer = owner_shutdown_should_handoff_to_viewer(
+                    session_access,
+                    status,
+                    attached_prompt_pending,
+                    control_server.as_ref(),
+                );
                 shutdown_terminal(&mut terminal, &crash_context.tui_active).await;
-                let attached_prompt_pending = !local_prompt_admissions
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .is_empty();
                 if should_detach_on_terminal_hangup(
                     signal,
                     status,
-                    !pending_prompt_ids.is_empty() || attached_prompt_pending,
+                    attached_prompt_pending,
                 ) {
                     // A terminal emulator can disappear independently of Borg (for
                     // example, a GPU/renderer crash). Keep the durable actor and
                     // control socket alive so a new `borg resume` can attach to the
                     // in-flight turn instead of cancelling it.
+                    if handoff_to_viewer {
+                        handoff_on_safe_boundary = true;
+                    }
                     detached_from_terminal = true;
                     tracing::warn!(
                         %session_id,
                         %signal,
                         "terminal disappeared during an active turn; detached UI and preserved session"
+                    );
+                    continue;
+                }
+                if handoff_to_viewer {
+                    handoff_on_safe_boundary = true;
+                    detached_from_terminal = true;
+                    tracing::warn!(
+                        %session_id,
+                        %signal,
+                        "shutdown requested with an attached viewer; preserving the active turn until its boundary"
                     );
                     continue;
                 }
@@ -4698,6 +4820,7 @@ mod tests {
     use super::*;
     use std::time::{Duration, Instant};
     use tempfile::tempdir;
+    use tokio::io::AsyncReadExt;
 
     #[test]
     fn older_history_pages_end_immediately_before_the_loaded_tail() {
@@ -5050,6 +5173,45 @@ mod tests {
                 .to_string()
                 .contains("Interrupt the current turn")
         );
+    }
+
+    #[tokio::test]
+    async fn owner_shutdown_hands_active_turn_to_an_attached_viewer() {
+        let root = tempdir().unwrap();
+        let session_id = Uuid::new_v4();
+        let journal_path = root.path().join(format!("{session_id}.jsonl"));
+        let socket_path = session_control_socket_path(root.path(), session_id);
+        let presence_path =
+            borg_remote::session_control_presence_socket_path(root.path(), session_id);
+        let journal = borg_remote::SessionJournal::open(&journal_path).unwrap();
+        let writer = journal.try_acquire_writer().unwrap().unwrap();
+        let (commands, _received) = mpsc::channel(1);
+        let server =
+            LocalSessionControlServer::start(socket_path, session_id, &writer, commands).unwrap();
+
+        assert!(!owner_shutdown_should_handoff_to_viewer(
+            LocalSessionAccess::Owned,
+            SessionStatus::Running,
+            false,
+            Some(&server),
+        ));
+        let mut presence = tokio::net::UnixStream::connect(presence_path)
+            .await
+            .unwrap();
+        let mut acknowledgement = [0_u8; 1];
+        presence.read_exact(&mut acknowledgement).await.unwrap();
+        assert!(owner_shutdown_should_handoff_to_viewer(
+            LocalSessionAccess::Owned,
+            SessionStatus::Running,
+            false,
+            Some(&server),
+        ));
+        assert!(!owner_shutdown_should_handoff_to_viewer(
+            LocalSessionAccess::Attached,
+            SessionStatus::Running,
+            false,
+            Some(&server),
+        ));
     }
 
     #[test]

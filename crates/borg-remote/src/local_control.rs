@@ -1,7 +1,10 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{
+    Arc, Mutex, OnceLock,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -25,6 +28,13 @@ struct LocalSessionOwnerMetadata {
 /// Path used by additional local terminals to attach to a session owner.
 pub fn session_control_socket_path(sessions_dir: &Path, session_id: Uuid) -> PathBuf {
     sessions_dir.join(format!("{session_id}.control.sock"))
+}
+
+/// Private, short-lived presence channel used by attached terminals. Keeping
+/// this separate from the command socket means a viewer can be counted even
+/// while it is idle and has not sent a command recently.
+pub fn session_control_presence_socket_path(sessions_dir: &Path, session_id: Uuid) -> PathBuf {
+    sessions_dir.join(format!("{session_id}.control.presence.sock"))
 }
 
 fn session_control_owner_path(sessions_dir: &Path, session_id: Uuid) -> PathBuf {
@@ -174,6 +184,7 @@ pub async fn send_local_session_command(
 #[cfg(unix)]
 pub struct LocalSessionControlServer {
     task: tokio::task::JoinHandle<()>,
+    attached_viewers: Arc<AtomicUsize>,
 }
 
 #[cfg(not(unix))]
@@ -199,6 +210,10 @@ impl LocalSessionControlServer {
     ) -> Result<Self> {
         Self::start(socket_path, session_id, writer, commands)
     }
+
+    pub fn has_attached_viewers(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(unix)]
@@ -220,6 +235,7 @@ impl LocalSessionControlServer {
         prompt_admissions: Option<Arc<Mutex<HashSet<Uuid>>>>,
     ) -> Result<Self> {
         use std::os::unix::fs::PermissionsExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::UnixListener;
 
         let journal_path = socket_path
@@ -235,36 +251,91 @@ impl LocalSessionControlServer {
             .with_context(|| format!("failed to bind {}", socket_path.display()))?;
         fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))
             .with_context(|| format!("failed to secure {}", socket_path.display()))?;
+        let presence_socket_path = session_control_presence_socket_path(
+            socket_path.parent().unwrap_or_else(|| Path::new(".")),
+            session_id,
+        );
+        if presence_socket_path.exists() {
+            fs::remove_file(&presence_socket_path).with_context(|| {
+                format!("failed to remove stale {}", presence_socket_path.display())
+            })?;
+        }
+        let presence_listener = UnixListener::bind(&presence_socket_path)
+            .with_context(|| format!("failed to bind {}", presence_socket_path.display()))?;
+        fs::set_permissions(&presence_socket_path, fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("failed to secure {}", presence_socket_path.display()))?;
         write_local_session_owner_metadata(
             socket_path.parent().unwrap_or_else(|| Path::new(".")),
             session_id,
         )?;
         let task_socket_path = socket_path.clone();
+        let attached_viewers = Arc::new(AtomicUsize::new(0));
+        let task_attached_viewers = Arc::clone(&attached_viewers);
         let task = tokio::spawn(async move {
             loop {
-                match listener.accept().await {
-                    Ok((stream, _)) => {
-                        let commands = commands.clone();
-                        let prompt_admissions = prompt_admissions.clone();
-                        tokio::spawn(handle_control_connection(
-                            stream,
-                            session_id,
-                            commands,
-                            prompt_admissions,
-                        ));
+                tokio::select! {
+                    result = listener.accept() => {
+                        match result {
+                            Ok((stream, _)) => {
+                                let commands = commands.clone();
+                                let prompt_admissions = prompt_admissions.clone();
+                                tokio::spawn(handle_control_connection(
+                                    stream,
+                                    session_id,
+                                    commands,
+                                    prompt_admissions,
+                                ));
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    %error,
+                                    socket_path = %task_socket_path.display(),
+                                    "local session control listener stopped"
+                                );
+                                break;
+                            }
+                        }
                     }
-                    Err(error) => {
-                        tracing::warn!(
-                            %error,
-                            socket_path = %task_socket_path.display(),
-                            "local session control listener stopped"
-                        );
-                        break;
+                    result = presence_listener.accept() => {
+                        match result {
+                            Ok((mut stream, _)) => {
+                                let attached_viewers = Arc::clone(&task_attached_viewers);
+                                tokio::spawn(async move {
+                                    attached_viewers.fetch_add(1, Ordering::AcqRel);
+                                    // The acknowledgement makes the attachment
+                                    // visible before its session loop proceeds.
+                                    let _ = stream.write_all(&[1]).await;
+                                    let mut byte = [0_u8; 1];
+                                    loop {
+                                        match stream.read(&mut byte).await {
+                                            Ok(0) | Err(_) => break,
+                                            Ok(_) => {}
+                                        }
+                                    }
+                                    attached_viewers.fetch_sub(1, Ordering::AcqRel);
+                                });
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    %error,
+                                    socket_path = %presence_socket_path.display(),
+                                    "local session presence listener stopped"
+                                );
+                                break;
+                            }
+                        }
                     }
                 }
             }
         });
-        Ok(Self { task })
+        Ok(Self {
+            task,
+            attached_viewers,
+        })
+    }
+
+    pub fn has_attached_viewers(&self) -> bool {
+        self.attached_viewers.load(Ordering::Acquire) > 0
     }
 }
 
@@ -340,6 +411,47 @@ pub async fn run_attached_session(
 ) -> Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::UnixStream;
+
+    let presence_socket_path = session_control_presence_socket_path(
+        socket_path.parent().unwrap_or_else(|| Path::new(".")),
+        session_id,
+    );
+    let mut _presence = match UnixStream::connect(&presence_socket_path).await {
+        Ok(mut stream) => {
+            let mut acknowledgement = [0_u8; 1];
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                stream.read_exact(&mut acknowledgement),
+            )
+            .await
+            {
+                Ok(Ok(_)) => Some(stream),
+                Ok(Err(error)) => {
+                    tracing::debug!(
+                        %error,
+                        socket_path = %presence_socket_path.display(),
+                        "local session presence handshake failed"
+                    );
+                    None
+                }
+                Err(_) => {
+                    tracing::debug!(
+                        socket_path = %presence_socket_path.display(),
+                        "local session presence handshake timed out"
+                    );
+                    None
+                }
+            }
+        }
+        Err(error) => {
+            tracing::debug!(
+                %error,
+                socket_path = %presence_socket_path.display(),
+                "local session owner does not expose a viewer presence channel"
+            );
+            None
+        }
+    };
 
     let mut refresh = tokio::time::interval(ATTACHED_SESSION_REFRESH_INTERVAL);
     let mut live_revision = 0_u64;
@@ -576,6 +688,37 @@ mod tests {
                 .contains("different session")
         );
         assert!(owner_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn presence_channel_tracks_idle_attached_viewers() {
+        let root = tempfile::tempdir().unwrap();
+        let session_id = Uuid::new_v4();
+        let journal_path = root.path().join(format!("{session_id}.jsonl"));
+        let socket_path = session_control_socket_path(root.path(), session_id);
+        let presence_path = session_control_presence_socket_path(root.path(), session_id);
+        let journal = SessionJournal::open(&journal_path).unwrap();
+        let writer = journal.try_acquire_writer().unwrap().unwrap();
+        let (owner_tx, _owner_rx) = mpsc::channel(1);
+        let server =
+            LocalSessionControlServer::start(socket_path, session_id, &writer, owner_tx).unwrap();
+
+        assert!(!server.has_attached_viewers());
+        let mut presence = tokio::net::UnixStream::connect(presence_path)
+            .await
+            .unwrap();
+        let mut acknowledgement = [0_u8; 1];
+        presence.read_exact(&mut acknowledgement).await.unwrap();
+        assert!(server.has_attached_viewers());
+
+        drop(presence);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while server.has_attached_viewers() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("viewer presence should be released when the attachment closes");
     }
 
     #[tokio::test]
