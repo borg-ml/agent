@@ -3303,7 +3303,15 @@ async fn child_authored_history(
     child_id: Uuid,
 ) -> Result<Vec<SessionEvent>> {
     let inherited = store.inherited_event_count(child_id).await?;
-    store.events_after(child_id, inherited, usize::MAX).await
+    let latest = store.state(child_id).await?.latest_sequence;
+    let after = recent_child_history_after(inherited, latest);
+    store
+        .events_after(child_id, after, RICH_TUI_HISTORY_EVENT_LIMIT)
+        .await
+}
+
+fn recent_child_history_after(inherited: u64, latest: u64) -> u64 {
+    inherited.max(latest.saturating_sub(RICH_TUI_HISTORY_EVENT_LIMIT as u64))
 }
 
 async fn recent_sessions_summary(
@@ -4207,6 +4215,13 @@ mod tests {
         assert_eq!(older_tui_history_after(513), Some(0));
         assert_eq!(older_tui_history_after(2_000), Some(975));
         assert_eq!(975 + RICH_TUI_HISTORY_PAGE_SIZE as u64, 1_999);
+    }
+
+    #[test]
+    fn child_history_tail_stays_bounded_after_long_runs_and_forks() {
+        assert_eq!(recent_child_history_after(0, 100), 0);
+        assert_eq!(recent_child_history_after(0, 60_000), 59_488);
+        assert_eq!(recent_child_history_after(59_900, 60_000), 59_900);
     }
 
     #[tokio::test]

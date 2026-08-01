@@ -1630,7 +1630,30 @@ impl SubagentCoordinator {
             )
             .await?;
         if id == root_session_id {
-            self.root_inbox.lock().await.push(inbox_message);
+            self.root_inbox.lock().await.push(inbox_message.clone());
+            if actor_session_id != root_session_id {
+                // Queue delivery intentionally does not wake the director, but
+                // the report must still be observable immediately. Project a
+                // child-authored message through the existing activity stream;
+                // the root actor records and renders it without admitting the
+                // queued inbox message to the model until the next turn.
+                let _ = self.activity_tx.send(SubagentActivity::SessionEvent {
+                    parent_session_id: root_session_id,
+                    task_name: actor,
+                    event: SessionEvent::new(
+                        actor_session_id,
+                        0,
+                        SessionEventKind::Message {
+                            message_id: inbox_message.message_id,
+                            actor: crate::EventActor::Assistant,
+                            text: message,
+                            attachments: Vec::new(),
+                            status: MessageStatus::Complete,
+                            delivery: None,
+                        },
+                    ),
+                });
+            }
             return Ok(());
         }
         let mut table = self.table.lock().await;
@@ -3078,11 +3101,28 @@ mod tests {
             .unwrap();
         bind_test_team(directory.path(), store.as_ref(), root, &[worker.session_id]).await;
         let mut wake = coordinator.subscribe_root_messages();
+        let mut activity = coordinator.subscribe();
 
         coordinator
             .send_message_as(worker.session_id, "/root", "blocked on an API decision")
             .await
             .unwrap();
+        let projected = activity.recv().await.unwrap();
+        assert!(matches!(
+            projected,
+            SubagentActivity::SessionEvent {
+                event: SessionEvent {
+                    kind: SessionEventKind::Message {
+                        actor: crate::EventActor::Assistant,
+                        status: MessageStatus::Complete,
+                        ref text,
+                        ..
+                    },
+                    ..
+                },
+                ..
+            } if text == "blocked on an API decision"
+        ));
         assert!(matches!(
             wake.try_recv(),
             Err(broadcast::error::TryRecvError::Empty)

@@ -1393,7 +1393,7 @@ impl BorgTerminal {
     }
 
     pub fn apply_session_event(&mut self, event: &SessionEvent) -> bool {
-        self.record_child_event(event);
+        let focused_child_transcript_changed = self.record_child_event(event);
         let projection_changed = match &event.kind {
             SessionEventKind::SessionStarted
             | SessionEventKind::ProviderSessionLinked { .. }
@@ -1507,7 +1507,8 @@ impl BorgTerminal {
                 .as_deref_mut()
                 .unwrap_or(&mut self.transcript);
             let entries_before = transcript.order.len();
-            let changed = session_event_changes_transcript(&event.kind);
+            let changed =
+                focused_child_transcript_changed || session_event_changes_transcript(&event.kind);
             let removed_entry = transcript.apply(event);
             (
                 removed_entry,
@@ -1534,20 +1535,20 @@ impl BorgTerminal {
         projection_changed
     }
 
-    fn record_child_event(&mut self, event: &SessionEvent) {
+    fn record_child_event(&mut self, event: &SessionEvent) -> bool {
         let SessionEventKind::SubagentActivity {
             agent,
             event: child_event,
             ..
         } = &event.kind
         else {
-            return;
+            return false;
         };
         let child_id = agent.session_id;
         self.child_statuses
             .insert(child_id, subagent_session_status(agent.status));
         let Some(child_event) = child_event else {
-            return;
+            return false;
         };
         if let SessionEventKind::StatusChanged { status, .. } = child_event.kind {
             self.child_statuses.insert(child_id, status);
@@ -1573,11 +1574,15 @@ impl BorgTerminal {
             _ => {}
         }
         if self.focused_child == Some(agent.session_id) {
+            let entries_before = self.transcript.order.len();
+            let changed = session_event_changes_transcript(&child_event.kind);
             if let Some(removed) = self.transcript.apply(child_event) {
                 self.remap_selection_after_entry_removal(removed);
             }
+            changed || self.transcript.order.len() != entries_before
         } else {
             self.child_transcript_mut(child_id).apply(child_event);
+            false
         }
     }
 
@@ -3197,7 +3202,6 @@ impl BorgTerminal {
             .map(|(row, _)| row.clone())
             .collect::<Vec<_>>();
         let total_subagents = agent_roster_entries.len().saturating_sub(1);
-        let team_agent_count = total_subagents.saturating_add(1);
         let session_is_active = matches!(status, SessionStatus::Starting | SessionStatus::Running);
         let active_goal = self.active_goal().cloned();
         let goal_status = self
@@ -3925,19 +3929,18 @@ impl BorgTerminal {
                     Style::default().fg(status_color),
                 ));
             }
-            let agents_status = (total_subagents > 0)
-                .then(|| agents_status_label(team_agent_count, active_subagents));
+            let agents_status = agents_status_label(active_subagents);
             let agents_status_width = agents_status.as_ref().map(|status| status.width());
-            if total_subagents > 0 {
+            if agents_status.is_some() {
                 status_spans.push(Span::styled(
                     STATUS_SEPARATOR,
                     Style::default().fg(Color::Gray),
                 ));
             }
             let agents_status_start = status_spans.iter().map(|span| span.width()).sum::<usize>();
-            if total_subagents > 0 {
+            if let Some(agents_status) = agents_status {
                 status_spans.push(Span::styled(
-                    agents_status.expect("agent status exists when subagents are present"),
+                    agents_status,
                     Style::default()
                         .fg(if self.agents_status_hovered || self.team_switcher_open {
                             Color::White
@@ -7901,6 +7904,11 @@ fn session_event_changes_transcript(kind: &SessionEventKind) -> bool {
                     .is_some_and(|value| value.eq_ignore_ascii_case("interrupted"))
         }
         SessionEventKind::ProviderEvent { kind, .. } => is_context_compaction(kind),
+        SessionEventKind::SubagentActivity {
+            activity,
+            agent,
+            event,
+        } => subagent_activity_summary(*activity, agent, event.as_deref()).is_some(),
         SessionEventKind::Message { .. }
         | SessionEventKind::ReasoningDelta { .. }
         | SessionEventKind::ReasoningCompleted
@@ -7912,7 +7920,6 @@ fn session_event_changes_transcript(kind: &SessionEventKind) -> bool {
         | SessionEventKind::GoalUpdated { .. }
         | SessionEventKind::GoalCleared { .. }
         | SessionEventKind::ContextCleared
-        | SessionEventKind::SubagentActivity { .. }
         | SessionEventKind::PromptRecalled { .. }
         | SessionEventKind::TurnCompleted { .. }
         | SessionEventKind::Error { .. } => true,
@@ -7942,6 +7949,15 @@ pub(crate) fn subagent_activity_summary(
     match activity {
         SubagentActivityKind::Started => Some(format!("agent · {task} · started")),
         SubagentActivityKind::Updated => match child_event.map(|event| &event.kind) {
+            Some(SessionEventKind::Message {
+                actor: EventActor::Assistant,
+                text,
+                status: MessageStatus::Complete,
+                ..
+            }) if !text.trim().is_empty() => Some(format!(
+                "agent · {task} · report · {}",
+                compact_text(text, 120)
+            )),
             Some(SessionEventKind::ApprovalRequested { title, detail, .. }) => Some(format!(
                 "agent · {task} · needs approval · {}",
                 compact_text(
@@ -9632,15 +9648,14 @@ fn activity_glyph(status: SessionStatus) -> &'static str {
     FRAMES[spinner_frame_index()]
 }
 
-fn agents_status_label(team_agent_count: usize, active_subagents: usize) -> String {
-    if active_subagents > 0 {
+fn agents_status_label(active_subagents: usize) -> Option<String> {
+    (active_subagents > 0).then(|| {
+        let working_team_size = active_subagents.saturating_add(1);
         format!(
-            "{} {team_agent_count} agents",
+            "{} {working_team_size} agents",
             activity_glyph(SessionStatus::Running)
         )
-    } else {
-        format!("{team_agent_count} agents")
-    }
+    })
 }
 
 fn spinner_frame_index() -> usize {

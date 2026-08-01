@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -32,6 +32,10 @@ struct QueuedPrompt {
     output_schema: Option<serde_json::Value>,
     delivery: PromptDelivery,
     visible: bool,
+    /// User-authored follow-ups are promoted as one FIFO batch when Escape
+    /// interrupts a turn. Internal team messages remain separate so they can
+    /// never replace or be folded into that user-visible batch.
+    interrupt_batch: bool,
 }
 
 struct PendingSteer {
@@ -617,6 +621,7 @@ async fn run_agent_session_store_kernel(
     let mut goal_turn_failures = ConsecutiveGoalTurnFailures::default();
     let mut pending = recover_queued_prompts(&recovery.queue_events);
     let mut deferred_commands = VecDeque::new();
+    let mut team_message_ids = HashSet::new();
     let mut at_turn_boundary = !pending.is_empty();
     let mut next_ready_detail = (!fresh).then(|| "Resumed".to_string());
     let (goal_tool_tx, mut goal_tool_rx) = mpsc::channel(8);
@@ -717,6 +722,7 @@ async fn run_agent_session_store_kernel(
             output_schema: None,
             delivery: PromptDelivery::Steer,
             visible: true,
+            interrupt_batch: true,
         });
     }
     loop {
@@ -728,6 +734,7 @@ async fn run_agent_session_store_kernel(
                 &mut pending,
                 &mut commands,
                 &mut deferred_commands,
+                &mut team_message_ids,
             )
             .await?;
             if interrupted_at_boundary {
@@ -755,6 +762,7 @@ async fn run_agent_session_store_kernel(
                 output_schema: None,
                 delivery: PromptDelivery::Queue,
                 visible: false,
+                interrupt_batch: false,
             })
         } else {
             record(
@@ -769,6 +777,25 @@ async fn run_agent_session_store_kernel(
             .await?;
             loop {
                 let command = tokio::select! {
+                    biased;
+                    command = next_host_command(&mut deferred_commands, &mut commands) => command,
+                    message = root_message_rx.recv(), if owns_team => {
+                        match message {
+                            Ok(message) => {
+                                team_message_ids.insert(message.message_id);
+                                Some(HostCommand::Prompt {
+                                    session_id,
+                                    message_id: message.message_id,
+                                    text: message.text,
+                                    attachments: Vec::new(),
+                                    output_schema: None,
+                                    delivery: message.delivery,
+                                })
+                            }
+                            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(broadcast::error::RecvError::Closed) => continue,
+                        }
+                    }
                     activity = subagent_activity_rx.recv(), if owns_team => {
                         if let Ok(activity) = activity {
                             record_subagent_activity(
@@ -781,21 +808,6 @@ async fn run_agent_session_store_kernel(
                         }
                         continue;
                     }
-                    message = root_message_rx.recv(), if owns_team => {
-                        match message {
-                            Ok(message) => Some(HostCommand::Prompt {
-                                session_id,
-                                message_id: message.message_id,
-                                text: message.text,
-                                attachments: Vec::new(),
-                                output_schema: None,
-                                delivery: message.delivery,
-                            }),
-                            Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                            Err(broadcast::error::RecvError::Closed) => continue,
-                        }
-                    }
-                    command = next_host_command(&mut deferred_commands, &mut commands) => command,
                 };
                 match command {
                     Some(HostCommand::Prompt {
@@ -825,6 +837,7 @@ async fn run_agent_session_store_kernel(
                                     delivery,
                                 });
                                 for message in inbox.into_iter().rev() {
+                                    team_message_ids.insert(message.message_id);
                                     deferred_commands.push_front(HostCommand::Prompt {
                                         session_id,
                                         message_id: message.message_id,
@@ -844,6 +857,7 @@ async fn run_agent_session_store_kernel(
                             output_schema,
                             delivery,
                             visible: true,
+                            interrupt_batch: !team_message_ids.remove(&message_id),
                         });
                     }
                     Some(HostCommand::RecallQueuedPrompt { .. }) => {}
@@ -909,6 +923,7 @@ async fn run_agent_session_store_kernel(
                                 output_schema: None,
                                 delivery: PromptDelivery::Queue,
                                 visible: false,
+                                interrupt_batch: false,
                             });
                         }
                     }
@@ -1439,14 +1454,17 @@ async fn run_agent_session_store_kernel(
                 }
                 message = root_message_rx.recv(), if owns_team => {
                     match message {
-                        Ok(message) => deferred_commands.push_front(HostCommand::Prompt {
-                            session_id,
-                            message_id: message.message_id,
-                            text: message.text,
-                            attachments: Vec::new(),
-                            output_schema: None,
-                            delivery: message.delivery,
-                        }),
+                        Ok(message) => {
+                            team_message_ids.insert(message.message_id);
+                            deferred_commands.push_front(HostCommand::Prompt {
+                                session_id,
+                                message_id: message.message_id,
+                                text: message.text,
+                                attachments: Vec::new(),
+                                output_schema: None,
+                                delivery: message.delivery,
+                            });
+                        }
                         Err(broadcast::error::RecvError::Lagged(_)) => {}
                         Err(broadcast::error::RecvError::Closed) => {}
                     }
@@ -1589,6 +1607,7 @@ async fn run_agent_session_store_kernel(
                                 output_schema,
                                 delivery: PromptDelivery::Steer,
                                 visible: true,
+                                interrupt_batch: !team_message_ids.remove(&message_id),
                             };
                             record_prompt_status(
                                 &mut journal,
@@ -1649,6 +1668,7 @@ async fn run_agent_session_store_kernel(
                                 output_schema,
                                 delivery: PromptDelivery::Queue,
                                 visible: true,
+                                interrupt_batch: !team_message_ids.remove(&message_id),
                             });
                         }
                         HostCommand::RecallQueuedPrompt { message_id, .. } => {
@@ -2244,6 +2264,7 @@ fn recover_queued_prompts(events: &[SessionEvent]) -> VecDeque<QueuedPrompt> {
                     output_schema: None,
                     delivery: delivery.unwrap_or(PromptDelivery::Queue),
                     visible: true,
+                    interrupt_batch: !is_attributed_team_message(text),
                 });
             }
             SessionEventKind::Message {
@@ -2351,12 +2372,23 @@ fn recall_withdrawable_steers(
 }
 
 fn coalesce_queued_prompts(pending: &mut VecDeque<QueuedPrompt>) {
-    if pending.len() < 2 {
+    if pending.is_empty() {
         return;
     }
 
-    let mut prompts = pending.drain(..).collect::<Vec<_>>();
-    let mut combined = prompts.pop().expect("at least two queued prompts");
+    let mut prompts = Vec::new();
+    let mut retained = VecDeque::with_capacity(pending.len());
+    while let Some(prompt) = pending.pop_front() {
+        if prompt.interrupt_batch {
+            prompts.push(prompt);
+        } else {
+            retained.push_back(prompt);
+        }
+    }
+    let Some(mut combined) = prompts.pop() else {
+        *pending = retained;
+        return;
+    };
     let mut text = String::new();
     let mut attachments = Vec::new();
     let mut visible = combined.visible;
@@ -2381,7 +2413,13 @@ fn coalesce_queued_prompts(pending: &mut VecDeque<QueuedPrompt>) {
     combined.attachments = attachments;
     combined.delivery = PromptDelivery::Queue;
     combined.visible = visible;
+    combined.interrupt_batch = true;
     pending.push_back(combined);
+    pending.append(&mut retained);
+}
+
+fn is_attributed_team_message(text: &str) -> bool {
+    text.starts_with("Team message from /")
 }
 
 async fn next_host_command(
@@ -2401,6 +2439,7 @@ async fn collect_input_at_turn_boundary(
     pending: &mut VecDeque<QueuedPrompt>,
     commands: &mut mpsc::Receiver<HostCommand>,
     deferred: &mut VecDeque<HostCommand>,
+    team_message_ids: &mut HashSet<Uuid>,
 ) -> Result<bool> {
     // Let input already emitted by the TUI reach the actor before promoting a
     // queued prompt into a turn. Prompt, Up, and Escape must stay ordered at
@@ -2432,6 +2471,7 @@ async fn collect_input_at_turn_boundary(
                     output_schema,
                     delivery: PromptDelivery::Queue,
                     visible: true,
+                    interrupt_batch: !team_message_ids.remove(&message_id),
                 };
                 record_prompt_status(
                     journal,
@@ -5936,6 +5976,7 @@ mod tests {
                 output_schema: None,
                 delivery: PromptDelivery::Queue,
                 visible: true,
+                interrupt_batch: true,
             },
             QueuedPrompt {
                 message_id: internal_id,
@@ -5944,6 +5985,7 @@ mod tests {
                 output_schema: None,
                 delivery: PromptDelivery::Queue,
                 visible: false,
+                interrupt_batch: false,
             },
             QueuedPrompt {
                 message_id: second_visible_id,
@@ -5952,6 +5994,7 @@ mod tests {
                 output_schema: None,
                 delivery: PromptDelivery::Queue,
                 visible: true,
+                interrupt_batch: true,
             },
             QueuedPrompt {
                 message_id: Uuid::new_v4(),
@@ -5960,6 +6003,7 @@ mod tests {
                 output_schema: None,
                 delivery: PromptDelivery::Steer,
                 visible: true,
+                interrupt_batch: true,
             },
         ]);
 
@@ -6008,6 +6052,7 @@ mod tests {
                 output_schema: None,
                 delivery: PromptDelivery::Steer,
                 visible: true,
+                interrupt_batch: true,
             },
             state,
         };
@@ -6057,6 +6102,7 @@ mod tests {
                 output_schema: None,
                 delivery: PromptDelivery::Queue,
                 visible: true,
+                interrupt_batch: true,
             },
             QueuedPrompt {
                 message_id: Uuid::new_v4(),
@@ -6065,6 +6111,7 @@ mod tests {
                 output_schema: None,
                 delivery: PromptDelivery::Queue,
                 visible: true,
+                interrupt_batch: true,
             },
             QueuedPrompt {
                 message_id: last_id,
@@ -6073,6 +6120,7 @@ mod tests {
                 output_schema: None,
                 delivery: PromptDelivery::Queue,
                 visible: true,
+                interrupt_batch: true,
             },
         ]);
 
@@ -6086,6 +6134,38 @@ mod tests {
         );
         assert_eq!(pending[0].attachments, [first_image, last_image]);
         assert_eq!(pending[0].delivery, PromptDelivery::Queue);
+    }
+
+    #[test]
+    fn escape_batch_runs_user_prompts_before_separate_team_messages() {
+        let prompt = |text: &str, interrupt_batch| QueuedPrompt {
+            message_id: Uuid::new_v4(),
+            text: text.to_string(),
+            attachments: Vec::new(),
+            output_schema: None,
+            delivery: PromptDelivery::Queue,
+            visible: true,
+            interrupt_batch,
+        };
+        let mut pending = VecDeque::from([
+            prompt("Team message from /root/worker:\n\ninternal report", false),
+            prompt("first user follow-up", true),
+            prompt("second user follow-up", true),
+        ]);
+
+        coalesce_queued_prompts(&mut pending);
+
+        assert_eq!(pending.len(), 2);
+        assert_eq!(
+            pending[0].text,
+            "first user follow-up\n\nsecond user follow-up"
+        );
+        assert_eq!(
+            pending[1].text,
+            "Team message from /root/worker:\n\ninternal report"
+        );
+        assert!(pending[0].interrupt_batch);
+        assert!(!pending[1].interrupt_batch);
     }
 
     #[tokio::test]
@@ -6123,6 +6203,7 @@ mod tests {
 
         let mut pending = VecDeque::new();
         let mut deferred = VecDeque::new();
+        let mut team_message_ids = HashSet::new();
         let interrupted = collect_input_at_turn_boundary(
             &mut journal,
             &event_tx,
@@ -6130,6 +6211,7 @@ mod tests {
             &mut pending,
             &mut command_rx,
             &mut deferred,
+            &mut team_message_ids,
         )
         .await
         .unwrap();
@@ -6311,6 +6393,28 @@ mod tests {
         assert_eq!(recovered[0].text, "still pending");
         assert_eq!(recovered[0].attachments, [PathBuf::from("/tmp/image.png")]);
         assert_eq!(recovered[0].delivery, PromptDelivery::Queue);
+    }
+
+    #[test]
+    fn recovered_team_messages_stay_out_of_escape_batches() {
+        let session_id = Uuid::new_v4();
+        let events = vec![SessionEvent::new(
+            session_id,
+            1,
+            SessionEventKind::Message {
+                message_id: Uuid::new_v4(),
+                actor: EventActor::User,
+                text: "Team message from /root/worker:\n\ninternal report".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Queued,
+                delivery: Some(PromptDelivery::Queue),
+            },
+        )];
+
+        let recovered = recover_queued_prompts(&events);
+
+        assert_eq!(recovered.len(), 1);
+        assert!(!recovered[0].interrupt_batch);
     }
 
     #[test]

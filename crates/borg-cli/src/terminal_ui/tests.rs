@@ -761,6 +761,54 @@ fn projection_only_events_keep_the_transcript_layout_cache() {
             payload: serde_json::json!({}),
         }
     ));
+
+    let child_id = Uuid::new_v4();
+    let agent = SubagentSnapshot {
+        session_id: child_id,
+        parent_session_id: Uuid::new_v4(),
+        task_name: "/root/inspect_ui".to_string(),
+        status: SubagentStatus::Running,
+        provider: CodingProvider::Codex,
+        model: None,
+        effort: None,
+        cwd: PathBuf::from("/workspace"),
+        detail: None,
+        final_text: None,
+        usage: Default::default(),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    assert!(!session_event_changes_transcript(
+        &SessionEventKind::SubagentActivity {
+            activity: SubagentActivityKind::Updated,
+            agent: agent.clone(),
+            event: Some(Box::new(SessionEvent::new(
+                child_id,
+                1,
+                SessionEventKind::ReasoningDelta {
+                    text: "hidden chatter".to_string(),
+                },
+            ))),
+        }
+    ));
+    assert!(session_event_changes_transcript(
+        &SessionEventKind::SubagentActivity {
+            activity: SubagentActivityKind::Updated,
+            agent,
+            event: Some(Box::new(SessionEvent::new(
+                child_id,
+                2,
+                SessionEventKind::Message {
+                    message_id: Uuid::new_v4(),
+                    actor: EventActor::Assistant,
+                    text: "visible report".to_string(),
+                    attachments: Vec::new(),
+                    status: MessageStatus::Complete,
+                    delivery: None,
+                },
+            ))),
+        }
+    ));
 }
 
 #[test]
@@ -1918,16 +1966,18 @@ fn active_subagent_count_tracks_only_working_children() {
 
 #[test]
 fn agents_status_spins_only_while_a_child_is_working() {
-    let working = agents_status_label(7, 1);
-    let idle = agents_status_label(7, 0);
+    let working = agents_status_label(1).expect("one child is working");
+    let larger_team = agents_status_label(2).expect("two children are working");
+    let idle = agents_status_label(0);
 
-    assert!(working.ends_with(" 7 agents"));
+    assert!(working.ends_with(" 2 agents"));
+    assert!(larger_team.ends_with(" 3 agents"));
     assert!(
         ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"]
             .iter()
             .any(|frame| working.contains(frame))
     );
-    assert_eq!(idle, "7 agents");
+    assert_eq!(idle, None);
 }
 
 #[test]
@@ -2028,7 +2078,6 @@ fn subagent_activity_collapses_chatter_and_keeps_terminal_result() {
         ))),
     ));
     assert_eq!(transcript.order.len(), 1);
-    agent.status = SubagentStatus::WaitingForApproval;
     transcript.apply(&activity(
         3,
         SubagentActivityKind::Updated,
@@ -2036,6 +2085,29 @@ fn subagent_activity_collapses_chatter_and_keeps_terminal_result() {
         Some(Box::new(SessionEvent::new(
             child_id,
             2,
+            SessionEventKind::Message {
+                message_id: Uuid::new_v4(),
+                actor: EventActor::Assistant,
+                text: "Found the renderer issue without another user prompt.".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            },
+        ))),
+    ));
+    assert!(matches!(
+        &transcript.order[0],
+        TranscriptEntry::Activity { text, .. }
+            if text == "agent · inspect_ui · report · Found the renderer issue without another user prompt."
+    ));
+    agent.status = SubagentStatus::WaitingForApproval;
+    transcript.apply(&activity(
+        4,
+        SubagentActivityKind::Updated,
+        &agent,
+        Some(Box::new(SessionEvent::new(
+            child_id,
+            3,
             SessionEventKind::ApprovalRequested {
                 approval_id: "approval-1".to_string(),
                 title: "Run focused tests?".to_string(),
@@ -2052,7 +2124,7 @@ fn subagent_activity_collapses_chatter_and_keeps_terminal_result() {
     ));
     agent.status = SubagentStatus::Stopped;
     agent.final_text = Some("Found the renderer issue.\nExtra detail".to_string());
-    transcript.apply(&activity(4, SubagentActivityKind::Completed, &agent, None));
+    transcript.apply(&activity(5, SubagentActivityKind::Completed, &agent, None));
 
     assert_eq!(transcript.order.len(), 1);
     assert!(matches!(

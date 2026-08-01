@@ -379,6 +379,27 @@ pub fn tool_call_summary(name: &str, input: &Value) -> (String, String) {
         return ("Wait for agents".to_string(), timeout);
     }
 
+    if matches!(tool.as_str(), "subagentactivity" | "subagent_activity") {
+        let kind = string_field(input, "kind").unwrap_or("updated");
+        let label = match kind.to_ascii_lowercase().as_str() {
+            "started" | "running" => "Agent started",
+            "completed" => "Agent completed",
+            "interrupted" => "Agent interrupted",
+            "failed" | "errored" => "Agent failed",
+            "stopped" | "shutdown" => "Agent stopped",
+            _ => "Agent activity",
+        };
+        let path = string_field(input, "agentPath")
+            .or_else(|| string_field(input, "agent_path"))
+            .or_else(|| string_field(input, "target"))
+            .unwrap_or("agent");
+        let task = path
+            .rsplit('/')
+            .find(|segment| !segment.is_empty())
+            .unwrap_or(path);
+        return (label.to_string(), compact_text(task, 120));
+    }
+
     if tool == "lsp_status" {
         return ("Language servers".to_string(), "status".to_string());
     }
@@ -571,7 +592,12 @@ fn tool_category(name: &str, label: &str) -> ToolPresentationCategory {
     if is_subagent_tool(label)
         || matches!(
             leaf.as_str(),
-            "task" | "agent" | "collab_tool_call" | "collabagenttoolcall"
+            "task"
+                | "agent"
+                | "subagentactivity"
+                | "subagent_activity"
+                | "collab_tool_call"
+                | "collabagenttoolcall"
         )
     {
         ToolPresentationCategory::Agent
@@ -1256,6 +1282,24 @@ mod tests {
         assert_eq!(gmail.label, "Read Gmail attachment");
         assert_eq!(gmail.detail, "Employment Contract.pdf");
         assert_eq!(gmail.category, ToolPresentationCategory::Read);
+    }
+
+    #[test]
+    fn projects_provider_subagent_activity_without_raw_identifiers() {
+        let activity = project_tool_presentation(
+            "SubagentActivity",
+            &json!({
+                "agentThreadId": "019fbb79-33be-7592-9982-f79f9f20f1fc",
+                "agentPath": "/root/capability_architecture_rank",
+                "kind": "interrupted"
+            }),
+            None,
+            false,
+        );
+
+        assert_eq!(activity.label, "Agent interrupted");
+        assert_eq!(activity.detail, "capability_architecture_rank");
+        assert_eq!(activity.category, ToolPresentationCategory::Agent);
     }
 
     #[test]
