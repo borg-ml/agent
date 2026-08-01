@@ -70,6 +70,7 @@ enum CacheMissCause {
 pub(super) struct CacheMissNotice {
     missed_tokens: u64,
     prompt_tokens: u64,
+    reusable_prefix_tokens: u64,
     cached_input_tokens: u64,
     cause: CacheMissCause,
     model: Option<String>,
@@ -77,9 +78,11 @@ pub(super) struct CacheMissNotice {
     cost_basis: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct CacheStatus {
     pub label: String,
     pub warning: bool,
+    resend_tokens: Option<u64>,
 }
 
 impl CacheDiagnostics {
@@ -99,6 +102,9 @@ impl CacheDiagnostics {
         signature: CacheSignature,
         usage: CacheUsage<'_>,
     ) -> Option<CacheMissNotice> {
+        // ProviderCallUsage keeps uncached input, cache reads, and cache writes
+        // in exclusive buckets, so their sum is the full prompt processed by
+        // the provider for this turn.
         let prompt_tokens = usage
             .input_tokens
             .saturating_add(usage.cached_input_tokens)
@@ -112,6 +118,7 @@ impl CacheDiagnostics {
             CodingProvider::Codex | CodingProvider::Claude
         ) || usage.cached_input_tokens > 0
             || usage.cache_creation_input_tokens > 0;
+        let had_prior_prompt = self.previous.is_some();
         let notice = self.previous.as_ref().and_then(|previous| {
             if !(cache_telemetry_available || previous.cache_telemetry_available) {
                 return None;
@@ -124,6 +131,7 @@ impl CacheDiagnostics {
             Some(CacheMissNotice {
                 missed_tokens,
                 prompt_tokens,
+                reusable_prefix_tokens,
                 cached_input_tokens: usage.cached_input_tokens,
                 cause: cache_miss_cause(previous, &signature, at),
                 model: signature.model.clone(),
@@ -132,9 +140,21 @@ impl CacheDiagnostics {
             })
         });
 
-        if cache_telemetry_available {
+        // A first turn has no prior prompt to hit. Recording its natural zero
+        // as a cache result makes the idle composer claim a false cache miss.
+        if cache_telemetry_available
+            && had_prior_prompt
+            && let Some(previous) = self.previous.as_ref()
+        {
+            let reusable_prefix_tokens = previous.prompt_tokens.min(prompt_tokens);
             self.latest = Some(LatestCacheUse {
-                hit_percent: cache_hit_percent(usage.cached_input_tokens, prompt_tokens),
+                // The newly appended user/assistant suffix was never eligible
+                // for reuse. Report how much of the prior reusable prefix hit,
+                // rather than diluting the percentage with brand-new tokens.
+                hit_percent: cache_hit_percent(
+                    usage.cached_input_tokens.min(reusable_prefix_tokens),
+                    reusable_prefix_tokens,
+                ),
                 signature: signature.clone(),
             });
         }
@@ -154,7 +174,10 @@ impl CacheDiagnostics {
     ) -> Option<CacheStatus> {
         let previous = self.previous.as_ref()?;
         if previous.signature.provider != signature.provider {
-            return Some(warning_status("cache cold · provider changed"));
+            return Some(warning_status(
+                "cache cold · provider changed",
+                previous.prompt_tokens,
+            ));
         }
         let model_changed = previous.signature.model != signature.model;
         let effort_changed = previous.signature.effort != signature.effort;
@@ -165,17 +188,20 @@ impl CacheDiagnostics {
                 (false, true) => "effort changed",
                 (false, false) => unreachable!(),
             };
-            return Some(warning_status(format!("cache cold · {changed}")));
+            return Some(warning_status(
+                format!("cache cold · {changed}"),
+                previous.prompt_tokens,
+            ));
         }
 
         let idle = elapsed(previous.at, now);
         if let Some(window) = cache_window(signature.provider)
             && idle >= window
         {
-            return Some(warning_status(format!(
-                "cache may be cold · {} idle",
-                format_duration(idle)
-            )));
+            return Some(warning_status(
+                format!("cache may be cold · {} idle", format_duration(idle)),
+                previous.prompt_tokens,
+            ));
         }
 
         self.latest
@@ -183,8 +209,36 @@ impl CacheDiagnostics {
             .filter(|latest| latest.signature == *signature)
             .map(|latest| CacheStatus {
                 label: format!("cache {}% hit", latest.hit_percent),
-                warning: latest.hit_percent == 0,
+                // This describes the completed turn. A zero hit does not
+                // predict another miss: processing that turn can warm the
+                // provider cache for the next request.
+                warning: false,
+                resend_tokens: None,
             })
+    }
+}
+
+impl CacheStatus {
+    pub(super) fn cold_cache_guidance(&self) -> String {
+        debug_assert!(self.warning);
+        let reason = self
+            .label
+            .strip_prefix("cache cold · ")
+            .or_else(|| self.label.strip_prefix("cache may be cold · "))
+            .unwrap_or(&self.label);
+        let resend = self.resend_tokens.map_or_else(
+            || "resend earlier context for reprocessing".to_string(),
+            |tokens| {
+                format!(
+                    "resend up to {} from the prior prompt for reprocessing",
+                    format_tokens(tokens)
+                )
+            },
+        );
+        format!(
+            "Cold cache: {reason}; the next turn may {resend}. Run /clear first if that \
+             context is no longer useful."
+        )
     }
 }
 
@@ -197,7 +251,10 @@ fn material_cache_miss(missed_tokens: u64, reusable_prefix_tokens: u64) -> bool 
 
 impl CacheMissNotice {
     pub(super) fn text(&self) -> String {
-        let hit_percent = cache_hit_percent(self.cached_input_tokens, self.prompt_tokens);
+        let hit_percent = cache_hit_percent(
+            self.cached_input_tokens.min(self.reusable_prefix_tokens),
+            self.reusable_prefix_tokens,
+        );
         let mut facts = vec![
             format!(
                 "{} of the prior prompt was reprocessed",
@@ -303,10 +360,11 @@ fn cache_hit_percent(cached_tokens: u64, prompt_tokens: u64) -> u8 {
     percent as u8
 }
 
-fn warning_status(label: impl Into<String>) -> CacheStatus {
+fn warning_status(label: impl Into<String>, resend_tokens: u64) -> CacheStatus {
     CacheStatus {
         label: label.into(),
         warning: true,
+        resend_tokens: Some(resend_tokens),
     }
 }
 
@@ -355,10 +413,18 @@ mod tests {
     }
 
     fn usage(input: u64, cached: u64) -> CacheUsage<'static> {
+        usage_with_cache_creation(input, cached, 0)
+    }
+
+    fn usage_with_cache_creation(
+        input: u64,
+        cached: u64,
+        cache_creation: u64,
+    ) -> CacheUsage<'static> {
         CacheUsage {
             input_tokens: input,
             cached_input_tokens: cached,
-            cache_creation_input_tokens: 0,
+            cache_creation_input_tokens: cache_creation,
             cost_microusd: None,
             cost_basis: "unavailable",
         }
@@ -406,6 +472,89 @@ mod tests {
         );
 
         assert!(notice.is_none());
+    }
+
+    #[test]
+    fn cache_hit_percentage_excludes_the_new_prompt_suffix() {
+        let mut diagnostics = CacheDiagnostics::default();
+        let at = Utc::now();
+        diagnostics.observe(at, signature("gpt-5.6-sol", "high"), usage(1_000, 99_000));
+        diagnostics.observe(
+            at + TimeDelta::minutes(1),
+            signature("gpt-5.6-sol", "high"),
+            usage(51_000, 100_000),
+        );
+
+        let status = diagnostics
+            .status(
+                at + TimeDelta::minutes(1),
+                &signature("gpt-5.6-sol", "high"),
+            )
+            .expect("measured cache status");
+        assert_eq!(status.label, "cache 100% hit");
+    }
+
+    #[test]
+    fn first_turn_does_not_claim_a_zero_percent_cache_hit() {
+        let mut diagnostics = CacheDiagnostics::default();
+        let at = Utc::now();
+        diagnostics.observe(
+            at,
+            signature("gpt-5.6-sol", "high"),
+            usage_with_cache_creation(1_000, 0, 99_000),
+        );
+
+        assert!(
+            diagnostics
+                .status(at, &signature("gpt-5.6-sol", "high"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn measured_zero_hit_does_not_predict_another_cold_turn() {
+        let mut diagnostics = CacheDiagnostics::default();
+        let at = Utc::now();
+        diagnostics.observe(
+            at,
+            signature("gpt-5.6-sol", "high"),
+            usage_with_cache_creation(1_000, 49_000, 50_000),
+        );
+        diagnostics.observe(
+            at + TimeDelta::minutes(1),
+            signature("gpt-5.6-sol", "high"),
+            usage(100_000, 0),
+        );
+
+        let status = diagnostics
+            .status(
+                at + TimeDelta::minutes(1),
+                &signature("gpt-5.6-sol", "high"),
+            )
+            .expect("measured cache status");
+        assert_eq!(status.label, "cache 0% hit");
+        assert!(!status.warning);
+    }
+
+    #[test]
+    fn cold_cache_guidance_includes_resend_token_count() {
+        let mut diagnostics = CacheDiagnostics::default();
+        let at = Utc::now();
+        diagnostics.observe(
+            at,
+            signature("gpt-5.6-sol", "high"),
+            usage_with_cache_creation(1_000, 49_000, 50_000),
+        );
+
+        let status = diagnostics
+            .status(at, &signature("gpt-5.6-sol", "low"))
+            .expect("cold cache status");
+        assert!(status.warning);
+        assert_eq!(
+            status.cold_cache_guidance(),
+            "Cold cache: effort changed; the next turn may resend up to 100.0k tokens from the \
+             prior prompt for reprocessing. Run /clear first if that context is no longer useful."
+        );
     }
 
     #[test]

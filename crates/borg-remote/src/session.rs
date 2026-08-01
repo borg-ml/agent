@@ -1386,7 +1386,17 @@ async fn run_agent_session_store_kernel(
                             let error = format!("{error:#}");
                             let ready_detail =
                                 format!("Turn failed; the session remains available: {error}");
-                            if goal_turn_failures.record(&error) >= 3 {
+                            if provider_error_is_usage_limited(&error) {
+                                goal_turn_failures.reset();
+                                usage_limit_active_goal(
+                                    &mut journal,
+                                    &events,
+                                    session_id,
+                                    &mut goal,
+                                    &mut goal_active_since,
+                                )
+                                .await?;
+                            } else if goal_turn_failures.record(&error) >= 3 {
                                 block_active_goal(
                                     &mut journal,
                                     &events,
@@ -3366,6 +3376,36 @@ async fn block_active_goal(
         .await?;
     }
     Ok(())
+}
+
+async fn usage_limit_active_goal(
+    journal: &mut RuntimeSessionStore,
+    events: &mpsc::Sender<SessionEvent>,
+    session_id: Uuid,
+    goal: &mut Option<SessionGoal>,
+    active_since: &mut Option<Instant>,
+) -> Result<()> {
+    if goal.as_ref().is_some_and(|goal| goal.status.is_active()) {
+        set_terminal_goal_status(
+            journal,
+            events,
+            session_id,
+            goal,
+            active_since,
+            GoalStatus::UsageLimited,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+fn provider_error_is_usage_limited(error: &str) -> bool {
+    let compact = error
+        .chars()
+        .filter(|character| !character.is_ascii_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    compact.contains(r#""kind":"rate_limit""#) || compact.contains(r#""kind":"billing_error""#)
 }
 
 #[derive(Default)]
@@ -6001,6 +6041,59 @@ mod tests {
 
         failures.reset();
         assert_eq!(failures.record("permission denied"), 1);
+    }
+
+    #[test]
+    fn structured_rate_and_billing_errors_are_usage_limited() {
+        assert!(provider_error_is_usage_limited(
+            r#"claude SDK API error: limit reached "kind":"rate_limit" "status":429"#
+        ));
+        assert!(provider_error_is_usage_limited(
+            r#"claude SDK API error: payment required "kind": "billing_error""#
+        ));
+        assert!(!provider_error_is_usage_limited(
+            r#"claude SDK API error: overloaded "kind":"overloaded" "status":529"#
+        ));
+    }
+
+    #[tokio::test]
+    async fn usage_limit_failure_stops_an_active_goal() {
+        let root = tempdir().unwrap();
+        let journal_path = root.path().join("session.jsonl");
+        let session_id = Uuid::new_v4();
+        let journal = SessionJournal::open(&journal_path).unwrap();
+        let store: Arc<dyn SessionStore> = Arc::new(
+            crate::session_store::JsonlSessionStore::from_journal(journal),
+        );
+        let mut journal = RuntimeSessionStore::new(store, Vec::new());
+        let (event_tx, _event_rx) = mpsc::channel(16);
+        let mut goal = Some(SessionGoal::new("Keep working".to_string(), None));
+        let mut active_since = Some(Instant::now());
+
+        usage_limit_active_goal(
+            &mut journal,
+            &event_tx,
+            session_id,
+            &mut goal,
+            &mut active_since,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            goal.as_ref().map(|goal| goal.status),
+            Some(GoalStatus::UsageLimited)
+        );
+        assert!(active_since.is_none());
+        assert_eq!(
+            SessionJournal::open(&journal_path)
+                .unwrap()
+                .goal()
+                .unwrap()
+                .unwrap()
+                .status,
+            GoalStatus::UsageLimited
+        );
     }
 
     #[test]

@@ -879,7 +879,7 @@ fn effort_changes_do_not_relabel_usage_from_the_active_turn() {
     assert!(
         transcript
             .cache_status(Utc::now())
-            .is_some_and(|(label, _)| label.contains("effort changed"))
+            .is_some_and(|status| status.label.contains("effort changed"))
     );
 
     apply(&mut transcript, started(new_turn, "high"));
@@ -1510,6 +1510,15 @@ fn dumb_or_explicit_plain_terminals_use_the_line_input_fallback() {
         Some("plain")
     ));
     assert!(rich_terminal_supported(Some("xterm-256color"), None));
+}
+
+#[test]
+fn keyboard_enhancement_does_not_request_release_events() {
+    let flags = keyboard_enhancement_flags();
+
+    assert!(flags.contains(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES));
+    assert!(flags.contains(KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES));
+    assert!(!flags.contains(KeyboardEnhancementFlags::REPORT_EVENT_TYPES));
 }
 
 #[test]
@@ -2415,6 +2424,8 @@ fn resume_picker_uses_a_balanced_two_column_layout() {
     let rows = rendered.lines().collect::<Vec<_>>();
 
     assert!(rows[0].contains("Resume session"));
+    assert!(rows[0].contains("type to filter"));
+    assert!(rows[0].contains("PgUp/PgDn older"));
     assert!(rows[0].contains("Latest response"));
     assert!(rows.iter().any(|row| row.contains("CURRENT DIRECTORY")));
     assert!(rows.iter().any(|row| row.contains("ALL DIRECTORIES")));
@@ -2659,6 +2670,58 @@ fn optimistic_idle_submission_is_visible_before_session_persistence() {
         },
     );
     assert!(transcript.apply(&queued).is_some());
+}
+
+#[test]
+fn optimistic_idle_submission_immediately_hides_cold_cache_guidance() {
+    let session_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    transcript.config = Some(SessionDisplayConfig {
+        cwd: PathBuf::from("/workspace"),
+        provider: CodingProvider::Codex,
+        model: Some("gpt-5.6-sol".to_string()),
+        effort: Some("high".to_string()),
+        response_language: ResponseLanguage::English,
+        fast: false,
+        permission_mode: PermissionMode::FullAccess,
+    });
+    let at = Utc::now() - chrono::Duration::minutes(31);
+    transcript.cache_diagnostics.observe(
+        at,
+        CacheSignature::new(CodingProvider::Codex, Some("gpt-5.6-sol"), Some("high")),
+        CacheUsage {
+            input_tokens: 1_000,
+            cached_input_tokens: 99_000,
+            cache_creation_input_tokens: 0,
+            cost_microusd: None,
+            cost_basis: "unavailable",
+        },
+    );
+    assert!(
+        transcript
+            .cache_status(Utc::now())
+            .is_some_and(|status| status.warning)
+    );
+
+    transcript.project_optimistic_message(&SessionEvent::new(
+        session_id,
+        0,
+        SessionEventKind::Message {
+            message_id,
+            actor: EventActor::User,
+            text: "start immediately".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: Some(PromptDelivery::Steer),
+        },
+    ));
+
+    assert_eq!(
+        transcript.active_turn.as_ref().map(|turn| turn.message_id),
+        Some(message_id)
+    );
+    assert_eq!(transcript.cache_status(Utc::now()), None);
 }
 
 #[test]
@@ -3232,6 +3295,20 @@ fn low_context_status_announces_imminent_compaction() {
 }
 
 #[test]
+fn stale_session_state_cannot_reseed_newer_root_projection_fields() {
+    let stale_ready = SessionState {
+        latest_sequence: 4,
+        status: Some(SessionStatus::Ready),
+        pending_approval_id: Some("stale-approval".to_string()),
+        ..SessionState::default()
+    };
+
+    assert!(session_state_snapshot_is_stale(5, &stale_ready));
+    assert!(!session_state_snapshot_is_stale(4, &stale_ready));
+    assert!(!session_state_snapshot_is_stale(3, &stale_ready));
+}
+
+#[test]
 fn projected_session_state_restores_status_config_outside_the_history_tail() {
     let separator = std::path::MAIN_SEPARATOR;
     let mut transcript = Transcript::default();
@@ -3430,6 +3507,40 @@ fn active_session_status_uses_vibrant_peach() {
         RUNNING_STATUS_PEACH
     );
     assert_eq!(session_status_color(SessionStatus::Failed), Color::LightRed);
+}
+
+#[test]
+fn status_hover_underlines_the_label_but_not_the_activity_glyph() {
+    let spans = status_control_spans("⠋", "running", RUNNING_STATUS_PEACH, true, Some("2m"));
+
+    assert_eq!(spans[0].content.as_ref(), " ⠋ ");
+    assert!(!spans[0].style.add_modifier.contains(Modifier::UNDERLINED));
+    assert_eq!(spans[1].content.as_ref(), "running");
+    assert!(spans[1].style.add_modifier.contains(Modifier::UNDERLINED));
+    assert_eq!(spans[2].content.as_ref(), " 2m");
+    assert!(!spans[2].style.add_modifier.contains(Modifier::UNDERLINED));
+}
+
+#[test]
+fn ready_status_does_not_register_an_actionable_hitbox() {
+    let footer = Rect::new(4, 20, 80, 1);
+
+    assert_eq!(
+        status_control_hit_area(SessionStatus::Ready, footer, 3, 12),
+        None
+    );
+    assert_eq!(
+        status_control_hit_area(SessionStatus::Running, footer, 3, 12),
+        Some(Rect::new(7, 20, 12, 1))
+    );
+}
+
+#[test]
+fn open_overlays_suppress_background_hover_hit_testing() {
+    assert!(!overlay_suppresses_background_hover(false, false, false));
+    assert!(overlay_suppresses_background_hover(true, false, false));
+    assert!(overlay_suppresses_background_hover(false, true, false));
+    assert!(overlay_suppresses_background_hover(false, false, true));
 }
 
 #[test]

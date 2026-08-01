@@ -159,6 +159,7 @@ impl CodexAppServerClient {
             }
             command.env("CODEX_HOME", codex_home);
         }
+        crate::subprocess::isolate_std_process_from_terminal(&mut command);
         let mut child = command
             .spawn()
             .context("failed to spawn codex app-server")?;
@@ -476,6 +477,7 @@ impl CodexAppServerClient {
 
         let mut state = TurnState {
             workspace_id: workspace_id.clone(),
+            turn_id: turn_id.clone(),
             output_text: String::new(),
             reasoning_text: String::new(),
             raw_notifications: Vec::new(),
@@ -542,6 +544,26 @@ impl CodexAppServerClient {
     where
         F: FnMut(&JsonRpcMessage) -> Result<()>,
     {
+        if !state.accepts_message(message) {
+            if let Some(request_id) = message.id {
+                if let Some(response) = unattended_server_request_response(message) {
+                    self.send_response(request_id, response)?;
+                } else {
+                    self.send_error_response(
+                        request_id,
+                        -32600,
+                        "request belongs to an inactive turn".to_string(),
+                    )?;
+                }
+            }
+            tracing::debug!(
+                method = message.method.as_deref().unwrap_or_default(),
+                active_turn_id = %state.turn_id,
+                message_turn_id = notification_turn_id(message).unwrap_or_default(),
+                "discarded Codex request from an inactive turn"
+            );
+            return Ok(true);
+        }
         let method = message.method.as_deref().unwrap_or("");
         if method == "currentTime/read" {
             let request_id = message
@@ -1188,6 +1210,32 @@ fn extract_turn_id(result: &Value, notifications: &[JsonRpcMessage]) -> Option<S
         })
 }
 
+/// Return the provider turn that owns a notification or server request.
+///
+/// Codex app-server keeps a single stdout stream across pooled turns. Messages
+/// from the previous turn can therefore already be buffered when `turn/start`
+/// for the next turn is acknowledged. They must never be projected into the
+/// new Borg turn merely because they were read while that turn was active.
+fn notification_turn_id(message: &JsonRpcMessage) -> Option<&str> {
+    let params = message.params.as_ref()?;
+    params
+        .get("turnId")
+        .and_then(Value::as_str)
+        .or_else(|| params.pointer("/turn/id").and_then(Value::as_str))
+}
+
+/// Current app-server protocol notifications that describe model work always
+/// carry a turn id. Treat a missing id as untrusted rather than silently
+/// attaching stale buffered work to whichever turn happens to read it.
+fn notification_requires_turn_id(method: Option<&str>) -> bool {
+    let Some(method) = method else {
+        return false;
+    };
+    method == "thread/tokenUsage/updated"
+        || method.starts_with("turn/")
+        || method.starts_with("item/")
+}
+
 fn clear_managed_codex_env(command: &mut Command) {
     for key in [
         "BORG_OPENAI_AUTH_JSON_B64",
@@ -1200,6 +1248,7 @@ fn clear_managed_codex_env(command: &mut Command) {
 
 struct TurnState {
     workspace_id: String,
+    turn_id: String,
     output_text: String,
     reasoning_text: String,
     raw_notifications: Vec<String>,
@@ -1213,6 +1262,13 @@ struct TurnState {
 }
 
 impl TurnState {
+    fn accepts_message(&self, message: &JsonRpcMessage) -> bool {
+        match notification_turn_id(message) {
+            Some(turn_id) => turn_id == self.turn_id,
+            None => !notification_requires_turn_id(message.method.as_deref()),
+        }
+    }
+
     fn handle_message<F>(
         &mut self,
         msg: JsonRpcMessage,
@@ -1221,6 +1277,15 @@ impl TurnState {
     where
         F: FnMut(&JsonRpcMessage) -> Result<()>,
     {
+        if !self.accepts_message(&msg) {
+            tracing::debug!(
+                method = msg.method.as_deref().unwrap_or_default(),
+                active_turn_id = %self.turn_id,
+                message_turn_id = notification_turn_id(&msg).unwrap_or_default(),
+                "quarantined Codex notification outside the active turn"
+            );
+            return Ok(None);
+        }
         on_notification(&msg)?;
         self.raw_notifications.push(serde_json::to_string(&msg)?);
 
@@ -1287,6 +1352,7 @@ impl TurnState {
                 if let Some(params) = &msg.params {
                     let status = params
                         .get("status")
+                        .or_else(|| params.pointer("/turn/status"))
                         .and_then(Value::as_str)
                         .unwrap_or("unknown");
                     if status == "failed" {
@@ -1666,6 +1732,7 @@ mod tests {
     fn test_turn_state() -> TurnState {
         TurnState {
             workspace_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
             output_text: String::new(),
             reasoning_text: String::new(),
             raw_notifications: Vec::new(),
@@ -1689,6 +1756,7 @@ mod tests {
             result: None,
             error: None,
             params: Some(serde_json::json!({
+                "turnId": "turn-1",
                 "itemId": "agent-1",
                 "delta": "First sentence.",
             })),
@@ -1700,6 +1768,7 @@ mod tests {
             result: None,
             error: None,
             params: Some(serde_json::json!({
+                "turnId": "turn-1",
                 "itemId": "agent-2",
                 "delta": "Second sentence.",
             })),
@@ -1712,6 +1781,99 @@ mod tests {
     }
 
     #[test]
+    fn stale_pooled_notifications_cannot_complete_or_emit_into_the_next_turn() {
+        let mut state = test_turn_state();
+        let mut projected = Vec::new();
+        let stale_delta = JsonRpcMessage {
+            id: None,
+            method: Some("item/agentMessage/delta".to_string()),
+            message: None,
+            result: None,
+            error: None,
+            params: Some(serde_json::json!({
+                "threadId": "thread-1",
+                "turnId": "turn-old",
+                "itemId": "agent-old",
+                "delta": "stale output",
+            })),
+        };
+        let stale_terminal = JsonRpcMessage {
+            id: None,
+            method: Some("turn/completed".to_string()),
+            message: None,
+            result: None,
+            error: None,
+            params: Some(serde_json::json!({
+                "threadId": "thread-1",
+                "turn": {"id": "turn-old", "status": "completed", "items": []},
+            })),
+        };
+
+        assert!(
+            state
+                .handle_message(stale_delta, &mut |message| {
+                    projected.push(message.method.clone());
+                    Ok(())
+                })
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            state
+                .handle_message(stale_terminal, &mut |message| {
+                    projected.push(message.method.clone());
+                    Ok(())
+                })
+                .unwrap()
+                .is_none()
+        );
+        assert!(projected.is_empty());
+        assert!(state.output_text.is_empty());
+
+        let current_terminal = JsonRpcMessage {
+            id: None,
+            method: Some("turn/completed".to_string()),
+            message: None,
+            result: None,
+            error: None,
+            params: Some(serde_json::json!({
+                "threadId": "thread-1",
+                "turn": {"id": "turn-1", "status": "completed", "items": []},
+            })),
+        };
+        assert!(
+            state
+                .handle_message(current_terminal, &mut |_| Ok(()))
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn turn_scoped_notifications_without_identity_are_quarantined() {
+        let mut state = test_turn_state();
+        let message = JsonRpcMessage {
+            id: None,
+            method: Some("item/agentMessage/delta".to_string()),
+            message: None,
+            result: None,
+            error: None,
+            params: Some(serde_json::json!({
+                "itemId": "unidentified",
+                "delta": "must not leak into this turn",
+            })),
+        };
+
+        assert!(
+            state
+                .handle_message(message, &mut |_| panic!("must not project"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(state.output_text.is_empty());
+    }
+
+    #[test]
     fn turn_state_keeps_provider_context_window_with_usage() {
         let mut state = test_turn_state();
         let message = JsonRpcMessage {
@@ -1721,6 +1883,7 @@ mod tests {
             result: None,
             error: None,
             params: Some(serde_json::json!({
+                "turnId": "turn-1",
                 "tokenUsage": {
                     "last": {
                         "totalTokens": 4000,
@@ -1779,6 +1942,7 @@ mod tests {
                     result: None,
                     error: None,
                     params: Some(serde_json::json!({
+                        "turnId": "turn-1",
                         "itemId": "agent-1",
                         "delta": "Working through the sources first.",
                     })),
@@ -1798,6 +1962,7 @@ mod tests {
                     params: Some(serde_json::json!({
                         "status": "completed",
                         "turn": {
+                            "id": "turn-1",
                             "items": [
                                 {
                                     "type": "agentMessage",

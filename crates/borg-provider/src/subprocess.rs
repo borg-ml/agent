@@ -98,7 +98,7 @@ where
     } else {
         Stdio::null()
     });
-    place_in_process_group(&mut command);
+    isolate_std_process_from_terminal(&mut command);
 
     let started_at = Instant::now();
     let mut child = command
@@ -208,7 +208,7 @@ where
 /// Place a subprocess in its own process group on Unix. No-op on
 /// platforms without process groups.
 #[cfg(unix)]
-fn place_in_process_group(command: &mut Command) {
+pub(crate) fn isolate_std_process_from_terminal(command: &mut Command) {
     use std::os::unix::process::CommandExt;
     // Setting pgid to 0 tells the child to become the leader of a new
     // process group. Its own children then inherit the group, so
@@ -217,7 +217,18 @@ fn place_in_process_group(command: &mut Command) {
 }
 
 #[cfg(not(unix))]
-fn place_in_process_group(_command: &mut Command) {}
+pub(crate) fn isolate_std_process_from_terminal(_command: &mut Command) {}
+
+/// Keep a long-lived async provider subprocess out of Borg's foreground
+/// terminal process group. Closing one attached terminal may SIGHUP Borg's
+/// foreground group, but it must not kill the app-server that owns the turn.
+#[cfg(unix)]
+pub(crate) fn isolate_async_process_from_terminal(command: &mut tokio::process::Command) {
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+pub(crate) fn isolate_async_process_from_terminal(_command: &mut tokio::process::Command) {}
 
 #[cfg(unix)]
 fn kill_process_group(pid: u32) {

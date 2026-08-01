@@ -9,6 +9,8 @@ import {
 } from "@anthropic-ai/claude-agent-sdk";
 import { createInterface } from "node:readline";
 
+import { TurnMessageBoundary } from "./turn_messages.js";
+
 type ProviderConfig = {
   prompt: string;
   attachments?: string[];
@@ -48,6 +50,7 @@ type UserMessage = {
   };
   parent_tool_use_id: null;
   session_id: string;
+  uuid: `${string}-${string}-${string}-${string}-${string}`;
 };
 
 class AsyncQueue<T> implements AsyncIterable<T> {
@@ -136,6 +139,7 @@ function userMessage(text: string): UserMessage {
     message: { role: "user", content: [{ type: "text", text }] },
     parent_tool_use_id: null,
     session_id: "",
+    uuid: globalThis.crypto.randomUUID(),
   };
 }
 
@@ -153,6 +157,8 @@ async function main(): Promise<void> {
   let config: ProviderConfig | undefined = JSON.parse(first.value);
   const turns = new AsyncQueue<ProviderConfig>();
   let activeInput: AsyncQueue<UserMessage> | undefined;
+  let activeInputIds: Set<string> | undefined;
+  let activeBoundary: TurnMessageBoundary | undefined;
   let activeStream: ReturnType<typeof query> | undefined;
   const pendingApprovals = new Map<
     string,
@@ -245,11 +251,23 @@ async function main(): Promise<void> {
         if (control.type === "start") {
           turns.push(control.config);
         } else if (control.type === "steer") {
-          activeInput?.push(
-            userMessage(promptText(control.text, control.attachments)),
+          const message = userMessage(
+            promptText(control.text, control.attachments),
           );
+          activeInputIds?.add(message.uuid);
+          activeInput?.push(message);
         } else if (control.type === "interrupt") {
-          await activeStream?.interrupt();
+          const stream = activeStream;
+          if (stream) {
+            await Promise.allSettled(
+              [
+                stream.interrupt(),
+                ...(activeBoundary?.backgroundTaskIds() ?? []).map((taskId) =>
+                  stream.stopTask(taskId),
+                ),
+              ],
+            );
+          }
         } else if (control.type === "approval") {
           const pending = pendingApprovals.get(control.approval_id);
           if (!pending) continue;
@@ -291,7 +309,14 @@ async function main(): Promise<void> {
     activeStream = stream;
     while (config) {
       const currentLifecycle = lifecycleKey(config);
-      input.push(userMessage(promptText(config.prompt, config.attachments)));
+      const initialMessage = userMessage(
+        promptText(config.prompt, config.attachments),
+      );
+      const inputIds = new Set([initialMessage.uuid]);
+      const boundary = new TurnMessageBoundary();
+      activeInputIds = inputIds;
+      activeBoundary = boundary;
+      input.push(initialMessage);
       while (true) {
         const nextMessage = await messages.next();
         if (nextMessage.done) {
@@ -299,6 +324,10 @@ async function main(): Promise<void> {
           break;
         }
         const message = nextMessage.value;
+        const action = boundary.classify(message, { inputIds });
+        if (action === "suppress") {
+          continue;
+        }
         process.stdout.write(`${JSON.stringify(message)}\n`);
         if (message.type === "assistant") {
           try {
@@ -318,7 +347,7 @@ async function main(): Promise<void> {
             // authoritative in that case.
           }
         }
-        if (message.type === "result") break;
+        if (action === "terminal") break;
       }
       if (!config) break;
       const next = await turns[Symbol.asyncIterator]().next();
@@ -330,6 +359,8 @@ async function main(): Promise<void> {
       config = nextConfig;
     }
     activeInput = undefined;
+    activeInputIds = undefined;
+    activeBoundary = undefined;
     activeStream = undefined;
     input.close();
     stream.close();

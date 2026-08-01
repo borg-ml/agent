@@ -1,6 +1,7 @@
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
 use tokio::sync::mpsc;
@@ -82,6 +83,16 @@ impl LocalSessionControlServer {
     ) -> Result<Self> {
         Ok(Self)
     }
+
+    pub fn start_with_prompt_admissions(
+        socket_path: PathBuf,
+        session_id: Uuid,
+        writer: &SessionWriterLease,
+        commands: mpsc::Sender<HostCommand>,
+        _prompt_admissions: Option<Arc<Mutex<HashSet<Uuid>>>>,
+    ) -> Result<Self> {
+        Self::start(socket_path, session_id, writer, commands)
+    }
 }
 
 #[cfg(unix)]
@@ -91,6 +102,16 @@ impl LocalSessionControlServer {
         session_id: Uuid,
         writer: &SessionWriterLease,
         commands: mpsc::Sender<HostCommand>,
+    ) -> Result<Self> {
+        Self::start_with_prompt_admissions(socket_path, session_id, writer, commands, None)
+    }
+
+    pub fn start_with_prompt_admissions(
+        socket_path: PathBuf,
+        session_id: Uuid,
+        writer: &SessionWriterLease,
+        commands: mpsc::Sender<HostCommand>,
+        prompt_admissions: Option<Arc<Mutex<HashSet<Uuid>>>>,
     ) -> Result<Self> {
         use std::os::unix::fs::PermissionsExt;
         use tokio::net::UnixListener;
@@ -114,7 +135,13 @@ impl LocalSessionControlServer {
                 match listener.accept().await {
                     Ok((stream, _)) => {
                         let commands = commands.clone();
-                        tokio::spawn(handle_control_connection(stream, session_id, commands));
+                        let prompt_admissions = prompt_admissions.clone();
+                        tokio::spawn(handle_control_connection(
+                            stream,
+                            session_id,
+                            commands,
+                            prompt_admissions,
+                        ));
                     }
                     Err(error) => {
                         tracing::warn!(
@@ -136,6 +163,7 @@ async fn handle_control_connection(
     mut stream: tokio::net::UnixStream,
     session_id: Uuid,
     commands: mpsc::Sender<HostCommand>,
+    prompt_admissions: Option<Arc<Mutex<HashSet<Uuid>>>>,
 ) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -152,6 +180,14 @@ async fn handle_control_connection(
         let command: HostCommand = serde_json::from_slice(&payload)?;
         if command.session_id() != Some(session_id) {
             bail!("command targets a different session");
+        }
+        if let HostCommand::Prompt { message_id, .. } = &command {
+            if let Some(admissions) = prompt_admissions.as_ref() {
+                admissions
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(*message_id);
+            }
         }
         commands
             .send(command)
@@ -339,13 +375,20 @@ mod tests {
             SessionJournal::open(root.path().join(format!("{session_id}.jsonl"))).unwrap();
         let writer = journal.try_acquire_writer().unwrap().unwrap();
         let (owner_tx, mut owner_rx) = mpsc::channel(1);
-        let _server =
-            LocalSessionControlServer::start(socket_path.clone(), session_id, &writer, owner_tx)
-                .unwrap();
+        let admissions = Arc::new(Mutex::new(HashSet::new()));
+        let _server = LocalSessionControlServer::start_with_prompt_admissions(
+            socket_path.clone(),
+            session_id,
+            &writer,
+            owner_tx,
+            Some(Arc::clone(&admissions)),
+        )
+        .unwrap();
 
+        let message_id = Uuid::new_v4();
         let command = HostCommand::Prompt {
             session_id,
-            message_id: Uuid::new_v4(),
+            message_id,
             text: "hello".to_string(),
             attachments: Vec::new(),
             output_schema: None,
@@ -367,6 +410,12 @@ mod tests {
         assert_eq!(
             owner_rx.recv().await.unwrap().session_id(),
             Some(session_id)
+        );
+        assert!(
+            admissions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains(&message_id)
         );
 
         let wrong_session_command = HostCommand::Interrupt {
@@ -441,6 +490,107 @@ mod tests {
                 .unwrap();
         assert!(tokio::net::UnixStream::connect(&socket_path).await.is_ok());
         drop(server);
+    }
+
+    #[tokio::test]
+    async fn attachment_delivers_durable_status_before_live_projection_state() {
+        let root = tempfile::tempdir().unwrap();
+        let session_id = Uuid::new_v4();
+        let journal_path = root.path().join(format!("{session_id}.jsonl"));
+        let socket_path = session_control_socket_path(root.path(), session_id);
+        let journal = SessionJournal::open(&journal_path).unwrap();
+        let _writer = journal.try_acquire_writer().unwrap().unwrap();
+        let sqlite = Arc::new(
+            crate::SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+                .await
+                .unwrap(),
+        );
+        sqlite.create_session(session_id).await.unwrap();
+        sqlite
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::SessionStarted,
+            ))
+            .await
+            .unwrap();
+        let ready = sqlite
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::StatusChanged {
+                    status: SessionStatus::Ready,
+                    detail: None,
+                },
+            ))
+            .await
+            .unwrap();
+        let running = sqlite
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::StatusChanged {
+                    status: SessionStatus::Running,
+                    detail: None,
+                },
+            ))
+            .await
+            .unwrap();
+        sqlite
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::ContextWindowUpdated {
+                    context_tokens: 80,
+                    context_window_tokens: 100,
+                },
+            ))
+            .await
+            .unwrap();
+
+        let (command_tx, command_rx) = mpsc::channel(1);
+        let (event_tx, mut event_rx) = mpsc::channel(4);
+        let store: Arc<dyn SessionStore> = sqlite;
+        let attachment = tokio::spawn(run_attached_session(
+            store,
+            session_id,
+            journal_path,
+            socket_path,
+            ready.sequence,
+            command_rx,
+            event_tx,
+        ));
+
+        let durable = tokio::time::timeout(std::time::Duration::from_secs(1), event_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let live = tokio::time::timeout(std::time::Duration::from_secs(1), event_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(durable.sequence, running.sequence);
+        assert!(matches!(
+            durable.kind,
+            SessionEventKind::StatusChanged {
+                status: SessionStatus::Running,
+                ..
+            }
+        ));
+        assert_eq!(live.sequence, 0);
+        assert!(matches!(
+            live.kind,
+            SessionEventKind::ContextWindowUpdated {
+                context_tokens: 80,
+                context_window_tokens: 100,
+            }
+        ));
+
+        command_tx
+            .send(HostCommand::Stop { session_id })
+            .await
+            .unwrap();
+        attachment.await.unwrap().unwrap();
     }
 
     #[test]

@@ -614,6 +614,7 @@ async fn run_claude_sdk_inner(
         command.env("ANTHROPIC_API_KEY", key);
     }
     apply_claude_channel_env(&mut command, req.provider_channel)?;
+    crate::subprocess::isolate_async_process_from_terminal(&mut command);
 
     let mut child = command
         .spawn()
@@ -897,6 +898,7 @@ async fn start_pooled_claude_sdk(channel: ProviderChannel) -> Result<PooledClaud
         command.env("ENABLE_TOOL_SEARCH", "auto:5");
     }
     apply_claude_channel_env(&mut command, channel)?;
+    crate::subprocess::isolate_async_process_from_terminal(&mut command);
     let mut child = command.spawn().with_context(|| {
         format!(
             "failed to spawn pooled Claude SDK adapter {}",

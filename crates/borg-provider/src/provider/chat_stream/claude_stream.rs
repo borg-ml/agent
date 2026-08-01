@@ -92,6 +92,45 @@ impl ClaudeStreamState {
                 {
                     self.session_id = Some(sid.to_string());
                 }
+                // API failures are delivered as assistant envelopes by the
+                // Agent SDK. Their text is user-facing, but the structured
+                // `error` field means this turn failed and must not be treated
+                // as a successful answer (which would auto-continue a goal).
+                if let Some(kind) = value.get("error").and_then(Value::as_str) {
+                    let message = value
+                        .get("message")
+                        .and_then(|message| message.get("content"))
+                        .and_then(Value::as_array)
+                        .map(|items| {
+                            items
+                                .iter()
+                                .filter_map(extract_text_block)
+                                .collect::<Vec<_>>()
+                                .join("\n\n")
+                        })
+                        .filter(|text| !text.trim().is_empty())
+                        .unwrap_or_else(|| "Claude API request failed".to_string());
+                    let status = value
+                        .get("apiErrorStatus")
+                        .or_else(|| value.get("api_error_status"))
+                        .and_then(Value::as_u64);
+                    let mut parts = vec![
+                        format!("claude SDK API error: {message}"),
+                        format!(r#""kind":"{kind}""#),
+                    ];
+                    if let Some(status) = status {
+                        parts.push(format!(r#""status":{status}"#));
+                    }
+                    self.emitted_failure = true;
+                    let _ = tx
+                        .send(ChatStreamEvent::Failed {
+                            error: parts.join(" "),
+                        })
+                        .await;
+                    // Keep draining until the SDK's result envelope so a
+                    // pooled adapter remains aligned for its next turn.
+                    return Ok(false);
+                }
                 if let Some(content) = value
                     .get("message")
                     .and_then(|message| message.get("content"))
@@ -353,6 +392,39 @@ mod tests {
         assert!(matches!(
             rx.try_recv(),
             Ok(ChatStreamEvent::ReasoningDelta(text)) if text == "checking the source"
+        ));
+    }
+
+    #[tokio::test]
+    async fn treats_assistant_api_error_as_a_terminal_failure() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut state = ClaudeStreamState::default();
+        let stop_reading = state
+            .handle_message(
+                &json!({
+                    "type": "assistant",
+                    "error": "rate_limit",
+                    "apiErrorStatus": 429,
+                    "message": {
+                        "content": [{
+                            "type": "text",
+                            "text": "You've hit your monthly spend limit"
+                        }]
+                    }
+                }),
+                &tx,
+            )
+            .await
+            .unwrap();
+
+        assert!(!stop_reading);
+        assert!(state.emitted_failure);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ChatStreamEvent::Failed { error })
+                if error.contains("monthly spend limit")
+                    && error.contains(r#""kind":"rate_limit""#)
+                    && error.contains(r#""status":429"#)
         ));
     }
 }

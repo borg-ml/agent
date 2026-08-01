@@ -13,7 +13,7 @@ claude-sdk:
     mkdir -p "$install_dir"
     cp "$source_dir/package.json" "$source_dir/package-lock.json" "$source_dir/tsconfig.json" "$install_dir/"
     mkdir -p "$install_dir/src"
-    cp "$source_dir/src/provider.ts" "$install_dir/src/provider.ts"
+    cp "$source_dir/src/provider.ts" "$source_dir/src/turn_messages.ts" "$install_dir/src/"
     npm --prefix "$install_dir" ci
     npm --prefix "$install_dir" run check
     npm --prefix "$install_dir" run build

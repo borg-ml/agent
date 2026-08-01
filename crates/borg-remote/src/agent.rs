@@ -413,6 +413,7 @@ async fn run_borg_provider_turn(
     let mut last_text_emit = Instant::now() - Duration::from_millis(50);
     let mut provider_session_id = turn.provider_session_id;
     let mut first_model_output = true;
+    let mut terminal_seen = false;
     while let Some(event) = stream.recv().await {
         match event {
             ChatStreamEvent::ProviderEvent { kind, payload, .. } => {
@@ -625,6 +626,7 @@ async fn run_borg_provider_turn(
                 usage,
                 session_id,
             } => {
+                terminal_seen = true;
                 final_output = final_text;
                 if let Some(session_id) = session_id {
                     provider_session_id = Some(session_id.clone());
@@ -654,6 +656,22 @@ async fn run_borg_provider_turn(
                         },
                     )
                     .await;
+                }
+                // A provider can report a nominally successful terminal result
+                // without any visible assistant text. Treat that as a failed
+                // turn instead of silently returning Ready: otherwise the
+                // user's prompt remains the last rendered item and the next
+                // prompt appears to "wake up" the missing response.
+                if !completed_segment && final_output.trim().is_empty() && text.trim().is_empty() {
+                    let error = "provider completed without a visible response (empty result)";
+                    send(
+                        &events,
+                        SessionEventKind::Error {
+                            message: error.to_string(),
+                        },
+                    )
+                    .await;
+                    bail!(error);
                 }
                 if !completed_segment {
                     text = final_output.clone();
@@ -686,6 +704,16 @@ async fn run_borg_provider_turn(
             }
         }
     }
+    if let Err(error) = require_provider_stream_terminal(terminal_seen) {
+        send(
+            &events,
+            SessionEventKind::Error {
+                message: error.to_string(),
+            },
+        )
+        .await;
+        return Err(error);
+    }
     send(
         &events,
         SessionEventKind::StatusChanged {
@@ -712,6 +740,14 @@ async fn run_borg_provider_turn(
             final_output
         },
     })
+}
+
+fn require_provider_stream_terminal(terminal_seen: bool) -> Result<()> {
+    anyhow::ensure!(
+        terminal_seen,
+        "provider stream closed without a terminal Done or Failed event"
+    );
+    Ok(())
 }
 
 fn request_can_use_claude_pool(request: &ChatStreamRequest) -> bool {
@@ -1036,5 +1072,16 @@ mod tests {
             "Claude sign-in required. Run /login to reconnect, then retry your message."
         );
         assert!(!message.contains("x-api-key"));
+    }
+
+    #[test]
+    fn provider_stream_cannot_succeed_without_a_terminal_event() {
+        assert!(require_provider_stream_terminal(true).is_ok());
+        assert_eq!(
+            require_provider_stream_terminal(false)
+                .unwrap_err()
+                .to_string(),
+            "provider stream closed without a terminal Done or Failed event"
+        );
     }
 }

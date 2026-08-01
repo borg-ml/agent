@@ -13,6 +13,7 @@
 // Remove once `run_claude_native_chat_stream` consumes these.
 #![allow(dead_code)]
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
@@ -500,6 +501,131 @@ mod tests {
     }
 
     #[test]
+    fn native_results_only_reject_explicitly_mismatched_input_ids() {
+        let (input_id, message) = user_message_with_id("hello");
+        assert_eq!(message["uuid"], input_id);
+        let input_ids = HashSet::from([input_id.clone()]);
+
+        assert!(message_belongs_to_turn(
+            &json!({
+                "type": "result",
+                "subtype": "success",
+                "user_message_uuid": input_id,
+            }),
+            &input_ids,
+        ));
+        assert!(!message_belongs_to_turn(
+            &json!({
+                "type": "result",
+                "subtype": "success",
+                "user_message_uuid": "queued-task-notification",
+            }),
+            &input_ids,
+        ));
+        assert!(message_belongs_to_turn(
+            &json!({"type": "result", "subtype": "success", "result": ""}),
+            &input_ids,
+        ));
+    }
+
+    #[test]
+    fn native_turn_waits_for_background_follow_up_result() {
+        let input_ids = HashSet::from(["prompt-id".to_string()]);
+        let mut boundary = TurnMessageBoundary::default();
+
+        assert_eq!(
+            boundary.classify(
+                &json!({
+                    "type": "system",
+                    "subtype": "background_tasks_changed",
+                    "tasks": [{"task_id": "task-1"}],
+                }),
+                &input_ids,
+            ),
+            TurnMessageAction::Forward,
+        );
+        assert_eq!(
+            boundary.classify(
+                &json!({
+                    "type": "result",
+                    "subtype": "success",
+                    "user_message_uuid": "prompt-id",
+                }),
+                &input_ids,
+            ),
+            TurnMessageAction::Suppress,
+        );
+        assert_eq!(
+            boundary.classify(
+                &json!({
+                    "type": "system",
+                    "subtype": "background_tasks_changed",
+                    "tasks": [],
+                }),
+                &input_ids,
+            ),
+            TurnMessageAction::Forward,
+        );
+        assert_eq!(
+            boundary.classify(
+                &json!({
+                    "type": "result",
+                    "subtype": "success",
+                    "user_message_uuid": "task-notification-id",
+                }),
+                &input_ids,
+            ),
+            TurnMessageAction::Terminal,
+        );
+
+        let mut fast_boundary = TurnMessageBoundary::default();
+        assert_eq!(
+            fast_boundary.classify(
+                &json!({
+                    "type": "system",
+                    "subtype": "background_tasks_changed",
+                    "tasks": [{"task_id": "quick"}],
+                }),
+                &input_ids,
+            ),
+            TurnMessageAction::Forward,
+        );
+        assert_eq!(
+            fast_boundary.classify(
+                &json!({
+                    "type": "system",
+                    "subtype": "background_tasks_changed",
+                    "tasks": [],
+                }),
+                &input_ids,
+            ),
+            TurnMessageAction::Forward,
+        );
+        assert_eq!(
+            fast_boundary.classify(
+                &json!({
+                    "type": "result",
+                    "subtype": "success",
+                    "user_message_uuid": "prompt-id",
+                }),
+                &input_ids,
+            ),
+            TurnMessageAction::Suppress,
+        );
+        assert_eq!(
+            fast_boundary.classify(
+                &json!({
+                    "type": "result",
+                    "subtype": "success",
+                    "result": "done",
+                }),
+                &input_ids,
+            ),
+            TurnMessageAction::Terminal,
+        );
+    }
+
+    #[test]
     fn cancel_frames_carry_the_request_id() {
         match Frame::parse(
             &json!({"type": "control_cancel_request", "request_id": "req-4"}).to_string(),
@@ -574,7 +700,7 @@ mod live_tests {
 // Control channel
 // ---------------------------------------------------------------------------
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use super::{ChatApprovalDecision, ChatStreamEvent};
 
@@ -608,6 +734,7 @@ struct PendingApproval {
 pub(super) enum OutboundKind {
     Initialize,
     Interrupt,
+    StopTask,
     ContextUsage,
 }
 
@@ -825,12 +952,97 @@ fn first_str(value: &Value, keys: &[&str]) -> Option<String> {
 
 /// A user message line on stdin — the same envelope the sidecar built.
 pub(super) fn user_message(text: &str) -> Value {
-    serde_json::json!({
+    user_message_with_id(text).1
+}
+
+fn user_message_with_id(text: &str) -> (String, Value) {
+    let id = uuid::Uuid::new_v4().to_string();
+    let message = serde_json::json!({
         "type": "user",
         "message": {"role": "user", "content": [{"type": "text", "text": text}]},
         "parent_tool_use_id": Value::Null,
         "session_id": "",
-    })
+        "uuid": id,
+    });
+    (id, message)
+}
+
+fn message_belongs_to_turn(value: &Value, input_ids: &HashSet<String>) -> bool {
+    if value.get("type").and_then(Value::as_str) != Some("result") {
+        return true;
+    }
+    value
+        .get("user_message_uuid")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .is_none_or(|id| input_ids.contains(id))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnMessageAction {
+    Forward,
+    Suppress,
+    Terminal,
+}
+
+#[derive(Debug, Default)]
+struct TurnMessageBoundary {
+    live_background_tasks: HashSet<String>,
+    observed_background_work: bool,
+    awaiting_post_background_result: bool,
+}
+
+impl TurnMessageBoundary {
+    fn background_task_ids(&self) -> Vec<String> {
+        self.live_background_tasks.iter().cloned().collect()
+    }
+
+    fn classify(&mut self, value: &Value, input_ids: &HashSet<String>) -> TurnMessageAction {
+        if value.get("type").and_then(Value::as_str) == Some("system")
+            && value.get("subtype").and_then(Value::as_str) == Some("background_tasks_changed")
+        {
+            self.live_background_tasks.clear();
+            if let Some(tasks) = value.get("tasks").and_then(Value::as_array) {
+                self.live_background_tasks
+                    .extend(tasks.iter().filter_map(|task| {
+                        task.get("task_id")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    }));
+            }
+            if !self.live_background_tasks.is_empty() {
+                self.observed_background_work = true;
+            }
+            return TurnMessageAction::Forward;
+        }
+
+        if value.get("type").and_then(Value::as_str) != Some("result") {
+            return TurnMessageAction::Forward;
+        }
+
+        if self.awaiting_post_background_result && self.live_background_tasks.is_empty() {
+            // Result correlation is optional. After withholding a foreground
+            // result, the next result at an empty live-task level is the
+            // post-notification terminal even when the SDK omits its UUID.
+            self.awaiting_post_background_result = false;
+            return TurnMessageAction::Terminal;
+        }
+
+        if !message_belongs_to_turn(value, input_ids) {
+            // A completion notification is an internal user message with its
+            // own UUID. Its follow-up result is valid only when this Borg turn
+            // previously withheld a result while background work was live.
+            return TurnMessageAction::Suppress;
+        }
+
+        if self.observed_background_work {
+            self.awaiting_post_background_result = true;
+            return TurnMessageAction::Suppress;
+        }
+
+        self.awaiting_post_background_result = false;
+        TurnMessageAction::Terminal
+    }
 }
 
 /// `initialize` handshake payload. `systemPrompt` is an array on the wire.
@@ -1507,6 +1719,7 @@ pub(super) async fn run(
         command.env("ANTHROPIC_API_KEY", key);
     }
     super::apply_claude_channel_env(&mut command, req.provider_channel)?;
+    crate::subprocess::isolate_async_process_from_terminal(&mut command);
 
     let mut child = command
         .spawn()
@@ -1554,15 +1767,15 @@ pub(super) async fn run(
         ))?,
     )
     .await?;
-    write_line(
-        &mut stdin,
-        &user_message(&prompt_text(&req.prompt, &req.attachments)),
-    )
-    .await?;
+    let (initial_input_id, initial_message) =
+        user_message_with_id(&prompt_text(&req.prompt, &req.attachments));
+    let mut input_ids = HashSet::from([initial_input_id]);
+    write_line(&mut stdin, &initial_message).await?;
 
     let mut reader = BufReader::new(stdout);
     let mut line = String::new();
     let mut stream_ended = false;
+    let mut turn_boundary = TurnMessageBoundary::default();
 
     while !stream_ended {
         line.clear();
@@ -1583,6 +1796,10 @@ pub(super) async fn run(
                 let frame = Frame::parse(trimmed)?;
                 match frame {
                     Frame::Message(value) => {
+                        let action = turn_boundary.classify(&value, &input_ids);
+                        if action == TurnMessageAction::Suppress {
+                            continue;
+                        }
                         let telemetry = classify_claude_provider_event(&value);
                         let _ = tx
                             .send(super::ChatStreamEvent::ProviderEvent {
@@ -1604,6 +1821,14 @@ pub(super) async fn run(
                         if state.handle_message(&value, &tx).await? {
                             stream_ended = true;
                         }
+                        // The sidecar exited after each turn, closing stdout and
+                        // ending the read loop for us. The CLI does not: in
+                        // streaming-input mode it stays alive waiting for the
+                        // next user message, so `result` is the only signal that
+                        // this turn is over. Without this the read blocks forever.
+                        if action == TurnMessageAction::Terminal {
+                            stream_ended = true;
+                        }
                     }
                     other => match channel.handle_frame(other) {
                         Inbound::Event(event) => {
@@ -1622,7 +1847,15 @@ pub(super) async fn run(
             control = super::receive_claude_control(&mut controls) => {
                 match control {
                     Some(control) => {
-                        if !apply_control(control, &mut channel, &mut stdin).await? {
+                        if !apply_control(
+                            control,
+                            &mut channel,
+                            &mut stdin,
+                            &mut input_ids,
+                            &turn_boundary.background_task_ids(),
+                        )
+                        .await?
+                        {
                             stream_ended = true;
                         }
                     }
@@ -1729,6 +1962,8 @@ async fn apply_control(
     control: ChatStreamControl,
     channel: &mut ControlChannel,
     stdin: &mut tokio::process::ChildStdin,
+    input_ids: &mut HashSet<String>,
+    background_task_ids: &[String],
 ) -> Result<bool> {
     match control {
         ChatStreamControl::Steer {
@@ -1737,7 +1972,11 @@ async fn apply_control(
             ack,
             ..
         } => {
-            let result = write_line(stdin, &user_message(&prompt_text(&text, &attachments))).await;
+            let (input_id, message) = user_message_with_id(&prompt_text(&text, &attachments));
+            let result = write_line(stdin, &message).await;
+            if result.is_ok() {
+                input_ids.insert(input_id);
+            }
             let reply = match &result {
                 Ok(()) => Ok(()),
                 Err(error) => Err(format!("{error:#}")),
@@ -1764,6 +2003,18 @@ async fn apply_control(
             }
         }
         ChatStreamControl::Interrupt => {
+            for task_id in background_task_ids {
+                let request_id = format!("borg-stop-task-{}", uuid::Uuid::new_v4());
+                channel.begin_request(&request_id, OutboundKind::StopTask);
+                write_line(
+                    stdin,
+                    &serde_json::to_value(OutboundControlRequest::new(
+                        &request_id,
+                        serde_json::json!({"subtype": "stop_task", "task_id": task_id}),
+                    ))?,
+                )
+                .await?;
+            }
             let request_id = format!("borg-interrupt-{}", uuid::Uuid::new_v4());
             channel.begin_request(&request_id, OutboundKind::Interrupt);
             write_line(

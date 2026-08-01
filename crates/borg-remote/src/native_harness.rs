@@ -866,22 +866,17 @@ async fn call_model_streaming(
     let mut pending_reasoning = String::new();
     let mut last_reasoning_emit = Instant::now() - Duration::from_millis(50);
     let mut progress_open = true;
+    // A provider may complete the foreground model result while retaining a
+    // progress sender for provider-owned background work. Do not let the
+    // foreground result become a Ready status until that event stream closes.
+    let mut completed = None;
     loop {
         tokio::select! {
-            result = &mut call => {
-                if !pending_reasoning.is_empty() {
-                    send(
-                        context.events,
-                        SessionEventKind::ReasoningDelta {
-                            text: std::mem::take(&mut pending_reasoning),
-                        },
-                    )
-                    .await;
-                }
-                return result
+            result = &mut call, if completed.is_none() => {
+                completed = Some(result
                     .map(Box::new)
                     .map(NativeModelOutcome::Completed)
-                    .map_err(|error| anyhow::anyhow!(error.message));
+                    .map_err(|error| anyhow::anyhow!(error.message)));
             }
             progress = progress_rx.recv(), if progress_open => match progress {
                 Some(ProviderProgress::Bytes {
@@ -955,6 +950,21 @@ async fn call_model_streaming(
                 | Some(AgentTurnControl::ProviderInteractionResponse { .. }) => {}
                 None => {}
             }
+        }
+
+        if completed.is_some() && !progress_open {
+            if !pending_reasoning.is_empty() {
+                send(
+                    context.events,
+                    SessionEventKind::ReasoningDelta {
+                        text: std::mem::take(&mut pending_reasoning),
+                    },
+                )
+                .await;
+            }
+            return completed
+                .take()
+                .expect("completed native model result is present");
         }
     }
 }
@@ -1652,7 +1662,119 @@ struct ReadSkillArgs {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
+
+    #[derive(Clone)]
+    struct HoldingProgressClient {
+        held_progress: Arc<Mutex<Option<mpsc::UnboundedSender<ProviderProgress>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl NativeModelClient for HoldingProgressClient {
+        async fn model_turn(
+            &self,
+            _provider: crate::CodingProvider,
+            _model: &str,
+            _effort: Option<&str>,
+            _request: ModelTurnRequest,
+            progress: Option<mpsc::UnboundedSender<ProviderProgress>>,
+        ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
+            let progress = progress.expect("native streaming always supplies progress");
+            progress
+                .send(ProviderProgress::ProviderEvent {
+                    kind: "background_task_live".to_string(),
+                    payload: json!({ "task_id": "task-1" }),
+                    raw_payload: None,
+                    stream_channel: Some("background".to_string()),
+                    content_text: None,
+                    provider_item_id: Some("task-1".to_string()),
+                    tool_use_id: None,
+                    tool_name: None,
+                    model: Some("test-model".to_string()),
+                    effort: None,
+                })
+                .expect("progress receiver remains alive");
+            *self.held_progress.lock().unwrap() = Some(progress);
+            Ok(ModelTurnResult {
+                message: ModelMessage::assistant(
+                    Some("foreground result".to_string()),
+                    None,
+                    None,
+                    Vec::new(),
+                ),
+                finish_reason: "stop".to_string(),
+                usage: ProviderCallUsage::default(),
+                raw_response: Value::Null,
+                trace: ProviderAttemptTrace::default(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn foreground_result_waits_for_provider_progress_to_close() {
+        let held_progress = Arc::new(Mutex::new(None));
+        let client = HoldingProgressClient {
+            held_progress: Arc::clone(&held_progress),
+        };
+        let (events_tx, mut events_rx) = mpsc::channel(8);
+        let mut task = tokio::spawn(async move {
+            let mut controls = None;
+            call_model_streaming(
+                &client,
+                crate::CodingProvider::Kimi,
+                "test-model",
+                None,
+                ModelTurnRequest {
+                    request_id: Some("test-request".to_string()),
+                    messages: vec![ModelMessage::user("hello")],
+                    tools: Vec::new(),
+                    output_schema: None,
+                },
+                ModelStreamContext {
+                    coding_provider: crate::CodingProvider::Kimi,
+                    assistant_message_id: Uuid::new_v4(),
+                    events: &events_tx,
+                    controls: &mut controls,
+                },
+            )
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if held_progress.lock().unwrap().is_some() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("provider should retain its progress sender");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut task)
+                .await
+                .is_err(),
+            "foreground completion must not escape while provider progress is live"
+        );
+
+        held_progress.lock().unwrap().take();
+        let outcome = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("progress closure should release the turn")
+            .expect("stream task should not panic")
+            .expect("native model turn should succeed");
+        assert!(matches!(outcome, NativeModelOutcome::Completed(_)));
+        assert!(matches!(
+            events_rx.recv().await,
+            Some(SessionEventKind::ProviderEvent {
+                kind,
+                payload,
+                ..
+            }) if kind == "background_task_live" && payload["task_id"] == "task-1"
+        ));
+    }
 
     #[test]
     fn tool_arguments_require_an_object() {

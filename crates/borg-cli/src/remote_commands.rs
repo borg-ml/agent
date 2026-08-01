@@ -1,8 +1,12 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, BufRead, IsTerminal, Write};
+use std::panic::{self, AssertUnwindSafe, PanicHookInfo};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 
 use anyhow::{Context, Result};
 use borg_remote::{
@@ -18,6 +22,7 @@ use borg_remote::{
     session_control_socket_path,
 };
 use chrono::{Local, Utc};
+use futures_util::FutureExt;
 use pulldown_cmark::{Event as MarkdownEvent, Parser as MarkdownParser};
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
@@ -43,6 +48,77 @@ const RICH_TUI_HISTORY_PAGE_SIZE: usize = 256;
 /// Resume filtering is local and eager, so load enough history to make search useful while
 /// keeping picker construction and per-keystroke filtering bounded.
 const RESUME_PICKER_SESSION_LIMIT: usize = 1_000;
+
+fn rich_terminal_can_prompt(stdin_is_terminal: bool, stdout_is_terminal: bool, json: bool) -> bool {
+    stdin_is_terminal && stdout_is_terminal && !json
+}
+
+#[derive(Default)]
+struct TuiCrashContext {
+    session_id: Mutex<Option<Uuid>>,
+    tui_active: Arc<AtomicBool>,
+}
+
+impl TuiCrashContext {
+    fn set_session_id(&self, session_id: Uuid) {
+        *self
+            .session_id
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(session_id);
+    }
+
+    fn session_id(&self) -> Option<Uuid> {
+        *self
+            .session_id
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+type PanicHook = dyn for<'a> Fn(&PanicHookInfo<'a>) + Send + Sync + 'static;
+
+/// Suppress the default panic report while the rich TUI is live. The terminal
+/// is dropped during unwinding, and the caller prints the resume instructions
+/// only after that cleanup has completed.
+struct TuiPanicHook {
+    previous: Arc<Mutex<Option<Box<PanicHook>>>>,
+}
+
+impl TuiPanicHook {
+    fn install(tui_active: Arc<AtomicBool>) -> Self {
+        let previous = Arc::new(Mutex::new(Some(panic::take_hook())));
+        let hook_previous = Arc::clone(&previous);
+        panic::set_hook(Box::new(move |info| {
+            if !tui_active.load(Ordering::Acquire) {
+                if let Some(previous) = hook_previous
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .as_ref()
+                {
+                    previous(info);
+                }
+            }
+        }));
+        Self { previous }
+    }
+}
+
+impl Drop for TuiPanicHook {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            return;
+        }
+        let _ = panic::take_hook();
+        let previous = self
+            .previous
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(previous) = previous {
+            panic::set_hook(previous);
+        }
+    }
+}
 
 pub(crate) async fn run_remote_command(command: RemoteCommand) -> Result<()> {
     match command {
@@ -307,21 +383,49 @@ pub(crate) async fn run_local_agent(args: LocalAgentCliArgs) -> Result<()> {
     let agent_config = AgentConfig::load(args.config.as_deref())?;
     crate::updater::spawn_background(agent_config.updates.clone());
     let ephemeral_sessions = args.ephemeral.then(tempfile::tempdir).transpose()?;
+    let crash_context = Arc::new(TuiCrashContext::default());
+    // Keep this guard outside the caught session future: terminal Drop runs
+    // while unwinding, then this guard is restored after catch_unwind returns.
+    let _tui_panic_hook = TuiPanicHook::install(Arc::clone(&crash_context.tui_active));
     let mut selected_session = None;
     let mut restored_prompt = None;
     loop {
-        let Some((next_session, next_prompt)) = run_local_agent_session(
+        let result = AssertUnwindSafe(run_local_agent_session(
             &args,
             selected_session,
             restored_prompt.take(),
             ephemeral_sessions.as_ref().map(tempfile::TempDir::path),
-        )
-        .await?
-        else {
-            return Ok(());
+            Arc::clone(&crash_context),
+        ))
+        .catch_unwind()
+        .await;
+        match result {
+            Ok(Ok(Some((next_session, next_prompt)))) => {
+                crash_context.tui_active.store(false, Ordering::Release);
+                selected_session = Some(next_session);
+                restored_prompt = next_prompt;
+            }
+            Ok(Ok(None)) => {
+                crash_context.tui_active.store(false, Ordering::Release);
+                return Ok(());
+            }
+            Ok(Err(error)) if crash_context.tui_active.swap(false, Ordering::AcqRel) => {
+                let Some(session_id) = crash_context.session_id() else {
+                    return Err(error);
+                };
+                println!("{}", resume_instructions(session_id, false));
+                return Ok(());
+            }
+            Ok(Err(error)) => return Err(error),
+            Err(payload) if crash_context.tui_active.swap(false, Ordering::AcqRel) => {
+                let Some(session_id) = crash_context.session_id() else {
+                    panic::resume_unwind(payload);
+                };
+                println!("{}", resume_instructions(session_id, false));
+                return Ok(());
+            }
+            Err(payload) => panic::resume_unwind(payload),
         };
-        selected_session = Some(next_session);
-        restored_prompt = next_prompt;
     }
 }
 
@@ -365,6 +469,44 @@ enum SessionSwitch {
     DetachViewer,
 }
 
+/// Durable session projection advanced by the same ordered event stream the
+/// local TUI consumes.
+///
+/// The SQLite projection can be ahead of this stream because the session actor
+/// commits an event before forwarding it. Keeping a delivery-aligned projection
+/// prevents an asynchronous store read from moving the UI backward or forward
+/// across events it has not rendered yet.
+struct DeliveredSessionProjection {
+    state: SessionState,
+}
+
+impl DeliveredSessionProjection {
+    fn new(state: SessionState) -> Self {
+        Self { state }
+    }
+
+    fn observe(&mut self, event: &SessionEvent) -> Result<()> {
+        if event.sequence > 0 {
+            self.state.apply(event)?;
+        } else if let SessionEventKind::ContextWindowUpdated {
+            context_tokens,
+            context_window_tokens,
+        } = &event.kind
+        {
+            // Context-window updates are coalesced live state. They deliberately
+            // do not consume a durable sequence, but history reprojection still
+            // needs the latest value already delivered to this TUI.
+            self.state.usage.context_tokens = Some(*context_tokens);
+            self.state.usage.context_window_tokens = Some(*context_window_tokens);
+        }
+        Ok(())
+    }
+
+    fn state(&self) -> &SessionState {
+        &self.state
+    }
+}
+
 impl LocalSessionAccess {
     fn is_attached(self) -> bool {
         self == Self::Attached
@@ -393,6 +535,7 @@ async fn run_local_agent_session(
     selected_session: Option<Uuid>,
     restored_prompt: Option<(String, Vec<PathBuf>)>,
     session_root_override: Option<&Path>,
+    crash_context: Arc<TuiCrashContext>,
 ) -> Result<Option<(Uuid, Option<(String, Vec<PathBuf>)>)>> {
     let mut agent_config = AgentConfig::load(args.config.as_deref())?;
     let agent_config_path = AgentConfig::path(args.config.as_deref());
@@ -419,6 +562,7 @@ async fn run_local_agent_session(
     } else {
         Uuid::new_v4()
     };
+    crash_context.set_session_id(session_id);
     let journal_path = sessions_dir.join(format!("{session_id}.jsonl"));
     let writer = SessionWriterLease::try_acquire(&journal_path)?;
     let session_access = if writer.is_some() {
@@ -582,6 +726,10 @@ async fn run_local_agent_session(
     let mut rendered = HashMap::new();
     let stdin_is_terminal = io::stdin().is_terminal();
     let can_prompt = stdin_is_terminal && !args.json;
+    let rich_tui_allowed =
+        rich_terminal_can_prompt(stdin_is_terminal, io::stdout().is_terminal(), args.json)
+            && !BorgTerminal::fallback_requested();
+    let fallback_terminal = can_prompt && !rich_tui_allowed;
     let mut initial_prompt = if !args.prompt.is_empty() {
         Some(args.prompt.join(" "))
     } else if !stdin_is_terminal {
@@ -623,7 +771,6 @@ async fn run_local_agent_session(
     };
     let has_initial_prompt = initial_prompt.is_some();
     let interactive = can_prompt;
-    let fallback_terminal = can_prompt && BorgTerminal::fallback_requested();
     let mut history = if can_prompt && !fallback_terminal {
         recent_tui_history(store.as_ref(), session_id, session_state.latest_sequence).await?
     } else {
@@ -706,7 +853,7 @@ async fn run_local_agent_session(
             }
         }));
     }
-    if !args.json {
+    if !args.json && fallback_terminal {
         println!(
             "\n  BORG  {} · {} · {}{}\n  session {}\n",
             provider_name(provider),
@@ -745,17 +892,19 @@ async fn run_local_agent_session(
 
     let (session_command_tx, session_commands) = mpsc::channel(64);
     let (session_event_tx, mut session_events) = mpsc::channel(256);
+    let local_prompt_admissions = Arc::new(Mutex::new(HashSet::new()));
     let actor_journal_path = journal_path.clone();
     let registration_template = launch.clone();
     let control_socket_path = session_control_socket_path(&sessions_dir, session_id);
     let control_server = if session_access.is_attached() {
         None
     } else {
-        Some(LocalSessionControlServer::start(
+        Some(LocalSessionControlServer::start_with_prompt_admissions(
             control_socket_path.clone(),
             session_id,
             writer.as_ref().expect("session owner holds writer lease"),
             session_command_tx.clone(),
+            Some(Arc::clone(&local_prompt_admissions)),
         )?)
     };
     let actor = if session_access.is_attached() {
@@ -803,7 +952,7 @@ async fn run_local_agent_session(
     };
     let mut shutdown_signals =
         ShutdownSignals::new().context("failed to install process shutdown handlers")?;
-    let mut terminal = if can_prompt && !args.json {
+    let mut terminal = if rich_tui_allowed {
         match BorgTerminal::enter(
             &sessions_dir,
             session_id,
@@ -822,6 +971,9 @@ async fn run_local_agent_session(
     } else {
         None
     };
+    crash_context
+        .tui_active
+        .store(terminal.is_some(), Ordering::Release);
     if let Some(terminal) = terminal.as_mut() {
         terminal.seed_history(&history);
         terminal.seed_team_roster(&team_snapshots);
@@ -848,11 +1000,10 @@ async fn run_local_agent_session(
             load_subagent_thread_state(team_store.as_ref(), &team_sessions_dir, session_id).await
         })
     });
-    let mut history_page_task: Option<
-        tokio::task::JoinHandle<Result<(Vec<SessionEvent>, SessionState)>>,
-    > = None;
+    let mut history_page_task: Option<tokio::task::JoinHandle<Result<Vec<SessionEvent>>>> = None;
     let mut input = (can_prompt && terminal.is_none()).then(spawn_terminal_input);
     let mut input_open = can_prompt && terminal.is_none();
+    let mut delivered_projection = DeliveredSessionProjection::new(session_state.clone());
     let mut status = session_state.status.unwrap_or(SessionStatus::Starting);
     let mut pending_approval = session_state.pending_approval_id.clone();
     let mut pending_provider_interaction = session_state
@@ -926,19 +1077,16 @@ async fn run_local_agent_session(
             }, if history_page_task.is_some() => {
                 history_page_task = None;
                 match history_page_result {
-                    Ok(Ok((older, latest_state))) if older.is_empty() => {
+                    Ok(Ok(older)) if older.is_empty() => {
                         history_start_reached = true;
-                        if let Some(terminal) = terminal.as_mut() {
-                            terminal.seed_session_state(&latest_state);
-                        }
                     }
-                    Ok(Ok((older, latest_state))) => {
+                    Ok(Ok(older)) => {
                         history.splice(0..0, older);
                         history_start_reached =
                             history.first().is_none_or(|event| event.sequence <= 1);
                         if let Some(terminal) = terminal.as_mut() {
                             terminal.replace_history(&history);
-                            terminal.seed_session_state(&latest_state);
+                            terminal.seed_session_state(delivered_projection.state());
                             terminal_dirty = true;
                         }
                     }
@@ -961,10 +1109,7 @@ async fn run_local_agent_session(
                     let before = history.first().expect("history has an unloaded prefix").sequence;
                     let history_store = Arc::clone(&store);
                     history_page_task = Some(tokio::spawn(async move {
-                        let older =
-                            older_tui_history(history_store.as_ref(), session_id, before).await?;
-                        let state = history_store.state(session_id).await?;
-                        Ok((older, state))
+                        older_tui_history(history_store.as_ref(), session_id, before).await
                     }));
                 }
                 let draw_started = std::time::Instant::now();
@@ -1026,14 +1171,51 @@ async fn run_local_agent_session(
                 let Some(event) = event else {
                     break;
                 };
-                if let Some(message_id) = committed_prompt_id(&event.kind) {
+                delivered_projection.observe(&event)?;
+                if let Some(message_id) = committed_prompt_id(&event.kind)
+                    && matches!(
+                        status,
+                        SessionStatus::Starting
+                            | SessionStatus::Running
+                            | SessionStatus::WaitingForApproval
+                    )
+                {
                     pending_prompt_ids.remove(&message_id);
+                    local_prompt_admissions
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .remove(&message_id);
+                } else if let SessionEventKind::PromptRecalled { message_id, .. } = &event.kind {
+                    pending_prompt_ids.remove(message_id);
+                    local_prompt_admissions
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .remove(message_id);
                 } else if matches!(event.kind, SessionEventKind::Error { .. }) {
                     pending_prompt_ids.clear();
+                    local_prompt_admissions
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clear();
                 }
                 if let SessionEventKind::StatusChanged { status: next, .. } = &event.kind {
                     status = *next;
                     saw_running |= *next == SessionStatus::Running;
+                    if matches!(
+                        next,
+                        SessionStatus::Starting
+                            | SessionStatus::Running
+                            | SessionStatus::WaitingForApproval
+                    ) {
+                        // The durable status now protects terminal hangup. Any
+                        // prompt-admission guard that bridged the earlier Ready
+                        // window has served its purpose.
+                        pending_prompt_ids.clear();
+                        local_prompt_admissions
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .clear();
+                    }
                     sleep_inhibitor.set_turn_active(matches!(
                         next,
                         SessionStatus::Starting
@@ -1753,7 +1935,7 @@ async fn run_local_agent_session(
                             // Both flows need a plain terminal: the subscription
                             // sign-in runs the provider's own device flow, and the
                             // key prompt reads from stdin with echo disabled.
-                            shutdown_terminal(&mut terminal).await;
+                            shutdown_terminal(&mut terminal, &crash_context.tui_active).await;
                             let outcome = match choice {
                                 ProviderAuthChoice::Subscription => {
                                     login_provider(target).await.map(|()| {
@@ -1798,6 +1980,7 @@ async fn run_local_agent_session(
                                 Err(error) => format!("Provider not connected: {error:#}"),
                             });
                             terminal = Some(restored);
+                            crash_context.tui_active.store(true, Ordering::Release);
                             if outcome.is_ok() {
                                 send_model_selection(
                                     &session_command_tx,
@@ -2531,7 +2714,7 @@ async fn run_local_agent_session(
                                             "This machine is already connected to Borg Remote."
                                         );
                                     } else {
-                                        shutdown_terminal(&mut terminal).await;
+                                        shutdown_terminal(&mut terminal, &crash_context.tui_active).await;
                                         let connected = match connect_remote_account(
                                             "https://borg.ml",
                                             None,
@@ -2600,6 +2783,7 @@ async fn run_local_agent_session(
                                             Err(error) => format!("Remote connection failed: {error:#}"),
                                         });
                                         terminal = Some(restored);
+                                        crash_context.tui_active.store(true, Ordering::Release);
                                     }
                                 }
                                 "/login" if attachments.is_empty() => {
@@ -2615,7 +2799,7 @@ async fn run_local_agent_session(
                                     } else {
                                         // The native device flow needs a normal terminal. Rebuild
                                         // the UI from its journal after the provider returns.
-                                        shutdown_terminal(&mut terminal).await;
+                                        shutdown_terminal(&mut terminal, &crash_context.tui_active).await;
                                         let login = login_provider(provider).await;
                                         let latest_state = store.state(session_id).await?;
                                         let latest = recent_tui_history(
@@ -2649,6 +2833,7 @@ async fn run_local_agent_session(
                                             Err(error) => format!("Sign-in failed: {error:#}"),
                                         });
                                         terminal = Some(restored);
+                                        crash_context.tui_active.store(true, Ordering::Release);
                                     }
                                 }
                                 "/quit" | "/exit" if attachments.is_empty() => {
@@ -2697,6 +2882,15 @@ async fn run_local_agent_session(
                                                     attachments.clone(),
                                                     delivery,
                                                 );
+                                            // The local projection is the
+                                            // authoritative interaction state
+                                            // until the durable TurnStarted
+                                            // arrives. This also makes a
+                                            // second immediate input queue or
+                                            // steer instead of starting a
+                                            // competing idle turn.
+                                            status = SessionStatus::Starting;
+                                            sleep_inhibitor.set_turn_active(true);
                                         }
                                         terminal.as_mut().expect("terminal").draw()?;
                                         terminal_dirty = terminal
@@ -2728,6 +2922,10 @@ async fn run_local_agent_session(
                                                     text,
                                                     attachments,
                                                 );
+                                            if !active {
+                                                status = SessionStatus::Ready;
+                                                sleep_inhibitor.set_turn_active(false);
+                                            }
                                             terminal.as_mut().expect("terminal").draw()?;
                                             terminal_dirty = false;
                                         }
@@ -2768,8 +2966,16 @@ async fn run_local_agent_session(
                 shutdown_signal_open = false;
                 let signal = signal.context("failed to listen for a process shutdown signal")?;
                 tracing::warn!(%session_id, %signal, "restoring terminal before process shutdown");
-                shutdown_terminal(&mut terminal).await;
-                if should_detach_on_terminal_hangup(signal, status, !pending_prompt_ids.is_empty()) {
+                shutdown_terminal(&mut terminal, &crash_context.tui_active).await;
+                let attached_prompt_pending = !local_prompt_admissions
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .is_empty();
+                if should_detach_on_terminal_hangup(
+                    signal,
+                    status,
+                    !pending_prompt_ids.is_empty() || attached_prompt_pending,
+                ) {
                     // A terminal emulator can disappear independently of Borg (for
                     // example, a GPU/renderer crash). Keep the durable actor and
                     // control socket alive so a new `borg resume` can attach to the
@@ -2794,12 +3000,22 @@ async fn run_local_agent_session(
             }
         }
     }
-    shutdown_terminal(&mut terminal).await;
-    if let Err(error) = actor
-        .await
-        .context("agent session task failed")
-        .and_then(|result| result)
-    {
+    let tui_was_active = crash_context.tui_active.load(Ordering::Acquire);
+    shutdown_terminal(&mut terminal, &crash_context.tui_active).await;
+    let actor_error = match actor.await {
+        Ok(result) => result.err(),
+        Err(join_error) if join_error.is_panic() && tui_was_active => {
+            println!("{}", resume_instructions(session_id, false));
+            return Ok(None);
+        }
+        Err(join_error) => Some(anyhow::anyhow!("agent session task failed: {join_error}")),
+    };
+    if let Some(error) = actor_error {
+        if tui_was_active {
+            tracing::error!(%session_id, error = %error, "local agent session crashed");
+            println!("{}", resume_instructions(session_id, false));
+            return Ok(None);
+        }
         let active_elsewhere = error
             .to_string()
             .contains("session is already active in another Borg process");
@@ -2940,7 +3156,8 @@ fn read_hidden_line() -> Result<String> {
     result
 }
 
-async fn shutdown_terminal(terminal: &mut Option<BorgTerminal>) {
+async fn shutdown_terminal(terminal: &mut Option<BorgTerminal>, tui_active: &AtomicBool) {
+    tui_active.store(false, Ordering::Release);
     if let Some(terminal) = terminal.take() {
         terminal.shutdown().await;
     }
@@ -4403,6 +4620,47 @@ mod tests {
     }
 
     #[test]
+    fn history_reprojection_uses_delivered_durable_and_live_projection() {
+        let session_id = Uuid::new_v4();
+        let ready = SessionState {
+            latest_sequence: 4,
+            status: Some(SessionStatus::Ready),
+            ..SessionState::default()
+        };
+        let stale_store_snapshot = ready.clone();
+        let mut delivered = DeliveredSessionProjection::new(ready);
+
+        delivered
+            .observe(&SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::ContextWindowUpdated {
+                    context_tokens: 80,
+                    context_window_tokens: 100,
+                },
+            ))
+            .unwrap();
+        assert_eq!(delivered.state().latest_sequence, 4);
+        assert_eq!(delivered.state().usage.context_tokens, Some(80));
+        assert_eq!(delivered.state().usage.context_window_tokens, Some(100));
+
+        delivered
+            .observe(&SessionEvent::new(
+                session_id,
+                5,
+                SessionEventKind::StatusChanged {
+                    status: SessionStatus::Running,
+                    detail: None,
+                },
+            ))
+            .unwrap();
+
+        assert_eq!(stale_store_snapshot.status, Some(SessionStatus::Ready));
+        assert_eq!(delivered.state().latest_sequence, 5);
+        assert_eq!(delivered.state().status, Some(SessionStatus::Running));
+    }
+
+    #[test]
     fn child_history_tail_stays_bounded_after_long_runs_and_forks() {
         assert_eq!(recent_child_history_after(0, 100), 36);
         assert_eq!(recent_child_history_after(0, 60_000), 59_936);
@@ -5337,5 +5595,26 @@ mod tests {
             instructions.lines().last(),
             Some("borg resume 00000000-0000-0000-0000-000000000000")
         );
+    }
+
+    #[test]
+    fn tui_crash_resume_output_is_only_the_two_requested_lines() {
+        let session_id = Uuid::nil();
+        let instructions = resume_instructions(session_id, false);
+
+        assert_eq!(
+            instructions,
+            "Copy and paste the line below to resume:\nborg resume 00000000-0000-0000-0000-000000000000"
+        );
+        assert_eq!(instructions.lines().count(), 2);
+        assert!(!instructions.contains("BORG"));
+        assert!(!instructions.contains('\x1b'));
+    }
+
+    #[test]
+    fn redirected_output_never_enters_rich_terminal_mode() {
+        assert!(rich_terminal_can_prompt(true, true, false));
+        assert!(!rich_terminal_can_prompt(true, false, false));
+        assert!(!rich_terminal_can_prompt(true, true, true));
     }
 }
