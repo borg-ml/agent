@@ -9,7 +9,7 @@ die() {
   exit 1
 }
 
-workspace_version() {
+workspace_version_from_stdin() {
   awk '
     /^\[workspace\.package\][[:space:]]*$/ {
       inside_workspace_package = 1
@@ -31,7 +31,15 @@ workspace_version() {
         exit 1
       }
     }
-  ' Cargo.toml
+  '
+}
+
+workspace_version() {
+  workspace_version_from_stdin <Cargo.toml
+}
+
+workspace_version_at() {
+  git show "$1:Cargo.toml" | workspace_version_from_stdin
 }
 
 validate_version() {
@@ -105,6 +113,75 @@ replace_workspace_version() {
   mv "$manifest_tmp" Cargo.toml
 }
 
+version_only_change() {
+  local parent="$1"
+  local commit="$2"
+  local previous="$3"
+  local target="$4"
+  local changed_file
+  local -a changed_files
+
+  mapfile -t changed_files < <(git diff --name-only "$parent" "$commit")
+  [[ " ${changed_files[*]} " == *" Cargo.toml "* ]] || return 1
+  for changed_file in "${changed_files[@]}"; do
+    case "$changed_file" in
+      Cargo.toml | Cargo.lock) ;;
+      *) return 1 ;;
+    esac
+  done
+
+  git diff --no-ext-diff --unified=0 "$parent" "$commit" -- Cargo.toml Cargo.lock |
+    awk -v previous="$previous" -v target="$target" '
+      /^diff --git / || /^index / || /^@@ / || /^--- / || /^\+\+\+ / { next }
+      /^-[^-]/ {
+        if ($0 != "-version = \"" previous "\"") exit 1
+        changed = 1
+        next
+      }
+      /^\+[^+]/ {
+        if ($0 != "+version = \"" target "\"") exit 1
+        changed = 1
+        next
+      }
+      { exit 1 }
+      END { if (!changed) exit 1 }
+    '
+}
+
+interrupted_release_commit() {
+  local target="$1"
+  local commit
+  local parent
+  local previous
+  local previous_tag
+  local subject
+
+  while IFS= read -r commit; do
+    parent="$(git rev-parse --verify "$commit^" 2>/dev/null)" || continue
+    previous="$(workspace_version_at "$parent" 2>/dev/null)" || continue
+    validate_version "$previous" || continue
+    version_is_greater "$target" "$previous" || continue
+    [[ "$(workspace_version_at "$commit" 2>/dev/null)" == "$target" ]] || continue
+
+    previous_tag="v$previous"
+    git rev-parse --quiet --verify "refs/tags/$previous_tag^{commit}" >/dev/null || continue
+    git merge-base --is-ancestor "$previous_tag" "$parent" || continue
+
+    subject="$(git log -1 --format=%s "$commit")"
+    case "$subject" in
+      "Bump workspace version to $target" | "Release Borg CLI $target") ;;
+      *) continue ;;
+    esac
+
+    version_only_change "$parent" "$commit" "$previous" "$target" || continue
+    [[ -z "$(git diff --name-only "$commit" HEAD -- Cargo.toml Cargo.lock)" ]] || continue
+    printf '%s\n' "$commit"
+    return 0
+  done < <(git log --first-parent --format='%H' -- Cargo.toml Cargo.lock)
+
+  return 1
+}
+
 run_release_checks() {
   cargo fmt --all -- --check
   cargo test --workspace --locked
@@ -155,15 +232,7 @@ requested_version="${requested_version#v}"
 if [[ -n "$requested_version" ]]; then
   validate_version "$requested_version" ||
     die "requested version '$requested_version' must be stable SemVer (X.Y.Z)"
-  target_version="$requested_version"
-else
-  target_version="$(next_patch_version "$current_version")"
 fi
-
-version_is_greater "$target_version" "$current_version" ||
-  die "target $target_version must be newer than workspace version $current_version"
-
-tag="v$target_version"
 remote="${BORG_RELEASE_REMOTE:-origin}"
 branch="${BORG_RELEASE_BRANCH:-main}"
 
@@ -181,18 +250,64 @@ remote_head="$(git rev-parse "refs/remotes/$remote/$branch")"
 local_head="$(git rev-parse HEAD)"
 [[ "$local_head" == "$remote_head" ]] ||
   die "local $branch must exactly match $remote/$branch before release"
-git rev-parse --quiet --verify "refs/tags/v$current_version^{commit}" >/dev/null ||
-  die "current version v$current_version has no local release tag"
-if git rev-parse --quiet --verify "refs/tags/$tag^{commit}" >/dev/null; then
+
+recovered=0
+tag="v$current_version"
+current_tag_commit=""
+if current_tag_commit="$(git rev-parse --verify "refs/tags/$tag^{commit}" 2>/dev/null)"; then
+  if ! git ls-remote --quiet --exit-code "$remote" "refs/tags/$tag" >/dev/null 2>&1 &&
+    [[ "$current_tag_commit" == "$local_head" ]]; then
+    recovered=1
+    target_version="$current_version"
+  else
+    if [[ -n "$requested_version" ]]; then
+      target_version="$requested_version"
+    else
+      target_version="$(next_patch_version "$current_version")"
+    fi
+    version_is_greater "$target_version" "$current_version" ||
+      die "target $target_version must be newer than workspace version $current_version"
+    tag="v$target_version"
+  fi
+else
+  if [[ ( -z "$requested_version" || "$requested_version" == "$current_version" ) ]] &&
+    interrupted_release_commit "$current_version" >/dev/null; then
+    recovered=1
+    target_version="$current_version"
+  else
+    die "current version v$current_version has no local release tag"
+  fi
+fi
+
+if [[ "$recovered" -eq 0 ]] && git rev-parse --quiet --verify "refs/tags/$tag^{commit}" >/dev/null; then
   die "tag $tag already exists"
 fi
 
-echo "Release plan: $current_version -> $target_version"
+if [[ "$recovered" -eq 1 ]]; then
+  echo "Recovered interrupted release: $target_version (version bump already committed)"
+else
+  echo "Release plan: $current_version -> $target_version"
+fi
 echo "Targets: Linux, macOS, and Windows on x86-64 and ARM64"
 
 if [[ "$mode" == "check" ]]; then
   run_release_checks
-  echo "Release checks passed. Run 'just release${requested_version:+ $requested_version}'."
+  if [[ "$recovered" -eq 1 ]]; then
+    echo "Release checks passed. Run 'just release' to publish v$target_version."
+  else
+    echo "Release checks passed. Run 'just release${requested_version:+ $requested_version}'."
+  fi
+  exit 0
+fi
+
+if [[ "$recovered" -eq 1 ]]; then
+  run_release_checks
+  if ! git rev-parse --quiet --verify "refs/tags/$tag^{commit}" >/dev/null; then
+    git tag -a "$tag" -m "Borg CLI $target_version"
+  fi
+  echo "Publishing $tag atomically to $remote..."
+  git push --atomic "$remote" "HEAD:refs/heads/$branch" "refs/tags/$tag"
+  echo "Release workflow started: $REPOSITORY_URL/actions/workflows/release.yml"
   exit 0
 fi
 

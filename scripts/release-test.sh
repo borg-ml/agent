@@ -245,6 +245,22 @@ assert_equal "2.0.0" "$(fixture_version "$success_fixture")" \
 git -C "$success_fixture" rev-parse --verify 'refs/tags/v2.0.0^{commit}' \
   >/dev/null || fail "explicit release tag is missing"
 
+interrupted_fixture="$(make_fixture interrupted)"
+sed -i 's/1\.2\.3/1.2.4/g' \
+  "$interrupted_fixture/Cargo.toml" "$interrupted_fixture/Cargo.lock"
+git -C "$interrupted_fixture" add Cargo.toml Cargo.lock
+git -C "$interrupted_fixture" commit --quiet -m "Bump workspace version to 1.2.4"
+git -C "$interrupted_fixture" push --quiet origin main
+interrupted_head="$(git -C "$interrupted_fixture" rev-parse HEAD)"
+run_release "$interrupted_fixture"
+assert_equal "$interrupted_head" "$(git -C "$interrupted_fixture" rev-parse HEAD)" \
+  "interrupted release HEAD"
+assert_equal "1.2.4" "$(fixture_version "$interrupted_fixture")" \
+  "interrupted release version"
+assert_equal "$interrupted_head" \
+  "$(git -C "$interrupted_fixture" rev-parse 'refs/tags/v1.2.4^{commit}')" \
+  "interrupted release tag"
+
 rollback_fixture="$(make_fixture rollback)"
 rollback_manifest="$(sha256sum "$rollback_fixture/Cargo.toml")"
 rollback_lock="$(sha256sum "$rollback_fixture/Cargo.lock")"
