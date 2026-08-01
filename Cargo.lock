@@ -426,7 +426,7 @@ dependencies = [
 
 [[package]]
 name = "borg"
-version = "0.1.31"
+version = "0.1.32"
 dependencies = [
  "aes-gcm",
  "agent-client-protocol",
@@ -471,7 +471,7 @@ dependencies = [
 
 [[package]]
 name = "borg-provider"
-version = "0.1.31"
+version = "0.1.32"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -494,7 +494,7 @@ dependencies = [
 
 [[package]]
 name = "borg-remote"
-version = "0.1.31"
+version = "0.1.32"
 dependencies = [
  "anyhow",
  "async-trait",
