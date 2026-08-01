@@ -87,13 +87,10 @@ const MIN_WHEEL_SCROLL_LINES_PER_EVENT: usize = 1;
 const MAX_WHEEL_SCROLL_LINES_PER_EVENT: usize = 12;
 const MAX_WHEEL_SCROLL_LINES_PER_FRAME: isize = 8;
 const WHEEL_SCROLL_EASING_DIVISOR: usize = 8;
-const MIN_NESTED_SCROLL_LINES_PER_FRAME: usize = 2;
-const MAX_NESTED_SCROLL_LINES_PER_FRAME: usize = 12;
 const NESTED_WHEEL_SCROLL_FULL_HEIGHT_ROWS: usize = 72;
 const MAX_PENDING_WHEEL_SCROLL_LINES: isize = 160;
 const TOOL_RUN_BOX_THRESHOLD: usize = 8;
 const MAX_COLLAPSED_PLAN_ITEMS: usize = 5;
-const MAX_TERMINAL_AGENTS_IN_ROSTER: usize = 4;
 
 fn keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
     KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
@@ -2894,12 +2891,14 @@ impl BorgTerminal {
             let current = self
                 .transcript
                 .tool_run_offset(nested.tool_run_start, nested.max_offset);
-            let next = nested.motion.advance_with_limits(
-                current,
-                nested.max_offset,
-                MIN_NESTED_SCROLL_LINES_PER_FRAME,
-                MAX_NESTED_SCROLL_LINES_PER_FRAME,
-            );
+            // Changing an actions viewport invalidates the transcript render
+            // cache. Apply the complete coalesced wheel gesture in one frame
+            // so a long thread is rebuilt once, rather than once per eased
+            // animation step. Main transcript scrolling does not invalidate
+            // that cache and can keep its smoother multi-frame motion.
+            let next = nested
+                .motion
+                .advance_immediately(current, nested.max_offset);
             (nested.tool_run_start, nested.max_offset, current, next)
         });
         if let Some((start, max_offset, current, next)) = nested_update
@@ -4230,7 +4229,9 @@ impl BorgTerminal {
             );
             let status_width = status_spans.iter().map(|span| span.width()).sum::<usize>();
             let agents_status = agents_status_label(active_subagents);
-            let agents_status_width = agents_status.as_ref().map(|status| status.width());
+            let agents_status_width = agents_status
+                .as_ref()
+                .map(|status| activity_glyph(SessionStatus::Running).width() + 1 + status.width());
             if agents_status.is_some() {
                 status_spans.push(Span::styled(
                     STATUS_SEPARATOR,
@@ -4239,19 +4240,14 @@ impl BorgTerminal {
             }
             let agents_status_start = status_spans.iter().map(|span| span.width()).sum::<usize>();
             if let Some(agents_status) = agents_status {
+                let hovered = self.agents_status_hovered || self.team_switcher_open;
+                status_spans.push(Span::styled(
+                    format!("{} ", activity_glyph(SessionStatus::Running)),
+                    agents_status_spinner_style(hovered),
+                ));
                 status_spans.push(Span::styled(
                     agents_status,
-                    Style::default()
-                        .fg(if self.agents_status_hovered || self.team_switcher_open {
-                            Color::White
-                        } else {
-                            SUBAGENT_PINK
-                        })
-                        .add_modifier(if self.agents_status_hovered || self.team_switcher_open {
-                            Modifier::BOLD | Modifier::UNDERLINED
-                        } else {
-                            Modifier::empty()
-                        }),
+                    agents_status_text_style(hovered),
                 ));
             }
             let goal_status_start = status_spans.iter().map(|span| span.width()).sum::<usize>();
@@ -5953,6 +5949,7 @@ struct Transcript {
     todos: Vec<PlanItem>,
     config: Option<SessionDisplayConfig>,
     active_turn: Option<ActiveTurnDisplayConfig>,
+    live_turn_closed: bool,
     subagents: HashMap<Uuid, SubagentStatus>,
     subagent_snapshots: HashMap<Uuid, SubagentSnapshot>,
     subagent_entries: HashMap<Uuid, usize>,
@@ -6009,6 +6006,7 @@ impl Default for Transcript {
             todos: Vec::new(),
             config: None,
             active_turn: None,
+            live_turn_closed: false,
             subagents: HashMap::new(),
             subagent_snapshots: HashMap::new(),
             subagent_entries: HashMap::new(),
@@ -6126,6 +6124,7 @@ enum TranscriptEntry {
 impl Transcript {
     fn project_optimistic_message(&mut self, event: &SessionEvent) {
         let _ = self.apply(event);
+        self.live_turn_closed = false;
         if event.sequence == 0
             && let SessionEventKind::Message {
                 message_id,
@@ -6178,6 +6177,15 @@ impl Transcript {
             self.context_remaining_percent =
                 context_remaining_percent(context_tokens, context_window_tokens);
         }
+        self.live_turn_closed = matches!(
+            state.status,
+            Some(
+                SessionStatus::Ready
+                    | SessionStatus::Completed
+                    | SessionStatus::Failed
+                    | SessionStatus::Stopped
+            )
+        );
     }
 
     fn reconcile_session_status(&mut self, state: &SessionState) {
@@ -6430,6 +6438,30 @@ impl Transcript {
         {
             self.active_turn = None;
         }
+        match &event.kind {
+            SessionEventKind::TurnStarted { .. }
+            | SessionEventKind::StatusChanged {
+                status:
+                    SessionStatus::Starting | SessionStatus::Running | SessionStatus::WaitingForApproval,
+                ..
+            } => self.live_turn_closed = false,
+            SessionEventKind::StatusChanged {
+                status:
+                    SessionStatus::Ready
+                    | SessionStatus::Completed
+                    | SessionStatus::Failed
+                    | SessionStatus::Stopped,
+                ..
+            } => {
+                self.live_turn_closed = true;
+                self.finish_live_assistant_messages(event.created_at);
+            }
+            SessionEventKind::TurnCompleted { .. } => {
+                self.live_turn_closed = true;
+                self.finish_live_assistant_messages(event.created_at);
+            }
+            _ => {}
+        }
         let mut removed_entry = None;
         match &event.kind {
             SessionEventKind::SessionConfigured {
@@ -6533,6 +6565,15 @@ impl Transcript {
                 attachments,
                 delivery,
             } => {
+                // A coalesced live snapshot can arrive after its durable
+                // terminal boundary during reconnect. Never resurrect a
+                // responding row once the active turn has been closed.
+                if *actor == EventActor::Assistant
+                    && *status == MessageStatus::InProgress
+                    && self.live_turn_closed
+                {
+                    return removed_entry;
+                }
                 // Team delivery is provider input, not a human-authored chat
                 // message. Its child-authored report is projected separately
                 // through SubagentActivity with the correct agent identity.
@@ -7035,6 +7076,30 @@ impl Transcript {
         }
     }
 
+    fn finish_live_assistant_messages(&mut self, completed_at: DateTime<Utc>) {
+        for (index, entry) in self.order.iter_mut().enumerate() {
+            let TranscriptEntry::Message {
+                actor: EventActor::Assistant,
+                status,
+                complete,
+                ..
+            } = entry
+            else {
+                continue;
+            };
+            if *status != MessageStatus::InProgress {
+                continue;
+            }
+            *status = MessageStatus::Complete;
+            *complete = true;
+            self.message_markdown_cache
+                .get_mut()
+                .messages
+                .remove(&index);
+        }
+        self.finish_reasoning(completed_at);
+    }
+
     fn set_auto_expand_edits(&mut self, enabled: bool) {
         self.auto_expand_edits = enabled;
         for entry in &mut self.order {
@@ -7122,14 +7187,7 @@ impl Transcript {
     fn active_subagent_count(&self) -> usize {
         self.subagents
             .values()
-            .filter(|status| {
-                matches!(
-                    status,
-                    SubagentStatus::Starting
-                        | SubagentStatus::Running
-                        | SubagentStatus::WaitingForApproval
-                )
-            })
+            .filter(|status| subagent_is_working(**status))
             .count()
     }
 
@@ -7150,36 +7208,12 @@ impl Transcript {
         } else {
             rows.push(("director  model pending  main thread".to_string(), None));
         }
-        let mut agents = self.subagent_snapshots.values().collect::<Vec<_>>();
-        agents.sort_by(|left, right| {
-            let left_terminal = matches!(
-                left.status,
-                SubagentStatus::Stopped | SubagentStatus::Failed
-            );
-            let right_terminal = matches!(
-                right.status,
-                SubagentStatus::Stopped | SubagentStatus::Failed
-            );
-            left_terminal.cmp(&right_terminal).then_with(|| {
-                if left_terminal {
-                    right.updated_at.cmp(&left.updated_at)
-                } else {
-                    left.task_name.cmp(&right.task_name)
-                }
-            })
-        });
-        let mut terminal_agents = 0;
-        agents.retain(|agent| {
-            if matches!(
-                agent.status,
-                SubagentStatus::Stopped | SubagentStatus::Failed
-            ) {
-                terminal_agents += 1;
-                terminal_agents <= MAX_TERMINAL_AGENTS_IN_ROSTER
-            } else {
-                true
-            }
-        });
+        let mut agents = self
+            .subagent_snapshots
+            .values()
+            .filter(|agent| subagent_is_working(agent.status))
+            .collect::<Vec<_>>();
+        agents.sort_by(|left, right| left.task_name.cmp(&right.task_name));
         rows.extend(agents.into_iter().map(|agent| {
             let name = display_agent_name(&agent.task_name);
             let model = agent
@@ -8272,6 +8306,17 @@ impl ScrollMotion {
             1,
             MAX_WHEEL_SCROLL_LINES_PER_FRAME as usize,
         )
+    }
+
+    fn advance_immediately(&mut self, scroll_from_bottom: usize, scroll_max: usize) -> usize {
+        let requested = std::mem::take(&mut self.remaining_lines);
+        if requested > 0 {
+            scroll_from_bottom
+                .saturating_add(requested as usize)
+                .min(scroll_max)
+        } else {
+            scroll_from_bottom.saturating_sub(requested.unsigned_abs())
+        }
     }
 
     fn advance_with_limits(
@@ -10227,12 +10272,34 @@ fn history_loading_line() -> Line<'static> {
 
 fn agents_status_label(active_subagents: usize) -> Option<String> {
     (active_subagents > 0).then(|| {
-        let working_team_size = active_subagents.saturating_add(1);
         format!(
-            "{} {working_team_size} agents",
-            activity_glyph(SessionStatus::Running)
+            "{active_subagents} agent{}",
+            if active_subagents == 1 { "" } else { "s" }
         )
     })
+}
+
+fn subagent_is_working(status: SubagentStatus) -> bool {
+    matches!(
+        status,
+        SubagentStatus::Starting | SubagentStatus::Running | SubagentStatus::WaitingForApproval
+    )
+}
+
+fn agents_status_spinner_style(hovered: bool) -> Style {
+    Style::default()
+        .fg(if hovered { Color::White } else { SUBAGENT_PINK })
+        .add_modifier(Modifier::BOLD)
+}
+
+fn agents_status_text_style(hovered: bool) -> Style {
+    Style::default()
+        .fg(if hovered { Color::White } else { SUBAGENT_PINK })
+        .add_modifier(if hovered {
+            Modifier::BOLD | Modifier::UNDERLINED
+        } else {
+            Modifier::empty()
+        })
 }
 
 fn spinner_frame_index() -> usize {

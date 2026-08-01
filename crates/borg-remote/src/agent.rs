@@ -657,38 +657,38 @@ async fn run_borg_provider_turn(
                     )
                     .await;
                 }
-                // A provider can report a nominally successful terminal result
-                // without any visible assistant text. Treat that as a failed
-                // turn instead of silently returning Ready: otherwise the
-                // user's prompt remains the last rendered item and the next
-                // prompt appears to "wake up" the missing response.
-                if !completed_segment && final_output.trim().is_empty() && text.trim().is_empty() {
-                    let error = "provider completed without a visible response (empty result)";
+                // Narration closes one assistant segment and allocates a new
+                // message id for the final segment. Complete the current
+                // segment independently of earlier narration; otherwise its
+                // last in-progress snapshot survives the terminal boundary.
+                let terminal_text =
+                    match terminal_assistant_text(&final_output, &text, completed_segment) {
+                        Ok(text) => text,
+                        Err(error) => {
+                            send(
+                                &events,
+                                SessionEventKind::Error {
+                                    message: error.to_string(),
+                                },
+                            )
+                            .await;
+                            return Err(error);
+                        }
+                    };
+                if let Some(terminal_text) = terminal_text {
+                    text = terminal_text.clone();
                     send(
                         &events,
-                        SessionEventKind::Error {
-                            message: error.to_string(),
+                        SessionEventKind::Message {
+                            message_id: assistant_message_id,
+                            actor: EventActor::Assistant,
+                            text: terminal_text,
+                            attachments: Vec::new(),
+                            status: MessageStatus::Complete,
+                            delivery: None,
                         },
                     )
                     .await;
-                    bail!(error);
-                }
-                if !completed_segment {
-                    text = final_output.clone();
-                    if !text.trim().is_empty() {
-                        send(
-                            &events,
-                            SessionEventKind::Message {
-                                message_id: assistant_message_id,
-                                actor: EventActor::Assistant,
-                                text: text.clone(),
-                                attachments: Vec::new(),
-                                status: MessageStatus::Complete,
-                                delivery: None,
-                            },
-                        )
-                        .await;
-                    }
                 }
             }
             ChatStreamEvent::Failed { error } => {
@@ -748,6 +748,32 @@ fn require_provider_stream_terminal(terminal_seen: bool) -> Result<()> {
         "provider stream closed without a terminal Done or Failed event"
     );
     Ok(())
+}
+
+fn terminal_assistant_text(
+    final_output: &str,
+    current_text: &str,
+    completed_segment: bool,
+) -> Result<Option<String>> {
+    let text = if completed_segment {
+        // `final_output` is the provider's aggregate answer. Narration has
+        // already committed prior segments, so only finish the current
+        // post-narration segment here; otherwise the aggregate is duplicated.
+        current_text
+    } else if final_output.trim().is_empty() {
+        current_text
+    } else {
+        final_output
+    };
+    if text.trim().is_empty() {
+        anyhow::ensure!(
+            completed_segment,
+            "provider completed without a visible response (empty result)"
+        );
+        Ok(None)
+    } else {
+        Ok(Some(text.to_string()))
+    }
 }
 
 fn request_can_use_claude_pool(request: &ChatStreamRequest) -> bool {
@@ -1082,6 +1108,32 @@ mod tests {
                 .unwrap_err()
                 .to_string(),
             "provider stream closed without a terminal Done or Failed event"
+        );
+    }
+
+    #[test]
+    fn terminal_result_completes_the_current_segment_after_narration() {
+        assert_eq!(
+            terminal_assistant_text("aggregate response", "partial response", true).unwrap(),
+            Some("partial response".to_string())
+        );
+        assert_eq!(
+            terminal_assistant_text("aggregate response", "", true).unwrap(),
+            None
+        );
+        assert_eq!(
+            terminal_assistant_text("final response", "partial response", false).unwrap(),
+            Some("final response".to_string())
+        );
+        assert_eq!(
+            terminal_assistant_text("", "partial response", false).unwrap(),
+            Some("partial response".to_string())
+        );
+        assert_eq!(
+            terminal_assistant_text("", "", false)
+                .unwrap_err()
+                .to_string(),
+            "provider completed without a visible response (empty result)"
         );
     }
 }

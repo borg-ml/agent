@@ -1,9 +1,10 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -14,9 +15,114 @@ use crate::{
 const MAX_CONTROL_COMMAND_BYTES: u64 = 1024 * 1024;
 const ATTACHED_SESSION_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
 
+#[derive(Debug, Serialize, Deserialize)]
+struct LocalSessionOwnerMetadata {
+    schema_version: u8,
+    pid: u32,
+    executable_identity: String,
+}
+
 /// Path used by additional local terminals to attach to a session owner.
 pub fn session_control_socket_path(sessions_dir: &Path, session_id: Uuid) -> PathBuf {
     sessions_dir.join(format!("{session_id}.control.sock"))
+}
+
+fn session_control_owner_path(sessions_dir: &Path, session_id: Uuid) -> PathBuf {
+    sessions_dir.join(format!("{session_id}.control.owner.json"))
+}
+
+/// Whether the process holding this local session's writer lease is running
+/// the exact same Borg executable as the caller.
+///
+/// Older Borg owners did not publish metadata. Treating absent, stale, or
+/// malformed metadata as a mismatch prevents a newly installed CLI from
+/// silently attaching its terminal to an obsolete long-lived process.
+pub fn local_session_owner_uses_current_binary(
+    sessions_dir: &Path,
+    session_id: Uuid,
+) -> Result<bool> {
+    let path = session_control_owner_path(sessions_dir, session_id);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", path.display()));
+        }
+    };
+    let metadata: LocalSessionOwnerMetadata = match serde_json::from_slice(&bytes) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            tracing::warn!(%error, path = %path.display(), "invalid local session owner metadata");
+            return Ok(false);
+        }
+    };
+    if metadata.schema_version != 1 || !process_is_alive(metadata.pid) {
+        return Ok(false);
+    }
+    Ok(metadata.executable_identity == current_executable_identity()?)
+}
+
+fn current_executable_identity() -> Result<String> {
+    static IDENTITY: OnceLock<String> = OnceLock::new();
+    if let Some(identity) = IDENTITY.get() {
+        return Ok(identity.clone());
+    }
+    let executable = std::env::current_exe().context("failed to locate the Borg executable")?;
+    let metadata = fs::metadata(&executable)
+        .with_context(|| format!("failed to identify {}", executable.display()))?;
+    #[cfg(unix)]
+    let identity = {
+        use std::os::unix::fs::MetadataExt;
+        format!(
+            "{}:{}:{}:{}:{}",
+            metadata.dev(),
+            metadata.ino(),
+            metadata.len(),
+            metadata.mtime(),
+            metadata.mtime_nsec()
+        )
+    };
+    #[cfg(not(unix))]
+    let identity = format!("{}:{:?}", metadata.len(), metadata.modified().ok());
+    IDENTITY.set(identity.clone()).ok();
+    Ok(identity)
+}
+
+#[cfg(unix)]
+fn process_is_alive(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    let result = unsafe { libc::kill(pid, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+fn process_is_alive(_pid: u32) -> bool {
+    true
+}
+
+#[cfg(unix)]
+fn write_local_session_owner_metadata(sessions_dir: &Path, session_id: Uuid) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = session_control_owner_path(sessions_dir, session_id);
+    let temporary = sessions_dir.join(format!(
+        ".{session_id}.control.owner.{}.tmp",
+        std::process::id()
+    ));
+    let metadata = LocalSessionOwnerMetadata {
+        schema_version: 1,
+        pid: std::process::id(),
+        executable_identity: current_executable_identity()?,
+    };
+    fs::write(&temporary, serde_json::to_vec(&metadata)?)
+        .with_context(|| format!("failed to write {}", temporary.display()))?;
+    fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("failed to secure {}", temporary.display()))?;
+    fs::rename(&temporary, &path)
+        .with_context(|| format!("failed to publish {}", path.display()))?;
+    Ok(())
 }
 
 /// Send one typed command to the process holding a session's writer lease.
@@ -129,6 +235,10 @@ impl LocalSessionControlServer {
             .with_context(|| format!("failed to bind {}", socket_path.display()))?;
         fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))
             .with_context(|| format!("failed to secure {}", socket_path.display()))?;
+        write_local_session_owner_metadata(
+            socket_path.parent().unwrap_or_else(|| Path::new(".")),
+            session_id,
+        )?;
         let task_socket_path = socket_path.clone();
         let task = tokio::spawn(async move {
             loop {
@@ -283,11 +393,12 @@ pub async fn run_attached_session(
             _ = refresh.tick() => {
                 for event in store.events_after(session_id, last_sequence, 1_000).await? {
                     last_sequence = event.sequence;
-                    if event
-                        .kind
-                        .cleared_live_state_keys()
-                        .iter()
-                        .any(|key| key == "reasoning")
+                    if event.kind.clears_live_turn_state()
+                        || event
+                            .kind
+                            .cleared_live_state_keys()
+                            .iter()
+                            .any(|key| key == "reasoning")
                     {
                         reasoning_snapshot.clear();
                     }
@@ -365,6 +476,34 @@ mod tests {
     use super::*;
     use crate::{PromptDelivery, SessionJournal};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn owner_metadata_prevents_silent_attachment_to_an_obsolete_binary() {
+        let root = tempfile::tempdir().unwrap();
+        let session_id = Uuid::new_v4();
+        let journal_path = root.path().join(format!("{session_id}.jsonl"));
+        let socket_path = session_control_socket_path(root.path(), session_id);
+        let journal = SessionJournal::open(&journal_path).unwrap();
+        let writer = journal.try_acquire_writer().unwrap().unwrap();
+        assert!(!local_session_owner_uses_current_binary(root.path(), session_id).unwrap());
+
+        let (commands, _rx) = mpsc::channel(1);
+        let _server =
+            LocalSessionControlServer::start(socket_path, session_id, &writer, commands).unwrap();
+        assert!(local_session_owner_uses_current_binary(root.path(), session_id).unwrap());
+
+        let stale = LocalSessionOwnerMetadata {
+            schema_version: 1,
+            pid: u32::MAX,
+            executable_identity: current_executable_identity().unwrap(),
+        };
+        fs::write(
+            session_control_owner_path(root.path(), session_id),
+            serde_json::to_vec(&stale).unwrap(),
+        )
+        .unwrap();
+        assert!(!local_session_owner_uses_current_binary(root.path(), session_id).unwrap());
+    }
 
     #[tokio::test]
     async fn attached_commands_are_acknowledged_and_session_scoped() {

@@ -16,10 +16,10 @@ use borg_remote::{
     PlanItemStatus, PromptDelivery, ResponseLanguage, SessionConfigAction, SessionEvent,
     SessionEventKind, SessionGoal, SessionState, SessionStatus, SessionStore, SessionWriterLease,
     SpawnSubagent, SqliteSessionStore, SqliteWorkspaceStore, SubagentAction, SubagentSnapshot,
-    TodoAction, default_host_config_path, enroll_host, login_provider, mirror_local_session,
-    probe_capabilities, provider_credentials_present, run_agent_session_with_store_and_writer,
-    run_agent_session_with_store_writer_and_peers, run_attached_session, run_host,
-    session_control_socket_path,
+    TodoAction, default_host_config_path, enroll_host, local_session_owner_uses_current_binary,
+    login_provider, mirror_local_session, probe_capabilities, provider_credentials_present,
+    run_agent_session_with_store_and_writer, run_agent_session_with_store_writer_and_peers,
+    run_attached_session, run_host, send_local_session_command, session_control_socket_path,
 };
 use chrono::{Local, Utc};
 use futures_util::FutureExt;
@@ -530,6 +530,35 @@ impl LocalSessionAccess {
     }
 }
 
+fn stale_local_owner_can_handoff(status: Option<SessionStatus>) -> bool {
+    matches!(status, Some(SessionStatus::Ready | SessionStatus::Stopped))
+}
+
+async fn stop_stale_local_owner_and_acquire(
+    journal_path: &Path,
+    control_socket_path: &Path,
+    session_id: Uuid,
+) -> Result<SessionWriterLease> {
+    send_local_session_command(
+        control_socket_path,
+        session_id,
+        HostCommand::Stop { session_id },
+    )
+    .await
+    .context("failed to ask the obsolete local session owner to stop")?;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Some(writer) = SessionWriterLease::try_acquire(journal_path)? {
+            return Ok(writer);
+        }
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "obsolete local session owner did not release its writer lease"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
 async fn run_local_agent_session(
     args: &LocalAgentCliArgs,
     selected_session: Option<Uuid>,
@@ -564,8 +593,10 @@ async fn run_local_agent_session(
     };
     crash_context.set_session_id(session_id);
     let journal_path = sessions_dir.join(format!("{session_id}.jsonl"));
-    let writer = SessionWriterLease::try_acquire(&journal_path)?;
-    let session_access = if writer.is_some() {
+    let control_socket_path = session_control_socket_path(&sessions_dir, session_id);
+    let remote_launch_path = sessions_dir.join(format!("{session_id}.launch.json"));
+    let mut writer = SessionWriterLease::try_acquire(&journal_path)?;
+    let mut session_access = if writer.is_some() {
         LocalSessionAccess::Owned
     } else {
         LocalSessionAccess::Attached
@@ -590,7 +621,28 @@ async fn run_local_agent_session(
         }
         sqlite_store.clone()
     };
-    let session_state = store.state(session_id).await?;
+    let mut session_state = store.state(session_id).await?;
+    let mut stale_local_owner = session_access.is_attached()
+        && !remote_launch_path.is_file()
+        && !local_session_owner_uses_current_binary(&sessions_dir, session_id)?;
+    if stale_local_owner && stale_local_owner_can_handoff(session_state.status) {
+        // Prompt admission intentionally precedes the durable Starting event.
+        // Give an obsolete owner one short scheduling window to expose that
+        // transition before deciding its apparently Ready state is safe to
+        // hand off, so an update cannot eat a just-submitted prompt.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        session_state = store.state(session_id).await?;
+        if stale_local_owner_can_handoff(session_state.status) {
+            tracing::info!(%session_id, "replacing obsolete local session owner before attach");
+            writer = Some(
+                stop_stale_local_owner_and_acquire(&journal_path, &control_socket_path, session_id)
+                    .await?,
+            );
+            session_access = LocalSessionAccess::Owned;
+            session_state = store.state(session_id).await?;
+            stale_local_owner = false;
+        }
+    }
     let resuming = session_state.latest_sequence > 0;
     let mut current_goal = session_state.goal.clone();
     let mut current_todos = session_state.todos.clone();
@@ -805,8 +857,7 @@ async fn run_local_agent_session(
         team_policy,
     };
     if session_access.is_attached() {
-        let remote_launch = sessions_dir.join(format!("{session_id}.launch.json"));
-        if remote_launch.is_file() {
+        if remote_launch_path.is_file() {
             anyhow::bail!(
                 "this session is still owned by the background Borg remote host; reopen it from the connected remote chat instead of starting a second local writer"
             );
@@ -895,7 +946,6 @@ async fn run_local_agent_session(
     let local_prompt_admissions = Arc::new(Mutex::new(HashSet::new()));
     let actor_journal_path = journal_path.clone();
     let registration_template = launch.clone();
-    let control_socket_path = session_control_socket_path(&sessions_dir, session_id);
     let control_server = if session_access.is_attached() {
         None
     } else {
@@ -912,7 +962,7 @@ async fn run_local_agent_session(
             Arc::clone(&store),
             session_id,
             actor_journal_path,
-            control_socket_path,
+            control_socket_path.clone(),
             session_state.latest_sequence,
             session_commands,
             session_event_tx,
@@ -978,6 +1028,12 @@ async fn run_local_agent_session(
         terminal.seed_history(&history);
         terminal.seed_team_roster(&team_snapshots);
         terminal.seed_session_state(&session_state);
+        if stale_local_owner {
+            terminal.set_notice(
+                "This turn is owned by an older Borg build · upgrading automatically when it finishes"
+                    .to_string(),
+            );
+        }
         terminal.set_auto_expand_edits(editor_preferences.presentation.auto_expand_edits);
         terminal.set_auto_expand_tools(editor_preferences.presentation.auto_expand_tools);
         terminal.set_transcript_labels(
@@ -1177,6 +1233,14 @@ async fn run_local_agent_session(
                 let Some(event) = event else {
                     break;
                 };
+                let handoff_stale_owner = stale_local_owner
+                    && matches!(
+                        event.kind,
+                        SessionEventKind::StatusChanged {
+                            status: SessionStatus::Ready,
+                            ..
+                        }
+                    );
                 delivered_projection.observe(&event)?;
                 if let Some(message_id) = committed_prompt_id(&event.kind)
                     && matches!(
@@ -1317,6 +1381,35 @@ async fn run_local_agent_session(
                     }
                 } else if !detached_from_terminal {
                     render_event(&event, args.json, &mut rendered)?;
+                }
+                if handoff_stale_owner {
+                    match send_local_session_command(
+                        &control_socket_path,
+                        session_id,
+                        HostCommand::Stop { session_id },
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            stale_local_owner = false;
+                            if let Some(terminal) = terminal.as_mut() {
+                                terminal.set_notice(
+                                    "Turn finished · restarting this session on the current Borg build"
+                                        .to_string(),
+                                );
+                                terminal_dirty = true;
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, %session_id, "could not replace obsolete local session owner");
+                            if let Some(terminal) = terminal.as_mut() {
+                                terminal.set_notice(format!(
+                                    "Could not upgrade the older session owner: {error:#}"
+                                ));
+                                terminal_dirty = true;
+                            }
+                        }
+                    }
                 }
                 if pending_approval.is_some() && !can_prompt {
                     let approval_id = pending_approval.take().expect("pending approval");
@@ -4957,6 +5050,48 @@ mod tests {
                 .to_string()
                 .contains("Interrupt the current turn")
         );
+    }
+
+    #[test]
+    fn obsolete_owner_handoff_waits_for_a_safe_turn_boundary() {
+        assert!(stale_local_owner_can_handoff(Some(SessionStatus::Ready)));
+        assert!(stale_local_owner_can_handoff(Some(SessionStatus::Stopped)));
+        assert!(!stale_local_owner_can_handoff(Some(
+            SessionStatus::Starting
+        )));
+        assert!(!stale_local_owner_can_handoff(Some(SessionStatus::Running)));
+        assert!(!stale_local_owner_can_handoff(Some(
+            SessionStatus::WaitingForApproval
+        )));
+        assert!(!stale_local_owner_can_handoff(None));
+    }
+
+    #[tokio::test]
+    async fn obsolete_owner_handoff_releases_and_reacquires_the_writer_lease() {
+        let root = tempdir().unwrap();
+        let session_id = Uuid::new_v4();
+        let journal_path = root.path().join(format!("{session_id}.jsonl"));
+        let socket_path = session_control_socket_path(root.path(), session_id);
+        let journal = borg_remote::SessionJournal::open(&journal_path).unwrap();
+        let writer = journal.try_acquire_writer().unwrap().unwrap();
+        let (commands, mut received) = mpsc::channel(1);
+        let _server =
+            LocalSessionControlServer::start(socket_path.clone(), session_id, &writer, commands)
+                .unwrap();
+        let release = tokio::spawn(async move {
+            assert!(matches!(
+                received.recv().await,
+                Some(HostCommand::Stop { session_id: target }) if target == session_id
+            ));
+            drop(writer);
+        });
+
+        let replacement =
+            stop_stale_local_owner_and_acquire(&journal_path, &socket_path, session_id)
+                .await
+                .unwrap();
+        release.await.unwrap();
+        drop(replacement);
     }
 
     #[test]

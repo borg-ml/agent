@@ -163,6 +163,23 @@ impl SessionEventKind {
         }
     }
 
+    /// Terminal boundaries end the current streamed turn. The context-window
+    /// snapshot is session metadata and intentionally survives, but streamed
+    /// assistant messages and reasoning must not outlive their turn.
+    pub fn clears_live_turn_state(&self) -> bool {
+        matches!(
+            self,
+            Self::TurnCompleted { .. }
+                | Self::StatusChanged {
+                    status: SessionStatus::Ready
+                        | SessionStatus::Completed
+                        | SessionStatus::Failed
+                        | SessionStatus::Stopped,
+                    ..
+                }
+        )
+    }
+
     pub fn payload_refs(&self) -> Vec<&SessionPayloadRef> {
         match self {
             Self::ToolStarted { input_ref, .. } => input_ref.iter().collect(),
@@ -926,6 +943,25 @@ impl SqliteSessionStore {
         self.ensure_recovery_index().await?;
         self.backfill_queued_prompt_inheritance().await?;
         self.rebuild_stale_projections().await?;
+        self.clear_terminal_live_state().await?;
+        Ok(())
+    }
+
+    /// Repair stores written before terminal boundaries cleared every streamed
+    /// turn key. Keep the context-window snapshot because it remains useful
+    /// while idle.
+    async fn clear_terminal_live_state(&self) -> Result<()> {
+        sqlx::query(
+            "delete from session_live_state \
+             where live_key <> 'context_window' \
+               and session_id in ( \
+                 select id from sessions \
+                 where json_extract(state_json, '$.status') in \
+                       ('ready', 'completed', 'failed', 'stopped') \
+               )",
+        )
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -1585,12 +1621,33 @@ impl SqliteSessionStore {
             .context("coalesced session event has no live-state key")?;
         event.sequence = 0;
         let mut transaction = self.begin_write().await?;
-        let current_revision: i64 =
-            sqlx::query_scalar("select live_revision from sessions where id = ?")
-                .bind(event.session_id.to_string())
-                .fetch_optional(&mut *transaction)
-                .await?
-                .with_context(|| format!("session {} does not exist", event.session_id))?;
+        let row = sqlx::query("select live_revision, state_json from sessions where id = ?")
+            .bind(event.session_id.to_string())
+            .fetch_optional(&mut *transaction)
+            .await?
+            .with_context(|| format!("session {} does not exist", event.session_id))?;
+        let current_revision = row.try_get::<i64, _>("live_revision")?;
+        let state: SessionState = serde_json::from_str(row.try_get("state_json")?)?;
+        let turn_live_allowed = matches!(
+            state.status,
+            Some(SessionStatus::Running | SessionStatus::WaitingForApproval)
+        );
+        if !turn_live_allowed {
+            // A provider task can finish after the actor has published its
+            // terminal status. Do not let that delayed snapshot resurrect a
+            // responding message or reasoning disclosure in an idle session.
+            sqlx::query(
+                "delete from session_live_state \
+                 where session_id = ? and live_key <> 'context_window'",
+            )
+            .bind(event.session_id.to_string())
+            .execute(&mut *transaction)
+            .await?;
+            if live_key != "context_window" {
+                transaction.commit().await?;
+                return Ok(event);
+            }
+        }
         let revision = current_revision.saturating_add(1);
         let stored_event = if let SessionEventKind::ReasoningDelta { text } = &event.kind {
             let prior = sqlx::query_scalar::<_, String>(
@@ -1739,12 +1796,22 @@ impl SessionStore for SqliteSessionStore {
         .bind(event.created_at.to_rfc3339())
         .execute(&mut *transaction)
         .await?;
-        for live_key in event.kind.cleared_live_state_keys() {
-            sqlx::query("delete from session_live_state where session_id = ? and live_key = ?")
-                .bind(event.session_id.to_string())
-                .bind(live_key)
-                .execute(&mut *transaction)
-                .await?;
+        if event.kind.clears_live_turn_state() {
+            sqlx::query(
+                "delete from session_live_state \
+                 where session_id = ? and live_key <> 'context_window'",
+            )
+            .bind(event.session_id.to_string())
+            .execute(&mut *transaction)
+            .await?;
+        } else {
+            for live_key in event.kind.cleared_live_state_keys() {
+                sqlx::query("delete from session_live_state where session_id = ? and live_key = ?")
+                    .bind(event.session_id.to_string())
+                    .bind(live_key)
+                    .execute(&mut *transaction)
+                    .await?;
+            }
         }
         sqlx::query(
             "update sessions set next_sequence = ?, state_json = ?, projection_version = 3, \
@@ -2767,6 +2834,10 @@ mod tests {
         for kind in [
             SessionEventKind::SessionStarted,
             configured(directory.path()),
+            SessionEventKind::StatusChanged {
+                status: SessionStatus::Running,
+                detail: None,
+            },
         ] {
             store
                 .append(SessionEvent::new(session_id, 0, kind))
@@ -2816,7 +2887,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(store.read(session_id).await.unwrap().len(), 2);
+        assert_eq!(store.read(session_id).await.unwrap().len(), 3);
         let live = store.live_events_after(session_id, 0).await.unwrap();
         assert_eq!(live.len(), 2);
         assert!(live.iter().any(|live| matches!(
@@ -2843,9 +2914,192 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(completed.sequence, 3);
+        assert_eq!(completed.sequence, 4);
         assert!(
             store
+                .live_events_after(session_id, 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_boundaries_clear_all_turn_live_state_but_keep_context_window() {
+        let (directory, store) = store().await;
+        let session_id = Uuid::new_v4();
+        store.create_session(session_id).await.unwrap();
+        for kind in [
+            SessionEventKind::SessionStarted,
+            configured(directory.path()),
+        ] {
+            store
+                .append(SessionEvent::new(session_id, 0, kind))
+                .await
+                .unwrap();
+        }
+
+        let live_message = |message_id| SessionEventKind::Message {
+            message_id,
+            actor: EventActor::Assistant,
+            text: "partial".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::InProgress,
+            delivery: None,
+        };
+        store
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                live_message(Uuid::new_v4()),
+            ))
+            .await
+            .unwrap();
+        store
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::ReasoningDelta {
+                    text: "thinking".to_string(),
+                },
+            ))
+            .await
+            .unwrap();
+        store
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::ContextWindowUpdated {
+                    context_tokens: 80,
+                    context_window_tokens: 100,
+                },
+            ))
+            .await
+            .unwrap();
+
+        store
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::TurnCompleted {
+                    message_id: Uuid::new_v4(),
+                    provider_session_id: None,
+                    final_text: String::new(),
+                    error: Some("turn interrupted".to_string()),
+                },
+            ))
+            .await
+            .unwrap();
+        let live = store.live_events_after(session_id, 0).await.unwrap();
+        assert_eq!(live.len(), 1);
+        assert!(matches!(
+            live[0].event.kind,
+            SessionEventKind::ContextWindowUpdated {
+                context_tokens: 80,
+                context_window_tokens: 100,
+            }
+        ));
+
+        store
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                live_message(Uuid::new_v4()),
+            ))
+            .await
+            .unwrap();
+        store
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::StatusChanged {
+                    status: SessionStatus::Ready,
+                    detail: None,
+                },
+            ))
+            .await
+            .unwrap();
+        let live = store.live_events_after(session_id, 0).await.unwrap();
+        assert_eq!(live.len(), 1);
+        assert!(matches!(
+            live[0].event.kind,
+            SessionEventKind::ContextWindowUpdated { .. }
+        ));
+
+        // A delayed coalesced event must not recreate turn state after the
+        // session has become idle.
+        store
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                live_message(Uuid::new_v4()),
+            ))
+            .await
+            .unwrap();
+        let live = store.live_events_after(session_id, 0).await.unwrap();
+        assert_eq!(live.len(), 1);
+        assert!(matches!(
+            live[0].event.kind,
+            SessionEventKind::ContextWindowUpdated { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn reopening_repairs_turn_live_state_left_on_a_terminal_session() {
+        let (directory, store) = store().await;
+        let path = directory.path().join("sessions.sqlite3");
+        let session_id = Uuid::new_v4();
+        store.create_session(session_id).await.unwrap();
+        store
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::SessionStarted,
+            ))
+            .await
+            .unwrap();
+        store
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::StatusChanged {
+                    status: SessionStatus::Ready,
+                    detail: None,
+                },
+            ))
+            .await
+            .unwrap();
+
+        let message_id = Uuid::new_v4();
+        let event = SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::Message {
+                message_id,
+                actor: EventActor::Assistant,
+                text: "stale response".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::InProgress,
+                delivery: None,
+            },
+        );
+        sqlx::query(
+            "insert into session_live_state \
+             (session_id, live_key, revision, event_json, updated_at) values (?, ?, ?, ?, ?)",
+        )
+        .bind(session_id.to_string())
+        .bind(format!("message:{message_id}"))
+        .bind(99_i64)
+        .bind(serde_json::to_string(&event).unwrap())
+        .bind(event.created_at.to_rfc3339())
+        .execute(store.pool())
+        .await
+        .unwrap();
+        drop(store);
+
+        let reopened = SqliteSessionStore::open(&path).await.unwrap();
+        assert!(
+            reopened
                 .live_events_after(session_id, 0)
                 .await
                 .unwrap()

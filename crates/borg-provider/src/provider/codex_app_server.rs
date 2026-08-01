@@ -472,8 +472,8 @@ impl CodexAppServerClient {
 
         let (turn_start_result, early_notifications) =
             self.send_request_inner("turn/start", Some(params), true)?;
-        let turn_id = extract_turn_id(&turn_start_result, &early_notifications)
-            .context("turn/start response did not include turn id")?;
+        let turn_id = extract_turn_id(&turn_start_result)
+            .context("Codex turn/start response did not include an active turn id")?;
 
         let mut state = TurnState {
             workspace_id: workspace_id.clone(),
@@ -1184,30 +1184,18 @@ impl LocalAgentPermission {
     }
 }
 
-fn extract_turn_id(result: &Value, notifications: &[JsonRpcMessage]) -> Option<String> {
+/// Extract the active turn only from the `turn/start` response.
+///
+/// Notifications are read from a pooled app-server stdout stream and may
+/// include queued events from an earlier turn. Inferring the active turn from
+/// a buffered `turn/started` notification can therefore make that old turn
+/// look current before notification filtering begins.
+fn extract_turn_id(result: &Value) -> Option<String> {
     result
         .pointer("/turn/id")
         .and_then(Value::as_str)
         .or_else(|| result.get("turnId").and_then(Value::as_str))
         .map(str::to_string)
-        .or_else(|| {
-            notifications.iter().find_map(|message| {
-                if message.method.as_deref() != Some("turn/started") {
-                    return None;
-                }
-                message
-                    .params
-                    .as_ref()
-                    .and_then(|params| params.pointer("/turn/id").and_then(Value::as_str))
-                    .or_else(|| {
-                        message
-                            .params
-                            .as_ref()
-                            .and_then(|params| params.get("turnId").and_then(Value::as_str))
-                    })
-                    .map(str::to_string)
-            })
-        })
 }
 
 /// Return the provider turn that owns a notification or server request.
@@ -1227,6 +1215,8 @@ fn notification_turn_id(message: &JsonRpcMessage) -> Option<&str> {
 /// Current app-server protocol notifications that describe model work always
 /// carry a turn id. Treat a missing id as untrusted rather than silently
 /// attaching stale buffered work to whichever turn happens to read it.
+/// `error` is intentionally not included: structured turn errors carry an id,
+/// but global/auth/transport errors may not and must still surface to callers.
 fn notification_requires_turn_id(method: Option<&str>) -> bool {
     let Some(method) = method else {
         return false;
@@ -1729,6 +1719,31 @@ mod tests {
         assert!(!expected_inactive_turn_interrupt(&unrelated));
     }
 
+    #[test]
+    fn turn_start_identity_comes_from_the_response_not_buffered_notifications() {
+        let stale_turn_started = JsonRpcMessage {
+            id: None,
+            method: Some("turn/started".to_string()),
+            message: None,
+            result: None,
+            error: None,
+            params: Some(serde_json::json!({
+                "threadId": "thread-1",
+                "turn": {"id": "turn-old", "status": "inProgress"},
+            })),
+        };
+
+        // `turn/start` always returns the turn identity. A queued notification
+        // is not an acceptable substitute because it may belong to a prior
+        // pooled turn.
+        assert_eq!(extract_turn_id(&Value::Null), None);
+        assert_eq!(
+            extract_turn_id(&serde_json::json!({"turn": {"id": "turn-new"}})),
+            Some("turn-new".to_string())
+        );
+        assert_eq!(notification_turn_id(&stale_turn_started), Some("turn-old"));
+    }
+
     fn test_turn_state() -> TurnState {
         TurnState {
             workspace_id: "thread-1".to_string(),
@@ -1784,51 +1799,125 @@ mod tests {
     fn stale_pooled_notifications_cannot_complete_or_emit_into_the_next_turn() {
         let mut state = test_turn_state();
         let mut projected = Vec::new();
-        let stale_delta = JsonRpcMessage {
-            id: None,
-            method: Some("item/agentMessage/delta".to_string()),
-            message: None,
-            result: None,
-            error: None,
-            params: Some(serde_json::json!({
-                "threadId": "thread-1",
-                "turnId": "turn-old",
-                "itemId": "agent-old",
-                "delta": "stale output",
-            })),
-        };
-        let stale_terminal = JsonRpcMessage {
-            id: None,
-            method: Some("turn/completed".to_string()),
-            message: None,
-            result: None,
-            error: None,
-            params: Some(serde_json::json!({
-                "threadId": "thread-1",
-                "turn": {"id": "turn-old", "status": "completed", "items": []},
-            })),
-        };
+        let stale_notifications = [
+            JsonRpcMessage {
+                id: None,
+                method: Some("turn/started".to_string()),
+                message: None,
+                result: None,
+                error: None,
+                params: Some(serde_json::json!({
+                    "threadId": "thread-1",
+                    "turn": {"id": "turn-old", "status": "inProgress"},
+                })),
+            },
+            JsonRpcMessage {
+                id: None,
+                method: Some("item/started".to_string()),
+                message: None,
+                result: None,
+                error: None,
+                params: Some(serde_json::json!({
+                    "threadId": "thread-1",
+                    "turnId": "turn-old",
+                    "item": {"id": "tool-old", "type": "commandExecution"},
+                })),
+            },
+            JsonRpcMessage {
+                id: None,
+                method: Some("item/agentMessage/delta".to_string()),
+                message: None,
+                result: None,
+                error: None,
+                params: Some(serde_json::json!({
+                    "threadId": "thread-1",
+                    "turnId": "turn-old",
+                    "itemId": "agent-old",
+                    "delta": "stale output",
+                })),
+            },
+            JsonRpcMessage {
+                id: None,
+                method: Some("item/reasoning/textDelta".to_string()),
+                message: None,
+                result: None,
+                error: None,
+                params: Some(serde_json::json!({
+                    "threadId": "thread-1",
+                    "turnId": "turn-old",
+                    "itemId": "reasoning-old",
+                    "delta": "stale reasoning",
+                })),
+            },
+            JsonRpcMessage {
+                id: None,
+                method: Some("item/completed".to_string()),
+                message: None,
+                result: None,
+                error: None,
+                params: Some(serde_json::json!({
+                    "threadId": "thread-1",
+                    "turnId": "turn-old",
+                    "item": {
+                        "id": "tool-old",
+                        "type": "commandExecution",
+                        "status": "completed",
+                        "aggregatedOutput": "stale result"
+                    },
+                })),
+            },
+            JsonRpcMessage {
+                id: None,
+                method: Some("thread/tokenUsage/updated".to_string()),
+                message: None,
+                result: None,
+                error: None,
+                params: Some(serde_json::json!({
+                    "threadId": "thread-1",
+                    "turnId": "turn-old",
+                    "tokenUsage": {"last": {"totalTokens": 999}},
+                })),
+            },
+            JsonRpcMessage {
+                id: None,
+                method: Some("error".to_string()),
+                message: None,
+                result: None,
+                error: None,
+                params: Some(serde_json::json!({
+                    "threadId": "thread-1",
+                    "turnId": "turn-old",
+                    "message": "stale error",
+                })),
+            },
+            JsonRpcMessage {
+                id: None,
+                method: Some("turn/completed".to_string()),
+                message: None,
+                result: None,
+                error: None,
+                params: Some(serde_json::json!({
+                    "threadId": "thread-1",
+                    "turn": {"id": "turn-old", "status": "completed", "items": []},
+                })),
+            },
+        ];
 
-        assert!(
-            state
-                .handle_message(stale_delta, &mut |message| {
-                    projected.push(message.method.clone());
-                    Ok(())
-                })
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            state
-                .handle_message(stale_terminal, &mut |message| {
-                    projected.push(message.method.clone());
-                    Ok(())
-                })
-                .unwrap()
-                .is_none()
-        );
+        for message in stale_notifications {
+            assert!(
+                state
+                    .handle_message(message, &mut |message| {
+                        projected.push(message.method.clone());
+                        Ok(())
+                    })
+                    .unwrap()
+                    .is_none()
+            );
+        }
         assert!(projected.is_empty());
         assert!(state.output_text.is_empty());
+        assert!(state.reasoning_text.is_empty());
+        assert!(state.raw_notifications.is_empty());
 
         let current_terminal = JsonRpcMessage {
             id: None,

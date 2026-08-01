@@ -1999,23 +1999,18 @@ fn active_subagent_count_tracks_only_working_children() {
 }
 
 #[test]
-fn agents_status_spins_only_while_a_child_is_working() {
+fn agents_status_label_counts_only_working_children() {
     let working = agents_status_label(1).expect("one child is working");
     let larger_team = agents_status_label(2).expect("two children are working");
     let idle = agents_status_label(0);
 
-    assert!(working.ends_with(" 2 agents"));
-    assert!(larger_team.ends_with(" 3 agents"));
-    assert!(
-        ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"]
-            .iter()
-            .any(|frame| working.contains(frame))
-    );
+    assert_eq!(working, "1 agent");
+    assert_eq!(larger_team, "2 agents");
     assert_eq!(idle, None);
 }
 
 #[test]
-fn agent_roster_keeps_live_agents_and_only_recent_terminal_agents() {
+fn agent_roster_contains_only_currently_working_children() {
     let parent_id = Uuid::new_v4();
     let now = chrono::Utc::now();
     let snapshot = |name: &str, status, age_minutes| SubagentSnapshot {
@@ -2035,13 +2030,11 @@ fn agent_roster_keeps_live_agents_and_only_recent_terminal_agents() {
     };
     let agents = [
         snapshot("z_live", SubagentStatus::Running, 20),
-        snapshot("a_live", SubagentStatus::Ready, 10),
+        snapshot("a_starting", SubagentStatus::Starting, 10),
+        snapshot("b_waiting", SubagentStatus::WaitingForApproval, 9),
+        snapshot("idle", SubagentStatus::Ready, 8),
         snapshot("oldest", SubagentStatus::Failed, 6),
         snapshot("older", SubagentStatus::Stopped, 5),
-        snapshot("recent_4", SubagentStatus::Failed, 4),
-        snapshot("recent_3", SubagentStatus::Stopped, 3),
-        snapshot("recent_2", SubagentStatus::Failed, 2),
-        snapshot("recent_1", SubagentStatus::Stopped, 1),
     ];
     let mut transcript = Transcript::default();
     for agent in agents {
@@ -2056,13 +2049,22 @@ fn agent_roster_keeps_live_agents_and_only_recent_terminal_agents() {
         .map(|(row, _)| row)
         .collect::<Vec<_>>();
 
-    assert_eq!(rows.len(), 7);
-    assert!(rows[1].starts_with("a_live "));
-    assert!(rows[2].starts_with("z_live "));
-    assert!(rows[3].starts_with("recent_1 "));
-    assert!(rows[4].starts_with("recent_2 "));
-    assert!(rows[5].starts_with("recent_3 "));
-    assert!(rows[6].starts_with("recent_4 "));
+    assert_eq!(rows.len(), 4);
+    assert!(rows[1].starts_with("a_starting "));
+    assert!(rows[2].starts_with("b_waiting "));
+    assert!(rows[3].starts_with("z_live "));
+    assert!(!rows.iter().any(|row| row.contains("idle")));
+    assert!(!rows.iter().any(|row| row.contains("oldest")));
+    assert!(!rows.iter().any(|row| row.contains("older")));
+}
+
+#[test]
+fn agents_status_hover_underlines_only_the_label() {
+    let spinner = agents_status_spinner_style(true);
+    let label = agents_status_text_style(true);
+
+    assert!(!spinner.add_modifier.contains(Modifier::UNDERLINED));
+    assert!(label.add_modifier.contains(Modifier::UNDERLINED));
 }
 
 #[test]
@@ -2686,6 +2688,7 @@ fn optimistic_idle_submission_immediately_hides_cold_cache_guidance() {
         fast: false,
         permission_mode: PermissionMode::FullAccess,
     });
+    transcript.live_turn_closed = true;
     let at = Utc::now() - chrono::Duration::minutes(31);
     transcript.cache_diagnostics.observe(
         at,
@@ -2721,6 +2724,7 @@ fn optimistic_idle_submission_immediately_hides_cold_cache_guidance() {
         transcript.active_turn.as_ref().map(|turn| turn.message_id),
         Some(message_id)
     );
+    assert!(!transcript.live_turn_closed);
     assert_eq!(transcript.cache_status(Utc::now()), None);
 }
 
@@ -2758,6 +2762,121 @@ fn in_progress_steer_never_materializes_as_a_responding_message() {
             complete: true,
             ..
         } if text == "follow up"
+    ));
+}
+
+#[test]
+fn terminal_boundary_settles_a_late_assistant_live_snapshot() {
+    let session_id = Uuid::new_v4();
+    let prompt_id = Uuid::new_v4();
+    let assistant_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::TurnStarted {
+            message_id: prompt_id,
+            provider: CodingProvider::Codex,
+            model: None,
+            effort: None,
+            fast: false,
+        },
+    ));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::Message {
+            message_id: assistant_id,
+            actor: EventActor::Assistant,
+            text: "partial response".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::InProgress,
+            delivery: None,
+        },
+    ));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        3,
+        SessionEventKind::TurnCompleted {
+            message_id: prompt_id,
+            provider_session_id: None,
+            final_text: "final response".to_string(),
+            error: None,
+        },
+    ));
+
+    assert!(transcript.order.iter().all(|entry| !matches!(
+        entry,
+        TranscriptEntry::Message {
+            actor: EventActor::Assistant,
+            status: MessageStatus::InProgress,
+            ..
+        }
+    )));
+    assert!(transcript.order.iter().any(|entry| matches!(
+        entry,
+        TranscriptEntry::Message {
+            actor: EventActor::Assistant,
+            status: MessageStatus::Complete,
+            text,
+            ..
+        } if text == "partial response"
+    )));
+
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        4,
+        SessionEventKind::Message {
+            message_id: assistant_id,
+            actor: EventActor::Assistant,
+            text: "stale live response".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::InProgress,
+            delivery: None,
+        },
+    ));
+    assert!(transcript.order.iter().all(|entry| !matches!(
+        entry,
+        TranscriptEntry::Message {
+            actor: EventActor::Assistant,
+            status: MessageStatus::InProgress,
+            ..
+        }
+    )));
+}
+
+#[test]
+fn resume_mid_turn_accepts_an_assistant_live_snapshot_without_turn_started() {
+    let session_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    transcript.seed_session_state(&SessionState {
+        status: Some(SessionStatus::Running),
+        ..SessionState::default()
+    });
+
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::Message {
+            message_id,
+            actor: EventActor::Assistant,
+            text: "resumed response".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::InProgress,
+            delivery: None,
+        },
+    ));
+
+    assert!(matches!(
+        transcript.order.first(),
+        Some(TranscriptEntry::Message {
+            actor: EventActor::Assistant,
+            status: MessageStatus::InProgress,
+            text,
+            ..
+        }) if text == "resumed response"
     ));
 }
 
@@ -3591,24 +3710,19 @@ fn wheel_distance_advances_in_bounded_frames_and_stops_at_boundaries() {
 }
 
 #[test]
-fn nested_wheel_motion_finishes_small_gestures_without_expensive_single_row_frames() {
+fn nested_wheel_motion_applies_a_coalesced_gesture_in_one_render_frame() {
     let mut scroll = 0;
     let mut motion = ScrollMotion::default();
     let event_lines = wheel_scroll_lines(30);
     motion.push(event_lines);
     let mut frames = 0;
     while motion.is_active() {
-        scroll = motion.advance_with_limits(
-            scroll,
-            500,
-            MIN_NESTED_SCROLL_LINES_PER_FRAME,
-            MAX_NESTED_SCROLL_LINES_PER_FRAME,
-        );
+        scroll = motion.advance_immediately(scroll, 500);
         frames += 1;
     }
 
     assert_eq!(scroll, event_lines as usize);
-    assert_eq!(frames, 3);
+    assert_eq!(frames, 1);
 }
 
 #[test]
