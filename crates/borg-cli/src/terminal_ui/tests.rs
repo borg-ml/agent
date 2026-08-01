@@ -2812,6 +2812,17 @@ fn historical_pages_require_explicit_upward_navigation() {
 }
 
 #[test]
+fn historical_page_loading_has_an_explicit_animated_label() {
+    let rendered = history_loading_line().to_string();
+    assert!(rendered.contains("Loading thread history…"));
+    assert!(
+        ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"]
+            .iter()
+            .any(|frame| rendered.contains(frame))
+    );
+}
+
+#[test]
 fn admitted_queued_prompt_is_inserted_at_its_real_transcript_boundary() {
     let session_id = Uuid::new_v4();
     let queued_id = Uuid::new_v4();

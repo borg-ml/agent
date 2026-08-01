@@ -549,6 +549,7 @@ pub struct BorgTerminal {
     queued_prompts: Vec<PendingPromptProjection>,
     replaying_history: bool,
     history_page_requested: bool,
+    history_page_loading: bool,
     picker: Option<Picker>,
     /// Model the user picked from a provider that still needs credentials;
     /// applied once the auth picker resolves.
@@ -1310,6 +1311,7 @@ impl BorgTerminal {
             queued_prompts: Vec::new(),
             replaying_history: false,
             history_page_requested: false,
+            history_page_loading: false,
             picker: None,
             pending_auth_model: None,
             keybindings_open: false,
@@ -1368,6 +1370,7 @@ impl BorgTerminal {
         self.scroll_from_bottom = 0;
         self.scroll_motion.cancel();
         self.history_page_requested = false;
+        self.history_page_loading = false;
         self.pending_scroll_anchor_height = None;
         self.pending_transcript_anchor = None;
         self.transcript.reserve_history(events.len());
@@ -1429,6 +1432,17 @@ impl BorgTerminal {
             self.history_page_requested = false;
         }
         should_load
+    }
+
+    pub fn set_history_page_loading(&mut self, loading: bool) {
+        if self.history_page_loading != loading {
+            self.history_page_loading = loading;
+            self.event_redraw_needed = true;
+        }
+    }
+
+    pub fn is_history_page_loading(&self) -> bool {
+        self.history_page_loading
     }
 
     pub fn seed_session_state(&mut self, state: &SessionState) {
@@ -3773,6 +3787,7 @@ impl BorgTerminal {
                     None
                 };
                 let scroll_start = scroll;
+                let show_history_loader = self.history_page_loading;
                 let visible_height = content_area.height as usize;
                 let sticky_tool_run_header =
                     sticky_tool_run_header_row(&tool_run_rows, scroll_start)
@@ -3908,7 +3923,7 @@ impl BorgTerminal {
                         ));
                     }
                 }
-                if let Some((index, mut header)) = sticky_tool_run_header {
+                if !show_history_loader && let Some((index, mut header)) = sticky_tool_run_header {
                     apply_line_background(
                         &mut header,
                         content_area.width as usize,
@@ -3924,7 +3939,8 @@ impl BorgTerminal {
                     };
                     frame.render_widget(Paragraph::new(header), sticky_area);
                     next_tool_run_header_hit_areas.push((sticky_area, index));
-                } else if let Some((index, mut header)) = sticky_tool_header {
+                } else if !show_history_loader && let Some((index, mut header)) = sticky_tool_header
+                {
                     apply_line_background(
                         &mut header,
                         content_area.width as usize,
@@ -3940,6 +3956,23 @@ impl BorgTerminal {
                     };
                     frame.render_widget(Paragraph::new(header), sticky_area);
                     next_tool_hit_areas.push((sticky_area, index));
+                }
+                if show_history_loader {
+                    let loader_area = Rect {
+                        height: 1,
+                        ..content_area
+                    };
+                    frame.render_widget(Clear, loader_area);
+                    frame.render_widget(Paragraph::new(history_loading_line()), loader_area);
+                    let is_behind_loader = |area: &Rect| {
+                        area.y < loader_area.bottom() && area.bottom() > loader_area.y
+                    };
+                    next_tool_hit_areas.retain(|(area, _)| !is_behind_loader(area));
+                    next_tool_run_hit_areas.retain(|(area, _, _)| !is_behind_loader(area));
+                    next_tool_run_header_hit_areas.retain(|(area, _)| !is_behind_loader(area));
+                    next_message_hit_areas.retain(|(area, _)| !is_behind_loader(area));
+                    next_entry_hit_areas.retain(|(area, _)| !is_behind_loader(area));
+                    next_link_hit_areas.retain(|(area, _)| !is_behind_loader(area));
                 }
                 if let Some(area) = scrollbar_area {
                     let minimum_thumb_height = MIN_SCROLLBAR_THUMB_ROWS.min(area.height);
@@ -10180,6 +10213,16 @@ fn activity_glyph(status: SessionStatus) -> &'static str {
     }
     const FRAMES: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
     FRAMES[spinner_frame_index()]
+}
+
+fn history_loading_line() -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("{} ", activity_glyph(SessionStatus::Running)),
+            Style::default().fg(BORG_ORANGE),
+        ),
+        Span::styled("Loading thread history…", Style::default().fg(Color::Gray)),
+    ])
 }
 
 fn agents_status_label(active_subagents: usize) -> Option<String> {

@@ -1076,6 +1076,10 @@ async fn run_local_agent_session(
                     .await
             }, if history_page_task.is_some() => {
                 history_page_task = None;
+                if let Some(terminal) = terminal.as_mut() {
+                    terminal.set_history_page_loading(false);
+                    terminal_dirty = true;
+                }
                 match history_page_result {
                     Ok(Ok(older)) if older.is_empty() => {
                         history_start_reached = true;
@@ -1107,6 +1111,7 @@ async fn run_local_agent_session(
                     && history_page_task.is_none();
                 if should_load_history {
                     let before = history.first().expect("history has an unloaded prefix").sequence;
+                    terminal.set_history_page_loading(true);
                     let history_store = Arc::clone(&store);
                     history_page_task = Some(tokio::spawn(async move {
                         older_tui_history(history_store.as_ref(), session_id, before).await
@@ -1128,6 +1133,7 @@ async fn run_local_agent_session(
                     terminal.has_blinking_cursor(),
                     status,
                 ) || terminal.is_launch_screen()
+                    || terminal.is_history_page_loading()
             }) => {
                 terminal_dirty = true;
             }
