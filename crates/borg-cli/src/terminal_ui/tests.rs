@@ -792,6 +792,18 @@ fn projection_only_events_keep_the_transcript_layout_cache() {
             payload: serde_json::json!({}),
         }
     ));
+    assert!(session_event_changes_transcript(
+        &SessionEventKind::StatusChanged {
+            status: SessionStatus::Ready,
+            detail: None,
+        }
+    ));
+    assert!(!session_event_changes_transcript(
+        &SessionEventKind::StatusChanged {
+            status: SessionStatus::Running,
+            detail: None,
+        }
+    ));
 
     let child_id = Uuid::new_v4();
     let agent = SubagentSnapshot {
@@ -2930,6 +2942,183 @@ fn in_progress_steer_never_materializes_as_a_responding_message() {
             ..
         } if text == "follow up"
     ));
+}
+
+#[test]
+fn active_turn_assistant_segments_follow_tool_actions() {
+    let session_id = Uuid::new_v4();
+    let prompt_id = Uuid::new_v4();
+    let assistant_id = Uuid::new_v4();
+    let tool_call_id = "tool-1".to_string();
+    let mut transcript = Transcript::default();
+
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::Message {
+            message_id: prompt_id,
+            actor: EventActor::User,
+            text: "investigate this".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: Some(PromptDelivery::Steer),
+        },
+    ));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::TurnStarted {
+            message_id: prompt_id,
+            provider: CodingProvider::Codex,
+            model: None,
+            effort: None,
+            fast: false,
+        },
+    ));
+    for (sequence, status) in [(3, MessageStatus::InProgress), (4, MessageStatus::Complete)] {
+        transcript.apply(&SessionEvent::new(
+            session_id,
+            sequence,
+            SessionEventKind::Message {
+                message_id: assistant_id,
+                actor: EventActor::Assistant,
+                text: "I am checking the provider trace first.".to_string(),
+                attachments: Vec::new(),
+                status,
+                delivery: None,
+            },
+        ));
+    }
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        5,
+        SessionEventKind::ToolStarted {
+            tool_call_id: tool_call_id.clone(),
+            name: "shell".to_string(),
+            input: serde_json::json!({"command": "trace"}),
+            input_ref: None,
+        },
+    ));
+
+    let tool_index = transcript.tools[&tool_call_id];
+    let assistant_index = transcript.messages[&assistant_id];
+    assert!(tool_index < assistant_index);
+    assert!(matches!(
+        &transcript.order[assistant_index],
+        TranscriptEntry::Message {
+            status: MessageStatus::Complete,
+            complete: true,
+            ..
+        }
+    ));
+
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        6,
+        SessionEventKind::ToolCompleted {
+            tool_call_id,
+            output: "trace complete".to_string(),
+            output_ref: None,
+            is_error: false,
+            input: None,
+            input_ref: None,
+        },
+    ));
+    let final_id = Uuid::new_v4();
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        7,
+        SessionEventKind::Message {
+            message_id: final_id,
+            actor: EventActor::Assistant,
+            text: "The provider trace is clear now.".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: None,
+        },
+    ));
+
+    assert!(transcript.tools["tool-1"] < transcript.messages[&final_id]);
+}
+
+#[test]
+fn running_tool_suppresses_stale_response_spinner() {
+    let session_id = Uuid::new_v4();
+    let prompt_id = Uuid::new_v4();
+    let assistant_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::Message {
+            message_id: prompt_id,
+            actor: EventActor::User,
+            text: "run the check".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: Some(PromptDelivery::Steer),
+        },
+    ));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::TurnStarted {
+            message_id: prompt_id,
+            provider: CodingProvider::Codex,
+            model: None,
+            effort: None,
+            fast: false,
+        },
+    ));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        3,
+        SessionEventKind::ToolStarted {
+            tool_call_id: "tool-2".to_string(),
+            name: "shell".to_string(),
+            input: serde_json::json!({"command": "check"}),
+            input_ref: None,
+        },
+    ));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        4,
+        SessionEventKind::Message {
+            message_id: assistant_id,
+            actor: EventActor::Assistant,
+            text: "I will report back after the check.".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::InProgress,
+            delivery: None,
+        },
+    ));
+    let rendered = transcript
+        .lines(100)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!rendered.contains("responding"), "{rendered}");
+
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        5,
+        SessionEventKind::ToolCompleted {
+            tool_call_id: "tool-2".to_string(),
+            output: "done".to_string(),
+            output_ref: None,
+            is_error: false,
+            input: None,
+            input_ref: None,
+        },
+    ));
+    let rendered = transcript
+        .lines(100)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("responding"), "{rendered}");
 }
 
 #[test]

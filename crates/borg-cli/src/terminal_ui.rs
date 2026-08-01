@@ -6913,6 +6913,11 @@ impl Transcript {
                 if is_edit_diff {
                     self.last_edit = Some(tool_index);
                 }
+                // Providers can finish a narration segment before asking for
+                // the next tool. That segment is complete as text, but the
+                // turn is not complete; keep the action stream together and
+                // render the segment after the work it introduced.
+                self.defer_active_assistant_segments();
             }
             SessionEventKind::ToolCompleted {
                 tool_call_id,
@@ -7161,6 +7166,92 @@ impl Transcript {
                 Some(edit - usize::from(edit > index))
             }
         });
+    }
+
+    fn defer_active_assistant_segments(&mut self) {
+        let Some(prompt_index) = self
+            .active_turn
+            .as_ref()
+            .and_then(|turn| self.messages.get(&turn.message_id).copied())
+        else {
+            return;
+        };
+        let deferred_indices = self
+            .order
+            .iter()
+            .enumerate()
+            .skip(prompt_index.saturating_add(1))
+            .filter_map(|(index, entry)| {
+                matches!(
+                    entry,
+                    TranscriptEntry::Message {
+                        actor: EventActor::Assistant,
+                        ..
+                    }
+                )
+                .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        if deferred_indices.is_empty() {
+            return;
+        }
+
+        for index in &deferred_indices {
+            if let TranscriptEntry::Message {
+                status, complete, ..
+            } = &mut self.order[*index]
+            {
+                *status = MessageStatus::Complete;
+                *complete = true;
+                self.message_markdown_cache.get_mut().messages.remove(index);
+            }
+        }
+
+        let mut deferred = Vec::with_capacity(deferred_indices.len());
+        let deferred_set = deferred_indices.into_iter().collect::<HashSet<_>>();
+        let old_order = std::mem::take(&mut self.order);
+        let mut remap = vec![0; old_order.len()];
+        let mut new_order = Vec::with_capacity(old_order.len());
+        for (old_index, entry) in old_order.into_iter().enumerate() {
+            if deferred_set.contains(&old_index) {
+                deferred.push((old_index, entry));
+            } else {
+                remap[old_index] = new_order.len();
+                new_order.push(entry);
+            }
+        }
+        for (old_index, entry) in deferred {
+            remap[old_index] = new_order.len();
+            new_order.push(entry);
+        }
+        self.order = new_order;
+        self.remap_order_indices(&remap);
+    }
+
+    fn remap_order_indices(&mut self, remap: &[usize]) {
+        for index in self
+            .messages
+            .values_mut()
+            .chain(self.tools.values_mut())
+            .chain(self.subagent_entries.values_mut())
+        {
+            *index = remap[*index];
+        }
+        self.selected = self.selected.map(|index| remap[index]);
+        self.tool_run_offsets = self
+            .tool_run_offsets
+            .drain()
+            .map(|(start, offset)| (remap[start], offset))
+            .collect();
+        self.expanded_tool_runs = self
+            .expanded_tool_runs
+            .drain()
+            .map(|start| remap[start])
+            .collect();
+        self.active_reasoning = self.active_reasoning.map(|index| remap[index]);
+        self.last_edit = self.last_edit.map(|index| remap[index]);
+        self.message_markdown_cache.get_mut().messages.clear();
+        self.tool_body_cache.get_mut().lines.clear();
     }
 
     fn append_reasoning(&mut self, text: &str, started_at: DateTime<Utc>, time: String) {
@@ -7522,18 +7613,19 @@ impl Transcript {
     }
 
     fn tool_spinner_cache_tick(&self) -> Option<usize> {
-        self.order
-            .iter()
-            .any(|entry| {
-                matches!(
-                    entry,
-                    TranscriptEntry::Tool {
-                        complete: false,
-                        ..
-                    }
-                )
-            })
-            .then(spinner_frame_index)
+        self.has_running_tool().then(spinner_frame_index)
+    }
+
+    fn has_running_tool(&self) -> bool {
+        self.order.iter().any(|entry| {
+            matches!(
+                entry,
+                TranscriptEntry::Tool {
+                    complete: false,
+                    ..
+                }
+            )
+        })
     }
 
     fn first_prompt(&self) -> Option<&str> {
@@ -7602,6 +7694,7 @@ impl Transcript {
         let mut selection_rows = Vec::new();
         let mut tool_run_starts = HashMap::new();
         let tool_run_windows = self.tool_run_windows();
+        let running_tool = self.has_running_tool();
         for (index, entry) in self.order.iter().enumerate() {
             let tool_window = tool_run_windows[index];
             if let Some(window) = tool_window.filter(|window| index == window.start) {
@@ -7745,7 +7838,7 @@ impl Transcript {
                             ),
                         ]));
                     }
-                    if !complete {
+                    if !complete && !running_tool {
                         lines.push(Line::from(Span::styled(
                             "    ◌ responding",
                             Style::default().fg(Color::Cyan),
@@ -8589,12 +8682,15 @@ fn session_event_changes_transcript(kind: &SessionEventKind) -> bool {
         | SessionEventKind::SubagentControl { .. }
         | SessionEventKind::ProviderSessionLinked { .. }
         | SessionEventKind::TurnStarted { .. } => false,
-        SessionEventKind::StatusChanged { status, detail } => {
-            *status == SessionStatus::Ready
-                && detail
-                    .as_deref()
-                    .is_some_and(|value| value.eq_ignore_ascii_case("interrupted"))
-        }
+        SessionEventKind::StatusChanged {
+            status:
+                SessionStatus::Ready
+                | SessionStatus::Completed
+                | SessionStatus::Failed
+                | SessionStatus::Stopped,
+            ..
+        } => true,
+        SessionEventKind::StatusChanged { .. } => false,
         SessionEventKind::ProviderEvent { kind, .. } => is_context_compaction(kind),
         SessionEventKind::SubagentActivity {
             activity,
