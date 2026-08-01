@@ -2501,6 +2501,50 @@ fn accepted_steer_stays_pending_until_user_message_commit() {
 }
 
 #[test]
+fn optimistic_idle_submission_is_visible_before_session_persistence() {
+    let session_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    let optimistic = SessionEvent::new(
+        session_id,
+        0,
+        SessionEventKind::Message {
+            message_id,
+            actor: EventActor::User,
+            text: "send this now".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: Some(PromptDelivery::Steer),
+        },
+    );
+
+    transcript.project_optimistic_message(&optimistic);
+    assert!(matches!(
+        transcript.order.last(),
+        Some(TranscriptEntry::Message {
+            actor: EventActor::User,
+            text,
+            status: MessageStatus::Complete,
+            ..
+        }) if text == "send this now"
+    ));
+
+    let queued = SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::Message {
+            message_id,
+            actor: EventActor::User,
+            text: "send this now".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Queued,
+            delivery: Some(PromptDelivery::Steer),
+        },
+    );
+    assert!(transcript.apply(&queued).is_some());
+}
+
+#[test]
 fn in_progress_steer_never_materializes_as_a_responding_message() {
     let session_id = Uuid::new_v4();
     let message_id = Uuid::new_v4();

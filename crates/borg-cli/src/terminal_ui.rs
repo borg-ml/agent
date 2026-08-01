@@ -1372,6 +1372,33 @@ impl BorgTerminal {
         }
     }
 
+    /// Put an idle user submission in the transcript before the session actor
+    /// persists it. The durable Message event will replace this transient row
+    /// once the command reaches the actor.
+    pub fn project_submitted_prompt(
+        &mut self,
+        message_id: Uuid,
+        text: String,
+        attachments: Vec<PathBuf>,
+        delivery: PromptDelivery,
+    ) {
+        let event = SessionEvent::new(
+            Uuid::nil(),
+            0,
+            SessionEventKind::Message {
+                message_id,
+                actor: EventActor::User,
+                text,
+                attachments,
+                status: MessageStatus::Complete,
+                delivery: Some(delivery),
+            },
+        );
+        self.transcript.project_optimistic_message(&event);
+        self.transcript.follow_tail = true;
+        self.transcript_render_cache = None;
+    }
+
     pub fn reject_optimistic_prompt(
         &mut self,
         target: Option<Uuid>,
@@ -1387,6 +1414,10 @@ impl BorgTerminal {
         } else {
             self.queued_prompts
                 .retain(|queued| queued.message_id != message_id);
+            if let Some(removed) = self.transcript.remove_message(message_id) {
+                self.remap_selection_after_entry_removal(removed);
+                self.transcript_render_cache = None;
+            }
         }
         self.composer.restore(text, attachments);
         self.notice = Some("Could not send the prompt; it was returned to the composer".into());
@@ -5749,6 +5780,10 @@ enum TranscriptEntry {
 }
 
 impl Transcript {
+    fn project_optimistic_message(&mut self, event: &SessionEvent) {
+        let _ = self.apply(event);
+    }
+
     fn reserve_history(&mut self, event_count: usize) {
         self.order.reserve(event_count);
         self.messages.reserve(event_count / 4);

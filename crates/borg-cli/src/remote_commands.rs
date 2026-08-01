@@ -1965,6 +1965,11 @@ async fn run_local_agent_session(
                                 },
                             },
                         );
+                        terminal.as_mut().expect("terminal").draw()?;
+                        terminal_dirty = terminal
+                            .as_ref()
+                            .expect("terminal")
+                            .has_pending_scroll_frame();
                         if session_command_tx.send(command).await.is_err() {
                             terminal
                                 .as_mut()
@@ -1975,6 +1980,8 @@ async fn run_local_agent_session(
                                     text,
                                     attachments,
                                 );
+                            terminal.as_mut().expect("terminal").draw()?;
+                            terminal_dirty = false;
                         }
                     }
                     UiAction::Submit {
@@ -2009,6 +2016,11 @@ async fn run_local_agent_session(
                                     delivery,
                                 },
                             };
+                            terminal.as_mut().expect("terminal").draw()?;
+                            terminal_dirty = terminal
+                                .as_ref()
+                                .expect("terminal")
+                                .has_pending_scroll_frame();
                             if session_command_tx.send(command).await.is_err() {
                                 terminal
                                     .as_mut()
@@ -2019,6 +2031,8 @@ async fn run_local_agent_session(
                                         text,
                                         attachments,
                                     );
+                                terminal.as_mut().expect("terminal").draw()?;
+                                terminal_dirty = false;
                             }
                             continue;
                         }
@@ -2653,7 +2667,22 @@ async fn run_local_agent_session(
                                                     text.clone(),
                                                     delivery,
                                                 );
+                                        } else {
+                                            terminal
+                                                .as_mut()
+                                                .expect("terminal")
+                                                .project_submitted_prompt(
+                                                    message_id,
+                                                    text.clone(),
+                                                    attachments.clone(),
+                                                    delivery,
+                                                );
                                         }
+                                        terminal.as_mut().expect("terminal").draw()?;
+                                        terminal_dirty = terminal
+                                            .as_ref()
+                                            .expect("terminal")
+                                            .has_pending_scroll_frame();
                                         if let Err(error) = session_command_tx.send(HostCommand::Prompt {
                                             session_id,
                                             message_id,
@@ -2677,6 +2706,8 @@ async fn run_local_agent_session(
                                                     text,
                                                     attachments,
                                                 );
+                                            terminal.as_mut().expect("terminal").draw()?;
+                                            terminal_dirty = false;
                                         }
                                     }
                                 }
