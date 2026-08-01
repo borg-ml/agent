@@ -1190,6 +1190,22 @@ fn todo_status_counts_open_items_and_tooltip_matches_plan_order_and_clipping() {
             .iter()
             .any(|row| row.contains("Keep the completed item visible"))
     );
+    let expanded_with_status = transcript.todo_tooltip_rows_with_status(true);
+    assert!(
+        expanded_with_status.iter().any(|(row, completed)| {
+            *completed && row.contains("Keep the completed item visible")
+        })
+    );
+    assert!(
+        todo_tooltip_row_style(true)
+            .add_modifier
+            .contains(Modifier::CROSSED_OUT)
+    );
+    assert!(
+        !todo_tooltip_row_style(false)
+            .add_modifier
+            .contains(Modifier::CROSSED_OUT)
+    );
     assert!(expanded.last().is_some_and(|row| row.contains("show less")));
 }
 
@@ -1396,6 +1412,56 @@ fn footer_metadata_preserves_the_full_working_directory_path() {
         footer_metadata_text("", "~/a/very-long-directory", 8),
         "~/a/very-long-directory "
     );
+}
+
+#[test]
+fn git_worktree_status_is_compact_and_includes_divergence_and_dirty_state() {
+    let status = parse_git_worktree_status(
+        "## feature/ui...origin/feature/ui [ahead 2, behind 1]\n M src/main.rs\n",
+    )
+    .expect("git status");
+
+    assert_eq!(status.branch, "feature/ui");
+    assert!(status.dirty);
+    assert_eq!(status.compact_label(), "git:feature/ui ↑2 ↓1*");
+    assert_eq!(
+        parse_git_worktree_status("## HEAD (no branch)\n")
+            .expect("detached status")
+            .compact_label(),
+        "git:detached"
+    );
+    assert!(parse_git_worktree_status("not a git status header").is_none());
+}
+
+#[test]
+fn git_status_falls_back_cleanly_outside_a_worktree() {
+    let missing = std::env::temp_dir().join(format!("borg-missing-worktree-{}", Uuid::new_v4()));
+    assert_eq!(read_git_worktree_status(&missing), None);
+}
+
+#[test]
+fn focused_transcript_configuration_switches_cwd_metadata() {
+    let config = |cwd: &str| SessionDisplayConfig {
+        cwd: PathBuf::from(cwd),
+        provider: CodingProvider::Codex,
+        model: None,
+        effort: None,
+        response_language: ResponseLanguage::default(),
+        fast: false,
+        permission_mode: PermissionMode::FullAccess,
+    };
+    let child_id = Uuid::new_v4();
+    let mut displayed = Transcript::default();
+    displayed.config = Some(config("/workspace/director"));
+    let mut child = Transcript::default();
+    child.config = Some(config("/workspace/child"));
+    let mut director = None;
+    let mut children = HashMap::from([(child_id, child)]);
+
+    switch_to_child_transcript(&mut displayed, &mut director, &mut children, child_id);
+    assert!(displayed.config_statuses().4.ends_with("child"));
+    switch_to_director_transcript(&mut displayed, &mut director, &mut children, child_id);
+    assert!(displayed.config_statuses().4.ends_with("director"));
 }
 
 #[test]
@@ -1892,7 +1958,7 @@ fn borg_control_results_render_compact_roster_plan_goal_and_follow_up() {
         r#"{"agents":[{"task_name":"inspect_ui","status":"running","model":"codex","effort":"low","message":"Inspect the renderer"}]}"#,
     )
     .expect("structured roster");
-    assert!(roster.contains("TEAM · 1 agent"));
+    assert!(roster.contains("TEAM · 1 subagent"));
     assert!(roster.contains("running  inspect_ui · codex/low"));
     assert!(roster.contains("Inspect the renderer"));
     assert!(!roster.contains("Debug payload"));
@@ -2035,8 +2101,8 @@ fn agents_status_label_counts_only_working_children() {
     let larger_team = agents_status_label(2).expect("two children are working");
     let idle = agents_status_label(0);
 
-    assert_eq!(working, "1 agent");
-    assert_eq!(larger_team, "2 agents");
+    assert_eq!(working, "1 subagent");
+    assert_eq!(larger_team, "2 subagents");
     assert_eq!(idle, None);
 }
 
@@ -2108,7 +2174,7 @@ fn model_effort_and_permission_hover_show_bottom_interaction_hints() {
 
     assert_eq!(
         hint(true, false, false, false),
-        Some("left click to open agents menu")
+        Some("left click to open subagents menu")
     );
     assert_eq!(
         hint(false, true, false, false),
@@ -2123,6 +2189,49 @@ fn model_effort_and_permission_hover_show_bottom_interaction_hints() {
         Some("left click change permissions")
     );
     assert_eq!(hint(false, false, false, false), None);
+}
+
+#[test]
+fn effort_and_permission_status_colors_reflect_their_values() {
+    assert_eq!(effort_status_color("low"), Color::LightGreen);
+    assert_eq!(effort_status_color("medium"), Color::Cyan);
+    assert_eq!(effort_status_color("high"), Color::Yellow);
+    assert_eq!(effort_status_color("xhigh"), Color::LightMagenta);
+    assert_eq!(effort_status_color("max"), Color::LightRed);
+    assert_eq!(effort_status_color("ultra"), Color::LightRed);
+    assert_eq!(effort_status_color("custom"), Color::Gray);
+
+    assert_eq!(
+        permission_status_color("manual approvals"),
+        Color::LightGreen
+    );
+    assert_eq!(permission_status_color("auto approvals"), Color::Yellow);
+    assert_eq!(permission_status_color("full access"), Color::LightRed);
+    assert_eq!(permission_status_color("custom"), Color::Gray);
+}
+
+#[test]
+fn value_colored_status_segments_keep_hover_styling() {
+    let mut resting = Vec::new();
+    push_interactive_status_segment(
+        &mut resting,
+        Some("high".to_string()),
+        false,
+        effort_status_color("high"),
+    );
+    assert_eq!(resting[1].style.fg, Some(Color::Yellow));
+    assert!(!resting[1].style.add_modifier.contains(Modifier::UNDERLINED));
+
+    let mut hovered = Vec::new();
+    push_interactive_status_segment(
+        &mut hovered,
+        Some("full access".to_string()),
+        true,
+        permission_status_color("full access"),
+    );
+    assert_eq!(hovered[1].style.fg, Some(Color::White));
+    assert!(hovered[1].style.add_modifier.contains(Modifier::BOLD));
+    assert!(hovered[1].style.add_modifier.contains(Modifier::UNDERLINED));
 }
 
 #[test]

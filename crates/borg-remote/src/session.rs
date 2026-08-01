@@ -182,12 +182,29 @@ impl RuntimeSessionStore {
         if let Some(projection) = &self.workspace_projection
             && let Err(error) = projection.project(&event).await
         {
+            let diagnostic = format!(
+                "workspace projection delivery failed for session event {} (sequence {}): {error:#}",
+                event.id, event.sequence
+            );
             tracing::warn!(
                 session_id = %event.session_id,
                 session_sequence = event.sequence,
                 error = %error,
                 "failed to update repairable workspace projection"
             );
+            // The workspace projection is repairable and must not make the
+            // session actor fail. Persist the failure directly in the source
+            // journal (without recursively attempting the same projection) so
+            // reconnect and repair tooling can diagnose the missing delivery.
+            self.store
+                .append(SessionEvent::new(
+                    event.session_id,
+                    0,
+                    SessionEventKind::Error {
+                        message: diagnostic,
+                    },
+                ))
+                .await?;
         }
         if matches!(event.kind, SessionEventKind::ContextCleared) {
             self.context_events.clear();
@@ -200,6 +217,42 @@ impl RuntimeSessionStore {
 }
 
 const INTERRUPT_GRACE_PERIOD: Duration = Duration::from_secs(3);
+#[cfg(not(test))]
+const PROVIDER_SETUP_LIVENESS_TIMEOUT: Duration = Duration::from_secs(120);
+#[cfg(test)]
+const PROVIDER_SETUP_LIVENESS_TIMEOUT: Duration = Duration::from_millis(200);
+#[cfg(not(test))]
+const PROVIDER_ACTIVE_LIVENESS_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
+#[cfg(test)]
+const PROVIDER_ACTIVE_LIVENESS_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(not(test))]
+const LIVE_EVENT_DELIVERY_TIMEOUT: Duration = Duration::from_secs(1);
+#[cfg(test)]
+const LIVE_EVENT_DELIVERY_TIMEOUT: Duration = Duration::from_millis(50);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TurnPhase {
+    AwaitingProvider,
+    Active,
+    Cancelling,
+}
+
+impl TurnPhase {
+    fn detail(self) -> &'static str {
+        match self {
+            Self::AwaitingProvider => "turn phase: awaiting provider",
+            Self::Active => "turn phase: provider active",
+            Self::Cancelling => "turn phase: cancelling",
+        }
+    }
+
+    fn liveness_timeout(self) -> Duration {
+        match self {
+            Self::AwaitingProvider => PROVIDER_SETUP_LIVENESS_TIMEOUT,
+            Self::Active | Self::Cancelling => PROVIDER_ACTIVE_LIVENESS_TIMEOUT,
+        }
+    }
+}
 
 struct SessionGoalToolCall {
     request: SessionGoalToolRequest,
@@ -1270,7 +1323,7 @@ async fn run_agent_session_store_kernel(
             session_id,
             SessionEventKind::StatusChanged {
                 status: SessionStatus::Running,
-                detail: None,
+                detail: Some(TurnPhase::AwaitingProvider.detail().to_string()),
             },
         )
         .await?;
@@ -1310,10 +1363,16 @@ async fn run_agent_session_store_kernel(
         let mut interrupted = false;
         let mut batch_pending_after_interrupt = false;
         let mut interrupt_deadline: Option<Pin<Box<Sleep>>> = None;
+        let mut turn_phase = TurnPhase::AwaitingProvider;
+        let liveness_deadline = tokio::time::sleep(turn_phase.liveness_timeout());
+        tokio::pin!(liveness_deadline);
         loop {
             tokio::select! {
                 result = &mut running => {
-                    let result = result.context("agent turn task failed")?;
+                    let result = match result {
+                        Ok(result) => result,
+                        Err(error) => Err(anyhow::anyhow!("agent turn task failed: {error}")),
+                    };
                     while let Ok(kind) = provider_events.try_recv() {
                         if is_executor_lifecycle_status(&kind) {
                             continue;
@@ -1434,6 +1493,21 @@ async fn run_agent_session_store_kernel(
                     if is_executor_lifecycle_status(&kind) {
                         continue;
                     }
+                    if turn_phase == TurnPhase::AwaitingProvider {
+                        turn_phase = TurnPhase::Active;
+                        record(
+                            &mut journal,
+                            &events,
+                            session_id,
+                            SessionEventKind::StatusChanged {
+                                status: SessionStatus::Running,
+                                detail: Some(turn_phase.detail().to_string()),
+                            },
+                        ).await?;
+                    }
+                    liveness_deadline.as_mut().reset(
+                        tokio::time::Instant::now() + turn_phase.liveness_timeout()
+                    );
                     let compaction_status = context_compaction_status(&kind);
                     if compaction_status == Some("started") {
                         context_compaction_in_progress = true;
@@ -1554,6 +1628,56 @@ async fn run_agent_session_store_kernel(
                     next_ready_detail = Some("Interrupted".to_string());
                     break;
                 }
+                _ = &mut liveness_deadline => {
+                    let timed_out_phase = turn_phase;
+                    running.abort();
+                    let _ = (&mut running).await;
+                    deny_pending_approval(
+                        &mut journal,
+                        &events,
+                        session_id,
+                        &mut pending_approval,
+                    ).await?;
+                    cancel_pending_provider_interaction(
+                        &mut journal,
+                        &events,
+                        session_id,
+                        &mut pending_provider_interaction,
+                    ).await?;
+                    promote_uncommitted_steers(
+                        &mut journal,
+                        &events,
+                        session_id,
+                        &mut pending,
+                        &mut pending_steers,
+                        false,
+                    ).await?;
+                    let error = format!(
+                        "turn liveness timeout while {}",
+                        timed_out_phase.detail().trim_start_matches("turn phase: ")
+                    );
+                    record(
+                        &mut journal,
+                        &events,
+                        session_id,
+                        SessionEventKind::Error { message: error.clone() },
+                    ).await?;
+                    record(
+                        &mut journal,
+                        &events,
+                        session_id,
+                        SessionEventKind::TurnCompleted {
+                            message_id: prompt.message_id,
+                            provider_session_id: provider_session_id.clone(),
+                            final_text: String::new(),
+                            error: Some(error.clone()),
+                        },
+                    ).await?;
+                    next_ready_detail = Some(format!(
+                        "Turn failed; the session remains available: {error}"
+                    ));
+                    break;
+                }
                 steer_result = steer_results.recv(), if !pending_steers.is_empty() => {
                     let Some((message_id, acknowledgement)) = steer_result else {
                         continue;
@@ -1600,11 +1724,31 @@ async fn run_agent_session_store_kernel(
                 command = next_host_command(&mut deferred_commands, &mut commands) => {
                     let Some(command) = command else {
                         running.abort();
+                        let _ = (&mut running).await;
                         deny_pending_approval(
                             &mut journal,
                             &events,
                             session_id,
                             &mut pending_approval,
+                        )
+                        .await?;
+                        cancel_pending_provider_interaction(
+                            &mut journal,
+                            &events,
+                            session_id,
+                            &mut pending_provider_interaction,
+                        )
+                        .await?;
+                        record(
+                            &mut journal,
+                            &events,
+                            session_id,
+                            SessionEventKind::TurnCompleted {
+                                message_id: prompt.message_id,
+                                provider_session_id: provider_session_id.clone(),
+                                final_text: String::new(),
+                                error: Some("session host disconnected during turn".to_string()),
+                            },
                         )
                         .await?;
                         stop(&mut journal, &events, session_id).await?;
@@ -1880,6 +2024,7 @@ async fn run_agent_session_store_kernel(
                                 &mut goal_active_since,
                             ).await?;
                             control_tx.send(AgentTurnControl::Interrupt).await.ok();
+                            turn_phase = TurnPhase::Cancelling;
                             interrupt_deadline =
                                 Some(Box::pin(tokio::time::sleep(INTERRUPT_GRACE_PERIOD)));
                             record(
@@ -1888,7 +2033,7 @@ async fn run_agent_session_store_kernel(
                                 session_id,
                                 SessionEventKind::StatusChanged {
                                     status: SessionStatus::Running,
-                                    detail: Some("Interrupt requested".to_string()),
+                                    detail: Some(turn_phase.detail().to_string()),
                                 },
                             ).await?;
                             interrupted = true;
@@ -1977,6 +2122,25 @@ async fn run_agent_session_store_kernel(
                                 &events,
                                 session_id,
                                 &mut pending_approval,
+                            )
+                            .await?;
+                            cancel_pending_provider_interaction(
+                                &mut journal,
+                                &events,
+                                session_id,
+                                &mut pending_provider_interaction,
+                            )
+                            .await?;
+                            record(
+                                &mut journal,
+                                &events,
+                                session_id,
+                                SessionEventKind::TurnCompleted {
+                                    message_id: prompt.message_id,
+                                    provider_session_id: provider_session_id.clone(),
+                                    final_text: String::new(),
+                                    error: Some("session stopped during turn".to_string()),
+                                },
                             )
                             .await?;
                             stop(&mut journal, &events, session_id).await?;
@@ -3581,10 +3745,39 @@ async fn record(
     session_id: Uuid,
     kind: SessionEventKind,
 ) -> Result<()> {
+    let persistence = kind.persistence();
     let event = journal
         .append(SessionEvent::new(session_id, 0, kind))
         .await?;
-    events.send(event).await.ok();
+    // The journal is authoritative. Durable lifecycle events get a short,
+    // bounded delivery window so a healthy live projection receives terminal
+    // boundaries in order, but a detached or wedged observer can never hold
+    // the single session actor forever. Ephemeral/coalesced events are safe to
+    // drop because reconnecting consumers recover durable state and live state
+    // is regenerated from the store.
+    if matches!(persistence, crate::EventPersistence::Durable) {
+        let sequence = event.sequence;
+        match tokio::time::timeout(LIVE_EVENT_DELIVERY_TIMEOUT, events.send(event)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                tracing::debug!(session_id = %session_id, sequence, "live session event receiver closed")
+            }
+            Err(_) => {
+                tracing::warn!(
+                    session_id = %session_id,
+                    sequence,
+                    timeout_ms = LIVE_EVENT_DELIVERY_TIMEOUT.as_millis(),
+                    "live session event delivery timed out; durable journal remains authoritative"
+                )
+            }
+        }
+    } else if let Err(error) = events.try_send(event) {
+        tracing::debug!(
+            session_id = %session_id,
+            error = ?error,
+            "dropped ephemeral live session event because the observer is not keeping up"
+        );
+    }
     Ok(())
 }
 
@@ -3784,6 +3977,49 @@ mod tests {
                 ..
             } if projected_session == session_id && session_event_id == queued.id
         ));
+    }
+
+    #[tokio::test]
+    async fn projection_delivery_failure_is_durable_and_does_not_fail_the_session_append() {
+        let root = tempdir().unwrap();
+        let session_id = Uuid::new_v4();
+        let session_store = Arc::new(
+            SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+                .await
+                .unwrap(),
+        );
+        session_store.create_session(session_id).await.unwrap();
+        let projection = WorkspaceProjection {
+            store: SqliteWorkspaceStore::open(root.path().join("workspaces.sqlite3"))
+                .await
+                .unwrap(),
+            workspace_id: Uuid::new_v4(),
+            agent_participant_id: Uuid::new_v4(),
+            human_participant_id: Uuid::new_v4(),
+        };
+        let store: Arc<dyn SessionStore> = session_store.clone();
+        let mut runtime =
+            RuntimeSessionStore::new(store, Vec::new()).with_workspace_projection(projection);
+
+        runtime
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::StatusChanged {
+                    status: SessionStatus::Running,
+                    detail: Some("turn phase: awaiting provider".to_string()),
+                },
+            ))
+            .await
+            .expect("repairable projection failure must not fail the source append");
+
+        let durable = session_store.read(session_id).await.unwrap();
+        assert!(durable.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::Error { message }
+                if message.contains("workspace projection delivery failed")
+                    && message.contains("sequence 1")
+        )));
     }
 
     /// A rewind forks the session into the parent's workspace under a brand new
@@ -4095,6 +4331,20 @@ mod tests {
     struct PrematureReadyExecutor {
         first_started: Arc<Notify>,
         release_first: Arc<Notify>,
+    }
+
+    struct HungProviderExecutor;
+
+    #[async_trait::async_trait]
+    impl AgentTurnExecutor for HungProviderExecutor {
+        async fn execute(
+            &self,
+            _turn: AgentTurn,
+            _events: mpsc::Sender<SessionEventKind>,
+            _controls: Option<mpsc::Receiver<AgentTurnControl>>,
+        ) -> Result<AgentTurnResult> {
+            std::future::pending().await
+        }
     }
 
     #[async_trait::async_trait]
@@ -4525,6 +4775,195 @@ mod tests {
             ready[0] > completed[1],
             "Ready must follow the final queued TurnCompleted event"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn provider_setup_stall_has_a_durable_terminal_boundary() {
+        let root = tempdir().unwrap();
+        let journal_path = root.path().join("session.jsonl");
+        let session_id = Uuid::new_v4();
+        let message_id = Uuid::new_v4();
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let actor = tokio::spawn({
+            let journal_path = journal_path.clone();
+            let cwd = root.path().to_path_buf();
+            async move {
+                run_agent_session_with_executor(
+                    &journal_path,
+                    session_id,
+                    LaunchSession {
+                        request_id: message_id,
+                        cwd,
+                        provider: CodingProvider::Codex,
+                        model: None,
+                        effort: None,
+                        fast: Some(false),
+                        response_language: crate::ResponseLanguage::Auto,
+                        permission_mode: PermissionMode::Manual,
+                        name: None,
+                        initial_prompt: Some("hang".to_string()),
+                        capabilities: Default::default(),
+                        subagent_concurrency_limit: None,
+                        extension_skill_roots: Vec::new(),
+                        team_policy: None,
+                    },
+                    command_rx,
+                    event_tx,
+                    Arc::new(HungProviderExecutor),
+                )
+                .await
+            }
+        });
+
+        let mut observed = Vec::new();
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+                .await
+                .expect("liveness timeout is bounded")
+                .expect("actor remains attached");
+            let ready = matches!(
+                event.kind,
+                SessionEventKind::StatusChanged {
+                    status: SessionStatus::Ready,
+                    ..
+                }
+            );
+            observed.push(event.kind);
+            if ready {
+                break;
+            }
+        }
+
+        command_tx
+            .send(HostCommand::Stop { session_id })
+            .await
+            .unwrap();
+        actor.await.unwrap().unwrap();
+
+        assert!(observed.iter().any(|kind| matches!(
+            kind,
+            SessionEventKind::StatusChanged {
+                status: SessionStatus::Running,
+                detail: Some(detail),
+            } if detail == TurnPhase::AwaitingProvider.detail()
+        )));
+        assert!(observed.iter().any(|kind| matches!(
+            kind,
+            SessionEventKind::TurnCompleted {
+                message_id: completed,
+                final_text,
+                error: Some(error),
+                ..
+            } if *completed == message_id && final_text.is_empty()
+                && error.contains("liveness timeout while awaiting provider")
+        )));
+
+        let durable = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+            .await
+            .unwrap()
+            .read(session_id)
+            .await
+            .unwrap();
+        assert!(durable.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::TurnCompleted {
+                message_id: completed,
+                error: Some(error),
+                ..
+            } if *completed == message_id
+                && error.contains("liveness timeout while awaiting provider")
+        )));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn detached_live_projection_cannot_block_durable_turn_terminalization() {
+        let root = tempdir().unwrap();
+        let journal_path = root.path().join("session.jsonl");
+        let session_id = Uuid::new_v4();
+        let message_id = Uuid::new_v4();
+        let (command_tx, command_rx) = mpsc::channel(2);
+        let (event_tx, event_rx) = mpsc::channel(1);
+        drop(event_rx);
+        let actor = tokio::spawn({
+            let cwd = root.path().to_path_buf();
+            async move {
+                run_agent_session_with_executor(
+                    &journal_path,
+                    session_id,
+                    LaunchSession {
+                        request_id: message_id,
+                        cwd,
+                        provider: CodingProvider::Codex,
+                        model: None,
+                        effort: None,
+                        fast: Some(false),
+                        response_language: crate::ResponseLanguage::Auto,
+                        permission_mode: PermissionMode::Manual,
+                        name: None,
+                        initial_prompt: Some("hang while detached".to_string()),
+                        capabilities: Default::default(),
+                        subagent_concurrency_limit: None,
+                        extension_skill_roots: Vec::new(),
+                        team_policy: None,
+                    },
+                    command_rx,
+                    event_tx,
+                    Arc::new(HungProviderExecutor),
+                )
+                .await
+            }
+        });
+
+        let session_store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let durable = session_store.read(session_id).await.unwrap_or_default();
+                if durable.iter().any(|event| {
+                    matches!(
+                        &event.kind,
+                        SessionEventKind::TurnCompleted {
+                            message_id: completed,
+                            error: Some(error),
+                            ..
+                        } if *completed == message_id && error.contains("liveness timeout")
+                    )
+                }) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached consumer can recover the durable timeout boundary");
+        command_tx
+            .send(HostCommand::Stop { session_id })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), actor)
+            .await
+            .expect("detached projection cannot wedge the actor")
+            .unwrap()
+            .unwrap();
+
+        let durable = session_store.read(session_id).await.unwrap();
+        assert!(durable.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::TurnCompleted {
+                message_id: completed,
+                error: Some(error),
+                ..
+            } if *completed == message_id && error.contains("liveness timeout")
+        )));
+        assert!(matches!(
+            durable.last().map(|event| &event.kind),
+            Some(SessionEventKind::StatusChanged {
+                status: SessionStatus::Stopped,
+                ..
+            })
+        ));
     }
 
     #[tokio::test(flavor = "current_thread")]

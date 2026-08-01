@@ -76,7 +76,7 @@ pub fn project_tool_presentation(
                     .map(|(language, text)| ToolPresentationBody { language, text })
             })
         }),
-        result: output.and_then(|output| summarize_tool_result(name, output, is_error)),
+        result: output.and_then(|output| summarize_tool_result(name, input, output, is_error)),
         body_rows: tool_detail_rows(name, input),
         backgrounded: output.is_some_and(|output| !is_error && tool_output_is_backgrounded(output)),
         hidden: is_internal_tool(name),
@@ -282,6 +282,10 @@ pub fn is_diff_language(language: &str) -> bool {
 
 pub fn tool_call_summary(name: &str, input: &Value) -> (String, String) {
     let tool = tool_leaf_name(name);
+
+    if let Some(git) = git_call(name, input) {
+        return (git.action.label().to_string(), git.detail);
+    }
 
     if matches!(
         tool.as_str(),
@@ -621,10 +625,13 @@ fn tool_category(name: &str, label: &str) -> ToolPresentationCategory {
         ToolPresentationCategory::Image
     } else if name.to_ascii_lowercase().contains("web") {
         ToolPresentationCategory::Web
-    } else if matches!(
-        leaf.as_str(),
-        "bash" | "command_execution" | "exec_command" | "exec"
-    ) {
+    } else if git_action_from_tool_name(name).is_some()
+        || matches!(tool_leaf_name(name).as_str(), "git") && is_git_label(label)
+        || matches!(
+            leaf.as_str(),
+            "bash" | "command_execution" | "exec_command" | "exec"
+        )
+    {
         ToolPresentationCategory::Execute
     } else if leaf.contains("edit") || leaf.contains("patch") || leaf.contains("write") {
         ToolPresentationCategory::Edit
@@ -635,6 +642,34 @@ fn tool_category(name: &str, label: &str) -> ToolPresentationCategory {
     } else {
         ToolPresentationCategory::Generic
     }
+}
+
+fn is_git_label(label: &str) -> bool {
+    matches!(
+        label,
+        "Add worktree"
+            | "List worktrees"
+            | "Remove worktree"
+            | "Prune worktrees"
+            | "Lock worktree"
+            | "Unlock worktree"
+            | "Git status"
+            | "Git diff"
+            | "Git log"
+            | "Git branch"
+            | "Switch branch"
+            | "Check out revision"
+            | "Commit changes"
+            | "Fetch changes"
+            | "Pull changes"
+            | "Push changes"
+            | "Merge branch"
+            | "Rebase branch"
+            | "Show revision"
+            | "Git tags"
+            | "Git remotes"
+            | "Repository info"
+    )
 }
 
 fn tool_detail_rows(name: &str, input: &Value) -> Vec<String> {
@@ -670,7 +705,12 @@ fn tool_detail_rows(name: &str, input: &Value) -> Vec<String> {
     Vec::new()
 }
 
-fn summarize_tool_result(name: &str, output: &str, is_error: bool) -> Option<String> {
+fn summarize_tool_result(
+    name: &str,
+    input: &Value,
+    output: &str,
+    is_error: bool,
+) -> Option<String> {
     let readable = readable_result_text(output);
     let trimmed = readable.trim();
     if trimmed.is_empty() || trimmed == "null" {
@@ -681,6 +721,9 @@ fn summarize_tool_result(name: &str, output: &str, is_error: bool) -> Option<Str
             .lines()
             .find(|line| !line.trim().is_empty())
             .map(|line| compact_text(line, 100));
+    }
+    if git_call(name, input).is_some() {
+        return concise_git_result(trimmed);
     }
     if let Ok(Value::Object(fields)) = serde_json::from_str::<Value>(trimmed) {
         if let Some(status) = fields.get("status").and_then(Value::as_str) {
@@ -751,6 +794,231 @@ fn summarize_tool_result(name: &str, output: &str, is_error: bool) -> Option<Str
     } else {
         "completed".to_string()
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GitAction {
+    WorktreeAdd,
+    WorktreeList,
+    WorktreeRemove,
+    WorktreePrune,
+    WorktreeLock,
+    WorktreeUnlock,
+    Status,
+    Diff,
+    Log,
+    Branch,
+    Switch,
+    Checkout,
+    Commit,
+    Fetch,
+    Pull,
+    Push,
+    Merge,
+    Rebase,
+    Show,
+    Tag,
+    Remote,
+    RepositoryInfo,
+}
+
+impl GitAction {
+    fn label(self) -> &'static str {
+        match self {
+            Self::WorktreeAdd => "Add worktree",
+            Self::WorktreeList => "List worktrees",
+            Self::WorktreeRemove => "Remove worktree",
+            Self::WorktreePrune => "Prune worktrees",
+            Self::WorktreeLock => "Lock worktree",
+            Self::WorktreeUnlock => "Unlock worktree",
+            Self::Status => "Git status",
+            Self::Diff => "Git diff",
+            Self::Log => "Git log",
+            Self::Branch => "Git branch",
+            Self::Switch => "Switch branch",
+            Self::Checkout => "Check out revision",
+            Self::Commit => "Commit changes",
+            Self::Fetch => "Fetch changes",
+            Self::Pull => "Pull changes",
+            Self::Push => "Push changes",
+            Self::Merge => "Merge branch",
+            Self::Rebase => "Rebase branch",
+            Self::Show => "Show revision",
+            Self::Tag => "Git tags",
+            Self::Remote => "Git remotes",
+            Self::RepositoryInfo => "Repository info",
+        }
+    }
+}
+
+struct GitCall {
+    action: GitAction,
+    detail: String,
+}
+
+fn git_call(name: &str, input: &Value) -> Option<GitCall> {
+    if let Some(command) = command_from_input(input)
+        && let Some((action, arguments)) = if tool_leaf_name(name) == "git" {
+            git_command(&format!("git {command}"))
+        } else {
+            git_command(command)
+        }
+    {
+        return Some(GitCall {
+            action,
+            detail: git_command_detail(action, &arguments),
+        });
+    }
+    let action = git_action_from_tool_name(name)?;
+    Some(GitCall {
+        action,
+        detail: git_tool_detail(action, input),
+    })
+}
+
+fn git_action_from_tool_name(name: &str) -> Option<GitAction> {
+    let lower = name.to_ascii_lowercase();
+    let leaf = tool_leaf_name(name);
+    let direct_git_tool = leaf.starts_with("git_")
+        || leaf.starts_with("git-")
+        || lower
+            .strip_prefix("mcp__")
+            .and_then(|rest| rest.split_once("__"))
+            .is_some_and(|(server, _)| server == "git");
+    if !direct_git_tool {
+        return None;
+    }
+    let normalized = leaf
+        .strip_prefix("git_")
+        .or_else(|| leaf.strip_prefix("git-"))
+        .unwrap_or(&leaf)
+        .replace('-', "_");
+    git_action_from_parts(&normalized.split('_').collect::<Vec<_>>())
+}
+
+fn git_command(command: &str) -> Option<(GitAction, Vec<String>)> {
+    let words = shell_words(command);
+    if let Some(script) = shell_script(&words) {
+        return git_command(script);
+    }
+    let git_index = words.iter().enumerate().find_map(|(index, word)| {
+        let executable = word.rsplit('/').next();
+        let starts_command = index == 0
+            || matches!(
+                words.get(index.wrapping_sub(1)).map(String::as_str),
+                Some("&&" | ";" | "||")
+            );
+        (starts_command && executable == Some("git")).then_some(index)
+    })?;
+    let mut parts = words[git_index + 1..].iter().map(String::as_str).peekable();
+    while let Some(part) = parts.peek().copied() {
+        if matches!(
+            part,
+            "-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace"
+        ) {
+            parts.next();
+            parts.next();
+        } else if part.starts_with('-') {
+            parts.next();
+        } else {
+            break;
+        }
+    }
+    let remaining = parts.map(str::to_string).collect::<Vec<_>>();
+    let refs = remaining.iter().map(String::as_str).collect::<Vec<_>>();
+    let action = git_action_from_parts(&refs)?;
+    Some((action, remaining))
+}
+
+fn git_action_from_parts(parts: &[&str]) -> Option<GitAction> {
+    match parts {
+        ["worktree", "add", ..] => Some(GitAction::WorktreeAdd),
+        ["worktree", "list", ..] => Some(GitAction::WorktreeList),
+        ["worktree", "remove", ..] => Some(GitAction::WorktreeRemove),
+        ["worktree", "prune", ..] => Some(GitAction::WorktreePrune),
+        ["worktree", "lock", ..] => Some(GitAction::WorktreeLock),
+        ["worktree", "unlock", ..] => Some(GitAction::WorktreeUnlock),
+        ["status", ..] => Some(GitAction::Status),
+        ["diff", ..] => Some(GitAction::Diff),
+        ["log", ..] => Some(GitAction::Log),
+        ["branch", ..] => Some(GitAction::Branch),
+        ["switch", ..] => Some(GitAction::Switch),
+        ["checkout", ..] => Some(GitAction::Checkout),
+        ["commit", ..] => Some(GitAction::Commit),
+        ["fetch", ..] => Some(GitAction::Fetch),
+        ["pull", ..] => Some(GitAction::Pull),
+        ["push", ..] => Some(GitAction::Push),
+        ["merge", ..] => Some(GitAction::Merge),
+        ["rebase", ..] => Some(GitAction::Rebase),
+        ["show", ..] => Some(GitAction::Show),
+        ["tag", ..] => Some(GitAction::Tag),
+        ["remote", ..] => Some(GitAction::Remote),
+        ["rev", "parse", ..]
+        | ["rev-parse", ..]
+        | ["rev_parse", ..]
+        | ["config", ..]
+        | ["describe", ..]
+        | ["symbolic", "ref", ..]
+        | ["symbolic-ref", ..]
+        | ["symbolic_ref", ..]
+        | ["ls", "files", ..]
+        | ["ls-files", ..]
+        | ["ls_files", ..]
+        | ["ls", "tree", ..]
+        | ["ls-tree", ..]
+        | ["ls_tree", ..] => Some(GitAction::RepositoryInfo),
+        _ => None,
+    }
+}
+
+fn git_command_detail(action: GitAction, arguments: &[String]) -> String {
+    let skip = if matches!(
+        action,
+        GitAction::WorktreeAdd
+            | GitAction::WorktreeList
+            | GitAction::WorktreeRemove
+            | GitAction::WorktreePrune
+            | GitAction::WorktreeLock
+            | GitAction::WorktreeUnlock
+    ) {
+        2
+    } else {
+        1
+    };
+    let detail = arguments
+        .iter()
+        .skip(skip)
+        .filter(|argument| !argument.starts_with('-'))
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" · ");
+    compact_text(&detail, 160)
+}
+
+fn git_tool_detail(_action: GitAction, input: &Value) -> String {
+    [
+        "path", "worktree", "branch", "ref", "revision", "remote", "name", "message",
+    ]
+    .into_iter()
+    .filter_map(|key| string_field(input, key))
+    .filter(|value| !value.trim().is_empty())
+    .take(2)
+    .map(str::to_string)
+    .collect::<Vec<_>>()
+    .join(" · ")
+}
+
+fn concise_git_result(output: &str) -> Option<String> {
+    let lines = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    match lines.as_slice() {
+        [] => None,
+        [line] if line.chars().count() < 80 => Some((*line).to_string()),
+        _ => Some(format!("{} lines", lines.len())),
+    }
 }
 
 fn readable_result_text(value: &str) -> String {
@@ -1373,5 +1641,111 @@ mod tests {
         );
         assert!(!rendered.contains("structuredContent"));
         assert!(!rendered.contains("_meta"));
+    }
+
+    #[test]
+    fn presents_common_git_shell_commands_with_raw_commands_intact() {
+        let cases = [
+            ("git status --short", "Git status", ""),
+            (
+                "git worktree add -b topic ../topic main",
+                "Add worktree",
+                "topic · ../topic · main",
+            ),
+            (
+                "bash -lc 'git worktree list --porcelain'",
+                "List worktrees",
+                "",
+            ),
+            ("git -C /repo diff --stat HEAD~1", "Git diff", "HEAD~1"),
+            ("cd /repo && git switch feature", "Switch branch", "feature"),
+            ("git rev-parse --show-toplevel", "Repository info", ""),
+        ];
+
+        for (command, label, detail) in cases {
+            let presentation = project_tool_presentation(
+                "functions.exec_command",
+                &json!({"cmd": command}),
+                None,
+                false,
+            );
+            assert_eq!(presentation.label, label, "{command}");
+            assert_eq!(presentation.detail, detail, "{command}");
+            assert_eq!(presentation.category, ToolPresentationCategory::Execute);
+            assert_eq!(
+                presentation.input.as_ref().map(|body| body.text.as_str()),
+                Some(command)
+                    .filter(|_| !command.starts_with("bash "))
+                    .or(Some("git worktree list --porcelain")),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn presents_direct_git_and_mcp_tool_names() {
+        let cases = [
+            (
+                "git_worktree_remove",
+                json!({"path": "../old"}),
+                "Remove worktree",
+                "../old",
+            ),
+            (
+                "mcp__git__worktree_lock",
+                json!({"worktree": "../topic"}),
+                "Lock worktree",
+                "../topic",
+            ),
+            (
+                "mcp__git__push",
+                json!({"remote": "origin", "branch": "main"}),
+                "Push changes",
+                "main · origin",
+            ),
+            ("mcp__git__remote", json!({}), "Git remotes", ""),
+        ];
+
+        for (name, input, label, detail) in cases {
+            let presentation = project_tool_presentation(name, &input, None, false);
+            assert_eq!(presentation.label, label, "{name}");
+            assert_eq!(presentation.detail, detail, "{name}");
+            assert_eq!(presentation.category, ToolPresentationCategory::Execute);
+        }
+
+        let git = project_tool_presentation(
+            "git",
+            &json!({"command": "branch --show-current"}),
+            None,
+            false,
+        );
+        assert_eq!(git.label, "Git branch");
+        assert_eq!(git.detail, "");
+    }
+
+    #[test]
+    fn git_results_report_observed_output_and_preserve_errors() {
+        let removed = project_tool_presentation(
+            "functions.exec_command",
+            &json!({"cmd": "git worktree remove ../old"}),
+            Some(""),
+            false,
+        );
+        assert_eq!(removed.result, None);
+
+        let failed = project_tool_presentation(
+            "functions.exec_command",
+            &json!({"cmd": "git worktree remove ../old"}),
+            Some("fatal: '../old' is not a working tree"),
+            true,
+        );
+        assert_eq!(
+            failed.result.as_deref(),
+            Some("fatal: '../old' is not a working tree")
+        );
+        assert_eq!(
+            failed.output.as_ref().map(|body| body.text.as_str()),
+            Some("fatal: '../old' is not a working tree")
+        );
     }
 }

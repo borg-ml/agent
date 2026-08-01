@@ -701,13 +701,39 @@ impl SqliteSessionStore {
             .synchronous(SqliteSynchronous::Full)
             .busy_timeout(SQLITE_BUSY_TIMEOUT)
             .foreign_keys(true);
-        let pool = SqlitePoolOptions::new()
-            .max_connections(8)
-            .connect_with(options)
-            .await
-            .with_context(|| format!("failed to open SQLite session store {}", path.display()))?;
+        let open_error_context =
+            || format!("failed to open SQLite session store {}", path.display());
+        let schema_deadline = std::time::Instant::now() + SQLITE_BUSY_TIMEOUT;
+        let pool = loop {
+            match SqlitePoolOptions::new()
+                .max_connections(8)
+                .connect_with(options.clone())
+                .await
+            {
+                Ok(pool) => break pool,
+                Err(error)
+                    if sqlite_lock_text(&error.to_string())
+                        && std::time::Instant::now() < schema_deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(error) => return Err(anyhow::Error::new(error).context(open_error_context())),
+            }
+        };
         let store = Self { pool };
-        store.ensure_schema().await?;
+        let schema_deadline = std::time::Instant::now() + SQLITE_BUSY_TIMEOUT;
+        loop {
+            match store.ensure_schema().await {
+                Ok(()) => break,
+                Err(error)
+                    if sqlite_schema_lock(&error)
+                        && std::time::Instant::now() < schema_deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
         Ok(store)
     }
 
@@ -1696,6 +1722,15 @@ impl SqliteSessionStore {
         transaction.commit().await?;
         Ok(event)
     }
+}
+
+fn sqlite_schema_lock(error: &anyhow::Error) -> bool {
+    sqlite_lock_text(&error.to_string())
+}
+
+fn sqlite_lock_text(error: &str) -> bool {
+    let message = error.to_ascii_lowercase();
+    message.contains("database is locked") || message.contains("database table is locked")
 }
 
 #[async_trait]

@@ -1,14 +1,24 @@
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
-#[cfg(unix)]
-use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+    mpsc as std_mpsc,
+};
 use std::time::{Duration, Instant};
+
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const INTERRUPT_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+const REQUEST_READ_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const MAX_QUARANTINED_RESPONSES: usize = 64;
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 use super::chat_stream::LocalAgentPermission;
 use super::chat_stream::{ChatApprovalDecision, ChatStreamControl};
@@ -38,15 +48,22 @@ pub struct JsonRpcMessage {
     pub params: Option<Value>,
 }
 
+enum ReaderMessage {
+    Message(JsonRpcMessage),
+    Failed(String),
+}
+
 pub struct CodexAppServerClient {
     child: Child,
     stdin: Option<ChildStdin>,
-    reader: BufReader<ChildStdout>,
+    reader: std_mpsc::Receiver<ReaderMessage>,
     next_id: u64,
     workspace_id: Option<String>,
     network_access: bool,
     web_search_allowed: bool,
     deferred_notifications: Vec<JsonRpcMessage>,
+    quarantined_responses: VecDeque<JsonRpcMessage>,
+    cancellation: Option<Arc<AtomicBool>>,
     _shell_env: crate::shell_env::CleanShellEnv,
     _managed_codex_home: Option<tempfile::TempDir>,
 }
@@ -95,6 +112,24 @@ impl CodexAppServerClient {
         codex_home: Option<&Path>,
         use_managed_openai_api_key: bool,
         extra_env: &[(String, String)],
+    ) -> Result<Self> {
+        Self::start_with_cancellation(
+            network_access,
+            web_search_allowed,
+            codex_home,
+            use_managed_openai_api_key,
+            extra_env,
+            None,
+        )
+    }
+
+    pub(crate) fn start_with_cancellation(
+        network_access: bool,
+        web_search_allowed: bool,
+        codex_home: Option<&Path>,
+        use_managed_openai_api_key: bool,
+        extra_env: &[(String, String)],
+        cancellation: Option<Arc<AtomicBool>>,
     ) -> Result<Self> {
         let started_at = Instant::now();
         let shell_env = crate::shell_env::CleanShellEnv::new()?;
@@ -178,6 +213,7 @@ impl CodexAppServerClient {
             .stdout
             .take()
             .context("codex app-server stdout not available")?;
+        let reader = spawn_reader(stdout);
         let mut stderr = child
             .stderr
             .take()
@@ -194,12 +230,14 @@ impl CodexAppServerClient {
         let mut client = Self {
             child,
             stdin: Some(stdin),
-            reader: BufReader::new(stdout),
+            reader,
             next_id: 1,
             workspace_id: None,
             network_access,
             web_search_allowed,
             deferred_notifications: Vec::new(),
+            quarantined_responses: VecDeque::new(),
+            cancellation,
             _shell_env: shell_env,
             _managed_codex_home: managed_codex_home,
         };
@@ -846,10 +884,44 @@ impl CodexAppServerClient {
 
     pub fn shutdown(&mut self) -> Result<()> {
         self.stdin.take();
-        let status = self
-            .child
-            .wait()
-            .context("failed waiting for codex app-server process to exit")?;
+        let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
+        let status = loop {
+            if self
+                .cancellation
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::Acquire))
+            {
+                tracing::debug!("cancelling Codex app-server shutdown with its owning turn");
+                self.child
+                    .kill()
+                    .context("failed killing cancelled codex app-server")?;
+                break self
+                    .child
+                    .wait()
+                    .context("failed waiting for cancelled codex app-server")?;
+            }
+            if let Some(status) = self
+                .child
+                .try_wait()
+                .context("failed checking codex app-server process during shutdown")?
+            {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                tracing::warn!(
+                    timeout_ms = SHUTDOWN_TIMEOUT.as_millis(),
+                    "codex app-server did not exit during graceful shutdown; killing it"
+                );
+                self.child
+                    .kill()
+                    .context("failed killing codex app-server during shutdown")?;
+                break self
+                    .child
+                    .wait()
+                    .context("failed waiting for killed codex app-server")?;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
         if !status.success() {
             tracing::warn!(
                 ?status,
@@ -870,9 +942,28 @@ impl CodexAppServerClient {
         params: Option<Value>,
         collect_notifications: bool,
     ) -> Result<(Value, Vec<JsonRpcMessage>)> {
+        let timeout = if method == "turn/interrupt" {
+            INTERRUPT_REQUEST_TIMEOUT
+        } else if method == "turn/steer" {
+            CONTROL_REQUEST_TIMEOUT
+        } else {
+            REQUEST_TIMEOUT
+        };
+        self.send_request_inner_with_timeout(method, params, collect_notifications, timeout)
+    }
+
+    fn send_request_inner_with_timeout(
+        &mut self,
+        method: &str,
+        params: Option<Value>,
+        collect_notifications: bool,
+        timeout: Duration,
+    ) -> Result<(Value, Vec<JsonRpcMessage>)> {
+        self.ensure_not_cancelled()?;
         let id = self.next_id;
         self.next_id += 1;
         let mut notifications = Vec::new();
+        let deadline = Instant::now() + timeout;
 
         let request = JsonRpcRequest {
             jsonrpc: "2.0",
@@ -882,6 +973,7 @@ impl CodexAppServerClient {
         };
 
         let line = serde_json::to_string(&request)?;
+        self.ensure_not_cancelled()?;
         let stdin = self
             .stdin
             .as_mut()
@@ -890,23 +982,25 @@ impl CodexAppServerClient {
         stdin.flush()?;
 
         loop {
-            let msg = self.read_message()?;
-            if msg.id == Some(id) {
-                if let Some(error) = msg.error {
-                    if collect_notifications && matches!(method, "turn/interrupt" | "turn/steer") {
-                        self.deferred_notifications.extend(notifications);
-                    }
-                    // Preserve the structured JSON-RPC error so callers can
-                    // classify rate-limit / overload / auth without string
-                    // matching. The wrapper's classifier looks for
-                    // `"code":429` / `"code":503` / `"code":529` substrings.
-                    bail!(
-                        "codex app-server error for {method}: {}",
-                        serde_json::to_string(&error).unwrap_or_else(|_| error.to_string())
-                    );
+            self.ensure_not_cancelled()?;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                if collect_notifications && matches!(method, "turn/interrupt" | "turn/steer") {
+                    self.deferred_notifications.extend(notifications);
                 }
-                return Ok((msg.result.unwrap_or(Value::Null), notifications));
+                bail!(
+                    "timed out after {} ms waiting for codex app-server response to {method} (request id {id})",
+                    timeout.as_millis()
+                );
             }
+            let Some(msg) = self.read_message_timeout(remaining.min(REQUEST_READ_POLL_INTERVAL))?
+            else {
+                continue;
+            };
+            // A server-initiated request has an id and a method. Handle that
+            // direction before matching client responses so an app-server
+            // request that happens to reuse our numeric id can never be
+            // mistaken for the response to our outstanding request.
             if let (Some(server_request_id), Some(server_method)) = (msg.id, msg.method.as_deref())
             {
                 if let Some(response) = unattended_server_request_response(&msg) {
@@ -923,10 +1017,43 @@ impl CodexAppServerClient {
                 }
                 continue;
             }
+            if msg.id == Some(id) {
+                if let Some(error) = msg.error {
+                    if collect_notifications && matches!(method, "turn/interrupt" | "turn/steer") {
+                        self.deferred_notifications.extend(notifications);
+                    }
+                    // Preserve the structured JSON-RPC error so callers can
+                    // classify rate-limit / overload / auth without string
+                    // matching. The wrapper's classifier looks for
+                    // `"code":429` / `"code":503` / `"code":529` substrings.
+                    bail!(
+                        "codex app-server error for {method}: {}",
+                        serde_json::to_string(&error).unwrap_or_else(|_| error.to_string())
+                    );
+                }
+                return Ok((msg.result.unwrap_or(Value::Null), notifications));
+            }
+            if msg.id.is_some() {
+                self.quarantine_response(msg, method, id);
+                continue;
+            }
             if collect_notifications {
                 notifications.push(msg);
             }
         }
+    }
+
+    fn quarantine_response(&mut self, response: JsonRpcMessage, method: &str, expected_id: u64) {
+        tracing::debug!(
+            response_id = ?response.id,
+            expected_id,
+            method,
+            "quarantined unmatched Codex app-server response"
+        );
+        if self.quarantined_responses.len() == MAX_QUARANTINED_RESPONSES {
+            self.quarantined_responses.pop_front();
+        }
+        self.quarantined_responses.push_back(response);
     }
 
     fn send_notification(&mut self, method: &str, params: Option<Value>) -> Result<()> {
@@ -980,33 +1107,85 @@ impl CodexAppServerClient {
         Ok(())
     }
 
-    fn read_message(&mut self) -> Result<JsonRpcMessage> {
-        let mut line = String::new();
-        loop {
-            line.clear();
-            let bytes = self
-                .reader
-                .read_line(&mut line)
-                .context("failed to read from codex app-server")?;
-            if bytes == 0 {
-                bail!("codex app-server stdout closed unexpectedly");
+    fn read_message_timeout(&mut self, timeout: Duration) -> Result<Option<JsonRpcMessage>> {
+        self.ensure_not_cancelled()?;
+        match self.reader.recv_timeout(timeout) {
+            Ok(ReaderMessage::Message(message)) => Ok(Some(message)),
+            Ok(ReaderMessage::Failed(error)) => bail!("{error}"),
+            Err(std_mpsc::RecvTimeoutError::Timeout) => Ok(None),
+            Err(std_mpsc::RecvTimeoutError::Disconnected) => {
+                bail!("codex app-server reader stopped unexpectedly")
             }
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            let msg: JsonRpcMessage = serde_json::from_str(trimmed)
-                .with_context(|| format!("failed to parse app-server message: {trimmed}"))?;
-            return Ok(msg);
         }
     }
 
-    fn read_message_timeout(&mut self, timeout: Duration) -> Result<Option<JsonRpcMessage>> {
-        if self.reader.buffer().is_empty() && !child_stdout_ready(self.reader.get_ref(), timeout)? {
-            return Ok(None);
+    fn ensure_not_cancelled(&self) -> Result<()> {
+        if self
+            .cancellation
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+        {
+            bail!("Codex app-server request cancelled with its owning turn")
         }
-        self.read_message().map(Some)
+        Ok(())
     }
+
+    pub(crate) fn detach_cancellation(&mut self) {
+        self.cancellation = None;
+    }
+
+    pub(crate) fn attach_cancellation(&mut self, cancellation: Arc<AtomicBool>) {
+        self.cancellation = Some(cancellation);
+    }
+}
+
+/// Own stdout reads on one dedicated thread so no JSON-RPC call can block the
+/// provider executor inside `BufRead::read_line`. The client consumes parsed
+/// frames through a timeout-capable channel, which bounds request waits even
+/// when the child writes a partial or unterminated frame.
+fn spawn_reader(stdout: ChildStdout) -> std_mpsc::Receiver<ReaderMessage> {
+    let (sender, receiver) = std_mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => {
+                    let _ = sender.send(ReaderMessage::Failed(
+                        "codex app-server stdout closed unexpectedly".to_string(),
+                    ));
+                    break;
+                }
+                Ok(_) => {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    match serde_json::from_str::<JsonRpcMessage>(trimmed) {
+                        Ok(message) => {
+                            if sender.send(ReaderMessage::Message(message)).is_err() {
+                                break;
+                            }
+                        }
+                        Err(error) => {
+                            let _ = sender.send(ReaderMessage::Failed(format!(
+                                "failed to parse app-server message: {trimmed}: {error}"
+                            )));
+                            break;
+                        }
+                    }
+                }
+                Err(error) => {
+                    let _ = sender.send(ReaderMessage::Failed(format!(
+                        "failed to read from codex app-server: {error}"
+                    )));
+                    break;
+                }
+            }
+        }
+    });
+    receiver
 }
 
 fn unattended_server_request_response(message: &JsonRpcMessage) -> Option<Value> {
@@ -1095,64 +1274,6 @@ fn parse_codex_weekly_usage(response: &Value) -> Result<CodexWeeklyUsage> {
         used_percent: used_percent as u8,
         resets_at: window.get("resetsAt").and_then(Value::as_i64),
     })
-}
-
-#[cfg(unix)]
-fn child_stdout_ready(stdout: &ChildStdout, timeout: Duration) -> Result<bool> {
-    let fd = stdout.as_raw_fd();
-    let mut pollfd = libc::pollfd {
-        fd,
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as i32;
-    loop {
-        let ready = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
-        if ready > 0 {
-            return Ok(true);
-        }
-        if ready == 0 {
-            return Ok(false);
-        }
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() != Some(libc::EINTR) {
-            return Err(error).context("failed to poll codex app-server stdout");
-        }
-    }
-}
-
-#[cfg(windows)]
-fn child_stdout_ready(stdout: &ChildStdout, timeout: Duration) -> Result<bool> {
-    use std::os::windows::io::AsRawHandle;
-    use std::time::Instant;
-    use windows_sys::Win32::System::Pipes::PeekNamedPipe;
-
-    let deadline = Instant::now() + timeout;
-    loop {
-        let mut available = 0_u32;
-        let ready = unsafe {
-            PeekNamedPipe(
-                stdout.as_raw_handle(),
-                std::ptr::null_mut(),
-                0,
-                std::ptr::null_mut(),
-                &mut available,
-                std::ptr::null_mut(),
-            )
-        };
-        if ready == 0 {
-            return Err(std::io::Error::last_os_error())
-                .context("failed to inspect codex app-server stdout");
-        }
-        if available > 0 {
-            return Ok(true);
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Ok(false);
-        }
-        std::thread::sleep(remaining.min(Duration::from_millis(5)));
-    }
 }
 
 fn turn_user_input(prompt: &str, attachments: &[PathBuf]) -> Vec<Value> {
@@ -1595,13 +1716,121 @@ fn inject_mcp_servers_config(params: &mut Value, mcp_config_path: Option<&str>) 
 
 impl Drop for CodexAppServerClient {
     fn drop(&mut self) {
-        let _ = self.child.kill();
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+        }
+        let _ = self.child.wait();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn scripted_client(script: &str) -> CodexAppServerClient {
+        let shell_env = crate::shell_env::CleanShellEnv::new().expect("clean shell environment");
+        let mut child = Command::new("sh")
+            .args(["-c", script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("scripted app-server");
+        let stdin = child.stdin.take().expect("script stdin");
+        let stdout = child.stdout.take().expect("script stdout");
+        CodexAppServerClient {
+            child,
+            stdin: Some(stdin),
+            reader: spawn_reader(stdout),
+            next_id: 1,
+            workspace_id: None,
+            network_access: false,
+            web_search_allowed: false,
+            deferred_notifications: Vec::new(),
+            quarantined_responses: VecDeque::new(),
+            cancellation: None,
+            _shell_env: shell_env,
+            _managed_codex_home: None,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn request_wait_quarantines_mismatched_response_ids() {
+        let mut client = scripted_client(
+            r#"read request
+printf '%s\n' '{"jsonrpc":"2.0","id":99,"result":{"stale":true}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"matched":true}}'"#,
+        );
+
+        let (result, notifications) = client
+            .send_request_inner_with_timeout("test/request", None, true, Duration::from_secs(1))
+            .expect("matched response");
+
+        assert_eq!(result, serde_json::json!({"matched": true}));
+        assert!(notifications.is_empty());
+        assert_eq!(client.quarantined_responses.len(), 1);
+        assert_eq!(client.quarantined_responses[0].id, Some(99));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn request_wait_exposes_a_bounded_timeout() {
+        let mut client = scripted_client("read request\nsleep 1");
+
+        let error = client
+            .send_request_inner_with_timeout("turn/start", None, true, Duration::from_millis(25))
+            .expect_err("request must time out");
+
+        let message = error.to_string();
+        assert!(message.contains("timed out after 25 ms"), "{message}");
+        assert!(message.contains("turn/start"), "{message}");
+        assert!(message.contains("request id 1"), "{message}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn partial_provider_frame_cannot_block_a_request_forever() {
+        let mut client = scripted_client("printf '%s' '{\"jsonrpc\":\"2.0\",\"id\":1'; sleep 1");
+
+        let error = client
+            .send_request_inner_with_timeout("turn/start", None, true, Duration::from_millis(25))
+            .expect_err("unterminated frame must time out");
+
+        assert!(error.to_string().contains("timed out after 25 ms"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn request_wait_honors_owner_cancellation() {
+        let mut client = scripted_client("read request\nsleep 1");
+        let cancellation = Arc::new(AtomicBool::new(false));
+        client.cancellation = Some(Arc::clone(&cancellation));
+        let cancel_later = Arc::clone(&cancellation);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(25));
+            cancel_later.store(true, Ordering::Release);
+        });
+
+        let error = client
+            .send_request_inner_with_timeout("turn/start", None, true, Duration::from_secs(1))
+            .expect_err("owner cancellation must end a synchronous request wait");
+
+        assert!(error.to_string().contains("cancelled with its owning turn"));
+    }
+
+    #[test]
+    fn bounded_control_wait_observes_cancellation() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        tx.blocking_send(ChatStreamControl::Interrupt)
+            .expect("queue cancellation");
+
+        assert!(matches!(
+            recv_control_until(&mut rx, Some(Instant::now() + Duration::from_millis(50))),
+            Some(ChatStreamControl::Interrupt)
+        ));
+    }
 
     #[test]
     fn command_modes_select_the_expected_codex_reviewer() {

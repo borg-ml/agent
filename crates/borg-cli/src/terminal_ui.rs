@@ -12,7 +12,9 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::process::Command;
+use std::sync::{Arc, mpsc};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::editor_preferences::{TranscriptPreferences, parse_hex_color};
@@ -76,6 +78,7 @@ const COMMAND_PANEL_BG: Color = Color::Rgb(31, 24, 27);
 /// Divider between status-line segments. It is its own span so a hovered
 /// segment underlines its own text only.
 const STATUS_SEPARATOR: &str = " · ";
+const GIT_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const STEER_SENT_NOTICE: &str =
     "Steer already sent to the active turn · Esc interrupts and sends it next";
 const DIRECTOR_CONTEXT_BOUNDARY: &str = "— context provided by director agent —";
@@ -462,6 +465,90 @@ pub enum UiAction {
     Quit,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GitWorktreeStatus {
+    branch: String,
+    dirty: bool,
+    ahead: usize,
+    behind: usize,
+}
+
+impl GitWorktreeStatus {
+    fn compact_label(&self) -> String {
+        let mut label = format!("git:{}", self.branch);
+        if self.ahead > 0 {
+            label.push_str(&format!(" ↑{}", self.ahead));
+        }
+        if self.behind > 0 {
+            label.push_str(&format!(" ↓{}", self.behind));
+        }
+        if self.dirty {
+            label.push('*');
+        }
+        label
+    }
+}
+
+struct CachedGitStatus {
+    value: Option<GitWorktreeStatus>,
+    refreshed_at: Instant,
+}
+
+struct GitStatusResult {
+    cwd: PathBuf,
+    value: Option<GitWorktreeStatus>,
+}
+
+struct GitStatusCache {
+    values: HashMap<PathBuf, CachedGitStatus>,
+    refreshing: HashSet<PathBuf>,
+    sender: mpsc::Sender<GitStatusResult>,
+    receiver: mpsc::Receiver<GitStatusResult>,
+}
+
+impl Default for GitStatusCache {
+    fn default() -> Self {
+        let (sender, receiver) = mpsc::channel();
+        Self {
+            values: HashMap::new(),
+            refreshing: HashSet::new(),
+            sender,
+            receiver,
+        }
+    }
+}
+
+impl GitStatusCache {
+    fn status_for(&mut self, cwd: &Path) -> Option<&GitWorktreeStatus> {
+        while let Ok(result) = self.receiver.try_recv() {
+            self.refreshing.remove(&result.cwd);
+            self.values.insert(
+                result.cwd,
+                CachedGitStatus {
+                    value: result.value,
+                    refreshed_at: Instant::now(),
+                },
+            );
+        }
+
+        let needs_refresh = self
+            .values
+            .get(cwd)
+            .is_none_or(|cached| cached.refreshed_at.elapsed() >= GIT_STATUS_REFRESH_INTERVAL);
+        if needs_refresh && self.refreshing.insert(cwd.to_path_buf()) {
+            let cwd = cwd.to_path_buf();
+            let sender = self.sender.clone();
+            thread::spawn(move || {
+                let value = read_git_worktree_status(&cwd);
+                let _ = sender.send(GitStatusResult { cwd, value });
+            });
+        }
+        self.values
+            .get(cwd)
+            .and_then(|cached| cached.value.as_ref())
+    }
+}
+
 pub struct BorgTerminal {
     terminal: Terminal<CrosstermBackend<Stdout>>,
     input: TerminalInput,
@@ -482,6 +569,7 @@ pub struct BorgTerminal {
     attachment_store: AttachmentStore,
     keymap: KeyMap,
     cwd: PathBuf,
+    git_status_cache: GitStatusCache,
     status: SessionStatus,
     /// Highest durable root sequence incorporated into this projection.
     /// Asynchronous history/state hydration may finish after live events, so
@@ -1301,6 +1389,7 @@ impl BorgTerminal {
             attachment_store,
             keymap,
             cwd,
+            git_status_cache: GitStatusCache::default(),
             status: SessionStatus::Starting,
             session_state_sequence: 0,
             pending_approval: false,
@@ -3505,8 +3594,21 @@ impl BorgTerminal {
         };
         let status_glyph = activity_glyph(status);
         let status_is_interruptible = status_control_is_actionable(status);
-        let (model_status, effort_status, fast_status, permission_status, cwd_status) =
+        let (model_status, effort_status, fast_status, permission_status, mut cwd_status) =
             self.transcript.config_statuses();
+        let active_cwd = self
+            .transcript
+            .config
+            .as_ref()
+            .map(|config| config.cwd.clone())
+            .unwrap_or_else(|| self.cwd.clone());
+        if cwd_status.is_empty() {
+            cwd_status = fish_style_path(&active_cwd);
+        }
+        if let Some(git_status) = self.git_status_cache.status_for(&active_cwd) {
+            cwd_status.push_str(" · ");
+            cwd_status.push_str(&git_status.compact_label());
+        }
         let cache_status = self.transcript.cache_status(Utc::now());
         let (context_status, context_imminent) = self.transcript.context_status();
         let team_transcript = self
@@ -4323,6 +4425,7 @@ impl BorgTerminal {
                 &mut status_spans,
                 model_status,
                 self.model_status_hovered,
+                Color::Gray,
             );
             let effort_status_start = status_spans.iter().map(|span| span.width()).sum::<usize>();
             // The separator is rendered unstyled, so the hover target is the
@@ -4330,10 +4433,15 @@ impl BorgTerminal {
             let effort_status_start = effort_status_start
                 .saturating_add(usize::from(effort_status.is_some()) * STATUS_SEPARATOR.width());
             let effort_status_width = effort_status.as_ref().map(|value| value.width());
+            let effort_status_color = effort_status
+                .as_deref()
+                .map(effort_status_color)
+                .unwrap_or(Color::Gray);
             push_interactive_status_segment(
                 &mut status_spans,
                 effort_status,
                 self.effort_status_hovered,
+                effort_status_color,
             );
             let fast_status_start = status_spans.iter().map(|span| span.width()).sum::<usize>();
             let fast_status_start = fast_status_start
@@ -4343,6 +4451,7 @@ impl BorgTerminal {
                 &mut status_spans,
                 fast_status,
                 self.fast_status_hovered,
+                Color::Gray,
             );
             let permission_status_start =
                 status_spans.iter().map(|span| span.width()).sum::<usize>();
@@ -4352,10 +4461,15 @@ impl BorgTerminal {
                 usize::from(permission_status.is_some()) * STATUS_SEPARATOR.width(),
             );
             let permission_status_width = permission_status.as_ref().map(|value| value.width());
+            let permission_status_color = permission_status
+                .as_deref()
+                .map(permission_status_color)
+                .unwrap_or(Color::Gray);
             push_interactive_status_segment(
                 &mut status_spans,
                 permission_status,
                 self.permission_status_hovered,
+                permission_status_color,
             );
             let status_line = Line::from(status_spans);
             let alignment_offset = if is_launch_screen {
@@ -4546,10 +4660,12 @@ impl BorgTerminal {
                 );
             }
             if self.todo_status_hovered && !self.transcript.todos.is_empty() {
-                let rows = self.transcript.todo_tooltip_rows(self.todo_status_expanded);
+                let rows = self
+                    .transcript
+                    .todo_tooltip_rows_with_status(self.todo_status_expanded);
                 let tooltip_width = rows
                     .iter()
-                    .map(|row| row.width() as u16)
+                    .map(|(row, _)| row.width() as u16)
                     .max()
                     .unwrap_or(24)
                     .saturating_add(4)
@@ -4557,7 +4673,12 @@ impl BorgTerminal {
                 let content_width = tooltip_width.saturating_sub(4).max(1) as usize;
                 let tooltip_lines = rows
                     .iter()
-                    .flat_map(|row| wrap_display(row, content_width))
+                    .flat_map(|(row, completed)| {
+                        let style = todo_tooltip_row_style(*completed);
+                        wrap_display(row, content_width)
+                            .into_iter()
+                            .map(move |line| (line, style))
+                    })
                     .collect::<Vec<_>>();
                 let tooltip_height = (tooltip_lines.len() as u16)
                     .saturating_add(2)
@@ -4576,7 +4697,7 @@ impl BorgTerminal {
                     Paragraph::new(
                         tooltip_lines
                             .into_iter()
-                            .map(|line| Line::from(line).style(Style::default().fg(Color::White)))
+                            .map(|(line, style)| Line::from(line).style(style))
                             .collect::<Vec<_>>(),
                     )
                     .style(Style::default().bg(COMMAND_PANEL_BG))
@@ -7335,9 +7456,17 @@ impl Transcript {
         (open > 0).then(|| format!("{open} open to-do{}", if open == 1 { "" } else { "s" }))
     }
 
+    #[cfg(test)]
     fn todo_tooltip_rows(&self, expanded: bool) -> Vec<String> {
+        self.todo_tooltip_rows_with_status(expanded)
+            .into_iter()
+            .map(|(row, _)| row)
+            .collect()
+    }
+
+    fn todo_tooltip_rows_with_status(&self, expanded: bool) -> Vec<(String, bool)> {
         if self.todos.is_empty() {
-            return vec!["No to-dos in the current plan".to_string()];
+            return vec![("No to-dos in the current plan".to_string(), false)];
         }
         let ordered = ordered_plan_items(&self.todos);
         let clipped = !expanded && ordered.len() > MAX_COLLAPSED_PLAN_ITEMS;
@@ -7354,16 +7483,22 @@ impl Transcript {
                     PlanItemStatus::InProgress => "●",
                     PlanItemStatus::Pending => "○",
                 };
-                format!("{glyph}  {}", item.content)
+                (
+                    format!("{glyph}  {}", item.content),
+                    item.status == PlanItemStatus::Completed,
+                )
             })
             .collect::<Vec<_>>();
         if clipped {
-            rows.push(format!(
-                "    + {} more · click to expand",
-                ordered.len() - MAX_COLLAPSED_PLAN_ITEMS
+            rows.push((
+                format!(
+                    "    + {} more · click to expand",
+                    ordered.len() - MAX_COLLAPSED_PLAN_ITEMS
+                ),
+                false,
             ));
         } else if expanded && ordered.len() > MAX_COLLAPSED_PLAN_ITEMS {
-            rows.push("    − click to show less".to_string());
+            rows.push(("    − click to show less".to_string(), false));
         }
         rows
     }
@@ -9133,6 +9268,52 @@ fn restore_transcript_viewport_anchor(
     scroll_max.saturating_sub(scroll_start)
 }
 
+fn read_git_worktree_status(cwd: &Path) -> Option<GitWorktreeStatus> {
+    let output = Command::new("git")
+        .args(["status", "--porcelain=v1", "--branch"])
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| parse_git_worktree_status(&String::from_utf8_lossy(&output.stdout)))
+        .flatten()
+}
+
+fn parse_git_worktree_status(output: &str) -> Option<GitWorktreeStatus> {
+    let mut lines = output.lines();
+    let header = lines.next()?.strip_prefix("## ")?;
+    let branch = header
+        .strip_prefix("No commits yet on ")
+        .unwrap_or(header)
+        .split("...")
+        .next()
+        .unwrap_or(header)
+        .split(" [")
+        .next()
+        .unwrap_or(header);
+    let branch = if branch == "HEAD (no branch)" {
+        "detached"
+    } else {
+        branch
+    };
+    let count = |name: &str| {
+        header
+            .split(['[', ']', ','])
+            .map(str::trim)
+            .find_map(|part| part.strip_prefix(name))
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0)
+    };
+    Some(GitWorktreeStatus {
+        branch: branch.to_string(),
+        dirty: lines.next().is_some(),
+        ahead: count("ahead "),
+        behind: count("behind "),
+    })
+}
+
 fn fish_style_path(path: &Path) -> String {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     fish_style_path_with_home(path, home.as_deref())
@@ -9670,7 +9851,7 @@ fn borg_control_tool_output_view(
             .and_then(serde_json::Value::as_array)
             .or_else(|| value.as_array())?;
         rows.push(format!(
-            "TEAM · {} agent{}",
+            "TEAM · {} subagent{}",
             agents.len(),
             if agents.len() == 1 { "" } else { "s" }
         ));
@@ -10218,6 +10399,20 @@ fn overlay_suppresses_background_hover(
     picker_open || team_switcher_open || keybindings_open
 }
 
+fn todo_tooltip_row_style(completed: bool) -> Style {
+    Style::default()
+        .fg(if completed {
+            Color::DarkGray
+        } else {
+            Color::White
+        })
+        .add_modifier(if completed {
+            Modifier::CROSSED_OUT
+        } else {
+            Modifier::empty()
+        })
+}
+
 fn bottom_interaction_hint(
     status_hovered: bool,
     status_is_interruptible: bool,
@@ -10233,7 +10428,7 @@ fn bottom_interaction_hint(
     } else if goal_status_hovered && goal_available {
         Some("left click toggle goal · right click open menu")
     } else if agents_status_hovered {
-        Some("left click to open agents menu")
+        Some("left click to open subagents menu")
     } else if model_status_hovered {
         Some("left click change model")
     } else if effort_status_hovered {
@@ -10292,6 +10487,7 @@ fn push_interactive_status_segment(
     spans: &mut Vec<Span<'static>>,
     value: Option<String>,
     hovered: bool,
+    resting_color: Color,
 ) {
     if let Some(value) = value {
         // The dot separator belongs to the status line, not to the segment, so
@@ -10303,13 +10499,33 @@ fn push_interactive_status_segment(
         spans.push(Span::styled(
             value,
             Style::default()
-                .fg(if hovered { Color::White } else { Color::Gray })
+                .fg(if hovered { Color::White } else { resting_color })
                 .add_modifier(if hovered {
                     Modifier::BOLD | Modifier::UNDERLINED
                 } else {
                     Modifier::empty()
                 }),
         ));
+    }
+}
+
+fn effort_status_color(effort: &str) -> Color {
+    match effort.to_ascii_lowercase().as_str() {
+        "low" => Color::LightGreen,
+        "medium" => Color::Cyan,
+        "high" => Color::Yellow,
+        "xhigh" => Color::LightMagenta,
+        "max" | "ultra" => Color::LightRed,
+        _ => Color::Gray,
+    }
+}
+
+fn permission_status_color(permission: &str) -> Color {
+    match permission {
+        "manual approvals" => Color::LightGreen,
+        "auto approvals" => Color::Yellow,
+        "full access" => Color::LightRed,
+        _ => Color::Gray,
     }
 }
 
@@ -10371,7 +10587,7 @@ fn history_loading_line() -> Line<'static> {
 fn agents_status_label(active_subagents: usize) -> Option<String> {
     (active_subagents > 0).then(|| {
         format!(
-            "{active_subagents} agent{}",
+            "{active_subagents} subagent{}",
             if active_subagents == 1 { "" } else { "s" }
         )
     })

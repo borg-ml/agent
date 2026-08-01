@@ -7,8 +7,12 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Arc, Mutex, mpsc as std_mpsc};
-use std::time::Instant;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+    mpsc as std_mpsc,
+};
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
@@ -35,6 +39,16 @@ use claude_stream::ClaudeStreamState;
 #[cfg(test)]
 use codex_items::*;
 use codex_stream::{CodexStreamMapper, codex_turn_usage};
+
+const CODEX_PREWARM_TIMEOUT: Duration = Duration::from_secs(45);
+
+struct CancelCodexWorkerOnDrop(Arc<AtomicBool>);
+
+impl Drop for CancelCodexWorkerOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub(super) struct ProviderEventTelemetry {
@@ -382,17 +396,36 @@ impl CodexAppServerPool {
         });
     }
 
-    fn take_prewarmed(&self) -> Option<Result<CodexAppServerClient>> {
-        self.prewarm
+    fn take_prewarmed(&self, cancellation: &AtomicBool) -> Option<Result<CodexAppServerClient>> {
+        let receiver = self
+            .prewarm
             .lock()
             .expect("Codex app-server prewarm lock poisoned")
-            .take()
-            .map(|receiver| {
-                receiver
-                    .recv()
-                    .context("Codex app-server prewarm worker stopped unexpectedly")
-                    .and_then(|result| result)
-            })
+            .take()?;
+        let deadline = Instant::now() + CODEX_PREWARM_TIMEOUT;
+        loop {
+            if cancellation.load(Ordering::Acquire) {
+                return Some(Err(anyhow!(
+                    "Codex app-server prewarm cancelled with its owning turn"
+                )));
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Some(Err(anyhow!(
+                    "Codex app-server prewarm timed out after {} ms",
+                    CODEX_PREWARM_TIMEOUT.as_millis()
+                )));
+            }
+            match receiver.recv_timeout(remaining.min(Duration::from_millis(50))) {
+                Ok(result) => return Some(result),
+                Err(std_mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std_mpsc::RecvTimeoutError::Disconnected) => {
+                    return Some(Err(anyhow!(
+                        "Codex app-server prewarm worker stopped unexpectedly"
+                    )));
+                }
+            }
+        }
     }
 
     pub fn compact(&self, thread_id: &str) -> Result<()> {
@@ -1174,6 +1207,8 @@ async fn run_codex_app_server_inner(
             );
         }
     }
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let _cancel_worker_on_drop = CancelCodexWorkerOnDrop(Arc::clone(&cancellation));
     tokio::task::spawn_blocking(move || -> Result<()> {
         let started_at = Instant::now();
         let mut control_rx = control_rx;
@@ -1248,24 +1283,41 @@ async fn run_codex_app_server_inner(
         });
         if !can_reuse
             && let Some(mut stale) = pooled.take()
-            && let Err(error) = stale.client.shutdown()
         {
-            tracing::warn!(?error, "failed to shut down stale Codex app-server");
+            stale
+                .client
+                .attach_cancellation(Arc::clone(&cancellation));
+            if let Err(error) = stale.client.shutdown() {
+                tracing::warn!(?error, "failed to shut down stale Codex app-server");
+            }
         }
-        let (mut client, client_source) = if let Some(pooled) = pooled {
+        if cancellation.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let (mut client, client_source) = if let Some(mut pooled) = pooled {
+            pooled
+                .client
+                .attach_cancellation(Arc::clone(&cancellation));
             (pooled.client, "pooled_thread")
-        } else if let Some(prewarmed) = pool.as_ref().and_then(CodexAppServerPool::take_prewarmed) {
+        } else if let Some(prewarmed) = pool
+            .as_ref()
+            .and_then(|pool| pool.take_prewarmed(&cancellation))
+        {
             match prewarmed {
                 Ok(client) => (client, "prewarmed_process"),
                 Err(error) => {
+                    if cancellation.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
                     tracing::warn!(?error, "Codex app-server prewarm failed; retrying inline");
                     (
-                        CodexAppServerClient::start(
+                        CodexAppServerClient::start_with_cancellation(
                             true,
                             req.web_search_allowed,
                             codex_auth.codex_home_override.as_deref(),
                             codex_auth.use_managed_openai_api_key,
                             &git_env,
+                            Some(Arc::clone(&cancellation)),
                         )
                         .context("failed to start codex app-server")?,
                         "cold_spawn",
@@ -1274,17 +1326,19 @@ async fn run_codex_app_server_inner(
             }
         } else {
             (
-                CodexAppServerClient::start(
+                CodexAppServerClient::start_with_cancellation(
                     true,
                     req.web_search_allowed,
                     codex_auth.codex_home_override.as_deref(),
                     codex_auth.use_managed_openai_api_key,
                     &git_env,
+                    Some(Arc::clone(&cancellation)),
                 )
                 .context("failed to start codex app-server")?,
                 "cold_spawn",
             )
         };
+        client.attach_cancellation(Arc::clone(&cancellation));
         tracing::debug!(
             target: "borg_ttft",
             stage = "codex_client_ready",
@@ -1292,6 +1346,9 @@ async fn run_codex_app_server_inner(
             source = client_source,
             "Codex request stage"
         );
+        if cancellation.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let persist_session = req.persist_session.unwrap_or(true);
         let mut turn_prompt = req.prompt.clone();
         let resumed = if can_reuse {
@@ -1299,6 +1356,9 @@ async fn run_codex_app_server_inner(
         } else if let Some(session_id) = req.session_id.as_deref()
             && !session_id.trim().is_empty()
         {
+            if cancellation.load(Ordering::Acquire) {
+                return Ok(());
+            }
             match client.thread_resume_with_permission(
                 session_id,
                 &req.system_prompt,
@@ -1311,6 +1371,9 @@ async fn run_codex_app_server_inner(
             ) {
                 Ok(_) => true,
                 Err(error) => {
+                    if cancellation.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
                     tracing::warn!(
                         %error,
                         session_id,
@@ -1339,6 +1402,9 @@ async fn run_codex_app_server_inner(
                 }
             }
         } else {
+            if cancellation.load(Ordering::Acquire) {
+                return Ok(());
+            }
             client
                 .thread_start_with_permission(
                     &req.system_prompt,
@@ -1359,6 +1425,9 @@ async fn run_codex_app_server_inner(
             resumed,
             "Codex request stage"
         );
+        if cancellation.load(Ordering::Acquire) {
+            return Ok(());
+        }
 
         let mut first_notification = true;
         let result = client
@@ -1383,7 +1452,11 @@ async fn run_codex_app_server_inner(
                 },
             )
             .context("codex app-server turn failed")?;
+        if cancellation.load(Ordering::Acquire) {
+            return Ok(());
+        }
         if let Some(pool) = pool.as_ref() {
+            client.detach_cancellation();
             *pool
                 .inner
                 .lock()
