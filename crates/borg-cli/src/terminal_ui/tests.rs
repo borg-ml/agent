@@ -2274,6 +2274,100 @@ fn the_command_palette_filters_across_commands_and_keybindings() {
     assert!(empty.contains("no match"), "{empty}");
 }
 
+#[test]
+fn resume_picker_filters_models_and_pages_without_wrapping() {
+    let mut local = PickerOption::new("Aug 1 · local", "local");
+    local.preview = Some("Latest response\n> **Model:** `gpt-5.6-sol`".to_string());
+    local.section = Some("Current directory".to_string());
+    let mut global = PickerOption::new("Jul 31 · global", "global");
+    global.preview = Some("Older response\n> **Model:** `claude-opus-5`".to_string());
+    global.section = Some("All directories".to_string());
+    let mut picker = Picker {
+        kind: PickerKind::Resume,
+        title: "Resume session",
+        options: vec![local, global],
+        selected: 0,
+        query: None,
+    };
+
+    picker.set_query("claude-opus".to_string());
+    assert_eq!(picker.matches(), vec![1]);
+    assert_eq!(picker.selected, 1);
+    let rendered = picker.display(112);
+    assert!(
+        rendered.contains("Resume session · claude-opus"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("ALL DIRECTORIES"), "{rendered}");
+    picker.set_query(String::new());
+    picker.selected = 0;
+    picker.page(12);
+    assert_eq!(picker.selected, 1);
+    picker.page(12);
+    assert_eq!(picker.selected, 1, "page navigation must stop at the end");
+}
+
+#[test]
+fn resume_picker_scroll_keeps_every_loaded_option_reachable() {
+    let options = (0..24)
+        .map(|index| {
+            let mut option = PickerOption::new(format!("Session {index:02}"), index.to_string());
+            option.preview = Some(format!("Preview for session {index:02}"));
+            if index == 0 {
+                option.section = Some("Current directory".to_string());
+            } else if index == 8 {
+                option.section = Some("All directories".to_string());
+            }
+            option
+        })
+        .collect::<Vec<_>>();
+    let mut picker = Picker {
+        kind: PickerKind::Resume,
+        title: "Resume session",
+        options,
+        selected: 0,
+        query: Some(String::new()),
+    };
+
+    assert!(picker.scroll(23));
+    assert_eq!(picker.selected, 23);
+    let line_count = picker.styled_lines(112, USER_LABEL_BLUE, USER_TEXT).len();
+    let offset = picker.scroll_offset(8, line_count);
+    let selected_line = picker
+        .option_row_offsets()
+        .into_iter()
+        .find_map(|(index, line)| (index == picker.selected).then_some(line))
+        .expect("selected option has a rendered row");
+    assert!((offset..offset + 8).contains(&selected_line));
+    assert!(
+        !picker.scroll(1),
+        "wheel scrolling stops at the last option"
+    );
+
+    picker.page(-12);
+    assert_eq!(picker.selected, 11);
+    picker.page(-12);
+    assert_eq!(picker.selected, 0);
+}
+
+#[test]
+fn launch_resume_picker_height_is_stable_and_reserved_once() {
+    let short_preview = composer_panel_height(4, 0, 18, true);
+    let long_preview = composer_panel_height(40, 0, 18, true);
+    assert_eq!(short_preview, 20);
+    assert_eq!(long_preview, 20);
+
+    let bounded = bounded_launch_composer_height(short_preview, 24, 1);
+    assert_eq!(bounded, 17);
+    let chunks = terminal_vertical_chunks(Rect::new(0, 0, 100, 24), 0, bounded, 1, true);
+    assert_eq!(chunks[0].height, 23);
+    assert_eq!(
+        chunks[3].height, 0,
+        "nested launch composer is not reserved twice"
+    );
+    assert!(bounded.saturating_add(6 + 1) <= 24);
+}
+
 /// Only commands whose bare form is not a command need finishing by hand;
 /// everything else must run outright or the palette is just a typing aid.
 #[test]

@@ -40,6 +40,9 @@ const ACTIVITY_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_m
 /// a resumed actor recovers independently of this presentation-only tail.
 const RICH_TUI_HISTORY_EVENT_LIMIT: usize = 64;
 const RICH_TUI_HISTORY_PAGE_SIZE: usize = 256;
+/// Resume filtering is local and eager, so load enough history to make search useful while
+/// keeping picker construction and per-keystroke filtering bounded.
+const RESUME_PICKER_SESSION_LIMIT: usize = 1_000;
 
 pub(crate) async fn run_remote_command(command: RemoteCommand) -> Result<()> {
     match command {
@@ -2426,7 +2429,7 @@ async fn run_local_agent_session(
                                 sqlite_store.as_ref(),
                                 session_id,
                                 &cwd,
-                                8,
+                                RESUME_PICKER_SESSION_LIMIT,
                             )
                             .await?;
                             if sessions.is_empty() {
@@ -3219,7 +3222,15 @@ async fn recent_session_options(
                     .to_string()
             })
             .unwrap_or_else(|| "Unknown time".to_string());
-        let label = format!("{timestamp} · {}", prompt_summary(&primary_preview, 56));
+        let label = [
+            Some(timestamp),
+            model.clone(),
+            Some(prompt_summary(&primary_preview, 56)),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" · ");
         let metadata = vec![
             started_at.map(|time| {
                 format!(
@@ -4945,6 +4956,15 @@ mod tests {
         store.create_session(target).await.unwrap();
         for kind in [
             SessionEventKind::SessionStarted,
+            SessionEventKind::SessionConfigured {
+                cwd: dir.path().to_path_buf(),
+                provider: CodingProvider::Codex,
+                model: Some("gpt-resume-filter".to_string()),
+                effort: Some("high".to_string()),
+                fast: false,
+                response_language: ResponseLanguage::Auto,
+                permission_mode: PermissionMode::FullAccess,
+            },
             SessionEventKind::Message {
                 message_id: Uuid::new_v4(),
                 actor: EventActor::User,
@@ -4985,8 +5005,10 @@ mod tests {
             .expect("target session should be resumable");
 
         assert!(target.label.contains("Latest formatted response"));
+        assert!(target.label.contains("gpt-resume-filter"));
         assert!(!target.label.contains("First setup request"));
         assert!(target.preview.starts_with("Latest **formatted** response"));
+        assert!(target.preview.contains("**Model:** `gpt-resume-filter`"));
         assert!(target.preview.contains("Latest prompt:"));
         assert!(target.preview.contains("Latest formatted request"));
     }
@@ -5108,6 +5130,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resume_picker_loads_older_sessions_in_recent_first_order() {
+        const SESSION_COUNT: usize = 12;
+
+        let dir = tempdir().expect("session directory");
+        let store = SqliteSessionStore::open(dir.path().join("sessions.sqlite3"))
+            .await
+            .unwrap();
+        let current = Uuid::new_v4();
+        store.create_session(current).await.unwrap();
+        let mut session_ids = Vec::with_capacity(SESSION_COUNT);
+        for index in 0..SESSION_COUNT {
+            let session_id = Uuid::new_v4();
+            session_ids.push(session_id);
+            store.create_session(session_id).await.unwrap();
+            for kind in [
+                SessionEventKind::SessionStarted,
+                SessionEventKind::SessionConfigured {
+                    cwd: dir.path().to_path_buf(),
+                    provider: CodingProvider::Codex,
+                    model: Some(format!("picker-model-{index}")),
+                    effort: None,
+                    fast: false,
+                    response_language: ResponseLanguage::Auto,
+                    permission_mode: PermissionMode::FullAccess,
+                },
+                SessionEventKind::Message {
+                    message_id: Uuid::new_v4(),
+                    actor: EventActor::User,
+                    text: format!("picker session {index}"),
+                    attachments: Vec::new(),
+                    status: MessageStatus::Complete,
+                    delivery: None,
+                },
+            ] {
+                store
+                    .append(SessionEvent::new(session_id, 0, kind))
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let options = recent_session_options(
+            dir.path(),
+            &store,
+            current,
+            dir.path(),
+            RESUME_PICKER_SESSION_LIMIT,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(options.len(), SESSION_COUNT);
+        assert_eq!(
+            options.iter().map(|option| option.id).collect::<Vec<_>>(),
+            session_ids.into_iter().rev().collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
     async fn incompatible_legacy_session_does_not_block_discovery_or_mutate_source() {
         let dir = tempdir().expect("session directory");
         let store = SqliteSessionStore::open(dir.path().join("sessions.sqlite3"))
@@ -5210,19 +5291,31 @@ mod tests {
         }
 
         assert_eq!(
-            recent_session_options(dir.path(), &store, current, dir.path(), 8)
-                .await
-                .unwrap()
-                .len(),
-            8
+            recent_session_options(
+                dir.path(),
+                &store,
+                current,
+                dir.path(),
+                RESUME_PICKER_SESSION_LIMIT,
+            )
+            .await
+            .unwrap()
+            .len(),
+            SESSION_COUNT
         );
         let mut samples = Vec::with_capacity(SAMPLES);
         for _ in 0..SAMPLES {
             let started = Instant::now();
-            let options = recent_session_options(dir.path(), &store, current, dir.path(), 8)
-                .await
-                .unwrap();
-            assert_eq!(options.len(), 8);
+            let options = recent_session_options(
+                dir.path(),
+                &store,
+                current,
+                dir.path(),
+                RESUME_PICKER_SESSION_LIMIT,
+            )
+            .await
+            .unwrap();
+            assert_eq!(options.len(), SESSION_COUNT);
             samples.push(started.elapsed());
         }
         samples.sort_unstable();

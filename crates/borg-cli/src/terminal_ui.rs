@@ -669,7 +669,18 @@ impl Picker {
         self.options
             .iter()
             .enumerate()
-            .filter(|(_, option)| fuzzy_matches(&option.label, query))
+            .filter(|(_, option)| {
+                fuzzy_matches(&option.label, query)
+                    || fuzzy_matches(&option.value, query)
+                    || option
+                        .section
+                        .as_deref()
+                        .is_some_and(|section| fuzzy_matches(section, query))
+                    || option
+                        .preview
+                        .as_deref()
+                        .is_some_and(|preview| fuzzy_matches(preview, query))
+            })
             .map(|(index, _)| index)
             .collect()
     }
@@ -701,6 +712,17 @@ impl Picker {
             .selected_position()
             .map_or(0, |position| (position + 1) % matches.len());
         self.selected = matches[position];
+    }
+
+    fn page(&mut self, delta: isize) {
+        let matches = self.matches();
+        let Some(position) = self.selected_position() else {
+            return;
+        };
+        let target = position
+            .saturating_add_signed(delta)
+            .min(matches.len().saturating_sub(1));
+        self.selected = matches[target];
     }
 
     /// Retarget the filter, keeping the selection on a row that still matches.
@@ -821,6 +843,21 @@ impl Picker {
         true
     }
 
+    /// Keep the selected row inside a picker viewport. This is shared by the
+    /// normal one-column picker and Resume's two-column surface so keyboard,
+    /// wheel, and mouse hit-testing all use the same slice.
+    fn scroll_offset(&self, content_height: usize, line_count: usize) -> usize {
+        let max_scroll = line_count.saturating_sub(content_height);
+        let selected_line = self
+            .option_row_offsets()
+            .iter()
+            .find_map(|(index, line)| (*index == self.selected).then_some(*line))
+            .unwrap_or(1);
+        selected_line
+            .saturating_sub(content_height.saturating_sub(2))
+            .min(max_scroll)
+    }
+
     fn selected_value(self) -> String {
         self.options[self.selected].value.clone()
     }
@@ -902,16 +939,22 @@ impl Picker {
         let left_content_width = left_width.saturating_sub(2);
         let right_width = width.saturating_sub(left_width + 3).max(1);
         let preview = self
-            .options
-            .get(self.selected)
+            .selected_position()
+            .and_then(|_| self.options.get(self.selected))
             .and_then(|option| option.preview.as_deref())
-            .unwrap_or("No session preview available");
+            .unwrap_or("No matching session");
         let preview_lines = markdown_lines(preview, right_width, Some(preview_message_color));
-        let option_rows = self.styled_option_rows();
+        let mut option_rows = self.styled_option_rows();
+        if option_rows.is_empty() {
+            option_rows.push((
+                "  no match".to_string(),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
         let row_count = option_rows.len().max(preview_lines.len());
         let mut lines = vec![Line::from(vec![
             Span::styled(
-                format!("> {}", pad_display(self.title, left_content_width)),
+                pad_display(&truncate_table_cell(&self.header(), left_width), left_width),
                 Style::default()
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
@@ -1976,7 +2019,9 @@ impl BorgTerminal {
                 })
                 .collect(),
             selected: 0,
-            query: None,
+            // Resume owns typed characters so session labels, responses, and
+            // metadata such as model names can be searched immediately.
+            query: Some(String::new()),
         });
     }
 
@@ -3446,29 +3491,25 @@ impl BorgTerminal {
                 .styled_lines_for_ranges(&composer_ranges, prompt_marker)
         };
         let composer_max_height = if resume_picker_open { 18 } else { 8 };
-        let composer_height = composer_line_count
-            .max(composer_cursor.0.saturating_add(1))
-            .clamp(1, composer_max_height) as u16
-            + 2;
+        let composer_height = composer_panel_height(
+            composer_line_count,
+            composer_cursor.0,
+            composer_max_height,
+            is_launch_screen && resume_picker_open,
+        );
+        let composer_height = if is_launch_screen {
+            bounded_launch_composer_height(composer_height, terminal_size.height, controls_height)
+        } else {
+            composer_height
+        };
         let composer_scroll = if let Some(picker) = self.picker.as_ref().filter(|picker| {
             !matches!(
                 picker.kind,
-                PickerKind::Commands
-                    | PickerKind::MessageActions
-                    | PickerKind::Goal
-                    | PickerKind::Resume
+                PickerKind::Commands | PickerKind::MessageActions | PickerKind::Goal
             )
         }) {
             let content_height = usize::from(composer_height.saturating_sub(2));
-            let max_scroll = composer_line_count.saturating_sub(content_height);
-            let selected_line = picker
-                .option_row_offsets()
-                .iter()
-                .find_map(|(index, line)| (*index == picker.selected).then_some(*line))
-                .unwrap_or(1);
-            selected_line
-                .saturating_sub(content_height.saturating_sub(2))
-                .min(max_scroll) as u16
+            picker.scroll_offset(content_height, composer_line_count) as u16
         } else {
             (composer_cursor.0 as u16).saturating_sub(composer_height.saturating_sub(3))
         };
@@ -3500,16 +3541,13 @@ impl BorgTerminal {
         let cursor_visible = cursor_blink_visible(self.cursor_blink_started_at.elapsed());
         self.terminal.draw(|frame| {
             let area = centered_content_area(frame.area());
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Min(3),
-                    Constraint::Length(queued_prompt_panel_height(&queued_prompts, area.width)),
-                    Constraint::Length(2 * u16::from(!is_launch_screen)),
-                    Constraint::Length(composer_height),
-                    Constraint::Length(footer_height),
-                ])
-                .split(area);
+            let chunks = terminal_vertical_chunks(
+                area,
+                queued_prompt_panel_height(&queued_prompts, area.width),
+                composer_height,
+                footer_height,
+                is_launch_screen,
+            );
             let status_color = session_status_color(status);
             let (status_area, transcript_area, composer_area, footer_area) = if is_launch_screen {
                 let launch_width = composer_area_width.min(chunks[0].width);
@@ -3926,10 +3964,7 @@ impl BorgTerminal {
             if let Some(picker) = self.picker.as_ref().filter(|picker| {
                 !matches!(
                     picker.kind,
-                    PickerKind::MessageActions
-                        | PickerKind::Commands
-                        | PickerKind::Goal
-                        | PickerKind::Resume
+                    PickerKind::MessageActions | PickerKind::Commands | PickerKind::Goal
                 )
             }) {
                 for (index, line) in picker.option_row_offsets() {
@@ -3938,11 +3973,14 @@ impl BorgTerminal {
                     };
                     let row = Rect {
                         x: composer_area.x.saturating_add(1),
-                        y: composer_area.y.saturating_add(1 + line as u16),
+                        y: composer_area
+                            .y
+                            .saturating_add(u16::from(!is_launch_screen))
+                            .saturating_add(line as u16),
                         width: composer_area.width.saturating_sub(2),
                         height: 1,
                     };
-                    if row.y < composer_area.bottom().saturating_sub(1) {
+                    if row.y < composer_area.bottom() {
                         next_picker_hit_areas.push((row, index));
                     }
                 }
@@ -4695,6 +4733,74 @@ impl BorgTerminal {
                 }
                 _ => UiAction::None,
             });
+        }
+        if matches!(
+            self.picker.as_ref().map(|picker| picker.kind),
+            Some(PickerKind::Resume)
+        ) {
+            if is_composer_newline(&self.keymap, &key) {
+                self.composer.insert("\n");
+                return Ok(UiAction::None);
+            }
+            let picker = self.picker.as_mut().expect("checked above");
+            let edit_query = |picker: &mut Picker, edit: &dyn Fn(&mut String)| {
+                let mut query = picker.query.clone().unwrap_or_default();
+                edit(&mut query);
+                picker.set_query(query);
+            };
+            return match key.code {
+                KeyCode::Up | KeyCode::Left => {
+                    picker.previous();
+                    Ok(UiAction::None)
+                }
+                KeyCode::Down | KeyCode::Right | KeyCode::Tab => {
+                    picker.next();
+                    Ok(UiAction::None)
+                }
+                KeyCode::PageUp => {
+                    picker.page(-12);
+                    Ok(UiAction::None)
+                }
+                KeyCode::PageDown => {
+                    picker.page(12);
+                    Ok(UiAction::None)
+                }
+                KeyCode::Home => {
+                    if let Some(index) = picker.matches().first().copied() {
+                        picker.selected = index;
+                    }
+                    Ok(UiAction::None)
+                }
+                KeyCode::End => {
+                    if let Some(index) = picker.matches().last().copied() {
+                        picker.selected = index;
+                    }
+                    Ok(UiAction::None)
+                }
+                KeyCode::Backspace => {
+                    edit_query(picker, &|query| {
+                        query.pop();
+                    });
+                    Ok(UiAction::None)
+                }
+                KeyCode::Char(character)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    edit_query(picker, &|query| query.push(character));
+                    Ok(UiAction::None)
+                }
+                KeyCode::Enter if picker.selected_position().is_some() => {
+                    self.run_selected_picker()
+                }
+                KeyCode::Enter => Ok(UiAction::None),
+                KeyCode::Esc => {
+                    self.picker = None;
+                    Ok(UiAction::None)
+                }
+                _ => Ok(UiAction::None),
+            };
         }
         // Composer editing shortcuts take precedence over Enter-driven picker
         // confirmation. Otherwise opening any picker turns Shift+Enter into a
@@ -8981,6 +9087,55 @@ fn responsive_launch_width(available: u16) -> u16 {
         available.saturating_mul(3) / 5
     }
     .max(1)
+}
+
+fn composer_panel_height(
+    line_count: usize,
+    cursor_row: usize,
+    max_content_height: usize,
+    fixed_height: bool,
+) -> u16 {
+    let content_height = if fixed_height {
+        max_content_height
+    } else {
+        line_count
+            .max(cursor_row.saturating_add(1))
+            .clamp(1, max_content_height)
+    };
+    (content_height.min(u16::MAX as usize) as u16).saturating_add(2)
+}
+
+/// The launch composition lives inside the first root chunk, so its composer
+/// must leave room for the splash, controls, and one-line status footer.
+fn bounded_launch_composer_height(desired: u16, terminal_height: u16, controls_height: u16) -> u16 {
+    desired.min(
+        terminal_height
+            .saturating_sub(6)
+            .saturating_sub(controls_height)
+            .max(1),
+    )
+}
+
+fn terminal_vertical_chunks(
+    area: Rect,
+    queued_height: u16,
+    composer_height: u16,
+    footer_height: u16,
+    is_launch_screen: bool,
+) -> [Rect; 5] {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(3),
+            Constraint::Length(queued_height),
+            Constraint::Length(2 * u16::from(!is_launch_screen)),
+            // On the launch screen the composer is nested in chunk zero. Do
+            // not reserve it a second time at the bottom of the root layout.
+            Constraint::Length(composer_height * u16::from(!is_launch_screen)),
+            Constraint::Length(footer_height),
+        ])
+        .split(area);
+    [chunks[0], chunks[1], chunks[2], chunks[3], chunks[4]]
 }
 
 fn centered_content_area(area: Rect) -> Rect {
