@@ -511,6 +511,8 @@ pub struct BorgTerminal {
     hovered_message: Option<usize>,
     hovered_link: Option<String>,
     hovered_picker_option: Option<usize>,
+    status_area: Option<Rect>,
+    status_hovered: bool,
     goal_status_area: Option<Rect>,
     goal_status_hovered: bool,
     todo_status_area: Option<Rect>,
@@ -1192,6 +1194,8 @@ impl BorgTerminal {
             hovered_message: None,
             hovered_link: None,
             hovered_picker_option: None,
+            status_area: None,
+            status_hovered: false,
             goal_status_area: None,
             goal_status_hovered: false,
             todo_status_area: None,
@@ -2312,6 +2316,7 @@ impl BorgTerminal {
                     .picker_hit_areas
                     .iter()
                     .find_map(|(area, index)| area.contains(pointer).then_some(*index));
+                self.status_hovered = self.status_area.is_some_and(|area| area.contains(pointer));
                 self.goal_status_hovered = self
                     .goal_status_area
                     .is_some_and(|area| area.contains(pointer));
@@ -2348,6 +2353,14 @@ impl BorgTerminal {
                 self.keybindings_hovered = self
                     .keybindings_hint_area
                     .is_some_and(|area| area.contains(pointer));
+                if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right))
+                    && self
+                        .goal_status_area
+                        .is_some_and(|area| area.contains(pointer))
+                {
+                    self.open_goal_picker();
+                    return Ok(UiAction::None);
+                }
                 if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
                     if self
                         .back_to_director_area
@@ -2366,6 +2379,18 @@ impl BorgTerminal {
                         }
                         return Ok(UiAction::None);
                     }
+                    if self.status_area.is_some_and(|area| area.contains(pointer))
+                        && matches!(
+                            self.active_status(),
+                            SessionStatus::Starting
+                                | SessionStatus::Running
+                                | SessionStatus::WaitingForApproval
+                        )
+                    {
+                        return Ok(UiAction::Interrupt {
+                            target: self.focused_child,
+                        });
+                    }
                     if self
                         .agents_status_area
                         .is_some_and(|area| area.contains(pointer))
@@ -2377,6 +2402,13 @@ impl BorgTerminal {
                         .goal_status_area
                         .is_some_and(|area| area.contains(pointer))
                     {
+                        if let Some(command) = self.active_goal().and_then(goal_toggle_command) {
+                            return Ok(UiAction::Submit {
+                                target: None,
+                                text: command.to_string(),
+                                attachments: Vec::new(),
+                            });
+                        }
                         self.open_goal_picker();
                         return Ok(UiAction::None);
                     }
@@ -3234,6 +3266,10 @@ impl BorgTerminal {
             status_label(status)
         };
         let status_glyph = activity_glyph(status);
+        let status_is_interruptible = matches!(
+            status,
+            SessionStatus::Starting | SessionStatus::Running | SessionStatus::WaitingForApproval
+        );
         let (model_status, effort_status, fast_status, permission_status, cwd_status) =
             self.transcript.config_statuses();
         let cache_status = self.transcript.cache_status(Utc::now());
@@ -3291,6 +3327,17 @@ impl BorgTerminal {
         let showing_primary_controls =
             !showing_slash_suggestions && notice.is_none() && cold_cache_guidance.is_none();
         let primary_controls = primary_controls_line(&self.keymap);
+        let interaction_hint = if self.status_hovered && status_is_interruptible {
+            Some("left click interrupt")
+        } else if self.goal_status_hovered && active_goal.is_some() {
+            Some("left click toggle goal · right click open menu")
+        } else {
+            None
+        };
+        let primary_controls_display = interaction_hint.map_or_else(
+            || primary_controls.clone(),
+            |hint| format!("{hint} · {primary_controls}"),
+        );
         let keybindings_hint = format!("keybindings {}", self.keymap.label(KeyAction::Keybindings));
         let notice_style = Style::default().fg(
             if notice
@@ -3313,7 +3360,15 @@ impl BorgTerminal {
                     .map(|line| Line::from(Span::styled(line, Style::default().fg(Color::Yellow))))
                     .collect()
             } else {
-                vec![Line::from(primary_controls.clone())]
+                vec![if let Some(hint) = interaction_hint {
+                    Line::from(vec![
+                        Span::styled(hint, Style::default().fg(Color::Yellow)),
+                        Span::raw(" · "),
+                        Span::raw(primary_controls.clone()),
+                    ])
+                } else {
+                    Line::from(primary_controls.clone())
+                }]
             }
         });
         let controls = if is_launch_screen {
@@ -3429,6 +3484,7 @@ impl BorgTerminal {
         let mut next_entry_hit_areas = Vec::new();
         let mut next_picker_hit_areas = Vec::new();
         let mut next_jump_to_bottom_area = None;
+        let mut next_status_area = None;
         let mut next_goal_status_area = None;
         let mut next_todo_status_area = None;
         let mut next_agents_status_area = None;
@@ -3963,9 +4019,21 @@ impl BorgTerminal {
                         .min(composer_area.bottom().saturating_sub(1)),
                 });
             }
+            let status_highlight = self.status_hovered && status_is_interruptible;
+            let status_style = Style::default()
+                .fg(if status_highlight {
+                    Color::White
+                } else {
+                    status_color
+                })
+                .add_modifier(if status_highlight {
+                    Modifier::BOLD | Modifier::UNDERLINED
+                } else {
+                    Modifier::empty()
+                });
             let mut status_spans = vec![Span::styled(
                 format!(" {status_glyph} {status_label}"),
-                Style::default().fg(status_color),
+                status_style,
             )];
             if session_is_active
                 && self.focused_child.is_none()
@@ -3977,11 +4045,9 @@ impl BorgTerminal {
                             .max(0) as u64
                     }))
             {
-                status_spans.push(Span::styled(
-                    format!(" {duration}"),
-                    Style::default().fg(status_color),
-                ));
+                status_spans.push(Span::styled(format!(" {duration}"), status_style));
             }
+            let status_width = status_spans.iter().map(|span| span.width()).sum::<usize>();
             let agents_status = agents_status_label(active_subagents);
             let agents_status_width = agents_status.as_ref().map(|status| status.width());
             if agents_status.is_some() {
@@ -4113,6 +4179,14 @@ impl BorgTerminal {
             } else {
                 0
             };
+            if status_width > 0 {
+                next_status_area = Some(Rect {
+                    x: status_area.x.saturating_add(alignment_offset),
+                    y: status_area.y,
+                    width: (status_width as u16).min(status_area.width),
+                    height: 1,
+                });
+            }
             if let Some(agents_status_width) = agents_status_width {
                 next_agents_status_area = Some(Rect {
                     x: status_area
@@ -4384,7 +4458,7 @@ impl BorgTerminal {
             }
             if showing_primary_controls {
                 let (controls_x, controls_y, controls_width) = if is_launch_screen {
-                    let width = primary_controls.width() as u16;
+                    let width = primary_controls_display.width() as u16;
                     (
                         composer_area
                             .x
@@ -4396,7 +4470,9 @@ impl BorgTerminal {
                     (
                         footer_area.x.saturating_add(1),
                         footer_area.y,
-                        primary_controls.width().min(footer_area.width as usize) as u16,
+                        primary_controls_display
+                            .width()
+                            .min(footer_area.width as usize) as u16,
                     )
                 };
                 let hint_width = keybindings_hint.width() as u16;
@@ -4527,6 +4603,7 @@ impl BorgTerminal {
         self.entry_hit_areas = next_entry_hit_areas;
         self.picker_hit_areas = next_picker_hit_areas;
         self.jump_to_bottom_area = next_jump_to_bottom_area;
+        self.status_area = next_status_area;
         self.goal_status_area = next_goal_status_area;
         self.todo_status_area = next_todo_status_area;
         self.agents_status_area = next_agents_status_area;
@@ -8736,7 +8813,7 @@ fn command_palette_options(keymap: &KeyMap) -> Vec<PickerOption> {
     }
     for (index, (action, chord)) in keybinding_reference(keymap).into_iter().enumerate() {
         // An empty value marks a row with nothing to run; Enter just closes.
-        let mut option = PickerOption::new(format!("{action:<16}{chord}"), String::new());
+        let mut option = PickerOption::new(format!("{action:<26} {chord}"), String::new());
         if index == 0 {
             option.section = Some("Keybindings".to_string());
         }
@@ -8925,25 +9002,27 @@ fn footer_metadata_text(context_status: &str, cwd_status: &str, max_width: usize
     if cwd_status.is_empty() {
         return truncate_table_cell(context_status, max_width);
     }
+    // Keep one cell of breathing room between the path and the terminal edge.
+    let cwd_display = format!("{cwd_status} ");
     if context_status.is_empty() {
-        return cwd_status.to_string();
+        return cwd_display;
     }
     let separator = "  ·  ";
-    let cwd_width = cwd_status.width();
+    let cwd_width = cwd_display.width();
     let separator_width = separator.width();
     let context_width = context_status.width();
     let required_width = context_width
         .saturating_add(separator_width)
         .saturating_add(cwd_width);
     if required_width <= max_width {
-        return format!("{context_status}{separator}{cwd_status}");
+        return format!("{context_status}{separator}{cwd_display}");
     }
     if cwd_width.saturating_add(separator_width) > max_width {
-        return cwd_status.to_string();
+        return cwd_display;
     }
     let context_width = max_width.saturating_sub(cwd_width + separator_width);
     format!(
-        "{}{separator}{cwd_status}",
+        "{}{separator}{cwd_display}",
         truncate_table_cell(context_status, context_width)
     )
 }

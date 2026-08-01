@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -860,6 +860,10 @@ async fn run_local_agent_session(
         .map(|((interaction_id, kind), payload)| (interaction_id, kind, payload));
     let mut child_pending_approvals = child_pending_approval_ids(&team_history);
     let mut saw_running = false;
+    // A prompt can be accepted by the local command channel while the actor
+    // still reports Ready. Preserve that handoff on terminal hangup instead
+    // of mistaking the short admission window for an idle session.
+    let mut pending_prompt_ids = HashSet::new();
     let mut stop_sent = false;
     let mut user_requested_exit = false;
     let mut exit_notice = None;
@@ -1019,6 +1023,11 @@ async fn run_local_agent_session(
                 let Some(event) = event else {
                     break;
                 };
+                if let Some(message_id) = committed_prompt_id(&event.kind) {
+                    pending_prompt_ids.remove(&message_id);
+                } else if matches!(event.kind, SessionEventKind::Error { .. }) {
+                    pending_prompt_ids.clear();
+                }
                 if let SessionEventKind::StatusChanged { status: next, .. } = &event.kind {
                     status = *next;
                     saw_running |= *next == SessionStatus::Running;
@@ -1555,14 +1564,18 @@ async fn run_local_agent_session(
                             idle_input(line)
                         };
                         if !text.is_empty() {
-                            session_command_tx.send(HostCommand::Prompt {
+                            let message_id = Uuid::new_v4();
+                            pending_prompt_ids.insert(message_id);
+                            if session_command_tx.send(HostCommand::Prompt {
                                 session_id,
-                                message_id: Uuid::new_v4(),
+                                message_id,
                                 text,
                                 attachments: Vec::new(),
                                 output_schema: None,
                                 delivery,
-                            }).await.ok();
+                            }).await.is_err() {
+                                pending_prompt_ids.remove(&message_id);
+                            }
                         }
                     }
                 }
@@ -1970,7 +1983,9 @@ async fn run_local_agent_session(
                             .as_ref()
                             .expect("terminal")
                             .has_pending_scroll_frame();
+                        pending_prompt_ids.insert(message_id);
                         if session_command_tx.send(command).await.is_err() {
+                            pending_prompt_ids.remove(&message_id);
                             terminal
                                 .as_mut()
                                 .expect("terminal")
@@ -2021,7 +2036,9 @@ async fn run_local_agent_session(
                                 .as_ref()
                                 .expect("terminal")
                                 .has_pending_scroll_frame();
+                            pending_prompt_ids.insert(message_id);
                             if session_command_tx.send(command).await.is_err() {
+                                pending_prompt_ids.remove(&message_id);
                                 terminal
                                     .as_mut()
                                     .expect("terminal")
@@ -2683,6 +2700,7 @@ async fn run_local_agent_session(
                                             .as_ref()
                                             .expect("terminal")
                                             .has_pending_scroll_frame();
+                                        pending_prompt_ids.insert(message_id);
                                         if let Err(error) = session_command_tx.send(HostCommand::Prompt {
                                             session_id,
                                             message_id,
@@ -2691,6 +2709,7 @@ async fn run_local_agent_session(
                                             output_schema: None,
                                             delivery,
                                         }).await {
+                                            pending_prompt_ids.remove(&message_id);
                                             let HostCommand::Prompt {
                                                 text, attachments, ..
                                             } = error.0
@@ -2747,7 +2766,7 @@ async fn run_local_agent_session(
                 let signal = signal.context("failed to listen for a process shutdown signal")?;
                 tracing::warn!(%session_id, %signal, "restoring terminal before process shutdown");
                 shutdown_terminal(&mut terminal).await;
-                if should_detach_on_terminal_hangup(signal, status) {
+                if should_detach_on_terminal_hangup(signal, status, !pending_prompt_ids.is_empty()) {
                     // A terminal emulator can disappear independently of Borg (for
                     // example, a GPU/renderer crash). Keep the durable actor and
                     // control socket alive so a new `borg resume` can attach to the
@@ -2974,12 +2993,31 @@ fn resume_instructions(session_id: Uuid, active_elsewhere: bool) -> String {
     format!("{warning}Copy and paste the line below to resume:\nborg resume {session_id}")
 }
 
-fn should_detach_on_terminal_hangup(signal: &str, status: SessionStatus) -> bool {
+fn should_detach_on_terminal_hangup(
+    signal: &str,
+    status: SessionStatus,
+    prompt_submission_pending: bool,
+) -> bool {
     signal == "SIGHUP"
-        && matches!(
-            status,
-            SessionStatus::Starting | SessionStatus::Running | SessionStatus::WaitingForApproval
-        )
+        && (prompt_submission_pending
+            || matches!(
+                status,
+                SessionStatus::Starting
+                    | SessionStatus::Running
+                    | SessionStatus::WaitingForApproval
+            ))
+}
+
+fn committed_prompt_id(kind: &SessionEventKind) -> Option<Uuid> {
+    match kind {
+        SessionEventKind::Message {
+            message_id,
+            actor: EventActor::User,
+            status: MessageStatus::Complete,
+            ..
+        } => Some(*message_id),
+        _ => None,
+    }
 }
 
 fn repeated_ctrl_c(last: &mut Option<std::time::Instant>, now: std::time::Instant) -> bool {
@@ -4650,19 +4688,28 @@ mod tests {
     fn active_session_survives_terminal_hangup_but_idle_session_stops() {
         assert!(should_detach_on_terminal_hangup(
             "SIGHUP",
-            SessionStatus::Running
+            SessionStatus::Running,
+            false
         ));
         assert!(should_detach_on_terminal_hangup(
             "SIGHUP",
-            SessionStatus::WaitingForApproval
+            SessionStatus::WaitingForApproval,
+            false
         ));
         assert!(!should_detach_on_terminal_hangup(
             "SIGHUP",
-            SessionStatus::Ready
+            SessionStatus::Ready,
+            false
         ));
         assert!(!should_detach_on_terminal_hangup(
             "SIGTERM",
-            SessionStatus::Running
+            SessionStatus::Running,
+            true
+        ));
+        assert!(should_detach_on_terminal_hangup(
+            "SIGHUP",
+            SessionStatus::Ready,
+            true
         ));
     }
 
