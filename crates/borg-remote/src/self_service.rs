@@ -72,8 +72,9 @@ impl SelfServiceContext {
             "exists": exists,
             "settings": serde_json::to_value(settings)?,
             "hot_reload": ["commands.aliases", "keybindings"],
+            "next_turn_reload": ["extensions", "mcp"],
             "restart_required": [
-                "capabilities", "extensions", "mcp", "team", "approvals", "updates"
+                "capabilities", "team", "approvals", "updates"
             ]
         }))
     }
@@ -186,10 +187,11 @@ impl SelfServiceContext {
             "path": path,
             "updated_sections": updated_sections,
             "hot_reloaded": ["commands.aliases", "keybindings"],
+            "next_turn_reloaded": ["extensions", "mcp"],
             "restart_required": [
-                "capabilities", "extensions", "mcp", "team", "approvals", "updates"
+                "capabilities", "team", "approvals", "updates"
             ],
-            "note": "Aliases and keybindings are reloaded by the running TUI; provider/MCP and capability changes take effect on the next session."
+            "note": "Aliases and keybindings reload in the running TUI. Blu and base MCP catalogs swap at the next turn boundary; capability/team/approval/update policy changes require a new session."
         }))
     }
 
@@ -235,7 +237,7 @@ impl SelfServiceContext {
             "path": skill_path,
             "hot_reload": "next native turn",
             "restart_required": false,
-            "note": "Project skills are rescanned at the start of every native turn. MCP servers belong in an extension manifest and require a new session."
+            "note": "Project skills are rescanned at the start of every native turn. Blu MCP manifests also reload at the next turn boundary."
         }))
     }
 
@@ -321,7 +323,7 @@ pub(crate) fn tool_specs() -> Vec<Value> {
         }),
         json!({
             "name": "update_agent_settings",
-            "description": "Safely merge typed Borg settings into the user agent.toml. Only known top-level sections are accepted; aliases and keybindings hot-reload in the running TUI, while provider/MCP/capability changes require a new session.",
+            "description": "Safely merge typed Borg settings into the user agent.toml. Aliases/keybindings hot-reload in the TUI; Blu and MCP catalogs reload at the next turn boundary; capability and policy changes require a new session.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -374,8 +376,7 @@ fn yaml_scalar(value: &str) -> String {
     let escaped = value
         .replace('\\', "\\\\")
         .replace('"', "\\\"")
-        .replace('\r', " ")
-        .replace('\n', " ");
+        .replace(['\r', '\n'], " ");
     format!("\"{escaped}\"")
 }
 

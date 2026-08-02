@@ -1,5 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -16,13 +17,13 @@ use uuid::Uuid;
 
 use crate::receipt::{ReceiptState, ReceiptStore, atomic_write_secure};
 use crate::{
-    CodingProvider, HostCapabilities, HostCommand, HostCommandEnvelope, HostHeartbeat,
-    LaunchSession, ProviderCapability, REMOTE_PROTOCOL_VERSION, RemoteHost, RemoteHostIdentity,
-    SessionEvent, SessionLiveEvent, SessionStore, SessionWriterLease, SqliteSessionStore,
-    WorkspaceAttachment, WorkspaceCommandErrorCode, WorkspaceCommandOutcome,
-    WorkspaceCommandRequest, WorkspaceCommandResponse, WorkspaceFilesystemErrorCode,
-    WorkspaceFilesystemOutcome, WorkspaceFilesystemRequest, WorkspaceFilesystemResponse,
-    execute_workspace_command, execute_workspace_filesystem,
+    AgentTurnExecutor, CodingProvider, HostCapabilities, HostCommand, HostCommandEnvelope,
+    HostHeartbeat, LaunchSession, ProviderCapability, REMOTE_PROTOCOL_VERSION, RemoteHost,
+    RemoteHostIdentity, SessionEvent, SessionLiveEvent, SessionPayloadRef, SessionStore,
+    SessionWriterLease, SqliteSessionStore, WorkspaceAttachment, WorkspaceCommandErrorCode,
+    WorkspaceCommandOutcome, WorkspaceCommandRequest, WorkspaceCommandResponse,
+    WorkspaceFilesystemErrorCode, WorkspaceFilesystemOutcome, WorkspaceFilesystemRequest,
+    WorkspaceFilesystemResponse, execute_workspace_command, execute_workspace_filesystem,
     run_agent_session_with_store_and_writer,
 };
 
@@ -96,6 +97,12 @@ struct EventBatch<'a> {
     events: &'a [SessionEvent],
 }
 
+// Keep ordinary uploads comfortably below the relay's request-body ceiling.
+// The adaptive 413 path below is still authoritative when a deployment has a
+// smaller limit or a single event is unusually large.
+const TARGET_EVENT_BATCH_BYTES: usize = 384 * 1024;
+const MAX_EVENT_BATCH_EVENTS: usize = 256;
+
 #[derive(Serialize)]
 struct LiveStateBatch<'a> {
     session_id: Uuid,
@@ -132,33 +139,51 @@ async fn upload_event_payloads(
     client: &Client,
     config: &HostConfig,
     store: &dyn SessionStore,
-    events: &[SessionEvent],
+    source_events: &[SessionEvent],
+    remote_events: &[SessionEvent],
 ) -> Result<bool> {
-    let payloads = events
-        .iter()
-        .flat_map(|event| {
-            event
-                .kind
-                .payload_refs()
-                .into_iter()
-                .map(move |payload| (event.session_id, payload.clone()))
-        })
-        .collect::<Vec<_>>();
-    for (session_id, payload) in payloads {
-        let bytes = store.load_payload(&payload).await?;
+    ensure!(
+        source_events.len() == remote_events.len(),
+        "remote payload preparation changed the event count"
+    );
+    let mut payloads = Vec::new();
+    for (source_event, remote_event) in source_events.iter().zip(remote_events) {
+        let target_session_id = remote_event.session_id;
+        let source_refs = scoped_payload_refs(source_event, target_session_id);
+        let remote_refs = scoped_payload_refs(remote_event, target_session_id);
+        ensure!(
+            source_refs.len() == remote_refs.len(),
+            "remote payload preparation changed the payload count for event {}",
+            source_event.id
+        );
+        for ((source_session_id, source), (remote_session_id, remote)) in
+            source_refs.into_iter().zip(remote_refs)
+        {
+            ensure!(
+                source_session_id == remote_session_id
+                    && source.kind == remote.kind
+                    && source.byte_len == remote.byte_len,
+                "remote payload preparation changed payload metadata for event {}",
+                source_event.id
+            );
+            payloads.push((remote_session_id, source, remote));
+        }
+    }
+    for (session_id, source, remote) in payloads {
+        let bytes = store.load_payload(&source).await?;
         let response = client
             .post(endpoint(
                 &config.server,
                 &format!(
                     "/api/remote/host/sessions/{session_id}/payloads/{}",
-                    payload.id
+                    remote.id
                 ),
             ))
             .bearer_auth(&config.host_token)
             .timeout(Duration::from_secs(30))
             .query(&[
-                ("kind", payload.kind.as_str().to_string()),
-                ("byte_len", payload.byte_len.to_string()),
+                ("kind", remote.kind.as_str().to_string()),
+                ("byte_len", remote.byte_len.to_string()),
             ])
             .body(bytes)
             .send()
@@ -171,7 +196,9 @@ async fn upload_event_payloads(
             Ok(response) => {
                 tracing::warn!(
                     status = %response.status(),
-                    payload_id = %payload.id,
+                    %session_id,
+                    payload_id = %remote.id,
+                    source_payload_id = %source.id,
                     "remote session payload upload failed; retained for replay"
                 );
                 return Ok(false);
@@ -179,7 +206,9 @@ async fn upload_event_payloads(
             Err(error) => {
                 tracing::warn!(
                     %error,
-                    payload_id = %payload.id,
+                    %session_id,
+                    payload_id = %remote.id,
+                    source_payload_id = %source.id,
                     "remote session payload upload failed; retained for replay"
                 );
                 return Ok(false);
@@ -187,6 +216,296 @@ async fn upload_event_payloads(
         }
     }
     Ok(true)
+}
+
+fn compact_event_payloads_for_upload(event: &SessionEvent) -> Result<SessionEvent> {
+    let mut compact = event.clone();
+    compact_event_payloads_in_place(&mut compact)?;
+    Ok(compact)
+}
+
+fn compact_event_payloads_in_place(event: &mut SessionEvent) -> Result<()> {
+    let event_id = event.id;
+    match &mut event.kind {
+        crate::SessionEventKind::ToolStarted {
+            input, input_ref, ..
+        } if input_ref.is_none() => {
+            let bytes = serde_json::to_vec(input)?;
+            if bytes.len() > crate::session_store::INLINE_SESSION_PAYLOAD_BYTES {
+                let payload = derived_payload_ref(
+                    event_id,
+                    crate::SessionPayloadKind::ToolInput,
+                    bytes.len(),
+                );
+                *input = crate::session_store::deferred_json_payload(&payload);
+                *input_ref = Some(payload);
+            }
+        }
+        crate::SessionEventKind::ToolCompleted {
+            output,
+            output_ref,
+            input,
+            input_ref,
+            ..
+        } => {
+            if output_ref.is_none()
+                && output.len() > crate::session_store::INLINE_SESSION_PAYLOAD_BYTES
+            {
+                let payload = derived_payload_ref(
+                    event_id,
+                    crate::SessionPayloadKind::ToolOutput,
+                    output.len(),
+                );
+                *output = crate::session_store::deferred_text_payload(output, &payload);
+                *output_ref = Some(payload);
+            }
+            if input_ref.is_none()
+                && let Some(value) = input
+            {
+                let bytes = serde_json::to_vec(&*value)?;
+                if bytes.len() > crate::session_store::INLINE_SESSION_PAYLOAD_BYTES {
+                    let payload = derived_payload_ref(
+                        event_id,
+                        crate::SessionPayloadKind::ToolResultInput,
+                        bytes.len(),
+                    );
+                    *value = crate::session_store::deferred_json_payload(&payload);
+                    *input_ref = Some(payload);
+                }
+            }
+        }
+        crate::SessionEventKind::SubagentActivity {
+            event: Some(child_event),
+            ..
+        } => compact_event_payloads_in_place(child_event)?,
+        _ => {}
+    }
+    Ok(())
+}
+
+fn derived_payload_ref(
+    event_id: Uuid,
+    kind: crate::SessionPayloadKind,
+    byte_len: usize,
+) -> SessionPayloadRef {
+    SessionPayloadRef {
+        id: Uuid::new_v5(&event_id, kind.as_str().as_bytes()),
+        kind,
+        byte_len: u64::try_from(byte_len).unwrap_or(u64::MAX),
+    }
+}
+
+fn prepare_event_upload(compact_event: &SessionEvent) -> SessionEvent {
+    let mut remote_event = compact_event.clone();
+    rekey_event_payloads(&mut remote_event, compact_event.session_id);
+    remote_event
+}
+
+fn rekey_event_payloads(event: &mut SessionEvent, target_session_id: Uuid) {
+    match &mut event.kind {
+        crate::SessionEventKind::ToolStarted { input_ref, .. } => {
+            rekey_remote_payload(target_session_id, input_ref);
+        }
+        crate::SessionEventKind::ToolCompleted {
+            output_ref,
+            input_ref,
+            ..
+        } => {
+            rekey_remote_payload(target_session_id, output_ref);
+            rekey_remote_payload(target_session_id, input_ref);
+        }
+        crate::SessionEventKind::SubagentActivity {
+            event: Some(child_event),
+            ..
+        } => rekey_event_payloads(child_event, target_session_id),
+        _ => {}
+    }
+}
+
+fn rekey_remote_payload(session_id: Uuid, payload: &mut Option<SessionPayloadRef>) {
+    if let Some(payload) = payload {
+        payload.id = Uuid::new_v5(&session_id, payload.id.as_bytes());
+    }
+}
+
+fn scoped_payload_refs(
+    event: &SessionEvent,
+    target_session_id: Uuid,
+) -> Vec<(Uuid, SessionPayloadRef)> {
+    let mut refs = event
+        .kind
+        .payload_refs()
+        .into_iter()
+        .map(|payload| (target_session_id, payload.clone()))
+        .collect::<Vec<_>>();
+    if let crate::SessionEventKind::SubagentActivity {
+        event: Some(child_event),
+        ..
+    } = &event.kind
+    {
+        refs.extend(scoped_payload_refs(child_event, target_session_id));
+    }
+    refs
+}
+
+fn event_upload_ranges(events: &[SessionEvent]) -> Result<VecDeque<Range<usize>>> {
+    let empty_batch_bytes = serde_json::to_vec(&EventBatch { events: &[] })?.len();
+    let mut ranges = VecDeque::new();
+    let mut start = 0;
+    let mut batch_bytes = empty_batch_bytes;
+
+    for (index, event) in events.iter().enumerate() {
+        let separator_bytes = usize::from(index > start);
+        let event_bytes = serde_json::to_vec(event)?.len();
+        if index > start
+            && (index - start >= MAX_EVENT_BATCH_EVENTS
+                || batch_bytes
+                    .saturating_add(separator_bytes)
+                    .saturating_add(event_bytes)
+                    > TARGET_EVENT_BATCH_BYTES)
+        {
+            ranges.push_back(start..index);
+            start = index;
+            batch_bytes = empty_batch_bytes;
+        }
+        batch_bytes = batch_bytes
+            .saturating_add(usize::from(index > start))
+            .saturating_add(event_bytes);
+    }
+    if start < events.len() {
+        ranges.push_back(start..events.len());
+    }
+    Ok(ranges)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EventUploadOutcome {
+    Complete,
+    Retryable,
+    Blocked {
+        session_id: Uuid,
+        sequence: u64,
+        event_kind: String,
+        event_bytes: usize,
+    },
+}
+
+async fn upload_event_page(
+    client: &Client,
+    config: &HostConfig,
+    store: &dyn SessionStore,
+    events: &[SessionEvent],
+    uploaded_sequence: &mut u64,
+    timeout: Duration,
+) -> Result<EventUploadOutcome> {
+    let compact_events = events
+        .iter()
+        .map(compact_event_payloads_for_upload)
+        .collect::<Result<Vec<_>>>()?;
+    let remote_events = compact_events
+        .iter()
+        .map(prepare_event_upload)
+        .collect::<Vec<_>>();
+    let mut ranges = event_upload_ranges(&remote_events)?;
+    while let Some(range) = ranges.pop_front() {
+        let batch = &remote_events[range.clone()];
+        if !upload_event_payloads(client, config, store, &compact_events[range.clone()], batch)
+            .await?
+        {
+            return Ok(EventUploadOutcome::Retryable);
+        }
+        let response = client
+            .post(endpoint(&config.server, "/api/remote/host/events"))
+            .bearer_auth(&config.host_token)
+            .timeout(timeout)
+            .json(&EventBatch { events: batch })
+            .send()
+            .await;
+        match response {
+            Ok(response) if response.status().is_success() => {
+                if let Some(last) = batch.last() {
+                    *uploaded_sequence = last.sequence;
+                }
+            }
+            Ok(response)
+                if response.status() == StatusCode::PAYLOAD_TOO_LARGE && batch.len() > 1 =>
+            {
+                let middle = range.start + range.len() / 2;
+                tracing::warn!(
+                    session_id = %batch[0].session_id,
+                    first_sequence = batch[0].sequence,
+                    last_sequence = batch[batch.len() - 1].sequence,
+                    events = batch.len(),
+                    "remote event batch was too large; splitting in order"
+                );
+                ranges.push_front(middle..range.end);
+                ranges.push_front(range.start..middle);
+            }
+            Ok(response) if response.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+                let event_bytes = serde_json::to_vec(&EventBatch { events: batch })?.len();
+                let event_kind = serde_json::to_value(&batch[0].kind)?
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string();
+                tracing::error!(
+                    session_id = %batch[0].session_id,
+                    sequence = batch[0].sequence,
+                    %event_kind,
+                    event_bytes,
+                    "remote relay rejected irreducible session event; durable event was not skipped and sync is blocked"
+                );
+                return Ok(EventUploadOutcome::Blocked {
+                    session_id: batch[0].session_id,
+                    sequence: batch[0].sequence,
+                    event_kind,
+                    event_bytes,
+                });
+            }
+            Ok(response) if response.status() == StatusCode::UNAUTHORIZED => {
+                bail!("remote host token was rejected; enroll this host again");
+            }
+            Ok(response) if response.status() == StatusCode::CONFLICT => {
+                bail!(
+                    "remote event replay conflicted with the durable journal for session {}: {}",
+                    batch[0].session_id,
+                    response.text().await.unwrap_or_default()
+                );
+            }
+            Ok(response) => {
+                let status = response.status();
+                let detail = response
+                    .text()
+                    .await
+                    .unwrap_or_default()
+                    .chars()
+                    .take(512)
+                    .collect::<String>();
+                tracing::warn!(
+                    %status,
+                    %detail,
+                    session_id = %batch[0].session_id,
+                    first_sequence = batch[0].sequence,
+                    last_sequence = batch[batch.len() - 1].sequence,
+                    events = batch.len(),
+                    "remote event upload failed; journaled for replay"
+                );
+                return Ok(EventUploadOutcome::Retryable);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    session_id = %batch[0].session_id,
+                    first_sequence = batch[0].sequence,
+                    last_sequence = batch[batch.len() - 1].sequence,
+                    events = batch.len(),
+                    "remote event upload failed; journaled for replay"
+                );
+                return Ok(EventUploadOutcome::Retryable);
+            }
+        }
+    }
+    Ok(EventUploadOutcome::Complete)
 }
 
 async fn upload_live_state(
@@ -471,7 +790,28 @@ pub async fn login_provider(provider: CodingProvider) -> Result<()> {
     Ok(())
 }
 
+pub type HostExecutorFactory =
+    Arc<dyn Fn(&HostConfig, &LaunchSession) -> Result<Arc<dyn AgentTurnExecutor>> + Send + Sync>;
+
+fn default_host_executor_factory() -> HostExecutorFactory {
+    Arc::new(|config, _launch| {
+        Ok(Arc::new(crate::LocalAgentTurnExecutor::with_model_gateway(
+            borg_provider::provider::ModelGateway {
+                endpoint: endpoint(&config.server, "/api/remote/host/kimi/chat/completions"),
+                bearer_token: config.host_token.clone(),
+            },
+        )))
+    })
+}
+
 pub async fn run_host(config_path: &Path) -> Result<()> {
+    run_host_with_executor_factory(config_path, default_host_executor_factory()).await
+}
+
+pub async fn run_host_with_executor_factory(
+    config_path: &Path,
+    executor_factory: HostExecutorFactory,
+) -> Result<()> {
     let config: HostConfig = serde_json::from_slice(
         &fs::read(config_path)
             .with_context(|| format!("failed to read {}", config_path.display()))?,
@@ -542,6 +882,7 @@ pub async fn run_host(config_path: &Path) -> Result<()> {
                 config.clone(),
                 session_root.clone(),
                 sessions.clone(),
+                Arc::clone(&executor_factory),
                 envelope.command,
             )
             .await;
@@ -634,6 +975,8 @@ pub async fn mirror_local_session(
     let capabilities = probe_capabilities(config.roots.clone()).await;
     let mut last_heartbeat = Instant::now() - Duration::from_secs(30);
     let (mut command_cursor, mut uploaded_sequence, mut uploaded_live_revision) = command_cursor;
+    let mut event_retry_at = Instant::now();
+    let mut shutdown_flush_pending = false;
     loop {
         if last_heartbeat.elapsed() >= Duration::from_secs(15) {
             if let Err(error) =
@@ -645,76 +988,66 @@ pub async fn mirror_local_session(
             }
         }
 
-        let pending = store
-            .events_after(session_id, uploaded_sequence, 1_024)
-            .await?;
-        let mut upload_failed = false;
-        for events in pending.chunks(256) {
-            if !upload_event_payloads(&client, &config, store.as_ref(), events).await? {
-                upload_failed = true;
-                break;
-            }
-            let response = client
-                .post(endpoint(&config.server, "/api/remote/host/events"))
-                .bearer_auth(&config.host_token)
-                .json(&EventBatch { events })
-                .send()
-                .await;
-            match response {
-                Ok(response) if response.status().is_success() => {
-                    uploaded_sequence = events
-                        .last()
-                        .map_or(uploaded_sequence, |event| event.sequence);
-                }
-                Ok(response) if response.status() == StatusCode::UNAUTHORIZED => {
-                    bail!("remote host token was rejected; enroll this host again");
-                }
-                Ok(response) if response.status() == StatusCode::CONFLICT => {
-                    bail!(
-                        "local session event replay conflicted with the durable remote journal: {}",
-                        response.text().await.unwrap_or_default()
-                    );
-                }
-                Ok(response) => {
-                    tracing::warn!(
-                        status = %response.status(),
-                        "local session event upload failed; journaled for replay"
-                    );
-                    upload_failed = true;
-                    break;
-                }
-                Err(error) => {
-                    tracing::warn!(%error, "local session event upload failed; journaled for replay");
-                    upload_failed = true;
-                    break;
-                }
-            }
-        }
-        if !upload_failed
-            && !upload_live_state(
+        let mut caught_up = false;
+        if Instant::now() >= event_retry_at {
+            let pending = store
+                .events_after(session_id, uploaded_sequence, 1_024)
+                .await?;
+            match upload_event_page(
                 &client,
                 &config,
                 store.as_ref(),
-                session_id,
-                &mut uploaded_live_revision,
+                &pending,
+                &mut uploaded_sequence,
+                Duration::from_secs(5),
             )
             .await?
-        {
-            upload_failed = true;
+            {
+                EventUploadOutcome::Complete => {
+                    if upload_live_state(
+                        &client,
+                        &config,
+                        store.as_ref(),
+                        session_id,
+                        &mut uploaded_live_revision,
+                    )
+                    .await?
+                    {
+                        caught_up = pending.len() < 1_024;
+                        event_retry_at = Instant::now();
+                    } else {
+                        event_retry_at = Instant::now() + Duration::from_secs(2);
+                    }
+                }
+                EventUploadOutcome::Retryable => {
+                    event_retry_at = Instant::now() + Duration::from_secs(2);
+                }
+                EventUploadOutcome::Blocked { .. } => {
+                    // Keep heartbeats and remote interrupt/stop commands alive
+                    // without rereading the same irreducible event in a loop.
+                    event_retry_at = Instant::now() + Duration::from_secs(300);
+                }
+            }
         }
-        if upload_failed {
-            if wait_for_mirror_shutdown(&mut shutdown, Duration::from_secs(2)).await {
-                return Ok(());
+        // A shutdown can arrive after this iteration read an empty suffix but
+        // before the actor commits its terminal status. Only finish after one
+        // complete upload pass that began after shutdown was observed.
+        if shutdown_flush_pending && caught_up {
+            return Ok(());
+        }
+        if *shutdown.borrow() {
+            shutdown_flush_pending = true;
+            let retry_delay = event_retry_at.saturating_duration_since(Instant::now());
+            if retry_delay.is_zero() {
+                tokio::task::yield_now().await;
+            } else {
+                tokio::time::sleep(retry_delay).await;
             }
             continue;
         }
-        if *shutdown.borrow() {
-            return Ok(());
-        }
-        if pending.len() < 1_024
-            && wait_for_mirror_shutdown(&mut shutdown, Duration::from_millis(250)).await
-        {
-            return Ok(());
+        if caught_up && wait_for_mirror_shutdown(&mut shutdown, Duration::from_millis(250)).await {
+            shutdown_flush_pending = true;
+            continue;
         }
 
         let request = client
@@ -738,6 +1071,7 @@ pub async fn mirror_local_session(
         let Some(response) = response else {
             // Run one final loop so every journaled event, including the
             // terminal status, is durably uploaded before this task exits.
+            shutdown_flush_pending = true;
             continue;
         };
         let response = match response {
@@ -855,6 +1189,7 @@ async fn dispatch(
     config: HostConfig,
     session_root: PathBuf,
     sessions: Arc<Mutex<HashMap<Uuid, mpsc::Sender<HostCommand>>>>,
+    executor_factory: HostExecutorFactory,
     command: HostCommand,
 ) -> bool {
     if let HostCommand::WorkspaceFilesystem { request } = &command {
@@ -975,7 +1310,16 @@ async fn dispatch(
         if sessions.lock().await.contains_key(&session_id) {
             return true;
         }
-        spawn_host_session(client, config, session_root, sessions, session_id, *request).await;
+        spawn_host_session(
+            client,
+            config,
+            session_root,
+            sessions,
+            Arc::clone(&executor_factory),
+            session_id,
+            *request,
+        )
+        .await;
         return true;
     }
     if let Some(session_id) = command.session_id() {
@@ -1018,6 +1362,7 @@ async fn dispatch(
                             config,
                             session_root,
                             sessions,
+                            Arc::clone(&executor_factory),
                             session_id,
                             metadata.request,
                         )
@@ -1276,6 +1621,7 @@ async fn spawn_host_session(
     config: HostConfig,
     session_root: PathBuf,
     sessions: Arc<Mutex<HashMap<Uuid, mpsc::Sender<HostCommand>>>>,
+    executor_factory: HostExecutorFactory,
     session_id: Uuid,
     request: LaunchSession,
 ) -> mpsc::Sender<HostCommand> {
@@ -1283,7 +1629,16 @@ async fn spawn_host_session(
     sessions.lock().await.insert(session_id, tx.clone());
     let sessions_for_cleanup = sessions.clone();
     tokio::spawn(async move {
-        if let Err(error) = run_session(client, config, session_root, session_id, request, rx).await
+        if let Err(error) = run_session(
+            client,
+            config,
+            session_root,
+            executor_factory,
+            session_id,
+            request,
+            rx,
+        )
+        .await
         {
             tracing::error!(session_id = %session_id, %error, "remote agent session failed");
         }
@@ -1296,6 +1651,7 @@ async fn run_session(
     client: Client,
     config: HostConfig,
     session_root: PathBuf,
+    executor_factory: HostExecutorFactory,
     session_id: Uuid,
     mut launch: LaunchSession,
     commands: mpsc::Receiver<HostCommand>,
@@ -1323,12 +1679,7 @@ async fn run_session(
     let (event_tx, mut event_rx) = mpsc::channel(256);
     let actor_session_root = session_root.clone();
     let actor_store = Arc::clone(&sqlite_store);
-    let executor = Arc::new(crate::LocalAgentTurnExecutor::with_model_gateway(
-        borg_provider::provider::ModelGateway {
-            endpoint: endpoint(&config.server, "/api/remote/host/kimi/chat/completions"),
-            bearer_token: config.host_token.clone(),
-        },
-    ));
+    let executor = executor_factory(&config, &launch)?;
     let actor = tokio::spawn(async move {
         run_agent_session_with_store_and_writer(
             &actor_session_root,
@@ -1379,39 +1730,26 @@ async fn flush_pending(
             .events_after(session_id, sync.uploaded_sequence, PAGE_SIZE)
             .await?;
         let caught_up = pending.len() < PAGE_SIZE;
-        for events in pending.chunks(256) {
-            if !upload_event_payloads(client, config, store, events).await? {
+        match upload_event_page(
+            client,
+            config,
+            store,
+            &pending,
+            &mut sync.uploaded_sequence,
+            Duration::from_secs(3),
+        )
+        .await?
+        {
+            EventUploadOutcome::Complete => {}
+            EventUploadOutcome::Retryable => {
                 sync.retry_at = Instant::now() + Duration::from_secs(2);
                 return Ok(());
             }
-            let response = client
-                .post(endpoint(&config.server, "/api/remote/host/events"))
-                .bearer_auth(&config.host_token)
-                .timeout(Duration::from_secs(3))
-                .json(&EventBatch { events })
-                .send()
-                .await;
-            match response {
-                Ok(response) if response.status().is_success() => {}
-                Ok(response) if response.status() == StatusCode::UNAUTHORIZED => {
-                    bail!("remote host token was rejected; enroll this host again");
-                }
-                Ok(response) => {
-                    tracing::warn!(
-                        status = %response.status(),
-                        "remote event upload failed; journaled for replay"
-                    );
-                    sync.retry_at = Instant::now() + Duration::from_secs(2);
-                    return Ok(());
-                }
-                Err(error) => {
-                    tracing::warn!(%error, "remote event upload failed; journaled for replay");
-                    sync.retry_at = Instant::now() + Duration::from_secs(2);
-                    return Ok(());
-                }
-            }
-            if let Some(last) = events.last() {
-                sync.uploaded_sequence = last.sequence;
+            EventUploadOutcome::Blocked { .. } => {
+                // Preserve the actor and command receiver. A later binary or
+                // relay limit change can resume from this exact cursor.
+                sync.retry_at = Instant::now() + Duration::from_secs(300);
+                return Ok(());
             }
         }
         if caught_up {
@@ -1492,9 +1830,589 @@ fn platform() -> String {
 mod tests {
     use chrono::Duration as ChronoDuration;
     use tempfile::tempdir;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
 
     use super::*;
     use crate::WorkspaceFilesystemOperation;
+
+    fn error_events(session_id: Uuid, count: usize, message_bytes: usize) -> Vec<SessionEvent> {
+        (1..=count)
+            .map(|sequence| {
+                SessionEvent::new(
+                    session_id,
+                    sequence as u64,
+                    crate::SessionEventKind::Error {
+                        message: "x".repeat(message_bytes),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    async fn read_http_request(stream: &mut TcpStream) -> (String, Vec<u8>) {
+        let mut request = Vec::new();
+        let header_end = loop {
+            let mut buffer = [0_u8; 4_096];
+            let read = stream.read(&mut buffer).await.unwrap();
+            assert!(read > 0);
+            request.extend_from_slice(&buffer[..read]);
+            if let Some(offset) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                break offset + 4;
+            }
+        };
+        let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+        let path = headers
+            .lines()
+            .next()
+            .unwrap()
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .to_string();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                line.split_once(':').and_then(|(name, value)| {
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+            })
+            .unwrap();
+        while request.len() - header_end < content_length {
+            let mut buffer = [0_u8; 4_096];
+            let read = stream.read(&mut buffer).await.unwrap();
+            assert!(read > 0);
+            request.extend_from_slice(&buffer[..read]);
+        }
+        (
+            path,
+            request[header_end..header_end + content_length].to_vec(),
+        )
+    }
+
+    async fn event_server(
+        statuses: Vec<&'static str>,
+    ) -> (String, tokio::task::JoinHandle<Vec<Vec<u64>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut delivered = Vec::new();
+            for status in statuses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let (_, request) = read_http_request(&mut stream).await;
+                let body: serde_json::Value = serde_json::from_slice(&request).unwrap();
+                delivered.push(
+                    body["events"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|event| event["sequence"].as_u64().unwrap())
+                        .collect::<Vec<_>>(),
+                );
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            delivered
+        });
+        (format!("http://{address}"), server)
+    }
+
+    #[tokio::test]
+    async fn mirror_shutdown_flushes_a_terminal_event_committed_during_the_caught_up_wait() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (first_upload_tx, first_upload_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut first_upload_tx = Some(first_upload_tx);
+            let mut uploads = Vec::new();
+            while uploads.len() < 2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let (path, body) = read_http_request(&mut stream).await;
+                let response = match path.as_str() {
+                    "/api/remote/host/sessions" => {
+                        let body = r#"{"command_cursor":0,"event_cursor":0,"live_revision":0}"#;
+                        format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                    }
+                    "/api/remote/host/heartbeat" => {
+                        "HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                            .to_string()
+                    }
+                    "/api/remote/host/events" => {
+                        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                        uploads.push(
+                            body["events"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .map(|event| event["sequence"].as_u64().unwrap())
+                                .collect::<Vec<_>>(),
+                        );
+                        if uploads.len() == 1
+                            && let Some(first_upload_tx) = first_upload_tx.take()
+                        {
+                            first_upload_tx.send(()).unwrap();
+                        }
+                        "HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                            .to_string()
+                    }
+                    unexpected => panic!("unexpected mirror request: {unexpected}"),
+                };
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+            uploads
+        });
+
+        let root = tempdir().unwrap();
+        let store = Arc::new(
+            crate::SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+                .await
+                .unwrap(),
+        );
+        let session_id = Uuid::new_v4();
+        store.create_session(session_id).await.unwrap();
+        store
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                crate::SessionEventKind::SessionStarted,
+            ))
+            .await
+            .unwrap();
+        let config_path = root.path().join("host.json");
+        write_config(
+            &config_path,
+            &HostConfig {
+                server: format!("http://{address}"),
+                ..test_config(root.path())
+            },
+        )
+        .unwrap();
+        let launch = LaunchSession {
+            request_id: session_id,
+            cwd: root.path().to_path_buf(),
+            provider: CodingProvider::Codex,
+            model: None,
+            effort: None,
+            fast: Some(false),
+            response_language: crate::ResponseLanguage::Auto,
+            permission_mode: crate::PermissionMode::FullAccess,
+            name: None,
+            initial_prompt: None,
+            capabilities: Default::default(),
+            subagent_concurrency_limit: None,
+            extension_skill_roots: Vec::new(),
+            team_policy: None,
+        };
+        let (command_tx, _command_rx) = mpsc::channel(1);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mirror_store: Arc<dyn SessionStore> = store.clone();
+        let mirror = tokio::spawn(async move {
+            mirror_local_session(
+                &config_path,
+                mirror_store,
+                session_id,
+                launch,
+                command_tx,
+                shutdown_rx,
+            )
+            .await
+        });
+
+        first_upload_rx.await.unwrap();
+        store
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                crate::SessionEventKind::StatusChanged {
+                    status: crate::SessionStatus::Stopped,
+                    detail: None,
+                },
+            ))
+            .await
+            .unwrap();
+        shutdown_tx.send(true).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(3), mirror)
+            .await
+            .expect("mirror should finish after its shutdown flush")
+            .unwrap()
+            .unwrap();
+        assert_eq!(server.await.unwrap(), vec![vec![1], vec![2]]);
+    }
+
+    #[test]
+    fn event_upload_ranges_bound_the_exact_serialized_request_size() {
+        let events = error_events(Uuid::new_v4(), 256, 2_500);
+        let ranges = event_upload_ranges(&events).unwrap();
+
+        assert!(
+            ranges.len() > 1,
+            "the regression page must exceed one batch"
+        );
+        assert_eq!(ranges.front().unwrap().start, 0);
+        assert_eq!(ranges.back().unwrap().end, events.len());
+        for (previous, next) in ranges.iter().zip(ranges.iter().skip(1)) {
+            assert_eq!(previous.end, next.start);
+        }
+        for range in ranges {
+            let bytes = serde_json::to_vec(&EventBatch {
+                events: &events[range.clone()],
+            })
+            .unwrap()
+            .len();
+            assert!(
+                bytes <= TARGET_EVENT_BATCH_BYTES || range.len() == 1,
+                "multi-event request was {bytes} bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn event_upload_ranges_preserve_the_relay_event_count_limit() {
+        let events = error_events(Uuid::new_v4(), 600, 1);
+        let ranges = event_upload_ranges(&events).unwrap();
+
+        assert_eq!(ranges.len(), 3);
+        assert!(
+            ranges
+                .iter()
+                .all(|range| range.len() <= MAX_EVENT_BATCH_EVENTS)
+        );
+        assert_eq!(ranges.front().unwrap().start, 0);
+        assert_eq!(ranges.back().unwrap().end, 600);
+    }
+
+    #[test]
+    fn remote_payload_ids_are_stable_and_session_scoped() {
+        let source_payload_id = Uuid::new_v4();
+        let source = SessionEvent::new(
+            Uuid::new_v4(),
+            1,
+            crate::SessionEventKind::ToolCompleted {
+                tool_call_id: "tool".to_string(),
+                output: String::new(),
+                output_ref: Some(SessionPayloadRef {
+                    id: source_payload_id,
+                    kind: crate::SessionPayloadKind::ToolOutput,
+                    byte_len: 42,
+                }),
+                is_error: false,
+                input: None,
+                input_ref: None,
+            },
+        );
+
+        let first = prepare_event_upload(&source);
+        let repeated = prepare_event_upload(&source);
+        let mut other_session = source.clone();
+        other_session.session_id = Uuid::new_v4();
+        let other = prepare_event_upload(&other_session);
+        let first_id = first.kind.payload_refs()[0].id;
+
+        assert_ne!(first_id, source_payload_id);
+        assert_eq!(first_id, repeated.kind.payload_refs()[0].id);
+        assert_ne!(first_id, other.kind.payload_refs()[0].id);
+        assert_eq!(source.kind.payload_refs()[0].id, source_payload_id);
+    }
+
+    #[test]
+    fn nested_child_tool_payloads_are_compacted_into_the_enclosing_remote_session() {
+        let child_session_id = Uuid::new_v4();
+        let child_event = SessionEvent::new(
+            child_session_id,
+            7,
+            crate::SessionEventKind::ToolCompleted {
+                tool_call_id: "large-child-tool".to_string(),
+                output: "x".repeat(crate::session_store::INLINE_SESSION_PAYLOAD_BYTES + 1),
+                output_ref: None,
+                is_error: false,
+                input: None,
+                input_ref: None,
+            },
+        );
+        let child_event_id = child_event.id;
+        let now = Utc::now();
+        let root_session_id = Uuid::new_v4();
+        let root_event = SessionEvent::new(
+            root_session_id,
+            1,
+            crate::SessionEventKind::SubagentActivity {
+                activity: crate::SubagentActivityKind::Updated,
+                agent: crate::SubagentSnapshot {
+                    session_id: child_session_id,
+                    parent_session_id: Uuid::new_v4(),
+                    task_name: "/root/child".to_string(),
+                    status: crate::SubagentStatus::Running,
+                    provider: CodingProvider::Codex,
+                    model: None,
+                    effort: None,
+                    cwd: PathBuf::from("/tmp"),
+                    created_at: now,
+                    updated_at: now,
+                    detail: None,
+                    final_text: None,
+                    usage: crate::SubagentUsage::default(),
+                },
+                event: Some(Box::new(child_event)),
+            },
+        );
+
+        let compact = compact_event_payloads_for_upload(&root_event).unwrap();
+        let remote = prepare_event_upload(&compact);
+        let source_refs = scoped_payload_refs(&compact, root_session_id);
+        let remote_refs = scoped_payload_refs(&remote, root_session_id);
+
+        assert_eq!(source_refs.len(), 1);
+        assert_eq!(source_refs[0].0, root_session_id);
+        assert_eq!(
+            source_refs[0].1.id,
+            Uuid::new_v5(
+                &child_event_id,
+                crate::SessionPayloadKind::ToolOutput.as_str().as_bytes()
+            )
+        );
+        assert_eq!(remote_refs[0].0, root_session_id);
+        assert_eq!(
+            remote_refs[0].1.id,
+            Uuid::new_v5(&root_session_id, source_refs[0].1.id.as_bytes())
+        );
+        assert!(serde_json::to_vec(&compact).unwrap().len() < TARGET_EVENT_BATCH_BYTES);
+    }
+
+    #[tokio::test]
+    async fn nested_child_payload_upload_uses_the_enclosing_session_and_original_bytes() {
+        let root = tempdir().unwrap();
+        let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+            .await
+            .unwrap();
+        let root_session_id = Uuid::new_v4();
+        let child_session_id = Uuid::new_v4();
+        store.create_session(root_session_id).await.unwrap();
+        store.create_session(child_session_id).await.unwrap();
+        let large_output = "z".repeat(crate::session_store::INLINE_SESSION_PAYLOAD_BYTES + 1);
+        let mut child_event = SessionEvent::new(
+            child_session_id,
+            0,
+            crate::SessionEventKind::ToolCompleted {
+                tool_call_id: "nested".to_string(),
+                output: large_output.clone(),
+                output_ref: None,
+                is_error: false,
+                input: None,
+                input_ref: None,
+            },
+        );
+        let stored_child = store.append(child_event.clone()).await.unwrap();
+        child_event.sequence = stored_child.sequence;
+        let compact_child = store.events_after(child_session_id, 0, 1).await.unwrap();
+        let source_payload_id = compact_child[0].kind.payload_refs()[0].id;
+        let remote_payload_id = Uuid::new_v5(&root_session_id, source_payload_id.as_bytes());
+        let now = Utc::now();
+        let root_event = SessionEvent::new(
+            root_session_id,
+            1,
+            crate::SessionEventKind::SubagentActivity {
+                activity: crate::SubagentActivityKind::Updated,
+                agent: crate::SubagentSnapshot {
+                    session_id: child_session_id,
+                    parent_session_id: root_session_id,
+                    task_name: "/root/child".to_string(),
+                    status: crate::SubagentStatus::Running,
+                    provider: CodingProvider::Codex,
+                    model: None,
+                    effort: None,
+                    cwd: root.path().to_path_buf(),
+                    created_at: now,
+                    updated_at: now,
+                    detail: None,
+                    final_text: None,
+                    usage: crate::SubagentUsage::default(),
+                },
+                event: Some(Box::new(child_event)),
+            },
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut payload_stream, _) = listener.accept().await.unwrap();
+            let (payload_path, payload_body) = read_http_request(&mut payload_stream).await;
+            payload_stream
+                .write_all(
+                    b"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let (mut event_stream, _) = listener.accept().await.unwrap();
+            let (_, event_body) = read_http_request(&mut event_stream).await;
+            event_stream
+                .write_all(
+                    b"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            (payload_path, payload_body, event_body)
+        });
+        let config = HostConfig {
+            server: format!("http://{address}"),
+            ..test_config(root.path())
+        };
+        let mut uploaded_sequence = 0;
+
+        assert_eq!(
+            upload_event_page(
+                &Client::new(),
+                &config,
+                &store,
+                &[root_event.clone()],
+                &mut uploaded_sequence,
+                Duration::from_secs(3),
+            )
+            .await
+            .unwrap(),
+            EventUploadOutcome::Complete
+        );
+        let (payload_path, payload_body, event_body) = server.await.unwrap();
+        assert!(payload_path.starts_with(&format!(
+            "/api/remote/host/sessions/{root_session_id}/payloads/{remote_payload_id}"
+        )));
+        assert_eq!(payload_body, large_output.as_bytes());
+        let uploaded: serde_json::Value = serde_json::from_slice(&event_body).unwrap();
+        assert_eq!(
+            uploaded["events"][0]["kind"]["event"]["kind"]["output_ref"]["id"],
+            remote_payload_id.to_string()
+        );
+        assert!(event_body.len() < TARGET_EVENT_BATCH_BYTES);
+        assert_eq!(uploaded_sequence, 1);
+        assert_eq!(root_event.kind.payload_refs().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn payload_too_large_is_split_without_skipping_or_reordering_events() {
+        let (server_url, server) = event_server(vec![
+            "413 Payload Too Large",
+            "204 No Content",
+            "204 No Content",
+        ])
+        .await;
+
+        let root = tempdir().unwrap();
+        let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+            .await
+            .unwrap();
+        let session_id = Uuid::new_v4();
+        let events = error_events(session_id, 4, 16);
+        let config = HostConfig {
+            server: server_url,
+            ..test_config(root.path())
+        };
+        let mut uploaded_sequence = 0;
+
+        assert_eq!(
+            upload_event_page(
+                &Client::new(),
+                &config,
+                &store,
+                &events,
+                &mut uploaded_sequence,
+                Duration::from_secs(3),
+            )
+            .await
+            .unwrap(),
+            EventUploadOutcome::Complete
+        );
+        assert_eq!(uploaded_sequence, 4);
+        assert_eq!(
+            server.await.unwrap(),
+            vec![vec![1, 2, 3, 4], vec![1, 2], vec![3, 4]]
+        );
+    }
+
+    #[tokio::test]
+    async fn split_retry_preserves_the_last_contiguous_cursor() {
+        let (server_url, server) = event_server(vec![
+            "413 Payload Too Large",
+            "204 No Content",
+            "500 Internal Server Error",
+        ])
+        .await;
+        let root = tempdir().unwrap();
+        let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+            .await
+            .unwrap();
+        let events = error_events(Uuid::new_v4(), 4, 16);
+        let config = HostConfig {
+            server: server_url,
+            ..test_config(root.path())
+        };
+        let mut uploaded_sequence = 0;
+
+        assert_eq!(
+            upload_event_page(
+                &Client::new(),
+                &config,
+                &store,
+                &events,
+                &mut uploaded_sequence,
+                Duration::from_secs(3),
+            )
+            .await
+            .unwrap(),
+            EventUploadOutcome::Retryable
+        );
+        assert_eq!(uploaded_sequence, 2);
+        assert_eq!(
+            server.await.unwrap(),
+            vec![vec![1, 2, 3, 4], vec![1, 2], vec![3, 4]]
+        );
+    }
+
+    #[tokio::test]
+    async fn singleton_payload_too_large_is_irreducible_and_never_skipped() {
+        let (server_url, server) = event_server(vec!["413 Payload Too Large"]).await;
+        let root = tempdir().unwrap();
+        let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+            .await
+            .unwrap();
+        let events = error_events(Uuid::new_v4(), 1, 16);
+        let config = HostConfig {
+            server: server_url,
+            ..test_config(root.path())
+        };
+        let mut uploaded_sequence = 0;
+
+        let outcome = upload_event_page(
+            &Client::new(),
+            &config,
+            &store,
+            &events,
+            &mut uploaded_sequence,
+            Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            EventUploadOutcome::Blocked {
+                sequence: 1,
+                event_kind,
+                ..
+            } if event_kind == "error"
+        ));
+        assert_eq!(uploaded_sequence, 0);
+        assert_eq!(server.await.unwrap(), vec![vec![1]]);
+    }
 
     #[test]
     fn workspace_attachment_requires_coherent_identity_and_live_lease() {
@@ -1614,6 +2532,7 @@ mod tests {
                 config,
                 root.path().to_path_buf(),
                 Arc::clone(&sessions),
+                default_host_executor_factory(),
                 HostCommand::Stop { session_id },
             )
             .await,

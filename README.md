@@ -31,8 +31,9 @@ configurable.
 - Codex, Claude, OpenCode, Kimi, OpenRouter, and OpenAI-compatible providers;
 - a native harness with bounded file tools, background
   processes, LSP, goals, plans, subagents, MCP, project guidance, and skills;
-- provider-neutral extensions through local/project skills and configurable
-  stdio MCP servers, plus configurable slash aliases and keybindings;
+- Blu live extensions with dependency-aware skill and MCP packages, typed
+  settings, atomic install/update, and turn-boundary hot reload, plus
+  configurable slash aliases and keybindings;
 - non-blocking, checksum-verified updates that take effect on the next launch;
 - **Full Access** (default), **Auto** model-reviewed commands, and **Manual**
   user-reviewed commands;
@@ -73,37 +74,52 @@ Automated CLI/terminal checks should use `borg agent --ephemeral --local-only`.
 That creates a temporary session store and removes it when the process exits,
 so health checks do not pollute the user's resume history or Remote workspace.
 
-## Extend Borg CLI
+Resume paints a bounded recent conversation synchronously, then fetches older
+pages only when you scroll. Restored subagents remain dormant metadata until an
+explicit child-directed action wakes them, and stopping the owning main thread
+stops every live child before releasing the session.
 
-Borg CLI uses composable, inspectable extension points instead of a private plugin
-runtime:
+## Extend Borg CLI with Blu
+
+Blu is Borg's inspectable, live extension system:
 
 - put `SKILL.md` packages in `.agents/skills`, `.borg/skills`,
   `~/.agents/skills`, `~/.borg/skills`, or `~/.codex/skills`;
-- add local stdio servers under `[mcp.servers.<name>]` in `agent.toml` to expose
-  arbitrary tools across Codex, Claude, OpenCode, and Borg's native providers;
+- install a user package with `borg extensions install <PATH-or-GIT-URL>`, or
+  add `--project` for a checkout-local package;
+- scaffold a package with `borg extensions new <id> --project`;
+- enable, disable, configure, update, remove, validate, and inspect packages
+  with the corresponding `borg extensions` subcommands;
+- add standalone stdio servers under `[mcp.servers.<name>]` in `agent.toml` to
+  expose arbitrary tools across Codex, Claude, OpenCode, and Borg's native
+  providers;
 - define slash-command aliases and remap every primary TUI action in the same
   typed config; and
 - keep project-specific agent instructions beside the code they govern.
 
-MCP extensions can be disabled per server and restricted with
-`allowed_tools`. See the checked-in config examples for the complete schema.
-Declarative extension manifests live in project `.borg/extensions/*.toml` or
-user `$XDG_CONFIG_HOME/borg/extensions/*.toml` (normally
-`~/.config/borg/extensions`). Project MCP declarations are cataloged but
-inactive unless the user explicitly sets
-`[extensions].allow_project_mcp = true`; user-owned manifests remain eligible
-when enabled. Manifests can declare capability requirements, skill-root
-metadata, and stdio MCP servers, but no shell or lifecycle hooks. Skill roots
-are catalog metadata only in this release. Inspect the effective catalog with
-`borg extensions` or `borg extensions --json`.
+Blu packages live in project `.borg/extensions/<id>/` or user
+`$XDG_CONFIG_HOME/borg/extensions/<id>/` (normally
+`~/.config/borg/extensions/<id>/`); legacy flat manifests remain compatible.
+Project packages are cataloged but inactive unless the user explicitly sets
+`[extensions].allow_project_mcp = true`. Packages may declare semantic-version
+dependencies, Borg/capability requirements, typed settings, skill roots, and
+namespaced stdio MCP servers. Invalid packages are isolated and reported by
+`borg extensions doctor` instead of preventing Borg from starting.
+
+Running local sessions watch the effective catalog, and enrolled Remote hosts
+revalidate it at each turn boundary. A validated change swaps skills and MCP
+definitions atomically for the next turn; an in-flight turn keeps the immutable
+snapshot it started with. Invalid changes retain the last-known-good runtime
+and show a TUI notice or host warning. Blu does not execute install or lifecycle
+hooks. See [Blu extensions](docs/blu-extensions.md) and the
+[manifest example](configs/extension.example.toml) for the full contract.
 
 Agents can maintain this setup through the built-in
 `get_agent_settings`, `update_agent_settings`, `list_plugins`, `read_plugin`,
 and `create_plugin` tools.
 Settings writes are atomic; slash aliases and keybindings reload in a running
-TUI, while provider, capability, and MCP changes intentionally take effect on
-the next session. `create_plugin` writes a project
+TUI, while Blu skills and MCP servers reload at the next turn boundary.
+`create_plugin` writes a project
 `.borg/skills/<id>/SKILL.md`; the live list/read tools see it immediately, and
 the native skill context rescans it at the start of the next native turn
 without a restart.

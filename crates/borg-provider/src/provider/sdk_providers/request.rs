@@ -29,6 +29,8 @@ pub(super) fn build_chat_stream_request(
 ) -> ChatStreamRequest {
     ChatStreamRequest {
         prompt: options.prompt.to_string(),
+        owner_session_id: None,
+        client_user_message_id: None,
         attachments: Vec::new(),
         model: options.model,
         effort: options.effort,

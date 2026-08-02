@@ -10,7 +10,7 @@
 
 use std::io;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -252,6 +252,40 @@ fn kill_process_group(pid: u32) {
 #[cfg(not(unix))]
 fn kill_process_group(_pid: u32) {}
 
+#[cfg(unix)]
+fn process_group_exists(pid: u32) -> bool {
+    // Signal 0 performs existence/permission checking without changing the
+    // process group. EPERM still proves that the group exists.
+    let result = unsafe { libc::killpg(pid as i32, 0) };
+    result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Terminate and reap a long-lived std subprocess together with every process
+/// that inherited its process group.
+///
+/// Provider adapters are deliberately isolated with `process_group(0)`. A
+/// plain `Child::kill` only signals the group leader and can leave an active
+/// shell/tool running after the adapter has disappeared. Cancellation paths
+/// must use this helper before they report the owning turn as settled.
+pub(crate) fn terminate_std_process_tree(child: &mut Child) -> io::Result<ExitStatus> {
+    let pid = child.id();
+    let status = child.try_wait()?;
+    #[cfg(unix)]
+    if process_group_exists(pid) {
+        // The group can outlive its leader. Always signal the stored PGID when
+        // it still exists, even if `try_wait` already reaped the leader.
+        kill_process_group(pid);
+    }
+    #[cfg(not(unix))]
+    if status.is_none() {
+        child.kill()?;
+    }
+    match status {
+        Some(status) => Ok(status),
+        None => child.wait(),
+    }
+}
+
 /// Reasonable defaults for common command timeouts.
 pub mod timeouts {
     use std::time::Duration;
@@ -302,6 +336,45 @@ mod tests {
             out.elapsed < Duration::from_secs(3),
             "timeout should fire promptly, got {:?}",
             out.elapsed
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_tree_cleanup_kills_the_group_after_its_leader_exits() {
+        let root = tempfile::tempdir().expect("temp root");
+        let descendant_path = root.path().join("descendant.pid");
+        let mut command = Command::new("sh");
+        command
+            .args([
+                "-c",
+                &format!(
+                    "sleep 30 & printf '%s' \"$!\" > '{}'",
+                    descendant_path.display()
+                ),
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        isolate_std_process_from_terminal(&mut command);
+        let mut child = command.spawn().expect("isolated leader");
+        assert!(child.wait().expect("leader exit").success());
+        let descendant_pid = std::fs::read_to_string(&descendant_path)
+            .expect("descendant pid")
+            .parse::<i32>()
+            .expect("numeric descendant pid");
+        assert_eq!(unsafe { libc::kill(descendant_pid, 0) }, 0);
+
+        terminate_std_process_tree(&mut child).expect("tree cleanup after leader exit");
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while unsafe { libc::kill(descendant_pid, 0) } == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_ne!(
+            unsafe { libc::kill(descendant_pid, 0) },
+            0,
+            "provider descendant survived after its process-group leader exited"
         );
     }
 

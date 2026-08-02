@@ -1,43 +1,162 @@
+//! Blu: Borg's live, declarative extension system.
+//!
+//! Blu packages stay deliberately inspectable. A package may contribute skills
+//! and provider-neutral stdio MCP servers, but it cannot register opaque shell
+//! hooks. Catalog reloads are transactional: callers keep the last-known-good
+//! runtime when a changed package does not validate.
+
 use crate::agent_config::CapabilityConfig;
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
+use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     fs,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
+    process::Command,
 };
+use uuid::Uuid;
 
 pub const MANIFEST_VERSION: u32 = 1;
+const STATE_VERSION: u32 = 1;
+const PACKAGE_MANIFEST_NAMES: [&str; 2] = ["blu.toml", "extension.toml"];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ExtensionScope {
+    Project,
+    User,
+}
+
+impl ExtensionScope {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Project => "project",
+            Self::User => "user",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct ExtensionCatalog {
+    /// Content-addressed catalog revision used by the live reload loop.
+    pub revision: String,
+    /// Dependency-first activation order.
+    pub load_order: Vec<String>,
     pub extensions: Vec<EffectiveExtension>,
+    /// Invalid packages are isolated here instead of preventing Borg startup.
+    pub diagnostics: Vec<ExtensionDiagnostic>,
 }
+
+impl ExtensionCatalog {
+    pub(crate) fn active_skill_roots(&self) -> Vec<PathBuf> {
+        self.load_order
+            .iter()
+            .filter_map(|id| self.extensions.iter().find(|extension| &extension.id == id))
+            .flat_map(|extension| extension.skill_roots.iter().cloned())
+            .collect()
+    }
+
+    pub(crate) fn extension(&self, id: &str) -> Option<&EffectiveExtension> {
+        self.extensions.iter().find(|extension| extension.id == id)
+    }
+
+    pub(crate) fn has_errors(&self) -> bool {
+        self.error_count() > 0
+    }
+
+    pub(crate) fn error_count(&self) -> usize {
+        self.diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.level == ExtensionDiagnosticLevel::Error)
+            .count()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ExtensionDiagnosticLevel {
+    Error,
+    Warning,
+}
+
+impl ExtensionDiagnosticLevel {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Error => "error",
+            Self::Warning => "warning",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ExtensionDiagnostic {
+    pub level: ExtensionDiagnosticLevel,
+    pub path: PathBuf,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct EffectiveExtension {
     pub id: String,
+    pub name: String,
     pub version: String,
+    pub description: Option<String>,
+    pub scope: ExtensionScope,
+    pub manifest_path: PathBuf,
     pub enabled: bool,
     pub active: bool,
     pub reason: Option<String>,
+    pub dependencies: BTreeMap<String, String>,
     pub skill_roots: Vec<PathBuf>,
     pub servers: Vec<String>,
+    /// Secret settings are always redacted from catalog output.
+    pub settings: BTreeMap<String, String>,
 }
-#[derive(Deserialize)]
+
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Manifest {
     manifest_version: u32,
     id: String,
+    #[serde(default)]
+    name: Option<String>,
     version: String,
+    #[serde(default)]
+    description: Option<String>,
     #[serde(default = "yes")]
     enabled: bool,
     #[serde(default)]
+    borg_version: Option<String>,
+    #[serde(default)]
     required_capabilities: Vec<String>,
+    #[serde(default)]
+    dependencies: BTreeMap<String, String>,
     #[serde(default)]
     skill_roots: Vec<PathBuf>,
     #[serde(default)]
+    config: BTreeMap<String, ConfigField>,
+    #[serde(default)]
     mcp: BTreeMap<String, Server>,
 }
-#[derive(Deserialize)]
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfigField {
+    #[serde(rename = "type", default = "string_kind")]
+    kind: String,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    required: bool,
+    #[serde(default)]
+    secret: bool,
+    #[serde(default)]
+    default: Option<toml::Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Server {
     command: String,
@@ -48,359 +167,1542 @@ struct Server {
     #[serde(default)]
     allowed_tools: Vec<String>,
 }
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct BluState {
+    state_version: u32,
+    extensions: BTreeMap<String, ExtensionState>,
+    sources: BTreeMap<String, SourceRecord>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ExtensionState {
+    enabled: Option<bool>,
+    config: BTreeMap<String, toml::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourceRecord {
+    kind: String,
+    location: String,
+    #[serde(default)]
+    revision: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct Candidate {
+    manifest: Manifest,
+    manifest_path: PathBuf,
+    package_root: PathBuf,
+    scope: ExtensionScope,
+    state: ExtensionState,
+    active: bool,
+    reason: Option<String>,
+    roots: Vec<PathBuf>,
+    servers: Vec<borg_provider::mcp::ExternalMcpServer>,
+}
+
 fn yes() -> bool {
     true
 }
+
+fn string_kind() -> String {
+    "string".to_string()
+}
+
 pub(crate) fn discover(
     cwd: &Path,
     capabilities: &CapabilityConfig,
     allow_project_mcp: bool,
 ) -> Result<(ExtensionCatalog, Vec<borg_provider::mcp::ExternalMcpServer>)> {
-    let user_dir = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|v| PathBuf::from(v).join(".config")))
-        .map(|root| root.join("borg/extensions"));
+    let user_root = user_config_root()?;
     discover_in_dirs(
         Some(cwd.join(".borg/extensions")),
-        user_dir,
+        Some(user_root.join("extensions")),
+        Some(cwd.join(".borg/blu.toml")),
+        Some(user_root.join("blu.toml")),
         capabilities,
         allow_project_mcp,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn discover_in_dirs(
     project_dir: Option<PathBuf>,
     user_dir: Option<PathBuf>,
+    project_state_path: Option<PathBuf>,
+    user_state_path: Option<PathBuf>,
     capabilities: &CapabilityConfig,
     allow_project_mcp: bool,
 ) -> Result<(ExtensionCatalog, Vec<borg_provider::mcp::ExternalMcpServer>)> {
-    let dirs = [(project_dir, true), (user_dir, false)];
-    let mut ids = BTreeSet::new();
-    let mut list = Vec::new();
-    let mut servers = Vec::new();
-    for (dir, is_project) in dirs
-        .into_iter()
-        .filter_map(|(dir, is_project)| dir.map(|dir| (dir, is_project)))
-    {
-        if !dir.exists() {
-            continue;
+    let mut diagnostics = Vec::new();
+    let mut digest = Sha256::new();
+    digest.update(format!("{capabilities:?}:{allow_project_mcp}").as_bytes());
+    let project_state =
+        load_state_for_discovery(project_state_path.as_deref(), &mut diagnostics, &mut digest);
+    let user_state =
+        load_state_for_discovery(user_state_path.as_deref(), &mut diagnostics, &mut digest);
+    let roots = [
+        (project_dir, ExtensionScope::Project, &project_state),
+        (user_dir, ExtensionScope::User, &user_state),
+    ];
+    let mut candidates = Vec::new();
+
+    for (dir, scope, state) in roots {
+        let Some(dir) = dir else { continue };
+        let reload_signal = dir
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("blu.reload");
+        if reload_signal.is_file() {
+            hash_file(&mut digest, &reload_signal)?;
         }
-        let mut entries = fs::read_dir(&dir)?.collect::<std::io::Result<Vec<_>>>()?;
-        entries.sort_by_key(|entry| entry.file_name());
-        for entry in entries {
-            let path = entry.path();
-            if path.extension().and_then(|x| x.to_str()) != Some("toml") {
-                continue;
-            }
-            let m: Manifest = toml::from_str(&fs::read_to_string(&path)?)
-                .with_context(|| format!("invalid extension {}", path.display()))?;
-            ensure!(
-                m.manifest_version == MANIFEST_VERSION,
-                "unsupported extension manifest version"
-            );
-            ensure!(
-                valid(&m.id) && ids.insert(m.id.clone()),
-                "duplicate or invalid extension id `{}`",
-                m.id
-            );
-            let missing = m
-                .required_capabilities
-                .iter()
-                .find(|x| !cap(capabilities, x));
-            let project_untrusted = is_project && !allow_project_mcp;
-            let active = m.enabled && missing.is_none() && !project_untrusted;
-            let reason = (!m.enabled)
-                .then(|| "disabled by manifest".into())
-                .or_else(|| missing.map(|x| format!("requires capability `{x}`")))
-                .or_else(|| {
-                    project_untrusted.then(|| {
-                        "project MCP trust is disabled; set [extensions].allow_project_mcp = true"
-                            .into()
-                    })
-                });
-            let manifest_dir =
-                path.parent().unwrap().canonicalize().with_context(|| {
-                    format!("canonicalize extension directory {}", path.display())
-                })?;
-            let roots = m
-                .skill_roots
-                .into_iter()
-                .map(|r| {
-                    ensure!(
-                        !r.is_absolute()
-                            && !r
-                                .components()
-                                .any(|c| matches!(c, std::path::Component::ParentDir)),
-                        "invalid skill root"
-                    );
-                    let requested = manifest_dir.join(r);
-                    if !requested.exists() {
-                        return Ok(None);
+        for path in manifest_paths(&dir)? {
+            hash_file(&mut digest, &path)?;
+            match load_candidate(&path, scope) {
+                Ok(mut candidate) => {
+                    // The filename hint is only an optimization; state is keyed by
+                    // the validated manifest id.
+                    candidate.state = state
+                        .extensions
+                        .get(&candidate.manifest.id)
+                        .cloned()
+                        .unwrap_or_default();
+                    match evaluate_candidate(&mut candidate, capabilities, allow_project_mcp) {
+                        Ok(()) => candidates.push(candidate),
+                        Err(error) => diagnostics.push(ExtensionDiagnostic {
+                            level: ExtensionDiagnosticLevel::Error,
+                            path,
+                            message: format!("{error:#}"),
+                        }),
                     }
-                    let root = requested.canonicalize().with_context(|| {
-                        format!("canonicalize extension skill root in {}", path.display())
-                    })?;
-                    ensure!(
-                        root.starts_with(&manifest_dir),
-                        "extension skill root escapes manifest directory"
-                    );
-                    Ok(Some(root))
+                }
+                Err(error) => diagnostics.push(ExtensionDiagnostic {
+                    level: ExtensionDiagnosticLevel::Error,
+                    path,
+                    message: format!("{error:#}"),
+                }),
+            }
+        }
+    }
+
+    // The closest scope wins deterministically. A project package can shadow a
+    // user package, but the duplicate remains visible as a diagnostic.
+    let mut seen = BTreeSet::new();
+    candidates.retain(|candidate| {
+        if seen.insert(candidate.manifest.id.clone()) {
+            true
+        } else {
+            diagnostics.push(ExtensionDiagnostic {
+                level: ExtensionDiagnosticLevel::Warning,
+                path: candidate.manifest_path.clone(),
+                message: format!(
+                    "extension `{}` is shadowed by the higher-priority project/user package",
+                    candidate.manifest.id
+                ),
+            });
+            false
+        }
+    });
+
+    resolve_dependencies(&mut candidates);
+    let load_order = dependency_order(&mut candidates);
+    let mut external_servers = Vec::new();
+    for id in &load_order {
+        if let Some(candidate) = candidates
+            .iter()
+            .find(|candidate| candidate.active && &candidate.manifest.id == id)
+        {
+            external_servers.extend(candidate.servers.clone());
+        }
+    }
+
+    let extensions = candidates.into_iter().map(effective).collect();
+    let catalog = ExtensionCatalog {
+        revision: format!("{:x}", digest.finalize()),
+        load_order,
+        extensions,
+        diagnostics,
+    };
+    Ok((catalog, external_servers))
+}
+
+fn load_candidate(path: &Path, scope: ExtensionScope) -> Result<Candidate> {
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("read extension manifest {}", path.display()))?;
+    let manifest: Manifest =
+        toml::from_str(&text).with_context(|| format!("invalid extension {}", path.display()))?;
+    ensure!(
+        manifest.manifest_version == MANIFEST_VERSION,
+        "unsupported manifest_version {}; this Borg supports {}",
+        manifest.manifest_version,
+        MANIFEST_VERSION
+    );
+    ensure!(
+        valid_id(&manifest.id),
+        "invalid extension id `{}`",
+        manifest.id
+    );
+    Version::parse(&manifest.version).with_context(|| {
+        format!(
+            "extension `{}` has an invalid semantic version",
+            manifest.id
+        )
+    })?;
+    let package_root = path
+        .parent()
+        .context("extension manifest has no parent directory")?
+        .canonicalize()
+        .with_context(|| format!("canonicalize package containing {}", path.display()))?;
+    let candidate = Candidate {
+        manifest,
+        manifest_path: path.to_path_buf(),
+        package_root,
+        scope,
+        state: ExtensionState::default(),
+        active: true,
+        reason: None,
+        roots: Vec::new(),
+        servers: Vec::new(),
+    };
+    Ok(candidate)
+}
+
+fn evaluate_candidate(
+    candidate: &mut Candidate,
+    capabilities: &CapabilityConfig,
+    allow_project_mcp: bool,
+) -> Result<()> {
+    candidate.active = true;
+    candidate.reason = None;
+    candidate.roots.clear();
+    candidate.servers.clear();
+    // Keep validation inputs detached from the activation fields we mutate as
+    // individual gates fail.
+    let manifest = candidate.manifest.clone();
+    validate_candidate_declarations(candidate, &manifest)?;
+    let enabled = candidate.state.enabled.unwrap_or(manifest.enabled);
+    if !enabled {
+        deactivate(candidate, "disabled by Blu state");
+    }
+    if let Some(requirement) = &manifest.borg_version {
+        let requirement = VersionReq::parse(requirement)
+            .with_context(|| format!("extension `{}` has invalid borg_version", manifest.id))?;
+        let running = Version::parse(env!("CARGO_PKG_VERSION"))?;
+        if !requirement.matches(&running) {
+            deactivate(
+                candidate,
+                format!("requires Borg {requirement}; running {running}"),
+            );
+        }
+    }
+    if let Some(missing) = manifest
+        .required_capabilities
+        .iter()
+        .find(|capability| !cap(capabilities, capability))
+    {
+        deactivate(candidate, format!("requires capability `{missing}`"));
+    }
+    if candidate.scope == ExtensionScope::Project && !allow_project_mcp {
+        deactivate(
+            candidate,
+            "project extension trust is disabled; set [extensions].allow_project_mcp = true",
+        );
+    }
+
+    // Disabled, untrusted, or capability-gated packages stay inspectable but
+    // do not require runtime-only settings or environment variables to exist.
+    if !candidate.active {
+        return Ok(());
+    }
+    let config = match resolved_config(&manifest, &candidate.state) {
+        Ok(config) => config,
+        Err(error) => {
+            deactivate(candidate, format!("{error:#}"));
+            return Ok(());
+        }
+    };
+    let mut servers = Vec::new();
+    for (name, server) in &manifest.mcp {
+        let rendered = (|| -> Result<_> {
+            let command = render_template(&server.command, &config, &candidate.package_root)?;
+            ensure!(
+                !command.trim().is_empty() && !command.contains('\0'),
+                "extension `{}` has an invalid MCP command",
+                manifest.id
+            );
+            let args = server
+                .args
+                .iter()
+                .map(|value| render_template(value, &config, &candidate.package_root))
+                .collect::<Result<Vec<_>>>()?;
+            let env = server
+                .env
+                .iter()
+                .map(|(key, value)| {
+                    Ok((
+                        key.clone(),
+                        render_template(value, &config, &candidate.package_root)?,
+                    ))
                 })
-                .collect::<Result<Vec<_>>>()?
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>();
-            let names = m.mcp.keys().map(|n| format!("{}__{}", m.id, n)).collect();
-            if active {
-                for (n, s) in m.mcp {
-                    ensure!(
-                        valid(&n) && !s.command.trim().is_empty() && !s.command.contains('\0'),
-                        "invalid extension server"
+                .collect::<Result<BTreeMap<_, _>>>()?;
+            Ok((command, args, env))
+        })();
+        let (command, args, env) = match rendered {
+            Ok(rendered) => rendered,
+            Err(error) => {
+                deactivate(candidate, format!("{error:#}"));
+                return Ok(());
+            }
+        };
+        servers.push(borg_provider::mcp::ExternalMcpServer {
+            name: format!("{}__{name}", manifest.id),
+            command,
+            args,
+            env,
+            allowed_tools: server.allowed_tools.clone(),
+        });
+    }
+    candidate.servers = servers;
+    Ok(())
+}
+
+fn validate_candidate_declarations(candidate: &mut Candidate, manifest: &Manifest) -> Result<()> {
+    if let Some(requirement) = &manifest.borg_version {
+        VersionReq::parse(requirement)
+            .with_context(|| format!("extension `{}` has invalid borg_version", manifest.id))?;
+    }
+    for capability in &manifest.required_capabilities {
+        ensure!(
+            known_capability(capability),
+            "extension `{}` requires unknown capability `{capability}`",
+            manifest.id
+        );
+    }
+    for (dependency, requirement) in &manifest.dependencies {
+        ensure!(valid_id(dependency), "invalid dependency id `{dependency}`");
+        VersionReq::parse(requirement).with_context(|| {
+            format!(
+                "extension `{}` dependency `{dependency}` has invalid version requirement",
+                manifest.id
+            )
+        })?;
+    }
+    validate_config_schema(manifest, &candidate.state)?;
+    for root in &manifest.skill_roots {
+        validate_relative_path(root, "skill root")?;
+        let requested = candidate.package_root.join(root);
+        ensure!(
+            requested.is_dir(),
+            "extension `{}` skill root does not exist: {}",
+            manifest.id,
+            requested.display()
+        );
+        let canonical = requested.canonicalize()?;
+        ensure!(
+            canonical.starts_with(&candidate.package_root),
+            "extension skill root escapes its package"
+        );
+        candidate.roots.push(canonical);
+    }
+    for (name, server) in &manifest.mcp {
+        ensure!(valid_id(name), "invalid MCP server name `{name}`");
+        ensure!(
+            !server.command.trim().is_empty() && !server.command.contains('\0'),
+            "extension `{}` has an invalid MCP command",
+            manifest.id
+        );
+        for key in server.env.keys() {
+            ensure!(valid_env_name(key), "invalid MCP environment name `{key}`");
+        }
+        validate_template(&server.command, manifest)?;
+        for argument in &server.args {
+            validate_template(argument, manifest)?;
+        }
+        for value in server.env.values() {
+            validate_template(value, manifest)?;
+        }
+    }
+    Ok(())
+}
+
+fn resolved_config(
+    manifest: &Manifest,
+    state: &ExtensionState,
+) -> Result<BTreeMap<String, toml::Value>> {
+    validate_config_schema(manifest, state)?;
+    let mut resolved = BTreeMap::new();
+    for (key, field) in &manifest.config {
+        let value = state
+            .config
+            .get(key)
+            .cloned()
+            .or_else(|| field.default.clone());
+        if let Some(value) = value {
+            resolved.insert(key.clone(), value);
+        } else if field.required {
+            let description = field
+                .description
+                .as_deref()
+                .map(|value| format!(" ({value})"))
+                .unwrap_or_default();
+            bail!(
+                "extension `{}` requires setting `{key}`{description}",
+                manifest.id
+            );
+        }
+    }
+    Ok(resolved)
+}
+
+fn validate_config_schema(manifest: &Manifest, state: &ExtensionState) -> Result<()> {
+    for key in state.config.keys() {
+        ensure!(
+            manifest.config.contains_key(key),
+            "extension `{}` has unknown configured setting `{key}`",
+            manifest.id
+        );
+    }
+    for (key, field) in &manifest.config {
+        ensure!(valid_id(key), "invalid extension setting name `{key}`");
+        ensure!(
+            matches!(
+                field.kind.as_str(),
+                "string" | "integer" | "float" | "boolean" | "array"
+            ),
+            "extension `{}` setting `{key}` has unsupported type `{}`",
+            manifest.id,
+            field.kind
+        );
+        if let Some(value) = state.config.get(key).or(field.default.as_ref()) {
+            ensure!(
+                config_type_matches(&field.kind, value),
+                "extension `{}` setting `{key}` must be {}",
+                manifest.id,
+                field.kind
+            );
+        }
+    }
+    Ok(())
+}
+
+fn config_type_matches(kind: &str, value: &toml::Value) -> bool {
+    matches!(
+        (kind, value),
+        ("string", toml::Value::String(_))
+            | ("integer", toml::Value::Integer(_))
+            | ("float", toml::Value::Float(_))
+            | ("boolean", toml::Value::Boolean(_))
+            | ("array", toml::Value::Array(_))
+    )
+}
+
+fn validate_template(input: &str, manifest: &Manifest) -> Result<()> {
+    let mut remainder = input;
+    while let Some(start) = remainder.find("${") {
+        let tail = &remainder[start + 2..];
+        let end = tail
+            .find('}')
+            .context("unterminated Blu template variable")?;
+        let variable = &tail[..end];
+        if variable == "extension_dir" {
+            // Always available.
+        } else if let Some(key) = variable.strip_prefix("config.") {
+            ensure!(
+                manifest.config.contains_key(key),
+                "extension `{}` template references unknown setting `{key}`",
+                manifest.id
+            );
+        } else if let Some(name) = variable.strip_prefix("env.") {
+            ensure!(
+                valid_env_name(name),
+                "invalid environment variable `{name}`"
+            );
+        } else {
+            bail!("unknown Blu template variable `${{{variable}}}`");
+        }
+        remainder = &tail[end + 1..];
+    }
+    Ok(())
+}
+
+fn render_template(
+    input: &str,
+    config: &BTreeMap<String, toml::Value>,
+    package_root: &Path,
+) -> Result<String> {
+    let mut output = String::with_capacity(input.len());
+    let mut remainder = input;
+    while let Some(start) = remainder.find("${") {
+        output.push_str(&remainder[..start]);
+        let tail = &remainder[start + 2..];
+        let end = tail
+            .find('}')
+            .context("unterminated Blu template variable")?;
+        let variable = &tail[..end];
+        let value = if variable == "extension_dir" {
+            package_root.display().to_string()
+        } else if let Some(key) = variable.strip_prefix("config.") {
+            config
+                .get(key)
+                .with_context(|| format!("missing extension setting `{key}`"))
+                .map(config_value_string)?
+        } else if let Some(name) = variable.strip_prefix("env.") {
+            ensure!(
+                valid_env_name(name),
+                "invalid environment variable `{name}`"
+            );
+            std::env::var(name)
+                .with_context(|| format!("environment variable `{name}` is not set"))?
+        } else {
+            bail!("unknown Blu template variable `${{{variable}}}`");
+        };
+        ensure!(!value.contains('\0'), "Blu template value contains NUL");
+        output.push_str(&value);
+        remainder = &tail[end + 1..];
+    }
+    output.push_str(remainder);
+    Ok(output)
+}
+
+fn config_value_string(value: &toml::Value) -> String {
+    match value {
+        toml::Value::String(value) => value.clone(),
+        other => other.to_string(),
+    }
+}
+
+fn resolve_dependencies(candidates: &mut [Candidate]) {
+    let versions = candidates
+        .iter()
+        .map(|candidate| {
+            (
+                candidate.manifest.id.clone(),
+                Version::parse(&candidate.manifest.version).expect("validated version"),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    loop {
+        let active = candidates
+            .iter()
+            .filter(|candidate| candidate.active)
+            .map(|candidate| candidate.manifest.id.clone())
+            .collect::<BTreeSet<_>>();
+        let mut changed = false;
+        for candidate in candidates.iter_mut().filter(|candidate| candidate.active) {
+            for (dependency, requirement) in &candidate.manifest.dependencies {
+                let requirement = match VersionReq::parse(requirement) {
+                    Ok(requirement) => requirement,
+                    Err(_) => {
+                        deactivate(
+                            candidate,
+                            format!(
+                                "dependency `{dependency}` has invalid version requirement `{requirement}`"
+                            ),
+                        );
+                        changed = true;
+                        break;
+                    }
+                };
+                let Some(version) = versions.get(dependency) else {
+                    deactivate(
+                        candidate,
+                        format!("missing dependency `{dependency}` ({requirement})"),
                     );
-                    servers.push(borg_provider::mcp::ExternalMcpServer {
-                        name: format!("{}__{}", m.id, n),
-                        command: s.command,
-                        args: s.args,
-                        env: s.env,
-                        allowed_tools: s.allowed_tools,
-                    });
+                    changed = true;
+                    break;
+                };
+                if !requirement.matches(version) {
+                    deactivate(
+                        candidate,
+                        format!("dependency `{dependency}` is {version}, requires {requirement}"),
+                    );
+                    changed = true;
+                    break;
+                }
+                if !active.contains(dependency) {
+                    deactivate(candidate, format!("dependency `{dependency}` is inactive"));
+                    changed = true;
+                    break;
                 }
             }
-            list.push(EffectiveExtension {
-                id: m.id,
-                version: m.version,
-                enabled: m.enabled,
-                active,
-                reason,
-                skill_roots: roots,
-                servers: names,
-            });
+        }
+        if !changed {
+            break;
         }
     }
-    Ok((ExtensionCatalog { extensions: list }, servers))
 }
-fn valid(s: &str) -> bool {
-    !s.is_empty()
-        && s.bytes()
-            .all(|x| x.is_ascii_alphanumeric() || matches!(x, b'-' | b'_'))
+
+fn dependency_order(candidates: &mut [Candidate]) -> Vec<String> {
+    let active_ids = candidates
+        .iter()
+        .filter(|candidate| candidate.active)
+        .map(|candidate| candidate.manifest.id.clone())
+        .collect::<BTreeSet<_>>();
+    let mut indegree = active_ids
+        .iter()
+        .map(|id| (id.clone(), 0_usize))
+        .collect::<BTreeMap<_, _>>();
+    let mut dependents = BTreeMap::<String, Vec<String>>::new();
+    for candidate in candidates.iter().filter(|candidate| candidate.active) {
+        for dependency in candidate.manifest.dependencies.keys() {
+            if active_ids.contains(dependency) {
+                *indegree.get_mut(&candidate.manifest.id).expect("active id") += 1;
+                dependents
+                    .entry(dependency.clone())
+                    .or_default()
+                    .push(candidate.manifest.id.clone());
+            }
+        }
+    }
+    let mut ready = indegree
+        .iter()
+        .filter_map(|(id, degree)| (*degree == 0).then_some(id.clone()))
+        .collect::<VecDeque<_>>();
+    let mut order = Vec::with_capacity(active_ids.len());
+    while let Some(id) = ready.pop_front() {
+        order.push(id.clone());
+        if let Some(children) = dependents.get(&id) {
+            for child in children {
+                let degree = indegree.get_mut(child).expect("dependent id");
+                *degree -= 1;
+                if *degree == 0 {
+                    ready.push_back(child.clone());
+                }
+            }
+        }
+    }
+    if order.len() != active_ids.len() {
+        let cycle_ids = active_ids
+            .difference(&order.iter().cloned().collect())
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        for candidate in candidates
+            .iter_mut()
+            .filter(|candidate| cycle_ids.contains(&candidate.manifest.id))
+        {
+            deactivate(candidate, "dependency cycle detected");
+        }
+    }
+    order
 }
-fn cap(c: &CapabilityConfig, s: &str) -> bool {
-    match s {
-        "multiplayer" => c.multiplayer,
-        "subagents" => c.subagents,
-        "autonomous_team" => c.autonomous_team,
-        "shared_work" => c.shared_work,
-        "presence" => c.presence,
-        "cloud_sync" => c.cloud_sync,
-        "web_relay" => c.web_relay,
-        "telemetry" => c.telemetry,
+
+fn effective(candidate: Candidate) -> EffectiveExtension {
+    let enabled = candidate
+        .state
+        .enabled
+        .unwrap_or(candidate.manifest.enabled);
+    let settings = candidate
+        .manifest
+        .config
+        .iter()
+        .filter_map(|(key, field)| {
+            candidate
+                .state
+                .config
+                .get(key)
+                .or(field.default.as_ref())
+                .map(|value| {
+                    (
+                        key.clone(),
+                        if field.secret {
+                            "<redacted>".to_string()
+                        } else {
+                            config_value_string(value)
+                        },
+                    )
+                })
+        })
+        .collect();
+    EffectiveExtension {
+        id: candidate.manifest.id.clone(),
+        name: candidate
+            .manifest
+            .name
+            .clone()
+            .unwrap_or_else(|| candidate.manifest.id.clone()),
+        version: candidate.manifest.version,
+        description: candidate.manifest.description,
+        scope: candidate.scope,
+        manifest_path: candidate.manifest_path,
+        enabled,
+        active: candidate.active,
+        reason: candidate.reason,
+        dependencies: candidate.manifest.dependencies,
+        skill_roots: candidate.roots,
+        servers: candidate
+            .manifest
+            .mcp
+            .keys()
+            .map(|name| format!("{}__{name}", candidate.manifest.id))
+            .collect(),
+        settings,
+    }
+}
+
+fn deactivate(candidate: &mut Candidate, reason: impl Into<String>) {
+    if candidate.active {
+        candidate.active = false;
+        candidate.reason = Some(reason.into());
+    }
+}
+
+fn manifest_paths(dir: &Path) -> Result<Vec<PathBuf>> {
+    if !dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut paths = Vec::new();
+    let mut entries = fs::read_dir(dir)?.collect::<std::io::Result<Vec<_>>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let path = entry.path();
+        if path.is_file() && path.extension().and_then(|value| value.to_str()) == Some("toml") {
+            paths.push(path);
+        } else if path.is_dir() {
+            for name in PACKAGE_MANIFEST_NAMES {
+                let manifest = path.join(name);
+                if manifest.is_file() {
+                    paths.push(manifest);
+                    break;
+                }
+            }
+        }
+    }
+    Ok(paths)
+}
+
+fn package_manifest(root: &Path) -> Result<PathBuf> {
+    if root.is_file() {
+        return Ok(root.to_path_buf());
+    }
+    for name in PACKAGE_MANIFEST_NAMES {
+        let path = root.join(name);
+        if path.is_file() {
+            return Ok(path);
+        }
+    }
+    let legacy = manifest_paths(root)?;
+    ensure!(
+        legacy.len() == 1,
+        "package must contain exactly one blu.toml, extension.toml, or legacy TOML manifest"
+    );
+    Ok(legacy[0].clone())
+}
+
+fn load_state(path: Option<&Path>) -> Result<BluState> {
+    let Some(path) = path.filter(|path| path.is_file()) else {
+        return Ok(BluState {
+            state_version: STATE_VERSION,
+            ..BluState::default()
+        });
+    };
+    let state: BluState = toml::from_str(&fs::read_to_string(path)?)
+        .with_context(|| format!("invalid Blu state {}", path.display()))?;
+    ensure!(
+        state.state_version == STATE_VERSION,
+        "unsupported Blu state version {} in {}",
+        state.state_version,
+        path.display()
+    );
+    Ok(state)
+}
+
+fn load_state_for_discovery(
+    path: Option<&Path>,
+    diagnostics: &mut Vec<ExtensionDiagnostic>,
+    digest: &mut Sha256,
+) -> BluState {
+    let Some(path) = path.filter(|path| path.is_file()) else {
+        return BluState {
+            state_version: STATE_VERSION,
+            ..BluState::default()
+        };
+    };
+    if let Err(error) = hash_file(digest, path) {
+        diagnostics.push(ExtensionDiagnostic {
+            level: ExtensionDiagnosticLevel::Error,
+            path: path.to_path_buf(),
+            message: format!("could not read Blu state: {error:#}"),
+        });
+        return BluState {
+            state_version: STATE_VERSION,
+            ..BluState::default()
+        };
+    }
+    match load_state(Some(path)) {
+        Ok(state) => state,
+        Err(error) => {
+            diagnostics.push(ExtensionDiagnostic {
+                level: ExtensionDiagnosticLevel::Error,
+                path: path.to_path_buf(),
+                message: format!("{error:#}"),
+            });
+            BluState {
+                state_version: STATE_VERSION,
+                ..BluState::default()
+            }
+        }
+    }
+}
+
+fn write_state(path: &Path, state: &BluState) -> Result<()> {
+    let parent = path.parent().context("Blu state path has no parent")?;
+    fs::create_dir_all(parent)?;
+    let temporary = parent.join(format!(".blu.{}.tmp", Uuid::new_v4()));
+    fs::write(&temporary, toml::to_string_pretty(state)?)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(windows))]
+    fs::rename(&temporary, path)
+        .with_context(|| format!("atomically replace {}", path.display()))?;
+    #[cfg(windows)]
+    {
+        let backup = parent.join(format!(".blu.{}.backup", Uuid::new_v4()));
+        if path.exists() {
+            fs::rename(path, &backup)
+                .with_context(|| format!("stage existing Blu state {}", path.display()))?;
+        }
+        if let Err(error) = fs::rename(&temporary, path) {
+            if backup.exists() {
+                let _ = fs::rename(&backup, path);
+            }
+            return Err(error).with_context(|| format!("replace Blu state {}", path.display()));
+        }
+        if backup.exists() {
+            fs::remove_file(backup)?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn set_enabled(cwd: &Path, id: &str, project: bool, enabled: bool) -> Result<PathBuf> {
+    ensure!(valid_id(id), "invalid extension id `{id}`");
+    let _ = manifest_in_scope(cwd, id, project)?;
+    let path = scope_state_path(cwd, project)?;
+    let mut state = load_state(Some(&path))?;
+    state.state_version = STATE_VERSION;
+    state.extensions.entry(id.to_string()).or_default().enabled = Some(enabled);
+    write_state(&path, &state)?;
+    Ok(path)
+}
+
+pub(crate) fn configure(
+    cwd: &Path,
+    id: &str,
+    key: &str,
+    value: Option<toml::Value>,
+    project: bool,
+) -> Result<PathBuf> {
+    ensure!(valid_id(id), "invalid extension id `{id}`");
+    ensure!(valid_id(key), "invalid extension setting `{key}`");
+    let (_, manifest) = manifest_in_scope(cwd, id, project)?;
+    let field = manifest
+        .config
+        .get(key)
+        .with_context(|| format!("extension `{id}` does not declare setting `{key}`"))?;
+    if let Some(value) = &value {
+        ensure!(
+            config_type_matches(&field.kind, value),
+            "extension `{id}` setting `{key}` must be {}",
+            field.kind
+        );
+    } else {
+        ensure!(
+            !field.required || field.default.is_some(),
+            "extension `{id}` setting `{key}` is required and has no default"
+        );
+    }
+    let path = scope_state_path(cwd, project)?;
+    let mut state = load_state(Some(&path))?;
+    state.state_version = STATE_VERSION;
+    let extension = state.extensions.entry(id.to_string()).or_default();
+    match value {
+        Some(value) => {
+            extension.config.insert(key.to_string(), value);
+        }
+        None => {
+            extension.config.remove(key);
+        }
+    }
+    write_state(&path, &state)?;
+    Ok(path)
+}
+
+fn manifest_in_scope(cwd: &Path, id: &str, project: bool) -> Result<(PathBuf, Manifest)> {
+    let directory = scope_extensions_dir(cwd, project)?;
+    for path in manifest_paths(&directory)? {
+        let text = fs::read_to_string(&path)?;
+        let manifest: Manifest = match toml::from_str(&text) {
+            Ok(manifest) => manifest,
+            Err(_) => continue,
+        };
+        if manifest.id == id {
+            return Ok((path, manifest));
+        }
+    }
+    bail!(
+        "extension `{id}` is not installed in the {} scope",
+        if project { "project" } else { "user" }
+    )
+}
+
+pub(crate) fn parse_config_value(value: &str) -> toml::Value {
+    #[derive(Deserialize)]
+    struct Wrapper {
+        value: toml::Value,
+    }
+    toml::from_str::<Wrapper>(&format!("value = {value}"))
+        .map(|wrapper| wrapper.value)
+        .unwrap_or_else(|_| toml::Value::String(value.to_string()))
+}
+
+pub(crate) fn install(cwd: &Path, source: &str, project: bool, force: bool) -> Result<String> {
+    install_expected(cwd, source, project, force, None)
+}
+
+fn install_expected(
+    cwd: &Path,
+    source: &str,
+    project: bool,
+    force: bool,
+    expected_id: Option<&str>,
+) -> Result<String> {
+    let (package, source_record, _temporary) = materialize_source(source)?;
+    let manifest_path = package_manifest(&package)?;
+    let scope = if project {
+        ExtensionScope::Project
+    } else {
+        ExtensionScope::User
+    };
+    let mut source_candidate = load_candidate(&manifest_path, scope)?;
+    let source_manifest = source_candidate.manifest.clone();
+    validate_candidate_declarations(&mut source_candidate, &source_manifest)?;
+    if let Some(expected_id) = expected_id {
+        ensure!(
+            source_candidate.manifest.id == expected_id,
+            "updated package changed id from `{expected_id}` to `{}`",
+            source_candidate.manifest.id
+        );
+    }
+    let manifest = source_candidate.manifest;
+    let extensions_dir = scope_extensions_dir(cwd, project)?;
+    fs::create_dir_all(&extensions_dir)?;
+    let destination = extensions_dir.join(&manifest.id);
+    ensure!(
+        force || !destination.exists(),
+        "extension `{}` is already installed; pass --force to replace it",
+        manifest.id
+    );
+    let staging = extensions_dir.join(format!(".{}.install-{}", manifest.id, Uuid::new_v4()));
+    if let Err(error) = copy_package(&package, &staging) {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(error).context("stage Blu package");
+    }
+    // Validate the staged package before replacing the live directory.
+    let staged_validation = (|| -> Result<()> {
+        let staged_manifest = package_manifest(&staging)?;
+        let mut staged_candidate = load_candidate(&staged_manifest, scope)?;
+        let staged_manifest = staged_candidate.manifest.clone();
+        validate_candidate_declarations(&mut staged_candidate, &staged_manifest)?;
+        ensure!(
+            staged_candidate.manifest.id == manifest.id,
+            "staged package id changed during copy"
+        );
+        Ok(())
+    })();
+    if let Err(error) = staged_validation {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(error).context("validate staged Blu package");
+    }
+    let state_path = scope_state_path(cwd, project)?;
+    let mut state = match load_state(Some(&state_path)) {
+        Ok(state) => state,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&staging);
+            return Err(error);
+        }
+    };
+    state.state_version = STATE_VERSION;
+    state.sources.insert(manifest.id.clone(), source_record);
+    let backup = extensions_dir.join(format!(".{}.backup-{}", manifest.id, Uuid::new_v4()));
+    if destination.exists()
+        && let Err(error) = fs::rename(&destination, &backup)
+    {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(error).context("stage previous Blu package");
+    }
+    if let Err(error) = fs::rename(&staging, &destination) {
+        if backup.exists() {
+            let _ = fs::rename(&backup, &destination);
+        }
+        let _ = fs::remove_dir_all(&staging);
+        return Err(error).context("activate staged Blu package");
+    }
+    if let Err(error) = write_state(&state_path, &state) {
+        let _ = fs::remove_dir_all(&destination);
+        if backup.exists() {
+            let _ = fs::rename(&backup, &destination);
+        }
+        return Err(error).context("record Blu install state; restored previous package");
+    }
+    if backup.exists()
+        && let Err(error) = fs::remove_dir_all(&backup)
+    {
+        tracing::warn!(path = %backup.display(), %error, "could not remove replaced Blu package backup");
+    }
+    Ok(manifest.id)
+}
+
+pub(crate) fn update(cwd: &Path, id: Option<&str>, project: bool) -> Result<Vec<String>> {
+    let state_path = scope_state_path(cwd, project)?;
+    let state = load_state(Some(&state_path))?;
+    let targets = match id {
+        Some(id) => vec![(
+            id.to_string(),
+            state
+                .sources
+                .get(id)
+                .cloned()
+                .with_context(|| format!("extension `{id}` has no recorded install source"))?,
+        )],
+        None => state
+            .sources
+            .iter()
+            .filter(|(_, source)| source.kind == "git")
+            .map(|(id, source)| (id.clone(), source.clone()))
+            .collect(),
+    };
+    let mut updated = Vec::new();
+    for (id, source) in targets {
+        ensure!(
+            source.kind == "git",
+            "extension `{id}` is local and cannot be updated automatically"
+        );
+        install_expected(cwd, &source.location, project, true, Some(&id))?;
+        updated.push(id);
+    }
+    Ok(updated)
+}
+
+pub(crate) fn remove(cwd: &Path, id: &str, project: bool) -> Result<PathBuf> {
+    ensure!(valid_id(id), "invalid extension id `{id}`");
+    let extensions_dir = scope_extensions_dir(cwd, project)?;
+    let package = extensions_dir.join(id);
+    let legacy = extensions_dir.join(format!("{id}.toml"));
+    let removed = if package.is_dir() {
+        package
+    } else if legacy.is_file() {
+        legacy
+    } else {
+        bail!("extension `{id}` is not installed in this scope");
+    };
+    let state_path = scope_state_path(cwd, project)?;
+    let mut state = load_state(Some(&state_path))?;
+    state.extensions.remove(id);
+    state.sources.remove(id);
+    let staged = extensions_dir.join(format!(".{id}.remove-{}", Uuid::new_v4()));
+    fs::rename(&removed, &staged)?;
+    if let Err(error) = write_state(&state_path, &state) {
+        let _ = fs::rename(&staged, &removed);
+        return Err(error).context("record Blu removal state; restored package");
+    }
+    if staged.is_dir() {
+        if let Err(error) = fs::remove_dir_all(&staged) {
+            tracing::warn!(path = %staged.display(), %error, "could not remove staged Blu package");
+        }
+    } else {
+        if let Err(error) = fs::remove_file(&staged) {
+            tracing::warn!(path = %staged.display(), %error, "could not remove staged Blu manifest");
+        }
+    }
+    Ok(removed)
+}
+
+pub(crate) fn scaffold(cwd: &Path, id: &str, version: &str, project: bool) -> Result<PathBuf> {
+    ensure!(valid_id(id), "invalid extension id `{id}`");
+    Version::parse(version).context("--version must be a semantic version")?;
+    let package = scope_extensions_dir(cwd, project)?.join(id);
+    ensure!(
+        !package.exists(),
+        "extension package already exists: {}",
+        package.display()
+    );
+    fs::create_dir_all(package.join("skills").join(id))?;
+    let manifest = format!(
+        "manifest_version = 1\nid = \"{id}\"\nname = \"{id}\"\nversion = \"{version}\"\ndescription = \"Describe this Blu extension\"\nenabled = true\nskill_roots = [\"skills\"]\n"
+    );
+    fs::write(package.join("blu.toml"), manifest)?;
+    fs::write(
+        package.join("skills").join(id).join("SKILL.md"),
+        format!(
+            "---\nname: {id}\ndescription: Describe when this extension applies.\n---\n\n# {id}\n\nAdd focused agent instructions here.\n"
+        ),
+    )?;
+    Ok(package)
+}
+
+pub(crate) fn touch_reload(cwd: &Path) -> Result<PathBuf> {
+    let path = cwd.join(".borg/blu.reload");
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&path, format!("{}\n", chrono::Utc::now().to_rfc3339()))?;
+    Ok(path)
+}
+
+fn materialize_source(source: &str) -> Result<(PathBuf, SourceRecord, Option<tempfile::TempDir>)> {
+    let local = PathBuf::from(source);
+    if local.exists() {
+        let canonical = local.canonicalize()?;
+        if canonical.is_file()
+            && !PACKAGE_MANIFEST_NAMES
+                .iter()
+                .any(|name| canonical.file_name().and_then(|value| value.to_str()) == Some(name))
+        {
+            let temporary = tempfile::tempdir()?;
+            let package = temporary.path().join("package");
+            fs::create_dir_all(&package)?;
+            fs::copy(&canonical, package.join("blu.toml"))?;
+            return Ok((
+                package,
+                SourceRecord {
+                    kind: "local".to_string(),
+                    location: canonical.display().to_string(),
+                    revision: None,
+                },
+                Some(temporary),
+            ));
+        }
+        let package = if canonical.is_file() {
+            canonical
+                .parent()
+                .context("manifest source has no parent")?
+                .to_path_buf()
+        } else {
+            canonical.clone()
+        };
+        return Ok((
+            package,
+            SourceRecord {
+                kind: "local".to_string(),
+                location: canonical.display().to_string(),
+                revision: None,
+            },
+            None,
+        ));
+    }
+    ensure!(
+        looks_like_git_source(source),
+        "source is not a local path or Git URL"
+    );
+    let location = source.strip_prefix("git+").unwrap_or(source);
+    let temporary = tempfile::tempdir()?;
+    let package = temporary.path().join("package");
+    let output = Command::new("git")
+        .args(["clone", "--depth", "1", "--", location])
+        .arg(&package)
+        .output()
+        .context("run git clone")?;
+    ensure!(
+        output.status.success(),
+        "git clone failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    let revision = Command::new("git")
+        .args(["-C"])
+        .arg(&package)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string());
+    Ok((
+        package,
+        SourceRecord {
+            kind: "git".to_string(),
+            location: source.to_string(),
+            revision,
+        },
+        Some(temporary),
+    ))
+}
+
+fn copy_package(source: &Path, destination: &Path) -> Result<()> {
+    fs::create_dir_all(destination)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name == ".git" || name == "target" {
+            continue;
+        }
+        let file_type = entry.file_type()?;
+        let target = destination.join(&name);
+        if file_type.is_symlink() {
+            bail!(
+                "Blu packages may not contain symlinks: {}",
+                entry.path().display()
+            );
+        } else if file_type.is_dir() {
+            copy_package(&entry.path(), &target)?;
+        } else if file_type.is_file() {
+            fs::copy(entry.path(), target)?;
+        }
+    }
+    Ok(())
+}
+
+fn looks_like_git_source(source: &str) -> bool {
+    source.starts_with("git+")
+        || source.starts_with("https://")
+        || source.starts_with("http://")
+        || source.starts_with("ssh://")
+        || source.starts_with("git@")
+}
+
+fn scope_extensions_dir(cwd: &Path, project: bool) -> Result<PathBuf> {
+    Ok(if project {
+        cwd.join(".borg/extensions")
+    } else {
+        user_config_root()?.join("extensions")
+    })
+}
+
+fn scope_state_path(cwd: &Path, project: bool) -> Result<PathBuf> {
+    Ok(if project {
+        cwd.join(".borg/blu.toml")
+    } else {
+        user_config_root()?.join("blu.toml")
+    })
+}
+
+fn user_config_root() -> Result<PathBuf> {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+        .map(|root| root.join("borg"))
+        .context("HOME or XDG_CONFIG_HOME is required for user extensions")
+}
+
+fn validate_relative_path(path: &Path, label: &str) -> Result<()> {
+    ensure!(!path.as_os_str().is_empty(), "{label} must not be empty");
+    ensure!(!path.is_absolute(), "{label} must be relative");
+    ensure!(
+        !path.components().any(|component| matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )),
+        "invalid {label}"
+    );
+    Ok(())
+}
+
+fn valid_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn valid_env_name(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+fn cap(config: &CapabilityConfig, name: &str) -> bool {
+    match name {
+        "multiplayer" => config.multiplayer,
+        "subagents" => config.subagents,
+        "autonomous_team" => config.autonomous_team,
+        "shared_work" => config.shared_work,
+        "presence" => config.presence,
+        "cloud_sync" => config.cloud_sync,
+        "web_relay" => config.web_relay,
+        "telemetry" => config.telemetry,
         _ => false,
     }
+}
+
+fn known_capability(name: &str) -> bool {
+    matches!(
+        name,
+        "multiplayer"
+            | "subagents"
+            | "autonomous_team"
+            | "shared_work"
+            | "presence"
+            | "cloud_sync"
+            | "web_relay"
+            | "telemetry"
+    )
+}
+
+fn hash_file(digest: &mut Sha256, path: &Path) -> Result<()> {
+    digest.update(path.to_string_lossy().as_bytes());
+    digest.update(fs::read(path)?);
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn manifest(id: &str, capability: &str) -> String {
+    fn manifest(id: &str, extra: &str) -> String {
         format!(
-            "manifest_version = 1\nid = \"{id}\"\nversion = \"1.0.0\"\nrequired_capabilities = [\"{capability}\"]\nskill_roots = [\"skills\"]\n[mcp.docs]\ncommand = \"docs-mcp\"\nargs = [\"serve\"]\n"
+            "manifest_version = 1\nid = \"{id}\"\nversion = \"1.0.0\"\nskill_roots = [\"skills\"]\n{extra}\n[mcp.docs]\ncommand = \"docs-mcp\"\nargs = [\"serve\"]\n"
         )
     }
 
-    #[test]
-    fn active_manifest_is_namespaced_and_inactive_manifest_does_not_expose_servers() {
-        let dir = tempfile::tempdir().unwrap();
-        let extension_dir = dir.path().join(".borg/extensions");
-        fs::create_dir_all(&extension_dir).unwrap();
-        fs::write(
-            extension_dir.join("docs.toml"),
-            manifest("docs", "multiplayer"),
-        )
-        .unwrap();
-        let (catalog, servers) = discover(dir.path(), &CapabilityConfig::default(), true).unwrap();
-        assert!(catalog.extensions[0].active);
-        assert_eq!(servers[0].name, "docs__docs");
-        let disabled = CapabilityConfig {
-            multiplayer: false,
-            ..CapabilityConfig::default()
-        };
-        let (catalog, servers) = discover(dir.path(), &disabled, true).unwrap();
-        assert!(!catalog.extensions[0].active);
-        assert!(servers.is_empty());
+    fn package(root: &Path, id: &str, extra: &str) {
+        let package = root.join(id);
+        fs::create_dir_all(package.join("skills")).unwrap();
+        fs::write(package.join("blu.toml"), manifest(id, extra)).unwrap();
     }
 
-    #[test]
-    fn duplicate_manifest_ids_are_rejected() {
-        let dir = tempfile::tempdir().unwrap();
-        let extension_dir = dir.path().join(".borg/extensions");
-        fs::create_dir_all(&extension_dir).unwrap();
-        fs::write(
-            extension_dir.join("one.toml"),
-            manifest("same", "multiplayer"),
-        )
-        .unwrap();
-        fs::write(
-            extension_dir.join("two.toml"),
-            manifest("same", "multiplayer"),
-        )
-        .unwrap();
-        assert!(discover(dir.path(), &CapabilityConfig::default(), true).is_err());
-    }
-
-    #[test]
-    fn path_traversal_and_unknown_capabilities_are_inactive_or_rejected() {
-        let dir = tempfile::tempdir().unwrap();
-        let extension_dir = dir.path().join(".borg/extensions");
-        fs::create_dir_all(&extension_dir).unwrap();
-        fs::write(
-            extension_dir.join("bad.toml"),
-            "manifest_version=1\nid=\"bad\"\nversion=\"1\"\nskill_roots=[\"../escape\"]\n",
-        )
-        .unwrap();
-        assert!(discover(dir.path(), &CapabilityConfig::default(), true).is_err());
-        fs::remove_file(extension_dir.join("bad.toml")).unwrap();
-        fs::write(
-            extension_dir.join("unknown.toml"),
-            manifest("unknown", "not_real"),
-        )
-        .unwrap();
-        let (catalog, servers) = discover(dir.path(), &CapabilityConfig::default(), true).unwrap();
-        assert!(!catalog.extensions[0].active);
-        assert!(
-            catalog.extensions[0]
-                .reason
-                .as_deref()
-                .unwrap()
-                .contains("not_real")
-        );
-        assert!(servers.is_empty());
-    }
-
-    #[test]
-    fn project_manifests_are_listed_before_user_catalog_position() {
-        let dir = tempfile::tempdir().unwrap();
-        let extension_dir = dir.path().join(".borg/extensions");
-        fs::create_dir_all(&extension_dir).unwrap();
-        fs::write(
-            extension_dir.join("first.toml"),
-            manifest("first", "multiplayer"),
-        )
-        .unwrap();
-        fs::write(
-            extension_dir.join("second.toml"),
-            manifest("second", "multiplayer"),
-        )
-        .unwrap();
-        let (catalog, _) = discover(dir.path(), &CapabilityConfig::default(), true).unwrap();
-        let ids = catalog
-            .extensions
-            .into_iter()
-            .map(|extension| extension.id)
-            .collect::<Vec<_>>();
-        assert_eq!(ids, vec!["first", "second"]);
-    }
-
-    #[test]
-    fn project_mcp_is_denied_by_default_and_activates_only_when_trusted() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(
-            dir.path().join("docs.toml"),
-            manifest("docs", "multiplayer"),
-        )
-        .unwrap();
-
-        let (catalog, servers) = discover_in_dirs(
-            Some(dir.path().to_owned()),
+    fn discover_test(
+        project: Option<PathBuf>,
+        user: Option<PathBuf>,
+        trusted: bool,
+    ) -> (ExtensionCatalog, Vec<borg_provider::mcp::ExternalMcpServer>) {
+        discover_in_dirs(
+            project,
+            user,
             None,
+            None,
+            &CapabilityConfig::default(),
+            trusted,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn trusted_package_loads_skills_and_namespaced_server() {
+        let root = tempfile::tempdir().unwrap();
+        package(
+            root.path(),
+            "docs",
+            "required_capabilities = [\"multiplayer\"]",
+        );
+        let (catalog, servers) = discover_test(Some(root.path().to_path_buf()), None, true);
+        assert!(catalog.extensions[0].active);
+        assert_eq!(catalog.load_order, ["docs"]);
+        assert_eq!(servers[0].name, "docs__docs");
+        assert_eq!(catalog.active_skill_roots().len(), 1);
+    }
+
+    #[test]
+    fn invalid_package_is_isolated_without_bricking_valid_catalog() {
+        let root = tempfile::tempdir().unwrap();
+        package(root.path(), "good", "");
+        fs::write(root.path().join("broken.toml"), "not = [valid").unwrap();
+        let (catalog, servers) = discover_test(None, Some(root.path().to_path_buf()), false);
+        assert_eq!(catalog.extensions.len(), 1);
+        assert_eq!(catalog.diagnostics.len(), 1);
+        assert_eq!(servers.len(), 1);
+    }
+
+    #[test]
+    fn invalid_state_is_reported_without_bricking_valid_packages() {
+        let root = tempfile::tempdir().unwrap();
+        package(root.path(), "good", "");
+        let state_path = root.path().join("state.toml");
+        fs::write(&state_path, "not = [valid").unwrap();
+        let (catalog, servers) = discover_in_dirs(
+            None,
+            Some(root.path().to_path_buf()),
+            None,
+            Some(state_path),
             &CapabilityConfig::default(),
             false,
         )
         .unwrap();
+        assert_eq!(catalog.extensions.len(), 1);
+        assert!(catalog.has_errors());
+        assert_eq!(servers.len(), 1);
+    }
+
+    #[test]
+    fn missing_runtime_setting_keeps_extension_visible_and_inactive() {
+        let root = tempfile::tempdir().unwrap();
+        package(
+            root.path(),
+            "configured",
+            "[config.token]\ntype=\"string\"\nrequired=true",
+        );
+        let (catalog, servers) = discover_test(None, Some(root.path().to_path_buf()), false);
+        assert_eq!(catalog.extensions.len(), 1);
         assert!(!catalog.extensions[0].active);
         assert!(
             catalog.extensions[0]
                 .reason
                 .as_deref()
                 .unwrap()
-                .contains("project MCP trust is disabled")
+                .contains("requires setting `token`")
         );
+        assert!(!catalog.has_errors());
         assert!(servers.is_empty());
-
-        let (catalog, servers) = discover_in_dirs(
-            Some(dir.path().to_owned()),
-            None,
-            &CapabilityConfig::default(),
-            true,
-        )
-        .unwrap();
-        assert!(catalog.extensions[0].active);
-        assert_eq!(servers[0].name, "docs__docs");
     }
 
     #[test]
-    fn trusted_skill_roots_are_canonical_and_untrusted_project_roots_are_inactive() {
-        let dir = tempfile::tempdir().unwrap();
-        let manifest_dir = dir.path().join(".borg/extensions");
-        let skills = manifest_dir.join("skills");
-        fs::create_dir_all(&skills).unwrap();
-        fs::write(
-            manifest_dir.join("docs.toml"),
-            manifest("docs", "multiplayer"),
-        )
-        .unwrap();
-        let canonical_manifest_dir = manifest_dir.canonicalize().unwrap();
-        let (untrusted, _) = discover(dir.path(), &CapabilityConfig::default(), false).unwrap();
-        assert!(!untrusted.extensions[0].active);
-        assert!(
-            untrusted.extensions[0]
-                .skill_roots
-                .iter()
-                .all(|root| root.starts_with(&canonical_manifest_dir))
+    fn project_package_shadows_user_and_requires_explicit_trust() {
+        let project = tempfile::tempdir().unwrap();
+        let user = tempfile::tempdir().unwrap();
+        package(project.path(), "same", "");
+        package(user.path(), "same", "");
+        let (catalog, servers) = discover_test(
+            Some(project.path().to_path_buf()),
+            Some(user.path().to_path_buf()),
+            false,
         );
-        let (trusted, _) = discover(dir.path(), &CapabilityConfig::default(), true).unwrap();
-        assert!(trusted.extensions[0].active);
+        assert_eq!(catalog.extensions.len(), 1);
+        assert!(!catalog.extensions[0].active);
+        assert_eq!(catalog.extensions[0].scope, ExtensionScope::Project);
+        assert!(servers.is_empty());
+        assert_eq!(catalog.diagnostics.len(), 1);
         assert_eq!(
-            trusted.extensions[0].skill_roots,
-            vec![skills.canonicalize().unwrap()]
+            catalog.diagnostics[0].level,
+            ExtensionDiagnosticLevel::Warning
         );
+        assert!(!catalog.has_errors());
     }
 
     #[test]
-    fn symlinked_skill_root_escape_is_rejected() {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::symlink;
-            let dir = tempfile::tempdir().unwrap();
-            let outside = tempfile::tempdir().unwrap();
-            let manifest_dir = dir.path().join(".borg/extensions");
-            fs::create_dir_all(&manifest_dir).unwrap();
-            symlink(outside.path(), manifest_dir.join("skills")).unwrap();
-            fs::write(
-                manifest_dir.join("bad.toml"),
-                manifest("bad", "multiplayer"),
-            )
-            .unwrap();
-            assert!(discover(dir.path(), &CapabilityConfig::default(), true).is_err());
-        }
+    fn dependencies_are_version_checked_and_loaded_first() {
+        let root = tempfile::tempdir().unwrap();
+        package(root.path(), "base", "");
+        package(root.path(), "consumer", "[dependencies]\nbase = \"^1\"");
+        let (catalog, _) = discover_test(None, Some(root.path().to_path_buf()), false);
+        assert_eq!(catalog.load_order, ["base", "consumer"]);
+        assert!(catalog.extensions.iter().all(|extension| extension.active));
     }
 
     #[test]
-    fn user_manifest_remains_active_without_project_trust() {
-        let dir = tempfile::tempdir().unwrap();
+    fn dependency_cycles_are_inactive() {
+        let root = tempfile::tempdir().unwrap();
+        package(root.path(), "one", "[dependencies]\ntwo = \"*\"");
+        package(root.path(), "two", "[dependencies]\none = \"*\"");
+        let (catalog, servers) = discover_test(None, Some(root.path().to_path_buf()), false);
+        assert!(catalog.extensions.iter().all(|extension| !extension.active));
+        assert!(servers.is_empty());
+    }
+
+    #[test]
+    fn typed_settings_render_into_server_configuration_and_secrets_are_redacted() {
+        let root = tempfile::tempdir().unwrap();
+        let package = root.path().join("configured");
+        fs::create_dir_all(package.join("skills")).unwrap();
         fs::write(
-            dir.path().join("docs.toml"),
-            manifest("docs", "multiplayer"),
+            package.join("blu.toml"),
+            "manifest_version=1\nid=\"configured\"\nversion=\"1.0.0\"\nskill_roots=[\"skills\"]\n[config.token]\ntype=\"string\"\nrequired=true\nsecret=true\n[mcp.api]\ncommand=\"api-mcp\"\nenv={ TOKEN=\"${config.token}\" }\n",
+        )
+        .unwrap();
+        let state_path = root.path().join("state.toml");
+        fs::write(
+            &state_path,
+            "state_version=1\n[extensions.configured.config]\ntoken=\"secret\"\n",
         )
         .unwrap();
         let (catalog, servers) = discover_in_dirs(
             None,
-            Some(dir.path().to_owned()),
+            Some(root.path().to_path_buf()),
+            None,
+            Some(state_path),
             &CapabilityConfig::default(),
             false,
         )
         .unwrap();
-        assert!(catalog.extensions[0].active);
-        assert_eq!(servers[0].name, "docs__docs");
+        assert_eq!(servers[0].env["TOKEN"], "secret");
+        assert_eq!(catalog.extensions[0].settings["token"], "<redacted>");
+    }
+
+    #[test]
+    fn path_escape_and_symlink_escape_are_rejected_per_package() {
+        let root = tempfile::tempdir().unwrap();
+        let bad = root.path().join("bad");
+        fs::create_dir_all(&bad).unwrap();
+        fs::write(
+            bad.join("blu.toml"),
+            "manifest_version=1\nid=\"bad\"\nversion=\"1.0.0\"\nskill_roots=[\"../escape\"]\n",
+        )
+        .unwrap();
+        let (catalog, _) = discover_test(None, Some(root.path().to_path_buf()), false);
+        assert!(catalog.extensions.is_empty());
+        assert_eq!(catalog.diagnostics.len(), 1);
+    }
+
+    #[test]
+    fn local_install_is_atomic_and_removable() {
+        let source = tempfile::tempdir().unwrap();
+        package(source.path(), "sample", "");
+        let workspace = tempfile::tempdir().unwrap();
+        let id = install(
+            workspace.path(),
+            source.path().join("sample").to_str().unwrap(),
+            true,
+            false,
+        )
+        .unwrap();
+        assert_eq!(id, "sample");
+        assert!(
+            workspace
+                .path()
+                .join(".borg/extensions/sample/blu.toml")
+                .is_file()
+        );
+        remove(workspace.path(), "sample", true).unwrap();
+        assert!(!workspace.path().join(".borg/extensions/sample").exists());
+    }
+
+    #[test]
+    fn force_install_keeps_previous_package_when_replacement_is_invalid() {
+        let good_source = tempfile::tempdir().unwrap();
+        package(good_source.path(), "sample", "");
+        let workspace = tempfile::tempdir().unwrap();
+        install(
+            workspace.path(),
+            good_source.path().join("sample").to_str().unwrap(),
+            true,
+            false,
+        )
+        .unwrap();
+
+        let bad_source = tempfile::tempdir().unwrap();
+        let bad_package = bad_source.path().join("sample");
+        fs::create_dir_all(&bad_package).unwrap();
+        fs::write(
+            bad_package.join("blu.toml"),
+            "manifest_version=1\nid=\"sample\"\nversion=\"2.0.0\"\nskill_roots=[\"missing\"]\n",
+        )
+        .unwrap();
+        assert!(install(workspace.path(), bad_package.to_str().unwrap(), true, true,).is_err());
+        let installed =
+            fs::read_to_string(workspace.path().join(".borg/extensions/sample/blu.toml")).unwrap();
+        assert!(installed.contains("version = \"1.0.0\""));
+    }
+
+    #[test]
+    fn standalone_manifest_install_does_not_copy_its_parent_directory() {
+        let source = tempfile::tempdir().unwrap();
+        let manifest = source.path().join("sample.toml");
+        fs::write(
+            &manifest,
+            "manifest_version=1\nid=\"sample\"\nversion=\"1.0.0\"\n",
+        )
+        .unwrap();
+        fs::write(source.path().join("unrelated-secret"), "do not copy").unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        install(workspace.path(), manifest.to_str().unwrap(), true, false).unwrap();
+        let installed = workspace.path().join(".borg/extensions/sample");
+        assert!(installed.join("blu.toml").is_file());
+        assert!(!installed.join("unrelated-secret").exists());
     }
 }

@@ -11,16 +11,16 @@ use std::sync::{
 use anyhow::{Context, Result};
 use borg_remote::{
     AgentTurnExecutor, ApprovalDecision, CodingProvider, EventActor, GoalAction, GoalStatus,
-    HostCommand, HostConfig, JsonlSessionStore, LaunchSession, LocalAgentSettings,
-    LocalAgentTurnExecutor, LocalSessionControlServer, MessageStatus, PermissionMode, PlanItem,
-    PlanItemStatus, PromptDelivery, ResponseLanguage, SessionConfigAction, SessionEvent,
-    SessionEventKind, SessionGoal, SessionState, SessionStatus, SessionStore, SessionWriterLease,
-    SpawnSubagent, SqliteSessionStore, SqliteWorkspaceStore, SubagentAction, SubagentSnapshot,
-    SubagentStatus, TodoAction, default_host_config_path, enroll_host,
-    local_session_owner_uses_current_binary, login_provider, mirror_local_session,
+    HostCommand, HostConfig, HostExecutorFactory, JsonlSessionStore, LaunchSession,
+    LocalAgentSettings, LocalAgentTurnExecutor, LocalSessionControlServer, MessageStatus,
+    PermissionMode, PlanItem, PlanItemStatus, PromptDelivery, ResponseLanguage,
+    SessionConfigAction, SessionEvent, SessionEventKind, SessionGoal, SessionState, SessionStatus,
+    SessionStore, SessionWriterLease, SpawnSubagent, SqliteSessionStore, SqliteWorkspaceStore,
+    SubagentAction, SubagentSnapshot, SubagentStatus, TodoAction, default_host_config_path,
+    enroll_host, local_session_owner_uses_current_binary, login_provider, mirror_local_session,
     probe_capabilities, provider_credentials_present, run_agent_session_with_store_and_writer,
-    run_agent_session_with_store_writer_and_peers, run_attached_session, run_host,
-    run_owned_session_projection, send_local_session_command, session_control_socket_path,
+    run_agent_session_with_store_writer_and_peers, run_attached_session,
+    run_host_with_executor_factory, send_local_session_command, session_control_socket_path,
 };
 use chrono::{Local, Utc};
 use futures_util::FutureExt;
@@ -42,10 +42,18 @@ use crate::terminal_ui::{
 const MIN_TUI_FPS: u64 = 15;
 const MAX_TUI_FPS: u64 = 240;
 const ACTIVITY_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(120);
-/// Keep first paint bounded. The canonical store remains complete and indexed;
-/// a resumed actor recovers independently of this presentation-only tail.
-const RICH_TUI_HISTORY_EVENT_LIMIT: usize = 64;
-const RICH_TUI_HISTORY_PAGE_SIZE: usize = 256;
+/// Keep first paint bounded while retaining enough context to include a real
+/// recent exchange instead of an empty shell made only of projection events.
+const RICH_TUI_HISTORY_EVENT_LIMIT: usize = 128;
+const RICH_TUI_HISTORY_BOOTSTRAP_SCAN_LIMIT: usize = 4_096;
+const RICH_TUI_HISTORY_MESSAGE_LIMIT: usize = 8;
+const RICH_TUI_HISTORY_PAGE_SIZE: usize = 512;
+const RICH_TUI_PROMPT_HISTORY_LIMIT: usize = 64;
+type BluDiscoveryResult = Result<(
+    crate::extensions::ExtensionCatalog,
+    Vec<borg_provider::mcp::ExternalMcpServer>,
+)>;
+type BluDiscoveryTask = tokio::task::JoinHandle<BluDiscoveryResult>;
 /// Resume filtering is local and eager, so load enough history to make search useful while
 /// keeping picker construction and per-keystroke filtering bounded.
 const RESUME_PICKER_SESSION_LIMIT: usize = 1_000;
@@ -90,14 +98,13 @@ impl TuiPanicHook {
         let previous = Arc::new(Mutex::new(Some(panic::take_hook())));
         let hook_previous = Arc::clone(&previous);
         panic::set_hook(Box::new(move |info| {
-            if !tui_active.load(Ordering::Acquire) {
-                if let Some(previous) = hook_previous
+            if !tui_active.load(Ordering::Acquire)
+                && let Some(previous) = hook_previous
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .as_ref()
-                {
-                    previous(info);
-                }
+            {
+                previous(info);
             }
         }));
         Self { previous }
@@ -154,7 +161,7 @@ pub(crate) async fn run_remote_command(command: RemoteCommand) -> Result<()> {
             crate::updater::spawn_background(agent_config.updates);
             let config_path = config.unwrap_or_else(default_host_config_path);
             println!("Borg Remote host connected from {}", config_path.display());
-            run_host(&config_path).await?;
+            run_host_with_executor_factory(&config_path, blu_host_executor_factory()).await?;
         }
         RemoteCommand::Install { config } => {
             let config_path = config.unwrap_or_else(default_host_config_path);
@@ -266,6 +273,54 @@ async fn connect_remote_account(
         enrolled.name, enrolled.host_id
     );
     Ok(())
+}
+
+fn blu_host_executor_factory() -> HostExecutorFactory {
+    Arc::new(|host, launch| {
+        let agent_config = AgentConfig::load(None)?;
+        let (catalog, extension_servers) = crate::extensions::discover(
+            &launch.cwd,
+            &agent_config.capabilities,
+            agent_config.extensions.allow_project_mcp,
+        )?;
+        let mut servers = agent_config.external_mcp_servers();
+        servers.extend(extension_servers);
+        let roots = catalog.active_skill_roots();
+        let local_settings = LocalAgentSettings {
+            approval_reviewer_model: agent_config.approvals.reviewer_model.clone(),
+            approval_reviewer_effort: agent_config.approvals.reviewer_effort.clone(),
+        };
+        let reload_cwd = launch.cwd.clone();
+        let reload = move || {
+            let agent_config = AgentConfig::load(None)?;
+            let (catalog, extension_servers) = crate::extensions::discover(
+                &reload_cwd,
+                &agent_config.capabilities,
+                agent_config.extensions.allow_project_mcp,
+            )?;
+            anyhow::ensure!(
+                !catalog.has_errors(),
+                "Blu catalog has errors; keeping the remote session's last-known-good snapshot"
+            );
+            let mut servers = agent_config.external_mcp_servers();
+            servers.extend(extension_servers);
+            Ok((servers, catalog.active_skill_roots()))
+        };
+        let executor = LocalAgentTurnExecutor::with_model_gateway_and_settings(
+            borg_provider::provider::ModelGateway {
+                endpoint: format!(
+                    "{}/api/remote/host/kimi/chat/completions",
+                    host.server.trim_end_matches('/')
+                ),
+                bearer_token: host.host_token.clone(),
+            },
+            local_settings,
+        )
+        .with_external_mcp_servers(servers)
+        .with_extension_skill_roots(roots)
+        .with_runtime_extension_loader(reload);
+        Ok(Arc::new(executor) as Arc<dyn AgentTurnExecutor>)
+    })
 }
 
 async fn open_browser(url: &str) -> Result<()> {
@@ -767,17 +822,14 @@ async fn run_local_agent_session(
         approval_reviewer_model: agent_config.approvals.reviewer_model.clone(),
         approval_reviewer_effort: agent_config.approvals.reviewer_effort.clone(),
     };
-    let (extension_catalog, extension_servers) = crate::extensions::discover(
+    let (mut extension_catalog, extension_servers) = crate::extensions::discover(
         &cwd,
         &agent_config.capabilities,
         agent_config.extensions.allow_project_mcp,
     )?;
-    let extension_skill_roots = extension_catalog
-        .extensions
-        .iter()
-        .filter(|extension| extension.active)
-        .flat_map(|extension| extension.skill_roots.iter().cloned())
-        .collect::<Vec<_>>();
+    let extension_skill_roots = extension_catalog.active_skill_roots();
+    let mut observed_extension_revision = extension_catalog.revision.clone();
+    let mut last_blu_discovery_error: Option<String> = None;
     let local_executor = if provider == CodingProvider::Kimi && host_config_path.is_file() {
         let config: HostConfig = serde_json::from_slice(
             &fs::read(&host_config_path)
@@ -801,8 +853,10 @@ async fn run_local_agent_session(
         let mut servers = agent_config.external_mcp_servers();
         servers.extend(extension_servers);
         servers
-    });
+    })
+    .with_extension_skill_roots(extension_skill_roots);
     local_executor.prewarm(provider);
+    let live_extension_executor = local_executor.clone();
     let executor: Arc<dyn AgentTurnExecutor> = Arc::new(local_executor);
     let mut rendered = HashMap::new();
     let stdin_is_terminal = io::stdin().is_terminal();
@@ -857,12 +911,21 @@ async fn run_local_agent_session(
     } else {
         store.read(session_id).await?
     };
-    let mut history_start_reached = history.first().is_none_or(|event| event.sequence <= 1);
-    let (team_history, team_snapshots) = if can_prompt && !fallback_terminal {
+    let composer_history = if can_prompt && !fallback_terminal {
+        store
+            .recent_user_messages(session_id, RICH_TUI_PROMPT_HISTORY_LIMIT)
+            .await?
+    } else {
+        Vec::new()
+    };
+    let mut history_start_reached = session_state.latest_sequence == 0
+        || history.first().is_some_and(|event| event.sequence <= 1);
+    let (team_history, mut team_snapshots) = if can_prompt && !fallback_terminal {
         subagent_state_from_history(&history)
     } else {
         (Vec::new(), Vec::new())
     };
+    reconcile_subagent_snapshots(store.as_ref(), &sessions_dir, &mut team_snapshots).await;
     let request_id = initial_prompt
         .as_ref()
         .map_or(session_id, |_| Uuid::new_v4());
@@ -882,7 +945,9 @@ async fn run_local_agent_session(
         initial_prompt,
         capabilities,
         subagent_concurrency_limit: Some(agent_config.subagent_concurrency_limit()),
-        extension_skill_roots,
+        // The local executor owns the live snapshot. Keeping launch roots
+        // empty avoids pinning or duplicating the startup catalog forever.
+        extension_skill_roots: Vec::new(),
         team_policy,
     };
     if session_access.is_attached() {
@@ -971,7 +1036,12 @@ async fn run_local_agent_session(
     }
 
     let (session_command_tx, session_commands) = mpsc::channel(64);
-    let (session_event_tx, mut session_events) = mpsc::channel(256);
+    // The owned actor is the single ordered live source. A generous bounded
+    // queue absorbs bursty child/tool traffic while preserving backpressure;
+    // do not merge the same actor stream back through SQLite here, because a
+    // durable boundary can delete its preceding live row before that second
+    // reader observes it and permanently desynchronise the owner UI.
+    let (session_event_tx, mut session_events) = mpsc::channel(4_096);
     let local_prompt_admissions = Arc::new(Mutex::new(HashSet::new()));
     let actor_journal_path = journal_path.clone();
     let registration_template = launch.clone();
@@ -986,7 +1056,6 @@ async fn run_local_agent_session(
             Some(Arc::clone(&local_prompt_admissions)),
         )?)
     };
-    let mut owner_projection_task = None;
     let actor = if session_access.is_attached() {
         tokio::spawn(run_attached_session(
             Arc::clone(&store),
@@ -998,14 +1067,6 @@ async fn run_local_agent_session(
             session_event_tx,
         ))
     } else {
-        let (actor_event_tx, actor_events) = mpsc::channel(256);
-        owner_projection_task = Some(tokio::spawn(run_owned_session_projection(
-            Arc::clone(&store),
-            session_id,
-            session_state.latest_sequence,
-            actor_events,
-            session_event_tx,
-        )));
         let writer = writer.expect("session owner holds writer lease");
         let actor_store = Arc::clone(&sqlite_store);
         let actor_session_root = sessions_dir.clone();
@@ -1016,7 +1077,7 @@ async fn run_local_agent_session(
                     session_id,
                     launch,
                     session_commands,
-                    actor_event_tx,
+                    session_event_tx,
                     executor,
                     actor_store,
                     writer,
@@ -1028,7 +1089,7 @@ async fn run_local_agent_session(
                     session_id,
                     launch,
                     session_commands,
-                    actor_event_tx,
+                    session_event_tx,
                     executor,
                     actor_store,
                     writer,
@@ -1063,6 +1124,7 @@ async fn run_local_agent_session(
         .tui_active
         .store(terminal.is_some(), Ordering::Release);
     if let Some(terminal) = terminal.as_mut() {
+        terminal.seed_composer_history(&composer_history);
         terminal.seed_history(&history);
         terminal.seed_team_roster(&team_snapshots);
         terminal.seed_session_state(&session_state);
@@ -1071,6 +1133,16 @@ async fn run_local_agent_session(
                 "This turn is owned by an older Borg build · upgrading automatically when it finishes"
                     .to_string(),
             );
+        } else if extension_catalog.has_errors() {
+            terminal.set_notice(format!(
+                "Blu isolated {} invalid extension{} · run `borg extensions doctor`",
+                extension_catalog.error_count(),
+                if extension_catalog.error_count() == 1 {
+                    ""
+                } else {
+                    "s"
+                },
+            ));
         }
         terminal.set_auto_expand_edits(editor_preferences.presentation.auto_expand_edits);
         terminal.set_auto_expand_tools(editor_preferences.presentation.auto_expand_tools);
@@ -1099,7 +1171,17 @@ async fn run_local_agent_session(
     {
         terminal.finish_child_history_hydration();
     }
-    let mut history_page_task: Option<tokio::task::JoinHandle<Result<Vec<SessionEvent>>>> = None;
+    // Warm one bounded older page immediately after first paint. Upward
+    // navigation then reveals already-loaded rows instead of waiting behind
+    // unrelated session/team hydration work.
+    let mut history_page_task: Option<tokio::task::JoinHandle<Result<Vec<SessionEvent>>>> =
+        (resuming && terminal.is_some() && !history_start_reached).then(|| {
+            let before = history_page_before(&history, session_state.latest_sequence);
+            let history_store = Arc::clone(&store);
+            tokio::spawn(async move {
+                older_tui_history(history_store.as_ref(), session_id, before).await
+            })
+        });
     let mut input = (can_prompt && terminal.is_none()).then(spawn_terminal_input);
     let mut input_open = can_prompt && terminal.is_none();
     let mut delivered_projection = DeliveredSessionProjection::new(session_state.clone());
@@ -1139,6 +1221,9 @@ async fn run_local_agent_session(
     cache_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut agent_config_tick = tokio::time::interval(std::time::Duration::from_millis(500));
     agent_config_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut blu_tick = tokio::time::interval(std::time::Duration::from_millis(500));
+    blu_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut blu_discovery_task: Option<BluDiscoveryTask> = None;
     let mut shutdown_signal_open = true;
     loop {
         tokio::select! {
@@ -1212,16 +1297,19 @@ async fn run_local_agent_session(
                 let terminal = terminal.as_mut().expect("terminal");
                 let interaction_frame = terminal.has_pending_scroll_frame();
                 terminal.advance_scroll_frame();
-                let should_load_history = terminal.take_history_page_request()
-                    && !history_start_reached
-                    && history_page_task.is_none();
-                if should_load_history {
-                    let before = history.first().expect("history has an unloaded prefix").sequence;
+                let history_requested = terminal.take_history_page_request();
+                if history_requested && !history_start_reached {
                     terminal.set_history_page_loading(true);
-                    let history_store = Arc::clone(&store);
-                    history_page_task = Some(tokio::spawn(async move {
-                        older_tui_history(history_store.as_ref(), session_id, before).await
-                    }));
+                    if history_page_task.is_none() {
+                        let before = history_page_before(
+                            &history,
+                            delivered_projection.state().latest_sequence,
+                        );
+                        let history_store = Arc::clone(&store);
+                        history_page_task = Some(tokio::spawn(async move {
+                            older_tui_history(history_store.as_ref(), session_id, before).await
+                        }));
+                    }
                 }
                 let draw_started = std::time::Instant::now();
                 terminal.draw()?;
@@ -1255,16 +1343,22 @@ async fn run_local_agent_session(
                         Ok(next) => {
                             let keybindings_changed = next.keybindings != agent_config.keybindings;
                             agent_config = next;
+                            // Force the Blu snapshot to include updated base
+                            // MCP servers, capability gates, and trust policy.
+                            observed_extension_revision.clear();
+                            if let Some(task) = blu_discovery_task.take() {
+                                task.abort();
+                            }
                             agent_config_signature = signature;
                             if let Some(terminal) = terminal.as_mut() {
                                 if keybindings_changed {
                                     if let Err(error) = terminal.reload_keybindings(&agent_config.keybindings) {
                                         terminal.set_notice(format!("Settings changed, but keybindings were invalid: {error:#}"));
                                     } else {
-                                        terminal.set_notice("Agent settings reloaded · aliases and keybindings are live".to_string());
+                                        terminal.set_notice("Agent settings reloaded · aliases/keybindings are live · Blu/MCP apply next turn".to_string());
                                     }
                                 } else {
-                                    terminal.set_notice("Agent settings changed · provider/MCP/capability changes apply next session".to_string());
+                                    terminal.set_notice("Agent settings changed · Blu/MCP apply next turn · provider/session policy applies next session".to_string());
                                 }
                                 terminal_dirty = true;
                             }
@@ -1276,6 +1370,107 @@ async fn run_local_agent_session(
                                 terminal_dirty = true;
                             }
                         }
+                    }
+                }
+            }
+            _ = blu_tick.tick(), if interactive && blu_discovery_task.is_none() => {
+                let discovery_cwd = cwd.clone();
+                let discovery_capabilities = agent_config.capabilities.clone();
+                let allow_project_mcp = agent_config.extensions.allow_project_mcp;
+                blu_discovery_task = Some(tokio::task::spawn_blocking(move || {
+                    crate::extensions::discover(
+                        &discovery_cwd,
+                        &discovery_capabilities,
+                        allow_project_mcp,
+                    )
+                }));
+            }
+            blu_result = async {
+                blu_discovery_task
+                    .as_mut()
+                    .expect("Blu discovery branch is guarded")
+                    .await
+            }, if blu_discovery_task.is_some() => {
+                blu_discovery_task = None;
+                match blu_result {
+                    Ok(Ok((next_catalog, next_extension_servers)))
+                        if next_catalog.revision != observed_extension_revision =>
+                    {
+                        observed_extension_revision = next_catalog.revision.clone();
+                        if !next_catalog.has_errors() {
+                            last_blu_discovery_error = None;
+                            let mut servers = agent_config.external_mcp_servers();
+                            servers.extend(next_extension_servers);
+                            live_extension_executor.replace_runtime_extensions(
+                                servers,
+                                next_catalog.active_skill_roots(),
+                            );
+                            extension_catalog = next_catalog;
+                            if let Some(terminal) = terminal.as_mut() {
+                                terminal.set_notice(
+                                    "Blu reloaded · extensions apply at the next turn boundary"
+                                        .to_string(),
+                                );
+                                terminal_dirty = true;
+                            }
+                        } else {
+                            let count = next_catalog.error_count();
+                            let first = next_catalog
+                                .diagnostics
+                                .iter()
+                                .find(|diagnostic| {
+                                    diagnostic.level
+                                        == crate::extensions::ExtensionDiagnosticLevel::Error
+                                })
+                                .map(|diagnostic| diagnostic.message.as_str());
+                            let message = match first {
+                                Some(first) => format!(
+                                    "{count} diagnostic{} rejected the reload; first: {first}",
+                                    if count == 1 { "" } else { "s" },
+                                ),
+                                None => format!(
+                                    "{count} diagnostic{} rejected the reload",
+                                    if count == 1 { "" } else { "s" },
+                                ),
+                            };
+                            last_blu_discovery_error = Some(message);
+                            if let Some(terminal) = terminal.as_mut() {
+                                terminal.set_notice(format!(
+                                    "Blu kept the last-known-good catalog · {count} diagnostic{} · run `borg extensions doctor`",
+                                    if count == 1 { "" } else { "s" },
+                                ));
+                                terminal_dirty = true;
+                            }
+                        }
+                    }
+                    Ok(Ok((next_catalog, _))) => {
+                        if !next_catalog.has_errors() {
+                            last_blu_discovery_error = None;
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        let message = format!("{error:#}");
+                        if last_blu_discovery_error.as_deref() != Some(message.as_str())
+                            && let Some(terminal) = terminal.as_mut()
+                        {
+                            terminal.set_notice(format!(
+                                "Blu kept the last-known-good catalog · {message}"
+                            ));
+                            terminal_dirty = true;
+                        }
+                        last_blu_discovery_error = Some(message);
+                    }
+                    Err(error) => {
+                        let message = format!("Blu discovery task failed: {error}");
+                        if last_blu_discovery_error.as_deref() != Some(message.as_str())
+                            && let Some(terminal) = terminal.as_mut()
+                        {
+                            terminal.set_notice(format!(
+                                "Blu kept the last-known-good catalog · {message}"
+                            ));
+                            terminal_dirty = true;
+                        }
+                        last_blu_discovery_error = Some(message);
                     }
                 }
             }
@@ -2138,6 +2333,7 @@ async fn run_local_agent_session(
                                 cwd.clone(),
                                 &agent_config.keybindings,
                             )?;
+                            restored.seed_composer_history(&composer_history);
                             restored.seed_history(&latest);
                             let (_, agents, histories) = load_subagent_thread_state(
                                 store.as_ref(),
@@ -2516,6 +2712,14 @@ async fn run_local_agent_session(
                                 .as_mut()
                                 .expect("terminal")
                                 .set_notice(lsp_support_summary());
+                        } else if line == "/extensions" && attachments.is_empty() {
+                            terminal.as_mut().expect("terminal").show_info(
+                                "Blu extensions",
+                                live_extension_summary(
+                                    &extension_catalog,
+                                    last_blu_discovery_error.as_deref(),
+                                ),
+                            );
                         } else if line == "/colors" && attachments.is_empty() {
                             terminal.as_mut().expect("terminal").set_notice(
                                 transcript_colors_summary(&editor_preferences),
@@ -2847,7 +3051,7 @@ async fn run_local_agent_session(
                                     .expect("terminal")
                                     .show_info(
                                         "Commands",
-                                        "/settings · /model · /effort · /followups · /refresh · /sleep · /usage · /clear · /compact · /resume · /goal · /todo · /login · /collab · /remote · /quit",
+                                        "/settings · /model · /effort · /extensions · /followups · /refresh · /sleep · /usage · /clear · /compact · /resume · /goal · /todo · /login · /collab · /remote · /quit",
                                     ),
                                 "/collab" | "/collab view" if attachments.is_empty() => {
                                     if collab_child.is_some() {
@@ -2952,6 +3156,7 @@ async fn run_local_agent_session(
                                             cwd.clone(),
                                             &agent_config.keybindings,
                                         )?;
+                                        restored.seed_composer_history(&composer_history);
                                         restored.seed_history(&latest);
                                         let (_, agents, histories) =
                                             load_subagent_thread_state(
@@ -3002,6 +3207,7 @@ async fn run_local_agent_session(
                                             cwd.clone(),
                                             &agent_config.keybindings,
                                         )?;
+                                        restored.seed_composer_history(&composer_history);
                                         restored.seed_history(&latest);
                                         let (_, agents, histories) =
                                             load_subagent_thread_state(
@@ -3253,17 +3459,7 @@ async fn run_local_agent_session(
         }
         Err(join_error) => Some(anyhow::anyhow!("agent session task failed: {join_error}")),
     };
-    let owner_projection_error = if let Some(task) = owner_projection_task {
-        match task.await {
-            Ok(result) => result.err(),
-            Err(error) => Some(anyhow::anyhow!(
-                "owned session projection task failed: {error}"
-            )),
-        }
-    } else {
-        None
-    };
-    if let Some(error) = actor_error.or(owner_projection_error) {
+    if let Some(error) = actor_error {
         if tui_was_active {
             tracing::error!(%session_id, error = %error, "local agent session crashed");
             println!("{}", resume_instructions(session_id, false));
@@ -3287,7 +3483,7 @@ async fn run_local_agent_session(
     if let Some(task) = mirror_task {
         task.await.context("remote mirror task failed")?;
     }
-    if user_requested_exit && resume_session.is_none() {
+    if should_print_exit_resume(user_requested_exit, resume_session, args.ephemeral) {
         if let Some(notice) = exit_notice {
             println!("\n  {notice}");
         }
@@ -3464,6 +3660,14 @@ fn resume_instructions(session_id: Uuid, active_elsewhere: bool) -> String {
         Default::default()
     };
     format!("{warning}Copy and paste the line below to resume:\nborg resume {session_id}")
+}
+
+fn should_print_exit_resume(
+    user_requested_exit: bool,
+    resume_session: Option<Uuid>,
+    ephemeral: bool,
+) -> bool {
+    user_requested_exit && resume_session.is_none() && !ephemeral
 }
 
 fn should_detach_on_terminal_hangup(
@@ -3777,17 +3981,65 @@ async fn recent_tui_history(
     session_id: Uuid,
     latest_sequence: u64,
 ) -> Result<Vec<SessionEvent>> {
-    store
+    let scanned = store
         .events_after(
             session_id,
             recent_tui_history_after(latest_sequence),
-            RICH_TUI_HISTORY_EVENT_LIMIT,
+            RICH_TUI_HISTORY_BOOTSTRAP_SCAN_LIMIT,
         )
-        .await
+        .await?;
+    Ok(select_resume_bootstrap_history(scanned))
 }
 
 fn recent_tui_history_after(latest_sequence: u64) -> u64 {
-    latest_sequence.saturating_sub(RICH_TUI_HISTORY_EVENT_LIMIT as u64)
+    latest_sequence.saturating_sub(RICH_TUI_HISTORY_BOOTSTRAP_SCAN_LIMIT as u64)
+}
+
+fn select_resume_bootstrap_history(events: Vec<SessionEvent>) -> Vec<SessionEvent> {
+    if events.len() <= RICH_TUI_HISTORY_EVENT_LIMIT {
+        return events;
+    }
+    let floor = events.len() - RICH_TUI_HISTORY_EVENT_LIMIT;
+    let message_indices = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| {
+            matches!(
+                event.kind,
+                SessionEventKind::Message {
+                    actor: EventActor::User | EventActor::Assistant,
+                    status: MessageStatus::Complete | MessageStatus::InProgress,
+                    ..
+                }
+            )
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let retained_messages = message_indices
+        .into_iter()
+        .rev()
+        .take(RICH_TUI_HISTORY_MESSAGE_LIMIT)
+        .collect::<HashSet<_>>();
+
+    // Keep a bounded event tail for current lifecycle/tool state and splice in
+    // the latest real conversation messages even when a high-volume child or
+    // tool stream pushed them outside that tail. A contiguous slice starting
+    // at the eighth message can contain thousands of irrelevant events and
+    // makes the first render just as unusable as loading the whole history.
+    events
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, event)| {
+            (index >= floor || retained_messages.contains(&index)).then_some(event)
+        })
+        .collect()
+}
+
+fn history_page_before(events: &[SessionEvent], latest_sequence: u64) -> u64 {
+    events
+        .first()
+        .map(|event| event.sequence)
+        .unwrap_or_else(|| latest_sequence.saturating_add(1))
 }
 
 async fn older_tui_history(
@@ -3888,11 +4140,9 @@ async fn load_subagent_thread_state(
 )> {
     let team_history = store.recovery(session_id).await?.subagent_events;
     let mut team_snapshots = latest_subagent_snapshots(&team_history);
+    reconcile_subagent_snapshots(store, sessions_dir, &mut team_snapshots).await;
     let mut child_histories = HashMap::new();
     for agent in &mut team_snapshots {
-        if let Ok(state) = store.state(agent.session_id).await {
-            reconcile_subagent_snapshot(agent, &state);
-        }
         match child_authored_history(store, agent.session_id).await {
             Ok(events) => {
                 child_histories.insert(agent.session_id, events);
@@ -3938,6 +4188,23 @@ async fn load_subagent_thread_state(
     Ok((team_history, team_snapshots, child_histories))
 }
 
+async fn reconcile_subagent_snapshots(
+    store: &dyn SessionStore,
+    sessions_dir: &Path,
+    agents: &mut [SubagentSnapshot],
+) {
+    for agent in agents {
+        // Parent SubagentActivity is a durable mirror, not the child's status
+        // authority. A crash can happen after the child journals Stopped but
+        // before the parent mirrors it. Resolve the child ledger before first
+        // paint so resume can never advertise stale background work.
+        if let Ok(state) = store.state(agent.session_id).await {
+            reconcile_subagent_snapshot(agent, &state);
+        }
+        reconcile_dormant_subagent_snapshot(sessions_dir, agent);
+    }
+}
+
 fn reconcile_subagent_snapshot(agent: &mut SubagentSnapshot, state: &SessionState) {
     if let Some(status) = state.status {
         agent.status = match status {
@@ -3958,6 +4225,23 @@ fn reconcile_subagent_snapshot(agent: &mut SubagentSnapshot, state: &SessionStat
     agent.usage.output_tokens = state.usage.output_tokens;
     agent.usage.total_tokens = state.usage.total_tokens;
     agent.usage.cost_microusd = state.usage.cost_microusd;
+}
+
+fn reconcile_dormant_subagent_snapshot(sessions_dir: &Path, agent: &mut SubagentSnapshot) {
+    if !matches!(
+        agent.status,
+        SubagentStatus::Starting | SubagentStatus::Running
+    ) {
+        return;
+    }
+    let path = sessions_dir
+        .join("subagents")
+        .join(format!("{}.jsonl", agent.session_id));
+    if let Ok(Some(writer)) = SessionWriterLease::try_acquire(&path) {
+        drop(writer);
+        agent.status = SubagentStatus::Ready;
+        agent.detail = Some("Paused with the parent session; follow up to wake".to_string());
+    }
 }
 
 /// Return only the child's authored events for presentation. Forked session
@@ -4565,6 +4849,53 @@ fn permission_name(permission: PermissionMode) -> &'static str {
     }
 }
 
+fn live_extension_summary(
+    catalog: &crate::extensions::ExtensionCatalog,
+    rejected_reload: Option<&str>,
+) -> String {
+    let mut lines = Vec::new();
+    if catalog.extensions.is_empty() {
+        lines.push("No Blu extensions installed.".to_string());
+    } else {
+        for extension in &catalog.extensions {
+            let state = if extension.active {
+                "active"
+            } else {
+                extension.reason.as_deref().unwrap_or("inactive")
+            };
+            lines.push(format!(
+                "{} {} · {} · {}",
+                extension.id,
+                extension.version,
+                extension.scope.label(),
+                state,
+            ));
+        }
+    }
+    if catalog.has_errors() {
+        lines.push(format!(
+            "{} invalid package{} isolated · run `borg extensions doctor`",
+            catalog.error_count(),
+            if catalog.error_count() == 1 { "" } else { "s" },
+        ));
+    }
+    if let Some(error) = rejected_reload {
+        lines.push(format!(
+            "Last reload rejected; the running revision is unchanged: {error}"
+        ));
+    }
+    lines.push(format!(
+        "{} active · revision {} · changes apply at the next turn boundary",
+        catalog
+            .extensions
+            .iter()
+            .filter(|extension| extension.active)
+            .count(),
+        &catalog.revision[..catalog.revision.len().min(12)],
+    ));
+    lines.join("\n")
+}
+
 fn lsp_support_summary() -> String {
     let servers = borg_remote::LspService::supported_status();
     let mut available = Vec::new();
@@ -4883,20 +5214,87 @@ mod tests {
     #[test]
     fn older_history_pages_end_immediately_before_the_loaded_tail() {
         assert_eq!(older_tui_history_after(1), None);
-        assert_eq!(older_tui_history_after(513), Some(256));
-        assert_eq!(older_tui_history_limit(513, 256), 256);
-        assert_eq!(older_tui_history_after(2_000), Some(1_743));
-        assert_eq!(older_tui_history_limit(2_000, 1_743), 256);
-        assert_eq!(1_743 + RICH_TUI_HISTORY_PAGE_SIZE as u64, 1_999);
+        assert_eq!(older_tui_history_after(513), Some(0));
+        assert_eq!(older_tui_history_limit(513, 0), 512);
+        assert_eq!(older_tui_history_after(2_000), Some(1_487));
+        assert_eq!(older_tui_history_limit(2_000, 1_487), 512);
+        assert_eq!(1_487 + RICH_TUI_HISTORY_PAGE_SIZE as u64, 1_999);
         assert_eq!(older_tui_history_after(37), Some(0));
         assert_eq!(older_tui_history_limit(37, 0), 36);
     }
 
     #[test]
-    fn first_resume_frame_uses_only_the_small_latest_tail() {
+    fn first_resume_scan_is_bounded_before_history_is_selected() {
         assert_eq!(recent_tui_history_after(10), 0);
-        assert_eq!(recent_tui_history_after(100), 36);
-        assert_eq!(recent_tui_history_after(60_000), 59_936);
+        assert_eq!(recent_tui_history_after(100), 0);
+        assert_eq!(recent_tui_history_after(60_000), 55_904);
+    }
+
+    #[test]
+    fn extensions_view_keeps_a_rejected_reload_visible() {
+        let catalog = crate::extensions::ExtensionCatalog {
+            revision: "0123456789abcdef".to_string(),
+            load_order: Vec::new(),
+            extensions: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+
+        let summary = live_extension_summary(
+            &catalog,
+            Some("1 diagnostic rejected the reload; first: unknown field"),
+        );
+
+        assert!(summary.contains("No Blu extensions installed."));
+        assert!(summary.contains(
+            "Last reload rejected; the running revision is unchanged: 1 diagnostic rejected the reload; first: unknown field"
+        ));
+        assert!(summary.contains("revision 0123456789ab"));
+    }
+
+    #[test]
+    fn first_resume_frame_keeps_real_recent_conversation_before_lazy_pages() {
+        let session_id = Uuid::new_v4();
+        let mut events = (1..=200)
+            .map(|sequence| {
+                SessionEvent::new(
+                    session_id,
+                    sequence,
+                    SessionEventKind::UsageUpdated {
+                        provider_duration_ms: 0,
+                        input_tokens: 1,
+                        output_tokens: 0,
+                        total_tokens: 1,
+                        cached_input_tokens: 0,
+                        cache_creation_input_tokens: 0,
+                        cost_usd: None,
+                        cost_microusd: None,
+                        cost_basis: String::new(),
+                        context_tokens: None,
+                        context_window_tokens: None,
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        events[20] = SessionEvent::new(
+            session_id,
+            21,
+            SessionEventKind::Message {
+                message_id: Uuid::new_v4(),
+                actor: EventActor::User,
+                text: "meaningful resume context".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            },
+        );
+
+        let selected = select_resume_bootstrap_history(events);
+        assert_eq!(selected.first().unwrap().sequence, 21);
+        assert_eq!(selected.len(), RICH_TUI_HISTORY_EVENT_LIMIT + 1);
+        assert!(selected.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::Message { text, .. } if text == "meaningful resume context"
+        )));
     }
 
     #[test]
@@ -4942,8 +5340,8 @@ mod tests {
 
     #[test]
     fn child_history_tail_stays_bounded_after_long_runs_and_forks() {
-        assert_eq!(recent_child_history_after(0, 100), 36);
-        assert_eq!(recent_child_history_after(0, 60_000), 59_936);
+        assert_eq!(recent_child_history_after(0, 100), 0);
+        assert_eq!(recent_child_history_after(0, 60_000), 59_872);
         assert_eq!(recent_child_history_after(59_980, 60_000), 59_980);
     }
 
@@ -4985,6 +5383,97 @@ mod tests {
         assert_eq!(team_history.len(), 1);
         assert_eq!(team_snapshots.len(), 1);
         assert_eq!(team_snapshots[0].session_id, child);
+    }
+
+    #[test]
+    fn resumed_roster_never_claims_an_unowned_child_is_running() {
+        let directory = tempdir().unwrap();
+        let root = Uuid::new_v4();
+        let child = Uuid::new_v4();
+        let now = Utc::now();
+        let mut snapshot = SubagentSnapshot {
+            session_id: child,
+            parent_session_id: root,
+            task_name: "/root/worker".to_string(),
+            status: SubagentStatus::Running,
+            provider: CodingProvider::Codex,
+            model: Some("gpt-test".to_string()),
+            effort: Some("low".to_string()),
+            cwd: PathBuf::from("/workspace"),
+            created_at: now,
+            updated_at: now,
+            detail: None,
+            final_text: None,
+            usage: borg_remote::SubagentUsage::default(),
+        };
+
+        reconcile_dormant_subagent_snapshot(directory.path(), &mut snapshot);
+        assert_eq!(snapshot.status, SubagentStatus::Ready);
+        assert!(
+            snapshot
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("follow up to wake")
+        );
+
+        let child_path = directory
+            .path()
+            .join("subagents")
+            .join(format!("{child}.jsonl"));
+        let _writer = SessionWriterLease::try_acquire(&child_path)
+            .unwrap()
+            .expect("test owns child");
+        snapshot.status = SubagentStatus::Running;
+        snapshot.detail = None;
+        reconcile_dormant_subagent_snapshot(directory.path(), &mut snapshot);
+        assert_eq!(snapshot.status, SubagentStatus::Running);
+    }
+
+    #[tokio::test]
+    async fn resumed_roster_prefers_the_child_terminal_ledger_over_a_stale_parent_mirror() {
+        let directory = tempdir().unwrap();
+        let root = Uuid::new_v4();
+        let child = Uuid::new_v4();
+        let now = Utc::now();
+        let store = SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
+            .await
+            .unwrap();
+        store.create_session(child).await.unwrap();
+        store
+            .append(SessionEvent::new(
+                child,
+                0,
+                SessionEventKind::StatusChanged {
+                    status: SessionStatus::Stopped,
+                    detail: Some("crash cleanup completed".to_string()),
+                },
+            ))
+            .await
+            .unwrap();
+        let mut snapshots = vec![SubagentSnapshot {
+            session_id: child,
+            parent_session_id: root,
+            task_name: "/root/worker".to_string(),
+            status: SubagentStatus::Running,
+            provider: CodingProvider::Codex,
+            model: Some("gpt-test".to_string()),
+            effort: Some("low".to_string()),
+            cwd: PathBuf::from("/workspace"),
+            created_at: now,
+            updated_at: now,
+            detail: Some("turn phase: provider active".to_string()),
+            final_text: None,
+            usage: borg_remote::SubagentUsage::default(),
+        }];
+
+        reconcile_subagent_snapshots(&store, directory.path(), &mut snapshots).await;
+
+        assert_eq!(snapshots[0].status, SubagentStatus::Stopped);
+        assert_eq!(
+            snapshots[0].detail.as_deref(),
+            Some("crash cleanup completed")
+        );
     }
 
     #[tokio::test]
@@ -5956,6 +6445,14 @@ mod tests {
             instructions.lines().last(),
             Some("borg resume 00000000-0000-0000-0000-000000000000")
         );
+    }
+
+    #[test]
+    fn ephemeral_exit_never_advertises_an_unresumable_session() {
+        assert!(!should_print_exit_resume(true, None, true));
+        assert!(should_print_exit_resume(true, None, false));
+        assert!(!should_print_exit_resume(true, Some(Uuid::new_v4()), false));
+        assert!(!should_print_exit_resume(false, None, false));
     }
 
     #[test]

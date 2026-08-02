@@ -19,8 +19,8 @@ use crate::{
     SessionStatus,
 };
 
-const INLINE_SESSION_PAYLOAD_BYTES: usize = 64 * 1024;
-const SESSION_PAYLOAD_PREVIEW_BYTES: usize = 4 * 1024;
+pub(crate) const INLINE_SESSION_PAYLOAD_BYTES: usize = 64 * 1024;
+pub(crate) const SESSION_PAYLOAD_PREVIEW_BYTES: usize = 4 * 1024;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const SQLITE_WRITE_TRANSACTION: &str = "BEGIN IMMEDIATE";
 pub const SESSION_PROJECTION_VERSION: i32 = 3;
@@ -104,18 +104,17 @@ impl SessionEventKind {
     }
 
     pub fn is_queue_relevant(&self) -> bool {
-        match self {
+        matches!(
+            self,
             Self::Message {
                 actor: crate::EventActor::User,
                 ..
-            }
-            | Self::PromptRecalled { .. } => true,
-            Self::Message {
-                actor: crate::EventActor::System,
-                ..
-            } => true,
-            _ => false,
-        }
+            } | Self::PromptRecalled { .. }
+                | Self::Message {
+                    actor: crate::EventActor::System,
+                    ..
+                }
+        )
     }
 
     pub fn is_subagent_relevant(&self) -> bool {
@@ -496,6 +495,37 @@ pub trait SessionStore: Send + Sync {
         sequence: u64,
         limit: usize,
     ) -> Result<Vec<SessionEvent>>;
+    /// Return the newest completed user messages authored in this session,
+    /// ordered from oldest to newest.
+    ///
+    /// This is intentionally separate from transcript paging: interactive
+    /// clients need durable prompt recall across resumes without loading the
+    /// entire event stream or coupling Up-arrow history to the visible tail.
+    async fn recent_user_messages(
+        &self,
+        session_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<SessionEvent>> {
+        let mut messages = self
+            .read(session_id)
+            .await?
+            .into_iter()
+            .filter(|event| {
+                matches!(
+                    event.kind,
+                    SessionEventKind::Message {
+                        actor: crate::EventActor::User,
+                        status: crate::MessageStatus::Complete,
+                        ..
+                    }
+                )
+            })
+            .rev()
+            .take(limit)
+            .collect::<Vec<_>>();
+        messages.reverse();
+        Ok(messages)
+    }
     async fn state(&self, session_id: Uuid) -> Result<SessionState>;
     /// Number of leading events this session inherited from a fork parent.
     ///
@@ -892,6 +922,10 @@ impl SqliteSessionStore {
             create index if not exists idx_session_events_message
                 on session_events (session_id, message_id)
                 where message_id is not null;
+
+            create index if not exists idx_session_events_fork_inheritable
+                on session_events (session_id, sequence)
+                where fork_inheritable = 1;
 
             create index if not exists idx_sessions_activity
                 on sessions (updated_at desc);
@@ -1386,6 +1420,105 @@ impl SqliteSessionStore {
             .collect()
     }
 
+    fn composed_event_slice<'a>(
+        &'a self,
+        session_id: Uuid,
+        before_or_at: Option<u64>,
+        fork_inheritable_only: bool,
+        skip: u64,
+        limit: usize,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<StoredEvent>>> + Send + 'a>> {
+        Box::pin(async move {
+            if limit == 0 {
+                return Ok(Vec::new());
+            }
+            let session = self.session_row(session_id).await?;
+            let logical_limit = before_or_at
+                .unwrap_or(session.next_sequence.saturating_sub(1))
+                .min(session.next_sequence.saturating_sub(1));
+            let inherited_limit = logical_limit.min(session.inherited_event_count);
+            let mut events = Vec::with_capacity(limit);
+
+            if skip < inherited_limit
+                && let (Some(parent), Some(cut)) =
+                    (session.parent_session_id, session.parent_cut_sequence)
+            {
+                let inherited_take = usize::try_from(inherited_limit - skip)
+                    .unwrap_or(usize::MAX)
+                    .min(limit);
+                events.extend(
+                    self.composed_event_slice(parent, Some(cut), true, skip, inherited_take)
+                        .await?,
+                );
+            }
+
+            let remaining = limit.saturating_sub(events.len());
+            if remaining == 0 || logical_limit <= session.inherited_event_count {
+                return Ok(events);
+            }
+
+            let rows = if fork_inheritable_only {
+                let local_skip = skip.saturating_sub(inherited_limit);
+                sqlx::query(
+                    "select event_json, fork_inheritable from session_events \
+                     where session_id = ? and sequence > ? and sequence <= ? \
+                     and fork_inheritable = 1 order by sequence limit ? offset ?",
+                )
+                .bind(session_id.to_string())
+                .bind(i64::try_from(session.inherited_event_count).unwrap_or(i64::MAX))
+                .bind(i64::try_from(logical_limit).unwrap_or(i64::MAX))
+                .bind(i64::try_from(remaining).unwrap_or(i64::MAX))
+                .bind(i64::try_from(local_skip).unwrap_or(i64::MAX))
+                .fetch_all(&self.pool)
+                .await?
+            } else {
+                let first_sequence = skip.max(inherited_limit).saturating_add(1);
+                sqlx::query(
+                    "select event_json, fork_inheritable from session_events \
+                     where session_id = ? and sequence >= ? and sequence <= ? \
+                     order by sequence limit ?",
+                )
+                .bind(session_id.to_string())
+                .bind(i64::try_from(first_sequence).unwrap_or(i64::MAX))
+                .bind(i64::try_from(logical_limit).unwrap_or(i64::MAX))
+                .bind(i64::try_from(remaining).unwrap_or(i64::MAX))
+                .fetch_all(&self.pool)
+                .await?
+            };
+            for row in rows {
+                events.push(StoredEvent {
+                    event: serde_json::from_str(row.try_get("event_json")?)?,
+                    fork_inheritable: row.try_get::<i64, _>("fork_inheritable")? != 0,
+                });
+            }
+            Ok(events)
+        })
+    }
+
+    async fn projected_event_slice(
+        &self,
+        session_id: Uuid,
+        sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<SessionEvent>> {
+        self.composed_event_slice(session_id, None, false, sequence, limit)
+            .await?
+            .into_iter()
+            .enumerate()
+            .map(|(index, stored)| {
+                let mut event = stored.event;
+                if event.session_id != session_id {
+                    event.id = inherited_event_id(session_id, event.id);
+                    event.session_id = session_id;
+                }
+                event.sequence = sequence
+                    .saturating_add(u64::try_from(index).unwrap_or(u64::MAX))
+                    .saturating_add(1);
+                Ok(event)
+            })
+            .collect()
+    }
+
     fn composed_recovery_events<'a>(
         &'a self,
         session_id: Uuid,
@@ -1581,63 +1714,75 @@ impl SqliteSessionStore {
         })
     }
 
-    async fn compact_payloads(
-        &self,
-        transaction: &mut Transaction<'_, Sqlite>,
-        event: &SessionEvent,
-    ) -> Result<SessionEvent> {
-        let mut compact = event.clone();
-        match &mut compact.kind {
-            SessionEventKind::ToolStarted {
-                input, input_ref, ..
-            } if input_ref.is_none() => {
-                let bytes = serde_json::to_vec(input)?;
-                if bytes.len() > INLINE_SESSION_PAYLOAD_BYTES {
-                    let payload =
-                        store_payload(transaction, event, SessionPayloadKind::ToolInput, &bytes)
-                            .await?;
-                    *input = deferred_json_payload(&payload);
-                    *input_ref = Some(payload);
-                }
-            }
-            SessionEventKind::ToolCompleted {
-                output,
-                output_ref,
-                input,
-                input_ref,
-                ..
-            } => {
-                if output_ref.is_none() && output.len() > INLINE_SESSION_PAYLOAD_BYTES {
-                    let payload = store_payload(
-                        transaction,
-                        event,
-                        SessionPayloadKind::ToolOutput,
-                        output.as_bytes(),
-                    )
-                    .await?;
-                    *output = deferred_text_payload(output, &payload);
-                    *output_ref = Some(payload);
-                }
-                if input_ref.is_none()
-                    && let Some(value) = input
-                {
-                    let bytes = serde_json::to_vec(value)?;
+    fn compact_payloads<'a>(
+        &'a self,
+        transaction: &'a mut Transaction<'_, Sqlite>,
+        event: &'a SessionEvent,
+    ) -> Pin<Box<dyn Future<Output = Result<SessionEvent>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut compact = event.clone();
+            match &mut compact.kind {
+                SessionEventKind::ToolStarted {
+                    input, input_ref, ..
+                } if input_ref.is_none() => {
+                    let bytes = serde_json::to_vec(input)?;
                     if bytes.len() > INLINE_SESSION_PAYLOAD_BYTES {
                         let payload = store_payload(
                             transaction,
                             event,
-                            SessionPayloadKind::ToolResultInput,
+                            SessionPayloadKind::ToolInput,
                             &bytes,
                         )
                         .await?;
-                        *value = deferred_json_payload(&payload);
+                        *input = deferred_json_payload(&payload);
                         *input_ref = Some(payload);
                     }
                 }
+                SessionEventKind::ToolCompleted {
+                    output,
+                    output_ref,
+                    input,
+                    input_ref,
+                    ..
+                } => {
+                    if output_ref.is_none() && output.len() > INLINE_SESSION_PAYLOAD_BYTES {
+                        let payload = store_payload(
+                            transaction,
+                            event,
+                            SessionPayloadKind::ToolOutput,
+                            output.as_bytes(),
+                        )
+                        .await?;
+                        *output = deferred_text_payload(output, &payload);
+                        *output_ref = Some(payload);
+                    }
+                    if input_ref.is_none()
+                        && let Some(value) = input
+                    {
+                        let bytes = serde_json::to_vec(value)?;
+                        if bytes.len() > INLINE_SESSION_PAYLOAD_BYTES {
+                            let payload = store_payload(
+                                transaction,
+                                event,
+                                SessionPayloadKind::ToolResultInput,
+                                &bytes,
+                            )
+                            .await?;
+                            *value = deferred_json_payload(&payload);
+                            *input_ref = Some(payload);
+                        }
+                    }
+                }
+                SessionEventKind::SubagentActivity {
+                    event: Some(child_event),
+                    ..
+                } => {
+                    **child_event = self.compact_payloads(transaction, child_event).await?;
+                }
+                _ => {}
             }
-            _ => {}
-        }
-        Ok(compact)
+            Ok(compact)
+        })
     }
 
     async fn append_live(&self, mut event: SessionEvent) -> Result<SessionEvent> {
@@ -1891,13 +2036,35 @@ impl SessionStore for SqliteSessionStore {
                 .map(|row| serde_json::from_str(row.try_get("event_json")?).map_err(Into::into))
                 .collect();
         }
-        Ok(self
-            .projected_events(session_id, None)
-            .await?
+        self.projected_event_slice(session_id, sequence, limit)
+            .await
+    }
+
+    async fn recent_user_messages(
+        &self,
+        session_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<SessionEvent>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            "select event_json from session_events \
+             where session_id = ? and event_kind = 'message' \
+               and json_extract(event_json, '$.kind.actor') = 'user' \
+               and json_extract(event_json, '$.kind.status') = 'complete' \
+             order by sequence desc limit ?",
+        )
+        .bind(session_id.to_string())
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_all(&self.pool)
+        .await?;
+        let mut messages = rows
             .into_iter()
-            .skip(usize::try_from(sequence).unwrap_or(usize::MAX))
-            .take(limit)
-            .collect())
+            .map(|row| serde_json::from_str(row.try_get("event_json")?).map_err(Into::into))
+            .collect::<Result<Vec<SessionEvent>>>()?;
+        messages.reverse();
+        Ok(messages)
     }
 
     async fn state(&self, session_id: Uuid) -> Result<SessionState> {
@@ -2149,7 +2316,7 @@ fn payload_kind_name(kind: SessionPayloadKind) -> &'static str {
     kind.as_str()
 }
 
-fn deferred_json_payload(payload: &SessionPayloadRef) -> serde_json::Value {
+pub(crate) fn deferred_json_payload(payload: &SessionPayloadRef) -> serde_json::Value {
     serde_json::json!({
         "borg_payload_deferred": true,
         "payload_id": payload.id,
@@ -2157,7 +2324,7 @@ fn deferred_json_payload(payload: &SessionPayloadRef) -> serde_json::Value {
     })
 }
 
-fn deferred_text_payload(value: &str, payload: &SessionPayloadRef) -> String {
+pub(crate) fn deferred_text_payload(value: &str, payload: &SessionPayloadRef) -> String {
     let mut end = value.len().min(SESSION_PAYLOAD_PREVIEW_BYTES);
     while !value.is_char_boundary(end) {
         end -= 1;
@@ -2599,6 +2766,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recent_user_messages_are_bounded_ordered_and_ignore_non_completed_prompts() {
+        let (_directory, store) = store().await;
+        let session_id = Uuid::new_v4();
+        store.create_session(session_id).await.unwrap();
+        for kind in [
+            message(Uuid::new_v4(), "first"),
+            SessionEventKind::Message {
+                message_id: Uuid::new_v4(),
+                actor: EventActor::Assistant,
+                text: "assistant".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            },
+            SessionEventKind::Message {
+                message_id: Uuid::new_v4(),
+                actor: EventActor::User,
+                text: "still queued".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Queued,
+                delivery: Some(PromptDelivery::Queue),
+            },
+            message(Uuid::new_v4(), "second"),
+            message(Uuid::new_v4(), "third"),
+        ] {
+            store
+                .append(SessionEvent::new(session_id, 0, kind))
+                .await
+                .unwrap();
+        }
+
+        let prompts = store.recent_user_messages(session_id, 2).await.unwrap();
+        let texts = prompts
+            .iter()
+            .filter_map(|event| match &event.kind {
+                SessionEventKind::Message { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(texts, vec!["second", "third"]);
+        assert!(
+            store
+                .recent_user_messages(session_id, 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn durable_store_health_requires_full_sync_wal_and_foreign_keys() {
         let (_directory, store) = store().await;
         let health = store.health().await.unwrap();
@@ -2791,6 +3008,71 @@ mod tests {
         let recovery = store.recovery(fork_id).await.unwrap();
         assert_eq!(recovery.context_events.len(), 1);
         assert_eq!(recovery.queue_events.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn inherited_event_pages_match_the_full_projection_across_lineage_boundaries() {
+        let (directory, store) = store().await;
+        let parent_id = Uuid::new_v4();
+        let child_id = Uuid::new_v4();
+        let grandchild_id = Uuid::new_v4();
+        store.create_session(parent_id).await.unwrap();
+        for kind in [
+            SessionEventKind::SessionStarted,
+            configured(directory.path()),
+            SessionEventKind::ProviderSessionLinked {
+                provider_session_id: "must-not-fork".to_string(),
+            },
+            message(Uuid::new_v4(), "parent-a"),
+            message(Uuid::new_v4(), "parent-b"),
+        ] {
+            store
+                .append(SessionEvent::new(parent_id, 0, kind))
+                .await
+                .unwrap();
+        }
+        store.fork_before(parent_id, child_id, 6).await.unwrap();
+        for text in ["child-a", "child-b", "child-c", "child-d"] {
+            store
+                .append(SessionEvent::new(
+                    child_id,
+                    0,
+                    message(Uuid::new_v4(), text),
+                ))
+                .await
+                .unwrap();
+        }
+        store.fork_before(child_id, grandchild_id, 8).await.unwrap();
+        for text in ["grandchild-a", "grandchild-b"] {
+            store
+                .append(SessionEvent::new(
+                    grandchild_id,
+                    0,
+                    message(Uuid::new_v4(), text),
+                ))
+                .await
+                .unwrap();
+        }
+
+        let full = store.read(grandchild_id).await.unwrap();
+        for sequence in 0..=u64::try_from(full.len() + 1).unwrap() {
+            for limit in [1, 2, 4, 100] {
+                let expected = full
+                    .iter()
+                    .skip(usize::try_from(sequence).unwrap())
+                    .take(limit)
+                    .map(|event| serde_json::to_value(event).unwrap())
+                    .collect::<Vec<_>>();
+                let actual = store
+                    .events_after(grandchild_id, sequence, limit)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .map(|event| serde_json::to_value(event).unwrap())
+                    .collect::<Vec<_>>();
+                assert_eq!(actual, expected, "sequence={sequence}, limit={limit}");
+            }
+        }
     }
 
     /// A rewind cuts immediately before the admission of the prompt it targets.

@@ -752,6 +752,10 @@ struct SubagentEntry {
     snapshot: SubagentSnapshot,
     commands: Option<mpsc::Sender<HostCommand>>,
     inbox: Vec<TeamInboxMessage>,
+    /// Restored children are metadata-only until an explicit child-directed
+    /// action wakes them. This prevents resuming an idle root from silently
+    /// starting providers in the background.
+    dormant: bool,
 }
 
 struct SubagentTable {
@@ -770,7 +774,7 @@ impl SubagentTable {
         let active = self
             .entries
             .values()
-            .filter(|entry| !entry.snapshot.status.is_terminal())
+            .filter(|entry| !entry.snapshot.status.is_terminal() && !entry.dormant)
             .count();
         if active >= self.max_children {
             bail!("subagent concurrency limit reached ({})", self.max_children);
@@ -798,6 +802,7 @@ impl SubagentTable {
                 snapshot: snapshot.clone(),
                 commands: None,
                 inbox: Vec::new(),
+                dormant: false,
             },
         );
         Ok(snapshot)
@@ -1168,11 +1173,14 @@ impl SubagentCoordinator {
     }
 
     /// Rebuild the coordinator projection from the durable parent event
-    /// stream, then resume non-terminal children from the shared typed store.
+    /// stream without starting child actors.
     ///
     /// Parent `SubagentActivity` events remain the topology authority; child
     /// projections only supply each child actor's conversational state.
-    pub async fn restore_from_events(&self, events: &[SessionEvent]) -> Result<()> {
+    pub async fn restore_from_events(
+        &self,
+        events: &[SessionEvent],
+    ) -> Result<Vec<SubagentActivity>> {
         let mut latest = HashMap::<Uuid, SubagentSnapshot>::new();
         let mut projected_root_messages = HashSet::new();
         for event in events {
@@ -1195,13 +1203,13 @@ impl SubagentCoordinator {
             }
         }
         *self.projected_root_messages.lock().await = projected_root_messages;
-        let mut resumable = Vec::new();
-        let mut recovery_failures = Vec::new();
+        let mut recovery_updates = Vec::new();
         let root_session_id = self.table.lock().await.root_session_id;
         for mut snapshot in latest.into_values() {
             if snapshot.parent_session_id != root_session_id {
                 continue;
             }
+            let mirrored_status = snapshot.status;
             let actor_path = child_journal_path(&self.journal_root, snapshot.session_id);
             let mut recovery_failed = false;
             if !snapshot.status.is_terminal() {
@@ -1224,6 +1232,12 @@ impl SubagentCoordinator {
                 match recovered {
                     Ok(state) if state.latest_sequence > 0 => {
                         project_child_state(&mut snapshot, &state);
+                        if !snapshot.status.is_terminal() {
+                            snapshot.status = SubagentStatus::Ready;
+                            snapshot.detail = Some(
+                                "Paused with the parent session; follow up to wake".to_string(),
+                            );
+                        }
                     }
                     Ok(_) => {
                         snapshot.status = SubagentStatus::Failed;
@@ -1251,30 +1265,27 @@ impl SubagentCoordinator {
                         snapshot: snapshot.clone(),
                         commands: None,
                         inbox: Vec::new(),
+                        dormant: !snapshot.status.is_terminal() && !recovery_failed,
                     },
                 );
             }
-            if recovery_failed {
-                recovery_failures.push(snapshot);
-            } else if !snapshot.status.is_terminal() {
-                resumable.push(snapshot);
+            if snapshot.status != mirrored_status {
+                let update = match snapshot.status {
+                    SubagentStatus::Ready => Some(SubagentActivity::Completed {
+                        agent: snapshot.clone(),
+                    }),
+                    SubagentStatus::Stopped => Some(SubagentActivity::Stopped {
+                        agent: snapshot.clone(),
+                    }),
+                    SubagentStatus::Failed => Some(SubagentActivity::Failed {
+                        agent: snapshot.clone(),
+                    }),
+                    SubagentStatus::Starting
+                    | SubagentStatus::Running
+                    | SubagentStatus::WaitingForApproval => None,
+                };
+                recovery_updates.extend(update);
             }
-        }
-        for snapshot in recovery_failures {
-            let _ = self
-                .activity_tx
-                .send(SubagentActivity::Failed { agent: snapshot });
-        }
-        for snapshot in resumable {
-            let mut launch = self.root_launch.clone();
-            launch.request_id = Uuid::new_v4();
-            launch.initial_prompt = None;
-            launch.provider = snapshot.provider;
-            launch.model = snapshot.model.clone();
-            launch.effort = snapshot.effort.clone();
-            launch.cwd = snapshot.cwd.clone();
-            launch.name = Some(snapshot.task_name.clone());
-            self.start_reserved(snapshot, launch, false).await?;
         }
         for message in self.pending_messages_for_session(root_session_id).await? {
             if self
@@ -1286,13 +1297,10 @@ impl SubagentCoordinator {
                     .await?;
                 continue;
             }
-            if message.delivery == PromptDelivery::Steer {
-                if let Err(error) = self.root_message_tx.send(message) {
-                    self.root_inbox.lock().await.push(error.0);
-                }
-            } else {
-                self.root_inbox.lock().await.push(message);
-            }
+            // A restart is not a delivery action. Preserve every pending root
+            // message for the next explicit root turn instead of letting an
+            // old wake/boundary delivery start work behind an idle TUI.
+            self.root_inbox.lock().await.push(message);
         }
         let child_ids = self
             .table
@@ -1328,11 +1336,12 @@ impl SubagentCoordinator {
             let Some(entry) = table.entries.get_mut(&child_id) else {
                 continue;
             };
-            for message in fresh_messages {
-                send_prompt(entry, child_id, message).await?;
-            }
+            entry.inbox.extend(fresh_messages);
         }
-        Ok(())
+        // The child ledger is authoritative. The root actor durably records
+        // these corrections before it publishes its initial Ready boundary;
+        // returning them avoids a best-effort broadcast race during restore.
+        Ok(recovery_updates)
     }
 
     pub async fn spawn(&self, request: SpawnSubagent) -> Result<SubagentSnapshot> {
@@ -1374,6 +1383,74 @@ impl SubagentCoordinator {
             .reserve(&request.task_name, &launch)?;
         self.start_reserved(snapshot.clone(), launch, true).await?;
         Ok(snapshot)
+    }
+
+    /// Lazily start one metadata-only child after an explicit action targets
+    /// it. Concurrent callers either own the wake transition or wait for the
+    /// command channel installed by that owner.
+    async fn ensure_child_actor(&self, session_id: Uuid) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let wake = {
+                let mut table = self.table.lock().await;
+                let active = table
+                    .entries
+                    .values()
+                    .filter(|entry| !entry.snapshot.status.is_terminal() && !entry.dormant)
+                    .count();
+                let max_children = table.max_children;
+                let entry = table
+                    .entries
+                    .get_mut(&session_id)
+                    .with_context(|| format!("unknown subagent session {session_id}"))?;
+                anyhow::ensure!(
+                    !entry.snapshot.status.is_terminal(),
+                    "subagent {} is not running",
+                    entry.snapshot.task_name
+                );
+                if entry.commands.is_some() {
+                    return Ok(());
+                }
+                if entry.dormant {
+                    anyhow::ensure!(
+                        active < max_children,
+                        "subagent concurrency limit reached ({max_children})"
+                    );
+                    entry.dormant = false;
+                    entry.snapshot.status = SubagentStatus::Starting;
+                    entry.snapshot.updated_at = Utc::now();
+                    entry.snapshot.detail = Some("Waking after parent resume".to_string());
+                    Some(entry.snapshot.clone())
+                } else {
+                    None
+                }
+            };
+            if let Some(snapshot) = wake {
+                let mut launch = self.root_launch.clone();
+                launch.request_id = Uuid::new_v4();
+                launch.initial_prompt = None;
+                launch.provider = snapshot.provider;
+                launch.model = snapshot.model.clone();
+                launch.effort = snapshot.effort.clone();
+                launch.cwd = snapshot.cwd.clone();
+                launch.name = Some(snapshot.task_name.clone());
+                if let Err(error) = self.start_reserved(snapshot.clone(), launch, false).await {
+                    let mut table = self.table.lock().await;
+                    if let Some(entry) = table.entries.get_mut(&session_id) {
+                        entry.dormant = true;
+                        entry.snapshot.status = SubagentStatus::Ready;
+                        entry.snapshot.detail = Some(format!("Could not wake: {error:#}"));
+                    }
+                    return Err(error);
+                }
+                return Ok(());
+            }
+            anyhow::ensure!(
+                tokio::time::Instant::now() < deadline,
+                "subagent actor did not finish starting"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 
     async fn start_reserved(
@@ -1423,13 +1500,16 @@ impl SubagentCoordinator {
                 )
                 .await?;
         }
-        self.table
-            .lock()
-            .await
-            .entries
-            .get_mut(&snapshot.session_id)
-            .expect("reserved subagent exists")
-            .commands = Some(command_tx);
+        let queued_inbox = {
+            let mut table = self.table.lock().await;
+            let entry = table
+                .entries
+                .get_mut(&snapshot.session_id)
+                .expect("reserved subagent exists");
+            entry.commands = Some(command_tx.clone());
+            entry.dormant = false;
+            std::mem::take(&mut entry.inbox)
+        };
         if announce {
             let _ = self.activity_tx.send(SubagentActivity::Started {
                 agent: snapshot.clone(),
@@ -1467,6 +1547,19 @@ impl SubagentCoordinator {
                 let _ = activity_tx.send(activity);
             }
         });
+        for message in queued_inbox {
+            command_tx
+                .send(HostCommand::Prompt {
+                    session_id: actor_session_id,
+                    message_id: message.message_id,
+                    text: message.text,
+                    attachments: Vec::new(),
+                    output_schema: None,
+                    delivery: message.delivery,
+                })
+                .await
+                .map_err(|_| anyhow::anyhow!("subagent command channel closed while waking"))?;
+        }
         Ok(())
     }
 
@@ -1523,13 +1616,18 @@ impl SubagentCoordinator {
             !text.trim().is_empty() || !attachments.is_empty(),
             "subagent prompt must not be empty"
         );
-        let (id, commands, task_name) = {
+        let id = {
             let table = self.table.lock().await;
             let id = table.resolve(target)?;
             anyhow::ensure!(
                 id != table.root_session_id,
                 "director is not a child session"
             );
+            id
+        };
+        self.ensure_child_actor(id).await?;
+        let (commands, task_name) = {
+            let table = self.table.lock().await;
             let entry = table
                 .entries
                 .get(&id)
@@ -1540,7 +1638,6 @@ impl SubagentCoordinator {
                 entry.snapshot.task_name
             );
             (
-                id,
                 entry.commands.clone().ok_or_else(|| {
                     anyhow::anyhow!("subagent {} is still starting", entry.snapshot.task_name)
                 })?,
@@ -1561,19 +1658,23 @@ impl SubagentCoordinator {
     }
 
     pub async fn recall_child_prompt(&self, target: &str, message_id: Option<Uuid>) -> Result<()> {
-        let (id, commands, task_name) = {
+        let id = {
             let table = self.table.lock().await;
             let id = table.resolve(target)?;
             anyhow::ensure!(
                 id != table.root_session_id,
                 "director is not a child session"
             );
+            id
+        };
+        self.ensure_child_actor(id).await?;
+        let (commands, task_name) = {
+            let table = self.table.lock().await;
             let entry = table
                 .entries
                 .get(&id)
                 .ok_or_else(|| anyhow::anyhow!("unknown subagent target: {target}"))?;
             (
-                id,
                 entry.commands.clone().ok_or_else(|| {
                     anyhow::anyhow!("subagent {} is still starting", entry.snapshot.task_name)
                 })?,
@@ -1857,6 +1958,7 @@ impl SubagentCoordinator {
             }
             return Ok(());
         }
+        self.ensure_child_actor(id).await?;
         let mut table = self.table.lock().await;
         let entry = table
             .entries
@@ -1883,6 +1985,70 @@ impl SubagentCoordinator {
             .await
     }
 
+    /// Stop every currently live child when the owning root session stops.
+    /// Dormant metadata-only children have no process or command channel and
+    /// therefore require no work here.
+    pub(crate) async fn stop_all(&self) -> Vec<SubagentActivity> {
+        let children = self
+            .table
+            .lock()
+            .await
+            .entries
+            .iter()
+            .filter_map(|(session_id, entry)| {
+                entry
+                    .commands
+                    .clone()
+                    .map(|commands| (*session_id, commands))
+            })
+            .collect::<Vec<_>>();
+        let child_ids = children
+            .iter()
+            .map(|(session_id, _)| *session_id)
+            .collect::<Vec<_>>();
+        for (session_id, commands) in children {
+            let _ = commands.send(HostCommand::Stop { session_id }).await;
+        }
+        let mut warn_at = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let live = self
+                .table
+                .lock()
+                .await
+                .entries
+                .values()
+                .filter(|entry| entry.commands.is_some())
+                .count();
+            if live == 0 {
+                break;
+            }
+            if tokio::time::Instant::now() >= warn_at {
+                tracing::warn!(live, "still waiting for child actors to stop with root");
+                warn_at = tokio::time::Instant::now() + Duration::from_secs(5);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let table = self.table.lock().await;
+        child_ids
+            .into_iter()
+            .filter_map(|session_id| {
+                let entry = table.entries.get(&session_id)?;
+                if entry.commands.is_some() {
+                    return None;
+                }
+                match entry.snapshot.status {
+                    SubagentStatus::Stopped => Some(SubagentActivity::Stopped {
+                        agent: entry.snapshot.clone(),
+                    }),
+                    SubagentStatus::Failed => Some(SubagentActivity::Failed {
+                        agent: entry.snapshot.clone(),
+                    }),
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
     pub async fn approve(
         &self,
         target: &str,
@@ -1902,8 +2068,9 @@ impl SubagentCoordinator {
         target: &str,
         command: impl FnOnce(Uuid) -> HostCommand,
     ) -> Result<()> {
+        let id = self.table.lock().await.resolve(target)?;
+        self.ensure_child_actor(id).await?;
         let table = self.table.lock().await;
-        let id = table.resolve(target)?;
         let entry = table.entries.get(&id).expect("resolved subagent exists");
         let sender = entry.commands.clone().ok_or_else(|| {
             anyhow::anyhow!("subagent {} is still starting", entry.snapshot.task_name)
@@ -3877,7 +4044,112 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restored_live_child_migrates_to_sqlite_and_accepts_typed_control() {
+    async fn restore_mirrors_a_child_stop_journaled_before_the_parent_crashed() {
+        let directory = tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let root = Uuid::new_v4();
+        let child_id = Uuid::new_v4();
+        let now = Utc::now();
+        let parent_event = SessionEvent::new(
+            root,
+            1,
+            SessionEventKind::SubagentActivity {
+                activity: SubagentActivityKind::Updated,
+                agent: SubagentSnapshot {
+                    session_id: child_id,
+                    parent_session_id: root,
+                    task_name: "/root/review_api".into(),
+                    status: SubagentStatus::Running,
+                    provider: CodingProvider::Codex,
+                    model: Some("gpt-test".into()),
+                    effort: Some("high".into()),
+                    cwd: workspace.clone(),
+                    created_at: now,
+                    updated_at: now,
+                    detail: Some("turn phase: provider active".into()),
+                    final_text: None,
+                    usage: SubagentUsage::default(),
+                },
+                event: None,
+            },
+        );
+        let child_path = child_journal_path(directory.path(), child_id);
+        let mut child_journal = crate::SessionJournal::open(&child_path).unwrap();
+        child_journal
+            .append(SessionEvent::new(
+                child_id,
+                0,
+                SessionEventKind::SessionStarted,
+            ))
+            .unwrap();
+        child_journal
+            .append(SessionEvent::new(
+                child_id,
+                0,
+                SessionEventKind::SessionConfigured {
+                    cwd: workspace,
+                    provider: CodingProvider::Codex,
+                    model: Some("gpt-test".into()),
+                    effort: Some("high".into()),
+                    fast: false,
+                    response_language: crate::ResponseLanguage::Auto,
+                    permission_mode: PermissionMode::Manual,
+                },
+            ))
+            .unwrap();
+        child_journal
+            .append(SessionEvent::new(
+                child_id,
+                0,
+                SessionEventKind::StatusChanged {
+                    status: SessionStatus::Stopped,
+                    detail: Some("crash cleanup completed".into()),
+                },
+            ))
+            .unwrap();
+
+        let store = Arc::new(
+            crate::SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
+                .await
+                .unwrap(),
+        );
+        store.create_session(root).await.unwrap();
+        let session_store: Arc<dyn SessionStore> = store;
+        let coordinator = SubagentCoordinator::new_with_store_and_executor(
+            directory.path(),
+            root,
+            launch(),
+            3,
+            Arc::new(crate::LocalAgentTurnExecutor::default()),
+            session_store,
+        )
+        .unwrap();
+        let updates = coordinator
+            .restore_from_events(&[parent_event])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            coordinator
+                .resolve_snapshot(&child_id.to_string())
+                .await
+                .unwrap()
+                .status,
+            SubagentStatus::Stopped
+        );
+        assert!(matches!(
+            updates.as_slice(),
+            [SubagentActivity::Stopped { agent }] if agent.session_id == child_id
+        ));
+        let idle_writer = crate::SessionWriterLease::try_acquire(&child_path)
+            .unwrap()
+            .expect("a reconciled stopped child remains dormant");
+        drop(idle_writer);
+    }
+
+    #[tokio::test]
+    async fn restored_live_child_stays_dormant_and_stops_with_its_root() {
         let directory = tempdir().unwrap();
         let workspace = directory.path().join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
@@ -3966,6 +4238,22 @@ mod tests {
             .unwrap();
         assert!(store.contains_session(child_id).await.unwrap());
         assert!(child_path.with_extension("jsonl.bak").is_file());
+        let idle_writer = crate::SessionWriterLease::try_acquire(&child_path)
+            .unwrap()
+            .expect("restoring the root must not start or lock the child actor");
+        drop(idle_writer);
+        let restored = coordinator
+            .resolve_snapshot(&child_id.to_string())
+            .await
+            .unwrap();
+        assert_eq!(restored.status, SubagentStatus::Ready);
+        assert!(
+            restored
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("follow up to wake")
+        );
         assert_eq!(
             store
                 .list_sessions(10)
@@ -3976,7 +4264,18 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![root]
         );
-        coordinator.stop(&child_id.to_string()).await.unwrap();
+        coordinator.ensure_child_actor(child_id).await.unwrap();
+        assert!(
+            crate::SessionWriterLease::try_acquire(&child_path)
+                .unwrap()
+                .is_none(),
+            "explicit wake should own the child writer"
+        );
+        let terminal_updates = coordinator.stop_all().await;
+        assert!(matches!(
+            terminal_updates.as_slice(),
+            [SubagentActivity::Stopped { agent }] if agent.session_id == child_id
+        ));
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 if matches!(
@@ -3989,5 +4288,9 @@ mod tests {
         })
         .await
         .expect("restored child emits stop activity");
+        let released_writer = crate::SessionWriterLease::try_acquire(&child_path)
+            .unwrap()
+            .expect("root stop must release the child writer");
+        drop(released_writer);
     }
 }

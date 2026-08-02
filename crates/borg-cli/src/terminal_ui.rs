@@ -360,6 +360,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/effort", "choose reasoning effort"),
     ("/language", "choose response and drafting language"),
     ("/lsp", "view language server support"),
+    ("/extensions", "view the live Blu extension runtime"),
     ("/fast", "toggle provider priority/fast mode"),
     ("/followups", "choose steer current turn or queue next turn"),
     ("/refresh", "choose terminal refresh rate"),
@@ -1531,6 +1532,13 @@ impl BorgTerminal {
         self.replaying_history = false;
     }
 
+    /// Seed durable composer recall independently from the bounded transcript
+    /// window. This keeps Up-arrow history stable across resumes even when the
+    /// visible tail is aggressively lazy-loaded.
+    pub fn seed_composer_history(&mut self, events: &[SessionEvent]) {
+        self.composer.seed_session_events(events);
+    }
+
     pub fn replace_history(&mut self, events: &[SessionEvent]) {
         let previous_height = self.rendered_transcript_height;
         let replaced_displayed = replace_root_transcript_history(
@@ -1785,6 +1793,12 @@ impl BorgTerminal {
                 status: MessageStatus::Complete,
                 ..
             } => {
+                // CLI launch prompts and prompts admitted through another
+                // attached surface may never pass through `Composer::take`.
+                // Every completed user message must still become recallable
+                // with Up in this running instance and future resumes.
+                self.composer
+                    .seed_session_events(std::slice::from_ref(event));
                 if self
                     .rewind_targets
                     .last()
@@ -2057,30 +2071,7 @@ impl BorgTerminal {
             .as_deref_mut()
             .unwrap_or(&mut self.transcript);
         for agent in agents {
-            transcript.subagents.insert(agent.session_id, agent.status);
-            transcript
-                .subagent_snapshots
-                .insert(agent.session_id, agent.clone());
-            if let Some(summary) = hydrated_subagent_activity_summary(agent) {
-                let time = canonical_local_time(agent.updated_at.with_timezone(&Local));
-                if let Some(index) = transcript.subagent_entries.get(&agent.session_id).copied()
-                    && let Some(TranscriptEntry::Activity {
-                        text: existing,
-                        time: existing_time,
-                    }) = transcript.order.get_mut(index)
-                {
-                    *existing = summary;
-                    *existing_time = time;
-                } else {
-                    transcript
-                        .subagent_entries
-                        .insert(agent.session_id, transcript.order.len());
-                    transcript.order.push(TranscriptEntry::Activity {
-                        text: summary,
-                        time,
-                    });
-                }
-            }
+            transcript.upsert_subagent_snapshot(agent);
             self.child_statuses
                 .insert(agent.session_id, subagent_session_status(agent.status));
         }
@@ -3726,16 +3717,16 @@ impl BorgTerminal {
         } else {
             primary_controls_line(&self.keymap)
         };
-        let interaction_hint = bottom_interaction_hint(
-            self.status_hovered,
+        let interaction_hint = bottom_interaction_hint(BottomInteractionHintState {
+            status_hovered: self.status_hovered,
             status_is_interruptible,
-            self.goal_status_hovered,
-            active_goal.is_some(),
-            self.agents_status_hovered,
-            self.model_status_hovered,
-            self.effort_status_hovered,
-            self.permission_status_hovered,
-        );
+            goal_status_hovered: self.goal_status_hovered,
+            goal_available: active_goal.is_some(),
+            agents_status_hovered: self.agents_status_hovered,
+            model_status_hovered: self.model_status_hovered,
+            effort_status_hovered: self.effort_status_hovered,
+            permission_status_hovered: self.permission_status_hovered,
+        });
         let primary_controls_display = interaction_hint.map_or_else(
             || primary_controls.clone(),
             |hint| format!("{hint} · {primary_controls}"),
@@ -4019,7 +4010,7 @@ impl BorgTerminal {
                 let show_history_loader = self.history_page_loading;
                 let visible_height = content_area.height as usize;
                 let sticky_tool_run_header =
-                    sticky_tool_run_header_row(&tool_run_rows, scroll_start)
+                    sticky_tool_run_header_row(tool_run_rows, scroll_start)
                         .map(|(index, row)| (index, transcript[row].clone()));
                 let sticky_index = tool_rows.partition_point(|(_, start, _)| *start < scroll_start);
                 let sticky_tool_header = if sticky_tool_run_header.is_some() {
@@ -5638,10 +5629,28 @@ fn replace_root_transcript_history(
     } else {
         &*transcript
     };
+    let reconciled_subagents = previous
+        .subagent_snapshots
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
     let mut replacement = fresh_transcript_like(previous);
     replacement.reserve_history(events.len());
     for event in events {
         replacement.apply(event);
+    }
+    // Older-page hydration rebuilds the root transcript. It may contain the
+    // parent's last pre-crash Running mirror even though child hydration has
+    // already reconciled that child to Ready/Stopped. Historical rows may
+    // expand the transcript, but may never regress a newer roster snapshot.
+    for agent in reconciled_subagents {
+        let should_preserve = replacement
+            .subagent_snapshots
+            .get(&agent.session_id)
+            .is_none_or(|historical| agent.updated_at >= historical.updated_at);
+        if should_preserve {
+            replacement.upsert_subagent_snapshot(&agent);
+        }
     }
     if child_is_focused {
         *director_transcript = Some(Box::new(replacement));
@@ -5793,6 +5802,7 @@ struct Composer {
     next_image_number: usize,
     next_pasted_text_number: usize,
     history: Vec<String>,
+    history_message_ids: HashSet<Uuid>,
     history_index: Option<usize>,
     history_draft: String,
 }
@@ -5825,7 +5835,7 @@ impl Composer {
             else {
                 continue;
             };
-            if seen.insert(*message_id) {
+            if seen.insert(*message_id) && self.history_message_ids.insert(*message_id) {
                 if !attachments.is_empty() {
                     if let Some(highest) = image_numbers_in_text(text).into_iter().max() {
                         self.next_image_number = self.next_image_number.max(highest);
@@ -6489,6 +6499,31 @@ enum TranscriptEntry {
 }
 
 impl Transcript {
+    fn upsert_subagent_snapshot(&mut self, agent: &SubagentSnapshot) {
+        self.subagents.insert(agent.session_id, agent.status);
+        self.subagent_snapshots
+            .insert(agent.session_id, agent.clone());
+        if let Some(summary) = hydrated_subagent_activity_summary(agent) {
+            let time = canonical_local_time(agent.updated_at.with_timezone(&Local));
+            if let Some(index) = self.subagent_entries.get(&agent.session_id).copied()
+                && let Some(TranscriptEntry::Activity {
+                    text: existing,
+                    time: existing_time,
+                }) = self.order.get_mut(index)
+            {
+                *existing = summary;
+                *existing_time = time;
+            } else {
+                self.subagent_entries
+                    .insert(agent.session_id, self.order.len());
+                self.order.push(TranscriptEntry::Activity {
+                    text: summary,
+                    time,
+                });
+            }
+        }
+    }
+
     fn project_optimistic_message(&mut self, event: &SessionEvent) {
         let _ = self.apply(event);
         self.live_turn_closed = false;
@@ -8008,12 +8043,12 @@ impl Transcript {
                     ]));
                     let display_items = ordered_plan_items(items);
                     let clipped = !*expanded && items.len() > MAX_COLLAPSED_PLAN_ITEMS;
-                    let mut shown = 0usize;
-                    for item in display_items {
-                        if clipped && shown >= MAX_COLLAPSED_PLAN_ITEMS {
-                            break;
-                        }
-                        shown += 1;
+                    let display_limit = if clipped {
+                        MAX_COLLAPSED_PLAN_ITEMS
+                    } else {
+                        usize::MAX
+                    };
+                    for item in display_items.into_iter().take(display_limit) {
                         let (glyph, marker_style, text_style) = match item.status {
                             PlanItemStatus::Completed => (
                                 "✓",
@@ -10745,7 +10780,8 @@ fn todo_tooltip_row_style(completed: bool) -> Style {
         })
 }
 
-fn bottom_interaction_hint(
+#[derive(Clone, Copy, Default)]
+struct BottomInteractionHintState {
     status_hovered: bool,
     status_is_interruptible: bool,
     goal_status_hovered: bool,
@@ -10754,18 +10790,20 @@ fn bottom_interaction_hint(
     model_status_hovered: bool,
     effort_status_hovered: bool,
     permission_status_hovered: bool,
-) -> Option<&'static str> {
-    if status_hovered && status_is_interruptible {
+}
+
+fn bottom_interaction_hint(state: BottomInteractionHintState) -> Option<&'static str> {
+    if state.status_hovered && state.status_is_interruptible {
         Some("left click interrupt")
-    } else if goal_status_hovered && goal_available {
+    } else if state.goal_status_hovered && state.goal_available {
         Some("left click toggle goal · right click open menu")
-    } else if agents_status_hovered {
+    } else if state.agents_status_hovered {
         Some("left click to open subagents menu")
-    } else if model_status_hovered {
+    } else if state.model_status_hovered {
         Some("left click change model")
-    } else if effort_status_hovered {
+    } else if state.effort_status_hovered {
         Some("left click change effort")
-    } else if permission_status_hovered {
+    } else if state.permission_status_hovered {
         Some("left click change permissions")
     } else {
         None

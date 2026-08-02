@@ -68,6 +68,60 @@ fn root_history_page_cannot_replace_a_focused_child_transcript() {
 }
 
 #[test]
+fn older_root_history_cannot_regress_an_authoritatively_stopped_child() {
+    let root = Uuid::new_v4();
+    let child = Uuid::new_v4();
+    let now = Utc::now();
+    let stale_running = SubagentSnapshot {
+        session_id: child,
+        parent_session_id: root,
+        task_name: "/root/worker".to_string(),
+        status: SubagentStatus::Running,
+        provider: CodingProvider::Codex,
+        model: Some("gpt-test".to_string()),
+        effort: Some("high".to_string()),
+        cwd: PathBuf::from("/workspace"),
+        created_at: now - chrono::Duration::minutes(1),
+        updated_at: now - chrono::Duration::seconds(1),
+        detail: Some("turn phase: provider active".to_string()),
+        final_text: None,
+        usage: borg_remote::SubagentUsage::default(),
+    };
+    let stale_parent_event = SessionEvent::new(
+        root,
+        10,
+        SessionEventKind::SubagentActivity {
+            activity: SubagentActivityKind::Updated,
+            agent: stale_running.clone(),
+            event: None,
+        },
+    );
+    let mut stopped = stale_running;
+    stopped.status = SubagentStatus::Stopped;
+    stopped.updated_at = now;
+    stopped.detail = Some("crash cleanup completed".to_string());
+
+    let mut displayed = Transcript::default();
+    displayed.upsert_subagent_snapshot(&stopped);
+    assert_eq!(displayed.active_subagent_count(), 0);
+    let mut director = None;
+
+    assert!(replace_root_transcript_history(
+        &mut displayed,
+        &mut director,
+        false,
+        &[stale_parent_event],
+    ));
+
+    assert_eq!(displayed.active_subagent_count(), 0);
+    assert_eq!(displayed.subagents[&child], SubagentStatus::Stopped);
+    assert_eq!(
+        displayed.subagent_snapshots[&child].detail.as_deref(),
+        Some("crash cleanup completed")
+    );
+}
+
+#[test]
 fn child_history_merge_prefers_completion_over_a_late_partial_snapshot() {
     let session_id = Uuid::new_v4();
     let message_id = Uuid::new_v4();
@@ -1812,6 +1866,79 @@ fn composer_history_rehydrates_completed_user_prompts_from_the_session_journal()
 }
 
 #[test]
+fn composer_history_keeps_previous_resume_prompts_outside_the_visible_tail() {
+    let session_id = Uuid::new_v4();
+    let message = |sequence, text: &str| {
+        SessionEvent::new(
+            session_id,
+            sequence,
+            SessionEventKind::Message {
+                message_id: Uuid::new_v4(),
+                actor: EventActor::User,
+                text: text.to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            },
+        )
+    };
+    let previous_run = message(1, "prompt from the previous resume");
+    let visible_tail = message(20_000, "prompt in the visible tail");
+    let mut composer = Composer::default();
+
+    composer.seed_session_events(std::slice::from_ref(&previous_run));
+    composer.seed_session_events(&[previous_run, visible_tail]);
+    composer.history_previous();
+    assert_eq!(composer.text, "prompt in the visible tail");
+    composer.history_previous();
+    assert_eq!(composer.text, "prompt from the previous resume");
+    assert_eq!(
+        composer.history.len(),
+        2,
+        "overlapping seeds deduplicate by message id"
+    );
+}
+
+#[test]
+fn completed_external_prompt_joins_existing_composer_history_once() {
+    let session_id = Uuid::new_v4();
+    let mut composer = Composer::default();
+    composer.insert("typed locally");
+    let _ = composer.take();
+    let local_completion = SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::Message {
+            message_id: Uuid::new_v4(),
+            actor: EventActor::User,
+            text: "typed locally".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: None,
+        },
+    );
+    let external_completion = SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::Message {
+            message_id: Uuid::new_v4(),
+            actor: EventActor::User,
+            text: "sent from an attached client".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: None,
+        },
+    );
+
+    composer.seed_session_events(&[local_completion, external_completion]);
+    composer.history_previous();
+    assert_eq!(composer.text, "sent from an attached client");
+    composer.history_previous();
+    assert_eq!(composer.text, "typed locally");
+    assert_eq!(composer.history.len(), 2);
+}
+
+#[test]
 fn composer_rehydration_advances_past_persisted_image_labels() {
     let session_id = Uuid::new_v4();
     let mut composer = Composer::default();
@@ -2412,9 +2539,13 @@ fn agents_status_hover_underlines_only_the_label() {
 #[test]
 fn model_effort_and_permission_hover_show_bottom_interaction_hints() {
     let hint = |agents, model, effort, permission| {
-        bottom_interaction_hint(
-            false, false, false, false, agents, model, effort, permission,
-        )
+        bottom_interaction_hint(BottomInteractionHintState {
+            agents_status_hovered: agents,
+            model_status_hovered: model,
+            effort_status_hovered: effort,
+            permission_status_hovered: permission,
+            ..BottomInteractionHintState::default()
+        })
     };
 
     assert_eq!(

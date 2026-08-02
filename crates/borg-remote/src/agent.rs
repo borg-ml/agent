@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -65,6 +65,8 @@ pub struct AgentTurn {
     pub external_mcp_servers: Vec<borg_provider::mcp::ExternalMcpServer>,
     /// Trusted extension-owned skill roots supplied by the launch contract.
     pub extension_skill_roots: Vec<PathBuf>,
+    /// Trusted runtime context appended to the provider system prompt.
+    pub system_prompt_appendix: String,
 }
 
 #[derive(Debug, Clone)]
@@ -140,7 +142,18 @@ pub struct LocalAgentTurnExecutor {
     claude_pool: ClaudeSdkPool,
     claude_sessions: Arc<Mutex<HashMap<String, ClaudeSessionSnapshot>>>,
     native_harness: NativeHarness,
+    runtime_extensions: Arc<RwLock<RuntimeExtensions>>,
+    runtime_extension_loader: Option<RuntimeExtensionLoader>,
+}
+
+type RuntimeExtensionLoader = Arc<
+    dyn Fn() -> Result<(Vec<borg_provider::mcp::ExternalMcpServer>, Vec<PathBuf>)> + Send + Sync,
+>;
+
+#[derive(Clone, Default)]
+struct RuntimeExtensions {
     external_mcp_servers: Vec<borg_provider::mcp::ExternalMcpServer>,
+    skill_roots: Vec<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -179,11 +192,70 @@ impl LocalAgentTurnExecutor {
     }
 
     pub fn with_external_mcp_servers(
-        mut self,
+        self,
         servers: Vec<borg_provider::mcp::ExternalMcpServer>,
     ) -> Self {
-        self.external_mcp_servers = servers;
+        self.runtime_extensions
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .external_mcp_servers = servers;
         self
+    }
+
+    /// Add trusted live skill roots to every subsequent turn. Native runtimes
+    /// rescan them when the turn starts, so no provider/session restart is
+    /// required.
+    pub fn with_extension_skill_roots(self, roots: Vec<PathBuf>) -> Self {
+        self.runtime_extensions
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .skill_roots = roots;
+        self
+    }
+
+    /// Atomically replace the live extension snapshot. An in-flight turn keeps
+    /// the immutable snapshot it started with; the next turn observes the new
+    /// MCP catalog and skill roots.
+    pub fn replace_runtime_extensions(
+        &self,
+        servers: Vec<borg_provider::mcp::ExternalMcpServer>,
+        skill_roots: Vec<PathBuf>,
+    ) {
+        *self
+            .runtime_extensions
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = RuntimeExtensions {
+            external_mcp_servers: servers,
+            skill_roots,
+        };
+    }
+
+    /// Refresh the extension snapshot at each turn boundary. Failed reloads
+    /// retain the last-known-good snapshot and are retried on the next turn.
+    pub fn with_runtime_extension_loader<F>(mut self, loader: F) -> Self
+    where
+        F: Fn() -> Result<(Vec<borg_provider::mcp::ExternalMcpServer>, Vec<PathBuf>)>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.runtime_extension_loader = Some(Arc::new(loader));
+        self
+    }
+
+    async fn refresh_runtime_extensions(&self) {
+        let Some(loader) = self.runtime_extension_loader.clone() else {
+            return;
+        };
+        match tokio::task::spawn_blocking(move || loader()).await {
+            Ok(Ok((servers, roots))) => self.replace_runtime_extensions(servers, roots),
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "kept last-known-good runtime extension snapshot");
+            }
+            Err(error) => {
+                tracing::warn!(%error, "runtime extension loader stopped unexpectedly");
+            }
+        }
     }
 
     pub fn prewarm(&self, provider: CodingProvider) {
@@ -201,10 +273,26 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
         events: mpsc::Sender<SessionEventKind>,
         controls: Option<mpsc::Receiver<AgentTurnControl>>,
     ) -> Result<AgentTurnResult> {
+        self.refresh_runtime_extensions().await;
+        let runtime_extensions = self
+            .runtime_extensions
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
         turn.external_mcp_servers
-            .extend(self.external_mcp_servers.clone());
+            .extend(runtime_extensions.external_mcp_servers);
+        turn.extension_skill_roots
+            .extend(runtime_extensions.skill_roots);
         if turn.provider.uses_native_harness() {
             return self.native_harness.run(turn, events, controls).await;
+        }
+        if !turn.extension_skill_roots.is_empty() {
+            turn.system_prompt_appendix.push_str(
+                &crate::native_context::extension_skill_prompt_appendix(
+                    turn.extension_skill_roots.clone(),
+                )
+                .await?,
+            );
         }
         events
             .send(SessionEventKind::StatusChanged {
@@ -217,11 +305,13 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
             turn,
             events,
             controls,
-            None,
-            true,
-            Some(self.codex_pool.clone()),
-            Some(self.claude_pool.clone()),
-            Some(self.claude_sessions.clone()),
+            BorgProviderTurnRuntime {
+                request_template: None,
+                local: true,
+                codex_pool: Some(self.codex_pool.clone()),
+                claude_pool: Some(self.claude_pool.clone()),
+                claude_sessions: Some(self.claude_sessions.clone()),
+            },
         )
         .await
     }
@@ -258,6 +348,11 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
     }
 
     async fn stop_session(&self, session_id: Uuid) -> Result<()> {
+        let pool = self.codex_pool.clone();
+        let owner_session_id = session_id.to_string();
+        tokio::task::spawn_blocking(move || pool.stop_owner(&owner_session_id))
+            .await
+            .context("Codex provider cleanup worker panicked")??;
         self.native_harness.stop_session(session_id).await;
         Ok(())
     }
@@ -284,7 +379,19 @@ pub async fn run_agent_turn_controlled(
         .ok();
     match turn.provider {
         CodingProvider::Codex | CodingProvider::Claude | CodingProvider::OpenCode => {
-            run_borg_provider_turn(turn, events, controls, None, true, None, None, None).await
+            run_borg_provider_turn(
+                turn,
+                events,
+                controls,
+                BorgProviderTurnRuntime {
+                    request_template: None,
+                    local: true,
+                    codex_pool: None,
+                    claude_pool: None,
+                    claude_sessions: None,
+                },
+            )
+            .await
         }
         CodingProvider::Kimi | CodingProvider::OpenRouter | CodingProvider::OpenAiCompatible => {
             NativeHarness::default().run(turn, events, controls).await
@@ -292,16 +399,27 @@ pub async fn run_agent_turn_controlled(
     }
 }
 
-async fn run_borg_provider_turn(
-    turn: AgentTurn,
-    events: mpsc::Sender<SessionEventKind>,
-    controls: Option<mpsc::Receiver<AgentTurnControl>>,
+struct BorgProviderTurnRuntime {
     request_template: Option<ChatStreamRequest>,
     local: bool,
     codex_pool: Option<CodexAppServerPool>,
     claude_pool: Option<ClaudeSdkPool>,
     claude_sessions: Option<Arc<Mutex<HashMap<String, ClaudeSessionSnapshot>>>>,
+}
+
+async fn run_borg_provider_turn(
+    turn: AgentTurn,
+    events: mpsc::Sender<SessionEventKind>,
+    controls: Option<mpsc::Receiver<AgentTurnControl>>,
+    runtime: BorgProviderTurnRuntime,
 ) -> Result<AgentTurnResult> {
+    let BorgProviderTurnRuntime {
+        request_template,
+        local,
+        codex_pool,
+        claude_pool,
+        claude_sessions,
+    } = runtime;
     let provider_turn_started = Instant::now();
     let ttft_session_id = turn.session_id;
     let ttft_message_id = turn.message_id;
@@ -309,6 +427,8 @@ async fn run_borg_provider_turn(
     let request = match request_template {
         Some(mut request) => {
             request.prompt = turn.prompt.clone();
+            request.owner_session_id = Some(turn.session_id.to_string());
+            request.client_user_message_id = Some(turn.message_id.to_string());
             request.attachments = turn.attachments;
             request.output_schema = turn.output_schema;
             request.model = turn.model.clone().or(request.model);
@@ -327,6 +447,10 @@ async fn run_borg_provider_turn(
                 request.system_prompt.push_str("\n\n");
                 request.system_prompt.push_str(instruction);
             }
+            if !turn.system_prompt_appendix.is_empty() {
+                request.system_prompt.push_str("\n\n");
+                request.system_prompt.push_str(&turn.system_prompt_appendix);
+            }
             request
         }
         None => {
@@ -334,6 +458,8 @@ async fn run_borg_provider_turn(
             mcp_external_servers.push(turn.agent_mcp_server);
             ChatStreamRequest {
                 prompt: turn.prompt.clone(),
+                owner_session_id: Some(turn.session_id.to_string()),
+                client_user_message_id: Some(turn.message_id.to_string()),
                 attachments: turn.attachments,
                 model: turn.model.clone(),
                 effort: turn.effort.clone(),
@@ -341,7 +467,11 @@ async fn run_borg_provider_turn(
                 system_prompt: match response_language_instruction {
                     Some(instruction) => format!("{CODING_SYSTEM_PROMPT}\n\n{instruction}"),
                     None => CODING_SYSTEM_PROMPT.to_string(),
-                },
+                } + if turn.system_prompt_appendix.is_empty() {
+                    ""
+                } else {
+                    "\n\n"
+                } + &turn.system_prompt_appendix,
                 output_schema: turn.output_schema,
                 mcp_owner_id: None,
                 mcp_allowed_scopes: Vec::new(),
@@ -997,6 +1127,57 @@ async fn send(events: &mpsc::Sender<SessionEventKind>, event: SessionEventKind) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_server(name: &str) -> borg_provider::mcp::ExternalMcpServer {
+        borg_provider::mcp::ExternalMcpServer {
+            name: name.to_string(),
+            command: "server".to_string(),
+            args: Vec::new(),
+            env: std::collections::BTreeMap::new(),
+            allowed_tools: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn runtime_extension_swap_is_atomic_at_turn_snapshot_boundary() {
+        let executor = LocalAgentTurnExecutor::default()
+            .with_external_mcp_servers(vec![test_server("old")])
+            .with_extension_skill_roots(vec![PathBuf::from("old-skills")]);
+        let in_flight_snapshot = executor.runtime_extensions.read().unwrap().clone();
+
+        executor.replace_runtime_extensions(
+            vec![test_server("new")],
+            vec![PathBuf::from("new-skills")],
+        );
+
+        assert_eq!(in_flight_snapshot.external_mcp_servers[0].name, "old");
+        assert_eq!(
+            in_flight_snapshot.skill_roots,
+            [PathBuf::from("old-skills")]
+        );
+        let next_turn = executor.runtime_extensions.read().unwrap();
+        assert_eq!(next_turn.external_mcp_servers[0].name, "new");
+        assert_eq!(next_turn.skill_roots, [PathBuf::from("new-skills")]);
+    }
+
+    #[tokio::test]
+    async fn runtime_extension_loader_refreshes_without_restarting_the_executor() {
+        let executor = LocalAgentTurnExecutor::default()
+            .with_external_mcp_servers(vec![test_server("old")])
+            .with_extension_skill_roots(vec![PathBuf::from("old-skills")])
+            .with_runtime_extension_loader(|| {
+                Ok((
+                    vec![test_server("reloaded")],
+                    vec![PathBuf::from("reloaded-skills")],
+                ))
+            });
+
+        executor.refresh_runtime_extensions().await;
+
+        let snapshot = executor.runtime_extensions.read().unwrap();
+        assert_eq!(snapshot.external_mcp_servers[0].name, "reloaded");
+        assert_eq!(snapshot.skill_roots, [PathBuf::from("reloaded-skills")]);
+    }
 
     #[tokio::test]
     async fn pending_steer_acknowledgement_does_not_block_interrupt() {

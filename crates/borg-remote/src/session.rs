@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 #[cfg(test)]
 use crate::SessionJournal;
-use crate::subagents::SharedWorkToolContext;
+use crate::subagents::{SharedWorkToolContext, TeamInboxMessage};
 use crate::{
     AgentTurn, AgentTurnControl, AgentTurnExecutor, CodingProvider, EventActor, GoalAction,
     GoalStatus, HostCommand, LaunchSession, LocalAgentTurnExecutor, MessageStatus, ModelGoalStatus,
@@ -56,6 +56,7 @@ struct RuntimeSessionStore {
     store: Arc<dyn SessionStore>,
     context_events: Vec<SessionEvent>,
     workspace_projection: Option<WorkspaceProjection>,
+    projection_diagnostics: VecDeque<SessionEvent>,
 }
 
 #[derive(Clone)]
@@ -93,7 +94,11 @@ impl WorkspaceProjection {
                 actor,
                 status: MessageStatus::Complete,
                 ..
-            } if matches!(actor, EventActor::User | EventActor::System) => {
+            } if *actor == EventActor::User => {
+                // Team messages already cross their workspace delivery
+                // boundary in SubagentCoordinator. Re-projecting the mirrored
+                // system message here can try to move an acknowledged delivery
+                // backwards to admitted.
                 self.store
                     .transition_message_delivery(
                         self.workspace_id,
@@ -157,6 +162,7 @@ impl RuntimeSessionStore {
             store,
             context_events,
             workspace_projection: None,
+            projection_diagnostics: VecDeque::new(),
         }
     }
 
@@ -175,6 +181,10 @@ impl RuntimeSessionStore {
 
     async fn contains_message(&self, session_id: Uuid, message_id: Uuid) -> Result<bool> {
         self.store.contains_message(session_id, message_id).await
+    }
+
+    fn take_projection_diagnostics(&mut self) -> VecDeque<SessionEvent> {
+        std::mem::take(&mut self.projection_diagnostics)
     }
 
     async fn append(&mut self, event: SessionEvent) -> Result<SessionEvent> {
@@ -196,7 +206,8 @@ impl RuntimeSessionStore {
             // session actor fail. Persist the failure directly in the source
             // journal (without recursively attempting the same projection) so
             // reconnect and repair tooling can diagnose the missing delivery.
-            self.store
+            let diagnostic_event = self
+                .store
                 .append(SessionEvent::new(
                     event.session_id,
                     0,
@@ -205,6 +216,7 @@ impl RuntimeSessionStore {
                     },
                 ))
                 .await?;
+            self.projection_diagnostics.push_back(diagnostic_event);
         }
         if matches!(event.kind, SessionEventKind::ContextCleared) {
             self.context_events.clear();
@@ -718,11 +730,10 @@ async fn run_agent_session_store_kernel(
     let mut root_inbox_tick = tokio::time::interval(ROOT_INBOX_REFRESH_INTERVAL);
     root_inbox_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     if owns_team {
-        subagents
-            .as_ref()
-            .expect("enabled team")
-            .restore_from_events(&recovery.subagent_events)
-            .await?;
+        let team = subagents.as_ref().expect("enabled team");
+        for activity in team.restore_from_events(&recovery.subagent_events).await? {
+            record_subagent_activity(&mut journal, &events, session_id, team, activity).await?;
+        }
     }
     if fresh && !initial_peers.is_empty() {
         let team = subagents
@@ -785,6 +796,13 @@ async fn run_agent_session_store_kernel(
         });
     }
     loop {
+        let goal_is_active = goal
+            .as_ref()
+            .is_some_and(|goal| goal.status == GoalStatus::Active);
+        if !goal_is_active {
+            settle_inactive_team_notifications(&mut journal, &events, session_id, &mut pending)
+                .await?;
+        }
         if at_turn_boundary {
             let interrupted_at_boundary = collect_input_at_turn_boundary(
                 &mut journal,
@@ -808,7 +826,7 @@ async fn run_agent_session_store_kernel(
                 coalesce_queued_prompts(&mut pending);
             }
         }
-        let next = if let Some(prompt) = pending.pop_front() {
+        let next = if let Some(prompt) = pop_next_pending_prompt(&mut pending, goal_is_active) {
             Some(prompt)
         } else if let Some(active_goal) = goal
             .as_ref()
@@ -897,25 +915,20 @@ async fn run_agent_session_store_kernel(
                                 .take_root_inbox()
                                 .await;
                             if !inbox.is_empty() {
-                                deferred_commands.push_front(HostCommand::Prompt {
+                                defer_root_inbox_behind_current_command(
+                                    &mut deferred_commands,
                                     session_id,
-                                    message_id,
-                                    text,
-                                    attachments,
-                                    output_schema,
-                                    delivery,
-                                });
-                                for message in inbox.into_iter().rev() {
-                                    team_message_ids.insert(message.message_id);
-                                    deferred_commands.push_front(HostCommand::Prompt {
+                                    HostCommand::Prompt {
                                         session_id,
-                                        message_id: message.message_id,
-                                        text: message.text,
-                                        attachments: Vec::new(),
-                                        output_schema: None,
-                                        delivery: message.delivery,
-                                    });
-                                }
+                                        message_id,
+                                        text,
+                                        attachments,
+                                        output_schema,
+                                        delivery,
+                                    },
+                                    inbox,
+                                    &mut team_message_ids,
+                                );
                                 continue;
                             }
                         }
@@ -924,6 +937,29 @@ async fn run_agent_session_store_kernel(
                         } else {
                             EventActor::User
                         };
+                        if actor == EventActor::System
+                            && !goal
+                                .as_ref()
+                                .is_some_and(|goal| goal.status == GoalStatus::Active)
+                        {
+                            settle_team_notification(
+                                &mut journal,
+                                &events,
+                                session_id,
+                                QueuedPrompt {
+                                    message_id,
+                                    text,
+                                    actor,
+                                    attachments,
+                                    output_schema,
+                                    delivery,
+                                    visible: true,
+                                    interrupt_batch: false,
+                                },
+                            )
+                            .await?;
+                            continue;
+                        }
                         break Some(QueuedPrompt {
                             message_id,
                             text,
@@ -1168,6 +1204,12 @@ async fn run_agent_session_store_kernel(
             }
         };
         let Some(prompt) = next else {
+            if owns_team && let Some(team) = &subagents {
+                for activity in team.stop_all().await {
+                    record_subagent_activity(&mut journal, &events, session_id, team, activity)
+                        .await?;
+                }
+            }
             stop(&mut journal, &events, session_id).await?;
             return Ok(());
         };
@@ -1346,6 +1388,7 @@ async fn run_agent_session_store_kernel(
             agent_tools: dispatcher.clone(),
             external_mcp_servers: Vec::new(),
             extension_skill_roots: launch.extension_skill_roots.clone(),
+            system_prompt_appendix: String::new(),
         };
         let turn_executor = Arc::clone(&executor);
         let mut running = tokio::spawn(async move {
@@ -1376,6 +1419,19 @@ async fn run_agent_session_store_kernel(
                     while let Ok(kind) = provider_events.try_recv() {
                         if is_executor_lifecycle_status(&kind) {
                             continue;
+                        }
+                        if turn_phase == TurnPhase::AwaitingProvider {
+                            turn_phase = TurnPhase::Active;
+                            record(
+                                &mut journal,
+                                &events,
+                                session_id,
+                                SessionEventKind::StatusChanged {
+                                    status: SessionStatus::Running,
+                                    detail: Some(turn_phase.detail().to_string()),
+                                },
+                            )
+                            .await?;
                         }
                         track_approval(&kind, &mut pending_approval);
                         track_provider_interaction(&kind, &mut pending_provider_interaction);
@@ -1591,6 +1647,7 @@ async fn run_agent_session_store_kernel(
                 }, if interrupt_deadline.is_some() => {
                     running.abort();
                     let _ = (&mut running).await;
+                    executor.stop_session(session_id).await?;
                     deny_pending_approval(
                         &mut journal,
                         &events,
@@ -1632,6 +1689,7 @@ async fn run_agent_session_store_kernel(
                     let timed_out_phase = turn_phase;
                     running.abort();
                     let _ = (&mut running).await;
+                    executor.stop_session(session_id).await?;
                     deny_pending_approval(
                         &mut journal,
                         &events,
@@ -1725,6 +1783,7 @@ async fn run_agent_session_store_kernel(
                     let Some(command) = command else {
                         running.abort();
                         let _ = (&mut running).await;
+                        executor.stop_session(session_id).await?;
                         deny_pending_approval(
                             &mut journal,
                             &events,
@@ -2049,6 +2108,7 @@ async fn run_agent_session_store_kernel(
                             ).await?;
                             running.abort();
                             let _ = (&mut running).await;
+                            executor.stop_session(session_id).await?;
                             deny_pending_approval(
                                 &mut journal,
                                 &events,
@@ -2143,6 +2203,20 @@ async fn run_agent_session_store_kernel(
                                 },
                             )
                             .await?;
+                            if owns_team
+                                && let Some(team) = &subagents
+                            {
+                                for activity in team.stop_all().await {
+                                    record_subagent_activity(
+                                        &mut journal,
+                                        &events,
+                                        session_id,
+                                        team,
+                                        activity,
+                                    )
+                                    .await?;
+                                }
+                            }
                             stop(&mut journal, &events, session_id).await?;
                             return Ok(());
                         }
@@ -2478,11 +2552,11 @@ fn recover_queued_prompts(events: &[SessionEvent]) -> VecDeque<QueuedPrompt> {
             }
             SessionEventKind::Message {
                 message_id,
-                actor,
+                actor: EventActor::User | EventActor::System,
                 status: MessageStatus::Complete,
                 delivery,
                 ..
-            } if matches!(actor, EventActor::User | EventActor::System) => {
+            } => {
                 if let Some(admitted) = pending
                     .iter()
                     .position(|prompt| prompt.message_id == *message_id)
@@ -2580,6 +2654,63 @@ fn recall_withdrawable_steers(
     recalled
 }
 
+fn pop_next_pending_prompt(
+    pending: &mut VecDeque<QueuedPrompt>,
+    allow_internal_turn: bool,
+) -> Option<QueuedPrompt> {
+    if let Some(index) = pending
+        .iter()
+        .position(|prompt| prompt.actor == EventActor::User)
+    {
+        return pending.remove(index);
+    }
+    allow_internal_turn.then(|| pending.pop_front()).flatten()
+}
+
+async fn settle_team_notification(
+    journal: &mut RuntimeSessionStore,
+    events: &mpsc::Sender<SessionEvent>,
+    session_id: Uuid,
+    prompt: QueuedPrompt,
+) -> Result<()> {
+    debug_assert_eq!(prompt.actor, EventActor::System);
+    if prompt.visible {
+        record_prompt_status(
+            journal,
+            events,
+            session_id,
+            &prompt,
+            MessageStatus::Complete,
+            prompt.delivery,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// An idle root without an active durable goal must not spend provider turns
+/// replying to internal reports. The report remains present in the durable
+/// transcript/subagent projection and becomes context for later turns, but it
+/// cannot seize the boundary from a human or make Escape advance to another
+/// invisible system turn.
+async fn settle_inactive_team_notifications(
+    journal: &mut RuntimeSessionStore,
+    events: &mpsc::Sender<SessionEvent>,
+    session_id: Uuid,
+    pending: &mut VecDeque<QueuedPrompt>,
+) -> Result<()> {
+    let mut retained = VecDeque::with_capacity(pending.len());
+    while let Some(prompt) = pending.pop_front() {
+        if prompt.actor == EventActor::System {
+            settle_team_notification(journal, events, session_id, prompt).await?;
+        } else {
+            retained.push_back(prompt);
+        }
+    }
+    *pending = retained;
+    Ok(())
+}
+
 fn coalesce_queued_prompts(pending: &mut VecDeque<QueuedPrompt>) {
     if pending.is_empty() {
         return;
@@ -2634,6 +2765,31 @@ async fn next_host_command(
     match deferred.pop_front() {
         Some(command) => Some(command),
         None => commands.recv().await,
+    }
+}
+
+fn defer_root_inbox_behind_current_command(
+    deferred: &mut VecDeque<HostCommand>,
+    session_id: Uuid,
+    current: HostCommand,
+    inbox: Vec<TeamInboxMessage>,
+    team_message_ids: &mut HashSet<Uuid>,
+) {
+    // `current` was already selected from the front of the host queue. Put it
+    // back at that exact boundary and append stale internal reports behind all
+    // host input already emitted. Reversing/push_front here was the provenance
+    // bug that let a resumed team report steal the user's provider turn.
+    deferred.push_front(current);
+    for message in inbox {
+        team_message_ids.insert(message.message_id);
+        deferred.push_back(HostCommand::Prompt {
+            session_id,
+            message_id: message.message_id,
+            text: message.text,
+            attachments: Vec::new(),
+            output_schema: None,
+            delivery: message.delivery,
+        });
     }
 }
 
@@ -3755,10 +3911,40 @@ async fn record(
     session_id: Uuid,
     kind: SessionEventKind,
 ) -> Result<()> {
+    let preceding_diagnostics = journal.take_projection_diagnostics();
     let persistence = kind.persistence();
     let event = journal
         .append(SessionEvent::new(session_id, 0, kind))
         .await?;
+    let following_diagnostics = journal.take_projection_diagnostics();
+    for diagnostic in preceding_diagnostics {
+        deliver_recorded_event(
+            events,
+            session_id,
+            diagnostic,
+            crate::EventPersistence::Durable,
+        )
+        .await;
+    }
+    deliver_recorded_event(events, session_id, event, persistence).await;
+    for diagnostic in following_diagnostics {
+        deliver_recorded_event(
+            events,
+            session_id,
+            diagnostic,
+            crate::EventPersistence::Durable,
+        )
+        .await;
+    }
+    Ok(())
+}
+
+async fn deliver_recorded_event(
+    events: &mpsc::Sender<SessionEvent>,
+    session_id: Uuid,
+    event: SessionEvent,
+    persistence: crate::EventPersistence,
+) {
     // The journal is authoritative. Durable lifecycle events get a short,
     // bounded delivery window so a healthy live projection receives terminal
     // boundaries in order, but a detached or wedged observer can never hold
@@ -3788,7 +3974,6 @@ async fn record(
             "dropped ephemeral live session event because the observer is not keeping up"
         );
     }
-    Ok(())
 }
 
 async fn stop(
@@ -3811,6 +3996,7 @@ async fn stop(
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use serde_json::json;
@@ -3960,6 +4146,41 @@ mod tests {
             .unwrap();
         assert_eq!(acknowledged[0].state, crate::DeliveryState::Acknowledged);
 
+        // A coordinator-authored team notification can be mirrored into the
+        // root session after its workspace delivery was already acknowledged.
+        // It is transcript provenance, not a second admission boundary, so it
+        // must never try to move that delivery backwards to Admitted.
+        runtime
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::Message {
+                    message_id,
+                    actor: EventActor::System,
+                    text: "team report".to_string(),
+                    attachments: Vec::new(),
+                    status: MessageStatus::Complete,
+                    delivery: Some(PromptDelivery::Queue),
+                },
+            ))
+            .await
+            .expect("a completed team notification must not regress delivery state");
+        let after_team_report = workspace_store
+            .deliveries_after(binding.workspace_id, binding.participant_id, 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            after_team_report[0].state,
+            crate::DeliveryState::Acknowledged
+        );
+        assert!(!store.read(session_id).await.unwrap().iter().any(|event| {
+            matches!(
+                &event.kind,
+                SessionEventKind::Error { message }
+                    if message.contains("invalid non-monotonic delivery transition")
+            )
+        }));
+
         for event in store.read(session_id).await.unwrap() {
             projection.project(&event).await.unwrap();
         }
@@ -3976,7 +4197,7 @@ mod tests {
             .replay(binding.workspace_id, binding.participant_id, 0, 10)
             .await
             .unwrap();
-        assert_eq!(replay.len(), 4, "repair replay must be idempotent");
+        assert_eq!(replay.len(), 5, "repair replay must be idempotent");
         assert_eq!(replay[1].author_id, human_id);
         assert!(matches!(
             replay[1].kind,
@@ -4011,17 +4232,28 @@ mod tests {
         let mut runtime =
             RuntimeSessionStore::new(store, Vec::new()).with_workspace_projection(projection);
 
-        runtime
-            .append(SessionEvent::new(
-                session_id,
-                0,
-                SessionEventKind::StatusChanged {
-                    status: SessionStatus::Running,
-                    detail: Some("turn phase: awaiting provider".to_string()),
-                },
-            ))
-            .await
-            .expect("repairable projection failure must not fail the source append");
+        let (event_tx, mut event_rx) = mpsc::channel(4);
+        record(
+            &mut runtime,
+            &event_tx,
+            session_id,
+            SessionEventKind::StatusChanged {
+                status: SessionStatus::Running,
+                detail: Some("turn phase: awaiting provider".to_string()),
+            },
+        )
+        .await
+        .expect("repairable projection failure must not fail the source append");
+
+        let projected = event_rx.recv().await.unwrap();
+        let diagnostic = event_rx.recv().await.unwrap();
+        assert_eq!(projected.sequence, 1);
+        assert_eq!(diagnostic.sequence, 2);
+        assert!(matches!(
+            &diagnostic.kind,
+            SessionEventKind::Error { message }
+                if message.contains("workspace projection delivery failed")
+        ));
 
         let durable = session_store.read(session_id).await.unwrap();
         assert!(durable.iter().any(|event| matches!(
@@ -4345,6 +4577,13 @@ mod tests {
 
     struct HungProviderExecutor;
 
+    struct CleanupBarrierExecutor {
+        started: Arc<Notify>,
+        cleanup_started: Arc<Notify>,
+        release_cleanup: Arc<Notify>,
+        cleanup_calls: AtomicUsize,
+    }
+
     #[async_trait::async_trait]
     impl AgentTurnExecutor for HungProviderExecutor {
         async fn execute(
@@ -4354,6 +4593,33 @@ mod tests {
             _controls: Option<mpsc::Receiver<AgentTurnControl>>,
         ) -> Result<AgentTurnResult> {
             std::future::pending().await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentTurnExecutor for CleanupBarrierExecutor {
+        async fn execute(
+            &self,
+            _turn: AgentTurn,
+            events: mpsc::Sender<SessionEventKind>,
+            _controls: Option<mpsc::Receiver<AgentTurnControl>>,
+        ) -> Result<AgentTurnResult> {
+            events
+                .send(SessionEventKind::ReasoningDelta {
+                    text: "provider active".to_string(),
+                })
+                .await
+                .ok();
+            self.started.notify_one();
+            std::future::pending().await
+        }
+
+        async fn stop_session(&self, _session_id: Uuid) -> Result<()> {
+            if self.cleanup_calls.fetch_add(1, Ordering::AcqRel) == 0 {
+                self.cleanup_started.notify_one();
+                self.release_cleanup.notified().await;
+            }
+            Ok(())
         }
     }
 
@@ -4778,7 +5044,27 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        assert_eq!(running.len(), 2, "executor Running events must be filtered");
+        assert_eq!(
+            running.len(),
+            4,
+            "each turn must expose exactly one awaiting and one active phase"
+        );
+        assert_eq!(
+            running
+                .iter()
+                .filter_map(|index| match &observed[*index] {
+                    SessionEventKind::StatusChanged { detail, .. } => detail.as_deref(),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                "turn phase: awaiting provider",
+                "turn phase: provider active",
+                "turn phase: awaiting provider",
+                "turn phase: provider active",
+            ],
+            "executor lifecycle statuses stay filtered while Borg phases remain deterministic"
+        );
         assert_eq!(completed.len(), 2);
         assert_eq!(ready.len(), 1, "executor Ready events must be filtered");
         assert!(
@@ -5325,6 +5611,116 @@ mod tests {
             [None, Some("provider-session".to_string())],
             "interrupting a Codex turn must preserve its provider thread"
         );
+    }
+
+    #[tokio::test]
+    async fn interrupt_timeout_cannot_publish_ready_before_provider_cleanup_finishes() {
+        let root = tempdir().unwrap();
+        let journal_path = root.path().join("session.jsonl");
+        let session_id = Uuid::new_v4();
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let started = Arc::new(Notify::new());
+        let cleanup_started = Arc::new(Notify::new());
+        let release_cleanup = Arc::new(Notify::new());
+        let executor = Arc::new(CleanupBarrierExecutor {
+            started: Arc::clone(&started),
+            cleanup_started: Arc::clone(&cleanup_started),
+            release_cleanup: Arc::clone(&release_cleanup),
+            cleanup_calls: AtomicUsize::new(0),
+        });
+        let actor = tokio::spawn(async move {
+            run_agent_session_with_executor(
+                &journal_path,
+                session_id,
+                LaunchSession {
+                    request_id: Uuid::new_v4(),
+                    cwd: root.path().to_path_buf(),
+                    provider: CodingProvider::Codex,
+                    model: None,
+                    effort: None,
+                    fast: Some(false),
+                    response_language: crate::ResponseLanguage::Auto,
+                    permission_mode: PermissionMode::Manual,
+                    name: None,
+                    initial_prompt: None,
+                    capabilities: Default::default(),
+                    subagent_concurrency_limit: None,
+                    extension_skill_roots: Vec::new(),
+                    team_policy: None,
+                },
+                command_rx,
+                event_tx,
+                executor,
+            )
+            .await
+        });
+
+        command_tx
+            .send(HostCommand::Prompt {
+                session_id,
+                message_id: Uuid::new_v4(),
+                text: "run until interrupted".to_string(),
+                attachments: Vec::new(),
+                output_schema: None,
+                delivery: PromptDelivery::Steer,
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("provider starts");
+        while event_rx.try_recv().is_ok() {}
+
+        command_tx
+            .send(HostCommand::Interrupt { session_id })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(4), cleanup_started.notified())
+            .await
+            .expect("interrupt timeout enters provider cleanup");
+
+        let before_cleanup = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(before_cleanup.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::StatusChanged {
+                status: SessionStatus::Running,
+                detail: Some(detail),
+            } if detail == "turn phase: cancelling"
+        )));
+        assert!(!before_cleanup.iter().any(|event| matches!(
+            event.kind,
+            SessionEventKind::StatusChanged {
+                status: SessionStatus::Ready,
+                ..
+            } | SessionEventKind::TurnCompleted { .. }
+        )));
+
+        release_cleanup.notify_one();
+        let mut saw_turn_completed = false;
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+                .await
+                .expect("terminal event after cleanup")
+                .expect("session remains open");
+            match event.kind {
+                SessionEventKind::TurnCompleted { .. } => saw_turn_completed = true,
+                SessionEventKind::StatusChanged {
+                    status: SessionStatus::Ready,
+                    detail: Some(detail),
+                } if detail == "Interrupted" => {
+                    assert!(saw_turn_completed, "Ready must follow TurnCompleted");
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        command_tx
+            .send(HostCommand::Stop { session_id })
+            .await
+            .unwrap();
+        actor.await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -6246,6 +6642,171 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn crash_reconciled_child_stop_is_durable_before_resumed_ready() {
+        let root = tempdir().unwrap();
+        let session_id = Uuid::new_v4();
+        let child_id = Uuid::new_v4();
+        let cwd = root.path().to_path_buf();
+        let store = Arc::new(
+            crate::SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+                .await
+                .unwrap(),
+        );
+        store.create_session(session_id).await.unwrap();
+        for kind in [
+            SessionEventKind::SessionStarted,
+            SessionEventKind::SessionConfigured {
+                cwd: cwd.clone(),
+                provider: CodingProvider::Codex,
+                model: Some("gpt-test".to_string()),
+                effort: Some("low".to_string()),
+                fast: false,
+                response_language: crate::ResponseLanguage::Auto,
+                permission_mode: PermissionMode::Manual,
+            },
+            SessionEventKind::SubagentActivity {
+                activity: SubagentActivityKind::Updated,
+                agent: crate::SubagentSnapshot {
+                    session_id: child_id,
+                    parent_session_id: session_id,
+                    task_name: "/root/worker".to_string(),
+                    status: crate::SubagentStatus::Running,
+                    provider: CodingProvider::Codex,
+                    model: Some("gpt-test".to_string()),
+                    effort: Some("low".to_string()),
+                    cwd: cwd.clone(),
+                    created_at: chrono::Utc::now(),
+                    updated_at: chrono::Utc::now(),
+                    detail: Some("turn phase: provider active".to_string()),
+                    final_text: None,
+                    usage: Default::default(),
+                },
+                event: None,
+            },
+            SessionEventKind::StatusChanged {
+                status: SessionStatus::Stopped,
+                detail: None,
+            },
+        ] {
+            store
+                .append(SessionEvent::new(session_id, 0, kind))
+                .await
+                .unwrap();
+        }
+        let child_path = root
+            .path()
+            .join("subagents")
+            .join(format!("{child_id}.jsonl"));
+        let mut child_journal = SessionJournal::open(&child_path).unwrap();
+        child_journal
+            .append(SessionEvent::new(
+                child_id,
+                0,
+                SessionEventKind::SessionStarted,
+            ))
+            .unwrap();
+        child_journal
+            .append(SessionEvent::new(
+                child_id,
+                0,
+                SessionEventKind::SessionConfigured {
+                    cwd: cwd.clone(),
+                    provider: CodingProvider::Codex,
+                    model: Some("gpt-test".to_string()),
+                    effort: Some("low".to_string()),
+                    fast: false,
+                    response_language: crate::ResponseLanguage::Auto,
+                    permission_mode: PermissionMode::Manual,
+                },
+            ))
+            .unwrap();
+        child_journal
+            .append(SessionEvent::new(
+                child_id,
+                0,
+                SessionEventKind::StatusChanged {
+                    status: SessionStatus::Stopped,
+                    detail: Some("crash cleanup completed".to_string()),
+                },
+            ))
+            .unwrap();
+
+        let root_journal =
+            SessionJournal::open(root.path().join(format!("{session_id}.jsonl"))).unwrap();
+        let writer = root_journal.acquire_writer().unwrap();
+        let (command_tx, command_rx) = mpsc::channel(2);
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        command_tx
+            .send(HostCommand::Stop { session_id })
+            .await
+            .unwrap();
+        drop(command_tx);
+
+        run_agent_session_with_store_and_writer(
+            root.path(),
+            session_id,
+            LaunchSession {
+                request_id: Uuid::new_v4(),
+                cwd,
+                provider: CodingProvider::Codex,
+                model: Some("gpt-test".to_string()),
+                effort: Some("low".to_string()),
+                fast: Some(false),
+                response_language: crate::ResponseLanguage::Auto,
+                permission_mode: PermissionMode::Manual,
+                name: None,
+                initial_prompt: None,
+                capabilities: Default::default(),
+                subagent_concurrency_limit: None,
+                extension_skill_roots: Vec::new(),
+                team_policy: None,
+            },
+            command_rx,
+            event_tx,
+            Arc::new(LocalAgentTurnExecutor::default()),
+            store,
+            writer,
+        )
+        .await
+        .unwrap();
+
+        let mut observed = Vec::new();
+        while let Some(event) = event_rx.recv().await {
+            observed.push(event);
+        }
+        let correction = observed
+            .iter()
+            .position(|event| {
+                matches!(
+                    &event.kind,
+                    SessionEventKind::SubagentActivity {
+                        activity: SubagentActivityKind::Stopped,
+                        agent,
+                        ..
+                    } if agent.session_id == child_id
+                )
+            })
+            .expect("child terminal correction");
+        let ready = observed
+            .iter()
+            .position(|event| {
+                matches!(
+                    event.kind,
+                    SessionEventKind::StatusChanged {
+                        status: SessionStatus::Ready,
+                        ..
+                    }
+                )
+            })
+            .expect("resumed Ready");
+        assert!(correction < ready);
+        let idle_writer = SessionWriterLease::try_acquire(&child_path)
+            .unwrap()
+            .expect("crash reconciliation must not start the child actor");
+        drop(idle_writer);
+    }
+
+    #[tokio::test]
     async fn initial_mixed_provider_peer_starts_with_isolated_provider_configuration() {
         let root = tempdir().unwrap();
         let session_id = Uuid::new_v4();
@@ -6794,6 +7355,131 @@ mod tests {
         );
         assert!(pending[0].interrupt_batch);
         assert!(!pending[1].interrupt_batch);
+    }
+
+    #[test]
+    fn pending_user_input_always_owns_the_next_turn_boundary() {
+        let prompt = |actor, text: &str| QueuedPrompt {
+            message_id: Uuid::new_v4(),
+            text: text.to_string(),
+            actor,
+            attachments: Vec::new(),
+            output_schema: None,
+            delivery: PromptDelivery::Queue,
+            visible: true,
+            interrupt_batch: actor == EventActor::User,
+        };
+        let mut pending = VecDeque::from([
+            prompt(EventActor::System, "internal report"),
+            prompt(EventActor::User, "human request"),
+        ]);
+
+        let next = pop_next_pending_prompt(&mut pending, true).unwrap();
+
+        assert_eq!(next.actor, EventActor::User);
+        assert_eq!(next.text, "human request");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].actor, EventActor::System);
+    }
+
+    #[test]
+    fn resumed_team_backlog_is_deferred_behind_the_triggering_user_prompt() {
+        let session_id = Uuid::new_v4();
+        let current_user_id = Uuid::new_v4();
+        let already_deferred_id = Uuid::new_v4();
+        let team_ids = [Uuid::new_v4(), Uuid::new_v4()];
+        let prompt = |message_id, text: &str| HostCommand::Prompt {
+            session_id,
+            message_id,
+            text: text.to_string(),
+            attachments: Vec::new(),
+            output_schema: None,
+            delivery: PromptDelivery::Queue,
+        };
+        let mut deferred = VecDeque::from([prompt(already_deferred_id, "next human prompt")]);
+        let inbox = team_ids
+            .into_iter()
+            .map(|message_id| TeamInboxMessage {
+                message_id,
+                text: "Team message from /root/worker:\n\nold report".to_string(),
+                report_text: "old report".to_string(),
+                sender_session_id: Uuid::new_v4(),
+                delivery: PromptDelivery::Queue,
+            })
+            .collect();
+        let mut team_message_ids = HashSet::new();
+
+        defer_root_inbox_behind_current_command(
+            &mut deferred,
+            session_id,
+            prompt(current_user_id, "triggering user prompt"),
+            inbox,
+            &mut team_message_ids,
+        );
+
+        let ordered_ids = deferred
+            .iter()
+            .filter_map(|command| match command {
+                HostCommand::Prompt { message_id, .. } => Some(*message_id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ordered_ids,
+            vec![
+                current_user_id,
+                already_deferred_id,
+                team_ids[0],
+                team_ids[1]
+            ]
+        );
+        assert!(!team_message_ids.contains(&current_user_id));
+        assert!(team_ids.iter().all(|id| team_message_ids.contains(id)));
+    }
+
+    #[tokio::test]
+    async fn inactive_team_reports_settle_without_starting_a_provider_turn() {
+        let root = tempdir().unwrap();
+        let journal = SessionJournal::open(root.path().join("session.jsonl")).unwrap();
+        let store: Arc<dyn SessionStore> = Arc::new(
+            crate::session_store::JsonlSessionStore::from_journal(journal),
+        );
+        let mut runtime = RuntimeSessionStore::new(Arc::clone(&store), Vec::new());
+        let session_id = Uuid::new_v4();
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let mut pending = VecDeque::from([QueuedPrompt {
+            message_id: Uuid::new_v4(),
+            text: "Team message from /root/worker:\n\nfinished".to_string(),
+            actor: EventActor::System,
+            attachments: Vec::new(),
+            output_schema: None,
+            delivery: PromptDelivery::Queue,
+            visible: true,
+            interrupt_batch: false,
+        }]);
+
+        settle_inactive_team_notifications(&mut runtime, &event_tx, session_id, &mut pending)
+            .await
+            .unwrap();
+
+        assert!(pending.is_empty());
+        let event = event_rx.recv().await.unwrap();
+        assert!(matches!(
+            event.kind,
+            SessionEventKind::Message {
+                actor: EventActor::System,
+                status: MessageStatus::Complete,
+                ..
+            }
+        ));
+        assert!(
+            !store
+                .read(session_id)
+                .await
+                .unwrap()
+                .iter()
+                .any(|event| { matches!(event.kind, SessionEventKind::TurnStarted { .. }) })
+        );
     }
 
     #[tokio::test]

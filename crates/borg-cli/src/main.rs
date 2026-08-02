@@ -10,13 +10,15 @@ mod sleep_inhibitor;
 mod terminal_ui;
 mod updater;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use std::fs::{self, OpenOptions};
 use std::sync::Mutex;
 use tracing_subscriber::fmt::writer::BoxMakeWriter;
 
-use crate::cli::{CapabilitiesArgs, Cli, Command, ExtensionsArgs, LocalAgentCliArgs};
+use crate::cli::{
+    CapabilitiesArgs, Cli, Command, ExtensionCommand, ExtensionsArgs, LocalAgentCliArgs,
+};
 use crate::remote_commands::{print_local_workspaces, run_local_agent, run_remote_command};
 
 #[tokio::main]
@@ -85,23 +87,284 @@ async fn doctor(json: bool) -> Result<()> {
 
 fn print_extensions(args: ExtensionsArgs) -> Result<()> {
     let config = agent_config::AgentConfig::load(None)?;
-    let (catalog, _) = extensions::discover(
-        &std::env::current_dir()?,
-        &config.capabilities,
-        config.extensions.allow_project_mcp,
-    )?;
-    if args.json {
-        println!("{}", serde_json::to_string_pretty(&catalog)?);
-    } else {
-        for extension in catalog.extensions {
-            println!(
-                "{} {} — {}",
-                extension.id,
-                extension.version,
-                extension.reason.unwrap_or_else(|| "active".into())
-            );
+    let cwd = std::env::current_dir()?;
+    let discover = || {
+        extensions::discover(
+            &cwd,
+            &config.capabilities,
+            config.extensions.allow_project_mcp,
+        )
+        .map(|(catalog, _)| catalog)
+    };
+    match args.command.unwrap_or(ExtensionCommand::List) {
+        ExtensionCommand::List => print_extension_catalog(&discover()?, args.json)?,
+        ExtensionCommand::Info { id } => {
+            let catalog = discover()?;
+            let extension = catalog
+                .extension(&id)
+                .with_context(|| format!("Blu extension `{id}` is not installed"))?;
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(extension)?);
+            } else {
+                println!("{} {}", extension.name, extension.version);
+                println!("  id: {}", extension.id);
+                println!("  scope: {}", extension.scope.label());
+                println!("  manifest: {}", extension.manifest_path.display());
+                println!(
+                    "  state: {}",
+                    extension.reason.as_deref().unwrap_or(if extension.active {
+                        "active"
+                    } else {
+                        "inactive"
+                    })
+                );
+                if let Some(description) = &extension.description {
+                    println!("  description: {description}");
+                }
+                if !extension.dependencies.is_empty() {
+                    println!("  dependencies:");
+                    for (id, requirement) in &extension.dependencies {
+                        println!("    {id} {requirement}");
+                    }
+                }
+                if !extension.settings.is_empty() {
+                    println!("  settings:");
+                    for (key, value) in &extension.settings {
+                        println!("    {key} = {value}");
+                    }
+                }
+                for root in &extension.skill_roots {
+                    println!("  skill root: {}", root.display());
+                }
+                for server in &extension.servers {
+                    println!("  MCP server: {server}");
+                }
+            }
+        }
+        ExtensionCommand::Doctor => {
+            let catalog = discover()?;
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&catalog)?);
+            } else if catalog.diagnostics.is_empty() {
+                println!(
+                    "Blu is ready · {} installed · {} active · revision {}",
+                    catalog.extensions.len(),
+                    catalog
+                        .extensions
+                        .iter()
+                        .filter(|extension| extension.active)
+                        .count(),
+                    &catalog.revision[..catalog.revision.len().min(12)]
+                );
+            } else {
+                for diagnostic in &catalog.diagnostics {
+                    eprintln!(
+                        "{}: {} — {}",
+                        diagnostic.level.label(),
+                        diagnostic.path.display(),
+                        diagnostic.message
+                    );
+                }
+            }
+            anyhow::ensure!(!catalog.has_errors(), "Blu catalog has errors");
+        }
+        ExtensionCommand::Enable(target) => {
+            let path = extensions::set_enabled(&cwd, &target.id, target.project, true)?;
+            let catalog = discover()?;
+            let extension = catalog
+                .extension(&target.id)
+                .with_context(|| format!("Blu extension `{}` is not installed", target.id))?;
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(extension)?);
+            } else {
+                println!(
+                    "Enabled {} · live state written to {}",
+                    target.id,
+                    path.display()
+                );
+            }
+        }
+        ExtensionCommand::Disable(target) => {
+            let path = extensions::set_enabled(&cwd, &target.id, target.project, false)?;
+            let catalog = discover()?;
+            let extension = catalog
+                .extension(&target.id)
+                .with_context(|| format!("Blu extension `{}` is not installed", target.id))?;
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(extension)?);
+            } else {
+                println!(
+                    "Disabled {} · live state written to {}",
+                    target.id,
+                    path.display()
+                );
+            }
+        }
+        ExtensionCommand::Config(config_args) => {
+            if config_args.unset {
+                anyhow::ensure!(config_args.value.is_none(), "--unset conflicts with VALUE");
+            }
+            if let Some(key) = config_args.key.as_deref() {
+                let value = if config_args.unset {
+                    None
+                } else {
+                    Some(extensions::parse_config_value(
+                        config_args
+                            .value
+                            .as_deref()
+                            .context("VALUE is required unless --unset is used")?,
+                    ))
+                };
+                let path =
+                    extensions::configure(&cwd, &config_args.id, key, value, config_args.project)?;
+                let catalog = discover()?;
+                let extension = catalog.extension(&config_args.id).with_context(|| {
+                    format!(
+                        "setting made extension `{}` invalid; run `borg extensions doctor` and correct or unset it",
+                        config_args.id
+                    )
+                })?;
+                if args.json {
+                    println!("{}", serde_json::to_string_pretty(extension)?);
+                } else {
+                    println!("Configured {}.{key} · {}", config_args.id, path.display());
+                }
+            } else {
+                anyhow::ensure!(
+                    config_args.value.is_none() && !config_args.unset,
+                    "KEY is required when setting or unsetting a value"
+                );
+                let catalog = discover()?;
+                let extension = catalog.extension(&config_args.id).with_context(|| {
+                    format!("Blu extension `{}` is not installed", config_args.id)
+                })?;
+                if args.json {
+                    println!("{}", serde_json::to_string_pretty(&extension.settings)?);
+                } else if extension.settings.is_empty() {
+                    println!("{} has no configured settings.", config_args.id);
+                } else {
+                    for (key, value) in &extension.settings {
+                        println!("{key} = {value}");
+                    }
+                }
+            }
+        }
+        ExtensionCommand::Install(install) => {
+            let id = extensions::install(&cwd, &install.source, install.project, install.force)?;
+            let catalog = discover()?;
+            let extension = catalog
+                .extension(&id)
+                .context("installed extension disappeared")?;
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(extension)?);
+            } else {
+                println!(
+                    "Installed {} {} · {}",
+                    extension.id,
+                    extension.version,
+                    extension
+                        .reason
+                        .as_deref()
+                        .unwrap_or("active at the next turn boundary")
+                );
+            }
+        }
+        ExtensionCommand::Update(update) => {
+            let updated = extensions::update(&cwd, update.id.as_deref(), update.project)?;
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&updated)?);
+            } else if updated.is_empty() {
+                println!("No Git-backed Blu extensions to update.");
+            } else {
+                println!("Updated {}", updated.join(", "));
+            }
+        }
+        ExtensionCommand::Remove(target) => {
+            let removed = extensions::remove(&cwd, &target.id, target.project)?;
+            if args.json {
+                println!(
+                    "{}",
+                    serde_json::json!({"removed": target.id, "path": removed})
+                );
+            } else {
+                println!("Removed {} · {}", target.id, removed.display());
+            }
+        }
+        ExtensionCommand::New(new) => {
+            let path = extensions::scaffold(&cwd, &new.id, &new.version, new.project)?;
+            if args.json {
+                println!("{}", serde_json::json!({"id": new.id, "path": path}));
+            } else {
+                println!("Created {} · {}", new.id, path.display());
+                println!(
+                    "Edit blu.toml and skills/{}/SKILL.md; changes load at the next turn boundary.",
+                    new.id
+                );
+            }
+        }
+        ExtensionCommand::Reload => {
+            let catalog = discover()?;
+            anyhow::ensure!(!catalog.has_errors(), "Blu catalog has errors");
+            let signal = extensions::touch_reload(&cwd)?;
+            if args.json {
+                println!(
+                    "{}",
+                    serde_json::json!({"revision": catalog.revision, "signal": signal})
+                );
+            } else {
+                println!(
+                    "Blu catalog {} validated · running sessions apply it at the next turn boundary",
+                    &catalog.revision[..catalog.revision.len().min(12)]
+                );
+            }
         }
     }
+    Ok(())
+}
+
+fn print_extension_catalog(catalog: &extensions::ExtensionCatalog, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(catalog)?);
+        return Ok(());
+    }
+    println!("Blu extensions");
+    if catalog.extensions.is_empty() {
+        println!("  No extensions installed. Try `borg extensions new <id> --project`.");
+    }
+    for extension in &catalog.extensions {
+        println!(
+            "  {:<20} {:<10} {:<8} {}",
+            extension.id,
+            extension.version,
+            if extension.active {
+                "active"
+            } else {
+                "inactive"
+            },
+            extension
+                .reason
+                .as_deref()
+                .unwrap_or(extension.scope.label())
+        );
+    }
+    for diagnostic in &catalog.diagnostics {
+        println!(
+            "  {}: {} — {}",
+            diagnostic.level.label(),
+            diagnostic.path.display(),
+            diagnostic.message
+        );
+    }
+    println!(
+        "  {} installed · {} active · revision {}",
+        catalog.extensions.len(),
+        catalog
+            .extensions
+            .iter()
+            .filter(|extension| extension.active)
+            .count(),
+        &catalog.revision[..catalog.revision.len().min(12)]
+    );
     Ok(())
 }
 

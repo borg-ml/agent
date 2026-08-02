@@ -12,164 +12,11 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::{
-    EventPersistence, HostCommand, SessionEvent, SessionEventKind, SessionStatus, SessionStore,
-    SessionWriterLease,
+    HostCommand, SessionEvent, SessionEventKind, SessionStatus, SessionStore, SessionWriterLease,
 };
 
 const MAX_CONTROL_COMMAND_BYTES: u64 = 1024 * 1024;
 const ATTACHED_SESSION_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
-
-/// Reconcile an owned session's live projection from its authoritative store.
-///
-/// The actor's bounded event channel is a low-latency wakeup path, not the
-/// source of truth. Durable events are replayed by sequence and coalesced live
-/// state is replayed by revision, so a slow terminal cannot create a permanent
-/// hole merely because an actor-side delivery timed out.
-pub async fn run_owned_session_projection(
-    store: Arc<dyn SessionStore>,
-    session_id: Uuid,
-    mut last_sequence: u64,
-    mut actor_events: mpsc::Receiver<SessionEvent>,
-    events: mpsc::Sender<SessionEvent>,
-) -> Result<()> {
-    let mut refresh = tokio::time::interval(ATTACHED_SESSION_REFRESH_INTERVAL);
-    refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut live_revision = 0_u64;
-    let mut reasoning_snapshot = String::new();
-
-    loop {
-        tokio::select! {
-            actor_event = actor_events.recv() => {
-                let Some(actor_event) = actor_event else {
-                    forward_store_projection(
-                        store.as_ref(),
-                        session_id,
-                        &mut last_sequence,
-                        &mut live_revision,
-                        &mut reasoning_snapshot,
-                        &events,
-                        None,
-                    ).await?;
-                    return Ok(());
-                };
-                match actor_event.kind.persistence() {
-                    EventPersistence::Durable => {
-                        if actor_event.sequence > last_sequence.saturating_add(1) {
-                            tracing::warn!(
-                                %session_id,
-                                delivered_sequence = last_sequence,
-                                notified_sequence = actor_event.sequence,
-                                "recovering a live projection gap from the durable session store"
-                            );
-                        }
-                        forward_store_projection(
-                            store.as_ref(),
-                            session_id,
-                            &mut last_sequence,
-                            &mut live_revision,
-                            &mut reasoning_snapshot,
-                            &events,
-                            Some(actor_event.sequence),
-                        ).await?;
-                        if events.is_closed() {
-                            return Ok(());
-                        }
-                    }
-                    EventPersistence::Coalesced => {
-                        forward_live_projection(
-                            store.as_ref(),
-                            session_id,
-                            &mut live_revision,
-                            &mut reasoning_snapshot,
-                            &events,
-                        ).await?;
-                        if events.is_closed() {
-                            return Ok(());
-                        }
-                    }
-                    EventPersistence::Ephemeral => {
-                        if events.send(actor_event).await.is_err() {
-                            return Ok(());
-                        }
-                    }
-                }
-            }
-            _ = refresh.tick() => {
-                forward_store_projection(
-                    store.as_ref(),
-                    session_id,
-                    &mut last_sequence,
-                    &mut live_revision,
-                    &mut reasoning_snapshot,
-                    &events,
-                    None,
-                ).await?;
-                if events.is_closed() {
-                    return Ok(());
-                }
-            }
-        }
-    }
-}
-
-async fn forward_store_projection(
-    store: &dyn SessionStore,
-    session_id: Uuid,
-    last_sequence: &mut u64,
-    live_revision: &mut u64,
-    reasoning_snapshot: &mut String,
-    events: &mpsc::Sender<SessionEvent>,
-    through_sequence: Option<u64>,
-) -> Result<()> {
-    loop {
-        let durable = store
-            .events_after(session_id, *last_sequence, 1_000)
-            .await?;
-        if durable.is_empty() {
-            break;
-        }
-        for event in durable {
-            *last_sequence = event.sequence;
-            if event.kind.clears_live_turn_state()
-                || event
-                    .kind
-                    .cleared_live_state_keys()
-                    .iter()
-                    .any(|key| key == "reasoning")
-            {
-                reasoning_snapshot.clear();
-            }
-            if events.send(event).await.is_err() {
-                return Ok(());
-            }
-            if through_sequence.is_some_and(|through| *last_sequence >= through) {
-                break;
-            }
-        }
-        if through_sequence.is_some_and(|through| *last_sequence >= through) {
-            break;
-        }
-    }
-    forward_live_projection(store, session_id, live_revision, reasoning_snapshot, events).await
-}
-
-async fn forward_live_projection(
-    store: &dyn SessionStore,
-    session_id: Uuid,
-    live_revision: &mut u64,
-    reasoning_snapshot: &mut String,
-    events: &mpsc::Sender<SessionEvent>,
-) -> Result<()> {
-    for live in store.live_events_after(session_id, *live_revision).await? {
-        *live_revision = (*live_revision).max(live.revision);
-        if let Some(event) = reasoning_delta_from_snapshot(live.event, reasoning_snapshot)
-            && events.send(event).await.is_err()
-        {
-            return Ok(());
-        }
-    }
-    Ok(())
-}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct LocalSessionOwnerMetadata {
@@ -515,13 +362,13 @@ async fn handle_control_connection(
         if command.session_id() != Some(session_id) {
             bail!("command targets a different session");
         }
-        if let HostCommand::Prompt { message_id, .. } = &command {
-            if let Some(admissions) = prompt_admissions.as_ref() {
-                admissions
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .insert(*message_id);
-            }
+        if let HostCommand::Prompt { message_id, .. } = &command
+            && let Some(admissions) = prompt_admissions.as_ref()
+        {
+            admissions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(*message_id);
         }
         commands
             .send(command)
@@ -739,90 +586,8 @@ pub async fn run_attached_session(
 #[cfg(unix)]
 mod tests {
     use super::*;
-    use crate::{PromptDelivery, SessionJournal, SqliteSessionStore};
+    use crate::{PromptDelivery, SessionJournal};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    #[tokio::test]
-    async fn owned_projection_recovers_missed_durable_and_live_events_from_store() {
-        let root = tempfile::tempdir().unwrap();
-        let session_id = Uuid::new_v4();
-        let store = Arc::new(
-            SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
-                .await
-                .unwrap(),
-        );
-        store.create_session(session_id).await.unwrap();
-        let started = store
-            .append(SessionEvent::new(
-                session_id,
-                0,
-                SessionEventKind::SessionStarted,
-            ))
-            .await
-            .unwrap();
-        let missed = store
-            .append(SessionEvent::new(
-                session_id,
-                0,
-                SessionEventKind::StatusChanged {
-                    status: SessionStatus::Ready,
-                    detail: None,
-                },
-            ))
-            .await
-            .unwrap();
-        store
-            .append(SessionEvent::new(
-                session_id,
-                0,
-                SessionEventKind::ContextWindowUpdated {
-                    context_tokens: 40,
-                    context_window_tokens: 100,
-                },
-            ))
-            .await
-            .unwrap();
-        let later = store
-            .append(SessionEvent::new(
-                session_id,
-                0,
-                SessionEventKind::StatusChanged {
-                    status: SessionStatus::Running,
-                    detail: None,
-                },
-            ))
-            .await
-            .unwrap();
-
-        let (actor_tx, actor_rx) = mpsc::channel(1);
-        let (event_tx, mut event_rx) = mpsc::channel(4);
-        let projection_store: Arc<dyn SessionStore> = store;
-        let projection = tokio::spawn(run_owned_session_projection(
-            projection_store,
-            session_id,
-            started.sequence,
-            actor_rx,
-            event_tx,
-        ));
-        actor_tx.send(later.clone()).await.unwrap();
-
-        let first = event_rx.recv().await.unwrap();
-        let second = event_rx.recv().await.unwrap();
-        let live = event_rx.recv().await.unwrap();
-        assert_eq!(first.sequence, missed.sequence);
-        assert_eq!(second.sequence, later.sequence);
-        assert_eq!(live.sequence, 0);
-        assert!(matches!(
-            live.kind,
-            SessionEventKind::ContextWindowUpdated {
-                context_tokens: 40,
-                context_window_tokens: 100,
-            }
-        ));
-
-        drop(actor_tx);
-        projection.await.unwrap().unwrap();
-    }
 
     #[tokio::test]
     async fn owner_metadata_prevents_silent_attachment_to_an_obsolete_binary() {

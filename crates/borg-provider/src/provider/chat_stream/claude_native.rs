@@ -2052,6 +2052,8 @@ mod live_runner {
     fn request(prompt: &str, workspace: &Path) -> ChatStreamRequest {
         ChatStreamRequest {
             prompt: prompt.to_string(),
+            owner_session_id: None,
+            client_user_message_id: None,
             attachments: Vec::new(),
             model: None,
             effort: Some("low".to_string()),

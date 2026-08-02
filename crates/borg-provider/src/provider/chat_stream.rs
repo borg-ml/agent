@@ -3,12 +3,13 @@
 use crate::{ProviderAuthBundle, ProviderAuthProvider, ProviderChannel};
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{
-    Arc, Mutex,
+    Arc, Condvar, Mutex,
     atomic::{AtomicBool, Ordering},
     mpsc as std_mpsc,
 };
@@ -17,7 +18,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
-use super::codex_app_server::{CodexAppServerClient, JsonRpcMessage};
+use super::codex_app_server::{CodexAppServerClient, CodexTurnInput, JsonRpcMessage};
 mod claude_native;
 mod claude_stream;
 mod codex_items;
@@ -39,6 +40,7 @@ use codex_items::*;
 use codex_stream::{CodexStreamMapper, codex_turn_usage};
 
 const CODEX_PREWARM_TIMEOUT: Duration = Duration::from_secs(45);
+const CODEX_FORCE_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 
 struct CancelCodexWorkerOnDrop(Arc<AtomicBool>);
 
@@ -186,6 +188,12 @@ impl fmt::Debug for ChatGitCredential {
 #[derive(Debug, Clone)]
 pub struct ChatStreamRequest {
     pub prompt: String,
+    /// Borg session that owns this provider worker. Local pools use it to
+    /// synchronously reap a worker before the session may report Ready.
+    pub owner_session_id: Option<String>,
+    /// Durable Borg message identity forwarded to providers that support
+    /// client-correlated user messages.
+    pub client_user_message_id: Option<String>,
     /// Provider-native local files/images attached to this user turn.
     pub attachments: Vec<PathBuf>,
     pub model: Option<String>,
@@ -353,10 +361,134 @@ pub fn run_codex_local_chat_stream(
 #[derive(Clone, Default)]
 pub struct CodexAppServerPool {
     inner: Arc<Mutex<Option<PooledCodexAppServer>>>,
-    prewarm: Arc<Mutex<Option<std_mpsc::Receiver<Result<CodexAppServerClient>>>>>,
+    prewarm: Arc<Mutex<Option<CodexPrewarm>>>,
+    active: Arc<Mutex<HashMap<String, CodexActiveWorker>>>,
+}
+
+struct CodexPrewarm {
+    receiver: std_mpsc::Receiver<Result<CodexAppServerClient>>,
+    cancellation: Arc<AtomicBool>,
+    completed: Arc<(Mutex<bool>, Condvar)>,
+}
+
+struct CodexPrewarmCompletion(Arc<(Mutex<bool>, Condvar)>);
+
+impl Drop for CodexPrewarmCompletion {
+    fn drop(&mut self) {
+        let (completed, wake) = &*self.0;
+        *completed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        wake.notify_all();
+    }
+}
+
+#[derive(Clone)]
+struct CodexActiveWorker {
+    cancellation: Arc<AtomicBool>,
+    completed: Arc<(Mutex<bool>, Condvar)>,
+}
+
+struct CodexActiveWorkerGuard {
+    owner_session_id: String,
+    active: Arc<Mutex<HashMap<String, CodexActiveWorker>>>,
+    cancellation: Arc<AtomicBool>,
+    completed: Arc<(Mutex<bool>, Condvar)>,
+    pooled: Arc<Mutex<Option<PooledCodexAppServer>>>,
+}
+
+impl Drop for CodexActiveWorkerGuard {
+    fn drop(&mut self) {
+        if self.cancellation.load(Ordering::Acquire) {
+            let stale = {
+                let mut pooled = self
+                    .pooled
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if pooled.as_ref().is_some_and(|pooled| {
+                    pooled.owner_session_id.as_deref() == Some(self.owner_session_id.as_str())
+                }) {
+                    pooled.take()
+                } else {
+                    None
+                }
+            };
+            // Dropping the client terminates its process group. Do this before
+            // publishing the completion acknowledgement consumed by Escape.
+            drop(stale);
+        }
+        let (completed, wake) = &*self.completed;
+        *completed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        wake.notify_all();
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if active
+            .get(&self.owner_session_id)
+            .is_some_and(|worker| Arc::ptr_eq(&worker.completed, &self.completed))
+        {
+            active.remove(&self.owner_session_id);
+        }
+    }
 }
 
 impl CodexAppServerPool {
+    fn register_active_worker(
+        &self,
+        owner_session_id: String,
+        cancellation: Arc<AtomicBool>,
+    ) -> CodexActiveWorkerGuard {
+        let completed = Arc::new((Mutex::new(false), Condvar::new()));
+        self.active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(
+                owner_session_id.clone(),
+                CodexActiveWorker {
+                    cancellation: Arc::clone(&cancellation),
+                    completed: Arc::clone(&completed),
+                },
+            );
+        CodexActiveWorkerGuard {
+            owner_session_id,
+            active: Arc::clone(&self.active),
+            cancellation,
+            completed,
+            pooled: Arc::clone(&self.inner),
+        }
+    }
+
+    /// Force the active provider worker for one Borg session to terminate and
+    /// wait until its app-server process tree has been reaped.
+    pub fn stop_owner(&self, owner_session_id: &str) -> Result<()> {
+        let worker = self
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(owner_session_id)
+            .cloned();
+        let Some(worker) = worker else {
+            return Ok(());
+        };
+        worker.cancellation.store(true, Ordering::Release);
+        let (completed, wake) = &*worker.completed;
+        let completed = completed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (completed, _timeout) = wake
+            .wait_timeout_while(completed, CODEX_FORCE_STOP_TIMEOUT, |completed| !*completed)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        anyhow::ensure!(
+            *completed,
+            "Codex provider worker for Borg session {owner_session_id} did not finish process-tree cleanup within {} ms",
+            CODEX_FORCE_STOP_TIMEOUT.as_millis()
+        );
+        Ok(())
+    }
+
     pub fn prewarm_local(&self, web_search_allowed: bool) {
         if self
             .inner
@@ -374,15 +506,29 @@ impl CodexAppServerPool {
             return;
         }
         let (tx, rx) = std_mpsc::sync_channel(1);
-        *prewarm = Some(rx);
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let completed = Arc::new((Mutex::new(false), Condvar::new()));
+        *prewarm = Some(CodexPrewarm {
+            receiver: rx,
+            cancellation: Arc::clone(&cancellation),
+            completed: Arc::clone(&completed),
+        });
         tracing::debug!(
             target: "borg_ttft",
             stage = "codex_prewarm_started",
             "Codex startup stage"
         );
         std::thread::spawn(move || {
+            let _completion = CodexPrewarmCompletion(completed);
             let started_at = Instant::now();
-            let result = CodexAppServerClient::start(true, web_search_allowed, None, false, &[]);
+            let result = CodexAppServerClient::start_with_cancellation(
+                true,
+                web_search_allowed,
+                None,
+                false,
+                &[],
+                Some(cancellation),
+            );
             tracing::debug!(
                 target: "borg_ttft",
                 stage = "codex_prewarm_finished",
@@ -395,7 +541,7 @@ impl CodexAppServerPool {
     }
 
     fn take_prewarmed(&self, cancellation: &AtomicBool) -> Option<Result<CodexAppServerClient>> {
-        let receiver = self
+        let prewarm = self
             .prewarm
             .lock()
             .expect("Codex app-server prewarm lock poisoned")
@@ -403,18 +549,27 @@ impl CodexAppServerPool {
         let deadline = Instant::now() + CODEX_PREWARM_TIMEOUT;
         loop {
             if cancellation.load(Ordering::Acquire) {
+                if let Err(error) = Self::cancel_and_join_prewarm(&prewarm) {
+                    return Some(Err(error));
+                }
                 return Some(Err(anyhow!(
                     "Codex app-server prewarm cancelled with its owning turn"
                 )));
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
+                if let Err(error) = Self::cancel_and_join_prewarm(&prewarm) {
+                    return Some(Err(error));
+                }
                 return Some(Err(anyhow!(
                     "Codex app-server prewarm timed out after {} ms",
                     CODEX_PREWARM_TIMEOUT.as_millis()
                 )));
             }
-            match receiver.recv_timeout(remaining.min(Duration::from_millis(50))) {
+            match prewarm
+                .receiver
+                .recv_timeout(remaining.min(Duration::from_millis(50)))
+            {
                 Ok(result) => return Some(result),
                 Err(std_mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(std_mpsc::RecvTimeoutError::Disconnected) => {
@@ -424,6 +579,23 @@ impl CodexAppServerPool {
                 }
             }
         }
+    }
+
+    fn cancel_and_join_prewarm(prewarm: &CodexPrewarm) -> Result<()> {
+        prewarm.cancellation.store(true, Ordering::Release);
+        let (completed, wake) = &*prewarm.completed;
+        let completed = completed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (completed, _timeout) = wake
+            .wait_timeout_while(completed, CODEX_FORCE_STOP_TIMEOUT, |completed| !*completed)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        anyhow::ensure!(
+            *completed,
+            "Codex app-server prewarm did not finish process-tree cleanup within {} ms",
+            CODEX_FORCE_STOP_TIMEOUT.as_millis()
+        );
+        Ok(())
     }
 
     pub fn compact(&self, thread_id: &str) -> Result<()> {
@@ -445,6 +617,7 @@ impl CodexAppServerPool {
 struct PooledCodexAppServer {
     client: CodexAppServerClient,
     key: CodexAppServerKey,
+    owner_session_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -473,9 +646,24 @@ fn run_codex_stream(
     pool: Option<CodexAppServerPool>,
 ) -> mpsc::Receiver<ChatStreamEvent> {
     let (tx, rx) = mpsc::channel::<ChatStreamEvent>(64);
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let active_worker_guard = pool.as_ref().and_then(|pool| {
+        req.owner_session_id.as_ref().map(|owner_session_id| {
+            pool.register_active_worker(owner_session_id.clone(), Arc::clone(&cancellation))
+        })
+    });
+    let cancel_closed_stream = Arc::clone(&cancellation);
     tokio::spawn(async move {
-        let provider =
-            run_codex_app_server_inner(req, tx.clone(), control_rx, local_auth, permission, pool);
+        let provider = run_codex_app_server_inner(
+            req,
+            tx.clone(),
+            control_rx,
+            local_auth,
+            permission,
+            pool,
+            cancellation,
+            active_worker_guard,
+        );
         tokio::pin!(provider);
         tokio::select! {
             result = &mut provider => {
@@ -489,6 +677,10 @@ fn run_codex_stream(
             }
             _ = tx.closed() => {
                 tracing::debug!("Codex stream receiver closed; cancelling provider worker");
+                cancel_closed_stream.store(true, Ordering::Release);
+                if let Err(err) = provider.await {
+                    tracing::debug!(?err, "cancelled Codex provider worker finished cleanup");
+                }
             }
         }
     });
@@ -1189,6 +1381,8 @@ async fn run_codex_app_server_inner(
     local_auth: bool,
     permission: LocalAgentPermission,
     pool: Option<CodexAppServerPool>,
+    cancellation: Arc<AtomicBool>,
+    active_worker_guard: Option<CodexActiveWorkerGuard>,
 ) -> Result<()> {
     // Codex only supports the `Direct` channel today. When OpenAI's
     // self-serve ZDR path lands (or when we wire up Azure OpenAI's
@@ -1212,9 +1406,12 @@ async fn run_codex_app_server_inner(
             );
         }
     }
-    let cancellation = Arc::new(AtomicBool::new(false));
     let _cancel_worker_on_drop = CancelCodexWorkerOnDrop(Arc::clone(&cancellation));
     tokio::task::spawn_blocking(move || -> Result<()> {
+        // Declared before the client so this guard is dropped last. Its
+        // completion signal therefore means any cancelled app-server process
+        // tree has already been killed and reaped.
+        let _active_worker_guard = active_worker_guard;
         let started_at = Instant::now();
         let mut control_rx = control_rx;
         let provider_home = tempfile::tempdir().context("failed to create Codex provider home")?;
@@ -1282,6 +1479,7 @@ async fn run_codex_app_server_inner(
         });
         let can_reuse = pooled.as_ref().is_some_and(|pooled| {
             pooled.key == pool_key
+                && pooled.owner_session_id == req.owner_session_id
                 && req.session_id.as_deref().is_some_and(|session_id| {
                     pooled.client.workspace_id() == Some(session_id)
                 })
@@ -1454,13 +1652,22 @@ async fn run_codex_app_server_inner(
             return Ok(());
         }
 
+        if can_reuse {
+            client
+                .settle_pooled_thread_before_input()
+                .context("failed to establish an idle pooled Codex thread")?;
+        }
+
         let result = if let Some(result) = resumed_turn_result {
             result
         } else {
             client
                 .turn_execute_streaming_with_schema_steering_and_attachments(
-                    &turn_prompt,
-                    &req.attachments,
+                    CodexTurnInput {
+                        prompt: &turn_prompt,
+                        attachments: &req.attachments,
+                        client_user_message_id: req.client_user_message_id.as_deref(),
+                    },
                     &working_directory,
                     req.output_schema.as_ref(),
                     control_rx.as_mut(),
@@ -1472,12 +1679,27 @@ async fn run_codex_app_server_inner(
             return Ok(());
         }
         if let Some(pool) = pool.as_ref() {
+            // `turn/completed` is not enough to establish Borg's Ready
+            // boundary: a provider extension can start another turn from its
+            // idle hook. Reconcile the bounded live turn page and stop any
+            // unowned continuation before transferring this client to the
+            // idle pool.
+            client
+                .settle_pooled_thread_before_input()
+                .context("failed to establish an idle Codex thread after turn completion")?;
+            if cancellation.load(Ordering::Acquire) {
+                return Ok(());
+            }
             client.detach_cancellation();
             *pool
                 .inner
                 .lock()
                 .expect("Codex app-server pool lock poisoned") =
-                Some(PooledCodexAppServer { client, key: pool_key });
+                Some(PooledCodexAppServer {
+                    client,
+                    key: pool_key,
+                    owner_session_id: req.owner_session_id.clone(),
+                });
         } else if let Err(error) = client.shutdown() {
             tracing::warn!(?error, "failed to shut down codex app-server after streamed turn");
         }
@@ -2095,6 +2317,72 @@ mod tests {
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    #[test]
+    fn stopping_an_owner_waits_for_provider_cleanup_acknowledgement() {
+        let pool = CodexAppServerPool::default();
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let guard = pool.register_active_worker("session-1".to_string(), Arc::clone(&cancellation));
+        let cleanup_finished = Arc::new(AtomicBool::new(false));
+        let cleanup_finished_worker = Arc::clone(&cleanup_finished);
+        let worker = std::thread::spawn(move || {
+            while !cancellation.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            std::thread::sleep(Duration::from_millis(25));
+            cleanup_finished_worker.store(true, Ordering::Release);
+            drop(guard);
+        });
+
+        pool.stop_owner("session-1")
+            .expect("stop waits for provider cleanup");
+        assert!(cleanup_finished.load(Ordering::Acquire));
+        worker.join().expect("cleanup worker");
+        assert!(
+            !pool
+                .active
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains_key("session-1")
+        );
+    }
+
+    #[test]
+    fn cancelling_a_turn_joins_an_inflight_codex_prewarm() {
+        let pool = CodexAppServerPool::default();
+        let (tx, receiver) = std_mpsc::sync_channel(1);
+        let prewarm_cancellation = Arc::new(AtomicBool::new(false));
+        let completed = Arc::new((Mutex::new(false), Condvar::new()));
+        *pool.prewarm.lock().expect("Codex prewarm lock") = Some(CodexPrewarm {
+            receiver,
+            cancellation: Arc::clone(&prewarm_cancellation),
+            completed: Arc::clone(&completed),
+        });
+        let cleanup_finished = Arc::new(AtomicBool::new(false));
+        let cleanup_finished_worker = Arc::clone(&cleanup_finished);
+        let worker = std::thread::spawn(move || {
+            let _completion = CodexPrewarmCompletion(completed);
+            while !prewarm_cancellation.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            std::thread::sleep(Duration::from_millis(25));
+            cleanup_finished_worker.store(true, Ordering::Release);
+            let _ = tx.send(Err(anyhow!("cancelled test prewarm")));
+        });
+        let owner_cancellation = AtomicBool::new(true);
+
+        let error = match pool
+            .take_prewarmed(&owner_cancellation)
+            .expect("prewarm existed")
+        {
+            Ok(_) => panic!("owner cancellation must reject the prewarm"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("cancelled with its owning turn"));
+        assert!(cleanup_finished.load(Ordering::Acquire));
+        worker.join().expect("prewarm worker");
+    }
+
     struct TestEnvGuard {
         key: &'static str,
         previous: Option<String>,
@@ -2122,6 +2410,8 @@ mod tests {
     fn test_claude_request(workspace: &Path) -> ChatStreamRequest {
         ChatStreamRequest {
             prompt: "hello".to_string(),
+            owner_session_id: None,
+            client_user_message_id: None,
             attachments: Vec::new(),
             model: Some("test-model".to_string()),
             effort: Some("medium".to_string()),

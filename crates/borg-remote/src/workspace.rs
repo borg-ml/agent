@@ -614,28 +614,46 @@ impl SqliteWorkspaceStore {
         recipient_id: Uuid,
         limit: usize,
     ) -> Result<Vec<(WorkspaceEvent, RecipientDelivery)>> {
-        let deliveries =
-            <Self as WorkspaceStore>::deliveries_after(self, workspace_id, recipient_id, 0, limit)
-                .await?;
-        let mut result = Vec::with_capacity(deliveries.len());
-        for delivery in deliveries {
-            if delivery.state != DeliveryState::Pending {
-                continue;
-            }
-            let event_json: Option<String> = sqlx::query_scalar(
-                "select event_json from workspace_events where workspace_id=? and sequence=?",
-            )
-            .bind(workspace_id.to_string())
-            .bind(i64::try_from(delivery.sequence)?)
-            .fetch_optional(&self.pool)
-            .await?;
-            let Some(event_json) = event_json else {
-                continue;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        // Session projections also create workspace deliveries and normally
+        // remain pending forever. Keep the message bit on the delivery row so
+        // this 50 ms inbox poll can seek directly to the pending-message
+        // intersection instead of scanning either all recipient deliveries or
+        // every settled workspace message.
+        let rows = sqlx::query(
+            "select d.sequence,d.recipient_id,d.mode,d.state,d.attempts,d.last_attempt_json,e.event_json \
+             from workspace_deliveries d indexed by idx_workspace_pending_message_deliveries \
+             join workspace_events e \
+               on e.workspace_id=d.workspace_id and e.sequence=d.sequence \
+             where d.workspace_id=? and d.recipient_id=? \
+               and d.is_message=1 and d.state='\"pending\"' \
+             order by d.sequence limit ?",
+        )
+        .bind(workspace_id.to_string())
+        .bind(recipient_id.to_string())
+        .bind(i64::try_from(limit)?)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut result = Vec::with_capacity(rows.len());
+        for row in rows {
+            let sequence = u64::try_from(row.get::<i64, _>("sequence"))?;
+            let event_json: String = row.get("event_json");
+            let event = serde_json::from_str(&event_json)?;
+            let delivery = RecipientDelivery {
+                workspace_id,
+                sequence,
+                recipient_id: Uuid::parse_str(row.get("recipient_id"))?,
+                mode: serde_json::from_str(row.get("mode"))?,
+                state: serde_json::from_str(row.get("state"))?,
+                attempts: u32::try_from(row.get::<i64, _>("attempts"))?,
+                last_attempt: row
+                    .get::<Option<String>, _>("last_attempt_json")
+                    .map(|value| serde_json::from_str(&value))
+                    .transpose()?,
             };
-            let event: WorkspaceEvent = serde_json::from_str(&event_json)?;
-            if matches!(event.kind, WorkspaceEventKind::Message { .. }) {
-                result.push((event, delivery));
-            }
+            result.push((event, delivery));
         }
         Ok(result)
     }
@@ -652,11 +670,46 @@ impl SqliteWorkspaceStore {
       create table if not exists workspace_work_items (workspace_id text not null references workspaces(id) on delete cascade, work_id text not null, created_sequence integer not null, primary key(workspace_id,work_id));
       create table if not exists workspace_work_claims (workspace_id text not null references workspaces(id) on delete cascade, work_id text not null, claim_id text not null, claimant_id text not null references workspace_participants(id), sequence integer not null, primary key(workspace_id,work_id));
       create table if not exists workspace_work_dependencies (workspace_id text not null references workspaces(id) on delete cascade, work_id text not null, depends_on_work_id text not null, sequence integer not null, primary key(workspace_id,work_id,depends_on_work_id));
-      create table if not exists workspace_deliveries (workspace_id text not null, sequence integer not null, recipient_id text not null references workspace_participants(id), mode text not null, state text not null, attempts integer not null default 0, last_attempt_json text, primary key(workspace_id,sequence,recipient_id), foreign key(workspace_id,sequence) references workspace_events(workspace_id,sequence) on delete cascade);
+      create table if not exists workspace_deliveries (workspace_id text not null, sequence integer not null, recipient_id text not null references workspace_participants(id), mode text not null, state text not null, attempts integer not null default 0, last_attempt_json text, is_message integer not null default 0, primary key(workspace_id,sequence,recipient_id), foreign key(workspace_id,sequence) references workspace_events(workspace_id,sequence) on delete cascade);
       create table if not exists workspace_presence_leases (workspace_id text not null references workspaces(id) on delete cascade, participant_id text not null references workspace_participants(id), client_id text not null, host_id text, expires_at text not null, primary key(workspace_id,participant_id,client_id));
       create index if not exists idx_workspace_delivery_recipient on workspace_deliveries(workspace_id,recipient_id,sequence);
       create index if not exists idx_workspace_events_id on workspace_events(workspace_id,id);
+      create index if not exists idx_workspace_events_messages on workspace_events(workspace_id,sequence) where json_extract(event_json, '$.kind.type')='message';
     "#).execute(&self.pool).await?;
+        let columns = sqlx::query("pragma table_info(workspace_deliveries)")
+            .fetch_all(&self.pool)
+            .await?;
+        if !columns
+            .iter()
+            .any(|column| column.get::<String, _>("name") == "is_message")
+        {
+            let mut tx = self.write().await?;
+            sqlx::query(
+                "alter table workspace_deliveries \
+                 add column is_message integer not null default 0",
+            )
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "update workspace_deliveries set is_message=1 \
+                 where exists( \
+                   select 1 from workspace_events e \
+                   where e.workspace_id=workspace_deliveries.workspace_id \
+                     and e.sequence=workspace_deliveries.sequence \
+                     and json_extract(e.event_json, '$.kind.type')='message' \
+                 )",
+            )
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+        }
+        sqlx::raw_sql(
+            r#"create index if not exists idx_workspace_pending_message_deliveries
+               on workspace_deliveries(workspace_id,recipient_id,sequence)
+               where is_message=1 and state='"pending"';"#,
+        )
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
     async fn members(
@@ -1026,8 +1079,9 @@ impl WorkspaceStore for SqliteWorkspaceStore {
                 .execute(&mut *tx)
                 .await?;
         }
+        let is_message = matches!(&e.kind, WorkspaceEventKind::Message { .. });
         for recipient in recipients {
-            sqlx::query("insert into workspace_deliveries(workspace_id,sequence,recipient_id,mode,state) values(?,?,?,?,?)").bind(e.workspace_id.to_string()).bind(seq).bind(recipient.to_string()).bind(serde_json::to_string(&mode)?).bind(serde_json::to_string(&DeliveryState::Pending)?).execute(&mut *tx).await?;
+            sqlx::query("insert into workspace_deliveries(workspace_id,sequence,recipient_id,mode,state,is_message) values(?,?,?,?,?,?)").bind(e.workspace_id.to_string()).bind(seq).bind(recipient.to_string()).bind(serde_json::to_string(&mode)?).bind(serde_json::to_string(&DeliveryState::Pending)?).bind(is_message).execute(&mut *tx).await?;
         }
         tx.commit().await?;
         Ok(e)
@@ -1513,6 +1567,258 @@ mod tests {
             DeliveryState::Recalled
         );
         assert_ne!(message_id, Uuid::nil());
+    }
+
+    #[tokio::test]
+    async fn pending_message_limit_ignores_older_non_message_deliveries() {
+        let (store, workspace, author, recipient, _) = fixture().await;
+        store
+            .append(WorkspaceEvent {
+                id: Uuid::new_v4(),
+                workspace_id: workspace.id,
+                sequence: 0,
+                author_id: author.id,
+                idempotency_key: "older-session-event".into(),
+                created_at: Utc::now(),
+                kind: WorkspaceEventKind::SessionEvent {
+                    session_id: Uuid::new_v4(),
+                    session_event_id: Uuid::new_v4(),
+                    session_sequence: 1,
+                    mode: DeliveryMode::Notify,
+                },
+            })
+            .await
+            .unwrap();
+        let message = store
+            .append(event(
+                workspace.id,
+                author.id,
+                Audience::Direct {
+                    participant: recipient.id,
+                },
+                "newer-message",
+            ))
+            .await
+            .unwrap();
+        let pending = store
+            .pending_message_events(workspace.id, recipient.id, 1)
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].0.id, message.id);
+        assert_eq!(pending[0].1.sequence, message.sequence);
+    }
+
+    #[tokio::test]
+    async fn pending_message_limit_ignores_older_settled_messages() {
+        let (store, workspace, author, recipient, _) = fixture().await;
+        let settled = store
+            .append(event(
+                workspace.id,
+                author.id,
+                Audience::Direct {
+                    participant: recipient.id,
+                },
+                "settled-message",
+            ))
+            .await
+            .unwrap();
+        store
+            .transition_delivery(
+                workspace.id,
+                settled.sequence,
+                recipient.id,
+                DeliveryState::Admitted,
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .transition_delivery(
+                workspace.id,
+                settled.sequence,
+                recipient.id,
+                DeliveryState::Acknowledged,
+                None,
+            )
+            .await
+            .unwrap();
+        let pending_message = store
+            .append(event(
+                workspace.id,
+                author.id,
+                Audience::Direct {
+                    participant: recipient.id,
+                },
+                "pending-message",
+            ))
+            .await
+            .unwrap();
+
+        let pending = store
+            .pending_message_events(workspace.id, recipient.id, 1)
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].0.id, pending_message.id);
+        assert_eq!(pending[0].1.sequence, pending_message.sequence);
+    }
+
+    #[tokio::test]
+    async fn failed_message_retry_reappears_without_a_new_workspace_event() {
+        let (store, workspace, author, recipient, _) = fixture().await;
+        let message = store
+            .append(event(
+                workspace.id,
+                author.id,
+                Audience::Direct {
+                    participant: recipient.id,
+                },
+                "retry-message",
+            ))
+            .await
+            .unwrap();
+        store
+            .transition_delivery(
+                workspace.id,
+                message.sequence,
+                recipient.id,
+                DeliveryState::Failed,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .pending_message_events(workspace.id, recipient.id, 1)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        store
+            .transition_delivery(
+                workspace.id,
+                message.sequence,
+                recipient.id,
+                DeliveryState::Pending,
+                None,
+            )
+            .await
+            .unwrap();
+        let pending = store
+            .pending_message_events(workspace.id, recipient.id, 1)
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].0.id, message.id);
+        assert_eq!(pending[0].1.state, DeliveryState::Pending);
+    }
+
+    #[tokio::test]
+    async fn pending_message_query_seeks_the_delivery_intersection_index() {
+        let (store, workspace, _, recipient, _) = fixture().await;
+        let rows = sqlx::query(
+            "explain query plan \
+             select d.sequence,d.recipient_id,d.mode,d.state,d.attempts,d.last_attempt_json,e.event_json \
+             from workspace_deliveries d indexed by idx_workspace_pending_message_deliveries \
+             join workspace_events e \
+               on e.workspace_id=d.workspace_id and e.sequence=d.sequence \
+             where d.workspace_id=? and d.recipient_id=? \
+               and d.is_message=1 and d.state='\"pending\"' \
+             order by d.sequence limit ?",
+        )
+        .bind(workspace.id.to_string())
+        .bind(recipient.id.to_string())
+        .bind(10_i64)
+        .fetch_all(store.pool())
+        .await
+        .unwrap();
+        let plan = rows
+            .iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            plan.contains("idx_workspace_pending_message_deliveries"),
+            "unexpected query plan: {plan}"
+        );
+    }
+
+    #[tokio::test]
+    async fn existing_workspace_store_backfills_the_message_delivery_bit() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let opts = SqliteConnectOptions::from_str(&format!("sqlite://{}", file.path().display()))
+            .unwrap()
+            .journal_mode(SqliteJournalMode::Wal)
+            .foreign_keys(false);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await
+            .unwrap();
+        sqlx::raw_sql(
+            r#"
+            create table workspace_events (
+              workspace_id text not null,
+              sequence integer not null,
+              id text not null,
+              author_id text not null,
+              idempotency_key text not null,
+              canonical_json text not null,
+              event_json text not null,
+              created_at text not null,
+              primary key(workspace_id,sequence)
+            );
+            create table workspace_deliveries (
+              workspace_id text not null,
+              sequence integer not null,
+              recipient_id text not null,
+              mode text not null,
+              state text not null,
+              attempts integer not null default 0,
+              last_attempt_json text,
+              primary key(workspace_id,sequence,recipient_id)
+            );
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("insert into workspace_events values(?,?,?,?,?,?,?,?)")
+            .bind("workspace")
+            .bind(1_i64)
+            .bind("event")
+            .bind("author")
+            .bind("key")
+            .bind("{}")
+            .bind(r#"{"kind":{"type":"message"}}"#)
+            .bind(Utc::now().to_rfc3339())
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("insert into workspace_deliveries values(?,?,?,?,?,?,?)")
+            .bind("workspace")
+            .bind(1_i64)
+            .bind("recipient")
+            .bind(r#""notify""#)
+            .bind(r#""pending""#)
+            .bind(0_i64)
+            .bind(Option::<String>::None)
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+
+        let store = SqliteWorkspaceStore::open(file.path()).await.unwrap();
+        let is_message: i64 = sqlx::query_scalar(
+            "select is_message from workspace_deliveries \
+             where workspace_id='workspace' and sequence=1 and recipient_id='recipient'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(is_message, 1);
     }
 
     #[tokio::test]

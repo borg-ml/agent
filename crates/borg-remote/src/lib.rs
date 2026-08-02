@@ -36,14 +36,14 @@ pub use command::execute_workspace_command;
 pub use contract::*;
 pub use filesystem::execute_workspace_filesystem;
 pub use host::{
-    HostConfig, default_host_config_path, enroll_host, login_provider, mirror_local_session,
-    probe_capabilities, provider_credentials_present, run_host,
+    HostConfig, HostExecutorFactory, default_host_config_path, enroll_host, login_provider,
+    mirror_local_session, probe_capabilities, provider_credentials_present, run_host,
+    run_host_with_executor_factory,
 };
 pub use journal::{SessionJournal, SessionWriterLease};
 pub use local_control::{
     LocalSessionControlServer, local_session_owner_uses_current_binary, run_attached_session,
-    run_owned_session_projection, send_local_session_command, session_control_presence_socket_path,
-    session_control_socket_path,
+    send_local_session_command, session_control_presence_socket_path, session_control_socket_path,
 };
 pub use lsp::LspService;
 pub use orchestration::*;

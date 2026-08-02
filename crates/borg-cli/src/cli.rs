@@ -35,7 +35,7 @@ pub(crate) enum Command {
     Update(UpdateArgs),
     /// Show configured and effective optional runtime capabilities.
     Capabilities(CapabilitiesArgs),
-    /// Discover effective project and user extension manifests.
+    /// Manage Blu live extensions.
     Extensions(ExtensionsArgs),
     /// List local multiplayer workspaces available to this OS user.
     Workspaces(WorkspacesArgs),
@@ -93,8 +93,89 @@ pub(crate) struct AcpArgs {
 
 #[derive(Debug, Args)]
 pub(crate) struct ExtensionsArgs {
-    #[arg(long)]
+    #[command(subcommand)]
+    pub(crate) command: Option<ExtensionCommand>,
+    /// Emit machine-readable JSON output.
+    // Parent-level and global preserves `borg extensions --json` while also
+    // accepting `borg extensions info <id> --json`.
+    #[arg(long, global = true)]
     pub(crate) json: bool,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum ExtensionCommand {
+    /// List the effective project and user Blu catalog.
+    List,
+    /// Show one extension, its activation decision, dependencies, and settings.
+    Info { id: String },
+    /// Validate every manifest, dependency, path, and configured server.
+    Doctor,
+    /// Enable an installed extension without editing its manifest.
+    Enable(ExtensionTargetArgs),
+    /// Disable an installed extension without editing its manifest.
+    Disable(ExtensionTargetArgs),
+    /// Set or inspect one extension setting.
+    Config(ExtensionConfigArgs),
+    /// Install an extension package from a local path or Git URL.
+    Install(ExtensionInstallArgs),
+    /// Update one Git-backed extension, or every Git-backed extension.
+    Update(ExtensionUpdateArgs),
+    /// Remove an installed extension package and its local state.
+    Remove(ExtensionTargetArgs),
+    /// Scaffold a new extension package.
+    New(ExtensionNewArgs),
+    /// Revalidate the catalog. Running sessions notice the filesystem change
+    /// and apply the last-known-good catalog at the next turn boundary.
+    Reload,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ExtensionTargetArgs {
+    pub(crate) id: String,
+    /// Target project-local state under .borg instead of the user catalog.
+    #[arg(long)]
+    pub(crate) project: bool,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ExtensionConfigArgs {
+    pub(crate) id: String,
+    /// Setting name. Omit with no value to list configured settings.
+    pub(crate) key: Option<String>,
+    /// TOML value (for example `true`, `42`, or `"text"`). Plain text is
+    /// accepted as a string for shell-friendly use.
+    pub(crate) value: Option<String>,
+    #[arg(long)]
+    pub(crate) unset: bool,
+    #[arg(long)]
+    pub(crate) project: bool,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ExtensionInstallArgs {
+    /// Local package directory, manifest path, or Git URL.
+    pub(crate) source: String,
+    #[arg(long)]
+    pub(crate) project: bool,
+    /// Replace an existing package with the same id after validation.
+    #[arg(long)]
+    pub(crate) force: bool,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ExtensionUpdateArgs {
+    pub(crate) id: Option<String>,
+    #[arg(long)]
+    pub(crate) project: bool,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ExtensionNewArgs {
+    pub(crate) id: String,
+    #[arg(long)]
+    pub(crate) project: bool,
+    #[arg(long, default_value = "0.1.0")]
+    pub(crate) version: String,
 }
 
 #[derive(Debug, Args)]
@@ -250,6 +331,46 @@ mod tests {
             panic!("workspaces command must not launch an agent");
         };
         assert!(args.json);
+    }
+
+    #[test]
+    fn blu_extension_commands_keep_json_global_and_scope_explicit() {
+        let command = Cli::try_parse_from([
+            "borg",
+            "extensions",
+            "install",
+            "./my-blu",
+            "--project",
+            "--json",
+        ])
+        .expect("Blu install command parses")
+        .command_or_agent();
+        let Command::Extensions(args) = command else {
+            panic!("extensions command must not launch an agent");
+        };
+        assert!(args.json);
+        assert!(matches!(
+            args.command,
+            Some(ExtensionCommand::Install(ExtensionInstallArgs {
+                project: true,
+                force: false,
+                ..
+            }))
+        ));
+
+        assert!(Cli::try_parse_from(["borg", "extensions", "--json"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "borg",
+                "extensions",
+                "config",
+                "docs",
+                "token",
+                "--unset",
+                "--project",
+            ])
+            .is_ok()
+        );
     }
 
     #[test]

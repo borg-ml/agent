@@ -16,8 +16,11 @@ use std::time::{Duration, Instant};
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const INTERRUPT_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+const INTERRUPT_COMPLETION_TIMEOUT: Duration = Duration::from_secs(2);
+const BACKGROUND_CLEANUP_TIMEOUT: Duration = Duration::from_millis(250);
 const REQUEST_READ_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_QUARANTINED_RESPONSES: usize = 64;
+const MAX_PENDING_TURN_NOTIFICATIONS: usize = 512;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 use super::chat_stream::LocalAgentPermission;
@@ -59,6 +62,7 @@ pub struct CodexAppServerClient {
     reader: std_mpsc::Receiver<ReaderMessage>,
     next_id: u64,
     workspace_id: Option<String>,
+    active_turn_id: Option<String>,
     network_access: bool,
     web_search_allowed: bool,
     deferred_notifications: Vec<JsonRpcMessage>,
@@ -101,9 +105,71 @@ pub struct TurnResult {
     pub model_context_window: Option<u64>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct CodexTurnInput<'a> {
+    pub prompt: &'a str,
+    pub attachments: &'a [PathBuf],
+    pub client_user_message_id: Option<&'a str>,
+}
+
 impl CodexAppServerClient {
     pub fn workspace_id(&self) -> Option<&str> {
         self.workspace_id.as_deref()
+    }
+
+    /// Re-establish the provider's idle boundary before reusing a pooled
+    /// app-server connection. A provider-owned continuation can start after
+    /// the preceding `turn/completed` notification but before the client is
+    /// checked out again, so the cached `active_turn_id` alone is not an
+    /// authority. The one-turn page is bounded and includes the live turn.
+    pub fn settle_pooled_thread_before_input(&mut self) -> Result<()> {
+        let workspace_id = self
+            .workspace_id
+            .clone()
+            .context("cannot synchronize a pooled Codex client without its thread id")?;
+        let mut observed_active_turn = self.active_turn_id.clone();
+        let (response, _) = self.send_request_inner_with_timeout_observing(
+            "thread/turns/list",
+            Some(serde_json::json!({
+                "threadId": workspace_id,
+                "limit": 1,
+                "sortDirection": "desc",
+                "itemsView": "summary",
+            })),
+            false,
+            CONTROL_REQUEST_TIMEOUT,
+            |message| {
+                let belongs_to_thread = message
+                    .params
+                    .as_ref()
+                    .and_then(|params| params.get("threadId"))
+                    .and_then(Value::as_str)
+                    .is_none_or(|thread_id| thread_id == workspace_id);
+                if !belongs_to_thread {
+                    return Ok(());
+                }
+                let Some(turn_id) = notification_turn_id(message) else {
+                    return Ok(());
+                };
+                match message.method.as_deref() {
+                    Some("turn/started") => observed_active_turn = Some(turn_id.to_string()),
+                    Some("turn/completed") if observed_active_turn.as_deref() == Some(turn_id) => {
+                        observed_active_turn = None;
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
+        )?;
+        self.active_turn_id = extract_active_turn_id(&response).or(observed_active_turn);
+        self.settle_resumed_active_turn()
+    }
+
+    fn terminate_process_tree(&mut self) -> Result<()> {
+        self.stdin.take();
+        crate::subprocess::terminate_std_process_tree(&mut self.child)
+            .context("failed terminating codex app-server process tree")?;
+        Ok(())
     }
 
     pub fn start(
@@ -233,6 +299,7 @@ impl CodexAppServerClient {
             reader,
             next_id: 1,
             workspace_id: None,
+            active_turn_id: None,
             network_access,
             web_search_allowed,
             deferred_notifications: Vec::new(),
@@ -343,6 +410,7 @@ impl CodexAppServerClient {
             .unwrap_or("")
             .to_string();
         self.workspace_id = Some(workspace_id.clone());
+        self.active_turn_id = None;
         Ok(workspace_id)
     }
 
@@ -405,8 +473,8 @@ impl CodexAppServerClient {
         fast: bool,
         working_directory: &str,
         permission: LocalAgentPermission,
-        output_schema_requested: bool,
-        mut on_notification: F,
+        _output_schema_requested: bool,
+        _on_notification: F,
     ) -> Result<(String, Option<TurnResult>)>
     where
         F: FnMut(&JsonRpcMessage) -> Result<()>,
@@ -421,37 +489,8 @@ impl CodexAppServerClient {
             working_directory,
             permission,
         );
-        let mut resumed_turn: Option<TurnState> = None;
-        let mut completed_turn: Option<TurnResult> = None;
-        let (response, _) = self.send_request_inner_with_timeout_observing(
-            "thread/resume",
-            Some(params),
-            false,
-            REQUEST_TIMEOUT,
-            |message| {
-                on_notification(message)?;
-                if completed_turn.is_some() {
-                    return Ok(());
-                }
-                let Some(turn_id) = notification_turn_id(message) else {
-                    return Ok(());
-                };
-                let state = resumed_turn.get_or_insert_with(|| {
-                    TurnState::new(
-                        thread_id.to_string(),
-                        turn_id.to_string(),
-                        output_schema_requested,
-                    )
-                });
-                if state.turn_id != turn_id {
-                    return Ok(());
-                }
-                if let Some(result) = state.handle_message(message.clone(), &mut |_| Ok(()))? {
-                    completed_turn = Some(result);
-                }
-                Ok(())
-            },
-        )?;
+        let (response, resume_notifications) =
+            self.send_request_inner("thread/resume", Some(params), true)?;
         validate_reasoning_effort(&response, reasoning_effort)?;
         let workspace_id = response
             .get("threadId")
@@ -460,7 +499,15 @@ impl CodexAppServerClient {
             .unwrap_or(thread_id)
             .to_string();
         self.workspace_id = Some(workspace_id.clone());
-        Ok((workspace_id, completed_turn))
+        self.active_turn_id = extract_active_turn_id(&response)
+            .or_else(|| active_turn_id_from_notifications(&resume_notifications));
+
+        // A provider turn that was already running before this Borg request
+        // belongs to the resumed thread, not to the new user message that
+        // caused the resume. Keep its identity so the new input can be sent
+        // through turn/steer, but do not project or complete the new Borg turn
+        // with buffered output from the old provider turn.
+        Ok((workspace_id, None))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -494,6 +541,7 @@ impl CodexAppServerClient {
             .unwrap_or(thread_id)
             .to_string();
         self.workspace_id = Some(workspace_id.clone());
+        self.active_turn_id = extract_active_turn_id(&response);
         Ok((workspace_id, None))
     }
 
@@ -521,6 +569,12 @@ impl CodexAppServerClient {
             "config": thread_config(self.web_search_allowed, reasoning_effort),
             "cwd": working_directory,
             "personality": "none",
+            "excludeTurns": true,
+            "initialTurnsPage": {
+                "limit": 1,
+                "sortDirection": "desc",
+                "itemsView": "notLoaded"
+            },
         });
 
         if !developer_instructions.is_empty() {
@@ -587,8 +641,11 @@ impl CodexAppServerClient {
         F: FnMut(&JsonRpcMessage) -> Result<()>,
     {
         self.turn_execute_streaming_with_schema_steering_and_attachments(
-            prompt,
-            &[],
+            CodexTurnInput {
+                prompt,
+                attachments: &[],
+                client_user_message_id: None,
+            },
             working_directory,
             output_schema,
             control_rx,
@@ -598,8 +655,7 @@ impl CodexAppServerClient {
 
     pub fn turn_execute_streaming_with_schema_steering_and_attachments<F>(
         &mut self,
-        prompt: &str,
-        attachments: &[PathBuf],
+        input: CodexTurnInput<'_>,
         working_directory: &str,
         output_schema: Option<&Value>,
         mut control_rx: Option<
@@ -610,6 +666,11 @@ impl CodexAppServerClient {
     where
         F: FnMut(&JsonRpcMessage) -> Result<()>,
     {
+        let CodexTurnInput {
+            prompt,
+            attachments,
+            client_user_message_id,
+        } = input;
         let workspace_id = self
             .workspace_id
             .clone()
@@ -625,44 +686,76 @@ impl CodexAppServerClient {
             // will be constrained to match.
             params["outputSchema"] = schema.clone();
         }
+        if let Some(client_id) = client_user_message_id {
+            params["clientUserMessageId"] = Value::String(client_id.to_string());
+        }
 
-        let (turn_start_result, early_notifications) =
-            self.send_request_inner("turn/start", Some(params), true)?;
+        // A new Borg turn may resume a provider thread whose previous owner
+        // disappeared mid-turn. Never steer the new user's prompt into that
+        // orphan: settle it first, then start a separately identified turn.
+        self.settle_resumed_active_turn()?;
+
+        let mut state =
+            TurnState::new(workspace_id.clone(), String::new(), output_schema.is_some());
+        state.client_user_message_id = client_user_message_id.map(str::to_string);
+        let mut result_before_response = None;
+        let (turn_start_result, _) = self.send_request_inner_with_timeout_observing(
+            "turn/start",
+            Some(params),
+            false,
+            REQUEST_TIMEOUT,
+            |message| {
+                if result_before_response.is_none() {
+                    result_before_response =
+                        state.handle_message(message.clone(), &mut on_notification)?;
+                }
+                Ok(())
+            },
+        )?;
         let turn_id = extract_turn_id(&turn_start_result)
             .context("Codex turn/start response did not include an active turn id")?;
-
-        let mut state = TurnState::new(
-            workspace_id.clone(),
-            turn_id.clone(),
-            output_schema.is_some(),
-        );
-
-        for msg in early_notifications {
-            if let Some(result) = state.handle_message(msg, &mut on_notification)? {
-                return Ok(result);
-            }
+        let result_while_binding = state.bind_turn_id(turn_id, &mut on_notification)?;
+        self.active_turn_id = Some(state.turn_id.clone());
+        if let Some(result) = result_before_response.or(result_while_binding) {
+            return self.finish_turn(&state, result);
         }
         if let Some(result) = self.drain_pending_steers(
             &workspace_id,
-            &turn_id,
             &mut control_rx,
             &mut state,
             &mut on_notification,
         )? {
-            return Ok(result);
+            return self.finish_turn(&state, result);
         }
 
         loop {
             if let Some(result) = self.drain_pending_steers(
                 &workspace_id,
-                &turn_id,
                 &mut control_rx,
                 &mut state,
                 &mut on_notification,
             )? {
-                return Ok(result);
+                return self.finish_turn(&state, result);
             }
-            let Some(msg) = self.read_message_timeout(Duration::from_millis(50))? else {
+            if state
+                .interrupt_deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                self.terminate_process_tree()?;
+                bail!(
+                    "Codex app-server did not confirm turn {} interruption before the deadline; its process tree was terminated",
+                    state.turn_id
+                );
+            }
+            let read_timeout = state
+                .interrupt_deadline
+                .map(|deadline| {
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(50))
+                })
+                .unwrap_or(Duration::from_millis(50));
+            let Some(msg) = self.read_message_timeout(read_timeout)? else {
                 continue;
             };
             if self.answer_server_request(
@@ -674,9 +767,122 @@ impl CodexAppServerClient {
                 continue;
             }
             if let Some(result) = state.handle_message(msg, &mut on_notification)? {
-                return Ok(result);
+                return self.finish_turn(&state, result);
             }
         }
+    }
+
+    fn finish_turn(&mut self, state: &TurnState, result: TurnResult) -> Result<TurnResult> {
+        if state.interrupt_requested
+            && let Err(error) = self.clean_background_terminals(&state.workspace_id)
+        {
+            let cleanup_error = self.terminate_process_tree().err();
+            bail!(
+                "Codex turn stopped but its background terminals could not be cleaned: {error:#}; forced process-tree cleanup: {}",
+                cleanup_error
+                    .map(|error| format!("failed: {error:#}"))
+                    .unwrap_or_else(|| "completed".to_string())
+            );
+        }
+        self.active_turn_id = None;
+        Ok(result)
+    }
+
+    fn clean_background_terminals(&mut self, workspace_id: &str) -> Result<()> {
+        self.send_request_inner_with_timeout(
+            "thread/backgroundTerminals/clean",
+            Some(serde_json::json!({ "threadId": workspace_id })),
+            false,
+            BACKGROUND_CLEANUP_TIMEOUT,
+        )?;
+        Ok(())
+    }
+
+    /// A provider thread can outlive a Borg owner that was killed while an
+    /// interrupt was in flight. A later prompt must never inherit that work.
+    /// Settle and discard the orphaned turn before creating the new one.
+    fn settle_resumed_active_turn(&mut self) -> Result<()> {
+        let Some(turn_id) = self.active_turn_id.take() else {
+            return Ok(());
+        };
+        let workspace_id = self
+            .workspace_id
+            .clone()
+            .context("cannot settle a resumed Codex turn without its thread id")?;
+        let deadline = Instant::now() + INTERRUPT_COMPLETION_TIMEOUT;
+        let params = serde_json::json!({
+            "threadId": workspace_id,
+            "turnId": turn_id,
+        });
+        let mut completed = false;
+        let interrupt = self.send_request_inner_with_timeout_observing(
+            "turn/interrupt",
+            Some(params),
+            false,
+            INTERRUPT_REQUEST_TIMEOUT,
+            |message| {
+                if message.method.as_deref() == Some("turn/completed")
+                    && notification_turn_id(message) == Some(turn_id.as_str())
+                {
+                    completed = true;
+                }
+                Ok(())
+            },
+        );
+        match interrupt {
+            Ok(_) => {}
+            Err(error) if expected_inactive_turn_interrupt(&error) => completed = true,
+            Err(error) => {
+                let cleanup = self.terminate_process_tree().err();
+                bail!(
+                    "failed to stop unfinished resumed Codex turn {turn_id}: {error:#}; forced process-tree cleanup: {}",
+                    cleanup
+                        .map(|error| format!("failed: {error:#}"))
+                        .unwrap_or_else(|| "completed".to_string())
+                );
+            }
+        }
+        while !completed && Instant::now() < deadline {
+            let timeout = deadline
+                .saturating_duration_since(Instant::now())
+                .min(REQUEST_READ_POLL_INTERVAL);
+            let Some(message) = self.read_message_timeout(timeout)? else {
+                continue;
+            };
+            if let (Some(request_id), Some(method)) = (message.id, message.method.as_deref()) {
+                if let Some(response) = unattended_server_request_response(&message) {
+                    self.send_response(request_id, response)?;
+                } else {
+                    self.send_error_response(
+                        request_id,
+                        -32601,
+                        format!("Borg does not provide the optional host service {method}"),
+                    )?;
+                }
+                continue;
+            }
+            if message.method.as_deref() == Some("turn/completed")
+                && notification_turn_id(&message) == Some(turn_id.as_str())
+            {
+                completed = true;
+            }
+        }
+        if !completed {
+            self.terminate_process_tree()?;
+            bail!(
+                "Codex app-server did not confirm cleanup of unfinished resumed turn {turn_id}; its process tree was terminated"
+            );
+        }
+        if let Err(error) = self.clean_background_terminals(&workspace_id) {
+            let cleanup = self.terminate_process_tree().err();
+            bail!(
+                "unfinished resumed Codex turn {turn_id} stopped, but background cleanup failed: {error:#}; forced process-tree cleanup: {}",
+                cleanup
+                    .map(|error| format!("failed: {error:#}"))
+                    .unwrap_or_else(|| "completed".to_string())
+            );
+        }
+        Ok(())
     }
 
     fn answer_server_request<F>(
@@ -691,7 +897,7 @@ impl CodexAppServerClient {
     where
         F: FnMut(&JsonRpcMessage) -> Result<()>,
     {
-        if !state.accepts_message(message) {
+        if message.id.is_some() && !state.accepts_message(message) {
             if let Some(request_id) = message.id {
                 if let Some(response) = unattended_server_request_response(message) {
                     self.send_response(request_id, response)?;
@@ -862,7 +1068,6 @@ impl CodexAppServerClient {
     fn drain_pending_steers<F>(
         &mut self,
         workspace_id: &str,
-        turn_id: &str,
         control_rx: &mut Option<
             &mut tokio::sync::mpsc::Receiver<super::chat_stream::ChatStreamControl>,
         >,
@@ -892,6 +1097,7 @@ impl CodexAppServerClient {
                         let _ = ack.send(Err("cannot steer with empty input".to_string()));
                         continue;
                     }
+                    let turn_id = state.turn_id.clone();
                     let mut params = serde_json::json!({
                         "threadId": workspace_id,
                         "input": turn_user_input(&text, &attachments),
@@ -900,14 +1106,25 @@ impl CodexAppServerClient {
                     if let Some(client_id) = client_user_message_id.as_deref() {
                         params["clientUserMessageId"] = Value::String(client_id.to_string());
                     }
-                    let result = self.send_request_inner("turn/steer", Some(params), true);
+                    let mut completed_during_request = None;
+                    let result = self.send_request_inner_with_timeout_observing(
+                        "turn/steer",
+                        Some(params),
+                        false,
+                        CONTROL_REQUEST_TIMEOUT,
+                        |message| {
+                            if completed_during_request.is_none() {
+                                completed_during_request =
+                                    state.handle_message(message.clone(), on_notification)?;
+                            }
+                            Ok(())
+                        },
+                    );
                     match result {
-                        Ok((_response, notifications)) => {
+                        Ok(_) => {
                             let _ = ack.send(Ok(()));
-                            for msg in notifications {
-                                if let Some(result) = state.handle_message(msg, on_notification)? {
-                                    return Ok(Some(result));
-                                }
+                            if let Some(result) = completed_during_request {
+                                return Ok(Some(result));
                             }
                         }
                         Err(err) => {
@@ -929,45 +1146,59 @@ impl CodexAppServerClient {
                     // a matching server-initiated request is pending.
                 }
                 super::chat_stream::ChatStreamControl::Interrupt => {
+                    let turn_id = state.turn_id.clone();
+                    state.interrupt_requested = true;
+                    state.interrupt_deadline = Some(Instant::now() + INTERRUPT_COMPLETION_TIMEOUT);
                     let params = serde_json::json!({
                         "threadId": workspace_id,
-                        "turnId": turn_id,
+                        "turnId": turn_id.clone(),
                     });
-                    let (_, notifications) =
-                        match self.send_request_inner("turn/interrupt", Some(params), true) {
-                            Ok(result) => result,
-                            Err(error) if expected_inactive_turn_interrupt(&error) => {
-                                // The provider can finish between the session actor
-                                // receiving Interrupt and this request reaching the
-                                // app-server. In that race there is no active turn
-                                // left to interrupt; ending this stream is the
-                                // correct idempotent result, not a provider failure.
-                                tracing::debug!(
-                                    %error,
-                                    turn_id,
-                                    "Codex turn was already inactive when interrupt arrived"
-                                );
-                                if let Some(result) =
-                                    self.drain_deferred_notifications(state, on_notification)?
-                                {
-                                    return Ok(Some(result));
-                                }
-                                return Ok(Some(TurnResult {
-                                    workspace_id: state.workspace_id.clone(),
-                                    output_text: state.output_text.clone(),
-                                    reasoning_text: state.reasoning_text.clone(),
-                                    raw_notifications: state.raw_notifications.clone(),
-                                    turn_token_usage: state.turn_token_usage.clone(),
-                                    total_token_usage: state.total_token_usage.clone(),
-                                    model_context_window: state.model_context_window,
-                                }));
+                    let mut completed_during_request = None;
+                    let response = self.send_request_inner_with_timeout_observing(
+                        "turn/interrupt",
+                        Some(params),
+                        false,
+                        INTERRUPT_REQUEST_TIMEOUT,
+                        |message| {
+                            if completed_during_request.is_none() {
+                                completed_during_request =
+                                    state.handle_message(message.clone(), on_notification)?;
                             }
-                            Err(error) => return Err(error),
-                        };
-                    for msg in notifications {
-                        if let Some(result) = state.handle_message(msg, on_notification)? {
-                            return Ok(Some(result));
+                            Ok(())
+                        },
+                    );
+                    match response {
+                        Ok(_) => {}
+                        Err(error) if expected_inactive_turn_interrupt(&error) => {
+                            // The provider can finish between the session actor
+                            // receiving Interrupt and this request reaching the
+                            // app-server. In that race there is no active turn
+                            // left to interrupt; ending this stream is the
+                            // correct idempotent result, not a provider failure.
+                            tracing::debug!(
+                                %error,
+                                %turn_id,
+                                "Codex turn was already inactive when interrupt arrived"
+                            );
+                            if let Some(result) =
+                                self.drain_deferred_notifications(state, on_notification)?
+                            {
+                                return Ok(Some(result));
+                            }
+                            return Ok(Some(TurnResult {
+                                workspace_id: state.workspace_id.clone(),
+                                output_text: state.output_text.clone(),
+                                reasoning_text: state.reasoning_text.clone(),
+                                raw_notifications: state.raw_notifications.clone(),
+                                turn_token_usage: state.turn_token_usage.clone(),
+                                total_token_usage: state.total_token_usage.clone(),
+                                model_context_window: state.model_context_window,
+                            }));
                         }
+                        Err(error) => return Err(error),
+                    }
+                    if let Some(result) = completed_during_request {
+                        return Ok(Some(result));
                     }
                 }
             }
@@ -1001,13 +1232,7 @@ impl CodexAppServerClient {
                 .is_some_and(|flag| flag.load(Ordering::Acquire))
             {
                 tracing::debug!("cancelling Codex app-server shutdown with its owning turn");
-                self.child
-                    .kill()
-                    .context("failed killing cancelled codex app-server")?;
-                break self
-                    .child
-                    .wait()
-                    .context("failed waiting for cancelled codex app-server")?;
+                return self.terminate_process_tree();
             }
             if let Some(status) = self
                 .child
@@ -1021,13 +1246,7 @@ impl CodexAppServerClient {
                     timeout_ms = SHUTDOWN_TIMEOUT.as_millis(),
                     "codex app-server did not exit during graceful shutdown; killing it"
                 );
-                self.child
-                    .kill()
-                    .context("failed killing codex app-server during shutdown")?;
-                break self
-                    .child
-                    .wait()
-                    .context("failed waiting for killed codex app-server")?;
+                return self.terminate_process_tree();
             }
             std::thread::sleep(Duration::from_millis(20));
         };
@@ -1450,6 +1669,44 @@ fn extract_turn_id(result: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Read the authoritative live turn from a bounded resume or turns page.
+///
+/// `excludeTurns` keeps the full persisted transcript out of the resume
+/// response; `initialTurnsPage(limit=1)` still includes the live in-progress
+/// turn when one exists.
+fn extract_active_turn_id(response: &Value) -> Option<String> {
+    [
+        response.pointer("/data"),
+        response.pointer("/initialTurnsPage/data"),
+        response.pointer("/thread/turns"),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(Value::as_array)
+    .flat_map(|turns| turns.iter().rev())
+    .find(|turn| turn.get("status").and_then(Value::as_str) == Some("inProgress"))
+    .and_then(|turn| turn.get("id"))
+    .and_then(Value::as_str)
+    .map(str::to_string)
+}
+
+fn active_turn_id_from_notifications(messages: &[JsonRpcMessage]) -> Option<String> {
+    let mut active_turn_id = None;
+    for message in messages {
+        let Some(turn_id) = notification_turn_id(message) else {
+            continue;
+        };
+        match message.method.as_deref() {
+            Some("turn/started") => active_turn_id = Some(turn_id.to_string()),
+            Some("turn/completed") if active_turn_id.as_deref() == Some(turn_id) => {
+                active_turn_id = None;
+            }
+            _ => {}
+        }
+    }
+    active_turn_id
+}
+
 /// Return the provider turn that owns a notification or server request.
 ///
 /// Codex app-server keeps a single stdout stream across pooled turns. Messages
@@ -1462,6 +1719,20 @@ fn notification_turn_id(message: &JsonRpcMessage) -> Option<&str> {
         .get("turnId")
         .and_then(Value::as_str)
         .or_else(|| params.pointer("/turn/id").and_then(Value::as_str))
+}
+
+fn notification_client_user_message_id(message: &JsonRpcMessage) -> Option<&str> {
+    let params = message.params.as_ref()?;
+    params
+        .get("clientUserMessageId")
+        .and_then(Value::as_str)
+        .or_else(|| params.pointer("/item/clientId").and_then(Value::as_str))
+}
+
+fn message_is_turn_scoped_notification(message: &JsonRpcMessage) -> bool {
+    message.id.is_none()
+        && notification_turn_id(message).is_some()
+        && notification_requires_turn_id(message.method.as_deref())
 }
 
 /// Current app-server protocol notifications that describe model work always
@@ -1501,6 +1772,10 @@ struct TurnState {
     emitted_agent_message_ids: HashSet<String>,
     emitted_any_agent_message: bool,
     output_schema_requested: bool,
+    client_user_message_id: Option<String>,
+    pending_turn_notifications: VecDeque<JsonRpcMessage>,
+    interrupt_requested: bool,
+    interrupt_deadline: Option<Instant>,
 }
 
 impl TurnState {
@@ -1518,7 +1793,37 @@ impl TurnState {
             emitted_agent_message_ids: HashSet::new(),
             emitted_any_agent_message: false,
             output_schema_requested,
+            client_user_message_id: None,
+            pending_turn_notifications: VecDeque::new(),
+            interrupt_requested: false,
+            interrupt_deadline: None,
         }
+    }
+
+    fn bind_turn_id<F>(
+        &mut self,
+        turn_id: String,
+        on_notification: &mut F,
+    ) -> Result<Option<TurnResult>>
+    where
+        F: FnMut(&JsonRpcMessage) -> Result<()>,
+    {
+        // A client-correlated user item can reveal the real execution turn
+        // before the turn/start response arrives. Keep that stronger binding
+        // when the response races and reports a stale wrapper identity.
+        if self.turn_id.is_empty() {
+            self.turn_id = turn_id;
+        }
+        let active_turn_id = self.turn_id.clone();
+        let pending = std::mem::take(&mut self.pending_turn_notifications);
+        for message in pending {
+            if notification_turn_id(&message) == Some(active_turn_id.as_str())
+                && let Some(result) = self.handle_message(message, on_notification)?
+            {
+                return Ok(Some(result));
+            }
+        }
+        Ok(None)
     }
 
     fn accepts_message(&self, message: &JsonRpcMessage) -> bool {
@@ -1536,6 +1841,47 @@ impl TurnState {
     where
         F: FnMut(&JsonRpcMessage) -> Result<()>,
     {
+        if !self.accepts_message(&msg) {
+            let correlated_turn_id = self
+                .client_user_message_id
+                .as_deref()
+                .filter(|client_id| notification_client_user_message_id(&msg) == Some(*client_id))
+                .and_then(|_| notification_turn_id(&msg))
+                .map(str::to_string);
+            if let Some(correlated_turn_id) = correlated_turn_id {
+                tracing::debug!(
+                    response_turn_id = %self.turn_id,
+                    notification_turn_id = %correlated_turn_id,
+                    client_user_message_id = self.client_user_message_id.as_deref().unwrap_or_default(),
+                    "bound Codex notification turn through the client user message identity"
+                );
+                self.turn_id = correlated_turn_id.clone();
+                let pending = std::mem::take(&mut self.pending_turn_notifications);
+                for pending_message in pending {
+                    if notification_turn_id(&pending_message) == Some(correlated_turn_id.as_str())
+                        && let Some(result) =
+                            self.handle_message(pending_message, on_notification)?
+                    {
+                        return Ok(Some(result));
+                    }
+                }
+            } else {
+                if message_is_turn_scoped_notification(&msg) {
+                    if self.pending_turn_notifications.len() == MAX_PENDING_TURN_NOTIFICATIONS {
+                        self.pending_turn_notifications.pop_front();
+                    }
+                    self.pending_turn_notifications.push_back(msg);
+                    return Ok(None);
+                }
+                tracing::debug!(
+                    method = msg.method.as_deref().unwrap_or_default(),
+                    active_turn_id = %self.turn_id,
+                    message_turn_id = notification_turn_id(&msg).unwrap_or_default(),
+                    "quarantined Codex notification outside the active turn"
+                );
+                return Ok(None);
+            }
+        }
         if !self.accepts_message(&msg) {
             tracing::debug!(
                 method = msg.method.as_deref().unwrap_or_default(),
@@ -1784,7 +2130,7 @@ fn expected_inactive_turn_interrupt(error: &anyhow::Error) -> bool {
     let text = error.to_string().to_ascii_lowercase();
     text.contains("codex app-server error for turn/interrupt")
         && text.contains("\"code\":-32600")
-        && text.contains("expected active turn id")
+        && (text.contains("expected active turn id") || text.contains("no active turn"))
 }
 
 fn error_value_text(value: &Value) -> Option<String> {
@@ -1820,6 +2166,12 @@ fn thread_config(web_search_allowed: bool, reasoning_effort: Option<&str>) -> Va
         // collaboration runtime enabled would expose a second model catalog
         // and a second child-session authority to the same acting model.
         "features": {
+            // Borg also owns durable goals and their continuation scheduler.
+            // If Codex goals remain enabled, its on-idle hook can start a new
+            // provider turn immediately after Borg publishes Ready. The next
+            // Borg prompt is then queued into that older turn and all of its
+            // already-produced events arrive as a misleading bulk backfill.
+            "goals": false,
             "multi_agent": false,
             "multi_agent_v2": false,
         },
@@ -1864,10 +2216,7 @@ fn inject_mcp_servers_config(params: &mut Value, mcp_config_path: Option<&str>) 
 
 impl Drop for CodexAppServerClient {
     fn drop(&mut self) {
-        if self.child.try_wait().ok().flatten().is_none() {
-            let _ = self.child.kill();
-        }
-        let _ = self.child.wait();
+        let _ = self.terminate_process_tree();
     }
 }
 
@@ -1878,13 +2227,14 @@ mod tests {
     #[cfg(unix)]
     fn scripted_client(script: &str) -> CodexAppServerClient {
         let shell_env = crate::shell_env::CleanShellEnv::new().expect("clean shell environment");
-        let mut child = Command::new("sh")
+        let mut command = Command::new("sh");
+        command
             .args(["-c", script])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("scripted app-server");
+            .stderr(Stdio::null());
+        crate::subprocess::isolate_std_process_from_terminal(&mut command);
+        let mut child = command.spawn().expect("scripted app-server");
         let stdin = child.stdin.take().expect("script stdin");
         let stdout = child.stdout.take().expect("script stdout");
         CodexAppServerClient {
@@ -1893,6 +2243,7 @@ mod tests {
             reader: spawn_reader(stdout),
             next_id: 1,
             workspace_id: None,
+            active_turn_id: None,
             network_access: false,
             web_search_allowed: false,
             deferred_notifications: Vec::new(),
@@ -1951,7 +2302,161 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"matched":true}}'"#,
 
     #[cfg(unix)]
     #[test]
-    fn resume_streams_notifications_from_the_resume_request() {
+    fn turn_notifications_stream_before_the_turn_start_response() {
+        let mut client = scripted_client(
+            r#"read start_request
+printf '%s\n' '{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"thread-1","turn":{"id":"turn-live","status":"inProgress","items":[]}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"thread-1","turnId":"turn-live","item":{"id":"user-1","type":"userMessage","clientId":"borg-message-live","content":[]}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"thread-1","turnId":"turn-live","item":{"id":"tool-live","type":"commandExecution","command":"sleep 1"}}}'
+sleep 0.5
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"turn":{"id":"turn-live"}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-live","status":"completed","items":[]}}}'"#,
+        );
+        client.workspace_id = Some("thread-1".to_string());
+        let (seen_tx, seen_rx) = std_mpsc::channel();
+
+        let worker = std::thread::spawn(move || {
+            client.turn_execute_streaming_with_schema_steering_and_attachments(
+                CodexTurnInput {
+                    prompt: "start now",
+                    attachments: &[],
+                    client_user_message_id: Some("borg-message-live"),
+                },
+                "/tmp",
+                None,
+                None,
+                |message| {
+                    seen_tx
+                        .send(message.method.clone().unwrap_or_default())
+                        .expect("observer remains connected");
+                    Ok(())
+                },
+            )
+        });
+
+        let first = seen_rx
+            .recv_timeout(Duration::from_millis(150))
+            .expect("live notification must not wait for the turn/start response");
+        assert_eq!(first, "turn/started");
+        let result = worker.join().expect("turn worker").expect("turn result");
+        assert_eq!(result.workspace_id, "thread-1");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn interrupt_keeps_streaming_until_terminal_confirmation_then_cleans_backgrounds() {
+        let mut client = scripted_client(
+            r#"read start_request
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"turn":{"id":"turn-live"}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"thread-1","turn":{"id":"turn-live","status":"inProgress","items":[]}}}'
+read interrupt_request
+printf '%s\n' '{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"thread-1","turnId":"turn-live","item":{"id":"tool-after-escape","type":"commandExecution","command":"still settling"}}}'
+sleep 0.5
+printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-live","status":"interrupted","items":[]}}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{}}'
+read clean_request
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{}}'"#,
+        );
+        client.workspace_id = Some("thread-1".to_string());
+        let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(1);
+        control_tx
+            .blocking_send(ChatStreamControl::Interrupt)
+            .expect("queue interrupt");
+        let (seen_tx, seen_rx) = std_mpsc::channel();
+
+        let worker = std::thread::spawn(move || {
+            client.turn_execute_streaming_with_schema_steering_and_attachments(
+                CodexTurnInput {
+                    prompt: "work",
+                    attachments: &[],
+                    client_user_message_id: Some("borg-message-interrupt"),
+                },
+                "/tmp",
+                None,
+                Some(&mut control_rx),
+                |message| {
+                    seen_tx
+                        .send(message.method.clone().unwrap_or_default())
+                        .expect("observer remains connected");
+                    Ok(())
+                },
+            )
+        });
+
+        let deadline = Instant::now() + Duration::from_millis(150);
+        let mut saw_tool = false;
+        while Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match seen_rx.recv_timeout(remaining) {
+                Ok(method) if method == "item/started" => {
+                    saw_tool = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        assert!(
+            saw_tool,
+            "events emitted while turn/interrupt is pending must remain live"
+        );
+        let result = worker
+            .join()
+            .expect("turn worker")
+            .expect("interrupted result");
+        assert_eq!(result.workspace_id, "thread-1");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unconfirmed_interrupt_kills_and_reaps_the_provider_process_group() {
+        let root = tempfile::tempdir().expect("temp root");
+        let pid_path = root.path().join("descendant.pid");
+        let script = format!(
+            r#"read start_request
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"turn":{{"id":"turn-stuck"}}}}}}'
+read interrupt_request
+sleep 30 &
+printf '%s' "$!" > '{}'
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{}}}}'
+wait"#,
+            pid_path.display()
+        );
+        let mut client = scripted_client(&script);
+        client.workspace_id = Some("thread-1".to_string());
+        let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(1);
+        control_tx
+            .blocking_send(ChatStreamControl::Interrupt)
+            .expect("queue interrupt");
+
+        let started = Instant::now();
+        let error = client
+            .turn_execute_streaming_with_schema_steering_and_attachments(
+                CodexTurnInput {
+                    prompt: "work",
+                    attachments: &[],
+                    client_user_message_id: Some("borg-message-stuck"),
+                },
+                "/tmp",
+                None,
+                Some(&mut control_rx),
+                |_| Ok(()),
+            )
+            .expect_err("missing turn/completed must force cleanup");
+        assert!(started.elapsed() < Duration::from_secs(4));
+        assert!(error.to_string().contains("process tree was terminated"));
+
+        let descendant_pid = fs::read_to_string(&pid_path)
+            .expect("descendant pid")
+            .parse::<i32>()
+            .expect("numeric descendant pid");
+        let alive = unsafe { libc::kill(descendant_pid, 0) } == 0;
+        assert!(!alive, "provider descendant survived Escape cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resume_quarantines_notifications_that_predate_the_new_borg_turn() {
         let mut client = scripted_client(
             r#"read request
 printf '%s\n' '{"jsonrpc":"2.0","method":"turn/started","params":{"turn":{"id":"turn-1"}}}'
@@ -1981,18 +2486,189 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"threadId":"thread-1"}}'"#,
             .expect("resume response");
 
         assert_eq!(workspace_id, "thread-1");
-        let result = result.expect("resumed turn result");
-        assert_eq!(result.output_text, "reply");
+        assert!(result.is_none());
+        assert!(seen.is_empty());
+        assert!(client.active_turn_id.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resumed_active_turn_is_stopped_before_the_new_prompt_is_streamed() {
+        let mut client = scripted_client(
+            r#"read resume_request
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"thread":{"id":"thread-1","turns":[]},"threadId":"thread-1","initialTurnsPage":{"data":[{"id":"turn-active","status":"inProgress","items":[]}],"nextCursor":null,"backwardsCursor":null}}}'
+read interrupt_request
+printf '%s\n' '{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"thread-1","turnId":"turn-active","item":{"id":"old-tool","type":"commandExecution"}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-active","status":"interrupted","items":[]}}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{}}'
+read clean_request
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{}}'
+read start_request
+printf '%s\n' '{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"thread-1","turn":{"id":"turn-execution","status":"inProgress","items":[]}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"thread-1","turnId":"turn-execution","item":{"id":"user-1","type":"userMessage","clientId":"borg-message-1","content":[]}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"item/reasoning/summaryTextDelta","params":{"threadId":"thread-1","turnId":"turn-execution","delta":"thinking"}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"thread-1","turnId":"turn-execution","itemId":"message-1","delta":"BORG_SYNC_OK_603A3BE9"}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"turn":{"id":"turn-execution"}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-execution","status":"completed","items":[]}}}'"#,
+        );
+
+        let (_, resumed_result) = client
+            .thread_resume_with_permission_streaming(
+                "thread-1",
+                "",
+                None,
+                None,
+                None,
+                false,
+                "/tmp",
+                LocalAgentPermission::FullAccess,
+                false,
+                |_| Ok(()),
+            )
+            .expect("resume response");
+        assert!(resumed_result.is_none());
+        assert_eq!(client.active_turn_id.as_deref(), Some("turn-active"));
+
+        let mut seen = Vec::new();
+        let result = client
+            .turn_execute_streaming_with_schema_steering_and_attachments(
+                CodexTurnInput {
+                    prompt: "probe",
+                    attachments: &[],
+                    client_user_message_id: Some("borg-message-1"),
+                },
+                "/tmp",
+                None,
+                None,
+                |message| {
+                    seen.push(message.method.clone().unwrap_or_default());
+                    Ok(())
+                },
+            )
+            .expect("fresh turn after orphan cleanup");
+
+        assert_eq!(result.output_text, "BORG_SYNC_OK_603A3BE9");
         assert_eq!(result.reasoning_text, "thinking");
         assert_eq!(
             seen,
             [
                 "turn/started",
+                "item/started",
                 "item/reasoning/summaryTextDelta",
                 "item/agentMessage/delta",
                 "turn/completed",
             ]
         );
+        assert!(client.active_turn_id.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pooled_provider_continuation_is_settled_before_the_next_borg_prompt() {
+        let mut client = scripted_client(
+            r#"read turns_request
+printf '%s\n' '{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"thread-1","turn":{"id":"turn-provider-goal","status":"inProgress","items":[]}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"thread-1","turnId":"turn-provider-goal","item":{"id":"old-tool","type":"commandExecution","command":"must not backfill"}}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"data":[{"id":"turn-provider-goal","status":"inProgress","items":[]}],"nextCursor":null,"backwardsCursor":null}}'
+read interrupt_request
+printf '%s\n' '{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"thread-1","turnId":"turn-provider-goal","item":{"id":"old-tool","type":"commandExecution","command":"must not backfill","status":"completed"}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-provider-goal","status":"interrupted","items":[]}}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{}}'
+read clean_request
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{}}'
+read start_request
+printf '%s\n' '{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"thread-1","turn":{"id":"turn-borg","status":"inProgress","items":[]}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"thread-1","turnId":"turn-borg","item":{"id":"user-1","type":"userMessage","clientId":"borg-message-2","content":[]}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"thread-1","turnId":"turn-borg","itemId":"message-1","delta":"fresh only"}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"turn":{"id":"turn-borg"}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-borg","status":"completed","items":[]}}}'"#,
+        );
+        client.workspace_id = Some("thread-1".to_string());
+
+        client
+            .settle_pooled_thread_before_input()
+            .expect("provider-owned pooled turn must be settled");
+        assert!(client.active_turn_id.is_none());
+
+        let mut seen = Vec::new();
+        let result = client
+            .turn_execute_streaming_with_schema_steering_and_attachments(
+                CodexTurnInput {
+                    prompt: "new Borg prompt",
+                    attachments: &[],
+                    client_user_message_id: Some("borg-message-2"),
+                },
+                "/tmp",
+                None,
+                None,
+                |message| {
+                    seen.push(message.clone());
+                    Ok(())
+                },
+            )
+            .expect("fresh Borg turn after pooled orphan cleanup");
+
+        assert_eq!(result.output_text, "fresh only");
+        assert!(seen.iter().all(|message| {
+            notification_turn_id(message).is_none_or(|turn_id| turn_id == "turn-borg")
+        }));
+        assert!(seen.iter().all(|message| {
+            message
+                .params
+                .as_ref()
+                .and_then(|params| params.pointer("/item/id"))
+                .and_then(Value::as_str)
+                != Some("old-tool")
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completed_resume_turn_race_falls_back_without_losing_the_new_turn() {
+        let mut client = scripted_client(
+            r#"read resume_request
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"thread":{"id":"thread-1","turns":[]},"threadId":"thread-1","initialTurnsPage":{"data":[{"id":"turn-old","status":"inProgress","items":[]}],"nextCursor":null,"backwardsCursor":null}}}'
+read steer_request
+printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-old","status":"completed","items":[]}}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"error":{"code":-32600,"message":"no active turn"}}'
+read clean_request
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{}}'
+read start_request
+printf '%s\n' '{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"thread-1","turn":{"id":"turn-new","status":"inProgress","items":[]}}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"turn":{"id":"turn-new"}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"thread-1","turnId":"turn-new","itemId":"message-1","delta":"fresh reply"}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-new","status":"completed","items":[]}}}'"#,
+        );
+
+        client
+            .thread_resume_with_permission_streaming(
+                "thread-1",
+                "",
+                None,
+                None,
+                None,
+                false,
+                "/tmp",
+                LocalAgentPermission::FullAccess,
+                false,
+                |_| Ok(()),
+            )
+            .expect("resume response");
+
+        let mut seen_turn_ids = Vec::new();
+        let result = client
+            .turn_execute_streaming("new prompt", "/tmp", |message| {
+                seen_turn_ids.push(notification_turn_id(message).map(str::to_string));
+                Ok(())
+            })
+            .expect("fresh fallback turn result");
+
+        assert_eq!(result.output_text, "fresh reply");
+        assert!(seen_turn_ids.iter().all(|turn_id| {
+            turn_id
+                .as_deref()
+                .is_none_or(|turn_id| turn_id == "turn-new")
+        }));
     }
 
     #[cfg(unix)]
@@ -2181,6 +2857,10 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"threadId":"thread-1"}}'"#,
             emitted_agent_message_ids: HashSet::new(),
             emitted_any_agent_message: false,
             output_schema_requested: false,
+            client_user_message_id: None,
+            pending_turn_notifications: VecDeque::new(),
+            interrupt_requested: false,
+            interrupt_deadline: None,
         }
     }
 
@@ -2580,6 +3260,10 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"threadId":"thread-1"}}'"#,
             Some("low")
         );
         assert!(config.get("reasoningEffort").is_none());
+        assert_eq!(
+            config.pointer("/features/goals").and_then(Value::as_bool),
+            Some(false)
+        );
         assert_eq!(
             config
                 .pointer("/features/multi_agent")

@@ -60,17 +60,23 @@ impl NativeContext {
             skill_roots.push(directory.join(".agents").join("skills"));
             skill_roots.push(directory.join(".borg").join("skills"));
         }
-        // Session launch validation has already constrained these roots to
-        // trusted host extension bases.  Do not silently drop a root here:
-        // doing so would make resumed-session behavior depend on timing.
-        for root in extension_skill_roots {
-            skill_roots.push(root.canonicalize().with_context(|| {
-                format!("canonicalize extension skill root {}", root.display())
-            })?);
-        }
         let mut skills = BTreeMap::new();
         for root in skill_roots {
-            load_skill_root(&root, &mut skills)?;
+            // Existing user/project skill roots historically allow a skill
+            // directory to be a symlink. Preserve that compatibility.
+            load_skill_root(&root, &mut skills, false)?;
+            if skills.len() >= MAX_SKILLS {
+                break;
+            }
+        }
+        // Session launch validation has already constrained these roots to
+        // trusted host extension bases. Do not silently drop or let a skill
+        // escape an extension root here.
+        for root in extension_skill_roots {
+            let canonical = root
+                .canonicalize()
+                .with_context(|| format!("canonicalize extension skill root {}", root.display()))?;
+            load_skill_root(&canonical, &mut skills, true)?;
             if skills.len() >= MAX_SKILLS {
                 break;
             }
@@ -139,6 +145,41 @@ impl NativeContext {
     }
 }
 
+/// Build the provider-neutral extension skill catalog for transports whose
+/// native tool runtime does not expose Borg's `read_skill` tool. Paths are
+/// explicit so the provider can progressively read the selected SKILL.md with
+/// its ordinary filesystem tools instead of receiving every skill eagerly.
+pub(crate) async fn extension_skill_prompt_appendix(roots: Vec<PathBuf>) -> Result<String> {
+    tokio::task::spawn_blocking(move || {
+        let mut skills = BTreeMap::new();
+        for root in roots {
+            let canonical = root
+                .canonicalize()
+                .with_context(|| format!("canonicalize extension skill root {}", root.display()))?;
+            load_skill_root(&canonical, &mut skills, true)?;
+            if skills.len() >= MAX_SKILLS {
+                break;
+            }
+        }
+        if skills.is_empty() {
+            return Ok(String::new());
+        }
+        let mut appendix = String::from(
+            "Blu extension skills are available below. When the user names one or the task clearly matches its description, read the complete SKILL.md at the listed path before acting and follow it for that turn.",
+        );
+        for (name, skill) in skills {
+            appendix.push_str(&format!(
+                "\n- {name}: {} (SKILL.md: {})",
+                skill.description,
+                skill.path.display()
+            ));
+        }
+        Ok(appendix)
+    })
+    .await
+    .context("extension skill catalog loader stopped")?
+}
+
 fn project_chain(cwd: &Path) -> Vec<PathBuf> {
     let mut ancestors = cwd
         .ancestors()
@@ -167,8 +208,15 @@ fn user_skill_roots() -> Vec<PathBuf> {
     roots
 }
 
-fn load_skill_root(root: &Path, skills: &mut BTreeMap<String, SkillEntry>) -> Result<()> {
-    let Ok(entries) = std::fs::read_dir(root) else {
+fn load_skill_root(
+    root: &Path,
+    skills: &mut BTreeMap<String, SkillEntry>,
+    require_containment: bool,
+) -> Result<()> {
+    let Ok(canonical_root) = root.canonicalize() else {
+        return Ok(());
+    };
+    let Ok(entries) = std::fs::read_dir(&canonical_root) else {
         return Ok(());
     };
     for entry in entries {
@@ -177,17 +225,25 @@ fn load_skill_root(root: &Path, skills: &mut BTreeMap<String, SkillEntry>) -> Re
         }
         let entry = entry?;
         let path = entry.path().join("SKILL.md");
-        let Ok(metadata) = path.metadata() else {
+        let Ok(canonical) = path.canonicalize() else {
+            continue;
+        };
+        if require_containment && !canonical.starts_with(&canonical_root) {
+            bail!(
+                "skill path escapes its declared root {}",
+                canonical_root.display()
+            );
+        }
+        let Ok(metadata) = canonical.metadata() else {
             continue;
         };
         if !metadata.is_file() || metadata.len() > MAX_SKILL_BYTES {
             continue;
         }
-        let content = std::fs::read_to_string(&path)
-            .with_context(|| format!("inspect skill {}", path.display()))?;
+        let content = std::fs::read_to_string(&canonical)
+            .with_context(|| format!("inspect skill {}", canonical.display()))?;
         let fallback_name = entry.file_name().to_string_lossy().to_string();
         let (name, description) = skill_metadata(&content, &fallback_name);
-        let canonical = path.canonicalize()?;
         skills.insert(
             name,
             SkillEntry {
@@ -238,8 +294,8 @@ mod tests {
             .expect("skill");
         }
         let mut skills = BTreeMap::new();
-        load_skill_root(&user.path().join("skills"), &mut skills).expect("user skills");
-        load_skill_root(&root.path().join("skills"), &mut skills).expect("project skills");
+        load_skill_root(&user.path().join("skills"), &mut skills, false).expect("user skills");
+        load_skill_root(&root.path().join("skills"), &mut skills, false).expect("project skills");
         assert_eq!(skills["review"].description, "project");
     }
 
@@ -261,5 +317,44 @@ mod tests {
             context.skills["extension-audit"].description,
             "trusted extension"
         );
+    }
+
+    #[tokio::test]
+    async fn non_native_provider_appendix_names_the_exact_extension_skill_path() {
+        let extension = tempfile::tempdir().expect("extension");
+        let directory = extension.path().join("skills").join("audit");
+        std::fs::create_dir_all(&directory).expect("skill directory");
+        let skill_path = directory.join("SKILL.md");
+        std::fs::write(
+            &skill_path,
+            "---\nname: extension-audit\ndescription: trusted extension\n---\n",
+        )
+        .expect("skill");
+
+        let appendix = extension_skill_prompt_appendix(vec![extension.path().join("skills")])
+            .await
+            .expect("appendix");
+        assert!(appendix.contains("extension-audit: trusted extension"));
+        assert!(appendix.contains(&skill_path.canonicalize().unwrap().display().to_string()));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn extension_skill_catalog_rejects_a_symlink_escape() {
+        let extension = tempfile::tempdir().expect("extension");
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::write(
+            outside.path().join("SKILL.md"),
+            "---\nname: escaped\ndescription: outside package\n---\n",
+        )
+        .expect("outside skill");
+        let skills = extension.path().join("skills");
+        std::fs::create_dir_all(&skills).expect("skills");
+        std::os::unix::fs::symlink(outside.path(), skills.join("escaped")).expect("skill symlink");
+
+        let error = extension_skill_prompt_appendix(vec![skills])
+            .await
+            .expect_err("extension skill must remain within its root");
+        assert!(error.to_string().contains("escapes its declared root"));
     }
 }
