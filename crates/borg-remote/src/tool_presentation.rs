@@ -55,6 +55,12 @@ pub fn project_tool_presentation(
     is_error: bool,
 ) -> ToolPresentation {
     let (mut label, mut detail) = tool_call_summary(name, input);
+    if matches!(tool_leaf_name(name).as_str(), "read" | "read_file")
+        && let Some(output) = output
+        && let Some(output_detail) = read_output_detail(input, output)
+    {
+        detail = output_detail;
+    }
     let input_body =
         tool_code_view(name, input).map(|(language, text)| ToolPresentationBody { language, text });
     let input_has_diff = input_body
@@ -216,6 +222,16 @@ pub fn tool_code_view(name: &str, input: &Value) -> Option<(String, String)> {
     ) {
         return None;
     }
+    if name.to_ascii_lowercase().contains("edit")
+        && let Some((path, source)) = claude_edit_diff(input)
+    {
+        let language = Path::new(&path)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| format!("diff:{extension}"))
+            .unwrap_or_else(|| "diff".to_string());
+        return Some((language, source));
+    }
     if let Some(source) = edit_source(input) {
         let is_edit = name.to_ascii_lowercase().contains("edit")
             || name.to_ascii_lowercase().contains("patch")
@@ -282,6 +298,13 @@ pub fn is_diff_language(language: &str) -> bool {
 
 pub fn tool_call_summary(name: &str, input: &Value) -> (String, String) {
     let tool = tool_leaf_name(name);
+
+    if matches!(tool.as_str(), "toolsearch" | "tool_search") {
+        return (
+            "Search Tools".to_string(),
+            high_signal_detail(input).unwrap_or_default(),
+        );
+    }
 
     if let Some(git) = git_call(name, input) {
         return (git.action.label().to_string(), git.detail);
@@ -577,7 +600,9 @@ fn product_tool_summary(name: &str, input: &Value) -> Option<(String, String)> {
         "outlook_read_attachment" => "Read Outlook attachment",
         _ => return None,
     };
-    let detail = if matches!(
+    let detail = if matches!(leaf.as_str(), "read" | "read_file") {
+        read_tool_detail(input).unwrap_or_default()
+    } else if matches!(
         leaf.as_str(),
         "edit" | "apply_patch" | "write" | "write_file"
     ) {
@@ -1217,6 +1242,54 @@ fn source_location(input: &Value) -> String {
     }
 }
 
+fn read_tool_detail(input: &Value) -> Option<String> {
+    let path = input_path(input)?;
+    let range = read_line_range(input).map(|(start, end)| format!(":{start}-{end}"));
+    Some(format!("{path}{}", range.unwrap_or_default()))
+}
+
+fn read_output_detail(input: &Value, output: &str) -> Option<String> {
+    let value = serde_json::from_str::<Value>(output).ok()?;
+    let path = input_path(input)
+        .or_else(|| value.get("path").and_then(Value::as_str))
+        .or_else(|| value.get("file_path").and_then(Value::as_str))?;
+    let range = read_line_range(&value)?;
+    Some(format!("{path}:{}-{}", range.0, range.1))
+}
+
+fn read_line_range(input: &Value) -> Option<(u64, u64)> {
+    let start = first_number(
+        input,
+        &[
+            "offset_line",
+            "start_line",
+            "line_start",
+            "offsetLine",
+            "startLine",
+            "line",
+        ],
+    );
+    let end = first_number(input, &["end_line", "line_end", "endLine"]);
+    let limit = first_number(
+        input,
+        &["limit_lines", "line_count", "num_lines", "limitLines"],
+    );
+    match (start, end, limit) {
+        (Some(start), Some(end), _) => Some((start, end)),
+        (Some(start), None, Some(limit)) if limit > 0 => {
+            Some((start, start.saturating_add(limit - 1)))
+        }
+        (None, Some(end), _) => Some((1, end)),
+        (None, None, Some(limit)) if limit > 0 => Some((1, limit)),
+        _ => None,
+    }
+}
+
+fn first_number(input: &Value, keys: &[&str]) -> Option<u64> {
+    keys.iter()
+        .find_map(|key| input.get(key).and_then(Value::as_u64))
+}
+
 fn format_duration(milliseconds: u64) -> String {
     if milliseconds >= 1_000 && milliseconds.is_multiple_of(1_000) {
         format!("{}s", milliseconds / 1_000)
@@ -1410,6 +1483,46 @@ fn edit_source(value: &Value) -> Option<&str> {
     }
 }
 
+/// Claude's native Edit tool carries a replacement pair instead of a patch.
+/// Keep the input useful while the tool is running by projecting that pair
+/// into the same diff body used by patch-based edit tools.
+fn claude_edit_diff(value: &Value) -> Option<(String, String)> {
+    match value {
+        Value::Array(items) => items.iter().find_map(claude_edit_diff),
+        Value::Object(fields) => {
+            let path = ["file_path", "path", "filename"]
+                .into_iter()
+                .find_map(|key| fields.get(key).and_then(Value::as_str));
+            let old = fields.get("old_string").and_then(Value::as_str);
+            let new = fields.get("new_string").and_then(Value::as_str);
+            if let (Some(path), Some(old), Some(new)) = (path, old, new)
+                && old != new
+            {
+                return Some((path.to_string(), replacement_diff(old, new, path)));
+            }
+            fields
+                .get("input")
+                .and_then(claude_edit_diff)
+                .or_else(|| fields.get("changes").and_then(claude_edit_diff))
+        }
+        _ => None,
+    }
+}
+
+fn replacement_diff(old: &str, new: &str, path: &str) -> String {
+    let mut lines = vec![format!("--- {path}"), format!("+++ {path}")];
+    lines.extend(prefixed_diff_lines('-', old));
+    lines.extend(prefixed_diff_lines('+', new));
+    lines.join("\n")
+}
+
+fn prefixed_diff_lines(prefix: char, source: &str) -> Vec<String> {
+    source
+        .split_inclusive('\n')
+        .map(|line| format!("{prefix}{}", line.trim_end_matches('\n')))
+        .collect()
+}
+
 fn edit_path(value: &Value) -> Option<String> {
     match value {
         Value::Array(items) => items.iter().find_map(edit_path),
@@ -1478,6 +1591,42 @@ mod tests {
     }
 
     #[test]
+    fn presents_tool_search_and_read_line_ranges_compactly() {
+        let tools = tool_call_summary(
+            "toolsearch",
+            &json!({"query": "select:mcp__borg_agent__get_goal"}),
+        );
+        assert_eq!(
+            tools,
+            (
+                "Search Tools".to_string(),
+                "select:mcp__borg_agent__get_goal".to_string()
+            )
+        );
+
+        let read = tool_call_summary(
+            "mcp__borg__read_file",
+            &json!({
+                "path": "docs/guide.md",
+                "offset_line": 12,
+                "limit_lines": 8
+            }),
+        );
+        assert_eq!(
+            read,
+            ("Read".to_string(), "docs/guide.md:12-19".to_string())
+        );
+
+        let completed = project_tool_presentation(
+            "mcp__borg__read_file",
+            &json!({"path": "docs/guide.md"}),
+            Some(r#"{"path":"docs/guide.md","start_line":12,"end_line":19}"#),
+            false,
+        );
+        assert_eq!(completed.detail, "docs/guide.md:12-19");
+    }
+
+    #[test]
     fn does_not_present_unmarked_file_contents_as_a_diff() {
         let edit = project_tool_presentation(
             "Edit",
@@ -1492,6 +1641,30 @@ mod tests {
         assert_eq!(
             edit.input.as_ref().map(|body| body.language.as_str()),
             Some("json")
+        );
+    }
+
+    #[test]
+    fn presents_claude_edit_replacements_as_a_diff() {
+        let edit = project_tool_presentation(
+            "Edit",
+            &json!({
+                "replace_all": false,
+                "file_path": "docs/review.md",
+                "old_string": "old line\n",
+                "new_string": "new line\n"
+            }),
+            None,
+            false,
+        );
+
+        assert_eq!(
+            edit.input.as_ref().map(|body| body.language.as_str()),
+            Some("diff:md")
+        );
+        assert_eq!(
+            edit.input.as_ref().map(|body| body.text.as_str()),
+            Some("--- docs/review.md\n+++ docs/review.md\n-old line\n+new line")
         );
     }
 

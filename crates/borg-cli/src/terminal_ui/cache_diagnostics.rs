@@ -11,8 +11,14 @@ use chrono::{DateTime, Utc};
 // prompt). A warning should describe a materially lost prefix, not rounding.
 const CACHE_MISS_NOISE_FLOOR_TOKENS: u64 = 2_048;
 const CACHE_MISS_MINIMUM_PRIOR_PREFIX_PERCENT: u64 = 5;
+// These are warning thresholds, not expiry guarantees. OpenAI documents a
+// 30-minute minimum TTL for GPT-5.6 prompt-cache breakpoints. Claude Code
+// requests a one-hour TTL automatically for subscription auth; its five-minute
+// default applies to API-key and third-party billing routes. The display
+// projection currently identifies the native Claude route, not the auth mode,
+// so use the subscription-safe one-hour threshold to avoid false warnings.
 const CODEX_CACHE_WINDOW: Duration = Duration::from_secs(30 * 60);
-const CLAUDE_CACHE_WINDOW: Duration = Duration::from_secs(5 * 60);
+const CLAUDE_CACHE_WINDOW: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct CacheSignature {
@@ -235,8 +241,13 @@ impl CacheStatus {
                 )
             },
         );
+        let qualification = self
+            .label
+            .starts_with("cache may be cold · ")
+            .then_some(" Review before sending; provider retention is not a guarantee.")
+            .unwrap_or_default();
         format!(
-            "Cold cache: {reason}; the next turn may {resend}. Run /clear first if that \
+            "Cold cache: {reason}; the next turn may {resend}.{qualification} Run /clear first if that \
              context is no longer useful."
         )
     }
@@ -412,6 +423,10 @@ mod tests {
         CacheSignature::new(CodingProvider::Codex, Some(model), Some(effort))
     }
 
+    fn claude_signature(model: &str) -> CacheSignature {
+        CacheSignature::new(CodingProvider::Claude, Some(model), None)
+    }
+
     fn usage(input: u64, cached: u64) -> CacheUsage<'static> {
         usage_with_cache_creation(input, cached, 0)
     }
@@ -453,6 +468,32 @@ mod tests {
             notice.cause,
             CacheMissCause::Idle(Duration::from_secs(31 * 60))
         );
+    }
+
+    #[test]
+    fn idle_warning_is_available_before_the_next_turn() {
+        let mut diagnostics = CacheDiagnostics::default();
+        let at = Utc::now();
+        let signature = claude_signature("claude-opus-5");
+        diagnostics.observe(at, signature.clone(), usage(1_000, 99_000));
+        diagnostics.observe(
+            at + TimeDelta::minutes(1),
+            signature.clone(),
+            usage(0, 100_000),
+        );
+
+        let status = diagnostics
+            .status(at + TimeDelta::minutes(8), &signature)
+            .expect("measured cache status");
+        assert!(!status.warning);
+        assert_eq!(status.label, "cache 100% hit");
+
+        let status = diagnostics
+            .status(at + TimeDelta::minutes(61), &signature)
+            .expect("idle cache status");
+        assert!(status.warning);
+        assert_eq!(status.label, "cache may be cold · 1h idle");
+        assert!(status.cold_cache_guidance().contains("before sending"));
     }
 
     #[test]

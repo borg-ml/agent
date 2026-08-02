@@ -1186,6 +1186,7 @@ async fn run_local_agent_session(
     let mut input_open = can_prompt && terminal.is_none();
     let mut delivered_projection = DeliveredSessionProjection::new(session_state.clone());
     let mut status = session_state.status.unwrap_or(SessionStatus::Starting);
+    let mut status_detail = session_state.status_detail.clone();
     let mut pending_approval = session_state.pending_approval_id.clone();
     let mut pending_provider_interaction = session_state
         .pending_provider_interaction_id
@@ -1513,8 +1514,9 @@ async fn run_local_agent_session(
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .clear();
                 }
-                if let SessionEventKind::StatusChanged { status: next, .. } = &event.kind {
+                if let SessionEventKind::StatusChanged { status: next, detail } = &event.kind {
                     status = *next;
+                    status_detail = detail.clone();
                     saw_running |= *next == SessionStatus::Running;
                     if matches!(
                         next,
@@ -2112,7 +2114,12 @@ async fn run_local_agent_session(
                                 | SessionStatus::WaitingForApproval
                         );
                         let (delivery, text) = if active {
-                            running_input(line, provider, steer_active_codex)
+                            running_input(
+                                line,
+                                provider,
+                                steer_active_codex,
+                                status_is_compacting(status_detail.as_deref()),
+                            )
                         } else {
                             idle_input(line)
                         };
@@ -2580,7 +2587,11 @@ async fn run_local_agent_session(
                                 .as_ref()
                                 .and_then(BorgTerminal::session_provider)
                                 .unwrap_or(provider);
-                            let delivery = default_active_delivery(active_provider, steer_active_codex);
+                            let delivery = if status_is_compacting(status_detail.as_deref()) {
+                                PromptDelivery::Queue
+                            } else {
+                                default_active_delivery(active_provider, steer_active_codex)
+                            };
                             terminal
                                 .as_mut()
                                 .expect("terminal")
@@ -3270,7 +3281,12 @@ async fn run_local_agent_session(
                                         .and_then(BorgTerminal::session_provider)
                                         .unwrap_or(provider);
                                     let (delivery, text) = if active {
-                                        running_input(&text, active_provider, steer_active_codex)
+                                        running_input(
+                                            &text,
+                                            active_provider,
+                                            steer_active_codex,
+                                            status_is_compacting(status_detail.as_deref()),
+                                        )
                                     } else {
                                         idle_input(&text)
                                     };
@@ -4451,6 +4467,7 @@ fn running_input(
     line: &str,
     provider: CodingProvider,
     steer_active_turn: bool,
+    compacting: bool,
 ) -> (PromptDelivery, String) {
     if let Some(text) = line.strip_prefix("/queue ") {
         return (PromptDelivery::Queue, text.trim().to_string());
@@ -4468,9 +4485,17 @@ fn running_input(
         );
     }
     (
-        default_active_delivery(provider, steer_active_turn),
+        if compacting {
+            PromptDelivery::Queue
+        } else {
+            default_active_delivery(provider, steer_active_turn)
+        },
         line.to_string(),
     )
+}
+
+fn status_is_compacting(detail: Option<&str>) -> bool {
+    detail.is_some_and(|detail| detail.to_ascii_lowercase().contains("compact"))
 }
 
 fn default_active_delivery(provider: CodingProvider, steer_active_turn: bool) -> PromptDelivery {
@@ -5666,37 +5691,57 @@ mod tests {
     #[test]
     fn active_message_delivery_respects_provider_capability_and_explicit_override() {
         assert_eq!(
-            running_input("plain", CodingProvider::Codex, true).0,
+            running_input("plain", CodingProvider::Codex, true, false).0,
             PromptDelivery::Steer
         );
         assert_eq!(
-            running_input("plain", CodingProvider::Codex, false).0,
+            running_input("plain", CodingProvider::Codex, false, false).0,
             PromptDelivery::Queue
         );
         assert_eq!(
-            running_input("/queue later", CodingProvider::Codex, true).0,
+            running_input("/queue later", CodingProvider::Codex, true, false).0,
             PromptDelivery::Queue
         );
         assert_eq!(
-            running_input("/steer now", CodingProvider::Codex, false).0,
+            running_input("/steer now", CodingProvider::Codex, false, false).0,
             PromptDelivery::Steer
         );
         assert_eq!(
-            running_input("plain", CodingProvider::OpenRouter, true).0,
+            running_input("plain", CodingProvider::OpenRouter, true, false).0,
             PromptDelivery::Steer
         );
         assert_eq!(
-            running_input("/steer now", CodingProvider::OpenAiCompatible, false).0,
+            running_input("/steer now", CodingProvider::OpenAiCompatible, false, false).0,
             PromptDelivery::Steer
         );
         assert_eq!(
-            running_input("plain", CodingProvider::Claude, true).0,
+            running_input("plain", CodingProvider::Claude, true, false).0,
             PromptDelivery::Steer
         );
         assert_eq!(
-            running_input("/steer now", CodingProvider::Claude, false).0,
+            running_input("/steer now", CodingProvider::Claude, false, false).0,
             PromptDelivery::Steer
         );
+    }
+
+    #[test]
+    fn ordinary_followups_queue_while_context_is_compacting() {
+        assert_eq!(
+            running_input("usage details", CodingProvider::Codex, true, true).0,
+            PromptDelivery::Queue
+        );
+        assert_eq!(
+            running_input("usage details", CodingProvider::Claude, true, true).0,
+            PromptDelivery::Queue
+        );
+        assert_eq!(
+            running_input("/steer now", CodingProvider::Codex, false, true).0,
+            PromptDelivery::Steer
+        );
+        assert!(status_is_compacting(Some(
+            "Automatically compacting context"
+        )));
+        assert!(!status_is_compacting(Some("turn phase: provider active")));
     }
 
     #[test]

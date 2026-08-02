@@ -1460,7 +1460,10 @@ fn the_goal_status_segment_toggles_only_what_it_can() {
 
     goal.status = GoalStatus::Active;
     assert_eq!(goal_toggle_command(&goal), Some("/goal pause"));
-    assert_eq!(goal_tooltip_title(&goal), " Goal · click to manage ");
+    assert_eq!(
+        goal_tooltip_title(&goal),
+        " Goal · left toggle · right clear "
+    );
 
     for status in [
         GoalStatus::Paused,
@@ -1469,13 +1472,19 @@ fn the_goal_status_segment_toggles_only_what_it_can() {
     ] {
         goal.status = status;
         assert_eq!(goal_toggle_command(&goal), Some("/goal resume"));
-        assert_eq!(goal_tooltip_title(&goal), " Goal · click to manage ");
+        assert_eq!(
+            goal_tooltip_title(&goal),
+            " Goal · left toggle · right clear "
+        );
     }
 
     for status in [GoalStatus::BudgetLimited, GoalStatus::Complete] {
         goal.status = status;
         assert_eq!(goal_toggle_command(&goal), None);
-        assert_eq!(goal_tooltip_title(&goal), " Goal · click to manage ");
+        assert_eq!(
+            goal_tooltip_title(&goal),
+            " Goal · left manage · right clear "
+        );
     }
 }
 
@@ -1800,6 +1809,14 @@ fn shift_or_alt_enter_inserts_a_composer_newline() {
     assert!(is_composer_newline(
         &keymap,
         &KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)
+    ));
+    assert!(is_composer_newline(
+        &keymap,
+        &KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT | KeyModifiers::SUPER)
+    ));
+    assert!(!is_composer_newline(
+        &keymap,
+        &KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL | KeyModifiers::SHIFT)
     ));
     assert!(!is_composer_newline(
         &keymap,
@@ -4041,7 +4058,7 @@ fn up_recall_targets_all_queued_prompts_only_for_an_empty_composer() {
 }
 
 #[test]
-fn up_does_not_fake_recall_an_already_submitted_steer() {
+fn up_asks_the_session_to_reconcile_a_pending_steer() {
     let steer = PendingPromptProjection {
         message_id: Uuid::new_v4(),
         text: "already submitted".to_string(),
@@ -4052,14 +4069,8 @@ fn up_does_not_fake_recall_an_already_submitted_steer() {
         "",
         std::slice::from_ref(&steer)
     ));
-    assert!(pending_steer_blocks_history_recall(
-        "",
-        std::slice::from_ref(&steer)
-    ));
-    assert!(!pending_steer_blocks_history_recall(
-        "draft in progress",
-        &[steer]
-    ));
+    assert!(has_pending_steer_prompts("", std::slice::from_ref(&steer)));
+    assert!(!has_pending_steer_prompts("draft in progress", &[steer]));
 }
 
 #[test]

@@ -80,8 +80,7 @@ const COMMAND_PANEL_BG: Color = Color::Rgb(31, 24, 27);
 /// segment underlines its own text only.
 const STATUS_SEPARATOR: &str = " · ";
 const GIT_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
-const STEER_SENT_NOTICE: &str =
-    "Steer already sent to the active turn · Esc interrupts and sends it next";
+const GOAL_CLEAR_COMMAND: &str = "/goal clear";
 const DIRECTOR_CONTEXT_BOUNDARY: &str = "— context provided by director agent —";
 const DOUBLE_CTRL_C_WINDOW: Duration = Duration::from_secs(1);
 const COPY_NOTICE_DURATION: Duration = Duration::from_secs(5);
@@ -1629,9 +1628,6 @@ impl BorgTerminal {
         text: String,
         delivery: PromptDelivery,
     ) {
-        if delivery == PromptDelivery::Steer && self.notice.as_deref() == Some(STEER_SENT_NOTICE) {
-            self.notice = None;
-        }
         if let Some(child) = target {
             push_queued_prompt(
                 self.child_queued_prompts.entry(child).or_default(),
@@ -1756,35 +1752,6 @@ impl BorgTerminal {
             self.session_state_sequence = self.session_state_sequence.max(event.sequence);
         }
         update_queued_prompts(&mut self.queued_prompts, &event.kind);
-        let steer_progressed = matches!(
-            &event.kind,
-            SessionEventKind::ProviderEvent { .. }
-                | SessionEventKind::Message {
-                    actor: EventActor::User,
-                    status: MessageStatus::InProgress,
-                    delivery: Some(PromptDelivery::Steer),
-                    ..
-                }
-                | SessionEventKind::Message {
-                    actor: EventActor::User,
-                    status: MessageStatus::Complete,
-                    delivery: Some(PromptDelivery::Steer),
-                    ..
-                }
-                | SessionEventKind::StatusChanged {
-                    status: SessionStatus::Ready,
-                    ..
-                }
-        );
-        if self.notice.as_deref() == Some(STEER_SENT_NOTICE)
-            && (steer_progressed
-                || !self
-                    .active_queued_prompts()
-                    .iter()
-                    .any(|prompt| prompt.delivery == PromptDelivery::Steer))
-        {
-            self.notice = None;
-        }
         match &event.kind {
             SessionEventKind::Message {
                 actor: EventActor::User,
@@ -2541,7 +2508,7 @@ impl BorgTerminal {
         });
     }
 
-    fn open_entry_actions(&mut self, index: usize) {
+    fn open_entry_actions(&mut self, index: usize) -> UiAction {
         let (title, options) = match self.transcript.order.get(index) {
             Some(TranscriptEntry::Message {
                 actor: EventActor::User,
@@ -2554,15 +2521,21 @@ impl BorgTerminal {
             Some(TranscriptEntry::Goal { .. }) => ("Goal actions", vec!["Copy goal"]),
             Some(TranscriptEntry::Plan { .. }) => ("Plan actions", vec!["Copy todo list"]),
             Some(TranscriptEntry::Info { .. }) => ("Card actions", vec!["Copy details"]),
-            _ => return,
+            _ => return UiAction::None,
         };
         self.transcript.selected = Some(index);
+        let run_directly = options.len() == 1;
         self.picker = Some(Picker::new(
             PickerKind::MessageActions,
             title,
             options,
             None,
         ));
+        if run_directly {
+            self.run_selected_message_action()
+        } else {
+            UiAction::None
+        }
     }
 
     fn open_goal_picker(&mut self) {
@@ -2720,8 +2693,11 @@ impl BorgTerminal {
                         .goal_status_area
                         .is_some_and(|area| area.contains(pointer))
                 {
-                    self.open_goal_picker();
-                    return Ok(UiAction::None);
+                    return Ok(UiAction::Submit {
+                        target: None,
+                        text: GOAL_CLEAR_COMMAND.to_string(),
+                        attachments: Vec::new(),
+                    });
                 }
                 if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
                     if self.picker.is_none()
@@ -2968,7 +2944,9 @@ impl BorgTerminal {
                         }
                     }
                     MouseEventKind::Down(MouseButton::Left) if self.hovered_message.is_some() => {
-                        self.open_entry_actions(self.hovered_message.expect("checked above"));
+                        return Ok(
+                            self.open_entry_actions(self.hovered_message.expect("checked above"))
+                        );
                     }
                     MouseEventKind::Down(MouseButton::Left) if self.hovered_entry.is_some() => {
                         let index = self.hovered_entry.expect("checked above");
@@ -2976,7 +2954,7 @@ impl BorgTerminal {
                             self.transcript.toggle_plan_expansion(index);
                             self.transcript_render_cache = None;
                         } else {
-                            self.open_entry_actions(index);
+                            return Ok(self.open_entry_actions(index));
                         }
                     }
                     MouseEventKind::Down(MouseButton::Left) => {
@@ -3701,7 +3679,8 @@ impl BorgTerminal {
             .filter(|_| {
                 status == SessionStatus::Ready
                     && self.picker.is_none()
-                    && !self.composer.text.trim().is_empty()
+                    && (!self.composer.text.trim().is_empty()
+                        || !self.composer.attachments.is_empty())
                     && !showing_slash_suggestions
                     && notice.is_none()
             })
@@ -5502,16 +5481,10 @@ impl BorgTerminal {
                         target: self.focused_child,
                     });
                 }
-                if pending_steer_blocks_history_recall(
-                    &self.composer.text,
-                    self.active_queued_prompts(),
-                ) {
+                if has_pending_steer_prompts(&self.composer.text, self.active_queued_prompts()) {
                     // Only the session knows whether the provider has accepted
-                    // the steer. An unacknowledged request comes back; one the
-                    // provider owns cannot be truthfully withdrawn. Either way
-                    // do not fall through to composer history, which would make
-                    // the steer look recalled without a session event.
-                    self.notice = Some(STEER_SENT_NOTICE.to_string());
+                    // the steer. Ask it to recall; an unacknowledged request
+                    // comes back, while an accepted one is safely ignored.
                     return Ok(UiAction::RecallQueuedPrompts {
                         target: self.focused_child,
                     });
@@ -5570,7 +5543,14 @@ impl BorgTerminal {
 }
 
 fn is_composer_newline(keymap: &KeyMap, key: &KeyEvent) -> bool {
+    // Some terminals add protocol metadata bits to modified Enter events;
+    // preserve the built-in multiline shortcut when those bits are present.
     keymap.matches(KeyAction::Newline, key)
+        || (key.code == KeyCode::Enter
+            && !key.modifiers.contains(KeyModifiers::CONTROL)
+            && key
+                .modifiers
+                .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT))
 }
 
 impl Drop for BorgTerminal {
@@ -7185,6 +7165,11 @@ impl Transcript {
                         Some(output),
                         *is_error,
                     );
+                    if completion_presentation.category == ToolPresentationCategory::Read
+                        && !completion_presentation.detail.is_empty()
+                    {
+                        *detail = completion_presentation.detail.clone();
+                    }
                     if completion_presentation.category == ToolPresentationCategory::Edit
                         && let Some(body) = completion_presentation
                             .output
@@ -9150,7 +9135,7 @@ fn has_recallable_queued_prompts(
             .any(|prompt| prompt.delivery == PromptDelivery::Queue)
 }
 
-fn pending_steer_blocks_history_recall(
+fn has_pending_steer_prompts(
     composer_text: &str,
     queued_prompts: &[PendingPromptProjection],
 ) -> bool {
@@ -10796,7 +10781,7 @@ fn bottom_interaction_hint(state: BottomInteractionHintState) -> Option<&'static
     if state.status_hovered && state.status_is_interruptible {
         Some("left click interrupt")
     } else if state.goal_status_hovered && state.goal_available {
-        Some("left click toggle goal · right click open menu")
+        Some("left click toggle/manage · right click clear goal")
     } else if state.agents_status_hovered {
         Some("left click to open subagents menu")
     } else if state.model_status_hovered {
@@ -10818,13 +10803,15 @@ fn permission_mode_label(mode: PermissionMode) -> &'static str {
     }
 }
 
-/// Name the click while the pointer is already on the segment, so goal
-/// management is discoverable without requiring slash-command knowledge.
+/// Name both goal actions while the pointer is already on the segment, so
+/// clearing does not require slash-command knowledge.
 fn goal_tooltip_title(goal: &SessionGoal) -> String {
-    match goal_toggle_command(goal) {
-        Some(_) => " Goal · click to manage ".to_string(),
-        None => " Goal · click to manage ".to_string(),
-    }
+    let left_action = if goal_toggle_command(goal).is_some() {
+        "toggle"
+    } else {
+        "manage"
+    };
+    format!(" Goal · left {left_action} · right clear ")
 }
 
 /// The slash command that flips a goal's run state, or `None` where there is
@@ -10848,7 +10835,7 @@ fn goal_picker_options(goal: &SessionGoal) -> Vec<PickerOption> {
         };
         options.push(PickerOption::new(toggle_label, toggle));
     }
-    options.push(PickerOption::new("Clear goal", "/goal clear"));
+    options.push(PickerOption::new("Clear goal", GOAL_CLEAR_COMMAND));
     options.push(PickerOption::new("Cancel", "cancel"));
     options
 }

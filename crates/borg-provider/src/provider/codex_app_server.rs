@@ -103,6 +103,9 @@ pub struct TurnResult {
     pub turn_token_usage: Option<TokenUsage>,
     pub total_token_usage: Option<TokenUsage>,
     pub model_context_window: Option<u64>,
+    /// The app-server process had to be discarded while honoring Escape.
+    /// Callers must not return this client to the idle pool.
+    pub discard_client: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -741,11 +744,14 @@ impl CodexAppServerClient {
                 .interrupt_deadline
                 .is_some_and(|deadline| Instant::now() >= deadline)
             {
-                self.terminate_process_tree()?;
-                bail!(
-                    "Codex app-server did not confirm turn {} interruption before the deadline; its process tree was terminated",
-                    state.turn_id
-                );
+                if let Err(error) = self.terminate_process_tree() {
+                    tracing::warn!(
+                        %error,
+                        turn_id = %state.turn_id,
+                        "failed to terminate the unresponsive Codex app-server after interrupt"
+                    );
+                }
+                return self.finish_turn(&state, interrupted_turn_result(&state, true));
             }
             let read_timeout = state
                 .interrupt_deadline
@@ -774,6 +780,7 @@ impl CodexAppServerClient {
 
     fn finish_turn(&mut self, state: &TurnState, result: TurnResult) -> Result<TurnResult> {
         if state.interrupt_requested
+            && !result.discard_client
             && let Err(error) = self.clean_background_terminals(&state.workspace_id)
         {
             let cleanup_error = self.terminate_process_tree().err();
@@ -1185,17 +1192,26 @@ impl CodexAppServerClient {
                             {
                                 return Ok(Some(result));
                             }
-                            return Ok(Some(TurnResult {
-                                workspace_id: state.workspace_id.clone(),
-                                output_text: state.output_text.clone(),
-                                reasoning_text: state.reasoning_text.clone(),
-                                raw_notifications: state.raw_notifications.clone(),
-                                turn_token_usage: state.turn_token_usage.clone(),
-                                total_token_usage: state.total_token_usage.clone(),
-                                model_context_window: state.model_context_window,
-                            }));
+                            return Ok(Some(interrupted_turn_result(state, false)));
                         }
-                        Err(error) => return Err(error),
+                        Err(error) => {
+                            if let Some(result) = completed_during_request {
+                                return Ok(Some(result));
+                            }
+                            tracing::warn!(
+                                %error,
+                                %turn_id,
+                                "Codex app-server did not acknowledge interrupt; discarding its process"
+                            );
+                            if let Err(cleanup_error) = self.terminate_process_tree() {
+                                tracing::warn!(
+                                    %cleanup_error,
+                                    %turn_id,
+                                    "failed to terminate the unresponsive Codex app-server"
+                                );
+                            }
+                            return Ok(Some(interrupted_turn_result(state, true)));
+                        }
                     }
                     if let Some(result) = completed_during_request {
                         return Ok(Some(result));
@@ -1749,6 +1765,19 @@ fn notification_requires_turn_id(method: Option<&str>) -> bool {
         || method.starts_with("item/")
 }
 
+fn interrupted_turn_result(state: &TurnState, discard_client: bool) -> TurnResult {
+    TurnResult {
+        workspace_id: state.workspace_id.clone(),
+        output_text: state.output_text.clone(),
+        reasoning_text: state.reasoning_text.clone(),
+        raw_notifications: state.raw_notifications.clone(),
+        turn_token_usage: state.turn_token_usage.clone(),
+        total_token_usage: state.total_token_usage.clone(),
+        model_context_window: state.model_context_window,
+        discard_client,
+    }
+}
+
 fn clear_managed_codex_env(command: &mut Command) {
     for key in [
         "BORG_OPENAI_AUTH_JSON_B64",
@@ -1984,6 +2013,7 @@ impl TurnState {
                     turn_token_usage: self.turn_token_usage.clone(),
                     total_token_usage: self.total_token_usage.clone(),
                     model_context_window: self.model_context_window,
+                    discard_client: false,
                 }));
             }
             _ => {}
@@ -2418,7 +2448,6 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"turn":{{"id":"turn-stuck"}}}
 read interrupt_request
 sleep 30 &
 printf '%s' "$!" > '{}'
-printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{}}}}'
 wait"#,
             pid_path.display()
         );
@@ -2430,7 +2459,7 @@ wait"#,
             .expect("queue interrupt");
 
         let started = Instant::now();
-        let error = client
+        let result = client
             .turn_execute_streaming_with_schema_steering_and_attachments(
                 CodexTurnInput {
                     prompt: "work",
@@ -2442,9 +2471,9 @@ wait"#,
                 Some(&mut control_rx),
                 |_| Ok(()),
             )
-            .expect_err("missing turn/completed must force cleanup");
+            .expect("Escape should complete locally after forcing provider cleanup");
         assert!(started.elapsed() < Duration::from_secs(4));
-        assert!(error.to_string().contains("process tree was terminated"));
+        assert!(result.discard_client);
 
         let descendant_pid = fs::read_to_string(&pid_path)
             .expect("descendant pid")

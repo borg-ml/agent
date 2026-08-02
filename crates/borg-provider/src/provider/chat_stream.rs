@@ -1678,30 +1678,32 @@ async fn run_codex_app_server_inner(
         if cancellation.load(Ordering::Acquire) {
             return Ok(());
         }
-        if let Some(pool) = pool.as_ref() {
-            // `turn/completed` is not enough to establish Borg's Ready
-            // boundary: a provider extension can start another turn from its
-            // idle hook. Reconcile the bounded live turn page and stop any
-            // unowned continuation before transferring this client to the
-            // idle pool.
-            client
-                .settle_pooled_thread_before_input()
-                .context("failed to establish an idle Codex thread after turn completion")?;
-            if cancellation.load(Ordering::Acquire) {
-                return Ok(());
+        if !result.discard_client {
+            if let Some(pool) = pool.as_ref() {
+                // `turn/completed` is not enough to establish Borg's Ready
+                // boundary: a provider extension can start another turn from
+                // its idle hook. Reconcile the bounded live turn page and stop
+                // any unowned continuation before transferring this client to
+                // the idle pool.
+                client
+                    .settle_pooled_thread_before_input()
+                    .context("failed to establish an idle Codex thread after turn completion")?;
+                if cancellation.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                client.detach_cancellation();
+                *pool
+                    .inner
+                    .lock()
+                    .expect("Codex app-server pool lock poisoned") =
+                    Some(PooledCodexAppServer {
+                        client,
+                        key: pool_key,
+                        owner_session_id: req.owner_session_id.clone(),
+                    });
+            } else if let Err(error) = client.shutdown() {
+                tracing::warn!(?error, "failed to shut down codex app-server after streamed turn");
             }
-            client.detach_cancellation();
-            *pool
-                .inner
-                .lock()
-                .expect("Codex app-server pool lock poisoned") =
-                Some(PooledCodexAppServer {
-                    client,
-                    key: pool_key,
-                    owner_session_id: req.owner_session_id.clone(),
-                });
-        } else if let Err(error) = client.shutdown() {
-            tracing::warn!(?error, "failed to shut down codex app-server after streamed turn");
         }
         let duration_ms = elapsed_millis_u64(started_at);
         let usage = codex_turn_usage(
