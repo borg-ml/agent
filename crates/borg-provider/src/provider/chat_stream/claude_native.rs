@@ -9,14 +9,10 @@
 //!
 //! Wire protocol reference: `docs/claude-native-protocol.md`.
 
-// The framing and resolution layer lands before the runner that drives it.
-// Remove once `run_claude_native_chat_stream` consumes these.
-#![allow(dead_code)]
-
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -203,6 +199,9 @@ pub(super) struct ClaudeBinary {
     /// platform package. `None` for a system `claude` on PATH, which ships no
     /// manifest — we accept it and rely on the `system/init` capability list.
     pub(super) harness_schema: Option<u64>,
+    /// The SDK wrapper version from the sibling package manifest, when available.
+    /// Claude Code uses this for SDK-originated telemetry and feature gates.
+    pub(super) sdk_version: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -219,6 +218,12 @@ struct SdkManifest {
 struct SdkCompat {
     #[serde(default)]
     harness_schema: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WrapperManifest {
+    #[serde(default)]
+    version: Option<String>,
 }
 
 /// Locate the `claude` binary, most-explicit source first.
@@ -277,30 +282,36 @@ fn describe(path: PathBuf) -> Result<ClaudeBinary> {
     let path = path
         .canonicalize()
         .with_context(|| format!("failed to canonicalize {}", path.display()))?;
-    let harness_schema = read_harness_schema(&path)?;
+    let (harness_schema, sdk_version) = read_manifest_metadata(&path)?;
     Ok(ClaudeBinary {
         path,
         harness_schema,
+        sdk_version,
     })
 }
 
 /// Read `sdkCompat.harnessSchema` from a manifest next to the binary, if one
 /// exists, and reject a schema this build does not understand.
-fn read_harness_schema(binary: &Path) -> Result<Option<u64>> {
+fn read_manifest_metadata(binary: &Path) -> Result<(Option<u64>, Option<String>)> {
     let Some(manifest_path) = manifest_beside(binary) else {
-        return Ok(None);
+        return Ok((None, None));
     };
     let raw = match std::fs::read_to_string(&manifest_path) {
         Ok(raw) => raw,
-        Err(_) => return Ok(None),
+        Err(_) => return Ok((None, None)),
     };
     // A manifest we cannot parse is not fatal — it is metadata, and the binary
     // may still be fine. Only an explicitly unsupported schema stops us.
     let Ok(manifest) = serde_json::from_str::<SdkManifest>(&raw) else {
-        return Ok(None);
+        return Ok((None, None));
     };
+    let sdk_version = manifest_path
+        .parent()
+        .and_then(|dir| std::fs::read_to_string(dir.join("../claude-agent-sdk/package.json")).ok())
+        .and_then(|raw| serde_json::from_str::<WrapperManifest>(&raw).ok())
+        .and_then(|package| package.version);
     let Some(schema) = manifest.sdk_compat.and_then(|compat| compat.harness_schema) else {
-        return Ok(None);
+        return Ok((None, sdk_version));
     };
     if !SUPPORTED_HARNESS_SCHEMAS.contains(&schema) {
         return Err(anyhow!(
@@ -312,10 +323,11 @@ fn read_harness_schema(binary: &Path) -> Result<Option<u64>> {
     }
     tracing::debug!(
         schema,
-        version = manifest.version.as_deref().unwrap_or("unknown"),
+        binary_version = manifest.version.as_deref().unwrap_or("unknown"),
+        sdk_version = sdk_version.as_deref().unwrap_or("unknown"),
         "resolved claude binary"
     );
-    Ok(Some(schema))
+    Ok((Some(schema), sdk_version))
 }
 
 fn manifest_beside(binary: &Path) -> Option<PathBuf> {
@@ -935,8 +947,15 @@ impl ControlChannel {
         frames
     }
 
+    #[cfg(test)]
     pub(super) fn has_pending_approval(&self, approval_id: &str) -> bool {
         self.pending_approvals.contains_key(approval_id)
+    }
+
+    pub(super) fn has_pending_context_usage(&self) -> bool {
+        self.pending_requests
+            .values()
+            .any(|kind| *kind == OutboundKind::ContextUsage)
     }
 }
 
@@ -951,6 +970,7 @@ fn first_str(value: &Value, keys: &[&str]) -> Option<String> {
 }
 
 /// A user message line on stdin — the same envelope the sidecar built.
+#[cfg(test)]
 pub(super) fn user_message(text: &str) -> Value {
     user_message_with_id(text).1
 }
@@ -1052,6 +1072,28 @@ pub(super) fn initialize_request(system_prompt: Option<&str>) -> Value {
         request["systemPrompt"] = Value::Array(vec![Value::String(prompt.to_string())]);
     }
     request
+}
+
+/// Ask the CLI for the same live context telemetry that the TypeScript SDK
+/// obtains with `stream.getContextUsage()` after each assistant message.
+async fn request_context_usage(
+    channel: &mut ControlChannel,
+    stdin: &mut tokio::process::ChildStdin,
+) -> Result<()> {
+    let request_id = format!("borg-context-{}", uuid::Uuid::new_v4());
+    channel.begin_request(&request_id, OutboundKind::ContextUsage);
+    let result = write_line(
+        stdin,
+        &serde_json::to_value(OutboundControlRequest::new(
+            &request_id,
+            serde_json::json!({"subtype": "get_context_usage"}),
+        ))?,
+    )
+    .await;
+    if result.is_err() {
+        channel.pending_requests.remove(&request_id);
+    }
+    result
 }
 
 #[cfg(test)]
@@ -1573,16 +1615,24 @@ use super::claude_stream::ClaudeStreamState;
 use super::{
     ChatStreamControl, ChatStreamRequest, LocalAgentPermission, ProviderAuthProvider,
     ProviderCallUsage, classify_claude_provider_event, elapsed_millis_u64, is_nonempty_session_id,
-    prepare_git_credential_env, prepare_request_mcp, read_mcp_servers_from_config, restore_bundle,
-    summarize_claude_provider_event,
+    prepare_git_credential_env, prepare_request_mcp, read_mcp_servers_from_config,
+    receive_claude_control, restore_bundle, summarize_claude_provider_event,
 };
+use crate::ProviderChannel;
 
 /// True when the native path should be used instead of the Node sidecar.
+///
+/// Native Rust is the production default. `BORG_CLAUDE_NATIVE=0` (or
+/// `false`/`sidecar`) remains an explicit escape hatch for deployments that
+/// still need the compatibility adapter during a staged rollout.
 pub(super) fn native_enabled() -> bool {
-    matches!(
-        std::env::var("BORG_CLAUDE_NATIVE").as_deref(),
-        Ok("1") | Ok("true")
-    )
+    match std::env::var("BORG_CLAUDE_NATIVE") {
+        Ok(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "sidecar" | "node" | "sdk"
+        ),
+        Err(_) => true,
+    }
 }
 
 /// Mirrors the sidecar's attachment handling: local paths are appended to the
@@ -1599,20 +1649,45 @@ fn prompt_text(prompt: &str, attachments: &[PathBuf]) -> String {
     format!("{prompt}\n\nAttached files:\n{list}")
 }
 
-pub(super) async fn run(
-    req: ChatStreamRequest,
-    tx: tokio::sync::mpsc::Sender<super::ChatStreamEvent>,
-    mut controls: Option<tokio::sync::mpsc::Receiver<ChatStreamControl>>,
+fn permission_mode(permission: LocalAgentPermission) -> &'static str {
+    match permission {
+        LocalAgentPermission::FullAccess => "bypassPermissions",
+        LocalAgentPermission::Auto => "acceptEdits",
+        LocalAgentPermission::Manual => "default",
+    }
+}
+
+/// The TypeScript SDK passes these settings through the CLI's `--settings`
+/// JSON flag. Keeping the exact pair together matters: Claude Code requires
+/// the per-session opt-in when fast mode is enabled by an SDK caller.
+fn fast_settings() -> String {
+    serde_json::json!({
+        "fastMode": true,
+        "fastModePerSessionOptIn": true,
+    })
+    .to_string()
+}
+
+/// Build the child command shared by one-shot and pooled native turns.
+/// Process-stable options are deliberately derived from the request here so a
+/// pooled process cannot accidentally inherit a previous turn's workspace,
+/// permissions, MCP configuration, or provider channel.
+fn build_native_command(
+    binary: &ClaudeBinary,
+    req: &ChatStreamRequest,
+    provider_home: &Path,
     local_auth: bool,
     permission: LocalAgentPermission,
-) -> Result<()> {
-    let started_at = std::time::Instant::now();
-    let binary = resolve_claude_binary()?;
-    let provider_home = tempfile::tempdir().context("failed to create Claude provider home")?;
+) -> Result<Command> {
+    tracing::debug!(
+        harness_schema = ?binary.harness_schema,
+        sdk_version = ?binary.sdk_version,
+        "building native Claude command"
+    );
     let workspace_dir = req
         .working_directory
         .clone()
-        .unwrap_or_else(|| provider_home.path().to_path_buf());
+        .unwrap_or_else(|| provider_home.to_path_buf());
     std::fs::create_dir_all(&workspace_dir).with_context(|| {
         format!(
             "failed to create Claude workspace directory {}",
@@ -1623,33 +1698,19 @@ pub(super) async fn run(
     if let Some(auth) = req.provider_auth.as_ref()
         && auth.provider == ProviderAuthProvider::Claude
     {
-        restore_bundle(
-            ProviderAuthProvider::Claude,
-            &auth.bundle,
-            provider_home.path(),
-        )
-        .context("failed to restore Claude provider auth bundle")?;
+        restore_bundle(ProviderAuthProvider::Claude, &auth.bundle, provider_home)
+            .context("failed to restore Claude provider auth bundle")?;
     }
 
-    let mcp_setup = prepare_request_mcp(provider_home.path(), &req, local_auth)?;
+    let mcp_setup = prepare_request_mcp(provider_home, req, local_auth)?;
     let mcp_servers = read_mcp_servers_from_config(mcp_setup.claude_config_path.as_deref())
         .context("failed to load Claude MCP server config")?;
-    let git_env = prepare_git_credential_env(provider_home.path(), &req.git_credentials)
+    let git_env = prepare_git_credential_env(provider_home, &req.git_credentials)
         .context("failed to prepare git credential helper")?;
 
     let mut command = Command::new(&binary.path);
-    command.args(BASE_ARGS);
-    // Always route permissions to us. The permission mode still decides
-    // whether the CLI asks at all; this only says who it asks.
-    command.args(STDIO_PERMISSION_ARGS);
-    command.args([
-        "--permission-mode",
-        match permission {
-            LocalAgentPermission::FullAccess => "bypassPermissions",
-            LocalAgentPermission::Auto => "acceptEdits",
-            LocalAgentPermission::Manual => "default",
-        },
-    ]);
+    command.args(BASE_ARGS).args(STDIO_PERMISSION_ARGS);
+    command.args(["--permission-mode", permission_mode(permission)]);
     if matches!(permission, LocalAgentPermission::FullAccess) {
         command.arg("--allow-dangerously-skip-permissions");
     }
@@ -1670,12 +1731,14 @@ pub(super) async fn run(
     let effort = req.effort.clone().unwrap_or_else(|| "medium".to_string());
     command.args(["--effort", &effort]);
 
+    if req.fast {
+        let settings = fast_settings();
+        command.args(["--settings", &settings]);
+    }
     if let Some(schema) = req.output_schema.as_ref() {
         command.args(["--json-schema", &serde_json::to_string(schema)?]);
     }
     if let Some(servers) = mcp_servers {
-        // Inline rather than a config path: the CLI accepts the same JSON the
-        // sidecar handed the SDK.
         command.args([
             "--mcp-config",
             &serde_json::to_string(&serde_json::json!({"mcpServers": servers}))?,
@@ -1687,8 +1750,6 @@ pub(super) async fn run(
     if let Some(resume_id) = req.session_id.as_deref()
         && is_nonempty_session_id(resume_id)
     {
-        // `--resume=<id>`, not a separate argv entry: the CLI parses this flag
-        // in its `=` form only.
         command.arg(format!("--resume={resume_id}"));
     }
     if req.persist_session == Some(false) {
@@ -1700,15 +1761,22 @@ pub(super) async fn run(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        // Without this a dropped future leaves the child (and its MCP servers)
-        // running and billing.
         .kill_on_drop(true);
     if !local_auth {
-        command.env("HOME", provider_home.path());
+        command.env("HOME", provider_home);
     }
     super::apply_git_credential_env(&mut command, &git_env);
-    // Matches the SDK's own entrypoint tagging; see docs/claude-native-protocol.md.
-    command.env("CLAUDE_CODE_ENTRYPOINT", "sdk-rs");
+    // The official SDK uses sdk-ts as the binary's SDK-origin tag. Preserve a
+    // caller override, but make the native Rust path behaviorally equivalent.
+    if std::env::var_os("CLAUDE_CODE_ENTRYPOINT").is_none() {
+        command.env("CLAUDE_CODE_ENTRYPOINT", "sdk-ts");
+    }
+    command.env_remove("NODE_OPTIONS");
+    if std::env::var_os("CLAUDE_AGENT_SDK_VERSION").is_none()
+        && let Some(version) = binary.sdk_version.as_deref()
+    {
+        command.env("CLAUDE_AGENT_SDK_VERSION", version);
+    }
     if std::env::var("ENABLE_TOOL_SEARCH").is_err() {
         command.env("ENABLE_TOOL_SEARCH", "auto:5");
     }
@@ -1720,6 +1788,21 @@ pub(super) async fn run(
     }
     super::apply_claude_channel_env(&mut command, req.provider_channel)?;
     crate::subprocess::isolate_async_process_from_terminal(&mut command);
+    Ok(command)
+}
+
+pub(super) async fn run(
+    req: ChatStreamRequest,
+    tx: tokio::sync::mpsc::Sender<super::ChatStreamEvent>,
+    mut controls: Option<tokio::sync::mpsc::Receiver<ChatStreamControl>>,
+    local_auth: bool,
+    permission: LocalAgentPermission,
+) -> Result<()> {
+    let started_at = std::time::Instant::now();
+    let binary = resolve_claude_binary()?;
+    let provider_home = tempfile::tempdir().context("failed to create Claude provider home")?;
+    let mut command =
+        build_native_command(&binary, &req, provider_home.path(), local_auth, permission)?;
 
     let mut child = command
         .spawn()
@@ -1775,15 +1858,24 @@ pub(super) async fn run(
     let mut reader = BufReader::new(stdout);
     let mut line = String::new();
     let mut stream_ended = false;
+    let mut terminal_seen = false;
+    let mut context_deadline: Option<tokio::time::Instant> = None;
     let mut turn_boundary = TurnMessageBoundary::default();
 
     while !stream_ended {
         line.clear();
+        let context_deadline_at = context_deadline;
         tokio::select! {
             // Biased so pending output is drained before new control input is
             // acted on; an approval decision is meaningless before the request
             // that prompted it has been read.
             biased;
+            _ = tokio::time::sleep_until(
+                context_deadline_at.unwrap_or_else(tokio::time::Instant::now)
+            ), if terminal_seen && channel.has_pending_context_usage() => {
+                tracing::warn!("claude context usage response timed out after the turn completed");
+                stream_ended = true;
+            }
             read = reader.read_line(&mut line) => {
                 let read = read.context("failed reading claude stdout")?;
                 if read == 0 {
@@ -1818,7 +1910,17 @@ pub(super) async fn run(
                             .await;
                         // Unchanged from the sidecar path: the message half of
                         // the protocol was already implemented here.
-                        if state.handle_message(&value, &tx).await? {
+                        let state_ended = state.handle_message(&value, &tx).await?;
+                        if value.get("type").and_then(Value::as_str) == Some("assistant")
+                            && !state_ended
+                            && let Err(error) = request_context_usage(&mut channel, &mut stdin).await
+                        {
+                            // Context telemetry is advisory. The provider
+                            // result remains usable when an older Claude
+                            // binary does not implement this control subtype.
+                            tracing::debug!(%error, "claude context usage request unavailable");
+                        }
+                        if state_ended {
                             stream_ended = true;
                         }
                         // The sidecar exited after each turn, closing stdout and
@@ -1827,7 +1929,15 @@ pub(super) async fn run(
                         // next user message, so `result` is the only signal that
                         // this turn is over. Without this the read blocks forever.
                         if action == TurnMessageAction::Terminal {
-                            stream_ended = true;
+                            terminal_seen = true;
+                            if channel.has_pending_context_usage() {
+                                context_deadline = Some(
+                                    tokio::time::Instant::now()
+                                        + std::time::Duration::from_secs(2),
+                                );
+                            } else {
+                                stream_ended = true;
+                            }
                         }
                     }
                     other => match channel.handle_frame(other) {
@@ -1839,15 +1949,20 @@ pub(super) async fn run(
                         Inbound::Reply(reply) => write_line(&mut stdin, &reply).await?,
                         Inbound::Response { kind, result } => {
                             handle_control_response(kind, result, &tx).await;
+                            if terminal_seen && !channel.has_pending_context_usage() {
+                                stream_ended = true;
+                            }
                         }
                         Inbound::Nothing => {}
                     },
                 }
             }
-            control = super::receive_claude_control(&mut controls) => {
+            control = receive_claude_control(&mut controls) => {
                 match control {
                     Some(control) => {
-                        if !apply_control(
+                        if terminal_seen {
+                            reject_late_native_control(control);
+                        } else if !apply_control(
                             control,
                             &mut channel,
                             &mut stdin,
@@ -1917,6 +2032,366 @@ pub(super) async fn run(
         })
         .await;
     Ok(())
+}
+
+/// A native Claude process kept alive by the local pool. The official SDK's
+/// `Query` object is long-lived and accepts multiple `start` messages; this is
+/// the equivalent process boundary for the Rust implementation.
+pub(super) struct PooledClaudeNative {
+    pub(super) child: tokio::process::Child,
+    pub(super) stdin: tokio::process::ChildStdin,
+    pub(super) stdout: BufReader<tokio::process::ChildStdout>,
+    pub(super) stderr: std::sync::Arc<tokio::sync::Mutex<String>>,
+    pub(super) _provider_home: tempfile::TempDir,
+    pub(super) channel: ProviderChannel,
+    lifecycle_key: String,
+    started: bool,
+    session_id: Option<String>,
+    pending_steers: Vec<(String, Value)>,
+}
+
+fn native_lifecycle_key(req: &ChatStreamRequest, permission: LocalAgentPermission) -> String {
+    let external_servers = req
+        .mcp_external_servers
+        .iter()
+        .map(|server| {
+            serde_json::json!({
+                "name": server.name,
+                "command": server.command,
+                "args": server.args,
+                "env": server.env,
+                "allowed_tools": server.allowed_tools,
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "workspace": req.working_directory,
+        "model": req.model.as_ref().filter(|model| !model.trim().is_empty()),
+        "effort": req.effort.clone().unwrap_or_else(|| "medium".to_string()),
+        "fast": req.fast,
+        "system_prompt": req.system_prompt,
+        "output_schema": req.output_schema,
+        "mcp_owner_id": req.mcp_owner_id,
+        "mcp_allowed_scopes": req.mcp_allowed_scopes,
+        "mcp_user_id": req.mcp_user_id,
+        "mcp_external_servers": external_servers,
+        "mcp_api_token": req.mcp_api_token,
+        "permission": permission_mode(permission),
+        "provider_channel": req.provider_channel.as_str(),
+        "persist_session": req.persist_session != Some(false),
+    })
+    .to_string()
+}
+
+async fn start_pooled_native(
+    req: &ChatStreamRequest,
+    permission: LocalAgentPermission,
+    lifecycle_key: String,
+) -> Result<PooledClaudeNative> {
+    let binary = resolve_claude_binary()?;
+    let provider_home = tempfile::tempdir().context("failed to create Claude provider home")?;
+    let mut command = build_native_command(&binary, req, provider_home.path(), true, permission)?;
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("failed to spawn {}", binary.path.display()))?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow!("pooled claude stdin pipe missing"))?;
+    let stdout = BufReader::new(
+        child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow!("pooled claude stdout pipe missing"))?,
+    );
+    let stderr = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
+    let child_stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("pooled claude stderr pipe missing"))?;
+    {
+        let stderr = stderr.clone();
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(child_stderr);
+            let mut line = String::new();
+            while reader.read_line(&mut line).await.is_ok_and(|read| read > 0) {
+                stderr.lock().await.push_str(&line);
+                line.clear();
+            }
+        });
+    }
+    Ok(PooledClaudeNative {
+        child,
+        stdin,
+        stdout,
+        stderr,
+        _provider_home: provider_home,
+        channel: req.provider_channel,
+        lifecycle_key,
+        started: false,
+        session_id: None,
+        pending_steers: Vec::new(),
+    })
+}
+
+/// Run one turn on a persistent native process and return whether it is safe
+/// to put the process back in the pool.
+pub(super) async fn run_pooled(
+    req: ChatStreamRequest,
+    tx: tokio::sync::mpsc::Sender<super::ChatStreamEvent>,
+    mut controls: Option<tokio::sync::mpsc::Receiver<ChatStreamControl>>,
+    permission: LocalAgentPermission,
+    pool: std::sync::Arc<tokio::sync::Mutex<Option<PooledClaudeNative>>>,
+) -> Result<()> {
+    anyhow::ensure!(
+        req.provider_auth.is_none() && req.git_credentials.is_empty(),
+        "credential-scoped Claude requests cannot reuse a pooled native process"
+    );
+    let lifecycle_key = native_lifecycle_key(&req, permission);
+    let started_at = std::time::Instant::now();
+    let mut guard = pool.lock().await;
+    let mut pooled = match guard.take() {
+        Some(pooled)
+            if pooled.channel == req.provider_channel && pooled.lifecycle_key == lifecycle_key =>
+        {
+            pooled
+        }
+        Some(mut stale) => {
+            let _ = stale.child.kill().await;
+            start_pooled_native(&req, permission, lifecycle_key).await?
+        }
+        None => start_pooled_native(&req, permission, lifecycle_key).await?,
+    };
+
+    let terminal = run_pooled_native_turn(
+        &mut pooled,
+        &req,
+        &tx,
+        &mut controls,
+        permission,
+        started_at,
+    )
+    .await;
+    let reusable = match terminal {
+        Ok(reusable) => reusable,
+        Err(error) => {
+            let _ = pooled.child.kill().await;
+            return Err(error);
+        }
+    };
+    if reusable {
+        *guard = Some(pooled);
+    } else {
+        let _ = pooled.child.kill().await;
+    }
+    Ok(())
+}
+
+async fn run_pooled_native_turn(
+    pooled: &mut PooledClaudeNative,
+    req: &ChatStreamRequest,
+    tx: &tokio::sync::mpsc::Sender<super::ChatStreamEvent>,
+    controls: &mut Option<tokio::sync::mpsc::Receiver<ChatStreamControl>>,
+    _permission: LocalAgentPermission,
+    started_at: std::time::Instant,
+) -> Result<bool> {
+    let mut channel = ControlChannel::new();
+    if !pooled.started {
+        let init_id = format!("borg-init-{}", uuid::Uuid::new_v4());
+        channel.begin_request(&init_id, OutboundKind::Initialize);
+        write_line(
+            &mut pooled.stdin,
+            &serde_json::to_value(OutboundControlRequest::new(
+                &init_id,
+                initialize_request(Some(&req.system_prompt)),
+            ))?,
+        )
+        .await?;
+        pooled.started = true;
+    }
+    let (input_id, message) = user_message_with_id(&prompt_text(&req.prompt, &req.attachments));
+    let mut input_ids = HashSet::from([input_id]);
+    write_line(&mut pooled.stdin, &message).await?;
+    for (input_id, message) in pooled.pending_steers.drain(..) {
+        input_ids.insert(input_id);
+        write_line(&mut pooled.stdin, &message).await?;
+    }
+
+    let mut state = ClaudeStreamState::default();
+    let mut line = String::new();
+    let mut terminal_seen = false;
+    let mut context_deadline: Option<tokio::time::Instant> = None;
+    let mut turn_boundary = TurnMessageBoundary::default();
+
+    while !terminal_seen || channel.has_pending_context_usage() {
+        line.clear();
+        let context_deadline_at = context_deadline;
+        tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(
+                context_deadline_at.unwrap_or_else(tokio::time::Instant::now)
+            ), if terminal_seen && channel.has_pending_context_usage() => {
+                tracing::warn!("pooled claude context usage response timed out after the turn completed");
+                break;
+            }
+            read = pooled.stdout.read_line(&mut line) => {
+                let read = read.context("failed reading pooled claude stdout")?;
+                if read == 0 {
+                    let stderr = pooled.stderr.lock().await.clone();
+                    if terminal_seen {
+                        break;
+                    }
+                    bail!("pooled claude exited unexpectedly: {}", stderr.trim());
+                }
+                let trimmed = line.trim_end_matches(['\r', '\n']);
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let frame = Frame::parse(trimmed)?;
+                match frame {
+                    Frame::Message(value) => {
+                        let action = turn_boundary.classify(&value, &input_ids);
+                        if action == TurnMessageAction::Suppress {
+                            continue;
+                        }
+                        let telemetry = classify_claude_provider_event(&value);
+                        let _ = tx.send(super::ChatStreamEvent::ProviderEvent {
+                            kind: format!(
+                                "claude.{}",
+                                value.get("type").and_then(Value::as_str).unwrap_or("message")
+                            ),
+                            payload: summarize_claude_provider_event(&value),
+                            raw_payload: Some(value.clone()),
+                            stream_channel: telemetry.stream_channel,
+                            content_text: telemetry.content_text,
+                            provider_item_id: telemetry.provider_item_id,
+                            tool_use_id: telemetry.tool_use_id,
+                            tool_name: telemetry.tool_name,
+                        }).await;
+                        let state_ended = state.handle_message(&value, tx).await?;
+                        if value.get("type").and_then(Value::as_str) == Some("assistant")
+                            && !state_ended
+                            && let Err(error) = request_context_usage(&mut channel, &mut pooled.stdin).await
+                        {
+                            tracing::debug!(%error, "pooled claude context usage request unavailable");
+                        }
+                        if let Some(session_id) = state.session_id.as_ref() {
+                            pooled.session_id = Some(session_id.clone());
+                        }
+                        if state_ended || action == TurnMessageAction::Terminal {
+                            terminal_seen = true;
+                            if channel.has_pending_context_usage() {
+                                context_deadline = Some(
+                                    tokio::time::Instant::now()
+                                        + std::time::Duration::from_secs(2),
+                                );
+                            }
+                        }
+                    }
+                    other => match channel.handle_frame(other) {
+                        Inbound::Event(event) => {
+                            if tx.send(event).await.is_err() {
+                                return Ok(false);
+                            }
+                        }
+                        Inbound::Reply(reply) => write_line(&mut pooled.stdin, &reply).await?,
+                        Inbound::Response { kind, result } => {
+                            handle_control_response(kind, result, tx).await;
+                        }
+                        Inbound::Nothing => {}
+                    },
+                }
+            }
+            control = receive_claude_control(controls), if controls.is_some() => {
+                let Some(control) = control else {
+                    *controls = None;
+                    continue;
+                };
+                if terminal_seen {
+                    queue_or_reject_native_control(pooled, control);
+                } else if !apply_control(
+                        control,
+                        &mut channel,
+                        &mut pooled.stdin,
+                        &mut input_ids,
+                        &turn_boundary.background_task_ids(),
+                    )
+                    .await?
+                {
+                    terminal_seen = true;
+                }
+            }
+        }
+        if terminal_seen && !channel.has_pending_context_usage() {
+            break;
+        }
+    }
+
+    // A steer can race the result frame. The TypeScript adapter preserves it
+    // for the next `start` message, so do the same while this receiver is
+    // still owned by the current pooled invocation.
+    while let Ok(control) = controls
+        .as_mut()
+        .map(|receiver| receiver.try_recv())
+        .transpose()
+    {
+        let Some(control) = control else {
+            break;
+        };
+        queue_or_reject_native_control(pooled, control);
+    }
+
+    for frame in channel.drain_pending() {
+        let _ = write_line(&mut pooled.stdin, &frame).await;
+    }
+    if !terminal_seen {
+        return Ok(false);
+    }
+    if !state.emitted_failure {
+        let final_text = state
+            .final_text
+            .take()
+            .unwrap_or_else(|| state.delta_accumulator.clone());
+        let usage = Some(state.final_usage.unwrap_or_else(|| ProviderCallUsage {
+            duration_ms: elapsed_millis_u64(started_at),
+            ..ProviderCallUsage::default()
+        }));
+        let _ = tx
+            .send(super::ChatStreamEvent::Done {
+                final_text,
+                usage,
+                session_id: state
+                    .session_id
+                    .take()
+                    .or_else(|| pooled.session_id.clone()),
+            })
+            .await;
+    }
+    Ok(true)
+}
+
+fn queue_or_reject_native_control(pooled: &mut PooledClaudeNative, control: ChatStreamControl) {
+    match control {
+        ChatStreamControl::Steer {
+            text,
+            attachments,
+            ack,
+            ..
+        } => {
+            let (input_id, message) = user_message_with_id(&prompt_text(&text, &attachments));
+            pooled.pending_steers.push((input_id, message));
+            let _ = ack.send(Ok(()));
+        }
+        ChatStreamControl::Approval { .. }
+        | ChatStreamControl::ProviderInteractionResponse { .. }
+        | ChatStreamControl::Interrupt => {}
+    }
+}
+
+fn reject_late_native_control(control: ChatStreamControl) {
+    if let ChatStreamControl::Steer { ack, .. } = control {
+        let _ = ack.send(Err("Claude turn ended before the steer was delivered".to_string()));
+    }
 }
 
 async fn handle_control_response(

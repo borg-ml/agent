@@ -42,6 +42,9 @@ use codex_stream::{CodexStreamMapper, codex_turn_usage};
 const CODEX_PREWARM_TIMEOUT: Duration = Duration::from_secs(45);
 const CODEX_FORCE_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 
+#[cfg(test)]
+pub(super) static CLAUDE_ENV_LOCK: Mutex<()> = Mutex::new(());
+
 struct CancelCodexWorkerOnDrop(Arc<AtomicBool>);
 
 impl Drop for CancelCodexWorkerOnDrop {
@@ -274,6 +277,7 @@ pub fn run_claude_local_chat_stream(
 #[derive(Clone, Default)]
 pub struct ClaudeSdkPool {
     inner: Arc<tokio::sync::Mutex<Option<PooledClaudeSdk>>>,
+    native_inner: Arc<tokio::sync::Mutex<Option<claude_native::PooledClaudeNative>>>,
 }
 
 struct PooledClaudeSdk {
@@ -294,9 +298,19 @@ pub fn run_pooled_claude_local_chat_stream(
 ) -> mpsc::Receiver<ChatStreamEvent> {
     let (tx, rx) = mpsc::channel::<ChatStreamEvent>(64);
     tokio::spawn(async move {
-        if let Err(error) =
+        let result = if claude_native::native_enabled() {
+            claude_native::run_pooled(
+                req,
+                tx.clone(),
+                control_rx,
+                permission,
+                pool.native_inner.clone(),
+            )
+            .await
+        } else {
             run_pooled_claude_sdk_inner(req, tx.clone(), control_rx, permission, pool).await
-        {
+        };
+        if let Err(error) = result {
             let _ = tx
                 .send(ChatStreamEvent::Failed {
                     error: format!("{error:#}"),
@@ -2317,7 +2331,7 @@ mod tests {
     use serde_json::json;
     use std::sync::Mutex;
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    use super::CLAUDE_ENV_LOCK as ENV_LOCK;
 
     #[test]
     fn stopping_an_owner_waits_for_provider_cleanup_acknowledgement() {
@@ -2474,6 +2488,7 @@ for await (const line of createInterface({ input: process.stdin })) {
         )
         .unwrap();
         let _adapter = TestEnvGuard::set("BORG_CLAUDE_SDK_PROVIDER", adapter.to_str().unwrap());
+        let _native = TestEnvGuard::set("BORG_CLAUDE_NATIVE", "0");
         let pool = ClaudeSdkPool::default();
 
         let first = final_text(run_pooled_claude_local_chat_stream(

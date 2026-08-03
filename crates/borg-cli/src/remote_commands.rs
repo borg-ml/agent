@@ -593,6 +593,25 @@ fn stale_local_owner_can_handoff(status: Option<SessionStatus>) -> bool {
     matches!(status, Some(SessionStatus::Ready | SessionStatus::Stopped))
 }
 
+/// A stopped state is the durable result of the previous local process going
+/// away, not the state of the new process the user just asked to resume. Keep
+/// the owner UI responsive while the actor rehydrates a long session; the
+/// actor's first real status event will replace this presentation state.
+fn resume_display_state(
+    mut state: SessionState,
+    access: LocalSessionAccess,
+    resuming: bool,
+) -> SessionState {
+    if resuming
+        && access == LocalSessionAccess::Owned
+        && state.status == Some(SessionStatus::Stopped)
+    {
+        state.status = Some(SessionStatus::Ready);
+        state.status_detail = None;
+    }
+    state
+}
+
 fn owner_shutdown_should_handoff_to_viewer(
     access: LocalSessionAccess,
     status: SessionStatus,
@@ -1119,10 +1138,12 @@ async fn run_local_agent_session(
     crash_context
         .tui_active
         .store(terminal.is_some(), Ordering::Release);
+    let display_session_state =
+        resume_display_state(session_state.clone(), session_access, resuming);
     if let Some(terminal) = terminal.as_mut() {
         terminal.seed_history(&history);
         terminal.seed_team_roster(&team_snapshots);
-        terminal.seed_session_state(&session_state);
+        terminal.seed_session_state(&display_session_state);
         if stale_local_owner {
             terminal.set_notice(
                 "This turn is owned by an older Borg build · upgrading automatically when it finishes"
@@ -1192,15 +1213,25 @@ async fn run_local_agent_session(
         });
     let mut input = (can_prompt && terminal.is_none()).then(spawn_terminal_input);
     let mut input_open = can_prompt && terminal.is_none();
-    let mut delivered_projection = DeliveredSessionProjection::new(session_state.clone());
-    let mut status = session_state.status.unwrap_or(SessionStatus::Starting);
-    let mut status_detail = session_state.status_detail.clone();
-    let mut pending_approval = session_state.pending_approval_id.clone();
-    let mut pending_provider_interaction = session_state
+    let mut delivered_projection = DeliveredSessionProjection::new(display_session_state.clone());
+    let mut status = display_session_state
+        .status
+        .unwrap_or(SessionStatus::Starting);
+    let mut status_detail = display_session_state.status_detail.clone();
+    let mut pending_approval = display_session_state.pending_approval_id.clone();
+    let mut pending_provider_interaction = display_session_state
         .pending_provider_interaction_id
         .clone()
-        .zip(session_state.pending_provider_interaction_kind.clone())
-        .zip(session_state.pending_provider_interaction_payload.clone())
+        .zip(
+            display_session_state
+                .pending_provider_interaction_kind
+                .clone(),
+        )
+        .zip(
+            display_session_state
+                .pending_provider_interaction_payload
+                .clone(),
+        )
         .map(|((interaction_id, kind), payload)| (interaction_id, kind, payload));
     let mut child_pending_approvals = child_pending_approval_ids(&team_history);
     let mut saw_running = false;
@@ -6208,6 +6239,30 @@ mod tests {
             SessionStatus::WaitingForApproval
         )));
         assert!(!stale_local_owner_can_handoff(None));
+    }
+
+    #[test]
+    fn owned_resume_presents_stopped_state_as_ready_while_rehydrating() {
+        let state = SessionState {
+            latest_sequence: 10_000,
+            status: Some(SessionStatus::Stopped),
+            status_detail: Some("process exited".to_string()),
+            ..SessionState::default()
+        };
+
+        let displayed = resume_display_state(state.clone(), LocalSessionAccess::Owned, true);
+        assert_eq!(displayed.status, Some(SessionStatus::Ready));
+        assert_eq!(displayed.status_detail, None);
+        assert_eq!(displayed.latest_sequence, state.latest_sequence);
+
+        assert_eq!(
+            resume_display_state(state.clone(), LocalSessionAccess::Attached, true).status,
+            Some(SessionStatus::Stopped)
+        );
+        assert_eq!(
+            resume_display_state(state, LocalSessionAccess::Owned, false).status,
+            Some(SessionStatus::Stopped)
+        );
     }
 
     #[tokio::test]
