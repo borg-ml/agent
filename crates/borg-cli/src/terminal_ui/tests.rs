@@ -2023,6 +2023,8 @@ fn keyboard_enhancement_does_not_request_release_events() {
 #[test]
 fn slash_command_picker_selects_the_highlighted_match() {
     assert_eq!(slash_matches("/int")[0].0, "/interrupt");
+    assert_eq!(slash_matches("/dir")[0].0, "/director");
+    assert_eq!(slash_matches("/pe")[0].0, "/peer");
     assert_eq!(slash_selected_command("/mo", 0), Some("/model"));
     assert_eq!(slash_selected_command("/eff", 0), Some("/effort"));
     assert_eq!(slash_selected_command("/lang", 0), Some("/language"));
@@ -3005,12 +3007,17 @@ fn launch_resume_picker_height_is_stable_and_reserved_once() {
 #[test]
 fn only_argument_taking_commands_are_inserted_rather_than_run() {
     assert!(slash_command_needs_argument("/ask"));
+    assert!(slash_command_needs_argument("/director"));
     assert!(slash_command_needs_argument("/claude"));
     assert!(slash_command_needs_argument("/gpt"));
+    assert!(slash_command_needs_argument("/peer"));
     assert!(slash_command_needs_argument("/queue"));
     assert!(slash_command_needs_argument("/steer"));
     for (command, _) in SLASH_COMMANDS.iter().filter(|(command, _)| {
-        !matches!(*command, "/ask" | "/claude" | "/gpt" | "/queue" | "/steer")
+        !matches!(
+            *command,
+            "/ask" | "/director" | "/claude" | "/gpt" | "/peer" | "/queue" | "/steer"
+        )
     }) {
         assert!(
             !slash_command_needs_argument(command),

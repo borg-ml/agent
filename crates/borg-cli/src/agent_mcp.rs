@@ -32,6 +32,7 @@ enum AgentToolEndpoint {
         socket: PathBuf,
         provider: borg_remote::CodingProvider,
         shared_work_enabled: bool,
+        consultation_enabled: bool,
         team_policy: Option<borg_remote::TeamPolicy>,
     },
     #[cfg(not(unix))]
@@ -40,6 +41,7 @@ enum AgentToolEndpoint {
         token: String,
         provider: borg_remote::CodingProvider,
         shared_work_enabled: bool,
+        consultation_enabled: bool,
         team_policy: Option<borg_remote::TeamPolicy>,
     },
 }
@@ -58,6 +60,12 @@ impl AgentToolEndpoint {
             .transpose()
             .context("BORG_AGENT_SHARED_WORK_ENABLED must be true or false")?
             .unwrap_or(false);
+        let consultation_enabled = std::env::var("BORG_AGENT_CONSULTATION_ENABLED")
+            .ok()
+            .map(|value| value.parse::<bool>())
+            .transpose()
+            .context("BORG_AGENT_CONSULTATION_ENABLED must be true or false")?
+            .unwrap_or(true);
         #[cfg(unix)]
         {
             std::env::var_os("BORG_AGENT_TOOL_SOCKET")
@@ -66,6 +74,7 @@ impl AgentToolEndpoint {
                     socket,
                     provider,
                     shared_work_enabled,
+                    consultation_enabled,
                     team_policy,
                 })
                 .context("BORG_AGENT_TOOL_SOCKET is required")
@@ -87,6 +96,7 @@ impl AgentToolEndpoint {
                 token,
                 provider,
                 shared_work_enabled,
+                consultation_enabled,
                 team_policy,
             })
         }
@@ -124,6 +134,21 @@ impl AgentToolEndpoint {
             } => *shared_work_enabled,
         }
     }
+
+    fn consultation_enabled(&self) -> bool {
+        match self {
+            #[cfg(unix)]
+            Self::Unix {
+                consultation_enabled,
+                ..
+            } => *consultation_enabled,
+            #[cfg(not(unix))]
+            Self::Loopback {
+                consultation_enabled,
+                ..
+            } => *consultation_enabled,
+        }
+    }
 }
 
 async fn handle_line(endpoint: &AgentToolEndpoint, line: &str) -> Option<Value> {
@@ -141,11 +166,12 @@ async fn handle_line(endpoint: &AgentToolEndpoint, line: &str) -> Option<Value> 
         })),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({
-            "tools": borg_remote::agent_tool_specs_with_capabilities(
+            "tools": borg_remote::agent_tool_specs_with_capabilities_and_consultation(
                 endpoint.provider(),
                 true,
                 endpoint.shared_work_enabled(),
                 endpoint.team_policy(),
+                endpoint.consultation_enabled(),
             )
         })),
         "tools/call" => {
@@ -254,6 +280,7 @@ mod tests {
             socket: Path::new("/unused").to_path_buf(),
             provider: borg_remote::CodingProvider::Codex,
             shared_work_enabled: true,
+            consultation_enabled: true,
             team_policy: None,
         };
         #[cfg(not(unix))]
@@ -262,6 +289,7 @@ mod tests {
             token: "unused".to_string(),
             provider: borg_remote::CodingProvider::Codex,
             shared_work_enabled: true,
+            consultation_enabled: true,
             team_policy: None,
         };
         let response = handle_line(
@@ -281,5 +309,6 @@ mod tests {
         assert!(names.contains(&"spawn_agent"));
         assert!(names.contains(&"wait_agent"));
         assert!(names.contains(&"create_shared_work"));
+        assert!(names.contains(&"consult_peer"));
     }
 }

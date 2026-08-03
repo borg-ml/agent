@@ -354,9 +354,14 @@ impl TextSelection {
 
 const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/help", "show commands"),
-    ("/ask", "ask another model for a second opinion"),
-    ("/claude", "persistent Claude Opus 5 · high sidecar"),
-    ("/gpt", "persistent GPT 5.6 Sol · xhigh sidecar"),
+    (
+        "/ask",
+        "ask another model through its persistent peer thread",
+    ),
+    ("/director", "send text to the persistent director thread"),
+    ("/claude", "ask the active model to consult its Claude peer"),
+    ("/gpt", "ask the active model to consult its GPT peer"),
+    ("/peer", "directly message or reset a persistent peer"),
     ("/settings", "view interactive session settings"),
     ("/model", "choose the model"),
     ("/effort", "choose reasoning effort"),
@@ -1998,6 +2003,10 @@ impl BorgTerminal {
 
     pub fn request_sidecar_focus(&mut self, task_name: impl Into<String>) {
         self.sidecar_focus_request = Some(task_name.into());
+    }
+
+    pub fn focus_director(&mut self) {
+        self.focus_director_transcript();
     }
 
     pub fn seed_child_history(&mut self, child_id: Uuid, events: &[SessionEvent]) {
@@ -9784,7 +9793,10 @@ fn fuzzy_matches(haystack: &str, needle: &str) -> bool {
 /// no message would send the literal word to the model, so the palette puts
 /// them in the composer for the user to finish.
 fn slash_command_needs_argument(command: &str) -> bool {
-    matches!(command, "/ask" | "/claude" | "/gpt" | "/queue" | "/steer")
+    matches!(
+        command,
+        "/ask" | "/director" | "/claude" | "/gpt" | "/peer" | "/queue" | "/steer"
+    )
 }
 
 /// Every row of the unified palette: the slash commands, then the keybindings

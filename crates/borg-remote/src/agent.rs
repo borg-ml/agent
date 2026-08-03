@@ -39,13 +39,16 @@ After editing supported source files, run LSP diagnostics before finishing and r
 Do not use a provider-native spawn or collaboration tool because those children are not part of \
 the Borg session tree and cannot be controlled from Borg Remote. \
 When the user starts a message with `/ask PROFILE`, `/claude`, `/gpt`, or `/codex`, treat it as a \
-request for a second opinion. Call `consult_model` with the requested profile before answering. \
-Preserve an explicit `@EFFORT` suffix in the profile when the intent includes one (for example, \
+request for a second opinion. Use `consult_peer` for the normal case: it keeps the opposite GPT/Claude \
+peer thread alive across calls and returns the peer's answer to you privately so you can reconcile \
+it before answering. Use `consult_model` only when a deliberately isolated one-shot opinion is wanted. \
+Call the peer only when another viewpoint would materially help; do not call it reflexively on every turn. \
+Preserve an explicit `@EFFORT` suffix in a profile when the intent includes one (for example, \
 `claude-opus-5@high` or `gpt-5.6-sol@xhigh`). \
-You decide the complete freeform briefing for that call: select and include the relevant context, \
-excerpts, constraints, and questions from the conversation or workspace. Do not pass a rigid \
-transcript-shaped bundle or ask the user to copy context manually. After the consultation returns, \
-reconcile it with your own judgment and answer the user.";
+You choose the complete freeform briefing: include the relevant objective, evidence, constraints, and \
+exact question, while omitting unrelated transcript noise. Never ask the human to relay messages manually. \
+The peer cannot invoke another peer; after the response returns, reconcile it with your own judgment and \
+remain the sole voice that answers the user.";
 
 #[derive(Clone)]
 pub struct AgentTurn {

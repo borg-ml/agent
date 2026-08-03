@@ -3,7 +3,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 #[cfg(unix)]
 use std::{fs::Permissions, os::unix::fs::PermissionsExt};
 
@@ -137,6 +137,7 @@ pub struct AgentToolDispatcher {
     lsp: crate::LspService,
     provider: CodingProvider,
     actor_session_id: Uuid,
+    consultation_enabled: bool,
     team_policy: Option<crate::TeamPolicy>,
     self_service: crate::self_service::SelfServiceContext,
 }
@@ -151,6 +152,7 @@ pub struct AgentToolServer {
     token: String,
     provider: CodingProvider,
     subagents_enabled: bool,
+    consultation_enabled: bool,
     shared_work_enabled: bool,
     team_policy: Option<crate::TeamPolicy>,
     cancel: CancellationToken,
@@ -216,6 +218,7 @@ impl AgentToolServer {
         let cleanup_path = socket_path.clone();
         let provider = dispatcher.provider;
         let subagents_enabled = dispatcher.subagents_enabled;
+        let consultation_enabled = dispatcher.consultation_enabled();
         let shared_work_enabled = dispatcher.shared_work.is_some();
         let team_policy = dispatcher.team_policy.clone();
         tokio::spawn(async move {
@@ -234,6 +237,7 @@ impl AgentToolServer {
             socket_path,
             provider,
             subagents_enabled,
+            consultation_enabled,
             shared_work_enabled,
             team_policy,
             cancel,
@@ -257,6 +261,7 @@ impl AgentToolServer {
         let server_token = token.clone();
         let provider = dispatcher.provider;
         let subagents_enabled = dispatcher.subagents_enabled;
+        let consultation_enabled = dispatcher.consultation_enabled();
         let shared_work_enabled = dispatcher.shared_work.is_some();
         let team_policy = dispatcher.team_policy.clone();
         tokio::spawn(async move {
@@ -281,6 +286,7 @@ impl AgentToolServer {
             token,
             provider,
             subagents_enabled,
+            consultation_enabled,
             shared_work_enabled,
             team_policy,
             cancel,
@@ -302,6 +308,10 @@ impl AgentToolServer {
             "BORG_AGENT_SHARED_WORK_ENABLED".to_string(),
             self.shared_work_enabled.to_string(),
         );
+        env.insert(
+            "BORG_AGENT_CONSULTATION_ENABLED".to_string(),
+            self.consultation_enabled.to_string(),
+        );
         #[cfg(unix)]
         env.insert(
             "BORG_AGENT_TOOL_SOCKET".to_string(),
@@ -320,11 +330,12 @@ impl AgentToolServer {
                 .into_owned(),
             args: vec!["__agent-mcp".to_string()],
             env,
-            allowed_tools: agent_tool_specs_with_capabilities(
+            allowed_tools: agent_tool_specs_with_capabilities_and_consultation(
                 self.provider,
                 self.subagents_enabled,
                 self.shared_work_enabled,
                 self.team_policy.as_ref(),
+                self.consultation_enabled,
             )
             .into_iter()
             .filter_map(|tool| {
@@ -403,6 +414,9 @@ impl AgentToolDispatcher {
         cwd: PathBuf,
         consultation: Option<SessionConsultationTools>,
     ) -> Self {
+        let consultation_enabled = subagents
+            .as_ref()
+            .is_none_or(|team| team.is_root_session(actor_session_id));
         Self {
             goals,
             todos,
@@ -413,18 +427,24 @@ impl AgentToolDispatcher {
             lsp,
             provider,
             actor_session_id,
+            consultation_enabled,
             team_policy,
             self_service: crate::self_service::SelfServiceContext::new(cwd),
         }
     }
 
     pub fn specs(&self) -> Vec<Value> {
-        agent_tool_specs_with_capabilities(
+        agent_tool_specs_with_capabilities_and_consultation(
             self.provider,
             self.subagents_enabled,
             self.shared_work.is_some(),
             self.team_policy.as_ref(),
+            self.consultation_enabled,
         )
+    }
+
+    fn consultation_enabled(&self) -> bool {
+        self.consultation_enabled
     }
 
     pub async fn call(&self, name: &str, arguments: Value) -> Result<Value> {
@@ -455,6 +475,10 @@ impl AgentToolDispatcher {
                 )
             }
             "consult_model" => {
+                anyhow::ensure!(
+                    self.consultation_enabled,
+                    "model consultation is disabled for peer sessions"
+                );
                 let args: ConsultModelArgs = serde_json::from_value(arguments)?;
                 let consultation = self
                     .consultation
@@ -468,6 +492,22 @@ impl AgentToolDispatcher {
                     "model": consultation.model,
                     "response": consultation.final_text,
                 }))
+            }
+            "consult_peer" => {
+                anyhow::ensure!(
+                    self.consultation_enabled,
+                    "persistent peer consultation is disabled for peer sessions"
+                );
+                anyhow::ensure!(
+                    self.subagents_enabled,
+                    "persistent peer consultation requires subagents"
+                );
+                let args: ConsultPeerArgs = serde_json::from_value(arguments)?;
+                self.subagents
+                    .as_ref()
+                    .context("persistent peer consultation is disabled for this session")?
+                    .consult_peer(self.provider, args.profile.as_deref(), &args.prompt)
+                    .await
             }
             "get_plan" => {
                 let _: NoArgs = serde_json::from_value(arguments)?;
@@ -892,6 +932,7 @@ pub struct TeamMessageOptions {
 #[derive(Clone)]
 pub struct SubagentCoordinator {
     journal_root: PathBuf,
+    root_session_id: Uuid,
     root_launch: LaunchSession,
     executor: Arc<dyn crate::AgentTurnExecutor>,
     store: Arc<dyn SessionStore>,
@@ -901,6 +942,7 @@ pub struct SubagentCoordinator {
     root_inbox: Arc<Mutex<Vec<TeamInboxMessage>>>,
     root_message_tx: broadcast::Sender<TeamInboxMessage>,
     projected_root_messages: Arc<Mutex<HashSet<Uuid>>>,
+    consultation_lock: Arc<Mutex<()>>,
 }
 
 impl SubagentCoordinator {
@@ -919,6 +961,7 @@ impl SubagentCoordinator {
         let (root_message_tx, _) = broadcast::channel(128);
         Ok(Self {
             journal_root: journal_root.into(),
+            root_session_id,
             root_launch,
             executor,
             store,
@@ -933,7 +976,12 @@ impl SubagentCoordinator {
             root_inbox: Arc::new(Mutex::new(Vec::new())),
             root_message_tx,
             projected_root_messages: Arc::new(Mutex::new(HashSet::new())),
+            consultation_lock: Arc::new(Mutex::new(())),
         })
+    }
+
+    pub(crate) fn is_root_session(&self, session_id: Uuid) -> bool {
+        self.root_session_id == session_id
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<SubagentActivity> {
@@ -1406,8 +1454,8 @@ impl SubagentCoordinator {
 
     /// Return the durable child for a provider-specific sidecar, creating it
     /// without an initial model turn when this is the first request. The task
-    /// name is deliberately deterministic so every future `/claude` or `/gpt`
-    /// command resolves to the same child session after hydration.
+    /// name is deliberately deterministic so every future `/claude`, `/gpt`,
+    /// or `/peer` command resolves to the same child session after hydration.
     pub async fn ensure_sidecar(
         &self,
         task_name: &str,
@@ -1453,7 +1501,7 @@ impl SubagentCoordinator {
             if snapshot.status.is_terminal() {
                 let mut revived = snapshot.clone();
                 revived.status = SubagentStatus::Starting;
-                revived.detail = Some("Waking persistent sidecar after resume".to_string());
+                revived.detail = Some("Waking persistent peer after resume".to_string());
                 revived.updated_at = Utc::now();
                 let mut launch = self.root_launch.clone();
                 launch.request_id = Uuid::new_v4();
@@ -1519,6 +1567,129 @@ impl SubagentCoordinator {
             .reserve(task_name.trim_start_matches("/root/"), &launch)?;
         self.start_reserved(snapshot.clone(), launch, true).await?;
         Ok(snapshot)
+    }
+
+    /// Ask the persistent provider sidecar for a private second opinion.
+    ///
+    /// This deliberately reuses the same `/root/claude` or `/root/gpt` child
+    /// that the interactive sidecar commands address. The primary model gets
+    /// the completed answer synchronously as a tool result; the peer never
+    /// receives a tool that can invoke another peer, so consultation cannot
+    /// turn into an unbounded model-to-model loop.
+    pub async fn consult_peer(
+        &self,
+        parent_provider: CodingProvider,
+        profile: Option<&str>,
+        prompt: &str,
+    ) -> Result<Value> {
+        let prompt = required_message(prompt)?;
+        anyhow::ensure!(
+            prompt.chars().count() <= 200_000,
+            "persistent peer briefing is too long"
+        );
+        let _consultation_guard = self.consultation_lock.lock().await;
+        let (provider, model, effort) = resolve_persistent_peer_profile(parent_provider, profile)?;
+        let (task_name, label) = match provider {
+            CodingProvider::Claude => ("claude", "Claude"),
+            CodingProvider::Codex => ("gpt", "GPT"),
+            _ => unreachable!("persistent peer profile is restricted to GPT and Claude"),
+        };
+        let mut activity = self.subscribe();
+        let sidecar = self
+            .ensure_sidecar(task_name, provider, model.clone(), effort.clone())
+            .await?;
+        let message_id = Uuid::new_v4();
+        let peer_prompt = format!(
+            "You are the persistent private {label} peer for the primary Borg agent. This is an +             internal consultation, not a user-facing turn. Do not invoke another model, send +             team messages, edit files, or ask the human for clarification. You may inspect +             workspace state when it is necessary to validate the briefing. Return concise, +             self-contained analysis that the primary agent can use immediately.\n\n{prompt}"
+        );
+        self.prompt_child(
+            &sidecar.task_name,
+            message_id,
+            peer_prompt,
+            Vec::new(),
+            PromptDelivery::Steer,
+        )
+        .await?;
+
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            anyhow::ensure!(
+                !remaining.is_zero(),
+                "persistent peer consultation timed out"
+            );
+            match tokio::time::timeout(remaining, activity.recv()).await {
+                Ok(Ok(SubagentActivity::SessionEvent { event, .. }))
+                    if event.session_id == sidecar.session_id =>
+                {
+                    match event.kind {
+                        SessionEventKind::Message {
+                            actor: EventActor::Assistant,
+                            text,
+                            status: MessageStatus::Complete,
+                            ..
+                        } => {
+                            let text = text.trim().to_string();
+                            anyhow::ensure!(
+                                !text.is_empty(),
+                                "persistent peer returned an empty response"
+                            );
+                            return Ok(json!({
+                                "persistent": true,
+                                "provider": provider.catalog_backend(),
+                                "model": model,
+                                "thread": sidecar.task_name,
+                                "response": text,
+                            }));
+                        }
+                        SessionEventKind::StatusChanged {
+                            status: SessionStatus::Failed | SessionStatus::Stopped,
+                            detail,
+                        } => {
+                            bail!(
+                                "persistent {} peer stopped before replying{}",
+                                label,
+                                detail
+                                    .map(|detail| format!(": {detail}"))
+                                    .unwrap_or_default()
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(Ok(SubagentActivity::Failed { agent }))
+                    if agent.session_id == sidecar.session_id =>
+                {
+                    bail!(
+                        "persistent {} peer failed{}",
+                        label,
+                        agent
+                            .detail
+                            .map(|detail| format!(": {detail}"))
+                            .unwrap_or_default()
+                    );
+                }
+                Ok(Ok(SubagentActivity::Completed { agent }))
+                    if agent.session_id == sidecar.session_id =>
+                {
+                    if let Some(text) = agent.final_text.filter(|text| !text.trim().is_empty()) {
+                        return Ok(json!({
+                            "persistent": true,
+                            "provider": provider.catalog_backend(),
+                            "model": model,
+                            "thread": sidecar.task_name,
+                            "response": text,
+                        }));
+                    }
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(broadcast::error::RecvError::Lagged(_))) => {}
+                Ok(Err(broadcast::error::RecvError::Closed)) => {
+                    bail!("persistent peer activity stream closed")
+                }
+                Err(_) => bail!("persistent peer consultation timed out"),
+            }
+        }
     }
 
     /// Lazily start one metadata-only child after an explicit action targets
@@ -2373,6 +2544,63 @@ fn default_effort_for_cross_provider_peer(provider: CodingProvider) -> Option<St
     }
 }
 
+fn resolve_persistent_peer_profile(
+    parent_provider: CodingProvider,
+    profile: Option<&str>,
+) -> Result<(CodingProvider, Option<String>, Option<String>)> {
+    let normalized = profile
+        .map(str::trim)
+        .filter(|profile| !profile.is_empty())
+        .map(str::to_ascii_lowercase);
+    let (provider, explicit_model, requested_effort) = if let Some(profile) = normalized {
+        let (profile, requested_effort) = profile
+            .rsplit_once('@')
+            .map_or((profile.as_str(), None), |(profile, effort)| {
+                (profile, (!effort.is_empty()).then_some(effort))
+            });
+        let (provider_hint, explicit_model) = profile
+            .split_once('/')
+            .map_or((profile, None), |(provider, model)| {
+                (provider, (!model.is_empty()).then_some(model))
+            });
+        let provider = match provider_hint {
+            "claude" | "anthropic" => CodingProvider::Claude,
+            "gpt" | "codex" | "openai" => CodingProvider::Codex,
+            _ => CodingProvider::for_model(provider_hint)
+                .with_context(|| format!("unknown persistent peer profile `{profile}`"))?,
+        };
+        (
+            provider,
+            explicit_model.map(str::to_string),
+            requested_effort.map(str::to_string),
+        )
+    } else {
+        let provider = match parent_provider {
+            CodingProvider::Claude => CodingProvider::Codex,
+            _ => CodingProvider::Claude,
+        };
+        (provider, None, None)
+    };
+    anyhow::ensure!(
+        matches!(provider, CodingProvider::Claude | CodingProvider::Codex),
+        "persistent peers currently support only GPT and Claude"
+    );
+    let default_model = match provider {
+        CodingProvider::Claude => Some("claude-opus-5".to_string()),
+        CodingProvider::Codex => Some(borg_provider::codex_product_model().to_string()),
+        _ => unreachable!(),
+    };
+    let default_effort = match provider {
+        CodingProvider::Claude => Some("high".to_string()),
+        CodingProvider::Codex => Some(borg_provider::codex_default_effort().to_string()),
+        _ => unreachable!(),
+    };
+    let model = explicit_model.or(default_model);
+    let effort = requested_effort.or(default_effort);
+    validate_subagent_overrides(provider, model.as_deref(), effort.as_deref())?;
+    Ok((provider, model, effort))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn boxed_agent_store_session(
     session_root: PathBuf,
@@ -2617,6 +2845,22 @@ pub fn agent_tool_specs_with_capabilities(
     shared_work_enabled: bool,
     team_policy: Option<&crate::TeamPolicy>,
 ) -> Vec<Value> {
+    agent_tool_specs_with_capabilities_and_consultation(
+        provider,
+        subagents_enabled,
+        shared_work_enabled,
+        team_policy,
+        true,
+    )
+}
+
+pub fn agent_tool_specs_with_capabilities_and_consultation(
+    provider: CodingProvider,
+    subagents_enabled: bool,
+    shared_work_enabled: bool,
+    team_policy: Option<&crate::TeamPolicy>,
+    consultation_enabled: bool,
+) -> Vec<Value> {
     let mut specs = vec![
         tool(
             "consult_model",
@@ -2763,6 +3007,41 @@ pub fn agent_tool_specs_with_capabilities(
             }),
         ),
     ];
+    if subagents_enabled && consultation_enabled {
+        specs.insert(
+            1,
+            tool(
+                "consult_peer",
+                "Ask the opposite GPT/Claude model for a private second opinion through its persistent peer thread. The peer keeps its context across calls and the completed response returns only to you for reconciliation. Use this when another viewpoint would materially improve the result; do not ask the human to relay messages, and do not call it reflexively on every turn.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "prompt": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 200000,
+                            "description": "A concise briefing containing the relevant objective, evidence, constraints, and the exact question for the peer. The peer already remembers prior consultations in its persistent thread."
+                        },
+                        "profile": {
+                            "type": "string",
+                            "maxLength": 128,
+                            "description": "Optional persistent peer profile such as claude, gpt, claude-opus-5@high, or gpt-5.6-sol@xhigh. Omit to choose the opposite provider automatically."
+                        }
+                    },
+                    "required": ["prompt"],
+                    "additionalProperties": false
+                }),
+            ),
+        );
+    }
+    if !consultation_enabled {
+        specs.retain(|spec| {
+            !matches!(
+                spec.get("name").and_then(Value::as_str),
+                Some("consult_model" | "consult_peer")
+            )
+        });
+    }
     specs.extend(crate::self_service::tool_specs());
     if shared_work_enabled {
         specs.extend(shared_work_tool_specs());
@@ -2956,6 +3235,14 @@ struct NoArgs {}
 struct ConsultModelArgs {
     profile: String,
     prompt: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConsultPeerArgs {
+    prompt: String,
+    #[serde(default)]
+    profile: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -3443,7 +3730,45 @@ async fn finish_agent(
 mod tests {
     use super::*;
     use crate::{PermissionMode, SessionEventKind};
+    use std::sync::Mutex as StdMutex;
     use tempfile::tempdir;
+
+    #[derive(Clone, Default)]
+    struct RecordingPeerExecutor {
+        prompts: Arc<StdMutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::AgentTurnExecutor for RecordingPeerExecutor {
+        async fn execute(
+            &self,
+            turn: crate::AgentTurn,
+            events: mpsc::Sender<SessionEventKind>,
+            _controls: Option<mpsc::Receiver<crate::AgentTurnControl>>,
+        ) -> Result<crate::AgentTurnResult> {
+            let response = {
+                let mut prompts = self.prompts.lock().expect("peer prompt lock");
+                let response = format!("persistent peer reply {}", prompts.len() + 1);
+                prompts.push(turn.prompt);
+                response
+            };
+            events
+                .send(SessionEventKind::Message {
+                    message_id: Uuid::new_v4(),
+                    actor: EventActor::Assistant,
+                    text: response.clone(),
+                    attachments: Vec::new(),
+                    status: MessageStatus::Complete,
+                    delivery: None,
+                })
+                .await
+                .map_err(|_| anyhow::anyhow!("peer event receiver closed"))?;
+            Ok(crate::AgentTurnResult {
+                provider_session_id: Some("persistent-peer-session".to_string()),
+                final_text: response,
+            })
+        }
+    }
 
     fn launch() -> LaunchSession {
         LaunchSession {
@@ -3571,6 +3896,73 @@ mod tests {
         coordinator.stop("/root/claude").await.unwrap();
     }
 
+    #[tokio::test]
+    async fn persistent_peer_consultation_reuses_the_sidecar_and_returns_to_the_primary() {
+        let directory = tempdir().unwrap();
+        let root = Uuid::new_v4();
+        let store = Arc::new(
+            crate::SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
+                .await
+                .unwrap(),
+        );
+        store.create_session(root).await.unwrap();
+        let prompts = Arc::new(StdMutex::new(Vec::new()));
+        let executor = RecordingPeerExecutor {
+            prompts: Arc::clone(&prompts),
+        };
+        let mut root_launch = launch();
+        root_launch.capabilities.multiplayer = false;
+        root_launch.cwd = directory.path().to_path_buf();
+        let coordinator = SubagentCoordinator::new_with_store_and_executor(
+            directory.path(),
+            root,
+            root_launch,
+            3,
+            Arc::new(executor),
+            store,
+        )
+        .unwrap();
+
+        let first = coordinator
+            .consult_peer(CodingProvider::Codex, None, "Compare the API boundaries.")
+            .await
+            .unwrap();
+        let first_thread = first["thread"].as_str().unwrap().to_string();
+        let second = coordinator
+            .consult_peer(
+                CodingProvider::Codex,
+                None,
+                "Now revisit the cancellation edge case.",
+            )
+            .await
+            .unwrap();
+        let reverse = coordinator
+            .consult_peer(
+                CodingProvider::Claude,
+                None,
+                "As the Claude primary, ask GPT to challenge the conclusion.",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(first["persistent"], true);
+        assert_eq!(first["provider"], "claude");
+        assert_eq!(first["response"], "persistent peer reply 1");
+        assert_eq!(second["response"], "persistent peer reply 2");
+        assert_eq!(second["thread"], first_thread);
+        assert_eq!(reverse["provider"], "codex");
+        assert_eq!(reverse["thread"], "/root/gpt");
+        assert_eq!(reverse["response"], "persistent peer reply 3");
+        let prompts = prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 3);
+        assert!(prompts[0].contains("Compare the API boundaries."));
+        assert!(prompts[1].contains("cancellation edge case"));
+        assert!(prompts[0].contains("persistent private Claude peer"));
+        assert!(prompts[2].contains("As the Claude primary"));
+        coordinator.stop("/root/claude").await.unwrap();
+        coordinator.stop("/root/gpt").await.unwrap();
+    }
+
     #[test]
     fn cross_provider_peer_does_not_inherit_an_incompatible_model_or_effort() {
         assert_eq!(
@@ -3601,6 +3993,32 @@ mod tests {
             default_effort_for_cross_provider_peer(CodingProvider::OpenRouter),
             None
         );
+    }
+
+    #[test]
+    fn persistent_peer_defaults_to_the_opposite_provider_and_stable_sidecar_profile() {
+        let (provider, model, effort) =
+            resolve_persistent_peer_profile(CodingProvider::Codex, None).unwrap();
+        assert_eq!(provider, CodingProvider::Claude);
+        assert_eq!(model.as_deref(), Some("claude-opus-5"));
+        assert_eq!(effort.as_deref(), Some("high"));
+
+        let (provider, model, effort) =
+            resolve_persistent_peer_profile(CodingProvider::Claude, None).unwrap();
+        assert_eq!(provider, CodingProvider::Codex);
+        assert_eq!(model.as_deref(), Some(borg_provider::codex_product_model()));
+        assert_eq!(
+            effort.as_deref(),
+            Some(borg_provider::codex_default_effort())
+        );
+
+        let (provider, model, effort) =
+            resolve_persistent_peer_profile(CodingProvider::Codex, Some("claude-opus-5@high"))
+                .unwrap();
+        assert_eq!(provider, CodingProvider::Claude);
+        assert_eq!(model.as_deref(), Some("claude-opus-5"));
+        assert_eq!(effort.as_deref(), Some("high"));
+        assert!(resolve_persistent_peer_profile(CodingProvider::Codex, Some("kimi")).is_err());
     }
 
     #[test]
@@ -4017,6 +4435,34 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn persistent_peer_tool_is_root_only_and_not_recursive() {
+        let root_names = agent_tool_specs_with_capabilities_and_consultation(
+            CodingProvider::Codex,
+            true,
+            false,
+            None,
+            true,
+        )
+        .into_iter()
+        .filter_map(|tool| tool["name"].as_str().map(str::to_owned))
+        .collect::<Vec<_>>();
+        assert!(root_names.iter().any(|name| name == "consult_peer"));
+
+        let child_names = agent_tool_specs_with_capabilities_and_consultation(
+            CodingProvider::Claude,
+            true,
+            false,
+            None,
+            false,
+        )
+        .into_iter()
+        .filter_map(|tool| tool["name"].as_str().map(str::to_owned))
+        .collect::<Vec<_>>();
+        assert!(!child_names.iter().any(|name| name == "consult_peer"));
+        assert!(!child_names.iter().any(|name| name == "consult_model"));
     }
 
     #[tokio::test]

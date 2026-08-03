@@ -341,6 +341,14 @@ pub fn tool_call_summary(name: &str, input: &Value) -> (String, String) {
         );
     }
 
+    if tool == "consult_peer" {
+        let profile = string_field(input, "profile").unwrap_or("opposite provider");
+        return (
+            "Consult peer".to_string(),
+            format!("{} · persistent peer", compact_text(profile, 80)),
+        );
+    }
+
     if tool == "create_goal" {
         let objective = string_field(input, "objective").unwrap_or("new goal");
         let budget = input
@@ -640,7 +648,7 @@ fn tool_category(name: &str, label: &str, input: &Value) -> ToolPresentationCate
         )
     {
         ToolPresentationCategory::Agent
-    } else if leaf == "consult_model" {
+    } else if matches!(leaf.as_str(), "consult_model" | "consult_peer") {
         ToolPresentationCategory::Agent
     } else if matches!(
         leaf.as_str(),
@@ -1884,6 +1892,22 @@ mod tests {
         assert_eq!(presentation.label, "Consult model");
         assert_eq!(presentation.detail, "claude · second opinion");
         assert_eq!(presentation.category, ToolPresentationCategory::Agent);
+    }
+
+    #[test]
+    fn presents_persistent_peer_consultation_without_exposing_raw_thread_ids() {
+        let presentation = project_tool_presentation(
+            "mcp__borg_agent__consult_peer",
+            &json!({"prompt": "Review the tradeoffs."}),
+            Some(
+                r#"{"persistent":true,"provider":"claude","thread":"/root/claude","response":"Use the narrower interface."}"#,
+            ),
+            false,
+        );
+        assert_eq!(presentation.label, "Consult peer");
+        assert_eq!(presentation.detail, "opposite provider · persistent peer");
+        assert_eq!(presentation.category, ToolPresentationCategory::Agent);
+        assert!(!presentation.detail.contains("/root/claude"));
     }
 
     #[test]

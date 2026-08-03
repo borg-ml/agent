@@ -2133,35 +2133,74 @@ async fn run_local_agent_session(
                     }
                     continue;
                 }
-                if let Some((sidecar, intent)) = persistent_sidecar_command(line) {
-                    let active = matches!(
-                        status,
-                        SessionStatus::Starting
-                            | SessionStatus::Running
-                            | SessionStatus::WaitingForApproval
-                    );
-                    let delivery = if active {
-                        running_input(
-                            line,
-                            provider,
-                            steer_active_codex,
-                            status_is_compacting(status_detail.as_deref()),
-                        )
-                        .0
-                    } else {
-                        PromptDelivery::Steer
-                    };
-                    for command in persistent_sidecar_commands(
-                        session_id,
-                        sidecar,
-                        &intent,
-                        Uuid::new_v4(),
-                        &[],
-                        delivery,
-                    ) {
-                        if session_command_tx.send(command).await.is_err() {
-                            break;
+                if let Some(prompt) = director_prompt_command(line) {
+                    match prompt {
+                        Ok(prompt) => {
+                            let active = matches!(
+                                status,
+                                SessionStatus::Starting
+                                    | SessionStatus::Running
+                                    | SessionStatus::WaitingForApproval
+                            );
+                            let delivery = director_prompt_delivery(
+                                active,
+                                provider,
+                                steer_active_codex,
+                                status_is_compacting(status_detail.as_deref()),
+                            );
+                            let message_id = Uuid::new_v4();
+                            if session_command_tx
+                                .send(director_prompt_host_command(
+                                    session_id,
+                                    message_id,
+                                    prompt,
+                                    Vec::new(),
+                                    delivery,
+                                ))
+                                .await
+                                .is_err()
+                            {
+                                eprintln!("\n  Could not reach the director thread.\n");
+                            }
                         }
+                        Err(error) => eprintln!("\n  {error}\n"),
+                    }
+                    continue;
+                }
+                if let Some(command) = persistent_sidecar_command(line) {
+                    match command {
+                        Ok((sidecar, intent)) => {
+                            let active = matches!(
+                                status,
+                                SessionStatus::Starting
+                                    | SessionStatus::Running
+                                    | SessionStatus::WaitingForApproval
+                            );
+                            let delivery = if active {
+                                running_input(
+                                    line,
+                                    provider,
+                                    steer_active_codex,
+                                    status_is_compacting(status_detail.as_deref()),
+                                )
+                                .0
+                            } else {
+                                PromptDelivery::Steer
+                            };
+                            for command in persistent_sidecar_commands(
+                                session_id,
+                                sidecar,
+                                &intent,
+                                Uuid::new_v4(),
+                                &[],
+                                delivery,
+                            ) {
+                                if session_command_tx.send(command).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        Err(error) => eprintln!("\n  {error}\n"),
                     }
                     continue;
                 }
@@ -2635,25 +2674,85 @@ async fn run_local_agent_session(
                         text,
                         attachments,
                     } => {
-                        if let Some((sidecar, intent)) = persistent_sidecar_command(&text) {
+                        let text = normalize_consultation_command(&text);
+                        if let Some(prompt) = director_prompt_command(&text) {
                             let terminal = terminal.as_mut().expect("terminal");
                             terminal.discard_pending_prompt(target, message_id);
-                            terminal.request_sidecar_focus(sidecar.task_name());
-                            terminal.set_notice(sidecar_notice(sidecar, &intent));
-                            for command in persistent_sidecar_commands(
-                                session_id,
-                                sidecar,
-                                &intent,
-                                message_id,
-                                &attachments,
-                                PromptDelivery::Queue,
-                            ) {
-                                if session_command_tx.send(command).await.is_err() {
-                                    terminal.set_notice(format!(
-                                        "Could not reach {} sidecar",
-                                        sidecar.label()
-                                    ));
-                                    break;
+                            match prompt {
+                                Ok(prompt) => {
+                                    terminal.focus_director();
+                                    terminal.project_pending_prompt(
+                                        None,
+                                        message_id,
+                                        prompt.clone(),
+                                        PromptDelivery::Queue,
+                                    );
+                                    terminal.set_notice("Queued message for director".to_string());
+                                    let command = director_prompt_host_command(
+                                        session_id,
+                                        message_id,
+                                        prompt,
+                                        attachments,
+                                        PromptDelivery::Queue,
+                                    );
+                                    terminal.draw()?;
+                                    terminal_dirty = terminal.has_pending_scroll_frame();
+                                    pending_prompt_ids.insert(message_id);
+                                    if let Err(error) = session_command_tx.send(command).await {
+                                        pending_prompt_ids.remove(&message_id);
+                                        let HostCommand::Prompt {
+                                            text, attachments, ..
+                                        } = error.0
+                                        else {
+                                            unreachable!("director submission always sends a prompt");
+                                        };
+                                        terminal.reject_optimistic_prompt(
+                                            None,
+                                            message_id,
+                                            format!("/director {text}"),
+                                            attachments,
+                                        );
+                                        terminal.set_notice(
+                                            "Could not reach the director thread".to_string(),
+                                        );
+                                        terminal.draw()?;
+                                        terminal_dirty = false;
+                                    }
+                                }
+                                Err(error) => {
+                                    terminal.restore_composer(text, attachments);
+                                    terminal.set_notice(error.to_string());
+                                }
+                            }
+                            continue;
+                        }
+                        if let Some(command) = persistent_sidecar_command(&text) {
+                            let terminal = terminal.as_mut().expect("terminal");
+                            terminal.discard_pending_prompt(target, message_id);
+                            match command {
+                                Ok((sidecar, intent)) => {
+                                    terminal.request_sidecar_focus(sidecar.task_name());
+                                    terminal.set_notice(sidecar_notice(sidecar, &intent));
+                                    for command in persistent_sidecar_commands(
+                                        session_id,
+                                        sidecar,
+                                        &intent,
+                                        message_id,
+                                        &attachments,
+                                        PromptDelivery::Queue,
+                                    ) {
+                                        if session_command_tx.send(command).await.is_err() {
+                                            terminal.set_notice(format!(
+                                                "Could not reach {} peer",
+                                                sidecar.label()
+                                            ));
+                                            break;
+                                        }
+                                    }
+                                }
+                                Err(error) => {
+                                    terminal.restore_composer(text, attachments);
+                                    terminal.set_notice(error.to_string());
                                 }
                             }
                             continue;
@@ -2705,24 +2804,111 @@ async fn run_local_agent_session(
                         text,
                         attachments,
                     } => {
-                        if let Some((sidecar, intent)) = persistent_sidecar_command(&text) {
+                        let text = normalize_consultation_command(&text);
+                        if let Some(prompt) = director_prompt_command(&text) {
                             let terminal = terminal.as_mut().expect("terminal");
-                            terminal.request_sidecar_focus(sidecar.task_name());
-                            terminal.set_notice(sidecar_notice(sidecar, &intent));
-                            for command in persistent_sidecar_commands(
-                                session_id,
-                                sidecar,
-                                &intent,
-                                Uuid::new_v4(),
-                                &attachments,
-                                PromptDelivery::Steer,
-                            ) {
-                                if session_command_tx.send(command).await.is_err() {
-                                    terminal.set_notice(format!(
-                                        "Could not reach {} sidecar",
-                                        sidecar.label()
-                                    ));
-                                    break;
+                            match prompt {
+                                Ok(prompt) => {
+                                    terminal.focus_director();
+                                    let active = matches!(
+                                        status,
+                                        SessionStatus::Starting
+                                            | SessionStatus::Running
+                                            | SessionStatus::WaitingForApproval
+                                    );
+                                    let delivery = director_prompt_delivery(
+                                        active,
+                                        provider,
+                                        steer_active_codex,
+                                        status_is_compacting(status_detail.as_deref()),
+                                    );
+                                    let message_id = Uuid::new_v4();
+                                    if active {
+                                        terminal.project_pending_prompt(
+                                            None,
+                                            message_id,
+                                            prompt.clone(),
+                                            delivery,
+                                        );
+                                    } else {
+                                        terminal.project_submitted_prompt(
+                                            message_id,
+                                            prompt.clone(),
+                                            attachments.clone(),
+                                            delivery,
+                                        );
+                                        status = SessionStatus::Starting;
+                                        sleep_inhibitor.set_turn_active(true);
+                                    }
+                                    terminal.set_notice("Sending to director".to_string());
+                                    let command = director_prompt_host_command(
+                                        session_id,
+                                        message_id,
+                                        prompt,
+                                        attachments,
+                                        delivery,
+                                    );
+                                    terminal.draw()?;
+                                    terminal_dirty = terminal.has_pending_scroll_frame();
+                                    pending_prompt_ids.insert(message_id);
+                                    if let Err(error) = session_command_tx.send(command).await {
+                                        pending_prompt_ids.remove(&message_id);
+                                        let HostCommand::Prompt {
+                                            text, attachments, ..
+                                        } = error.0
+                                        else {
+                                            unreachable!("director submission always sends a prompt");
+                                        };
+                                        terminal.reject_optimistic_prompt(
+                                            None,
+                                            message_id,
+                                            format!("/director {text}"),
+                                            attachments,
+                                        );
+                                        if !active {
+                                            status = SessionStatus::Ready;
+                                            sleep_inhibitor.set_turn_active(false);
+                                        }
+                                        terminal.set_notice(
+                                            "Could not reach the director thread".to_string(),
+                                        );
+                                        terminal.draw()?;
+                                        terminal_dirty = false;
+                                    }
+                                }
+                                Err(error) => {
+                                    terminal.restore_composer(text, attachments);
+                                    terminal.set_notice(error.to_string());
+                                }
+                            }
+                            continue;
+                        }
+                        if let Some(command) = persistent_sidecar_command(&text) {
+                            let terminal = terminal.as_mut().expect("terminal");
+                            match command {
+                                Ok((sidecar, intent)) => {
+                                    terminal.request_sidecar_focus(sidecar.task_name());
+                                    terminal.set_notice(sidecar_notice(sidecar, &intent));
+                                    for command in persistent_sidecar_commands(
+                                        session_id,
+                                        sidecar,
+                                        &intent,
+                                        Uuid::new_v4(),
+                                        &attachments,
+                                        PromptDelivery::Steer,
+                                    ) {
+                                        if session_command_tx.send(command).await.is_err() {
+                                            terminal.set_notice(format!(
+                                                "Could not reach {} peer",
+                                                sidecar.label()
+                                            ));
+                                            break;
+                                        }
+                                    }
+                                }
+                                Err(error) => {
+                                    terminal.restore_composer(text, attachments);
+                                    terminal.set_notice(error.to_string());
                                 }
                             }
                             continue;
@@ -4671,13 +4857,6 @@ enum PersistentSidecar {
 }
 
 impl PersistentSidecar {
-    const fn alias(self) -> &'static str {
-        match self {
-            Self::Claude => "/claude",
-            Self::Gpt => "/gpt",
-        }
-    }
-
     const fn task_name(self) -> &'static str {
         match self {
             Self::Claude => "/root/claude",
@@ -4728,33 +4907,46 @@ enum PersistentSidecarIntent {
     Prompt(String),
 }
 
-/// Parse the direct, durable peer lanes. `/ask` remains deliberately outside
-/// this parser so it continues to be a one-shot briefing chosen by the main
-/// model through `consult_model`.
-fn persistent_sidecar_command(line: &str) -> Option<(PersistentSidecar, PersistentSidecarIntent)> {
+/// Parse explicit direct control of a durable peer. `/claude` and `/gpt`
+/// remain deliberately outside this parser: they are friendly aliases that
+/// let the active model make a context-aware `consult_peer` call.
+fn persistent_sidecar_command(
+    line: &str,
+) -> Option<Result<(PersistentSidecar, PersistentSidecarIntent)>> {
     let trimmed = line.trim();
-    for sidecar in [PersistentSidecar::Claude, PersistentSidecar::Gpt] {
-        let alias = sidecar.alias();
-        if trimmed == alias {
-            return Some((sidecar, PersistentSidecarIntent::Ensure));
-        }
-        let Some(rest) = trimmed.strip_prefix(alias).filter(|rest| {
-            rest.chars()
-                .next()
-                .is_some_and(|character| character.is_whitespace())
-        }) else {
-            continue;
-        };
-        let rest = rest.trim();
-        if rest.is_empty() {
-            return Some((sidecar, PersistentSidecarIntent::Ensure));
-        }
-        if matches!(rest.to_ascii_lowercase().as_str(), "clear" | "new") {
-            return Some((sidecar, PersistentSidecarIntent::Clear));
-        }
-        return Some((sidecar, PersistentSidecarIntent::Prompt(rest.to_string())));
+    let Some(rest) = trimmed.strip_prefix("/peer") else {
+        return None;
+    };
+    if rest
+        .chars()
+        .next()
+        .is_some_and(|character| !character.is_whitespace())
+    {
+        return None;
     }
-    None
+
+    let mut parts = rest.trim().splitn(2, char::is_whitespace);
+    let sidecar = match parts
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "claude" => PersistentSidecar::Claude,
+        "gpt" => PersistentSidecar::Gpt,
+        _ => {
+            return Some(Err(anyhow::anyhow!("usage: /peer claude|gpt [TEXT|clear]")));
+        }
+    };
+    let request = parts.next().unwrap_or_default().trim();
+    let intent = if request.is_empty() {
+        PersistentSidecarIntent::Ensure
+    } else if matches!(request.to_ascii_lowercase().as_str(), "clear" | "new") {
+        PersistentSidecarIntent::Clear
+    } else {
+        PersistentSidecarIntent::Prompt(request.to_string())
+    };
+    Some(Ok((sidecar, intent)))
 }
 
 fn persistent_sidecar_commands(
@@ -4806,18 +4998,23 @@ fn persistent_sidecar_commands(
 
 fn sidecar_notice(sidecar: PersistentSidecar, intent: &PersistentSidecarIntent) -> String {
     match intent {
-        PersistentSidecarIntent::Ensure => format!("{} sidecar ready", sidecar.label()),
-        PersistentSidecarIntent::Clear => format!("Clearing {} sidecar context", sidecar.label()),
-        PersistentSidecarIntent::Prompt(_) => format!("Sending to {} sidecar", sidecar.label()),
+        PersistentSidecarIntent::Ensure => format!("{} peer ready", sidecar.label()),
+        PersistentSidecarIntent::Clear => format!("Clearing {} peer context", sidecar.label()),
+        PersistentSidecarIntent::Prompt(_) => format!("Sending to {} peer", sidecar.label()),
     }
 }
 
-/// `/codex` remains a compatibility alias for the one-shot GPT consultation.
-/// Persistent lanes are intentionally handled before this provider-neutral
-/// normalizer.
+/// `/claude` and `/gpt` are the ergonomic aliases for a primary-agent-driven
+/// persistent consultation. `/codex` remains a compatibility alias for an
+/// explicit GPT peer consultation; the active model still chooses the useful
+/// briefing. Direct sidecar controls are handled before this normalizer.
 pub(crate) fn normalize_consultation_command(line: &str) -> String {
     let trimmed = line.trim();
-    for (alias, profile) in [("/codex", "gpt-5.6-sol@xhigh")] {
+    for (alias, profile) in [
+        ("/claude", "claude"),
+        ("/gpt", "gpt"),
+        ("/codex", "gpt-5.6-sol@xhigh"),
+    ] {
         if trimmed == alias {
             return format!("/ask {profile}");
         }
@@ -4834,6 +5031,59 @@ pub(crate) fn normalize_consultation_command(line: &str) -> String {
 
 fn status_is_compacting(detail: Option<&str>) -> bool {
     detail.is_some_and(|detail| detail.to_ascii_lowercase().contains("compact"))
+}
+
+fn director_prompt_command(line: &str) -> Option<Result<String>> {
+    let trimmed = line.trim();
+    let rest = trimmed.strip_prefix("/director")?;
+    if !rest.is_empty()
+        && !rest
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_whitespace())
+    {
+        return None;
+    }
+    let prompt = rest.trim();
+    if prompt.is_empty() {
+        Some(Err(anyhow::anyhow!("usage: /director TEXT")))
+    } else {
+        Some(Ok(prompt.to_string()))
+    }
+}
+
+fn director_prompt_delivery(
+    active: bool,
+    provider: CodingProvider,
+    steer_active_turn: bool,
+    compacting: bool,
+) -> PromptDelivery {
+    if active {
+        if compacting {
+            PromptDelivery::Queue
+        } else {
+            default_active_delivery(provider, steer_active_turn)
+        }
+    } else {
+        PromptDelivery::Steer
+    }
+}
+
+fn director_prompt_host_command(
+    session_id: Uuid,
+    message_id: Uuid,
+    text: String,
+    attachments: Vec<PathBuf>,
+    delivery: PromptDelivery,
+) -> HostCommand {
+    HostCommand::Prompt {
+        session_id,
+        message_id,
+        text,
+        attachments,
+        output_schema: None,
+        delivery,
+    }
 }
 
 fn default_active_delivery(provider: CodingProvider, steer_active_turn: bool) -> PromptDelivery {
@@ -4906,9 +5156,11 @@ fn print_agent_help() {
     println!(
         r#"
   /settings         show interactive settings
-  /ask PROFILE TEXT ask another model for a second opinion
-  /claude TEXT      persistent Claude Opus 5 sidecar (use /claude clear to reset)
-  /gpt TEXT         persistent GPT 5.6 Sol sidecar (use /gpt clear to reset)
+  /ask PROFILE TEXT ask another model through its persistent peer thread
+  /director TEXT    send a message to the persistent director thread
+  /claude TEXT      ask the active model to consult its persistent Claude peer
+  /gpt TEXT         ask the active model to consult its persistent GPT peer
+  /peer PROVIDER    direct persistent-peer control; add TEXT, clear, or new
   /model            choose the model
   /effort           choose reasoning effort
   /followups        choose steer current turn or queue next turn
@@ -5579,33 +5831,86 @@ mod tests {
 
     #[test]
     fn persistent_sidecar_aliases_keep_their_durable_lane_identity() {
-        assert_eq!(
-            persistent_sidecar_command("/claude review this"),
-            Some((
+        assert!(matches!(
+            persistent_sidecar_command("/peer claude review this"),
+            Some(Ok((
                 PersistentSidecar::Claude,
-                PersistentSidecarIntent::Prompt("review this".to_string())
-            ))
+                PersistentSidecarIntent::Prompt(ref prompt)
+            ))) if prompt == "review this"
+        ));
+        assert!(matches!(
+            persistent_sidecar_command("/peer gpt clear"),
+            Some(Ok((PersistentSidecar::Gpt, PersistentSidecarIntent::Clear)))
+        ));
+        assert!(matches!(
+            persistent_sidecar_command("/peer claude"),
+            Some(Ok((
+                PersistentSidecar::Claude,
+                PersistentSidecarIntent::Ensure
+            )))
+        ));
+        assert!(persistent_sidecar_command("/peer").is_some_and(|result| result.is_err()));
+        assert!(
+            persistent_sidecar_command("/peer claudette review")
+                .is_some_and(|result| result.is_err())
         );
-        assert_eq!(
-            persistent_sidecar_command("/gpt clear"),
-            Some((PersistentSidecar::Gpt, PersistentSidecarIntent::Clear))
-        );
-        assert_eq!(
-            persistent_sidecar_command("/claude"),
-            Some((PersistentSidecar::Claude, PersistentSidecarIntent::Ensure))
-        );
-        assert_eq!(persistent_sidecar_command("/claudette review"), None);
+        assert!(persistent_sidecar_command("/peered review").is_none());
     }
 
     #[test]
-    fn consultation_aliases_leave_persistent_lanes_alone() {
+    fn director_command_extracts_text_without_matching_longer_commands() {
+        assert_eq!(
+            director_prompt_command("/director review the focused child").and_then(Result::ok),
+            Some("review the focused child".to_string())
+        );
+        assert!(director_prompt_command("/director").is_some_and(|result| result.is_err()));
+        assert!(director_prompt_command("/directorate review").is_none());
+        assert_eq!(
+            director_prompt_delivery(true, CodingProvider::Codex, true, false),
+            PromptDelivery::Steer
+        );
+        assert_eq!(
+            director_prompt_delivery(false, CodingProvider::Codex, true, false),
+            PromptDelivery::Steer
+        );
+        assert_eq!(
+            director_prompt_delivery(true, CodingProvider::Codex, true, true),
+            PromptDelivery::Queue
+        );
+        let session_id = Uuid::new_v4();
+        let message_id = Uuid::new_v4();
+        let command = director_prompt_host_command(
+            session_id,
+            message_id,
+            "send this to the root".to_string(),
+            vec![PathBuf::from("brief.png")],
+            PromptDelivery::Steer,
+        );
+        assert!(matches!(
+            command,
+            HostCommand::Prompt {
+                session_id: actual_session_id,
+                message_id: actual_message_id,
+                text,
+                attachments,
+                delivery: PromptDelivery::Steer,
+                ..
+            } if actual_session_id == session_id
+                && actual_message_id == message_id
+                && text == "send this to the root"
+                && attachments == vec![PathBuf::from("brief.png")]
+        ));
+    }
+
+    #[test]
+    fn consultation_aliases_route_through_the_primary_model() {
         assert_eq!(
             normalize_consultation_command("/claude review this"),
-            "/claude review this"
+            "/ask claude review this"
         );
         assert_eq!(
             normalize_consultation_command("/gpt compare these approaches"),
-            "/gpt compare these approaches"
+            "/ask gpt compare these approaches"
         );
         assert_eq!(
             normalize_consultation_command("/codex check the design"),
@@ -5615,7 +5920,19 @@ mod tests {
             normalize_consultation_command("/ask claude review"),
             "/ask claude review"
         );
+        assert_eq!(
+            normalize_consultation_command("/peer claude review"),
+            "/peer claude review"
+        );
         assert_eq!(normalize_consultation_command("/claudette"), "/claudette");
+        assert_eq!(
+            idle_input("/claude review this").1,
+            "/ask claude review this"
+        );
+        assert_eq!(
+            running_input("/gpt compare this", CodingProvider::Claude, true, false).1,
+            "/ask gpt compare this"
+        );
     }
 
     #[test]

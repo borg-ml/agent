@@ -124,6 +124,18 @@ TUI, while Blu skills and MCP servers reload at the next turn boundary.
 the native skill context rescans it at the start of the next native turn
 without a restart.
 
+## Cross-model peer consultation
+
+The active GPT or Claude thread remains the primary conversation. `/claude TEXT`
+and `/gpt TEXT` ask that primary model to choose the useful context and consult
+the matching persistent peer thread; `/ask PROFILE TEXT` remains the explicit
+provider form. The peer's answer returns to the primary model for
+reconciliation, so the human never has to relay messages between models.
+Omitting the provider from `/ask` lets the model use the opposite provider
+automatically. The peer cannot invoke another peer. Direct peer maintenance
+uses the deliberately explicit `/peer claude|gpt [TEXT|clear]` command, and
+shares the same durable `/root/claude` and `/root/gpt` lanes as consultation.
+
 ## Local multiplayer workspaces
 
 Run `borg workspaces` to list the current OS user's durable local workspaces.
