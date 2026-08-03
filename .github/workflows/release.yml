@@ -19,30 +19,8 @@ jobs:
           ./scripts/release.sh --verify-tag "$GITHUB_REF_NAME"
           ./scripts/release-test.sh
 
-  provider-parity:
-    needs: validate
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
-        with:
-          toolchain: "1.94.0"
-      - name: Run deterministic provider parity contracts
-        shell: bash
-        run: |
-          cargo test --locked -p borg-provider provider::chat_stream::tests::codex_and_claude_normalize_mcp_tool_lifecycle_identically
-          cargo test --locked -p borg-provider provider::chat_stream::tests::codex_and_claude_usage_maps_share_billing_buckets
-          cargo test --locked -p borg-remote subagents::tests::every_execution_lane_exposes_the_same_borg_control_plane
-          cargo test --locked -p borg-remote session::tests::active_provider_steer_uses_turn_control_across_provider_lanes
-      - name: Check and build Claude Agent SDK adapter
-        shell: bash
-        run: |
-          npm --prefix packages/borg-claude-sdk ci
-          npm --prefix packages/borg-claude-sdk run check
-          npm --prefix packages/borg-claude-sdk run build
-
   build:
-    needs: [validate, provider-parity]
+    needs: validate
     strategy:
       fail-fast: false
       matrix:
@@ -85,13 +63,10 @@ jobs:
           fi
           "$binary" --version
           "$binary" --help >/dev/null
-      - name: Build Claude Agent SDK adapter
+      - name: Install pinned native Claude payload
         shell: bash
         run: |
-          npm --prefix packages/borg-claude-sdk ci
-          npm --prefix packages/borg-claude-sdk run check
-          npm --prefix packages/borg-claude-sdk run build
-          npm --prefix packages/borg-claude-sdk prune --omit=dev
+          npm --prefix packages/claude-native-runtime ci --omit=dev --ignore-scripts
       - name: Package Unix archive
         if: matrix.archive == 'tar'
         shell: bash
@@ -100,10 +75,24 @@ jobs:
           package_dir="borg-${{ matrix.target }}"
           mkdir "$package_dir"
           cp "target/${{ matrix.target }}/release/borg" "$package_dir/"
-          mkdir -p "$package_dir/providers"
-          cp -R packages/borg-claude-sdk "$package_dir/providers/claude-sdk"
+          native_package=""
+          for candidate in packages/claude-native-runtime/node_modules/@anthropic-ai/claude-agent-sdk-*; do
+            if [[ -x "$candidate/claude" ]]; then
+              native_package="$candidate"
+              break
+            fi
+          done
+          test -n "$native_package"
+          mkdir -p "$package_dir/providers/claude"
+          cp "$native_package/claude" "$package_dir/providers/claude/claude"
+          cp "$native_package/manifest.json" "$package_dir/providers/claude/manifest.json"
+          cp packages/claude-native-runtime/node_modules/@anthropic-ai/claude-agent-sdk/package.json "$package_dir/providers/claude/package.json"
+          chmod 700 "$package_dir/providers/claude/claude"
+          mkdir -p "$package_dir/docs" "$package_dir/configs"
+          cp docs/blu-extensions.md "$package_dir/docs/"
+          cp configs/extension.example.toml "$package_dir/configs/"
           cp LICENSE NOTICE.md README.md "$package_dir/"
-          tar -C "$package_dir" -czf "$PWD/$asset" borg providers LICENSE NOTICE.md README.md
+          tar -C "$package_dir" -czf "$PWD/$asset" borg providers docs configs LICENSE NOTICE.md README.md
           if command -v sha256sum >/dev/null 2>&1; then
             sha256sum "$asset" >"$asset.sha256"
           else
@@ -117,8 +106,17 @@ jobs:
           $packageDir = "borg-${{ matrix.target }}"
           New-Item -ItemType Directory -Path $packageDir
           Copy-Item "target/${{ matrix.target }}/release/borg.exe" $packageDir
-          New-Item -ItemType Directory -Path "$packageDir/providers"
-          Copy-Item -Recurse "packages/borg-claude-sdk" "$packageDir/providers/claude-sdk"
+          $platformPackage = Get-ChildItem "packages/claude-native-runtime/node_modules/@anthropic-ai" -Directory |
+            Where-Object { $_.Name -like "claude-agent-sdk-*" -and (Test-Path (Join-Path $_.FullName "claude.exe")) } |
+            Select-Object -First 1
+          if (-not $platformPackage) { throw "Claude native platform package was not installed" }
+          New-Item -ItemType Directory -Path "$packageDir/providers/claude"
+          Copy-Item (Join-Path $platformPackage.FullName "claude.exe") "$packageDir/providers/claude/claude.exe"
+          Copy-Item (Join-Path $platformPackage.FullName "manifest.json") "$packageDir/providers/claude/manifest.json"
+          Copy-Item "packages/claude-native-runtime/node_modules/@anthropic-ai/claude-agent-sdk/package.json" "$packageDir/providers/claude/package.json"
+          New-Item -ItemType Directory -Path "$packageDir/docs", "$packageDir/configs"
+          Copy-Item "docs/blu-extensions.md" "$packageDir/docs/"
+          Copy-Item "configs/extension.example.toml" "$packageDir/configs/"
           Copy-Item LICENSE, NOTICE.md, README.md $packageDir
           Compress-Archive -Path "$packageDir/*" -DestinationPath $asset
           $hash = (Get-FileHash -Algorithm SHA256 $asset).Hash.ToLowerInvariant()
@@ -133,6 +131,11 @@ jobs:
           binary="$(find "$smoke_dir" -type f -name borg -print -quit)"
           test -n "$binary"
           "$binary" --version
+          native="$(find "$smoke_dir" -path '*/providers/claude/claude' -type f -print -quit)"
+          test -n "$native"
+          "$native" --version
+          test -f "$(dirname "$binary")/docs/blu-extensions.md"
+          test -f "$(dirname "$binary")/configs/extension.example.toml"
       - name: Install-smoke the Windows archive
         if: matrix.archive == 'zip'
         shell: pwsh
@@ -143,6 +146,11 @@ jobs:
           $binary = Get-ChildItem -Path $smokeDir -Recurse -Filter "borg.exe" | Select-Object -First 1
           if (-not $binary) { throw "packaged borg.exe was not found" }
           & $binary.FullName --version
+          $native = Get-ChildItem -Path $smokeDir -Recurse -Filter "claude.exe" | Select-Object -First 1
+          if (-not $native) { throw "packaged native claude.exe was not found" }
+          & $native.FullName --version
+          if (-not (Get-ChildItem -Path $smokeDir -Recurse -Filter "blu-extensions.md")) { throw "Blu documentation was not packaged" }
+          if (-not (Get-ChildItem -Path $smokeDir -Recurse -Filter "extension.example.toml")) { throw "Blu manifest example was not packaged" }
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: borg-${{ matrix.target }}

@@ -294,7 +294,7 @@ impl AgentConfig {
                 server
                     .allowed_tools
                     .iter()
-                    .all(|tool| !tool.trim().is_empty() && !tool.contains('\0')),
+                    .all(|tool| valid_allowed_tool(tool)),
                 "MCP server `{name}` has an invalid allowed tool"
             );
         }
@@ -455,6 +455,14 @@ fn valid_alias(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn valid_allowed_tool(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
 }
 
 #[cfg(test)]

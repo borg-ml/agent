@@ -1,26 +1,24 @@
-//! Streaming chat runners for the typed Codex app-server and Claude SDK paths.
+//! Streaming chat runners for the typed Codex app-server and native
+//! `claude-agents` paths.
 
 use crate::{ProviderAuthBundle, ProviderAuthProvider, ProviderChannel};
 use anyhow::{Context, Result, anyhow, bail};
-use serde_json::{Value, json};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::{
     Arc, Condvar, Mutex,
     atomic::{AtomicBool, Ordering},
     mpsc as std_mpsc,
 };
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::Command;
 use tokio::sync::mpsc;
 
 use super::codex_app_server::{CodexAppServerClient, CodexTurnInput, JsonRpcMessage};
 mod claude_native;
-mod claude_stream;
 mod codex_items;
 mod codex_stream;
 mod opencode_stream;
@@ -34,7 +32,6 @@ use crate::provider_auth::{
     codex_home_holds_chatgpt_session_checked, ensure_codex_home, restore_bundle,
 };
 use crate::runtime::{ProviderCallUsage, elapsed_millis_u64};
-use claude_stream::ClaudeStreamState;
 #[cfg(test)]
 use codex_items::*;
 use codex_stream::{CodexStreamMapper, codex_turn_usage};
@@ -275,41 +272,26 @@ pub fn run_claude_local_chat_stream(
 }
 
 #[derive(Clone, Default)]
-pub struct ClaudeSdkPool {
-    inner: Arc<tokio::sync::Mutex<Option<PooledClaudeSdk>>>,
-    native_inner: Arc<tokio::sync::Mutex<Option<claude_native::PooledClaudeNative>>>,
-}
-
-struct PooledClaudeSdk {
-    child: tokio::process::Child,
-    stdin: tokio::process::ChildStdin,
-    stdout: BufReader<tokio::process::ChildStdout>,
-    stderr: Arc<tokio::sync::Mutex<String>>,
-    _provider_home: tempfile::TempDir,
-    channel: ProviderChannel,
-    started: bool,
+pub struct ClaudeAgentsPool {
+    native_inner: claude_agents::ClaudePool,
 }
 
 pub fn run_pooled_claude_local_chat_stream(
     req: ChatStreamRequest,
     control_rx: Option<mpsc::Receiver<ChatStreamControl>>,
     permission: LocalAgentPermission,
-    pool: ClaudeSdkPool,
+    pool: ClaudeAgentsPool,
 ) -> mpsc::Receiver<ChatStreamEvent> {
     let (tx, rx) = mpsc::channel::<ChatStreamEvent>(64);
     tokio::spawn(async move {
-        let result = if claude_native::native_enabled() {
-            claude_native::run_pooled(
-                req,
-                tx.clone(),
-                control_rx,
-                permission,
-                pool.native_inner.clone(),
-            )
-            .await
-        } else {
-            run_pooled_claude_sdk_inner(req, tx.clone(), control_rx, permission, pool).await
-        };
+        let result = claude_native::run_pooled(
+            req,
+            tx.clone(),
+            control_rx,
+            permission,
+            pool.native_inner.clone(),
+        )
+        .await;
         if let Err(error) = result {
             let _ = tx
                 .send(ChatStreamEvent::Failed {
@@ -329,13 +311,7 @@ fn run_claude_stream(
 ) -> mpsc::Receiver<ChatStreamEvent> {
     let (tx, rx) = mpsc::channel::<ChatStreamEvent>(64);
     tokio::spawn(async move {
-        // Native path talks to the `claude` binary directly; the sidecar path
-        // goes through packages/borg-claude-sdk. Both emit identical events.
-        let result = if claude_native::native_enabled() {
-            claude_native::run(req, tx.clone(), control_rx, local_auth, permission).await
-        } else {
-            run_claude_sdk_inner(req, tx.clone(), control_rx, local_auth, permission).await
-        };
+        let result = claude_native::run(req, tx.clone(), control_rx, local_auth, permission).await;
         if let Err(err) = result {
             let _ = tx
                 .send(ChatStreamEvent::Failed {
@@ -641,6 +617,10 @@ struct CodexAppServerKey {
     working_directory: String,
     permission: LocalAgentPermission,
     web_search_allowed: bool,
+    /// System instructions and external MCP definitions are part of the
+    /// provider thread bootstrap. A pooled client must be replaced when live
+    /// Blu reloads change either input.
+    context_fingerprint: String,
 }
 
 pub fn run_pooled_codex_local_chat_stream(
@@ -722,670 +702,6 @@ pub fn run_opencode_local_chat_stream(
         }
     });
     rx
-}
-
-async fn run_claude_sdk_inner(
-    req: ChatStreamRequest,
-    tx: mpsc::Sender<ChatStreamEvent>,
-    control_rx: Option<mpsc::Receiver<ChatStreamControl>>,
-    local_auth: bool,
-    permission: LocalAgentPermission,
-) -> Result<()> {
-    let started_at = Instant::now();
-    let provider_home = tempfile::tempdir().context("failed to create Claude provider home")?;
-    let workspace_dir = req
-        .working_directory
-        .clone()
-        .unwrap_or_else(|| provider_home.path().to_path_buf());
-    fs::create_dir_all(&workspace_dir).with_context(|| {
-        format!(
-            "failed to create Claude workspace directory {}",
-            workspace_dir.display()
-        )
-    })?;
-    if let Some(auth) = req.provider_auth.as_ref()
-        && auth.provider == ProviderAuthProvider::Claude
-    {
-        restore_bundle(
-            ProviderAuthProvider::Claude,
-            &auth.bundle,
-            provider_home.path(),
-        )
-        .context("failed to restore Claude provider auth bundle")?;
-    }
-    let mcp_setup = prepare_request_mcp(provider_home.path(), &req, local_auth)?;
-    let provider_path =
-        resolve_claude_sdk_provider_path().context("failed to resolve Claude SDK provider path")?;
-    let provider_dir = provider_path
-        .parent()
-        .map(Path::to_path_buf)
-        .ok_or_else(|| {
-            anyhow!(
-                "invalid Claude SDK provider path: {}",
-                provider_path.display()
-            )
-        })?;
-    let mcp_servers = read_mcp_servers_from_config(mcp_setup.claude_config_path.as_deref())
-        .context("failed to load Claude MCP server config")?;
-    let git_env = prepare_git_credential_env(provider_home.path(), &req.git_credentials)
-        .context("failed to prepare git credential helper")?;
-
-    let model = req
-        .model
-        .or_else(|| {
-            (!local_auth)
-                .then(|| default_model_for_backend("claude"))
-                .flatten()
-        })
-        .filter(|model| !model.trim().is_empty());
-    let mut config = serde_json::json!({
-        "prompt": req.prompt,
-        "attachments": req.attachments,
-        "workspace_dir": workspace_dir,
-        "effort": req.effort.unwrap_or_else(|| "medium".to_string()),
-        "permission_mode": match permission {
-            LocalAgentPermission::FullAccess => "bypassPermissions",
-            LocalAgentPermission::Auto => "acceptEdits",
-            LocalAgentPermission::Manual => "default",
-        },
-        "system_prompt": req.system_prompt,
-    });
-    if let Some(model) = model {
-        config["model"] = Value::String(model);
-    }
-    if req.fast {
-        config["fast"] = Value::Bool(true);
-    }
-    if let Some(schema) = req.output_schema.as_ref() {
-        config["output_schema"] = schema.clone();
-    }
-    if let Some(servers) = mcp_servers {
-        config["mcp_servers"] = servers;
-    }
-    if !mcp_setup.allowed_tools.is_empty() {
-        config["allowed_tools"] = Value::String(mcp_setup.allowed_tools.clone());
-    }
-    if let Some(resume_id) = req.session_id.as_deref()
-        && is_nonempty_session_id(resume_id)
-    {
-        // Tells the bundled provider.ts to pass `resume: session_id`
-        // to @anthropic-ai/claude-agent-sdk's query(). The SDK will
-        // pick up the prior conversation server-side rather than
-        // sending a fresh system prompt + tool list.
-        //
-        // We filter to session_ids the SDK itself issued (captured on
-        // a prior Done). Random UUIDs generated by the runner for its
-        // own tracking purposes are rejected so the SDK doesn't error
-        // on an unrecognised id.
-        config["resume"] = Value::String(resume_id.to_string());
-    }
-    if let Some(persist) = req.persist_session {
-        // Forwarded as a tri-state — only emit the key when explicitly
-        // set so the bun side keeps the SDK's own default (persist)
-        // for pass-through callers that didn't decide.
-        config["persist_session"] = Value::Bool(persist);
-    }
-
-    let mut command = Command::new("node");
-    command
-        .arg(&provider_path)
-        .current_dir(&provider_dir)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        // If the runner drops this future (cancellation, parent stage
-        // failure, panic) the bun subprocess + its children would
-        // otherwise outlive the request and keep paying the API.
-        // kill_on_drop hands the cleanup to tokio.
-        .kill_on_drop(true);
-    if !local_auth {
-        command.env("HOME", provider_home.path());
-    }
-    apply_git_credential_env(&mut command, &git_env);
-    if std::env::var("ENABLE_TOOL_SEARCH").is_err() {
-        // Claude Agent SDK tool search defers large MCP schemas until the
-        // model asks for them. Borg exposes a compact catalogue up front and
-        // lets the SDK discover concrete tools on demand when supported.
-        command.env("ENABLE_TOOL_SEARCH", "auto:5");
-    }
-    if std::env::var_os("ANTHROPIC_API_KEY").is_none()
-        && let Some(key) =
-            crate::credentials::stored_api_key(crate::credentials::ApiKeyCredential::Anthropic)
-    {
-        // Key auth for users who chose "add an API key" over a subscription
-        // sign-in; the bundled SDK reads it from the environment we hand the
-        // subprocess, and never from a file it could leak elsewhere.
-        command.env("ANTHROPIC_API_KEY", key);
-    }
-    apply_claude_channel_env(&mut command, req.provider_channel)?;
-    crate::subprocess::isolate_async_process_from_terminal(&mut command);
-
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("failed to spawn bun for {}", provider_path.display()))?;
-
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| anyhow!("claude SDK stdin pipe missing"))?;
-    let config_bytes = serde_json::to_vec(&config)?;
-    stdin
-        .write_all(&config_bytes)
-        .await
-        .context("failed to write Claude SDK config to stdin")?;
-    stdin
-        .write_all(b"\n")
-        .await
-        .context("failed to delimit Claude SDK config on stdin")?;
-    stdin
-        .flush()
-        .await
-        .context("failed to flush Claude SDK config")?;
-
-    let control_task = tokio::spawn(forward_claude_controls(stdin, control_rx));
-
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow!("claude SDK stdout pipe missing"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| anyhow!("claude SDK stderr pipe missing"))?;
-
-    let stderr_buf = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
-    {
-        let stderr_buf = stderr_buf.clone();
-        tokio::spawn(async move {
-            let mut reader = BufReader::new(stderr);
-            let mut buf = String::new();
-            loop {
-                buf.clear();
-                match reader.read_line(&mut buf).await {
-                    Ok(0) => break,
-                    Ok(_) => stderr_buf.lock().await.push_str(&buf),
-                    Err(_) => break,
-                }
-            }
-        });
-    }
-
-    let mut reader = BufReader::new(stdout);
-    let mut line = String::new();
-    let mut state = ClaudeStreamState::default();
-
-    loop {
-        line.clear();
-        let read = reader
-            .read_line(&mut line)
-            .await
-            .context("failed reading Claude SDK stdout")?;
-        if read == 0 {
-            break;
-        }
-        let trimmed = line.trim_end_matches(['\r', '\n']);
-        if trimmed.is_empty() {
-            continue;
-        }
-        let value: Value = serde_json::from_str(trimmed)
-            .with_context(|| format!("failed to parse Claude SDK line: {trimmed}"))?;
-        if let Some(event) = claude_adapter_event(&value) {
-            if tx.send(event).await.is_err() {
-                break;
-            }
-            continue;
-        }
-        let telemetry = classify_claude_provider_event(&value);
-        let _ = tx
-            .send(ChatStreamEvent::ProviderEvent {
-                kind: format!(
-                    "claude.{}",
-                    value
-                        .get("type")
-                        .and_then(Value::as_str)
-                        .unwrap_or("message")
-                ),
-                payload: summarize_claude_provider_event(&value),
-                raw_payload: Some(value.clone()),
-                stream_channel: telemetry.stream_channel,
-                content_text: telemetry.content_text,
-                provider_item_id: telemetry.provider_item_id,
-                tool_use_id: telemetry.tool_use_id,
-                tool_name: telemetry.tool_name,
-            })
-            .await;
-        if state.handle_message(&value, &tx).await? {
-            break;
-        }
-    }
-
-    let status = child
-        .wait()
-        .await
-        .context("failed waiting for Claude SDK process")?;
-    control_task.abort();
-
-    if state.emitted_failure {
-        return Ok(());
-    }
-
-    if !status.success() {
-        let stderr_text = stderr_buf.lock().await.clone();
-        let trimmed = stderr_text.trim();
-        let suffix = if trimmed.is_empty() {
-            String::new()
-        } else {
-            format!(": {trimmed}")
-        };
-        let _ = tx
-            .send(ChatStreamEvent::Failed {
-                error: format!(
-                    "claude SDK exited with status {}{}",
-                    status
-                        .code()
-                        .map(|code| code.to_string())
-                        .unwrap_or_else(|| "?".into()),
-                    suffix
-                ),
-            })
-            .await;
-        return Ok(());
-    }
-
-    let final_text = state
-        .final_text
-        .take()
-        .unwrap_or_else(|| state.delta_accumulator.clone());
-    let usage = Some(state.final_usage.unwrap_or_else(|| ProviderCallUsage {
-        duration_ms: elapsed_millis_u64(started_at),
-        ..ProviderCallUsage::default()
-    }));
-    let session_id = state.session_id.take();
-    let _ = tx
-        .send(ChatStreamEvent::Done {
-            final_text,
-            usage,
-            session_id,
-        })
-        .await;
-    Ok(())
-}
-
-async fn run_pooled_claude_sdk_inner(
-    req: ChatStreamRequest,
-    tx: mpsc::Sender<ChatStreamEvent>,
-    mut controls: Option<mpsc::Receiver<ChatStreamControl>>,
-    permission: LocalAgentPermission,
-    pool: ClaudeSdkPool,
-) -> Result<()> {
-    anyhow::ensure!(
-        req.provider_auth.is_none() && req.git_credentials.is_empty(),
-        "credential-scoped Claude requests cannot reuse a pooled adapter process"
-    );
-    let started_at = Instant::now();
-    let mut guard = pool.inner.lock().await;
-    let mut pooled = match guard.take() {
-        Some(pooled) if pooled.channel == req.provider_channel => pooled,
-        Some(mut stale) => {
-            let _ = stale.child.kill().await;
-            start_pooled_claude_sdk(req.provider_channel).await?
-        }
-        None => start_pooled_claude_sdk(req.provider_channel).await?,
-    };
-    let config = build_pooled_claude_config(&req, pooled._provider_home.path(), permission)?;
-    let wire_value = if pooled.started {
-        json!({ "type": "start", "config": config })
-    } else {
-        pooled.started = true;
-        config
-    };
-    write_claude_control(&mut pooled.stdin, &wire_value)
-        .await
-        .context("failed to start pooled Claude turn")?;
-
-    let mut state = ClaudeStreamState::default();
-    let mut line = String::new();
-    let mut terminal_seen = false;
-    loop {
-        line.clear();
-        tokio::select! {
-            read = pooled.stdout.read_line(&mut line) => {
-                let read = read.context("failed reading pooled Claude SDK stdout")?;
-                if read == 0 {
-                    let stderr = pooled.stderr.lock().await.clone();
-                    bail!("pooled Claude SDK exited unexpectedly: {}", stderr.trim());
-                }
-                let trimmed = line.trim_end_matches(['\r', '\n']);
-                if trimmed.is_empty() {
-                    continue;
-                }
-                let value: Value = serde_json::from_str(trimmed)
-                    .with_context(|| format!("failed to parse Claude SDK line: {trimmed}"))?;
-                if let Some(event) = claude_adapter_event(&value) {
-                    if tx.send(event).await.is_err() {
-                        break;
-                    }
-                    continue;
-                }
-                let telemetry = classify_claude_provider_event(&value);
-                let _ = tx.send(ChatStreamEvent::ProviderEvent {
-                    kind: format!(
-                        "claude.{}",
-                        value.get("type").and_then(Value::as_str).unwrap_or("message")
-                    ),
-                    payload: summarize_claude_provider_event(&value),
-                    raw_payload: Some(value.clone()),
-                    stream_channel: telemetry.stream_channel,
-                    content_text: telemetry.content_text,
-                    provider_item_id: telemetry.provider_item_id,
-                    tool_use_id: telemetry.tool_use_id,
-                    tool_name: telemetry.tool_name,
-                }).await;
-                let terminal = value.get("type").and_then(Value::as_str) == Some("result");
-                terminal_seen |= terminal;
-                if state.handle_message(&value, &tx).await? || terminal {
-                    break;
-                }
-            }
-            control = receive_claude_control(&mut controls), if controls.is_some() => {
-                let Some(control) = control else {
-                    controls = None;
-                    continue;
-                };
-                forward_one_claude_control(&mut pooled.stdin, control).await?;
-            }
-        }
-    }
-
-    if terminal_seen && !state.emitted_failure {
-        let final_text = state
-            .final_text
-            .take()
-            .unwrap_or_else(|| state.delta_accumulator.clone());
-        let usage = Some(state.final_usage.unwrap_or_else(|| ProviderCallUsage {
-            duration_ms: elapsed_millis_u64(started_at),
-            ..ProviderCallUsage::default()
-        }));
-        let _ = tx
-            .send(ChatStreamEvent::Done {
-                final_text,
-                usage,
-                session_id: state.session_id.take(),
-            })
-            .await;
-    }
-    if terminal_seen {
-        *guard = Some(pooled);
-    } else {
-        let _ = pooled.child.kill().await;
-    }
-    Ok(())
-}
-
-async fn start_pooled_claude_sdk(channel: ProviderChannel) -> Result<PooledClaudeSdk> {
-    let provider_home = tempfile::tempdir().context("failed to create Claude provider home")?;
-    let provider_path =
-        resolve_claude_sdk_provider_path().context("failed to resolve Claude SDK provider path")?;
-    let provider_dir = provider_path
-        .parent()
-        .map(Path::to_path_buf)
-        .context("Claude SDK adapter has no parent directory")?;
-    let mut command = Command::new("node");
-    command
-        .arg(&provider_path)
-        .current_dir(provider_dir)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    if std::env::var("ENABLE_TOOL_SEARCH").is_err() {
-        command.env("ENABLE_TOOL_SEARCH", "auto:5");
-    }
-    apply_claude_channel_env(&mut command, channel)?;
-    crate::subprocess::isolate_async_process_from_terminal(&mut command);
-    let mut child = command.spawn().with_context(|| {
-        format!(
-            "failed to spawn pooled Claude SDK adapter {}",
-            provider_path.display()
-        )
-    })?;
-    let stdin = child
-        .stdin
-        .take()
-        .context("pooled Claude SDK stdin pipe missing")?;
-    let stdout = BufReader::new(
-        child
-            .stdout
-            .take()
-            .context("pooled Claude SDK stdout pipe missing")?,
-    );
-    let stderr = Arc::new(tokio::sync::Mutex::new(String::new()));
-    let child_stderr = child
-        .stderr
-        .take()
-        .context("pooled Claude SDK stderr pipe missing")?;
-    {
-        let stderr = stderr.clone();
-        tokio::spawn(async move {
-            let mut reader = BufReader::new(child_stderr);
-            let mut line = String::new();
-            while reader.read_line(&mut line).await.is_ok_and(|read| read > 0) {
-                stderr.lock().await.push_str(&line);
-                line.clear();
-            }
-        });
-    }
-    Ok(PooledClaudeSdk {
-        child,
-        stdin,
-        stdout,
-        stderr,
-        _provider_home: provider_home,
-        channel,
-        started: false,
-    })
-}
-
-fn build_pooled_claude_config(
-    req: &ChatStreamRequest,
-    provider_home: &Path,
-    permission: LocalAgentPermission,
-) -> Result<Value> {
-    let workspace_dir = req
-        .working_directory
-        .clone()
-        .unwrap_or_else(|| provider_home.to_path_buf());
-    fs::create_dir_all(&workspace_dir)?;
-    let mcp_setup = prepare_request_mcp(provider_home, req, true)?;
-    let mcp_servers = read_mcp_servers_from_config(mcp_setup.claude_config_path.as_deref())?;
-    let mut config = json!({
-        "prompt": req.prompt,
-        "attachments": req.attachments,
-        "workspace_dir": workspace_dir,
-        "effort": req.effort.clone().unwrap_or_else(|| "medium".to_string()),
-        "permission_mode": match permission {
-            LocalAgentPermission::FullAccess => "bypassPermissions",
-            LocalAgentPermission::Auto => "acceptEdits",
-            LocalAgentPermission::Manual => "default",
-        },
-        "system_prompt": req.system_prompt,
-    });
-    if let Some(model) = req.model.as_ref().filter(|model| !model.trim().is_empty()) {
-        config["model"] = Value::String(model.clone());
-    }
-    if req.fast {
-        config["fast"] = Value::Bool(true);
-    }
-    if let Some(schema) = req.output_schema.as_ref() {
-        config["output_schema"] = schema.clone();
-    }
-    if let Some(servers) = mcp_servers {
-        config["mcp_servers"] = servers;
-    }
-    if !mcp_setup.allowed_tools.is_empty() {
-        config["allowed_tools"] = Value::String(mcp_setup.allowed_tools);
-    }
-    if let Some(session_id) = req
-        .session_id
-        .as_deref()
-        .filter(|id| is_nonempty_session_id(id))
-    {
-        config["resume"] = Value::String(session_id.to_string());
-    }
-    if let Some(persist) = req.persist_session {
-        config["persist_session"] = Value::Bool(persist);
-    }
-    Ok(config)
-}
-
-async fn forward_claude_controls(
-    mut stdin: tokio::process::ChildStdin,
-    mut controls: Option<mpsc::Receiver<ChatStreamControl>>,
-) -> Result<()> {
-    let Some(controls) = controls.as_mut() else {
-        stdin.shutdown().await?;
-        return Ok(());
-    };
-    while let Some(control) = controls.recv().await {
-        if forward_one_claude_control(&mut stdin, control)
-            .await
-            .is_err()
-        {
-            break;
-        }
-    }
-    stdin.shutdown().await?;
-    Ok(())
-}
-
-async fn receive_claude_control(
-    controls: &mut Option<mpsc::Receiver<ChatStreamControl>>,
-) -> Option<ChatStreamControl> {
-    match controls {
-        Some(controls) => controls.recv().await,
-        None => std::future::pending().await,
-    }
-}
-
-async fn forward_one_claude_control(
-    stdin: &mut tokio::process::ChildStdin,
-    control: ChatStreamControl,
-) -> Result<()> {
-    let value = match control {
-        ChatStreamControl::Steer {
-            text,
-            attachments,
-            ack,
-            ..
-        } => {
-            let value = json!({
-                "type": "steer",
-                "text": text,
-                "attachments": attachments,
-            });
-            match write_claude_control(stdin, &value).await {
-                Ok(()) => {
-                    let _ = ack.send(Ok(()));
-                    return Ok(());
-                }
-                Err(error) => {
-                    let _ = ack.send(Err(
-                        "Claude turn ended before the steer was delivered".to_string()
-                    ));
-                    return Err(error);
-                }
-            }
-        }
-        ChatStreamControl::Interrupt => json!({ "type": "interrupt" }),
-        ChatStreamControl::Approval {
-            approval_id,
-            decision,
-        } => json!({
-            "type": "approval",
-            "approval_id": approval_id,
-            "decision": match decision {
-                ChatApprovalDecision::ApproveOnce => "approve_once",
-                ChatApprovalDecision::ApproveSession => "approve_session",
-                ChatApprovalDecision::Reject => "reject",
-            },
-        }),
-        ChatStreamControl::ProviderInteractionResponse {
-            interaction_id,
-            response,
-        } => json!({
-            "type": "provider_interaction_response",
-            "interaction_id": interaction_id,
-            "response": response,
-        }),
-    };
-    write_claude_control(stdin, &value).await
-}
-
-fn claude_adapter_event(value: &Value) -> Option<ChatStreamEvent> {
-    if value.get("type").and_then(Value::as_str) == Some("borg_context_usage") {
-        return Some(ChatStreamEvent::ProviderEvent {
-            kind: "claude.context_usage".to_string(),
-            payload: value.clone(),
-            raw_payload: Some(value.clone()),
-            stream_channel: Some("usage".to_string()),
-            content_text: None,
-            provider_item_id: None,
-            tool_use_id: None,
-            tool_name: None,
-        });
-    }
-    if value.get("type").and_then(Value::as_str) == Some("borg_provider_interaction") {
-        return Some(ChatStreamEvent::ProviderInteractionRequested {
-            interaction_id: value.get("interaction_id")?.as_str()?.to_string(),
-            kind: value
-                .get("kind")
-                .and_then(Value::as_str)
-                .unwrap_or("provider_interaction")
-                .to_string(),
-            title: value
-                .get("title")
-                .and_then(Value::as_str)
-                .unwrap_or("Claude requests input")
-                .to_string(),
-            detail: value
-                .get("detail")
-                .and_then(Value::as_str)
-                .unwrap_or("Claude needs additional input.")
-                .to_string(),
-            payload: value.get("payload").cloned().unwrap_or(Value::Null),
-        });
-    }
-    if value.get("type").and_then(Value::as_str) != Some("borg_permission_request") {
-        return None;
-    }
-    let approval_id = value.get("approval_id")?.as_str()?.to_string();
-    let title = value
-        .get("title")
-        .and_then(Value::as_str)
-        .unwrap_or("Claude tool permission")
-        .to_string();
-    let detail = value
-        .get("detail")
-        .and_then(Value::as_str)
-        .unwrap_or("Claude requested permission to use a tool.")
-        .to_string();
-    let command = value
-        .get("command")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    Some(ChatStreamEvent::ApprovalRequested {
-        approval_id,
-        title,
-        detail,
-        command,
-    })
-}
-
-async fn write_claude_control(stdin: &mut tokio::process::ChildStdin, value: &Value) -> Result<()> {
-    stdin.write_all(&serde_json::to_vec(value)?).await?;
-    stdin.write_all(b"\n").await?;
-    stdin.flush().await?;
-    Ok(())
 }
 
 async fn run_codex_app_server_inner(
@@ -1484,6 +800,7 @@ async fn run_codex_app_server_inner(
             working_directory: working_directory.clone(),
             permission,
             web_search_allowed: req.web_search_allowed,
+            context_fingerprint: codex_context_fingerprint(&req),
         };
         let mut pooled = pool.as_ref().and_then(|pool| {
             pool.inner
@@ -1753,6 +1070,51 @@ async fn run_codex_app_server_inner(
     .context("codex app-server worker panicked")?
 }
 
+fn codex_context_fingerprint(req: &ChatStreamRequest) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"borg-codex-context-v1");
+    hash_fingerprint_part(&mut digest, &req.system_prompt);
+    hash_fingerprint_optional(&mut digest, req.mcp_owner_id.as_deref());
+    hash_fingerprint_optional(&mut digest, req.mcp_user_id.as_deref());
+    hash_fingerprint_optional(&mut digest, req.mcp_api_token.as_deref());
+    for scope in &req.mcp_allowed_scopes {
+        hash_fingerprint_part(&mut digest, scope);
+    }
+    let mut servers = req.mcp_external_servers.iter().collect::<Vec<_>>();
+    servers.sort_by(|left, right| left.name.cmp(&right.name));
+    for server in servers {
+        hash_fingerprint_part(&mut digest, &server.name);
+        hash_fingerprint_part(&mut digest, &server.command);
+        for argument in &server.args {
+            hash_fingerprint_part(&mut digest, argument);
+        }
+        for (key, value) in &server.env {
+            hash_fingerprint_part(&mut digest, key);
+            hash_fingerprint_part(&mut digest, value);
+        }
+        for tool in &server.allowed_tools {
+            hash_fingerprint_part(&mut digest, tool);
+        }
+    }
+    hex::encode(digest.finalize())
+}
+
+fn hash_fingerprint_part(digest: &mut Sha256, value: impl AsRef<[u8]>) {
+    let value = value.as_ref();
+    digest.update((value.len() as u64).to_le_bytes());
+    digest.update(value);
+}
+
+fn hash_fingerprint_optional(digest: &mut Sha256, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            digest.update([1]);
+            hash_fingerprint_part(digest, value);
+        }
+        None => digest.update([0]),
+    }
+}
+
 struct CodexAuthHomeResolution {
     codex_home_override: Option<PathBuf>,
     use_managed_openai_api_key: bool,
@@ -1929,262 +1291,30 @@ fn install_codex_mcp_config(
     }
     fs::create_dir_all(target_codex_home)
         .with_context(|| format!("failed to create {}", target_codex_home.display()))?;
-    fs::copy(&source_config, target_codex_home.join("config.toml")).with_context(|| {
+    let target_config = target_codex_home.join("config.toml");
+    let config = fs::read(&source_config).with_context(|| {
         format!(
-            "failed to copy {} into {}",
+            "failed to read {} for installation into {}",
             source_config.display(),
             target_codex_home.display()
         )
     })?;
+    crate::mcp::write_private_file(&target_config, &config).with_context(|| {
+        format!(
+            "failed to install {} into {}",
+            source_config.display(),
+            target_codex_home.display()
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(target_codex_home, fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("failed to secure {}", target_codex_home.display()))?;
+        fs::set_permissions(&target_config, fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("failed to secure {}", target_config.display()))?;
+    }
     Ok(())
-}
-
-fn summarize_claude_provider_event(value: &Value) -> Value {
-    let mut out = serde_json::Map::new();
-    if let Some(kind) = value.get("type").and_then(Value::as_str) {
-        out.insert("type".to_string(), Value::String(kind.to_string()));
-    }
-    if let Some(subtype) = value.get("subtype").and_then(Value::as_str) {
-        out.insert("subtype".to_string(), Value::String(subtype.to_string()));
-    }
-    if let Some(session_id) = value.get("session_id").and_then(Value::as_str) {
-        out.insert(
-            "session_id".to_string(),
-            Value::String(session_id.to_string()),
-        );
-    }
-    if let Some(result) = value.get("result").and_then(Value::as_str) {
-        out.insert("result_chars".to_string(), json!(result.chars().count()));
-    }
-    if let Some(message) = value.get("message")
-        && let Some(content) = message.get("content").and_then(Value::as_array)
-    {
-        out.insert("content_blocks".to_string(), json!(content.len()));
-        let block_types: Vec<_> = content
-            .iter()
-            .filter_map(|block| block.get("type").and_then(Value::as_str))
-            .collect();
-        out.insert("content_block_types".to_string(), json!(block_types));
-    }
-    Value::Object(out)
-}
-
-fn classify_claude_provider_event(value: &Value) -> ProviderEventTelemetry {
-    let message_type = value.get("type").and_then(Value::as_str).unwrap_or("");
-    match message_type {
-        "stream_event" => {
-            let Some(event) = value.get("event") else {
-                return ProviderEventTelemetry::default();
-            };
-            if event.get("type").and_then(Value::as_str) == Some("content_block_delta")
-                && let Some(delta) = event.get("delta")
-            {
-                let (stream_channel, content_text) =
-                    match delta.get("type").and_then(Value::as_str).unwrap_or("") {
-                        "text_delta" => (
-                            Some("assistant_text".to_string()),
-                            delta
-                                .get("text")
-                                .and_then(Value::as_str)
-                                .map(str::to_string),
-                        ),
-                        "thinking_delta" => (
-                            Some("reasoning".to_string()),
-                            delta
-                                .get("thinking")
-                                .and_then(Value::as_str)
-                                .map(str::to_string),
-                        ),
-                        _ => (None, None),
-                    };
-                if stream_channel.is_some() {
-                    return ProviderEventTelemetry {
-                        stream_channel,
-                        content_text,
-                        provider_item_id: event
-                            .get("index")
-                            .and_then(Value::as_i64)
-                            .map(|index| index.to_string()),
-                        ..ProviderEventTelemetry::default()
-                    };
-                }
-            }
-            ProviderEventTelemetry {
-                stream_channel: Some("provider_event".to_string()),
-                ..ProviderEventTelemetry::default()
-            }
-        }
-        "assistant" => {
-            let content = value
-                .get("message")
-                .and_then(|message| message.get("content"))
-                .and_then(Value::as_array);
-            if let Some(blocks) = content
-                && let Some(tool) = blocks
-                    .iter()
-                    .find(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
-            {
-                return ProviderEventTelemetry {
-                    stream_channel: Some("tool_call".to_string()),
-                    provider_item_id: tool.get("id").and_then(Value::as_str).map(str::to_string),
-                    tool_use_id: tool.get("id").and_then(Value::as_str).map(str::to_string),
-                    tool_name: tool.get("name").and_then(Value::as_str).map(str::to_string),
-                    content_text: tool.get("input").map(Value::to_string),
-                };
-            }
-            ProviderEventTelemetry {
-                stream_channel: Some("assistant_message".to_string()),
-                content_text: content.map(|blocks| {
-                    blocks
-                        .iter()
-                        .filter_map(extract_text_block)
-                        .collect::<Vec<_>>()
-                        .join("\n\n")
-                }),
-                ..ProviderEventTelemetry::default()
-            }
-        }
-        "user" => {
-            let content = value
-                .get("message")
-                .and_then(|message| message.get("content"))
-                .and_then(Value::as_array);
-            if let Some(blocks) = content
-                && let Some(tool_result) = blocks
-                    .iter()
-                    .find(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
-            {
-                return ProviderEventTelemetry {
-                    stream_channel: Some("tool_result".to_string()),
-                    tool_use_id: tool_result
-                        .get("tool_use_id")
-                        .and_then(Value::as_str)
-                        .map(str::to_string),
-                    content_text: Some(extract_tool_result_content(tool_result.get("content"))),
-                    ..ProviderEventTelemetry::default()
-                };
-            }
-            ProviderEventTelemetry::default()
-        }
-        "result" => ProviderEventTelemetry {
-            stream_channel: Some("terminal".to_string()),
-            content_text: value
-                .get("result")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            ..ProviderEventTelemetry::default()
-        },
-        "error" => ProviderEventTelemetry {
-            stream_channel: Some("error".to_string()),
-            content_text: value
-                .get("message")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            ..ProviderEventTelemetry::default()
-        },
-        _ => ProviderEventTelemetry::default(),
-    }
-}
-
-fn extract_tool_result_content(content: Option<&Value>) -> String {
-    let Some(content) = content else {
-        return String::new();
-    };
-    match content {
-        Value::String(text) => text.clone(),
-        Value::Array(items) => {
-            let mut out = String::new();
-            for item in items {
-                if let Some(text) = item.get("text").and_then(Value::as_str) {
-                    if !out.is_empty() {
-                        out.push('\n');
-                    }
-                    out.push_str(text);
-                } else if let Value::String(text) = item {
-                    if !out.is_empty() {
-                        out.push('\n');
-                    }
-                    out.push_str(text);
-                } else {
-                    if !out.is_empty() {
-                        out.push('\n');
-                    }
-                    out.push_str(&item.to_string());
-                }
-            }
-            out
-        }
-        other => other.to_string(),
-    }
-}
-
-fn extract_text_block(item: &Value) -> Option<String> {
-    if item.get("type").and_then(Value::as_str) != Some("text") {
-        return None;
-    }
-    item.get("text")
-        .and_then(Value::as_str)
-        .map(ToString::to_string)
-}
-
-fn resolve_claude_sdk_provider_path() -> Result<PathBuf> {
-    if let Ok(path) = std::env::var("BORG_CLAUDE_SDK_PROVIDER") {
-        let path = PathBuf::from(path);
-        if path.exists() {
-            return path
-                .canonicalize()
-                .with_context(|| format!("failed to canonicalize {}", path.display()));
-        }
-    }
-
-    let installed = std::env::var_os("BORG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".borg")))
-        .map(|home| home.join("providers/claude-sdk/dist/provider.js"));
-    if let Some(installed) = installed
-        && installed.exists()
-    {
-        return installed
-            .canonicalize()
-            .with_context(|| format!("failed to canonicalize {}", installed.display()));
-    }
-
-    let adjacent_to_executable = std::env::current_exe()
-        .ok()
-        .and_then(|executable| executable.parent().map(Path::to_path_buf))
-        .map(|bin_dir| bin_dir.join("providers/claude-sdk/dist/provider.js"));
-    if let Some(adjacent) = adjacent_to_executable
-        && adjacent.exists()
-    {
-        return adjacent
-            .canonicalize()
-            .with_context(|| format!("failed to canonicalize {}", adjacent.display()));
-    }
-
-    let manifest_relative = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../packages/borg-claude-sdk/dist/provider.js");
-    if manifest_relative.exists() {
-        return manifest_relative
-            .canonicalize()
-            .with_context(|| format!("failed to canonicalize {}", manifest_relative.display()));
-    }
-
-    let cwd_relative = std::env::current_dir()
-        .unwrap_or_default()
-        .join("packages/borg-claude-sdk/dist/provider.js");
-    if cwd_relative.exists() {
-        return cwd_relative
-            .canonicalize()
-            .with_context(|| format!("failed to canonicalize {}", cwd_relative.display()));
-    }
-
-    Err(anyhow!(
-        "Claude Agent SDK provider is not installed; run `just claude-sdk` from a Borg CLI checkout or set BORG_CLAUDE_SDK_PROVIDER"
-    ))
-}
-
-fn is_nonempty_session_id(id: &str) -> bool {
-    !id.trim().is_empty()
 }
 
 fn read_mcp_servers_from_config(config_path: Option<&Path>) -> Result<Option<Value>> {
@@ -2265,66 +1395,6 @@ printf '\n'
     Ok(env)
 }
 
-fn apply_git_credential_env(command: &mut Command, env: &[(String, String)]) {
-    for (key, value) in env {
-        command.env(key, value);
-    }
-}
-
-/// Flip the Claude Agent SDK binary onto Vertex or Bedrock by setting the
-/// env vars the bundled `@anthropic-ai/claude-agent-sdk` reads at startup.
-/// For `Direct` this is a no-op — the SDK hits the Anthropic API with the
-/// credentials already on the process.
-///
-/// Missing credentials are treated as configuration errors rather than
-/// silent fall-back to Direct. An Enterprise-tier run that expected Vertex
-/// must fail loudly if `BORG_VERTEX_PROJECT_ID` isn't set, not quietly send
-/// traffic to the wrong network.
-fn apply_claude_channel_env(command: &mut Command, channel: ProviderChannel) -> Result<()> {
-    match channel {
-        ProviderChannel::Direct => Ok(()),
-        ProviderChannel::Vertex => {
-            let project_id = std::env::var("BORG_VERTEX_PROJECT_ID")
-                .or_else(|_| std::env::var("ANTHROPIC_VERTEX_PROJECT_ID"))
-                .context(
-                    "Vertex channel selected but neither BORG_VERTEX_PROJECT_ID nor \
-                     ANTHROPIC_VERTEX_PROJECT_ID is set",
-                )?;
-            let region = std::env::var("BORG_VERTEX_REGION")
-                .or_else(|_| std::env::var("CLOUD_ML_REGION"))
-                .unwrap_or_else(|_| "global".to_string());
-            command
-                .env("CLAUDE_CODE_USE_VERTEX", "1")
-                .env("ANTHROPIC_VERTEX_PROJECT_ID", project_id)
-                .env("CLOUD_ML_REGION", region);
-            if let Ok(creds) = std::env::var("BORG_VERTEX_CREDENTIALS_PATH")
-                && !creds.trim().is_empty()
-            {
-                command.env("GOOGLE_APPLICATION_CREDENTIALS", creds);
-            }
-            Ok(())
-        }
-        ProviderChannel::Bedrock => {
-            let region = std::env::var("BORG_BEDROCK_REGION")
-                .or_else(|_| std::env::var("AWS_REGION"))
-                .context(
-                    "Bedrock channel selected but neither BORG_BEDROCK_REGION nor \
-                     AWS_REGION is set",
-                )?;
-            command
-                .env("CLAUDE_CODE_USE_BEDROCK", "1")
-                .env("AWS_REGION", region);
-            Ok(())
-        }
-        ProviderChannel::AzureOpenAi => {
-            bail!(
-                "AzureOpenAi channel is not supported for Claude; this channel is \
-                 reserved for future Codex/OpenAI routing"
-            );
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2397,222 +1467,6 @@ mod tests {
         assert!(error.to_string().contains("cancelled with its owning turn"));
         assert!(cleanup_finished.load(Ordering::Acquire));
         worker.join().expect("prewarm worker");
-    }
-
-    struct TestEnvGuard {
-        key: &'static str,
-        previous: Option<String>,
-    }
-
-    impl TestEnvGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let previous = std::env::var(key).ok();
-            unsafe { std::env::set_var(key, value) };
-            Self { key, previous }
-        }
-    }
-
-    impl Drop for TestEnvGuard {
-        fn drop(&mut self) {
-            unsafe {
-                match self.previous.as_deref() {
-                    Some(value) => std::env::set_var(self.key, value),
-                    None => std::env::remove_var(self.key),
-                }
-            }
-        }
-    }
-
-    fn test_claude_request(workspace: &Path) -> ChatStreamRequest {
-        ChatStreamRequest {
-            prompt: "hello".to_string(),
-            owner_session_id: None,
-            client_user_message_id: None,
-            attachments: Vec::new(),
-            model: Some("test-model".to_string()),
-            effort: Some("medium".to_string()),
-            fast: false,
-            system_prompt: "test system".to_string(),
-            output_schema: None,
-            mcp_owner_id: None,
-            mcp_allowed_scopes: Vec::new(),
-            mcp_user_id: None,
-            mcp_external_servers: Vec::new(),
-            mcp_api_token: None,
-            provider_auth: None,
-            git_credentials: Vec::new(),
-            working_directory: Some(workspace.to_path_buf()),
-            session_id: None,
-            provider_channel: ProviderChannel::Direct,
-            persist_session: Some(false),
-            web_search_allowed: false,
-            resume_unavailable_prompt: None,
-        }
-    }
-
-    async fn final_text(mut stream: mpsc::Receiver<ChatStreamEvent>) -> String {
-        while let Some(event) = stream.recv().await {
-            match event {
-                ChatStreamEvent::Done { final_text, .. } => return final_text,
-                ChatStreamEvent::Failed { error } => panic!("Claude stream failed: {error}"),
-                _ => {}
-            }
-        }
-        panic!("Claude stream ended without Done")
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn pooled_claude_adapter_reuses_one_process_across_turns() {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-        let root = tempfile::tempdir().unwrap();
-        let adapter = root.path().join("fake-claude-adapter.mjs");
-        fs::write(
-            &adapter,
-            r#"
-import { createInterface } from "node:readline";
-let count = 0;
-for await (const line of createInterface({ input: process.stdin })) {
-  const wire = JSON.parse(line);
-  const config = wire.type === "start" ? wire.config : wire;
-  if (!config.prompt) continue;
-  count += 1;
-  process.stdout.write(JSON.stringify({
-    type: "system", subtype: "init", session_id: "session-1"
-  }) + "\n");
-  process.stdout.write(JSON.stringify({
-    type: "result", subtype: "success", result: `process-turn-${count}`,
-    session_id: "session-1"
-  }) + "\n");
-}
-"#,
-        )
-        .unwrap();
-        let _adapter = TestEnvGuard::set("BORG_CLAUDE_SDK_PROVIDER", adapter.to_str().unwrap());
-        let _native = TestEnvGuard::set("BORG_CLAUDE_NATIVE", "0");
-        let pool = ClaudeSdkPool::default();
-
-        let first = final_text(run_pooled_claude_local_chat_stream(
-            test_claude_request(root.path()),
-            None,
-            LocalAgentPermission::FullAccess,
-            pool.clone(),
-        ))
-        .await;
-        let second = final_text(run_pooled_claude_local_chat_stream(
-            test_claude_request(root.path()),
-            None,
-            LocalAgentPermission::FullAccess,
-            pool,
-        ))
-        .await;
-
-        assert_eq!(first, "process-turn-1");
-        assert_eq!(second, "process-turn-2");
-    }
-
-    #[test]
-    fn pooled_claude_config_preserves_resume_attachments_schema_and_permissions() {
-        let root = tempfile::tempdir().unwrap();
-        let attachment = root.path().join("screen.png");
-        fs::write(&attachment, b"image").unwrap();
-        let mut request = test_claude_request(root.path());
-        request.attachments = vec![attachment.clone()];
-        request.session_id = Some("claude-session-1".to_string());
-        request.output_schema = Some(json!({
-            "type": "object",
-            "properties": { "ok": { "type": "boolean" } },
-            "required": ["ok"]
-        }));
-
-        let config =
-            build_pooled_claude_config(&request, root.path(), LocalAgentPermission::Manual)
-                .expect("Claude config");
-
-        assert_eq!(config["attachments"], json!([attachment]));
-        assert_eq!(config["resume"], "claude-session-1");
-        assert_eq!(config["permission_mode"], "default");
-        assert_eq!(config["persist_session"], false);
-        assert_eq!(config["output_schema"]["required"], json!(["ok"]));
-    }
-
-    #[test]
-    fn claude_adapter_permission_request_maps_to_provider_neutral_approval() {
-        let event = claude_adapter_event(&json!({
-            "type": "borg_permission_request",
-            "approval_id": "permission-1",
-            "tool_name": "Bash",
-            "title": "Run command",
-            "detail": "Claude wants to run cargo test.",
-            "command": "cargo test"
-        }))
-        .expect("permission event");
-
-        assert!(matches!(
-            event,
-            ChatStreamEvent::ApprovalRequested {
-                approval_id,
-                title,
-                detail,
-                command: Some(command),
-            } if approval_id == "permission-1"
-                && title == "Run command"
-                && detail == "Claude wants to run cargo test."
-                && command == "cargo test"
-        ));
-    }
-
-    #[test]
-    fn claude_adapter_context_usage_maps_to_transient_provider_telemetry() {
-        let event = claude_adapter_event(&json!({
-            "type": "borg_context_usage",
-            "total_tokens": 12_345,
-            "context_window_tokens": 200_000,
-            "model": "claude-sonnet-5"
-        }))
-        .expect("context usage event");
-
-        assert!(matches!(
-            event,
-            ChatStreamEvent::ProviderEvent {
-                ref kind,
-                ref payload,
-                ref stream_channel,
-                ..
-            } if kind == "claude.context_usage"
-                && payload["total_tokens"] == 12_345
-                && stream_channel.as_deref() == Some("usage")
-        ));
-    }
-
-    #[test]
-    fn claude_adapter_elicitation_maps_to_provider_neutral_interaction() {
-        let event = claude_adapter_event(&json!({
-            "type": "borg_provider_interaction",
-            "interaction_id": "elicitation-1",
-            "kind": "mcp_elicitation",
-            "title": "Deployment region",
-            "detail": "Choose a region.",
-            "payload": {
-                "serverName": "deploy",
-                "requestedSchema": {"type": "object"}
-            }
-        }))
-        .expect("provider interaction");
-
-        assert!(matches!(
-            event,
-            ChatStreamEvent::ProviderInteractionRequested {
-                interaction_id,
-                kind,
-                title,
-                detail,
-                payload,
-            } if interaction_id == "elicitation-1"
-                && kind == "mcp_elicitation"
-                && title == "Deployment region"
-                && detail == "Choose a region."
-                && payload["serverName"] == "deploy"
-        ));
     }
 
     #[test]
@@ -2806,119 +1660,8 @@ for await (const line of createInterface({ input: process.stdin })) {
     }
 
     #[test]
-    fn codex_and_claude_normalize_mcp_tool_lifecycle_identically() {
-        let (codex_tx, mut codex_rx) = mpsc::channel(16);
-        let mut codex = CodexStreamMapper::default();
-        for message in [
-            JsonRpcMessage {
-                id: None,
-                method: Some("item/started".to_string()),
-                message: None,
-                result: None,
-                error: None,
-                params: Some(json!({
-                    "item": {
-                        "type": "mcpToolCall",
-                        "id": "tool-1",
-                        "serverName": "borg",
-                        "toolName": "read_file",
-                        "input": {"path": "README.md"}
-                    }
-                })),
-            },
-            JsonRpcMessage {
-                id: None,
-                method: Some("item/completed".to_string()),
-                message: None,
-                result: None,
-                error: None,
-                params: Some(json!({
-                    "item": {
-                        "type": "mcpToolCall",
-                        "id": "tool-1",
-                        "serverName": "borg",
-                        "toolName": "read_file",
-                        "input": {"path": "README.md"},
-                        "output": "contents"
-                    }
-                })),
-            },
-        ] {
-            codex.handle(&message, &codex_tx).unwrap();
-        }
-        drop(codex_tx);
-        let codex_events = {
-            let mut events = Vec::new();
-            while let Ok(event) = codex_rx.try_recv() {
-                if !matches!(event, ChatStreamEvent::ProviderEvent { .. }) {
-                    events.push(event);
-                }
-            }
-            events
-        };
-
-        let claude_events = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async {
-                let (claude_tx, mut claude_rx) = mpsc::channel(16);
-                let mut claude = ClaudeStreamState::default();
-                claude
-                    .handle_message(
-                        &json!({
-                            "type": "assistant",
-                            "message": {"content": [{
-                                "type": "tool_use",
-                                "id": "tool-1",
-                                "name": "mcp__borg__read_file",
-                                "input": {"path": "README.md"}
-                            }]}
-                        }),
-                        &claude_tx,
-                    )
-                    .await
-                    .unwrap();
-                claude
-                    .handle_message(
-                        &json!({
-                            "type": "user",
-                            "message": {"content": [{
-                                "type": "tool_result",
-                                "tool_use_id": "tool-1",
-                                "content": "contents",
-                                "is_error": false
-                            }]}
-                        }),
-                        &claude_tx,
-                    )
-                    .await
-                    .unwrap();
-                drop(claude_tx);
-                let mut events = Vec::new();
-                while let Ok(event) = claude_rx.try_recv() {
-                    events.push(event);
-                }
-                events
-            });
-
-        assert!(
-            matches!(codex_events.first(), Some(ChatStreamEvent::ToolCall { id, name, input }) if id == "tool-1" && name == "mcp__borg__read_file" && input["path"] == "README.md")
-        );
-        assert!(
-            matches!(claude_events.first(), Some(ChatStreamEvent::ToolCall { id, name, input }) if id == "tool-1" && name == "mcp__borg__read_file" && input["path"] == "README.md")
-        );
-        assert!(
-            matches!(codex_events.get(1), Some(ChatStreamEvent::ToolResult { tool_use_id, output, is_error: false, .. }) if tool_use_id == "tool-1" && output == "contents")
-        );
-        assert!(
-            matches!(claude_events.get(1), Some(ChatStreamEvent::ToolResult { tool_use_id, output, is_error: false, .. }) if tool_use_id == "tool-1" && output == "contents")
-        );
-    }
-
-    #[test]
     fn codex_and_claude_usage_maps_share_billing_buckets() {
-        let claude = super::super::extract_claude_usage(&json!({
+        let claude = claude_agents::extract_usage(&json!({
             "usage": {
                 "input_tokens": 12,
                 "cache_read_input_tokens": 3,
@@ -3199,138 +1942,6 @@ for await (const line of createInterface({ input: process.stdin })) {
                 Some(value) => std::env::set_var("CODEX_HOME", value),
                 None => std::env::remove_var("CODEX_HOME"),
             }
-        }
-    }
-
-    // ---------------- apply_claude_channel_env ----------------
-
-    mod claude_channel_env {
-        use super::*;
-
-        struct EnvVarGuard {
-            key: &'static str,
-            previous: Option<String>,
-        }
-
-        impl EnvVarGuard {
-            fn set(key: &'static str, value: &str) -> Self {
-                let previous = std::env::var(key).ok();
-                unsafe { std::env::set_var(key, value) };
-                Self { key, previous }
-            }
-            fn unset(key: &'static str) -> Self {
-                let previous = std::env::var(key).ok();
-                unsafe { std::env::remove_var(key) };
-                Self { key, previous }
-            }
-        }
-
-        impl Drop for EnvVarGuard {
-            fn drop(&mut self) {
-                unsafe {
-                    match self.previous.as_deref() {
-                        Some(value) => std::env::set_var(self.key, value),
-                        None => std::env::remove_var(self.key),
-                    }
-                }
-            }
-        }
-
-        #[test]
-        fn direct_channel_is_a_no_op() {
-            let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            let mut command = Command::new("true");
-            apply_claude_channel_env(&mut command, ProviderChannel::Direct).expect("direct is ok");
-            // No easy way to assert the Command didn't mutate other than
-            // "it didn't panic" — this guards against a regression that adds
-            // unconditional env vars.
-        }
-
-        #[test]
-        fn vertex_without_project_id_fails_fast() {
-            let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            let _g1 = EnvVarGuard::unset("BORG_VERTEX_PROJECT_ID");
-            let _g2 = EnvVarGuard::unset("ANTHROPIC_VERTEX_PROJECT_ID");
-            let mut command = Command::new("true");
-            let err = apply_claude_channel_env(&mut command, ProviderChannel::Vertex)
-                .expect_err("missing project id should fail");
-            let message = format!("{err:#}");
-            assert!(
-                message.contains("Vertex channel selected"),
-                "unexpected error: {message}"
-            );
-        }
-
-        #[test]
-        fn vertex_uses_configured_project_and_region() {
-            let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            let _g1 = EnvVarGuard::set("BORG_VERTEX_PROJECT_ID", "proj-test-42");
-            let _g2 = EnvVarGuard::set("BORG_VERTEX_REGION", "europe-west1");
-            let mut command = Command::new("true");
-            apply_claude_channel_env(&mut command, ProviderChannel::Vertex)
-                .expect("vertex config should succeed");
-            // Command doesn't expose its env map publicly, so we rely on
-            // the success path + hand-off to the spawned binary. Failure
-            // to read project id would have bailed above.
-        }
-
-        #[test]
-        fn bedrock_without_region_fails_fast() {
-            let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            let _g1 = EnvVarGuard::unset("BORG_BEDROCK_REGION");
-            let _g2 = EnvVarGuard::unset("AWS_REGION");
-            let mut command = Command::new("true");
-            let err = apply_claude_channel_env(&mut command, ProviderChannel::Bedrock)
-                .expect_err("missing region should fail");
-            let message = format!("{err:#}");
-            assert!(
-                message.contains("Bedrock channel selected"),
-                "unexpected error: {message}"
-            );
-        }
-
-        #[test]
-        fn bedrock_with_region_succeeds() {
-            let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            let _g1 = EnvVarGuard::set("BORG_BEDROCK_REGION", "us-east-1");
-            let mut command = Command::new("true");
-            apply_claude_channel_env(&mut command, ProviderChannel::Bedrock)
-                .expect("bedrock with region should succeed");
-        }
-
-        #[test]
-        fn azure_openai_is_rejected_for_claude() {
-            let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            let mut command = Command::new("true");
-            let err = apply_claude_channel_env(&mut command, ProviderChannel::AzureOpenAi)
-                .expect_err("azure openai is not a claude channel");
-            let message = format!("{err:#}");
-            assert!(
-                message.contains("AzureOpenAi channel is not supported for Claude"),
-                "unexpected error: {message}"
-            );
-        }
-    }
-
-    // ---------------- provider session_id gate ----------------
-    mod sdk_session_id {
-        use super::super::is_nonempty_session_id;
-
-        #[test]
-        fn accepts_returned_provider_ids() {
-            assert!(is_nonempty_session_id("ses-abc123"));
-            assert!(is_nonempty_session_id("sess_abc"));
-            assert!(is_nonempty_session_id("conv_12345"));
-            assert!(is_nonempty_session_id("cnv_xyz"));
-            assert!(is_nonempty_session_id(
-                "550e8400-e29b-41d4-a716-446655440000"
-            ));
-        }
-
-        #[test]
-        fn rejects_empty_and_whitespace() {
-            assert!(!is_nonempty_session_id(""));
-            assert!(!is_nonempty_session_id("   "));
         }
     }
 }

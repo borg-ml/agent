@@ -11,25 +11,25 @@ require identical provider protocols.
 | Stream text, reasoning, tools, results | Native notifications | Native SDK messages | Implemented |
 | Structured output | `outputSchema` | `outputFormat.json_schema` | Implemented |
 | MCP tools | Dynamic app-server config | SDK `mcpServers` | Implemented |
-| Session continuation | Thread resume and pooled thread | SDK `resume` | Implemented through the retained adapter/query runtime, with resume fallback |
-| Process/session reuse | Pooled app-server | Streaming `Query` supports multi-turn input | Implemented with a keyed local SDK pool |
+| Session continuation | Thread resume and pooled thread | Native `--resume` and persistent stream-json process | Implemented |
+| Process/session reuse | Pooled app-server | Persistent native Claude stream-json process | Implemented with a keyed local Rust pool |
 | Steer active turn | `turn/steer` | Streaming input supports additional user messages | Implemented |
 | Interrupt active turn | App-server interrupt | `Query.interrupt()` | Implemented |
 | Permission responses | App-server control responses | `canUseTool` callback and dynamic permission mode | Implemented, including session grants |
 | Provider interactions | App-server interaction requests | SDK MCP elicitation callback | Implemented |
 | Context telemetry | Token notifications | `getContextUsage()` and usage messages | Implemented |
 | Manual compaction | `thread/compact` | No public direct compact method; `/compact` can be sent as session input | Implemented through resumed `/compact` turn |
-| Cancellation cleanup | Interrupt plus app-server shutdown | `interrupt()` and `close()` | Implemented; incomplete pooled turns are discarded |
-| Prewarm | Local app-server prewarm | SDK module/runtime can be kept alive | Node/SDK runtime is retained after the first turn |
-| Adapter packaging | Codex binary is discovered directly | Borg TypeScript adapter plus pinned SDK | Added in-tree and included in release archives |
+| Cancellation cleanup | Interrupt plus app-server shutdown | `interrupt()` and `close()` | Implemented; receipt/cancellation cleanup is confirmed before pool reuse |
+| Prewarm | Local app-server prewarm | Native Claude process can be kept alive | Native process is retained after the first turn |
+| Runtime packaging | Codex binary is discovered directly | Claude binary plus `claude-agents` Rust runtime | Native binary is discovered from installed/release locations; Rust runtime is imported from the standalone crate |
 
 ## Acceptance criteria
 
 Claude reaches practical parity when:
 
-1. A pinned, type-checked adapter is installed by supported Borg install and
+1. A pinned Claude binary is installed or packaged by supported Borg install and
    release flows without relying on an untracked local file.
-2. A local session keeps one controllable SDK query runtime alive across turns
+2. A local session keeps one controllable native Claude runtime alive across turns
    when its workspace, model, permissions, and routing configuration remain
    compatible.
 3. steer, interrupt, permission decisions, and shutdown have acknowledgements
@@ -41,8 +41,8 @@ Claude reaches practical parity when:
 6. manual compaction either uses a supported SDK control or sends `/compact`
    through the active streaming session and confirms its compact boundary.
 7. unit and integration tests cover messages, tools, structured output,
-   attachments, MCP, permissions, resume, control races, cancellation, and
-   malformed/provider-error events.
+   attachments, MCP, permissions, resume, control races, cancellation,
+   malformed/provider-error events, and packaged native-payload resolution.
 
 The only currently known protocol difference is that the Claude SDK does not
 expose a dedicated public compaction method equivalent to Codex
@@ -51,17 +51,16 @@ observe the resulting boundary.
 
 ## Verification map
 
-Release verification is split between the in-tree TypeScript adapter and the
-provider-neutral Rust runtime:
+Release verification covers the native Rust runtime and the standalone
+`claude-agents` crate:
 
 | Acceptance area | Regression evidence |
 | --- | --- |
-| Adapter protocol and pinned SDK | `npm ci`, `npm run check`, and `npm run build` in `packages/borg-claude-sdk` |
-| Process reuse across turns | `pooled_claude_adapter_reuses_one_process_across_turns` |
-| Resume, attachments, schema, permissions | `pooled_claude_config_preserves_resume_attachments_schema_and_permissions` |
-| Steer and interrupt delivery | `active_provider_steer_uses_turn_control_for_codex_and_claude` plus adapter control tests |
-| Permission and MCP interactions | `claude_adapter_permission_request_maps_to_provider_neutral_approval` and `claude_adapter_elicitation_maps_to_provider_neutral_interaction` |
-| Context and final usage | `claude_adapter_context_usage_maps_to_transient_provider_telemetry`, `claude_context_usage_is_available_before_turn_completion`, and `claude_usage_accepts_assistant_and_result_envelopes` |
+| Native command/protocol and pooled reuse | `claude-agents` fake-runner integration tests |
+| Resume, attachments, schema, permissions | `claude-agents` request construction and control-channel tests |
+| Steer and interrupt delivery | `active_provider_steer_uses_turn_control_for_codex_and_claude` plus `claude-agents` control tests |
+| Permission and MCP interactions | `claude-agents` approval and elicitation normalization tests |
+| Context and final usage | `claude-agents` usage tests, `claude_context_usage_is_available_before_turn_completion`, and `claude-agents::extract_usage` |
 | Authentication recovery | `claude_auth_status_requires_an_authenticated_json_state` and `claude_auth_failures_have_one_actionable_terminal_message` |
 | Reconnect reasoning visibility | `attached_reasoning_snapshots_become_incremental_deltas` and `attached_reasoning_accepts_a_new_snapshot_after_live_state_reset` |
 | Cancellation and durable recovery | session interruption, queued-turn recovery, and incomplete-turn discard tests shared with Codex |
@@ -69,14 +68,19 @@ provider-neutral Rust runtime:
 The release gate is:
 
 ```console
-just claude-sdk
 cargo check --workspace
 cargo test --workspace
+git clone https://github.com/borg-ml/claude-agents.git
+cargo test --manifest-path claude-agents/Cargo.toml --locked
 ```
 
+The native path needs the packaged or installed `claude` binary. The
+`packages/claude-native-runtime` npm manifest is only used to fetch that
+upstream platform binary; it is not a runtime adapter.
+
 A credentialed smoke must then run two turns in one Claude thread, verify the
-second turn reuses the adapter/session, run `/compact`, and confirm nonzero
-final usage. This smoke covers upstream authentication and service behavior
+second turn reuses the native process/session, run `/compact`, and confirm nonzero
+final usage. These smokes cover upstream authentication and service behavior
 that deterministic tests cannot emulate.
 
 ## Claude authentication and recovery

@@ -40,13 +40,17 @@ discover → parse → validate → resolve dependencies → activate → snapsh
                                   next turn ← atomic live swap
 ```
 
-Borg hashes manifests, state, effective capabilities, trust, and explicit
-reload signals. Running local TUI sessions check that revision twice per
+Borg hashes manifests, package contents, declared skill roots, state, effective
+capabilities, trust, and explicit reload signals. Running local TUI sessions check that revision twice per
 second; enrolled Remote hosts revalidate immediately before every turn. A valid
 change updates skill roots and MCP server definitions for the next turn without
 restarting the session. The current turn is never mutated underneath a
 provider. If validation fails, Borg keeps the previous runtime and points the
 user to `borg extensions doctor`.
+
+For enrolled hosts, the host-side catalog is authoritative: serialized skill
+paths from a controller are discarded at the host boundary and cannot grant
+access to an inactive or untrusted package.
 
 ## Commands
 
@@ -104,7 +108,9 @@ allow_project_mcp = true
 
 Blu never runs package install hooks, update hooks, activation scripts, or an
 embedded scripting VM. MCP commands are direct argv-based stdio processes, not
-shell snippets. Use `allowed_tools` to expose the smallest tool surface.
+shell snippets. Use `allowed_tools` to expose the smallest tool surface; the
+allowlist is enforced by Borg's native runtime and translated to each external
+provider's MCP policy format.
 
 ## Compatibility
 

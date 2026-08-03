@@ -14,6 +14,7 @@ publish = false
 anyhow.workspace = true
 async-trait.workspace = true
 base64.workspace = true
+claude-agents = { git = "https://github.com/borg-ml/claude-agents.git" }
 chrono.workspace = true
 futures = "0.3"
 getrandom = "0.2"
@@ -22,6 +23,7 @@ libc = "0.2"
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
 toml = "0.8.23"

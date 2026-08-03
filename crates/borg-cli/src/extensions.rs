@@ -257,13 +257,52 @@ fn discover_in_dirs(
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .join("blu.reload");
-        if reload_signal.is_file() {
-            hash_file(&mut digest, &reload_signal)?;
+        if let Err(error) = hash_directory_signature(&mut digest, &dir) {
+            diagnostics.push(ExtensionDiagnostic {
+                level: ExtensionDiagnosticLevel::Error,
+                path: dir.clone(),
+                message: format!("could not inspect extension directory: {error:#}"),
+            });
         }
-        for path in manifest_paths(&dir)? {
-            hash_file(&mut digest, &path)?;
+        if reload_signal.is_file() {
+            if let Err(error) = hash_file(&mut digest, &reload_signal) {
+                diagnostics.push(ExtensionDiagnostic {
+                    level: ExtensionDiagnosticLevel::Warning,
+                    path: reload_signal.clone(),
+                    message: format!("could not inspect Blu reload signal: {error:#}"),
+                });
+            }
+        }
+        let paths = match manifest_paths(&dir) {
+            Ok(paths) => paths,
+            Err(error) => {
+                diagnostics.push(ExtensionDiagnostic {
+                    level: ExtensionDiagnosticLevel::Error,
+                    path: dir.clone(),
+                    message: format!("could not enumerate extensions: {error:#}"),
+                });
+                Vec::new()
+            }
+        };
+        for path in paths {
+            if let Err(error) = hash_file(&mut digest, &path) {
+                diagnostics.push(ExtensionDiagnostic {
+                    level: ExtensionDiagnosticLevel::Error,
+                    path: path.clone(),
+                    message: format!("could not fingerprint extension: {error:#}"),
+                });
+            }
             match load_candidate(&path, scope) {
                 Ok(mut candidate) => {
+                    if let Err(error) = hash_package_tree(&mut digest, &candidate.package_root) {
+                        diagnostics.push(ExtensionDiagnostic {
+                            level: ExtensionDiagnosticLevel::Warning,
+                            path: candidate.package_root.clone(),
+                            message: format!(
+                                "could not completely fingerprint extension package: {error:#}"
+                            ),
+                        });
+                    }
                     // The filename hint is only an optimization; state is keyed by
                     // the validated manifest id.
                     candidate.state = state
@@ -524,6 +563,13 @@ fn validate_candidate_declarations(candidate: &mut Candidate, manifest: &Manifes
         }
         for value in server.env.values() {
             validate_template(value, manifest)?;
+        }
+        for tool in &server.allowed_tools {
+            ensure!(
+                valid_allowed_tool(tool),
+                "extension `{}` has an invalid allowed MCP tool `{tool}`",
+                manifest.id
+            );
         }
     }
     Ok(())
@@ -1418,6 +1464,14 @@ fn valid_env_name(value: &str) -> bool {
         && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
+fn valid_allowed_tool(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+}
+
 fn cap(config: &CapabilityConfig, name: &str) -> bool {
     match name {
         "multiplayer" => config.multiplayer,
@@ -1449,6 +1503,52 @@ fn known_capability(name: &str) -> bool {
 fn hash_file(digest: &mut Sha256, path: &Path) -> Result<()> {
     digest.update(path.to_string_lossy().as_bytes());
     digest.update(fs::read(path)?);
+    Ok(())
+}
+
+fn hash_directory_signature(digest: &mut Sha256, path: &Path) -> Result<()> {
+    digest.update(b"directory-signature-v1");
+    digest.update(path.to_string_lossy().as_bytes());
+    let entries = match fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            digest.update(b"missing");
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let mut entries = entries.collect::<std::io::Result<Vec<_>>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let metadata = entry.metadata()?;
+        digest.update(entry.file_name().to_string_lossy().as_bytes());
+        digest.update(metadata.len().to_le_bytes());
+        digest.update([metadata.is_dir() as u8, metadata.is_file() as u8]);
+    }
+    Ok(())
+}
+
+fn hash_package_tree(digest: &mut Sha256, root: &Path) -> Result<()> {
+    let mut entries = fs::read_dir(root)?.collect::<std::io::Result<Vec<_>>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let path = entry.path();
+        let name = entry.file_name();
+        if name == ".git" || name == "target" {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(&path)?;
+        digest.update(path.to_string_lossy().as_bytes());
+        digest.update(metadata.len().to_le_bytes());
+        digest.update([metadata.is_dir() as u8, metadata.is_file() as u8]);
+        if metadata.is_dir() {
+            hash_package_tree(digest, &path)?;
+        } else if metadata.is_file() {
+            digest.update(fs::read(&path)?);
+        } else if metadata.file_type().is_symlink() {
+            digest.update(fs::read_link(&path)?.to_string_lossy().as_bytes());
+        }
+    }
     Ok(())
 }
 
@@ -1528,6 +1628,21 @@ mod tests {
         assert_eq!(catalog.extensions.len(), 1);
         assert!(catalog.has_errors());
         assert_eq!(servers.len(), 1);
+    }
+
+    #[test]
+    fn package_content_and_root_changes_advance_live_revision() {
+        let root = tempfile::tempdir().unwrap();
+        package(root.path(), "watched", "");
+        let (first, _) = discover_test(None, Some(root.path().to_path_buf()), false);
+        fs::write(root.path().join("watched/skills/SKILL.md"), "changed").unwrap();
+        let (second, _) = discover_test(None, Some(root.path().to_path_buf()), false);
+        assert_ne!(first.revision, second.revision);
+
+        fs::remove_dir_all(root.path().join("watched/skills")).unwrap();
+        let (third, _) = discover_test(None, Some(root.path().to_path_buf()), false);
+        assert_ne!(second.revision, third.revision);
+        assert!(third.has_errors());
     }
 
     #[test]

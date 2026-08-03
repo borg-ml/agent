@@ -3,21 +3,29 @@ set shell := ["bash", "-eu", "-o", "pipefail", "-c"]
 default:
     @just --list
 
-# Install the pinned Claude Agent SDK adapter used by local and remote sessions.
-claude-sdk:
+# Install only the Claude binary used by the native Rust runtime.
+claude-native:
     #!/usr/bin/env bash
     set -euo pipefail
-    source_dir="$PWD/packages/borg-claude-sdk"
-    install_dir="${BORG_HOME:-$HOME/.borg}/providers/claude-sdk"
+    source_dir="$PWD/packages/claude-native-runtime"
+    install_dir="${BORG_HOME:-$HOME/.borg}/providers/claude-native-runtime"
+    native_dir="${BORG_HOME:-$HOME/.borg}/providers/claude"
     test -f "$source_dir/package-lock.json"
-    mkdir -p "$install_dir"
-    cp "$source_dir/package.json" "$source_dir/package-lock.json" "$source_dir/tsconfig.json" "$install_dir/"
-    mkdir -p "$install_dir/src"
-    cp "$source_dir/src/provider.ts" "$source_dir/src/turn_messages.ts" "$install_dir/src/"
-    npm --prefix "$install_dir" ci
-    npm --prefix "$install_dir" run check
-    npm --prefix "$install_dir" run build
-    npm --prefix "$install_dir" prune --omit=dev
+    mkdir -p "$install_dir" "$native_dir"
+    cp "$source_dir/package.json" "$source_dir/package-lock.json" "$install_dir/"
+    npm --prefix "$install_dir" ci --omit=dev --ignore-scripts
+    platform_dir=""
+    for candidate in "$install_dir"/node_modules/@anthropic-ai/claude-agent-sdk-*; do
+        if [[ -x "$candidate/claude" ]]; then
+            platform_dir="$candidate"
+            break
+        fi
+    done
+    test -n "$platform_dir"
+    cp "$platform_dir/claude" "$native_dir/claude"
+    cp "$platform_dir/manifest.json" "$native_dir/manifest.json"
+    cp "$install_dir/node_modules/@anthropic-ai/claude-agent-sdk/package.json" "$native_dir/package.json"
+    chmod 700 "$native_dir/claude"
 
 # Validate a release without changing the repository.
 release-check version="":

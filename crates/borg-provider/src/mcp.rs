@@ -1,9 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde_json::{Map, json};
+#[cfg(windows)]
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Default)]
 pub struct ProviderMcpSetup {
@@ -41,6 +44,21 @@ pub fn merge_allowed_tools(base: &str, extras: &[&str]) -> String {
         .join(",")
 }
 
+/// Normalize a provider-neutral allowlist entry to the MCP wire tool name.
+/// Entries from another server namespace are ignored rather than allowing a
+/// caller to smuggle a cross-server permission into a provider config.
+pub(crate) fn normalize_mcp_tool_name(server_name: &str, allowed: &str) -> Option<String> {
+    let prefix = format!("mcp__{server_name}__");
+    allowed
+        .strip_prefix(&prefix)
+        .map(str::to_string)
+        .or_else(|| (!allowed.starts_with("mcp__")).then(|| allowed.to_string()))
+}
+
+fn claude_mcp_tool_name(server_name: &str, allowed: &str) -> Option<String> {
+    normalize_mcp_tool_name(server_name, allowed).map(|tool| format!("mcp__{server_name}__{tool}"))
+}
+
 pub fn prepare_external_provider_mcp(
     work_dir: &Path,
     external_servers: &[ExternalMcpServer],
@@ -61,14 +79,16 @@ pub fn prepare_external_provider_mcp(
             }),
         );
     }
-    fs::write(
+    write_private_file(
         &claude_config_path,
-        serde_json::to_vec_pretty(&json!({ "mcpServers": servers }))?,
+        &serde_json::to_vec_pretty(&json!({ "mcpServers": servers }))?,
     )
     .with_context(|| format!("failed to write {}", claude_config_path.display()))?;
 
     fs::create_dir_all(&codex_home)
         .with_context(|| format!("failed to create {}", codex_home.display()))?;
+    restrict_directory(&codex_home)
+        .with_context(|| format!("failed to secure {}", codex_home.display()))?;
     let mut mcp_servers = BTreeMap::new();
     for server in external_servers {
         let mut config = BTreeMap::new();
@@ -88,23 +108,95 @@ pub fn prepare_external_provider_mcp(
             ),
         );
         config.insert("env".to_string(), toml::Value::try_from(&server.env)?);
+        // Codex names MCP tools by their wire name in `enabled_tools`. Blu
+        // accepts either that wire name or Borg's provider-neutral
+        // `mcp__<server>__<tool>` name, but never lets an allowlist for one
+        // server accidentally authorize a tool from another server.
+        if !server.allowed_tools.is_empty() {
+            let enabled_tools = server
+                .allowed_tools
+                .iter()
+                .filter_map(|tool| normalize_mcp_tool_name(&server.name, tool))
+                .map(toml::Value::String)
+                .collect();
+            config.insert(
+                "enabled_tools".to_string(),
+                toml::Value::Array(enabled_tools),
+            );
+        }
         mcp_servers.insert(server.name.clone(), toml::Value::try_from(config)?);
     }
     let config = BTreeMap::from([(
         "mcp_servers".to_string(),
         toml::Value::try_from(mcp_servers)?,
     )]);
-    fs::write(codex_home.join("config.toml"), toml::to_string(&config)?)?;
+    write_private_file(
+        &codex_home.join("config.toml"),
+        toml::to_string(&config)?.as_bytes(),
+    )?;
 
     Ok(ProviderMcpSetup {
         claude_config_path: Some(claude_config_path),
         codex_home: Some(codex_home),
         allowed_tools: external_servers
             .iter()
-            .flat_map(|server| server.allowed_tools.iter().cloned())
+            .flat_map(|server| {
+                server
+                    .allowed_tools
+                    .iter()
+                    .filter_map(|tool| claude_mcp_tool_name(&server.name, tool))
+            })
             .collect::<Vec<_>>()
             .join(","),
     })
+}
+
+pub(crate) fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .with_context(|| format!("private file {} has no parent", path.display()))?;
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".borg-mcp-")
+        .tempfile_in(parent)
+        .with_context(|| format!("create temporary private file in {}", parent.display()))?;
+    temporary.write_all(contents)?;
+    temporary.as_file().sync_all()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o600))?;
+    }
+    let temporary = temporary.into_temp_path();
+    #[cfg(not(windows))]
+    fs::rename(&temporary, path)
+        .with_context(|| format!("atomically replace {}", path.display()))?;
+    #[cfg(windows)]
+    {
+        let backup = path.with_file_name(format!(".mcp-backup-{}", Uuid::new_v4()));
+        if path.exists() {
+            fs::rename(path, &backup)
+                .with_context(|| format!("stage existing private file {}", path.display()))?;
+        }
+        if let Err(error) = fs::rename(&temporary, path) {
+            if backup.exists() {
+                let _ = fs::rename(&backup, path);
+            }
+            return Err(error).with_context(|| format!("replace {}", path.display()));
+        }
+        if backup.exists() {
+            fs::remove_file(backup)?;
+        }
+    }
+    Ok(())
+}
+
+fn restrict_directory(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
 }
 
 pub fn prepare_provider_mcp_with_scope(
@@ -116,4 +208,69 @@ pub fn prepare_provider_mcp_with_scope(
     _api_token: Option<&str>,
 ) -> Result<ProviderMcpSetup> {
     prepare_external_provider_mcp(work_dir, external_servers)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codex_config_preserves_mcp_allowlists_and_namespaces() {
+        let root = tempfile::tempdir().expect("temporary provider home");
+        let servers = vec![ExternalMcpServer {
+            name: "docs__search".to_string(),
+            command: "docs-mcp".to_string(),
+            args: vec!["serve".to_string()],
+            env: BTreeMap::from([(String::from("TOKEN"), String::from("secret"))]),
+            allowed_tools: vec![
+                "search".to_string(),
+                "mcp__docs__search__read".to_string(),
+                "mcp__other__secret".to_string(),
+            ],
+        }];
+
+        let setup = prepare_external_provider_mcp(root.path(), &servers).unwrap();
+        let config = toml::from_str::<toml::Value>(
+            &fs::read_to_string(root.path().join(".codex-local-mcp/config.toml")).unwrap(),
+        )
+        .unwrap();
+        let enabled = config
+            .get("mcp_servers")
+            .and_then(|value| value.get("docs__search"))
+            .and_then(|value| value.get("enabled_tools"))
+            .and_then(toml::Value::as_array)
+            .unwrap();
+        assert_eq!(
+            enabled
+                .iter()
+                .filter_map(toml::Value::as_str)
+                .collect::<Vec<_>>(),
+            vec!["search", "read"]
+        );
+        assert_eq!(
+            setup.allowed_tools,
+            "mcp__docs__search__search,mcp__docs__search__read"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(root.path().join(".borg-local-mcp.json"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+            assert_eq!(
+                fs::metadata(root.path().join(".codex-local-mcp/config.toml"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
 }

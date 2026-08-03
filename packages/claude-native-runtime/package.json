@@ -1,0 +1,10 @@
+{
+  "name": "@borg-ml/claude-native-runtime",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Pinned Claude Code native runtime used by Borg's Rust claude-agents integration",
+  "license": "GPL-3.0-or-later",
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "0.3.220"
+  }
+}

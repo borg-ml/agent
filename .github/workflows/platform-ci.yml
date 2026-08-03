@@ -59,6 +59,9 @@ jobs:
           fi
           "$binary" --version
           "$binary" --help >/dev/null
+      - name: Install the pinned native Claude payload
+        shell: bash
+        run: npm --prefix packages/claude-native-runtime ci --omit=dev --ignore-scripts
       - name: Package and extract-smoke the Unix archive
         if: matrix.archive == 'tar'
         shell: bash
@@ -69,9 +72,28 @@ jobs:
           trap 'rm -rf "$stage" "$extract"' EXIT
           mkdir "$stage/borg-${{ matrix.target }}"
           cp "target/${{ matrix.target }}/release/borg" "$stage/borg-${{ matrix.target }}/"
+          native_package=""
+          for candidate in packages/claude-native-runtime/node_modules/@anthropic-ai/claude-agent-sdk-*; do
+            if [[ -x "$candidate/claude" ]]; then
+              native_package="$candidate"
+              break
+            fi
+          done
+          test -n "$native_package"
+          mkdir -p "$stage/borg-${{ matrix.target }}/providers/claude"
+          cp "$native_package/claude" "$stage/borg-${{ matrix.target }}/providers/claude/claude"
+          cp "$native_package/manifest.json" "$stage/borg-${{ matrix.target }}/providers/claude/manifest.json"
+          cp packages/claude-native-runtime/node_modules/@anthropic-ai/claude-agent-sdk/package.json "$stage/borg-${{ matrix.target }}/providers/claude/package.json"
+          chmod 700 "$stage/borg-${{ matrix.target }}/providers/claude/claude"
+          mkdir -p "$stage/borg-${{ matrix.target }}/docs" "$stage/borg-${{ matrix.target }}/configs"
+          cp docs/blu-extensions.md "$stage/borg-${{ matrix.target }}/docs/"
+          cp configs/extension.example.toml "$stage/borg-${{ matrix.target }}/configs/"
           tar -C "$stage" -czf "$asset" "borg-${{ matrix.target }}"
           tar -xzf "$asset" -C "$extract"
           "$extract/borg-${{ matrix.target }}/borg" --version
+          "$extract/borg-${{ matrix.target }}/providers/claude/claude" --version
+          test -f "$extract/borg-${{ matrix.target }}/docs/blu-extensions.md"
+          test -f "$extract/borg-${{ matrix.target }}/configs/extension.example.toml"
       - name: Package and extract-smoke the Windows archive
         if: matrix.archive == 'zip'
         shell: pwsh
@@ -83,30 +105,24 @@ jobs:
           if (Test-Path $extract) { Remove-Item -Recurse -Force $extract }
           New-Item -ItemType Directory -Path $stage | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/borg.exe" $stage
+          $platformPackage = Get-ChildItem "packages/claude-native-runtime/node_modules/@anthropic-ai" -Directory |
+            Where-Object { $_.Name -like "claude-agent-sdk-*" -and (Test-Path (Join-Path $_.FullName "claude.exe")) } |
+            Select-Object -First 1
+          if (-not $platformPackage) { throw "Claude native platform package was not installed" }
+          New-Item -ItemType Directory -Path "$stage/providers/claude"
+          Copy-Item (Join-Path $platformPackage.FullName "claude.exe") "$stage/providers/claude/claude.exe"
+          Copy-Item (Join-Path $platformPackage.FullName "manifest.json") "$stage/providers/claude/manifest.json"
+          Copy-Item "packages/claude-native-runtime/node_modules/@anthropic-ai/claude-agent-sdk/package.json" "$stage/providers/claude/package.json"
+          New-Item -ItemType Directory -Path "$stage/docs", "$stage/configs"
+          Copy-Item "docs/blu-extensions.md" "$stage/docs/"
+          Copy-Item "configs/extension.example.toml" "$stage/configs/"
           Compress-Archive -Path "$stage/*" -DestinationPath $asset
           Expand-Archive -Path $asset -DestinationPath $extract
           $binary = Get-ChildItem -Path $extract -Filter "borg.exe" | Select-Object -First 1
           if (-not $binary) { throw "packaged borg.exe was not found" }
           & $binary.FullName --version
-
-  provider-parity:
-    name: Provider parity and Claude adapter
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
-        with:
-          toolchain: "1.94.0"
-      - name: Run deterministic provider parity contracts
-        shell: bash
-        run: |
-          cargo test --locked -p borg-provider provider::chat_stream::tests::codex_and_claude_normalize_mcp_tool_lifecycle_identically
-          cargo test --locked -p borg-provider provider::chat_stream::tests::codex_and_claude_usage_maps_share_billing_buckets
-          cargo test --locked -p borg-remote subagents::tests::every_execution_lane_exposes_the_same_borg_control_plane
-          cargo test --locked -p borg-remote session::tests::active_provider_steer_uses_turn_control_across_provider_lanes
-      - name: Check and build Claude Agent SDK adapter
-        shell: bash
-        run: |
-          npm --prefix packages/borg-claude-sdk ci
-          npm --prefix packages/borg-claude-sdk run check
-          npm --prefix packages/borg-claude-sdk run build
+          $native = Get-ChildItem -Path $extract -Recurse -Filter "claude.exe" | Select-Object -First 1
+          if (-not $native) { throw "packaged native claude.exe was not found" }
+          & $native.FullName --version
+          if (-not (Get-ChildItem -Path $extract -Recurse -Filter "blu-extensions.md")) { throw "Blu documentation was not packaged" }
+          if (-not (Get-ChildItem -Path $extract -Recurse -Filter "extension.example.toml")) { throw "Blu manifest example was not packaged" }

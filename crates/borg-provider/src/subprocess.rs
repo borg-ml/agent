@@ -219,17 +219,6 @@ pub(crate) fn isolate_std_process_from_terminal(command: &mut Command) {
 #[cfg(not(unix))]
 pub(crate) fn isolate_std_process_from_terminal(_command: &mut Command) {}
 
-/// Keep a long-lived async provider subprocess out of Borg's foreground
-/// terminal process group. Closing one attached terminal may SIGHUP Borg's
-/// foreground group, but it must not kill the app-server that owns the turn.
-#[cfg(unix)]
-pub(crate) fn isolate_async_process_from_terminal(command: &mut tokio::process::Command) {
-    command.process_group(0);
-}
-
-#[cfg(not(unix))]
-pub(crate) fn isolate_async_process_from_terminal(_command: &mut tokio::process::Command) {}
-
 #[cfg(unix)]
 fn kill_process_group(pid: u32) {
     // SAFETY: `killpg` takes a PGID (here the child's PID, since it

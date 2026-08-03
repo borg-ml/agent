@@ -2,12 +2,13 @@ use std::collections::HashSet;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
 use super::{ChatStreamEvent, ChatStreamRequest, LocalAgentPermission};
+use crate::mcp::{ExternalMcpServer, normalize_mcp_tool_name};
 use crate::runtime::ProviderCallUsage;
 
 pub(super) async fn run(
@@ -41,26 +42,9 @@ pub(super) async fn run(
         command.arg("--file").arg(attachment);
     }
     if !request.mcp_external_servers.is_empty() {
-        let servers = request
-            .mcp_external_servers
-            .iter()
-            .map(|server| {
-                (
-                    server.name.clone(),
-                    serde_json::json!({
-                        "type": "local",
-                        "command": std::iter::once(server.command.clone())
-                            .chain(server.args.iter().cloned())
-                            .collect::<Vec<_>>(),
-                        "environment": server.env,
-                        "enabled": true,
-                    }),
-                )
-            })
-            .collect::<serde_json::Map<_, _>>();
         command.env(
             "OPENCODE_CONFIG_CONTENT",
-            serde_json::to_string(&serde_json::json!({ "mcp": servers }))?,
+            serde_json::to_string(&opencode_config(&request.mcp_external_servers))?,
         );
     }
 
@@ -214,6 +198,48 @@ pub(super) async fn run(
     Ok(())
 }
 
+fn opencode_config(servers: &[ExternalMcpServer]) -> Value {
+    let mcp_servers = servers
+        .iter()
+        .map(|server| {
+            (
+                server.name.clone(),
+                serde_json::json!({
+                    "type": "local",
+                    "command": std::iter::once(server.command.clone())
+                        .chain(server.args.iter().cloned())
+                        .collect::<Vec<_>>(),
+                    "environment": server.env,
+                    "enabled": true,
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    let mut permission = serde_json::Map::new();
+    for server in servers {
+        if server.allowed_tools.is_empty() {
+            continue;
+        }
+        // OpenCode exposes MCP tools as `<server>_<tool>` and evaluates
+        // wildcard permission rules in object order. serde_json's map is
+        // sorted, so the `*` rule sorts before conventional MCP tool names
+        // and the exact allow rules reliably win.
+        permission.insert(format!("{}_{}", server.name, "*"), json!("deny"));
+        for tool in &server.allowed_tools {
+            let Some(tool) = normalize_mcp_tool_name(&server.name, tool) else {
+                continue;
+            };
+            permission.insert(format!("{}_{}", server.name, tool), json!("allow"));
+        }
+    }
+    let mut config = serde_json::Map::new();
+    config.insert("mcp".to_string(), Value::Object(mcp_servers));
+    if !permission.is_empty() {
+        config.insert("permission".to_string(), Value::Object(permission));
+    }
+    Value::Object(config)
+}
+
 fn opencode_run_args(
     session_id: Option<&str>,
     model: &str,
@@ -345,9 +371,13 @@ fn parse_usage(value: &Value) -> Option<ProviderCallUsage> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use serde_json::json;
 
-    use super::{LocalAgentPermission, opencode_run_args, parse_usage};
+    use super::{
+        ExternalMcpServer, LocalAgentPermission, opencode_config, opencode_run_args, parse_usage,
+    };
 
     #[test]
     fn permission_mode_maps_to_supported_opencode_v2_argv() {
@@ -394,5 +424,37 @@ mod tests {
         assert_eq!(usage.cached_input_tokens, 13_184);
         assert_eq!(usage.total_tokens, 13_248);
         assert_eq!(usage.cost_microusd, Some(125_000));
+    }
+
+    #[test]
+    fn opencode_config_denies_unlisted_mcp_tools() {
+        let config = opencode_config(&[ExternalMcpServer {
+            name: "docs".to_string(),
+            command: "docs-mcp".to_string(),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            allowed_tools: vec![
+                "search".to_string(),
+                "mcp__docs__read".to_string(),
+                "mcp__other__secret".to_string(),
+            ],
+        }]);
+        let permission = config
+            .get("permission")
+            .and_then(serde_json::Value::as_object)
+            .expect("MCP permission policy");
+        assert_eq!(
+            permission.get("docs_*").and_then(|v| v.as_str()),
+            Some("deny")
+        );
+        assert_eq!(
+            permission.get("docs_search").and_then(|v| v.as_str()),
+            Some("allow")
+        );
+        assert_eq!(
+            permission.get("docs_read").and_then(|v| v.as_str()),
+            Some("allow")
+        );
+        assert!(!permission.contains_key("docs_secret"));
     }
 }

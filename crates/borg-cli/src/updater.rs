@@ -123,9 +123,12 @@ async fn update(check_only: bool, quiet: bool) -> Result<UpdateOutcome> {
     verify_checksum(&asset_name, &archive, &checksum_bytes)?;
     let temporary = tempfile::tempdir().context("failed to create update staging directory")?;
     let candidate = temporary.path().join(executable_name());
+    let provider_candidate = temporary.path().join("providers/claude");
     extract_executable(&archive, &candidate)?;
+    extract_native_provider(&archive, &provider_candidate)?;
     validate_candidate(&candidate, &latest)?;
-    install_candidate(&candidate, &latest)?;
+    validate_native_provider(&provider_candidate)?;
+    install_candidate(&candidate, &provider_candidate, &latest)?;
     Ok(UpdateOutcome::Installed(latest))
 }
 
@@ -211,6 +214,51 @@ fn extract_executable(archive: &[u8], destination: &Path) -> Result<()> {
     bail!("Borg release archive does not contain `borg`")
 }
 
+#[cfg(unix)]
+fn extract_native_provider(archive: &[u8], destination: &Path) -> Result<()> {
+    use flate2::read::GzDecoder;
+    let mut tar = tar::Archive::new(GzDecoder::new(Cursor::new(archive)));
+    fs::create_dir_all(destination)
+        .context("failed to create native provider staging directory")?;
+    let mut found_binary = false;
+    for entry in tar.entries().context("invalid Borg release archive")? {
+        let mut entry = entry.context("invalid Borg release entry")?;
+        let path = entry.path().context("invalid Borg release path")?;
+        let Ok(relative) = path.strip_prefix(Path::new("providers/claude")) else {
+            continue;
+        };
+        let Some(name) = relative.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if relative.components().count() != 1
+            || !matches!(name, "claude" | "manifest.json" | "package.json")
+        {
+            continue;
+        }
+        let name = name.to_string();
+        let output = destination.join(&name);
+        let mut file = fs::File::create(&output).with_context(|| {
+            format!("failed to stage native provider file {}", output.display())
+        })?;
+        std::io::copy(&mut entry, &mut file).with_context(|| {
+            format!(
+                "failed to extract native provider file {}",
+                output.display()
+            )
+        })?;
+        file.sync_all()
+            .context("failed to sync native provider file")?;
+        if name == "claude" {
+            found_binary = true;
+        }
+    }
+    anyhow::ensure!(
+        found_binary,
+        "Borg release archive does not contain providers/claude/claude"
+    );
+    Ok(())
+}
+
 #[cfg(windows)]
 fn extract_executable(archive: &[u8], destination: &Path) -> Result<()> {
     let mut zip = zip::ZipArchive::new(Cursor::new(archive)).context("invalid Borg release zip")?;
@@ -220,6 +268,32 @@ fn extract_executable(archive: &[u8], destination: &Path) -> Result<()> {
     let mut output = fs::File::create(destination).context("failed to stage Borg update")?;
     std::io::copy(&mut entry, &mut output).context("failed to extract Borg update")?;
     output.sync_all().context("failed to sync Borg update")
+}
+
+#[cfg(windows)]
+fn extract_native_provider(archive: &[u8], destination: &Path) -> Result<()> {
+    let mut zip = zip::ZipArchive::new(Cursor::new(archive)).context("invalid Borg release zip")?;
+    fs::create_dir_all(destination)
+        .context("failed to create native provider staging directory")?;
+    for name in ["claude.exe", "manifest.json", "package.json"] {
+        let archive_name = format!("providers/claude/{name}");
+        let mut entry = zip
+            .by_name(&archive_name)
+            .with_context(|| format!("Borg release zip does not contain `{archive_name}`"))?;
+        let output = destination.join(name);
+        let mut file = fs::File::create(&output).with_context(|| {
+            format!("failed to stage native provider file {}", output.display())
+        })?;
+        std::io::copy(&mut entry, &mut file).with_context(|| {
+            format!(
+                "failed to extract native provider file {}",
+                output.display()
+            )
+        })?;
+        file.sync_all()
+            .context("failed to sync native provider file")?;
+    }
+    Ok(())
 }
 
 fn validate_candidate(candidate: &Path, expected: &Version) -> Result<()> {
@@ -244,10 +318,25 @@ fn validate_candidate(candidate: &Path, expected: &Version) -> Result<()> {
     Ok(())
 }
 
+fn validate_native_provider(provider: &Path) -> Result<()> {
+    for name in [
+        native_provider_executable_name(),
+        "manifest.json",
+        "package.json",
+    ] {
+        anyhow::ensure!(
+            provider.join(name).is_file(),
+            "staged native provider is missing `{name}`"
+        );
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
-fn install_candidate(candidate: &Path, _version: &Version) -> Result<()> {
+fn install_candidate(candidate: &Path, provider: &Path, _version: &Version) -> Result<()> {
     let executable = std::env::current_exe().context("failed to locate installed Borg")?;
-    install_candidate_at(candidate, &executable)
+    install_candidate_at(candidate, &executable)?;
+    install_native_provider_at(provider, &executable)
 }
 
 #[cfg(unix)]
@@ -269,8 +358,69 @@ fn install_candidate_at(candidate: &Path, executable: &Path) -> Result<()> {
     fs::rename(&staged, executable).context("failed to atomically replace installed Borg")
 }
 
+fn install_native_provider_at(provider: &Path, executable: &Path) -> Result<()> {
+    validate_native_provider(provider)?;
+    let target = std::env::var_os("BORG_HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join("providers/claude"))
+        .or_else(|| {
+            executable
+                .parent()
+                .map(|parent| parent.join("providers/claude"))
+        })
+        .context("installed Borg has no provider destination")?;
+    install_native_provider_to(provider, &target)
+}
+
+fn install_native_provider_to(provider: &Path, target: &Path) -> Result<()> {
+    let providers_parent = target
+        .parent()
+        .context("native provider destination has no parent")?;
+    fs::create_dir_all(&providers_parent)
+        .context("failed to create installed provider directory")?;
+    let staged = providers_parent.join(format!(".claude-update-{}", std::process::id()));
+    let backup = providers_parent.join(format!(".claude-backup-{}", std::process::id()));
+    if staged.exists() {
+        fs::remove_dir_all(&staged).context("failed to clear stale provider staging")?;
+    }
+    if backup.exists() {
+        fs::remove_dir_all(&backup).context("failed to clear stale provider backup")?;
+    }
+    fs::create_dir(&staged).context("failed to stage native provider")?;
+    for name in [
+        native_provider_executable_name(),
+        "manifest.json",
+        "package.json",
+    ] {
+        fs::copy(provider.join(name), staged.join(name))
+            .with_context(|| format!("failed to copy native provider `{name}`"))?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(
+            staged.join(native_provider_executable_name()),
+            fs::Permissions::from_mode(0o700),
+        )
+        .context("failed to make native provider executable")?;
+    }
+    if target.exists() {
+        fs::rename(&target, &backup).context("failed to stage the installed native provider")?;
+    }
+    if let Err(error) = fs::rename(&staged, &target) {
+        if backup.exists() {
+            let _ = fs::rename(&backup, &target);
+        }
+        return Err(error).context("failed to atomically install native provider");
+    }
+    if backup.exists() {
+        fs::remove_dir_all(&backup).context("failed to remove old native provider")?;
+    }
+    Ok(())
+}
+
 #[cfg(windows)]
-fn install_candidate(candidate: &Path, version: &Version) -> Result<()> {
+fn install_candidate(candidate: &Path, provider: &Path, version: &Version) -> Result<()> {
     use std::os::windows::process::CommandExt;
     let executable = std::env::current_exe().context("failed to locate installed Borg")?;
     let parent = executable
@@ -280,6 +430,7 @@ fn install_candidate(candidate: &Path, version: &Version) -> Result<()> {
     let staged = parent.join(format!(".borg-update-{id}.exe"));
     let helper = parent.join(format!(".borg-update-{id}.ps1"));
     fs::copy(candidate, &staged).context("failed to stage update beside installed Borg")?;
+    install_native_provider_at(provider, &executable)?;
     let script = r#"param([int]$ParentId,[string]$Source,[string]$Destination,[string]$Helper)
 Wait-Process -Id $ParentId -ErrorAction SilentlyContinue
 for ($i = 0; $i -lt 120; $i++) {
@@ -337,6 +488,14 @@ fn platform_asset() -> Result<String> {
 
 fn executable_name() -> &'static str {
     if cfg!(windows) { "borg.exe" } else { "borg" }
+}
+
+fn native_provider_executable_name() -> &'static str {
+    if cfg!(windows) {
+        "claude.exe"
+    } else {
+        "claude"
+    }
 }
 
 fn state_path() -> Option<PathBuf> {
@@ -453,6 +612,39 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn unix_release_archive_extracts_the_native_provider_payload() {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        let mut archive = tar::Builder::new(GzEncoder::new(Vec::new(), Compression::fast()));
+        for (name, bytes) in [
+            ("providers/claude/claude", b"claude-binary".as_slice()),
+            (
+                "providers/claude/manifest.json",
+                br#"{"sdkCompat":{"harnessSchema":1}}"#,
+            ),
+            ("providers/claude/package.json", br#"{"version":"1.0.0"}"#),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o700);
+            header.set_cksum();
+            archive
+                .append_data(&mut header, name, Cursor::new(bytes))
+                .unwrap();
+        }
+        let compressed = archive.into_inner().unwrap().finish().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("providers/claude");
+        extract_native_provider(&compressed, &destination).unwrap();
+        validate_native_provider(&destination).unwrap();
+        assert_eq!(
+            fs::read(destination.join("claude")).unwrap(),
+            b"claude-binary"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn unix_install_replaces_the_binary_atomically() {
         let directory = tempfile::tempdir().unwrap();
         let installed = directory.path().join("borg");
@@ -461,5 +653,24 @@ mod tests {
         fs::write(&candidate, b"new").unwrap();
         install_candidate_at(&candidate, &installed).unwrap();
         assert_eq!(fs::read(installed).unwrap(), b"new");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_install_replaces_the_native_provider_atomically() {
+        let directory = tempfile::tempdir().unwrap();
+        let installed = directory.path().join("borg");
+        let provider = directory.path().join("staged-provider");
+        fs::write(&installed, b"borg").unwrap();
+        fs::create_dir(&provider).unwrap();
+        fs::write(provider.join("claude"), b"new-claude").unwrap();
+        fs::write(provider.join("manifest.json"), b"{}").unwrap();
+        fs::write(provider.join("package.json"), b"{}").unwrap();
+        install_native_provider_to(&provider, &directory.path().join("providers/claude")).unwrap();
+        let installed_provider = directory.path().join("providers/claude");
+        assert_eq!(
+            fs::read(installed_provider.join("claude")).unwrap(),
+            b"new-claude"
+        );
     }
 }

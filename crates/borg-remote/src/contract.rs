@@ -434,8 +434,9 @@ pub struct LaunchSession {
     /// use Borg's current default and keep older launch payloads compatible.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent_concurrency_limit: Option<u32>,
-    /// Canonical paths from active, trusted extension manifests. Missing data
-    /// preserves legacy launch payload behavior.
+    /// Canonical paths from active, trusted extension manifests for local
+    /// execution. Enrolled hosts discard this controller hint and derive their
+    /// own active catalog, so a serialized path never grants host access.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extension_skill_roots: Vec<PathBuf>,
     /// Optional autonomous-team policy. Absent preserves ordinary manual

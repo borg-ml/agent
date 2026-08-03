@@ -152,7 +152,11 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) before submitting changes.
 
 Tags matching `v*` build checksum-paired `borg` archives for Linux, macOS, and
 Windows on x86-64 and ARM64. Each release archive contains the self-contained
-`borg` CLI, `LICENSE`, `NOTICE.md`, and this README.
+`borg` CLI, the pinned native Claude payload under `providers/claude/`,
+the Blu guide and manifest example under `docs/` and `configs/`, `LICENSE`,
+`NOTICE.md`, and this README. The Rust protocol runtime is provided
+by the standalone MIT-licensed [`claude-agents`](https://github.com/borg-ml/claude-agents)
+crate.
 
 ---
 

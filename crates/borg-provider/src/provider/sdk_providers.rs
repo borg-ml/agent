@@ -1,10 +1,10 @@
-//! Provider impls that drive every Claude / Codex run through the
-//! Claude Agent SDK and the Codex app-server. The CLI binaries (`claude
+//! Provider impls that drive every Claude / Codex run through the native
+//! `claude-agents` runtime and the Codex app-server. The CLI binaries (`claude
 //! exec`, `codex exec`) are no longer used — these are the only paths.
 //!
 //! Both providers rely on server-side structured-output enforcement:
-//! - Agent SDK: `outputFormat: { type: "json_schema", schema }` passed through
-//!   `packages/borg-claude-sdk/src/provider.ts`.
+//! - Claude: `outputFormat: { type: "json_schema", schema }` passed through
+//!   the native `claude-agents` stream-json runtime.
 //! - Codex app-server: `outputSchema` param on the `turn/start` JSON-RPC call.
 //!
 //! The SDK / app-server layer retries internally on schema-validation failure,
@@ -37,7 +37,7 @@ use request::{ChatStreamRequestOptions, build_chat_stream_request};
 pub use stream_result::{await_freeform_result, await_structured_result};
 
 #[derive(Debug, Clone)]
-pub struct ClaudeSdkProvider {
+pub struct ClaudeAgentsProvider {
     pub model: Option<String>,
     pub effort: Option<String>,
     pub fast: bool,
@@ -72,7 +72,7 @@ pub struct CodexAppServerProvider {
     pub mcp: BorgAgentMcpContext,
 }
 
-impl ClaudeSdkProvider {
+impl ClaudeAgentsProvider {
     fn chat_stream_request(
         &self,
         prompt: &str,
@@ -138,7 +138,7 @@ impl CodexAppServerProvider {
 }
 
 #[async_trait]
-impl Provider for ClaudeSdkProvider {
+impl Provider for ClaudeAgentsProvider {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -156,7 +156,7 @@ impl Provider for ClaudeSdkProvider {
             rx,
             progress,
             self.label(),
-            "claude-agent-sdk",
+            "claude-agents",
             self.model.clone(),
             self.effort.clone(),
         )
@@ -175,7 +175,7 @@ impl Provider for ClaudeSdkProvider {
             rx,
             progress,
             self.label(),
-            "claude-agent-sdk",
+            "claude-agents",
             self.model.clone(),
             self.effort.clone(),
         )
@@ -183,7 +183,7 @@ impl Provider for ClaudeSdkProvider {
     }
 
     fn label(&self) -> &'static str {
-        "claude-sdk"
+        "claude-agents"
     }
 
     fn structured_output_dialect(&self) -> StructuredOutputDialect {

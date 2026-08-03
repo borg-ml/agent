@@ -1,7 +1,8 @@
 # Claude native protocol (stream-json + control_request)
 
-Reference for the native Rust port of the Claude Agent SDK integration, replacing the
-Node sidecar at `packages/borg-claude-sdk`.
+Reference for the native Rust `claude-agents` runtime imported by Borg. The
+`packages/claude-native-runtime` npm package is only the pinned upstream binary
+payload used during installation and release packaging.
 
 Extracted from `@anthropic-ai/claude-agent-sdk@0.3.220` (`sdk.d.ts`, `sdk.mjs`) and
 **verified live** against `claude` 2.1.220 (`manifest.json` `sdkCompat.harnessSchema: 1`).
@@ -21,7 +22,7 @@ The stream is a **multiplexed demux**, not a pure message stream. Frame types on
 
 | `type` | Direction | Meaning |
 |---|---|---|
-| `system`, `assistant`, `user`, `result`, `stream_event`, `rate_limit_event` | CLI → us | SDK messages — already parsed by `ClaudeStreamState` |
+| `system`, `assistant`, `user`, `result`, `stream_event`, `rate_limit_event` | CLI → us | SDK messages — parsed by `claude-agents` |
 | `control_response` | CLI → us | Reply to a request we sent; correlate on `response.request_id` |
 | `control_request` | CLI → us | CLI asking *us* (permissions, elicitation, hooks) |
 | `control_cancel_request` | CLI → us | Abort an in-flight inbound `control_request` by `request_id` |
@@ -56,6 +57,7 @@ Flags the sidecar's `Options` currently map to:
 | `resume` | `--resume=<session_id>` (note: `=` form) |
 | `persistSession: false` | `--no-session-persistence` |
 | `includePartialMessages` | `--include-partial-messages` |
+| `settings: {fastMode, fastModePerSessionOptIn}` | `--settings '{"fastMode":true,"fastModePerSessionOptIn":true}'` |
 | `cwd` | process `cwd`, not a flag |
 
 `--permission-prompt-tool stdio` is the mechanism that routes permission decisions to
@@ -64,8 +66,9 @@ permission-prompt tool.
 
 `systemPrompt` is **not** a flag — it goes in the `initialize` handshake.
 
-Env: the SDK sets `CLAUDE_CODE_ENTRYPOINT` (`sdk-ts`) and clears `NODE_OPTIONS`.
-See open question below.
+Env: the native runner sets `CLAUDE_CODE_ENTRYPOINT` to `sdk-ts` when the caller has
+not set it, removes `NODE_OPTIONS`, and forwards the pinned wrapper version as
+`CLAUDE_AGENT_SDK_VERSION` when packaged metadata is available.
 
 ## The initialize handshake
 
@@ -110,15 +113,21 @@ Responses may carry `pending_permission_requests` / `pending_user_dialog_request
 
 ### Subtypes Borg actually uses
 
-Five of the 36 declared variants:
+The native path currently uses these declared variants:
 
 - `initialize` (out) — handshake above.
 - `interrupt` (out) — response `{still_queued: string[]}`, plus `cancelled[]` when the
   request sets `cancel_queued: true`. Gated by capability `interrupt_receipt_v1` /
-  `interrupt_cancel_queued_v1`.
+  `interrupt_cancel_queued_v1`; native Rust follows up with
+  `cancel_async_message` for every `still_queued` UUID and only reuses a pooled
+  process after every cancellation is confirmed.
+- `cancel_async_message` (out) — `{message_uuid}`; a successful response must carry
+  `{cancelled:true}` before a pooled process can be reused.
 - `get_context_usage` (out) — `{totalTokens, maxTokens, rawMaxTokens, model, categories}`.
+- `stop_task` (out) — stops a background task before an interrupt.
 - `can_use_tool` (**in**) — see below.
-- MCP elicitation (**in**) — routed to `onElicitation` in the sidecar.
+- MCP elicitation (**in**) — normalized to the SDK-shaped provider interaction
+  payload; the compatibility sidecar routes the same request through `onElicitation`.
 
 ### `can_use_tool` (inbound) — verified live
 
@@ -129,7 +138,7 @@ Request fields observed: `subtype`, `tool_name`, `input`, `tool_use_id`,
 `display_name` and `description` are **normally present** — verified live. The
 synthesized `"Use <tool>"` / `"Claude requested permission to use <tool>."` wording is
 a degraded path, not the common one. Test fixtures that omit these fields exercise
-only the fallback and will disagree with the binary.
+only the synthesized wording and will disagree with the binary.
 
 Reply payload is the permission result plus `toolUseID`:
 
@@ -142,8 +151,10 @@ Deny: `{"behavior":"deny","message":"…","interrupt":true?}`.
 Session-scoped approval: `updatedPermissions` carrying the request's
 `permission_suggestions`.
 
-Note `updatedInput` — the current sidecar never sets it, so "approve with edits" is
-not expressible today. The native port should thread it through.
+The standalone Rust runtime preserves the wire field by echoing the original tool
+input as `updatedInput`. Borg's high-level approval API does not currently expose
+a separate edited-input value; supporting "approve with edits" would require an
+explicit API addition rather than a protocol change.
 
 Every inbound request must be answered or the turn hangs. `control_cancel_request`
 withdraws one; drop the pending entry and do not reply.
@@ -177,20 +188,27 @@ use a genuinely gated tool (e.g. `Write`).
 - **No in-process MCP bridging needed.** Borg's MCP servers are stdio `command`+`args`
   (`crates/borg-provider/src/mcp.rs`); the CLI spawns them itself. The `sdkMcpServers` /
   `mcp_message` machinery — the hardest part of the protocol — is not on our path.
-- The message-stream half is already reimplemented in `claude_stream.rs`. The port adds
-  the control half; it does not introduce a new dependency on undocumented behavior.
+- The message-stream and control halves are implemented in the standalone
+  `claude-agents` crate; Borg supplies binary discovery, auth, MCP, and workspace
+  configuration at the integration boundary.
 - The ~270 MB `claude` binary remains either way — it ships as the platform
-  optionalDependency `@anthropic-ai/claude-agent-sdk-<platform>`. The port removes the
-  Node runtime, the npm wrapper dep, the `dist/provider.js` build step, and
-  wrapper-vs-binary version skew.
+  optionalDependency `@anthropic-ai/claude-agent-sdk-<platform>`. The native Rust
+  path removes the Node runtime from normal execution. The npm package is not copied
+  into releases; only its platform-specific binary and metadata are installed under
+  `providers/claude/`.
 
-## Open questions
+## Rust runtime parity decisions
 
-1. **`CLAUDE_CODE_ENTRYPOINT`.** The SDK sets `sdk-ts`. The spike used `sdk-rs` with no
-   observable difference, but the value may gate features (`fast_mode_disabled_reason`
-   came back `sdk_opt_in_required`). Decide deliberately before shipping.
-2. **Fast mode.** The sidecar sets `settings.fastMode` / `fastModePerSessionOptIn`,
-   which reach the CLI through the generic settings passthrough, not a dedicated flag.
-   Confirm the flag spelling used by `--settings`.
-3. **`--json-schema` vs `initialize.jsonSchema`.** Both exist. The SDK passes the flag;
-   confirm precedence and whether structured-output retries behave identically.
+1. **Entrypoint compatibility.** Native Rust uses the SDK's observable `sdk-ts` tag
+   and preserves an explicit caller override.
+2. **Fast mode.** Native Rust passes both SDK settings keys through `--settings`, and
+   deterministic coverage asserts the exact JSON reaches the child.
+3. **Structured output.** Native Rust follows the SDK's current `--json-schema` CLI
+   mapping; `claude-agents` prefers the result envelope's `structured_output`.
+4. **Pooling.** Local pooled sessions keep one native process alive, restart it when
+   lifecycle configuration changes, transfer steers that race a terminal result to
+   the replacement session, and discard the process after abnormal or unconfirmed
+   termination.
+5. **Context telemetry.** Native Rust requests `get_context_usage` after each assistant
+   message, emits the provider-neutral `claude.context_usage` event, and treats missing
+   or unsupported responses as advisory rather than failing the turn.

@@ -7,7 +7,7 @@ mod sdk_providers;
 
 pub use chat_stream::{
     ChatApprovalDecision, ChatGitCredential, ChatProviderAuth, ChatStreamControl, ChatStreamEvent,
-    ChatStreamRequest, ClaudeSdkPool, CodexAppServerPool, LocalAgentPermission,
+    ChatStreamRequest, ClaudeAgentsPool, CodexAppServerPool, LocalAgentPermission,
     run_claude_chat_stream, run_claude_chat_stream_with_control, run_claude_local_chat_stream,
     run_codex_chat_stream, run_codex_chat_stream_with_control, run_codex_freeform_chat_stream,
     run_codex_local_chat_stream, run_opencode_local_chat_stream,
@@ -24,7 +24,7 @@ pub use openai_compatible::{
 };
 pub use openrouter::OpenRouterProvider;
 pub use sdk_providers::{
-    ClaudeSdkProvider, CodexAppServerProvider, await_freeform_result, await_structured_result,
+    ClaudeAgentsProvider, CodexAppServerProvider, await_freeform_result, await_structured_result,
 };
 
 use std::collections::VecDeque;
@@ -546,65 +546,6 @@ pub fn default_effort_for_backend(backend: &str) -> Option<String> {
     }
 }
 
-/// Project a Claude Agent SDK message envelope into a `ProviderCallUsage`.
-/// Used by the live chat-stream parser (chat_stream.rs) to harvest token
-/// usage / cost off the streamed `assistant` envelope. Public so it can
-/// be called across modules in this crate.
-pub(crate) fn extract_claude_usage(envelope: &Value) -> ProviderCallUsage {
-    // SDK assistant envelopes keep Anthropic usage under `message.usage`,
-    // while terminal result envelopes expose cumulative usage at the top
-    // level. Accept both shapes so final turn telemetry is never replaced by
-    // an all-zero fallback.
-    let usage = envelope
-        .get("usage")
-        .or_else(|| envelope.pointer("/message/usage"));
-    let input_tokens = usage
-        .and_then(|value| value.get("input_tokens"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let cached_input_tokens = usage
-        .and_then(|value| value.get("cache_read_input_tokens"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let cache_creation_input_tokens = usage
-        .and_then(|value| value.get("cache_creation_input_tokens"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let output_tokens = usage
-        .and_then(|value| value.get("output_tokens"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let duration_ms = envelope
-        .get("duration_ms")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let total_tokens = input_tokens
-        .saturating_add(cached_input_tokens)
-        .saturating_add(cache_creation_input_tokens)
-        .saturating_add(output_tokens);
-    let cost_microusd = envelope
-        .get("total_cost_usd")
-        .and_then(Value::as_f64)
-        .and_then(provider_cost_usd_to_microusd);
-
-    ProviderCallUsage {
-        duration_ms,
-        input_tokens,
-        cached_input_tokens,
-        cache_creation_input_tokens,
-        output_tokens,
-        total_tokens,
-        context_tokens: None,
-        context_window_tokens: None,
-        cost_microusd,
-        cost_basis: if cost_microusd.is_some() {
-            CostBasis::ProviderReported
-        } else {
-            CostBasis::Unavailable
-        },
-    }
-}
-
 pub(crate) fn extract_chat_completions_usage(
     raw: &Value,
     duration_ms: u64,
@@ -895,8 +836,8 @@ mod tests {
     use super::{
         CLAUDE_DEFAULT_MODEL, CLAUDE_SELECTABLE_MODELS, PROVIDER_HTTP_ERROR_BODY_MAX_BYTES,
         PROVIDER_MCP_CONFIG_MAX_BYTES, estimate_openai_cache_miss_microusd,
-        estimate_openai_cost_microusd, extract_chat_completions_usage, extract_claude_usage,
-        microusd_for_tokens, parse_chat_completion_json_text, provider_cost_usd_to_microusd,
+        estimate_openai_cost_microusd, extract_chat_completions_usage, microusd_for_tokens,
+        parse_chat_completion_json_text, provider_cost_usd_to_microusd,
         provider_response_body_would_exceed_limit, read_provider_mcp_config_text,
         truncate_provider_text,
     };
@@ -1015,42 +956,6 @@ mod tests {
         assert_eq!(usage.total_tokens, 130);
         assert_eq!(usage.duration_ms, 250);
         assert_eq!(usage.cost_microusd, Some(1234));
-    }
-
-    #[test]
-    fn claude_usage_accepts_assistant_and_result_envelopes() {
-        let assistant = json!({
-            "type": "assistant",
-            "message": {
-                "usage": {
-                    "input_tokens": 11,
-                    "cache_read_input_tokens": 7,
-                    "cache_creation_input_tokens": 5,
-                    "output_tokens": 3
-                }
-            }
-        });
-        let assistant_usage = extract_claude_usage(&assistant);
-        assert_eq!(assistant_usage.input_tokens, 11);
-        assert_eq!(assistant_usage.cached_input_tokens, 7);
-        assert_eq!(assistant_usage.cache_creation_input_tokens, 5);
-        assert_eq!(assistant_usage.output_tokens, 3);
-        assert_eq!(assistant_usage.total_tokens, 26);
-
-        let result = json!({
-            "type": "result",
-            "duration_ms": 250,
-            "total_cost_usd": 0.012345,
-            "usage": {
-                "input_tokens": 20,
-                "cache_read_input_tokens": 10,
-                "output_tokens": 4
-            }
-        });
-        let result_usage = extract_claude_usage(&result);
-        assert_eq!(result_usage.total_tokens, 34);
-        assert_eq!(result_usage.duration_ms, 250);
-        assert_eq!(result_usage.cost_microusd, Some(12_345));
     }
 
     #[test]

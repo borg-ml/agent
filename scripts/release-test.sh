@@ -19,18 +19,23 @@ fail() {
   exit 1
 }
 
-# Keep the tag workflow aligned with the binary-only Borg package and the
-# provider-parity gate. Fixture copies used below do not contain workflows, so
-# only enforce this contract when running from the real checkout.
+# Keep the tag workflow aligned with the self-contained Borg archive. Fixture
+# copies used below do not contain workflows, so only enforce this contract when
+# running from the real checkout.
 if [[ -f "$repo_root/.github/workflows/release.yml" ]]; then
   release_workflow="$repo_root/.github/workflows/release.yml"
   if grep -Eq -- 'cargo test.*-p borg --lib' "$release_workflow"; then
     fail "release workflow still invokes --lib for the binary-only borg package"
   fi
-  grep -Fq 'provider-parity:' "$release_workflow" ||
-    fail "release workflow is missing the provider-parity gate"
-  grep -Fq 'needs: [validate, provider-parity]' "$release_workflow" ||
-    fail "release build does not depend on provider parity"
+  grep -Fq 'providers/claude' "$release_workflow" ||
+    fail "release archive does not package the native Claude payload"
+  grep -Fq 'docs/blu-extensions.md' "$release_workflow" ||
+    fail "release archive does not package the Blu guide"
+  grep -Fq 'configs/extension.example.toml' "$release_workflow" ||
+    fail "release archive does not package the Blu manifest example"
+  if grep -Eq 'providers/claude-sdk|BORG_CLAUDE_NATIVE|borg-claude-sdk' "$release_workflow"; then
+    fail "release workflow still contains the removed Claude fallback"
+  fi
 fi
 
 # Keep the manually dispatchable platform matrix honest even before a hosted
@@ -52,8 +57,15 @@ if [[ -f "$repo_root/.github/workflows/platform-ci.yml" ]]; then
   grep -Fq 'cargo test --locked --target ${{ matrix.target }} -p borg --no-fail-fast' \
     "$platform_workflow" ||
     fail "platform workflow is missing the binary-only native test matrix"
-  grep -Fq 'provider-parity:' "$platform_workflow" ||
-    fail "platform workflow is missing the provider-parity job"
+  grep -Fq 'providers/claude' "$platform_workflow" ||
+    fail "platform archive does not package the native Claude payload"
+  grep -Fq 'docs/blu-extensions.md' "$platform_workflow" ||
+    fail "platform archive does not package the Blu guide"
+  grep -Fq 'configs/extension.example.toml' "$platform_workflow" ||
+    fail "platform archive does not package the Blu manifest example"
+  if grep -Eq 'providers/claude-sdk|BORG_CLAUDE_NATIVE|borg-claude-sdk' "$platform_workflow"; then
+    fail "platform workflow still contains the removed Claude fallback"
+  fi
 fi
 
 assert_equal() {

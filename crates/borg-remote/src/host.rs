@@ -1616,6 +1616,19 @@ fn persist_launch_metadata(
         .with_context(|| format!("failed to atomically write {}", path.display()))
 }
 
+fn discard_serialized_extension_roots(launch: &mut LaunchSession) {
+    if !launch.extension_skill_roots.is_empty() {
+        tracing::debug!(
+            count = launch.extension_skill_roots.len(),
+            "discarding controller-supplied extension roots at host boundary"
+        );
+        // A remote controller may only request a session. The host-side
+        // executor factory discovers its own active/trusted Blu catalog; no
+        // serialized path is allowed to become a host filesystem capability.
+        launch.extension_skill_roots.clear();
+    }
+}
+
 async fn spawn_host_session(
     client: Client,
     config: HostConfig,
@@ -1657,6 +1670,7 @@ async fn run_session(
     commands: mpsc::Receiver<HostCommand>,
 ) -> Result<()> {
     launch.cwd = validate_host_cwd(&config.roots, &launch.cwd)?;
+    discard_serialized_extension_roots(&mut launch);
     let journal_path = session_root.join(format!("{session_id}.jsonl"));
     let writer = SessionWriterLease::acquire(&journal_path)?;
     let sqlite_store =
@@ -1835,6 +1849,22 @@ mod tests {
 
     use super::*;
     use crate::WorkspaceFilesystemOperation;
+
+    #[test]
+    fn host_boundary_discards_controller_supplied_extension_roots() {
+        let mut launch: LaunchSession = serde_json::from_value(serde_json::json!({
+            "request_id": Uuid::new_v4(),
+            "cwd": "/workspace",
+            "provider": "codex",
+            "permission_mode": "manual",
+            "extension_skill_roots": ["/workspace/.borg/extensions/untrusted/skills"]
+        }))
+        .expect("launch payload");
+
+        discard_serialized_extension_roots(&mut launch);
+
+        assert!(launch.extension_skill_roots.is_empty());
+    }
 
     fn error_events(session_id: Uuid, count: usize, message_bytes: usize) -> Vec<SessionEvent> {
         (1..=count)

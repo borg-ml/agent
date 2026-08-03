@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use borg_provider::provider::{
-    ChatApprovalDecision, ChatStreamControl, ChatStreamEvent, ChatStreamRequest, ClaudeSdkPool,
+    ChatApprovalDecision, ChatStreamControl, ChatStreamEvent, ChatStreamRequest, ClaudeAgentsPool,
     CodexAppServerPool, LocalAgentPermission, run_claude_chat_stream_with_control,
     run_claude_local_chat_stream, run_codex_chat_stream_with_control, run_codex_local_chat_stream,
     run_opencode_local_chat_stream, run_pooled_claude_local_chat_stream,
@@ -191,7 +191,7 @@ pub trait AgentTurnExecutor: Send + Sync {
 #[derive(Clone, Default)]
 pub struct LocalAgentTurnExecutor {
     codex_pool: CodexAppServerPool,
-    claude_pool: ClaudeSdkPool,
+    claude_pool: ClaudeAgentsPool,
     claude_sessions: Arc<Mutex<HashMap<String, ClaudeSessionSnapshot>>>,
     native_harness: NativeHarness,
     runtime_extensions: Arc<RwLock<RuntimeExtensions>>,
@@ -212,7 +212,7 @@ struct RuntimeExtensions {
 struct ClaudeSessionSnapshot {
     request: ChatStreamRequest,
     permission: LocalAgentPermission,
-    pool: Option<ClaudeSdkPool>,
+    pool: Option<ClaudeAgentsPool>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -722,7 +722,7 @@ struct BorgProviderTurnRuntime {
     request_template: Option<ChatStreamRequest>,
     local: bool,
     codex_pool: Option<CodexAppServerPool>,
-    claude_pool: Option<ClaudeSdkPool>,
+    claude_pool: Option<ClaudeAgentsPool>,
     claude_sessions: Option<Arc<Mutex<HashMap<String, ClaudeSessionSnapshot>>>>,
 }
 

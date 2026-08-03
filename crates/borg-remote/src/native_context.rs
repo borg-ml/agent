@@ -18,6 +18,10 @@ pub(crate) struct NativeContext {
 struct SkillEntry {
     description: String,
     path: PathBuf,
+    /// Canonical root captured with the catalog entry. `read_skill` verifies
+    /// this root again so a path swap cannot turn a trusted skill into an
+    /// arbitrary filesystem read.
+    root: PathBuf,
 }
 
 impl NativeContext {
@@ -60,26 +64,43 @@ impl NativeContext {
             skill_roots.push(directory.join(".agents").join("skills"));
             skill_roots.push(directory.join(".borg").join("skills"));
         }
-        let mut skills = BTreeMap::new();
+        let mut base_skills = BTreeMap::new();
         for root in skill_roots {
             // Existing user/project skill roots historically allow a skill
             // directory to be a symlink. Preserve that compatibility.
-            load_skill_root(&root, &mut skills, false)?;
-            if skills.len() >= MAX_SKILLS {
-                break;
-            }
+            load_skill_root(&root, &mut base_skills, false, MAX_SKILLS)?;
         }
         // Session launch validation has already constrained these roots to
         // trusted host extension bases. Do not silently drop or let a skill
         // escape an extension root here.
+        let mut extension_skills = BTreeMap::new();
         for root in extension_skill_roots {
             let canonical = root
                 .canonicalize()
                 .with_context(|| format!("canonicalize extension skill root {}", root.display()))?;
-            load_skill_root(&canonical, &mut skills, true)?;
+            load_skill_root(&canonical, &mut extension_skills, true, MAX_SKILLS)?;
+        }
+        // Keep the historical user/project precedence while reserving room
+        // for active Blu skills. Previously 128 ordinary skills could make
+        // every extension skill silently disappear from the native catalog.
+        let extension_only = extension_skills
+            .keys()
+            .filter(|name| !base_skills.contains_key(*name))
+            .count();
+        let base_limit = MAX_SKILLS.saturating_sub(extension_only);
+        let mut skills = base_skills
+            .iter()
+            .take(base_limit)
+            .map(|(name, skill)| (name.clone(), skill.clone()))
+            .collect::<BTreeMap<_, _>>();
+        for (name, skill) in extension_skills {
+            skills.entry(name).or_insert(skill);
+        }
+        for (name, skill) in base_skills {
             if skills.len() >= MAX_SKILLS {
                 break;
             }
+            skills.entry(name).or_insert(skill);
         }
         Ok(Self {
             project_instructions,
@@ -127,14 +148,28 @@ impl NativeContext {
             .skills
             .get(name)
             .with_context(|| format!("unknown skill `{name}`"))?;
-        let metadata = tokio::fs::metadata(&skill.path).await?;
+        let canonical_root = tokio::fs::canonicalize(&skill.root)
+            .await
+            .with_context(|| format!("revalidate skill root {}", skill.root.display()))?;
+        anyhow::ensure!(
+            canonical_root == skill.root,
+            "skill `{name}` root changed since the catalog was loaded"
+        );
+        let canonical_path = tokio::fs::canonicalize(&skill.path)
+            .await
+            .with_context(|| format!("revalidate skill {}", skill.path.display()))?;
+        anyhow::ensure!(
+            canonical_path == skill.path && canonical_path.starts_with(&canonical_root),
+            "skill `{name}` path changed or escapes its declared root"
+        );
+        let metadata = tokio::fs::metadata(&canonical_path).await?;
         if metadata.len() > MAX_SKILL_BYTES {
             bail!(
                 "skill `{name}` exceeds the {} KiB limit",
                 MAX_SKILL_BYTES / 1024
             );
         }
-        let content = tokio::fs::read_to_string(&skill.path)
+        let content = tokio::fs::read_to_string(&canonical_path)
             .await
             .with_context(|| format!("read skill {}", skill.path.display()))?;
         Ok(json!({
@@ -156,10 +191,7 @@ pub(crate) async fn extension_skill_prompt_appendix(roots: Vec<PathBuf>) -> Resu
             let canonical = root
                 .canonicalize()
                 .with_context(|| format!("canonicalize extension skill root {}", root.display()))?;
-            load_skill_root(&canonical, &mut skills, true)?;
-            if skills.len() >= MAX_SKILLS {
-                break;
-            }
+            load_skill_root(&canonical, &mut skills, true, MAX_SKILLS)?;
         }
         if skills.is_empty() {
             return Ok(String::new());
@@ -212,6 +244,7 @@ fn load_skill_root(
     root: &Path,
     skills: &mut BTreeMap<String, SkillEntry>,
     require_containment: bool,
+    max_skills: usize,
 ) -> Result<()> {
     let Ok(canonical_root) = root.canonicalize() else {
         return Ok(());
@@ -220,7 +253,7 @@ fn load_skill_root(
         return Ok(());
     };
     for entry in entries {
-        if skills.len() >= MAX_SKILLS {
+        if skills.len() >= max_skills {
             break;
         }
         let entry = entry?;
@@ -249,6 +282,7 @@ fn load_skill_root(
             SkillEntry {
                 description,
                 path: canonical,
+                root: canonical_root.clone(),
             },
         );
     }
@@ -294,8 +328,10 @@ mod tests {
             .expect("skill");
         }
         let mut skills = BTreeMap::new();
-        load_skill_root(&user.path().join("skills"), &mut skills, false).expect("user skills");
-        load_skill_root(&root.path().join("skills"), &mut skills, false).expect("project skills");
+        load_skill_root(&user.path().join("skills"), &mut skills, false, MAX_SKILLS)
+            .expect("user skills");
+        load_skill_root(&root.path().join("skills"), &mut skills, false, MAX_SKILLS)
+            .expect("project skills");
         assert_eq!(skills["review"].description, "project");
     }
 
@@ -317,6 +353,36 @@ mod tests {
             context.skills["extension-audit"].description,
             "trusted extension"
         );
+    }
+
+    #[test]
+    fn active_extension_skills_are_reserved_at_the_global_cap() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::create_dir(workspace.path().join(".git")).expect("project marker");
+        let project_root = workspace.path().join(".borg/skills");
+        for index in 0..MAX_SKILLS {
+            let directory = project_root.join(format!("base-{index:03}"));
+            std::fs::create_dir_all(&directory).expect("base skill directory");
+            std::fs::write(
+                directory.join("SKILL.md"),
+                format!("---\nname: base-{index:03}\n---\n"),
+            )
+            .expect("base skill");
+        }
+        let extension = tempfile::tempdir().expect("extension");
+        let directory = extension.path().join("skills/audit");
+        std::fs::create_dir_all(&directory).expect("extension skill directory");
+        std::fs::write(
+            directory.join("SKILL.md"),
+            "---\nname: extension-audit\ndescription: active\n---\n",
+        )
+        .expect("extension skill");
+
+        let context =
+            NativeContext::load_blocking(workspace.path(), &[extension.path().join("skills")])
+                .expect("context");
+        assert!(context.skills.contains_key("extension-audit"));
+        assert_eq!(context.skills.len(), MAX_SKILLS);
     }
 
     #[tokio::test]
