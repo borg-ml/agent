@@ -93,10 +93,11 @@ impl SessionEventKind {
                 ..
             } => true,
             Self::TurnCompleted { .. } | Self::ContextCleared => true,
+            Self::ProviderEvent { kind, .. } if kind == "context_compaction" => true,
             Self::ProviderEvent { provider, kind, .. } if provider.uses_native_harness() => {
                 matches!(
                     kind.as_str(),
-                    "native_model_message" | "native_tool_round_completed" | "context_compaction"
+                    "native_model_message" | "native_tool_round_completed"
                 )
             }
             _ => false,

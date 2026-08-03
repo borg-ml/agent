@@ -1690,6 +1690,19 @@ fn footer_metadata_highlights_only_imminent_compaction() {
 }
 
 #[test]
+fn copy_notice_is_rendered_as_a_high_contrast_badge() {
+    let line = copy_notice_line("✓ Copied last response".to_string());
+
+    assert_eq!(line.spans.len(), 1);
+    assert_eq!(line.spans[0].content, "  ✓ Copied last response  ");
+    assert_eq!(line.spans[0].style.fg, Some(Color::Black));
+    assert_eq!(line.spans[0].style.bg, Some(Color::LightGreen));
+    assert!(line.spans[0].style.add_modifier.contains(Modifier::BOLD));
+    assert!(is_copy_notice("Copied selected transcript entry"));
+    assert!(!is_copy_notice("Copy failed: clipboard unavailable"));
+}
+
+#[test]
 fn git_worktree_status_is_compact_and_includes_divergence_and_dirty_state() {
     let status = parse_git_worktree_status(
         "## feature/ui...origin/feature/ui [ahead 2, behind 1]\n M src/main.rs\n",
@@ -2486,13 +2499,52 @@ fn active_subagent_count_tracks_only_working_children() {
 
 #[test]
 fn agents_status_label_counts_only_working_children() {
-    let working = agents_status_label(1).expect("one child is working");
-    let larger_team = agents_status_label(2).expect("two children are working");
-    let idle = agents_status_label(0);
+    let working = agents_status_label_with_persistent_sidecars(1, 0).expect("one child is working");
+    let larger_team =
+        agents_status_label_with_persistent_sidecars(2, 0).expect("two children are working");
+    let idle = agents_status_label_with_persistent_sidecars(0, 0);
 
     assert_eq!(working, "1 subagent");
     assert_eq!(larger_team, "2 subagents");
     assert_eq!(idle, None);
+}
+
+#[test]
+fn persistent_sidecars_remain_visible_when_ready() {
+    let now = chrono::Utc::now();
+    let sidecar = SubagentSnapshot {
+        session_id: Uuid::new_v4(),
+        parent_session_id: Uuid::new_v4(),
+        task_name: "/root/claude".to_string(),
+        status: SubagentStatus::Ready,
+        provider: CodingProvider::Claude,
+        model: Some("claude-opus-5".to_string()),
+        effort: Some("high".to_string()),
+        cwd: PathBuf::from("/workspace"),
+        created_at: now,
+        updated_at: now,
+        detail: None,
+        final_text: None,
+        usage: borg_remote::SubagentUsage::default(),
+    };
+    let mut transcript = Transcript::default();
+    transcript
+        .subagent_snapshots
+        .insert(sidecar.session_id, sidecar);
+
+    let rows = transcript
+        .agent_roster_entries()
+        .into_iter()
+        .map(|(row, _)| row)
+        .collect::<Vec<_>>();
+
+    assert_eq!(rows.len(), 2);
+    assert!(rows[1].starts_with("Claude  claude-opus-5  high  ready"));
+    assert_eq!(transcript.persistent_sidecar_count(), 1);
+    assert_eq!(
+        agents_status_label_with_persistent_sidecars(0, 1).as_deref(),
+        Some("1 persistent peer")
+    );
 }
 
 #[test]
@@ -2703,7 +2755,7 @@ fn subagent_activity_collapses_chatter_and_keeps_terminal_result() {
     assert!(matches!(
         &transcript.order[0],
         TranscriptEntry::Activity { text, .. }
-            if text == "agent · inspect_ui · report · Found the renderer issue without another user prompt."
+            if text == "Message agent · inspect_ui · report · Found the renderer issue without another user prompt."
     ));
     agent.status = SubagentStatus::WaitingForApproval;
     transcript.apply(&activity(
@@ -2952,12 +3004,14 @@ fn launch_resume_picker_height_is_stable_and_reserved_once() {
 /// everything else must run outright or the palette is just a typing aid.
 #[test]
 fn only_argument_taking_commands_are_inserted_rather_than_run() {
+    assert!(slash_command_needs_argument("/ask"));
+    assert!(slash_command_needs_argument("/claude"));
+    assert!(slash_command_needs_argument("/gpt"));
     assert!(slash_command_needs_argument("/queue"));
     assert!(slash_command_needs_argument("/steer"));
-    for (command, _) in SLASH_COMMANDS
-        .iter()
-        .filter(|(command, _)| !matches!(*command, "/queue" | "/steer"))
-    {
+    for (command, _) in SLASH_COMMANDS.iter().filter(|(command, _)| {
+        !matches!(*command, "/ask" | "/claude" | "/gpt" | "/queue" | "/steer")
+    }) {
         assert!(
             !slash_command_needs_argument(command),
             "{command} would be inserted instead of run"
@@ -4664,7 +4718,10 @@ fn expanded_tool_run_shows_every_action_and_collapses_again() {
     let expanded = render(&transcript);
     assert!(expanded.contains("call-0"), "{expanded}");
     assert!(expanded.contains("call-19"), "{expanded}");
-    assert!(expanded.contains("actions · 20"), "{expanded}");
+    assert!(
+        expanded.contains("actions · 20 · click to collapse"),
+        "{expanded}"
+    );
     assert!(!expanded.contains("↑ more"), "{expanded}");
     assert!(!expanded.contains("↓ more"), "{expanded}");
 
@@ -5544,12 +5601,11 @@ fn incoming_transcript_lines_move_selection_with_live_content() {
     let viewport_height = 5;
     let previous_scroll_from_bottom = 0;
     let previous_scroll_start = previous_height - viewport_height;
-    let next_scroll_from_bottom =
-        if should_preserve_transcript_viewport(previous_scroll_from_bottom, true) {
-            preserve_scroll_anchor(previous_scroll_from_bottom, previous_height, next_height)
-        } else {
-            previous_scroll_from_bottom
-        };
+    let next_scroll_from_bottom = if should_preserve_transcript_viewport(true) {
+        preserve_scroll_anchor(previous_scroll_from_bottom, previous_height, next_height)
+    } else {
+        previous_scroll_from_bottom
+    };
     let next_scroll_start = (next_height - viewport_height) - next_scroll_from_bottom;
 
     assert_eq!(next_scroll_start, previous_scroll_start + 1);
@@ -5570,8 +5626,98 @@ fn incoming_transcript_lines_move_selection_with_live_content() {
     apply_text_selection(&mut viewport, next_scroll_start, start, end);
     assert!(viewport[1].spans.iter().any(|span| span.style.bg.is_some()));
     assert!(viewport[2].spans.iter().all(|span| span.style.bg.is_none()));
-    assert!(should_preserve_transcript_viewport(3, false));
-    assert!(!should_preserve_transcript_viewport(3, true));
+    assert!(should_preserve_transcript_viewport(false));
+    assert!(!should_preserve_transcript_viewport(true));
+}
+
+#[test]
+fn live_message_selection_moves_up_when_the_tail_grows() {
+    let session_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    let initial_text = (0..24)
+        .map(|line| format!("line {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::Message {
+            message_id,
+            actor: EventActor::Assistant,
+            text: initial_text,
+            attachments: Vec::new(),
+            status: MessageStatus::InProgress,
+            delivery: None,
+        },
+    ));
+
+    let before = transcript.render(80, None, None, None);
+    let viewport_height = 8;
+    let before_height = before.0.len();
+    let before_scroll_start = before_height - viewport_height;
+    let selected_row = before
+        .0
+        .iter()
+        .position(|line| line.to_string().contains("line 18"))
+        .expect("selected live row is rendered");
+    assert!(selected_row >= before_scroll_start);
+    let selection = TextSelection {
+        anchor: selection_point_for_row(&before.6, selected_row, 2),
+        focus: selection_point_for_row(&before.6, selected_row + 2, 4),
+        dragging: false,
+        autoscroll: 0,
+        pointer: Position::new(0, 0),
+    };
+    let before_viewport_row = selected_row - before_scroll_start;
+
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::Message {
+            message_id,
+            actor: EventActor::Assistant,
+            text: format!(
+                "{}\nline 24\nline 25\nline 26\nline 27",
+                (0..24)
+                    .map(|line| format!("line {line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+            attachments: Vec::new(),
+            status: MessageStatus::InProgress,
+            delivery: None,
+        },
+    ));
+
+    let after = transcript.render(80, None, None, None);
+    let after_height = after.0.len();
+    let after_scroll_start = after_height - viewport_height;
+    let (resolved_start, _) = resolved_selection(selection, &after.6).expect("selection resolves");
+    let added_rows = after_height - before_height;
+    assert_eq!(after_scroll_start, before_scroll_start + added_rows);
+    assert_eq!(
+        resolved_start.row - after_scroll_start,
+        before_viewport_row - added_rows,
+        "a tail-following selection moves upward by the rows added below it"
+    );
+
+    let mut viewport = after.0[after_scroll_start..after_scroll_start + viewport_height].to_vec();
+    apply_text_selection(
+        &mut viewport,
+        after_scroll_start,
+        resolved_start,
+        resolved_selection(selection, &after.6)
+            .expect("selection resolves")
+            .1,
+    );
+    assert!(
+        viewport
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .any(|span| span.style.bg.is_some()),
+        "the moved selection remains highlighted in the new tail viewport"
+    );
 }
 
 #[test]

@@ -354,6 +354,9 @@ impl TextSelection {
 
 const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/help", "show commands"),
+    ("/ask", "ask another model for a second opinion"),
+    ("/claude", "persistent Claude Opus 5 · high sidecar"),
+    ("/gpt", "persistent GPT 5.6 Sol · xhigh sidecar"),
     ("/settings", "view interactive session settings"),
     ("/model", "choose the model"),
     ("/effort", "choose reasoning effort"),
@@ -564,6 +567,7 @@ pub struct BorgTerminal {
     child_statuses: HashMap<Uuid, SessionStatus>,
     child_pending_approvals: HashSet<Uuid>,
     focused_child: Option<Uuid>,
+    sidecar_focus_request: Option<String>,
     team_switcher_open: bool,
     team_roster_hit_areas: Vec<(Rect, Option<Uuid>)>,
     hovered_team_roster: Option<usize>,
@@ -1387,6 +1391,7 @@ impl BorgTerminal {
             child_statuses: HashMap::new(),
             child_pending_approvals: HashSet::new(),
             focused_child: None,
+            sidecar_focus_request: None,
             team_switcher_open: false,
             team_roster_hit_areas: Vec::new(),
             hovered_team_roster: None,
@@ -1640,6 +1645,18 @@ impl BorgTerminal {
         }
     }
 
+    pub fn discard_pending_prompt(&mut self, target: Option<Uuid>, message_id: Uuid) {
+        if let Some(child) = target {
+            self.child_queued_prompts
+                .entry(child)
+                .or_default()
+                .retain(|queued| queued.message_id != message_id);
+        } else {
+            self.queued_prompts
+                .retain(|queued| queued.message_id != message_id);
+        }
+    }
+
     /// Put an idle user submission in the transcript before the session actor
     /// persists it. The durable Message event will replace this transient row
     /// once the command reaches the actor.
@@ -1724,6 +1741,18 @@ impl BorgTerminal {
     }
 
     pub fn apply_session_event(&mut self, event: &SessionEvent) -> bool {
+        if let SessionEventKind::SubagentControl {
+            outcome: borg_remote::SubagentControlOutcome::Accepted { agent },
+            ..
+        } = &event.kind
+            && self
+                .sidecar_focus_request
+                .as_deref()
+                .is_some_and(|task_name| task_name == agent.task_name)
+        {
+            self.focus_child_transcript(agent.session_id);
+            self.sidecar_focus_request = None;
+        }
         let focused_child_transcript_changed = self.record_child_event(event);
         let projection_changed = match &event.kind {
             SessionEventKind::SessionStarted
@@ -1797,6 +1826,7 @@ impl BorgTerminal {
             SessionEventKind::ContextCleared if !self.replaying_history => {
                 self.notice = Some("Conversation context cleared".to_string());
                 self.scroll_from_bottom = 0;
+                self.transcript.follow_tail = true;
                 self.hovered_tool = None;
                 self.hovered_tool_run = None;
                 self.hovered_tool_run_header = None;
@@ -1830,17 +1860,15 @@ impl BorgTerminal {
             self.remap_selection_after_entry_removal(removed);
         }
         if transcript_changed {
-            if should_preserve_transcript_viewport(
-                self.scroll_from_bottom,
-                self.text_selection.is_some(),
-            ) && self.pending_scroll_anchor_height.is_none()
+            if should_preserve_transcript_viewport(self.transcript.follow_tail)
+                && self.pending_scroll_anchor_height.is_none()
             {
                 self.pending_scroll_anchor_height = Some(self.rendered_transcript_height);
             }
             self.transcript_render_cache = None;
         }
-        if self.scroll_from_bottom == 0 {
-            self.transcript.follow_tail = true;
+        if self.transcript.follow_tail {
+            self.scroll_from_bottom = 0;
             self.pending_scroll_anchor_height = None;
         }
         projection_changed
@@ -1968,6 +1996,10 @@ impl BorgTerminal {
         self.focused_child
     }
 
+    pub fn request_sidecar_focus(&mut self, task_name: impl Into<String>) {
+        self.sidecar_focus_request = Some(task_name.into());
+    }
+
     pub fn seed_child_history(&mut self, child_id: Uuid, events: &[SessionEvent]) {
         let was_replaying = self.replaying_history;
         self.replaying_history = true;
@@ -2076,6 +2108,7 @@ impl BorgTerminal {
 
     fn reset_transcript_focus(&mut self) {
         self.scroll_from_bottom = 0;
+        self.transcript.follow_tail = true;
         self.transcript_render_cache = None;
         self.text_selection = None;
         self.hovered_entry = None;
@@ -3101,14 +3134,19 @@ impl BorgTerminal {
         {
             self.nested_scroll_motion = None;
         }
+        let scroll_was_active = self.scroll_motion.is_active();
         self.scroll_from_bottom = self
             .scroll_motion
             .advance(self.scroll_from_bottom, self.transcript_scroll_max);
+        if scroll_was_active {
+            self.transcript.follow_tail = self.scroll_from_bottom == 0;
+        }
         let selection_autoscroll = self
             .text_selection
             .filter(|selection| selection.dragging)
             .map_or(0, |selection| selection.autoscroll);
         if selection_autoscroll > 0 {
+            self.transcript.follow_tail = false;
             self.scroll_from_bottom = self
                 .scroll_from_bottom
                 .saturating_add(SELECTION_AUTOSCROLL_LINES_PER_FRAME)
@@ -3117,6 +3155,9 @@ impl BorgTerminal {
             self.scroll_from_bottom = self
                 .scroll_from_bottom
                 .saturating_sub(SELECTION_AUTOSCROLL_LINES_PER_FRAME);
+            if self.scroll_from_bottom == 0 {
+                self.transcript.follow_tail = true;
+            }
         }
         if selection_autoscroll != 0
             && let Some(pointer) = self.text_selection.map(|selection| selection.pointer)
@@ -3138,6 +3179,11 @@ impl BorgTerminal {
 
     fn queue_wheel_scroll(&mut self, lines: isize) {
         self.nested_scroll_motion = None;
+        if lines > 0 {
+            self.transcript.follow_tail = false;
+        } else if lines < 0 && self.scroll_from_bottom == 0 {
+            self.transcript.follow_tail = true;
+        }
         self.scroll_motion.push(lines);
     }
 
@@ -3282,6 +3328,7 @@ impl BorgTerminal {
                 / usize::from(thumb_travel)
         };
         self.scroll_from_bottom = self.transcript_scroll_max.saturating_sub(scroll_from_top);
+        self.transcript.follow_tail = self.scroll_from_bottom == 0;
     }
 
     fn capture_transcript_anchor_for_collapse(&mut self) {
@@ -3500,11 +3547,7 @@ impl BorgTerminal {
             .copy_notice_expires_at
             .is_some_and(|expires_at| Instant::now() >= expires_at)
         {
-            if self
-                .notice
-                .as_deref()
-                .is_some_and(|notice| notice.to_ascii_lowercase().contains("copied"))
-            {
+            if self.notice.as_deref().is_some_and(is_copy_notice) {
                 self.notice = None;
             }
             self.copy_notice_expires_at = None;
@@ -3648,6 +3691,7 @@ impl BorgTerminal {
             .as_deref()
             .unwrap_or(&self.transcript);
         let active_subagents = team_transcript.active_subagent_count();
+        let persistent_sidecars = team_transcript.persistent_sidecar_count();
         let agent_roster_entries = team_transcript.agent_roster_entries();
         let focused_agent_name = self.focused_child.and_then(|child| {
             team_transcript
@@ -3711,21 +3755,24 @@ impl BorgTerminal {
             |hint| format!("{hint} · {primary_controls}"),
         );
         let keybindings_hint = format!("keybindings {}", self.keymap.label(KeyAction::Keybindings));
-        let notice_style = Style::default().fg(
-            if notice
-                .as_deref()
-                .is_some_and(|message| message.starts_with("✓ Copied"))
-            {
-                Color::LightGreen
-            } else if self.picker.is_none() && self.composer.text.trim_start().starts_with('/') {
-                Color::White
-            } else {
-                Color::DarkGray
-            },
-        );
+        let copy_notice_active = notice.as_deref().is_some_and(is_copy_notice);
+        let notice_style = if copy_notice_active {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::LightGreen)
+                .add_modifier(Modifier::BOLD)
+        } else if self.picker.is_none() && self.composer.text.trim_start().starts_with('/') {
+            Style::default().fg(Color::White)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
         let controls = slash_suggestions.unwrap_or_else(|| {
             if let Some(notice) = notice {
-                vec![Line::from(Span::styled(notice, notice_style))]
+                if copy_notice_active {
+                    vec![copy_notice_line(notice)]
+                } else {
+                    vec![Line::from(Span::styled(notice, notice_style))]
+                }
             } else if let Some(guidance) = cold_cache_guidance {
                 wrap_display(&guidance, content_width.saturating_sub(2).max(1) as usize)
                     .into_iter()
@@ -4381,7 +4428,8 @@ impl BorgTerminal {
                 status_duration.as_deref(),
             );
             let status_width = status_spans.iter().map(|span| span.width()).sum::<usize>();
-            let agents_status = agents_status_label(active_subagents);
+            let agents_status =
+                agents_status_label_with_persistent_sidecars(active_subagents, persistent_sidecars);
             let agents_status_width = agents_status
                 .as_ref()
                 .map(|status| activity_glyph(SessionStatus::Running).width() + 1 + status.width());
@@ -5415,12 +5463,14 @@ impl BorgTerminal {
         }
         if self.keymap.matches(KeyAction::ScrollUp, &key) {
             self.history_page_requested = true;
+            self.transcript.follow_tail = false;
             self.scroll_from_bottom = self.scroll_from_bottom.saturating_add(8);
             return Ok(UiAction::None);
         }
         if self.keymap.matches(KeyAction::ScrollDown, &key) {
             self.history_page_requested = false;
             self.scroll_from_bottom = self.scroll_from_bottom.saturating_sub(8);
+            self.transcript.follow_tail = self.scroll_from_bottom == 0;
             return Ok(UiAction::None);
         }
         if self.keymap.matches(KeyAction::Interrupt, &key) {
@@ -5738,10 +5788,18 @@ fn subagent_session_status(status: SubagentStatus) -> SessionStatus {
 }
 
 fn display_agent_name(task_name: &str) -> String {
-    task_name
-        .strip_prefix("/root/")
-        .unwrap_or(task_name)
-        .to_string()
+    match task_name.strip_prefix("/root/").unwrap_or(task_name) {
+        "claude" => "Claude".to_string(),
+        "gpt" => "GPT".to_string(),
+        name => name.to_string(),
+    }
+}
+
+fn is_persistent_sidecar_task_name(task_name: &str) -> bool {
+    matches!(
+        task_name.strip_prefix("/root/").unwrap_or(task_name),
+        "claude" | "gpt"
+    )
 }
 
 fn team_roster_row_style(focused: bool, hovered: bool, is_subagent: bool) -> Style {
@@ -6367,7 +6425,7 @@ impl Default for Transcript {
             subagents: HashMap::new(),
             subagent_snapshots: HashMap::new(),
             subagent_entries: HashMap::new(),
-            follow_tail: false,
+            follow_tail: true,
             selected: None,
             auto_expand_edits: true,
             auto_expand_tools: false,
@@ -7595,6 +7653,13 @@ impl Transcript {
             .count()
     }
 
+    fn persistent_sidecar_count(&self) -> usize {
+        self.subagent_snapshots
+            .values()
+            .filter(|agent| is_persistent_sidecar_task_name(&agent.task_name))
+            .count()
+    }
+
     fn agent_roster_entries(&self) -> Vec<(String, Option<Uuid>)> {
         let mut rows = Vec::new();
         if let Some(config) = self.config.as_ref() {
@@ -7615,7 +7680,10 @@ impl Transcript {
         let mut agents = self
             .subagent_snapshots
             .values()
-            .filter(|agent| subagent_is_working(agent.status))
+            .filter(|agent| {
+                subagent_is_working(agent.status)
+                    || is_persistent_sidecar_task_name(&agent.task_name)
+            })
             .collect::<Vec<_>>();
         agents.sort_by(|left, right| left.task_name.cmp(&right.task_name));
         rows.extend(agents.into_iter().map(|agent| {
@@ -7988,7 +8056,7 @@ impl Transcript {
                 TranscriptEntry::Activity { text, time } => {
                     let time = display_local_time(time, today);
                     let prefix = if tool_window.is_some() { "│ " } else { "  " };
-                    let activity_color = if text.starts_with("agent · ") {
+                    let activity_color = if is_subagent_activity_text(text) {
                         SUBAGENT_PINK
                     } else {
                         Color::DarkGray
@@ -8450,16 +8518,19 @@ impl Transcript {
 
                         lines.truncate(content_start);
                         lines.extend(visible_lines);
+                        let action_hint = if self.tool_run_expanded(window.start) {
+                            if offset > 0 {
+                                " · click to collapse · ↑ scroll"
+                            } else {
+                                " · click to collapse"
+                            }
+                        } else if offset > 0 {
+                            " · click to expand · ↑ scroll"
+                        } else {
+                            " · click to expand"
+                        };
                         lines[header_row] = Line::from(Span::styled(
-                            format!(
-                                "┌─ actions · {}{}",
-                                window.total,
-                                if offset > 0 {
-                                    " · click to expand · ↑ scroll"
-                                } else {
-                                    " · click to expand"
-                                }
-                            ),
+                            format!("┌─ actions · {}{}", window.total, action_hint),
                             Style::default().fg(Color::DarkGray),
                         ));
                         lines.push(Line::from(Span::styled(
@@ -8893,7 +8964,7 @@ pub(crate) fn subagent_activity_summary(
                 status: MessageStatus::Complete,
                 ..
             }) if !text.trim().is_empty() => Some(format!(
-                "agent · {task} · report · {}",
+                "Message agent · {task} · report · {}",
                 compact_text(text, 120)
             )),
             Some(SessionEventKind::ApprovalRequested { title, detail, .. }) => Some(format!(
@@ -8956,7 +9027,12 @@ fn hydrated_subagent_activity_summary(agent: &SubagentSnapshot) -> Option<String
             .final_text
             .as_deref()
             .filter(|text| !text.trim().is_empty())
-            .map(|text| format!("agent · {task} · report · {}", compact_text(text, 120))),
+            .map(|text| {
+                format!(
+                    "Message agent · {task} · report · {}",
+                    compact_text(text, 120)
+                )
+            }),
     }
 }
 
@@ -9353,8 +9429,12 @@ fn apply_text_selection(
 fn action_run_bridge(entry: &TranscriptEntry) -> bool {
     matches!(
         entry,
-        TranscriptEntry::Activity { text, .. } if text.starts_with("agent · ")
+        TranscriptEntry::Activity { text, .. } if is_subagent_activity_text(text)
     )
+}
+
+fn is_subagent_activity_text(text: &str) -> bool {
+    text.starts_with("agent · ") || text.starts_with("Message agent · ")
 }
 
 fn selected_transcript_text(
@@ -9505,8 +9585,8 @@ fn preserve_scroll_anchor(
     }
 }
 
-fn should_preserve_transcript_viewport(scroll_from_bottom: usize, selection_active: bool) -> bool {
-    scroll_from_bottom > 0 && !selection_active
+fn should_preserve_transcript_viewport(follow_tail: bool) -> bool {
+    !follow_tail
 }
 
 fn should_load_history_page(
@@ -9704,7 +9784,7 @@ fn fuzzy_matches(haystack: &str, needle: &str) -> bool {
 /// no message would send the literal word to the model, so the palette puts
 /// them in the composer for the user to finish.
 fn slash_command_needs_argument(command: &str) -> bool {
-    matches!(command, "/queue" | "/steer")
+    matches!(command, "/ask" | "/claude" | "/gpt" | "/queue" | "/steer")
 }
 
 /// Every row of the unified palette: the slash commands, then the keybindings
@@ -9761,6 +9841,18 @@ fn primary_controls_line(keymap: &KeyMap) -> String {
         keymap.label(KeyAction::Send),
         keymap.label(KeyAction::Keybindings)
     )
+}
+
+fn is_copy_notice(message: &str) -> bool {
+    message.to_ascii_lowercase().contains("copied")
+}
+
+fn copy_notice_line(notice: String) -> Line<'static> {
+    let style = Style::default()
+        .fg(Color::Black)
+        .bg(Color::LightGreen)
+        .add_modifier(Modifier::BOLD);
+    Line::from(Span::styled(format!("  {notice}  "), style))
 }
 
 fn inset_control_lines(mut lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
@@ -10941,13 +11033,28 @@ fn history_loading_line() -> Line<'static> {
     ])
 }
 
-fn agents_status_label(active_subagents: usize) -> Option<String> {
-    (active_subagents > 0).then(|| {
-        format!(
+fn agents_status_label_with_persistent_sidecars(
+    active_subagents: usize,
+    persistent_sidecars: usize,
+) -> Option<String> {
+    if active_subagents == 0 && persistent_sidecars == 0 {
+        return None;
+    }
+    if persistent_sidecars == 0 {
+        return Some(format!(
             "{active_subagents} subagent{}",
             if active_subagents == 1 { "" } else { "s" }
-        )
-    })
+        ));
+    }
+    if active_subagents == 0 {
+        return Some(format!(
+            "{persistent_sidecars} persistent peer{}",
+            if persistent_sidecars == 1 { "" } else { "s" }
+        ));
+    }
+    Some(format!(
+        "{active_subagents} active · {persistent_sidecars} persistent"
+    ))
 }
 
 fn subagent_is_working(status: SubagentStatus) -> bool {

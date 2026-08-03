@@ -773,7 +773,7 @@ async fn run_local_agent_session(
         CodingProvider::OpenAiCompatible => None,
         CodingProvider::Claude | CodingProvider::OpenCode => None,
     });
-    let (recorded_cwd, provider, model, mut effort, fast, response_language, permission_mode) =
+    let (recorded_cwd, mut provider, model, mut effort, fast, response_language, permission_mode) =
         if let Some(recorded_config) = recorded_config {
             recorded_config
         } else {
@@ -1575,12 +1575,14 @@ async fn run_local_agent_session(
                         current_todos = items.clone();
                     }
                     SessionEventKind::SessionConfigured {
+                        provider: configured_provider,
                         model,
                         effort,
                         fast,
                         response_language,
                         ..
                     } => {
+                        provider = *configured_provider;
                         current_model = model.clone();
                         current_effort = effort.clone();
                         current_fast = *fast;
@@ -1813,12 +1815,16 @@ async fn run_local_agent_session(
                     continue;
                 }
                 if let Some(model) = line.strip_prefix("/model ") {
-                    session_command_tx.send(HostCommand::Configure {
+                    let model = model.trim().to_string();
+                    let target = CodingProvider::for_model(&model).unwrap_or(provider);
+                    send_model_selection(
+                        &session_command_tx,
                         session_id,
-                        action: SessionConfigAction::SetModel {
-                            model: model.trim().to_string(),
-                        },
-                    }).await.ok();
+                        provider,
+                        target,
+                        model,
+                    )
+                    .await;
                     continue;
                 }
                 if line == "/effort" {
@@ -2064,6 +2070,38 @@ async fn run_local_agent_session(
                                 .ok();
                         }
                         Err(error) => eprintln!("\n  {error}\n"),
+                    }
+                    continue;
+                }
+                if let Some((sidecar, intent)) = persistent_sidecar_command(line) {
+                    let active = matches!(
+                        status,
+                        SessionStatus::Starting
+                            | SessionStatus::Running
+                            | SessionStatus::WaitingForApproval
+                    );
+                    let delivery = if active {
+                        running_input(
+                            line,
+                            provider,
+                            steer_active_codex,
+                            status_is_compacting(status_detail.as_deref()),
+                        )
+                        .0
+                    } else {
+                        PromptDelivery::Steer
+                    };
+                    for command in persistent_sidecar_commands(
+                        session_id,
+                        sidecar,
+                        &intent,
+                        Uuid::new_v4(),
+                        &[],
+                        delivery,
+                    ) {
+                        if session_command_tx.send(command).await.is_err() {
+                            break;
+                        }
                     }
                     continue;
                 }
@@ -2534,6 +2572,29 @@ async fn run_local_agent_session(
                         text,
                         attachments,
                     } => {
+                        if let Some((sidecar, intent)) = persistent_sidecar_command(&text) {
+                            let terminal = terminal.as_mut().expect("terminal");
+                            terminal.discard_pending_prompt(target, message_id);
+                            terminal.request_sidecar_focus(sidecar.task_name());
+                            terminal.set_notice(sidecar_notice(sidecar, &intent));
+                            for command in persistent_sidecar_commands(
+                                session_id,
+                                sidecar,
+                                &intent,
+                                message_id,
+                                &attachments,
+                                PromptDelivery::Queue,
+                            ) {
+                                if session_command_tx.send(command).await.is_err() {
+                                    terminal.set_notice(format!(
+                                        "Could not reach {} sidecar",
+                                        sidecar.label()
+                                    ));
+                                    break;
+                                }
+                            }
+                            continue;
+                        }
                         let command = target.map_or_else(
                             || HostCommand::Prompt {
                                 session_id,
@@ -2581,6 +2642,28 @@ async fn run_local_agent_session(
                         text,
                         attachments,
                     } => {
+                        if let Some((sidecar, intent)) = persistent_sidecar_command(&text) {
+                            let terminal = terminal.as_mut().expect("terminal");
+                            terminal.request_sidecar_focus(sidecar.task_name());
+                            terminal.set_notice(sidecar_notice(sidecar, &intent));
+                            for command in persistent_sidecar_commands(
+                                session_id,
+                                sidecar,
+                                &intent,
+                                Uuid::new_v4(),
+                                &attachments,
+                                PromptDelivery::Steer,
+                            ) {
+                                if session_command_tx.send(command).await.is_err() {
+                                    terminal.set_notice(format!(
+                                        "Could not reach {} sidecar",
+                                        sidecar.label()
+                                    ));
+                                    break;
+                                }
+                            }
+                            continue;
+                        }
                         if let Some(target) = target {
                             let message_id = Uuid::new_v4();
                             let active_provider = terminal
@@ -2673,6 +2756,7 @@ async fn run_local_agent_session(
                             continue;
                         }
                         let expanded = agent_config.expand_command(text.trim());
+                        let expanded = normalize_consultation_command(&expanded);
                         let line = expanded.trim();
                         if line == "/model" && attachments.is_empty() {
                             terminal.as_mut().expect("terminal").open_model_picker();
@@ -2780,12 +2864,21 @@ async fn run_local_agent_session(
                         } else if let Some(model) = line.strip_prefix("/model ")
                             && attachments.is_empty()
                         {
-                            session_command_tx.send(HostCommand::Configure {
+                            let model = model.trim().to_string();
+                            let active_provider = terminal
+                                .as_ref()
+                                .and_then(BorgTerminal::session_provider)
+                                .unwrap_or(provider);
+                            let target =
+                                CodingProvider::for_model(&model).unwrap_or(active_provider);
+                            send_model_selection(
+                                &session_command_tx,
                                 session_id,
-                                action: SessionConfigAction::SetModel {
-                                    model: model.trim().to_string(),
-                                },
-                            }).await.ok();
+                                active_provider,
+                                target,
+                                model,
+                            )
+                            .await;
                         } else if let Some(effort) = line.strip_prefix("/effort ")
                             && attachments.is_empty()
                         {
@@ -4454,6 +4547,7 @@ fn agent_config_file_signature(path: Option<&Path>) -> Option<(std::time::System
 }
 
 fn idle_input(line: &str) -> (PromptDelivery, String) {
+    let line = normalize_consultation_command(line);
     if let Some(text) = line.strip_prefix("/queue ") {
         return (PromptDelivery::Queue, text.trim().to_string());
     }
@@ -4469,6 +4563,7 @@ fn running_input(
     steer_active_turn: bool,
     compacting: bool,
 ) -> (PromptDelivery, String) {
+    let line = normalize_consultation_command(line);
     if let Some(text) = line.strip_prefix("/queue ") {
         return (PromptDelivery::Queue, text.trim().to_string());
     }
@@ -4492,6 +4587,174 @@ fn running_input(
         },
         line.to_string(),
     )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PersistentSidecar {
+    Claude,
+    Gpt,
+}
+
+impl PersistentSidecar {
+    const fn alias(self) -> &'static str {
+        match self {
+            Self::Claude => "/claude",
+            Self::Gpt => "/gpt",
+        }
+    }
+
+    const fn task_name(self) -> &'static str {
+        match self {
+            Self::Claude => "/root/claude",
+            Self::Gpt => "/root/gpt",
+        }
+    }
+
+    const fn task_name_argument(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Gpt => "gpt",
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Claude => "Claude",
+            Self::Gpt => "GPT",
+        }
+    }
+
+    const fn provider(self) -> CodingProvider {
+        match self {
+            Self::Claude => CodingProvider::Claude,
+            Self::Gpt => CodingProvider::Codex,
+        }
+    }
+
+    const fn model(self) -> &'static str {
+        match self {
+            Self::Claude => "claude-opus-5",
+            Self::Gpt => "gpt-5.6-sol",
+        }
+    }
+
+    const fn effort(self) -> &'static str {
+        match self {
+            Self::Claude => "high",
+            Self::Gpt => "xhigh",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PersistentSidecarIntent {
+    Ensure,
+    Clear,
+    Prompt(String),
+}
+
+/// Parse the direct, durable peer lanes. `/ask` remains deliberately outside
+/// this parser so it continues to be a one-shot briefing chosen by the main
+/// model through `consult_model`.
+fn persistent_sidecar_command(line: &str) -> Option<(PersistentSidecar, PersistentSidecarIntent)> {
+    let trimmed = line.trim();
+    for sidecar in [PersistentSidecar::Claude, PersistentSidecar::Gpt] {
+        let alias = sidecar.alias();
+        if trimmed == alias {
+            return Some((sidecar, PersistentSidecarIntent::Ensure));
+        }
+        let Some(rest) = trimmed.strip_prefix(alias).filter(|rest| {
+            rest.chars()
+                .next()
+                .is_some_and(|character| character.is_whitespace())
+        }) else {
+            continue;
+        };
+        let rest = rest.trim();
+        if rest.is_empty() {
+            return Some((sidecar, PersistentSidecarIntent::Ensure));
+        }
+        if matches!(rest.to_ascii_lowercase().as_str(), "clear" | "new") {
+            return Some((sidecar, PersistentSidecarIntent::Clear));
+        }
+        return Some((sidecar, PersistentSidecarIntent::Prompt(rest.to_string())));
+    }
+    None
+}
+
+fn persistent_sidecar_commands(
+    session_id: Uuid,
+    sidecar: PersistentSidecar,
+    intent: &PersistentSidecarIntent,
+    message_id: Uuid,
+    attachments: &[PathBuf],
+    delivery: PromptDelivery,
+) -> Vec<HostCommand> {
+    let ensure = HostCommand::Subagent {
+        session_id,
+        action: SubagentAction::Ensure {
+            request_id: Uuid::new_v4(),
+            task_name: sidecar.task_name_argument().to_string(),
+            provider: sidecar.provider(),
+            model: Some(sidecar.model().to_string()),
+            effort: Some(sidecar.effort().to_string()),
+        },
+    };
+    match intent {
+        PersistentSidecarIntent::Ensure => vec![ensure],
+        PersistentSidecarIntent::Clear => vec![
+            ensure,
+            HostCommand::Subagent {
+                session_id,
+                action: SubagentAction::ClearContext {
+                    request_id: Uuid::new_v4(),
+                    target: sidecar.task_name().to_string(),
+                },
+            },
+        ],
+        PersistentSidecarIntent::Prompt(prompt) => vec![
+            ensure,
+            HostCommand::Subagent {
+                session_id,
+                action: SubagentAction::Prompt {
+                    request_id: Uuid::new_v4(),
+                    target: sidecar.task_name().to_string(),
+                    message_id,
+                    text: prompt.clone(),
+                    attachments: attachments.to_vec(),
+                    delivery,
+                },
+            },
+        ],
+    }
+}
+
+fn sidecar_notice(sidecar: PersistentSidecar, intent: &PersistentSidecarIntent) -> String {
+    match intent {
+        PersistentSidecarIntent::Ensure => format!("{} sidecar ready", sidecar.label()),
+        PersistentSidecarIntent::Clear => format!("Clearing {} sidecar context", sidecar.label()),
+        PersistentSidecarIntent::Prompt(_) => format!("Sending to {} sidecar", sidecar.label()),
+    }
+}
+
+/// `/codex` remains a compatibility alias for the one-shot GPT consultation.
+/// Persistent lanes are intentionally handled before this provider-neutral
+/// normalizer.
+pub(crate) fn normalize_consultation_command(line: &str) -> String {
+    let trimmed = line.trim();
+    for (alias, profile) in [("/codex", "gpt-5.6-sol@xhigh")] {
+        if trimmed == alias {
+            return format!("/ask {profile}");
+        }
+        if let Some(request) = trimmed.strip_prefix(alias).filter(|rest| {
+            rest.chars()
+                .next()
+                .is_some_and(|character| character.is_whitespace())
+        }) {
+            return format!("/ask {profile}{}", request);
+        }
+    }
+    line.to_string()
 }
 
 fn status_is_compacting(detail: Option<&str>) -> bool {
@@ -4568,6 +4831,9 @@ fn print_agent_help() {
     println!(
         r#"
   /settings         show interactive settings
+  /ask PROFILE TEXT ask another model for a second opinion
+  /claude TEXT      persistent Claude Opus 5 sidecar (use /claude clear to reset)
+  /gpt TEXT         persistent GPT 5.6 Sol sidecar (use /gpt clear to reset)
   /model            choose the model
   /effort           choose reasoning effort
   /followups        choose steer current turn or queue next turn
@@ -5235,6 +5501,86 @@ mod tests {
     use std::time::{Duration, Instant};
     use tempfile::tempdir;
     use tokio::io::AsyncReadExt;
+
+    #[test]
+    fn persistent_sidecar_aliases_keep_their_durable_lane_identity() {
+        assert_eq!(
+            persistent_sidecar_command("/claude review this"),
+            Some((
+                PersistentSidecar::Claude,
+                PersistentSidecarIntent::Prompt("review this".to_string())
+            ))
+        );
+        assert_eq!(
+            persistent_sidecar_command("/gpt clear"),
+            Some((PersistentSidecar::Gpt, PersistentSidecarIntent::Clear))
+        );
+        assert_eq!(
+            persistent_sidecar_command("/claude"),
+            Some((PersistentSidecar::Claude, PersistentSidecarIntent::Ensure))
+        );
+        assert_eq!(persistent_sidecar_command("/claudette review"), None);
+    }
+
+    #[test]
+    fn consultation_aliases_leave_persistent_lanes_alone() {
+        assert_eq!(
+            normalize_consultation_command("/claude review this"),
+            "/claude review this"
+        );
+        assert_eq!(
+            normalize_consultation_command("/gpt compare these approaches"),
+            "/gpt compare these approaches"
+        );
+        assert_eq!(
+            normalize_consultation_command("/codex check the design"),
+            "/ask gpt-5.6-sol@xhigh check the design"
+        );
+        assert_eq!(
+            normalize_consultation_command("/ask claude review"),
+            "/ask claude review"
+        );
+        assert_eq!(normalize_consultation_command("/claudette"), "/claudette");
+    }
+
+    #[test]
+    fn persistent_sidecar_prompt_is_ensured_then_sent_to_the_same_child() {
+        let session_id = Uuid::new_v4();
+        let commands = persistent_sidecar_commands(
+            session_id,
+            PersistentSidecar::Claude,
+            &PersistentSidecarIntent::Prompt("review the design".to_string()),
+            Uuid::nil(),
+            &[],
+            PromptDelivery::Steer,
+        );
+        assert_eq!(commands.len(), 2);
+        assert!(matches!(
+            &commands[0],
+            HostCommand::Subagent {
+                action: SubagentAction::Ensure {
+                    task_name,
+                    provider: CodingProvider::Claude,
+                    model: Some(model),
+                    effort: Some(effort),
+                    ..
+                },
+                ..
+            } if task_name == "claude" && model == "claude-opus-5" && effort == "high"
+        ));
+        assert!(matches!(
+            &commands[1],
+            HostCommand::Subagent {
+                action: SubagentAction::Prompt {
+                    target,
+                    text,
+                    delivery: PromptDelivery::Steer,
+                    ..
+                },
+                ..
+            } if target == "/root/claude" && text == "review the design"
+        ));
+    }
 
     #[test]
     fn older_history_pages_end_immediately_before_the_loaded_tail() {

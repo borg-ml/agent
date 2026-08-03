@@ -5,7 +5,6 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use borg_provider::ProviderChannel;
 use borg_provider::provider::{
     ChatApprovalDecision, ChatStreamControl, ChatStreamEvent, ChatStreamRequest, ClaudeSdkPool,
     CodexAppServerPool, LocalAgentPermission, run_claude_chat_stream_with_control,
@@ -13,13 +12,14 @@ use borg_provider::provider::{
     run_opencode_local_chat_stream, run_pooled_claude_local_chat_stream,
     run_pooled_codex_local_chat_stream,
 };
+use borg_provider::{CostBasis, ProviderCallUsage, ProviderChannel};
 use serde_json::Value;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::{
-    CodingProvider, EventActor, MessageStatus, PermissionMode, SessionEventKind, SessionStatus,
-    native_harness::NativeHarness,
+    CodingProvider, EventActor, MessageStatus, PermissionMode, ResponseLanguage, SessionEventKind,
+    SessionStatus, native_harness::NativeHarness,
 };
 
 pub(crate) const CODING_SYSTEM_PROMPT: &str = "\
@@ -37,7 +37,15 @@ item UUIDs; omit IDs for new items. \
 Use its LSP tools for diagnostics and semantic code navigation when the workspace language is supported. \
 After editing supported source files, run LSP diagnostics before finishing and repair errors caused by the edit. \
 Do not use a provider-native spawn or collaboration tool because those children are not part of \
-the Borg session tree and cannot be controlled from Borg Remote.";
+the Borg session tree and cannot be controlled from Borg Remote. \
+When the user starts a message with `/ask PROFILE`, `/claude`, `/gpt`, or `/codex`, treat it as a \
+request for a second opinion. Call `consult_model` with the requested profile before answering. \
+Preserve an explicit `@EFFORT` suffix in the profile when the intent includes one (for example, \
+`claude-opus-5@high` or `gpt-5.6-sol@xhigh`). \
+You decide the complete freeform briefing for that call: select and include the relevant context, \
+excerpts, constraints, and questions from the conversation or workspace. Do not pass a rigid \
+transcript-shaped bundle or ask the user to copy context manually. After the consultation returns, \
+reconcile it with your own judgment and answer the user.";
 
 #[derive(Clone)]
 pub struct AgentTurn {
@@ -69,6 +77,30 @@ pub struct AgentTurn {
     pub system_prompt_appendix: String,
 }
 
+/// A one-shot second-opinion request selected by the main model. The session
+/// actor resolves the user-facing profile alias before handing this request to
+/// the provider executor, so the provider call never shares the main thread's
+/// conversation or provider session.
+#[derive(Debug, Clone)]
+pub struct ConsultationRequest {
+    pub owner_session_id: Uuid,
+    pub message_id: Uuid,
+    pub provider: CodingProvider,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub cwd: PathBuf,
+    pub prompt: String,
+    pub response_language: ResponseLanguage,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConsultationResult {
+    pub provider: CodingProvider,
+    pub model: Option<String>,
+    pub final_text: String,
+    pub usage: ProviderCallUsage,
+}
+
 #[derive(Debug, Clone)]
 pub struct AgentTurnResult {
     pub provider_session_id: Option<String>,
@@ -79,6 +111,9 @@ pub struct AgentTurnResult {
 pub struct AgentCompaction {
     pub summary: String,
     pub usage: borg_provider::ProviderCallUsage,
+    /// A newly created provider conversation, when compaction had to rebuild
+    /// context after switching providers.
+    pub provider_session_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -116,6 +151,13 @@ pub trait AgentTurnExecutor: Send + Sync {
         controls: Option<mpsc::Receiver<AgentTurnControl>>,
     ) -> Result<AgentTurnResult>;
 
+    /// Run an isolated, one-shot consultation without attaching it to the
+    /// main session's provider conversation or exposing the main session's
+    /// tools. Providers that cannot offer this path report a normal tool error.
+    async fn consult(&self, _request: ConsultationRequest) -> Result<ConsultationResult> {
+        anyhow::bail!("model consultation is not supported by this executor")
+    }
+
     async fn compact(&self, _provider: CodingProvider, _provider_session_id: &str) -> Result<()> {
         anyhow::bail!("manual context compaction is not supported by this provider")
     }
@@ -128,6 +170,12 @@ pub trait AgentTurnExecutor: Send + Sync {
         _conversation: Vec<borg_provider::provider::ModelMessage>,
     ) -> Result<AgentCompaction> {
         anyhow::bail!("native context compaction is not supported by this provider")
+    }
+
+    /// Compact a durable transcript when the selected provider has no native
+    /// conversation yet, as happens immediately after a provider switch.
+    async fn compact_retained_context(&self, _turn: AgentTurn) -> Result<AgentCompaction> {
+        anyhow::bail!("cross-provider context compaction is not supported by this provider")
     }
 
     async fn stop_session(&self, _session_id: Uuid) -> Result<()> {
@@ -312,8 +360,41 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
                 claude_pool: Some(self.claude_pool.clone()),
                 claude_sessions: Some(self.claude_sessions.clone()),
             },
+            true,
         )
         .await
+    }
+
+    async fn consult(&self, request: ConsultationRequest) -> Result<ConsultationResult> {
+        if request.provider.uses_native_harness() {
+            let (final_text, usage) = self
+                .native_harness
+                .consult(
+                    request.provider,
+                    request
+                        .model
+                        .as_deref()
+                        .context("native consultation requires an explicit model")?,
+                    request.effort.as_deref(),
+                    request.response_language,
+                    &request.prompt,
+                )
+                .await?;
+            return Ok(ConsultationResult {
+                provider: request.provider,
+                model: request.model,
+                final_text,
+                usage,
+            });
+        }
+
+        let (final_text, usage) = run_local_consultation_stream(&request).await?;
+        Ok(ConsultationResult {
+            provider: request.provider,
+            model: request.model,
+            final_text,
+            usage,
+        })
     }
 
     async fn compact(&self, provider: CodingProvider, provider_session_id: &str) -> Result<()> {
@@ -344,7 +425,99 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
             .native_harness
             .compact(provider, model, effort, conversation)
             .await?;
-        Ok(AgentCompaction { summary, usage })
+        Ok(AgentCompaction {
+            summary,
+            usage,
+            provider_session_id: None,
+        })
+    }
+
+    async fn compact_retained_context(&self, turn: AgentTurn) -> Result<AgentCompaction> {
+        anyhow::ensure!(
+            matches!(
+                turn.provider,
+                CodingProvider::Codex | CodingProvider::Claude
+            ),
+            "cross-provider context compaction is not supported by {:?}",
+            turn.provider
+        );
+
+        let mut turn = turn;
+        // The preparation turn must never mutate the workspace. The prompt
+        // also asks the model not to use tools, while this permission mode
+        // makes any accidental tool request require an approval that the
+        // private collector below will deny.
+        turn.permission_mode = PermissionMode::Manual;
+        let (events, mut event_rx) = mpsc::channel(128);
+        let (control_tx, control_rx) = mpsc::channel(16);
+        let usage = Arc::new(Mutex::new(ProviderCallUsage::default()));
+        let usage_sink = Arc::clone(&usage);
+        let collector = tokio::spawn(async move {
+            while let Some(event) = event_rx.recv().await {
+                if let SessionEventKind::ApprovalRequested { approval_id, .. } = &event {
+                    let _ = control_tx
+                        .send(AgentTurnControl::Approval {
+                            approval_id: approval_id.clone(),
+                            decision: crate::ApprovalDecision::Deny,
+                        })
+                        .await;
+                }
+                if let Some(observed) = usage_from_session_event(&event) {
+                    *usage_sink
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = observed;
+                }
+            }
+        });
+
+        let provider = turn.provider;
+        let result = run_borg_provider_turn(
+            turn,
+            events.clone(),
+            Some(control_rx),
+            BorgProviderTurnRuntime {
+                request_template: None,
+                local: true,
+                codex_pool: Some(self.codex_pool.clone()),
+                claude_pool: Some(self.claude_pool.clone()),
+                claude_sessions: Some(self.claude_sessions.clone()),
+            },
+            false,
+        )
+        .await;
+        drop(events);
+        collector
+            .await
+            .context("compaction event collector stopped unexpectedly")?;
+        let result = result?;
+        let provider_session_id = result
+            .provider_session_id
+            .context("provider compaction preparation did not create a conversation")?;
+
+        match provider {
+            CodingProvider::Codex => self.codex_pool.compact(&provider_session_id)?,
+            CodingProvider::Claude => {
+                compact_claude_session(
+                    self.claude_session_snapshot(&provider_session_id)?,
+                    &provider_session_id,
+                )
+                .await?;
+            }
+            _ => unreachable!("provider was validated above"),
+        }
+
+        anyhow::ensure!(
+            !result.final_text.trim().is_empty(),
+            "provider compaction preparation returned an empty summary"
+        );
+        Ok(AgentCompaction {
+            summary: result.final_text,
+            usage: usage
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+            provider_session_id: Some(provider_session_id),
+        })
     }
 
     async fn stop_session(&self, session_id: Uuid) -> Result<()> {
@@ -356,6 +529,134 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
         self.native_harness.stop_session(session_id).await;
         Ok(())
     }
+}
+
+impl LocalAgentTurnExecutor {
+    fn claude_session_snapshot(&self, provider_session_id: &str) -> Result<ClaudeSessionSnapshot> {
+        self.claude_sessions
+            .lock()
+            .expect("Claude session registry lock poisoned")
+            .get(provider_session_id)
+            .cloned()
+            .context("Claude context is not available after compaction preparation")
+    }
+}
+
+const CONSULTATION_SYSTEM_PROMPT: &str = "You are a second-opinion consultant in a Borg multi-model workflow. Analyze the complete briefing supplied by the caller, identify important omissions or disagreements, and return a self-contained response that the main agent can reconcile. Do not modify files, call tools, or ask the user for clarification.";
+
+async fn run_local_consultation_stream(
+    request: &ConsultationRequest,
+) -> Result<(String, ProviderCallUsage)> {
+    anyhow::ensure!(
+        matches!(
+            request.provider,
+            CodingProvider::Codex | CodingProvider::Claude | CodingProvider::OpenCode
+        ),
+        "unsupported local consultation provider: {:?}",
+        request.provider
+    );
+
+    let mut system_prompt = CONSULTATION_SYSTEM_PROMPT.to_string();
+    if let Some(instruction) = request.response_language.instruction() {
+        system_prompt.push_str("\n\n");
+        system_prompt.push_str(instruction);
+    }
+    let provider_request = ChatStreamRequest {
+        prompt: request.prompt.clone(),
+        owner_session_id: Some(format!("consultation:{}", request.owner_session_id)),
+        client_user_message_id: Some(request.message_id.to_string()),
+        attachments: Vec::new(),
+        model: request.model.clone(),
+        effort: request.effort.clone(),
+        fast: false,
+        system_prompt,
+        output_schema: None,
+        mcp_owner_id: None,
+        mcp_allowed_scopes: Vec::new(),
+        mcp_user_id: None,
+        mcp_external_servers: Vec::new(),
+        mcp_api_token: None,
+        provider_auth: None,
+        git_credentials: Vec::new(),
+        working_directory: Some(request.cwd.clone()),
+        session_id: None,
+        provider_channel: ProviderChannel::Direct,
+        persist_session: Some(false),
+        web_search_allowed: false,
+        resume_unavailable_prompt: None,
+    };
+
+    let (control_tx, control_rx) = mpsc::channel(16);
+    let mut stream = match request.provider {
+        CodingProvider::Codex => run_codex_local_chat_stream(
+            provider_request,
+            Some(control_rx),
+            LocalAgentPermission::Manual,
+        ),
+        CodingProvider::Claude => run_claude_local_chat_stream(
+            provider_request,
+            Some(control_rx),
+            LocalAgentPermission::Manual,
+        ),
+        CodingProvider::OpenCode => {
+            drop(control_rx);
+            run_opencode_local_chat_stream(provider_request, LocalAgentPermission::Manual)
+        }
+        CodingProvider::Kimi | CodingProvider::OpenRouter | CodingProvider::OpenAiCompatible => {
+            unreachable!("native provider handled above")
+        }
+    };
+
+    let mut text = String::new();
+    let mut final_text = None;
+    let mut usage = ProviderCallUsage::default();
+    while let Some(event) = stream.recv().await {
+        match event {
+            ChatStreamEvent::Delta(delta) => text.push_str(&delta),
+            ChatStreamEvent::Narration { text: narration } => {
+                if text.is_empty() {
+                    text = narration;
+                }
+            }
+            ChatStreamEvent::ApprovalRequested { approval_id, .. } => {
+                control_tx
+                    .send(ChatStreamControl::Approval {
+                        approval_id,
+                        decision: ChatApprovalDecision::Reject,
+                    })
+                    .await
+                    .ok();
+            }
+            ChatStreamEvent::ToolCall { name, .. } => {
+                bail!("consultant attempted to use tool `{name}`")
+            }
+            ChatStreamEvent::ProviderInteractionRequested { title, .. } => {
+                bail!("consultant requested interactive input: {title}")
+            }
+            ChatStreamEvent::Done {
+                final_text: result,
+                usage: result_usage,
+                ..
+            } => {
+                final_text = Some(result);
+                if let Some(result_usage) = result_usage {
+                    usage = result_usage;
+                }
+                break;
+            }
+            ChatStreamEvent::Failed { error } => bail!("{error}"),
+            ChatStreamEvent::ProviderEvent { .. }
+            | ChatStreamEvent::ReasoningDelta(_)
+            | ChatStreamEvent::Phase { .. }
+            | ChatStreamEvent::ToolResult { .. } => {}
+        }
+    }
+    let final_text = final_text.unwrap_or(text);
+    anyhow::ensure!(
+        !final_text.trim().is_empty(),
+        "consultant returned an empty response"
+    );
+    Ok((final_text, usage))
 }
 
 pub async fn run_agent_turn(
@@ -390,6 +691,7 @@ pub async fn run_agent_turn_controlled(
                     claude_pool: None,
                     claude_sessions: None,
                 },
+                true,
             )
             .await
         }
@@ -412,6 +714,7 @@ async fn run_borg_provider_turn(
     events: mpsc::Sender<SessionEventKind>,
     controls: Option<mpsc::Receiver<AgentTurnControl>>,
     runtime: BorgProviderTurnRuntime,
+    tools_enabled: bool,
 ) -> Result<AgentTurnResult> {
     let BorgProviderTurnRuntime {
         request_template,
@@ -439,10 +742,12 @@ async fn run_borg_provider_turn(
             request.working_directory = Some(turn.cwd.clone());
             request.session_id = turn.provider_session_id.clone().or(request.session_id);
             request.resume_unavailable_prompt = None;
-            request
-                .mcp_external_servers
-                .extend(turn.external_mcp_servers);
-            request.mcp_external_servers.push(turn.agent_mcp_server);
+            if tools_enabled {
+                request
+                    .mcp_external_servers
+                    .extend(turn.external_mcp_servers);
+                request.mcp_external_servers.push(turn.agent_mcp_server);
+            }
             if let Some(instruction) = response_language_instruction {
                 request.system_prompt.push_str("\n\n");
                 request.system_prompt.push_str(instruction);
@@ -454,8 +759,13 @@ async fn run_borg_provider_turn(
             request
         }
         None => {
-            let mut mcp_external_servers = turn.external_mcp_servers;
-            mcp_external_servers.push(turn.agent_mcp_server);
+            let mcp_external_servers = if tools_enabled {
+                let mut servers = turn.external_mcp_servers;
+                servers.push(turn.agent_mcp_server);
+                servers
+            } else {
+                Vec::new()
+            };
             ChatStreamRequest {
                 prompt: turn.prompt.clone(),
                 owner_session_id: Some(turn.session_id.to_string()),
@@ -918,6 +1228,41 @@ fn terminal_assistant_text(
 
 fn request_can_use_claude_pool(request: &ChatStreamRequest) -> bool {
     request.provider_auth.is_none() && request.git_credentials.is_empty()
+}
+
+fn usage_from_session_event(event: &SessionEventKind) -> Option<ProviderCallUsage> {
+    let SessionEventKind::UsageUpdated {
+        provider_duration_ms,
+        input_tokens,
+        output_tokens,
+        cached_input_tokens,
+        cache_creation_input_tokens,
+        total_tokens,
+        cost_microusd,
+        cost_basis,
+        context_tokens,
+        context_window_tokens,
+        ..
+    } = event
+    else {
+        return None;
+    };
+    Some(ProviderCallUsage {
+        duration_ms: *provider_duration_ms,
+        input_tokens: *input_tokens,
+        output_tokens: *output_tokens,
+        cached_input_tokens: *cached_input_tokens,
+        cache_creation_input_tokens: *cache_creation_input_tokens,
+        total_tokens: *total_tokens,
+        context_tokens: *context_tokens,
+        context_window_tokens: *context_window_tokens,
+        cost_microusd: *cost_microusd,
+        cost_basis: match cost_basis.as_str() {
+            "provider_reported" => CostBasis::ProviderReported,
+            "estimated_from_pricing" => CostBasis::EstimatedFromPricing,
+            _ => CostBasis::Unavailable,
+        },
+    })
 }
 
 async fn compact_claude_session(

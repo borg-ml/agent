@@ -30,7 +30,8 @@ mod workspace;
 
 pub use agent::{
     AgentCompaction, AgentTurn, AgentTurnControl, AgentTurnExecutor, AgentTurnResult,
-    LocalAgentSettings, LocalAgentTurnExecutor, run_agent_turn, run_agent_turn_controlled,
+    ConsultationRequest, ConsultationResult, LocalAgentSettings, LocalAgentTurnExecutor,
+    run_agent_turn, run_agent_turn_controlled,
 };
 pub use command::execute_workspace_command;
 pub use contract::*;
@@ -48,9 +49,10 @@ pub use local_control::{
 pub use lsp::LspService;
 pub use orchestration::*;
 pub use session::{
-    SessionGoalTools, SessionTodoTools, run_agent_session, run_agent_session_with_executor,
-    run_agent_session_with_executor_and_writer, run_agent_session_with_store_and_writer,
-    run_agent_session_with_store_writer_and_peers, run_agent_session_with_writer,
+    SessionConsultationTools, SessionGoalTools, SessionTodoTools, run_agent_session,
+    run_agent_session_with_executor, run_agent_session_with_executor_and_writer,
+    run_agent_session_with_store_and_writer, run_agent_session_with_store_writer_and_peers,
+    run_agent_session_with_writer,
 };
 pub use session_store::{
     EventPersistence, JsonlSessionStore, SESSION_PROJECTION_VERSION, SessionConfiguration,

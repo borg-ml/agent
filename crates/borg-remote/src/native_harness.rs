@@ -448,6 +448,65 @@ impl NativeHarness {
         bail!("native provider exceeded the harness limit of {MAX_TOOL_ROUNDS} tool rounds")
     }
 
+    pub(crate) async fn consult(
+        &self,
+        provider: crate::CodingProvider,
+        model: &str,
+        effort: Option<&str>,
+        response_language: crate::ResponseLanguage,
+        prompt: &str,
+    ) -> Result<(String, ProviderCallUsage)> {
+        anyhow::ensure!(
+            provider.uses_native_harness(),
+            "{provider:?} does not use Borg's native model harness"
+        );
+        let mut system_prompt =
+            "You are a second-opinion consultant in a Borg multi-model workflow. Analyze the complete briefing supplied by the caller, identify important omissions or disagreements, and return a self-contained response that the main agent can reconcile. Do not modify files, call tools, or ask the user for clarification.".to_string();
+        if let Some(instruction) = response_language.instruction() {
+            system_prompt.push_str("\n\n");
+            system_prompt.push_str(instruction);
+        }
+        let result = self
+            .model_client
+            .model_turn(
+                provider,
+                model,
+                effort,
+                ModelTurnRequest {
+                    request_id: Some(format!("consult:{}", Uuid::new_v4())),
+                    messages: vec![
+                        ModelMessage::System {
+                            content: system_prompt,
+                        },
+                        ModelMessage::user(prompt),
+                    ],
+                    tools: Vec::new(),
+                    output_schema: None,
+                },
+                None,
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!(error.message))?;
+        let ModelMessage::Assistant {
+            content,
+            tool_calls,
+            ..
+        } = result.message
+        else {
+            bail!("native consultation returned a non-assistant message")
+        };
+        anyhow::ensure!(
+            tool_calls.is_empty(),
+            "native consultation unexpectedly requested a tool"
+        );
+        let final_text = content.unwrap_or_default();
+        anyhow::ensure!(
+            !final_text.trim().is_empty(),
+            "native consultation returned an empty response"
+        );
+        Ok((final_text, result.usage))
+    }
+
     pub(crate) async fn stop_session(&self, session_id: Uuid) {
         self.process_manager.terminate_session(session_id).await;
     }

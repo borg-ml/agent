@@ -14,17 +14,19 @@ use uuid::Uuid;
 use crate::SessionJournal;
 use crate::subagents::{SharedWorkToolContext, TeamInboxMessage};
 use crate::{
-    AgentTurn, AgentTurnControl, AgentTurnExecutor, CodingProvider, EventActor, GoalAction,
-    GoalStatus, HostCommand, LaunchSession, LocalAgentTurnExecutor, MessageStatus, ModelGoalStatus,
-    PlanItem, PlanItemStatus, PromptDelivery, SessionEvent, SessionEventKind, SessionGoal,
-    SessionGoalToolRequest, SessionGoalToolResponse, SessionState, SessionStatus, SessionStore,
-    SessionTodoToolRequest, SessionTodoToolResponse, SessionWriterLease, SqliteSessionStore,
-    SqliteWorkspaceStore, SubagentAction, SubagentActivity, SubagentActivityKind,
-    SubagentControlOutcome, SubagentCoordinator, TodoAction, TodoItemUpdate, WorkspaceEvent,
-    WorkspaceEventKind, WorkspaceStore,
+    AgentTurn, AgentTurnControl, AgentTurnExecutor, CodingProvider, ConsultationRequest,
+    ConsultationResult, EventActor, GoalAction, GoalStatus, HostCommand, LaunchSession,
+    LocalAgentTurnExecutor, MessageStatus, ModelGoalStatus, PlanItem, PlanItemStatus,
+    PromptDelivery, SessionEvent, SessionEventKind, SessionGoal, SessionGoalToolRequest,
+    SessionGoalToolResponse, SessionState, SessionStatus, SessionStore, SessionTodoToolRequest,
+    SessionTodoToolResponse, SessionWriterLease, SqliteSessionStore, SqliteWorkspaceStore,
+    SubagentAction, SubagentActivity, SubagentActivityKind, SubagentControlOutcome,
+    SubagentCoordinator, TodoAction, TodoItemUpdate, WorkspaceEvent, WorkspaceEventKind,
+    WorkspaceStore,
 };
 
 const ROOT_INBOX_REFRESH_INTERVAL: Duration = Duration::from_millis(50);
+const RETAINED_COMPACTION_SYSTEM_PROMPT: &str = "This is an internal context-compaction preparation turn. Do not use tools, modify files, or answer the user. Return only a compact continuation summary of the supplied prior provider conversation.";
 
 #[derive(Clone)]
 struct QueuedPrompt {
@@ -320,6 +322,42 @@ impl SessionTodoTools {
         receiver
             .await
             .map_err(|_| "session todo actor stopped before replying".to_string())?
+    }
+}
+
+struct SessionConsultationToolCall {
+    profile: String,
+    prompt: String,
+    response: oneshot::Sender<std::result::Result<ConsultationResult, String>>,
+}
+
+/// Model-facing consultation tool backed by the session actor. The main
+/// provider chooses the complete freeform briefing; this channel only carries
+/// that briefing and the requested provider/model profile to the isolated
+/// executor call.
+#[derive(Clone, Debug)]
+pub struct SessionConsultationTools {
+    requests: mpsc::Sender<SessionConsultationToolCall>,
+}
+
+impl SessionConsultationTools {
+    pub async fn call(
+        &self,
+        profile: String,
+        prompt: String,
+    ) -> std::result::Result<ConsultationResult, String> {
+        let (response, receiver) = oneshot::channel();
+        self.requests
+            .send(SessionConsultationToolCall {
+                profile,
+                prompt,
+                response,
+            })
+            .await
+            .map_err(|_| "session consultation actor is unavailable".to_string())?;
+        receiver
+            .await
+            .map_err(|_| "session consultation actor stopped before replying".to_string())?
     }
 }
 
@@ -700,6 +738,10 @@ async fn run_agent_session_store_kernel(
     let todo_tools = SessionTodoTools {
         requests: todo_tool_tx,
     };
+    let (consultation_tool_tx, mut consultation_tool_rx) = mpsc::channel(8);
+    let consultation_tools = SessionConsultationTools {
+        requests: consultation_tool_tx,
+    };
     let subagents_enabled = launch.capabilities.subagents;
     let owns_team = shared_team.is_none() && subagents_enabled;
     let subagents = if subagents_enabled {
@@ -771,6 +813,7 @@ async fn run_agent_session_store_kernel(
         shared_work,
         launch.team_policy.clone(),
         launch.cwd.clone(),
+        Some(consultation_tools),
     );
     let agent_tool_server =
         crate::AgentToolServer::start(session_root, session_id, dispatcher.clone()).await?;
@@ -1080,15 +1123,22 @@ async fn run_agent_session_store_kernel(
                                     .model
                                     .as_deref()
                                     .context("native context compaction requires a model")?;
+                                let mut conversation =
+                                    native_conversation(journal.context_events(), launch.provider)?;
+                                if conversation.is_empty()
+                                    && let Some(context) =
+                                        retained_conversation_context(journal.context_events())
+                                {
+                                    conversation.push(borg_provider::provider::ModelMessage::user(
+                                        format!("Previous provider conversation:\n\n{context}"),
+                                    ));
+                                }
                                 executor
                                     .compact_native(
                                         launch.provider,
                                         model,
                                         launch.effort.as_deref(),
-                                        native_conversation(
-                                            journal.context_events(),
-                                            launch.provider,
-                                        )?,
+                                        conversation,
                                     )
                                     .await
                                     .map(Some)
@@ -1098,9 +1148,38 @@ async fn run_agent_session_store_kernel(
                                         .compact(launch.provider, provider_session_id)
                                         .await
                                         .map(|()| None),
-                                    None => Err(anyhow::anyhow!(
-                                        "there is no provider conversation to compact yet"
-                                    )),
+                                    None => {
+                                        let context =
+                                            retained_conversation_context(journal.context_events())
+                                                .context(
+                                                    "there is no conversation to compact yet",
+                                                )?;
+                                        executor
+                                            .compact_retained_context(AgentTurn {
+                                                session_id,
+                                                message_id: Uuid::new_v4(),
+                                                provider: launch.provider,
+                                                provider_session_id: None,
+                                                cwd: launch.cwd.clone(),
+                                                prompt: retained_compaction_prompt(&context),
+                                                attachments: Vec::new(),
+                                                output_schema: None,
+                                                model: launch.model.clone(),
+                                                effort: launch.effort.clone(),
+                                                fast: launch.fast,
+                                                response_language: launch.response_language,
+                                                permission_mode: launch.permission_mode,
+                                                conversation: Vec::new(),
+                                                agent_mcp_server: agent_mcp_server.clone(),
+                                                agent_tools: dispatcher.clone(),
+                                                external_mcp_servers: Vec::new(),
+                                                extension_skill_roots: Vec::new(),
+                                                system_prompt_appendix:
+                                                    RETAINED_COMPACTION_SYSTEM_PROMPT.to_string(),
+                                            })
+                                            .await
+                                            .map(Some)
+                                    }
                                 }
                             }
                         }
@@ -1116,6 +1195,15 @@ async fn run_agent_session_store_kernel(
                                     )
                                     .await?;
                                 }
+                                let compacted_provider_session_id = native
+                                    .as_ref()
+                                    .and_then(|native| native.provider_session_id.clone());
+                                let summary = native
+                                    .as_ref()
+                                    .map(|native| native.summary.clone())
+                                    .unwrap_or_else(|| {
+                                        "Conversation context compacted on request".to_string()
+                                    });
                                 record(
                                     &mut journal,
                                     &events,
@@ -1124,9 +1212,7 @@ async fn run_agent_session_store_kernel(
                                         provider: launch.provider,
                                         kind: "context_compaction".to_string(),
                                         payload: serde_json::json!({
-                                            "summary": native
-                                                .map(|native| native.summary)
-                                                .unwrap_or_else(|| "Conversation context compacted on request".to_string()),
+                                            "summary": summary,
                                             "native": launch.provider.uses_native_harness(),
                                         }),
                                     },
@@ -1146,6 +1232,27 @@ async fn run_agent_session_store_kernel(
                                         },
                                     )
                                     .await?;
+                                }
+                                if let Some(new_provider_session_id) = compacted_provider_session_id
+                                {
+                                    record(
+                                        &mut journal,
+                                        &events,
+                                        session_id,
+                                        SessionEventKind::ProviderSessionLinked {
+                                            provider_session_id: new_provider_session_id.clone(),
+                                        },
+                                    )
+                                    .await?;
+                                    provider_session_id = Some(new_provider_session_id);
+                                    retained_context = None;
+                                } else if let Some(native) = native.as_ref()
+                                    && !launch.provider.uses_native_harness()
+                                {
+                                    retained_context = Some(format!(
+                                        "Previous conversation summary:\n\n{}",
+                                        native.summary
+                                    ));
                                 }
                             }
                             Err(error) => {
@@ -2260,6 +2367,55 @@ async fn run_agent_session_store_kernel(
                     .map_err(|error| format!("{error:#}"));
                     request.response.send(result).ok();
                 }
+                request = consultation_tool_rx.recv() => {
+                    let Some(request) = request else {
+                        continue;
+                    };
+                    let result: std::result::Result<ConsultationResult, String> = async {
+                        anyhow::ensure!(
+                            !request.prompt.trim().is_empty(),
+                            "consultation prompt must not be empty"
+                        );
+                        anyhow::ensure!(
+                            request.prompt.chars().count() <= 200_000,
+                            "consultation prompt is too long"
+                        );
+                        let (provider, model, requested_effort) =
+                            resolve_consultation_profile(&request.profile).map_err(|error| {
+                                anyhow::anyhow!("invalid consultation profile: {error}")
+                            })?;
+                        let effort = requested_effort.or_else(|| if provider == launch.provider {
+                            launch.effort.clone()
+                        } else {
+                            default_consultation_effort(provider)
+                        });
+                        executor
+                            .consult(ConsultationRequest {
+                                owner_session_id: session_id,
+                                message_id: Uuid::new_v4(),
+                                provider,
+                                model,
+                                effort,
+                                cwd: launch.cwd.clone(),
+                                prompt: request.prompt,
+                                response_language: launch.response_language,
+                            })
+                            .await
+                            .map_err(|error| anyhow::anyhow!("{error:#}"))
+                    }
+                    .await
+                    .map_err(|error| format!("{error:#}"));
+                    if let Ok(consultation) = &result {
+                        record(
+                            &mut journal,
+                            &events,
+                            session_id,
+                            native_usage_event(&consultation.usage),
+                        )
+                        .await?;
+                    }
+                    request.response.send(result).ok();
+                }
             }
         }
         if batch_pending_after_interrupt {
@@ -2313,6 +2469,76 @@ fn subagent_concurrency_limit(launch: &LaunchSession) -> usize {
                 .map(|policy| policy.limits.max_concurrent_assignments as usize)
         })
         .unwrap_or(crate::DEFAULT_MAX_SUBAGENTS)
+}
+
+fn resolve_consultation_profile(
+    profile: &str,
+) -> Result<(CodingProvider, Option<String>, Option<String>)> {
+    let profile = profile.trim();
+    anyhow::ensure!(!profile.is_empty(), "profile must not be empty");
+    let normalized = profile.to_ascii_lowercase();
+    let (profile, requested_effort) =
+        normalized
+            .rsplit_once('@')
+            .map_or((normalized.as_str(), None), |(profile, effort)| {
+                (
+                    profile,
+                    (!effort.trim().is_empty()).then_some(effort.trim()),
+                )
+            });
+    let (provider_hint, explicit_model) = profile
+        .split_once('/')
+        .map_or((profile, None), |(provider, model)| {
+            (provider, (!model.trim().is_empty()).then_some(model.trim()))
+        });
+    let provider = match provider_hint {
+        "gpt" | "codex" | "openai" => CodingProvider::Codex,
+        "claude" | "anthropic" => CodingProvider::Claude,
+        "opencode" | "open-code" => CodingProvider::OpenCode,
+        "kimi" => CodingProvider::Kimi,
+        "openrouter" | "open-router" => CodingProvider::OpenRouter,
+        "openai-compatible" | "open-ai-compatible" => CodingProvider::OpenAiCompatible,
+        _ => CodingProvider::for_model(profile)
+            .with_context(|| format!("unknown provider or model `{profile}`"))?,
+    };
+    let model = explicit_model
+        .map(str::to_string)
+        .or_else(|| CodingProvider::for_model(profile).map(|_| profile.to_string()))
+        .or_else(|| {
+            provider
+                .model_catalog()
+                .map(|catalog| catalog.default_model.to_string())
+        })
+        .or_else(|| {
+            (provider == CodingProvider::OpenAiCompatible)
+                .then(|| std::env::var("BORG_OPENAI_COMPATIBLE_MODEL").ok())
+                .flatten()
+        });
+    anyhow::ensure!(
+        !provider.uses_native_harness() || model.as_deref().is_some_and(|model| !model.is_empty()),
+        "consultation provider {} requires a model profile",
+        provider.label()
+    );
+    if let Some(effort) = requested_effort {
+        let supported = provider
+            .model_catalog()
+            .is_none_or(|catalog| catalog.supports_effort(effort));
+        anyhow::ensure!(
+            supported,
+            "consultation provider {} does not support effort `{effort}`",
+            provider.label()
+        );
+    }
+    Ok((provider, model, requested_effort.map(str::to_string)))
+}
+
+fn default_consultation_effort(provider: CodingProvider) -> Option<String> {
+    match provider {
+        CodingProvider::Codex => Some(borg_provider::codex_default_effort().to_string()),
+        CodingProvider::Kimi => Some(borg_provider::kimi_default_effort().to_string()),
+        CodingProvider::OpenRouter | CodingProvider::OpenAiCompatible => Some("medium".to_string()),
+        CodingProvider::Claude | CodingProvider::OpenCode => None,
+    }
 }
 
 /// Resolve serialized extension roots at the host launch boundary.
@@ -2422,11 +2648,9 @@ fn native_conversation(
     let mut pending = Vec::new();
     for event in events {
         match &event.kind {
-            SessionEventKind::ProviderEvent {
-                provider: event_provider,
-                kind,
-                payload,
-            } if *event_provider == provider && kind == "context_compaction" => {
+            SessionEventKind::ProviderEvent { kind, payload, .. }
+                if kind == "context_compaction" =>
+            {
                 pending.clear();
                 conversation.clear();
                 if let Some(summary) = payload.get("summary").and_then(Value::as_str) {
@@ -2495,9 +2719,17 @@ fn native_usage_event(usage: &borg_provider::ProviderCallUsage) -> SessionEventK
 }
 
 fn retained_conversation_context(events: &[SessionEvent]) -> Option<String> {
-    let messages = events
-        .iter()
-        .filter_map(|event| match &event.kind {
+    let mut messages = Vec::new();
+    for event in events {
+        match &event.kind {
+            SessionEventKind::ProviderEvent { kind, payload, .. }
+                if kind == "context_compaction" =>
+            {
+                messages.clear();
+                if let Some(summary) = payload.get("summary").and_then(Value::as_str) {
+                    messages.push(format!("Previous conversation summary:\n\n{summary}"));
+                }
+            }
             SessionEventKind::Message {
                 actor,
                 text,
@@ -2508,7 +2740,7 @@ fn retained_conversation_context(events: &[SessionEvent]) -> Option<String> {
                 EventActor::User | EventActor::Assistant | EventActor::System
             ) =>
             {
-                Some(format!(
+                messages.push(format!(
                     "{}: {text}",
                     if *actor == EventActor::Assistant {
                         "Assistant"
@@ -2517,10 +2749,16 @@ fn retained_conversation_context(events: &[SessionEvent]) -> Option<String> {
                     }
                 ))
             }
-            _ => None,
-        })
-        .collect::<Vec<_>>();
+            _ => {}
+        }
+    }
     (!messages.is_empty()).then(|| messages.join("\n\n"))
+}
+
+fn retained_compaction_prompt(context: &str) -> String {
+    format!(
+        "Summarize this prior provider conversation for the next agent. Preserve user requirements, decisions, files changed, commands and tests run, unresolved errors, approvals, and next steps. Do not use tools or modify the workspace. Return only the continuation summary.\n\n<prior_provider_conversation>\n{context}\n</prior_provider_conversation>"
+    )
 }
 
 fn recover_queued_prompts(events: &[SessionEvent]) -> VecDeque<QueuedPrompt> {
@@ -3436,6 +3674,19 @@ async fn apply_subagent_action(
     let request_id = action.request_id();
     let result: Result<SubagentControlOutcome> = async {
         match action {
+            SubagentAction::Ensure {
+                task_name,
+                provider,
+                model,
+                effort,
+                ..
+            } => Ok(SubagentControlOutcome::Accepted {
+                agent: Box::new(
+                    subagents
+                        .ensure_sidecar(&task_name, provider, model, effort)
+                        .await?,
+                ),
+            }),
             SubagentAction::List { path_prefix, .. } => Ok(SubagentControlOutcome::Listed {
                 agents: subagents.list(path_prefix.as_deref()).await,
             }),
@@ -3472,6 +3723,12 @@ async fn apply_subagent_action(
                 target, message_id, ..
             } => {
                 subagents.recall_child_prompt(&target, message_id).await?;
+                Ok(SubagentControlOutcome::Accepted {
+                    agent: Box::new(subagents.resolve_snapshot(&target).await?),
+                })
+            }
+            SubagentAction::ClearContext { target, .. } => {
+                subagents.clear_context(&target).await?;
                 Ok(SubagentControlOutcome::Accepted {
                     agent: Box::new(subagents.resolve_snapshot(&target).await?),
                 })
@@ -4004,13 +4261,14 @@ mod tests {
     use tokio::sync::Notify;
 
     use super::*;
-    use crate::{AgentTurnResult, CodingProvider, PermissionMode};
+    use crate::{AgentCompaction, AgentTurnResult, CodingProvider, PermissionMode};
 
     type RecordedTurns = Arc<Mutex<Vec<(PathBuf, Option<serde_json::Value>)>>>;
     type RecordedPromptTurns = Arc<Mutex<Vec<(String, Vec<PathBuf>)>>>;
     type RecordedContextTurns = Arc<Mutex<Vec<(String, Option<String>)>>>;
     type RecordedProviderTurns =
         Arc<Mutex<Vec<(CodingProvider, Option<String>, Option<String>, String)>>>;
+    type RecordedCompactionTurns = Arc<Mutex<Vec<(CodingProvider, Option<String>, String)>>>;
 
     #[tokio::test]
     async fn durable_session_events_project_once_into_the_bound_workspace() {
@@ -4462,6 +4720,17 @@ mod tests {
         called: Arc<Notify>,
     }
 
+    struct ConsultingExecutor {
+        seen_tool: Arc<Mutex<Vec<(String, String)>>>,
+        seen_provider: Arc<Mutex<Vec<(CodingProvider, Option<String>, String)>>>,
+        called: Arc<Notify>,
+    }
+
+    struct CrossProviderCompactionExecutor {
+        seen: RecordedCompactionTurns,
+        compacted: Arc<Notify>,
+    }
+
     #[async_trait::async_trait]
     impl AgentTurnExecutor for RecordingExecutor {
         async fn execute(
@@ -4528,6 +4797,110 @@ mod tests {
             Ok(AgentTurnResult {
                 provider_session_id: Some(format!("{:?}-session", turn.provider)),
                 final_text: "done".to_string(),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentTurnExecutor for ConsultingExecutor {
+        async fn execute(
+            &self,
+            turn: AgentTurn,
+            events: mpsc::Sender<SessionEventKind>,
+            _controls: Option<mpsc::Receiver<AgentTurnControl>>,
+        ) -> Result<AgentTurnResult> {
+            let consultation = turn
+                .agent_tools
+                .call(
+                    "consult_model",
+                    json!({
+                        "profile": "claude-opus-5@high",
+                        "prompt": "Review the selected interface and call out hidden risks."
+                    }),
+                )
+                .await?;
+            self.seen_tool.lock().unwrap().push((
+                "claude".to_string(),
+                consultation["response"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            ));
+            events
+                .send(SessionEventKind::Message {
+                    message_id: Uuid::new_v4(),
+                    actor: EventActor::Assistant,
+                    text: consultation["response"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                    attachments: Vec::new(),
+                    status: MessageStatus::Complete,
+                    delivery: None,
+                })
+                .await
+                .unwrap();
+            self.called.notify_one();
+            Ok(AgentTurnResult {
+                provider_session_id: Some("main-session".to_string()),
+                final_text: "reconciled consultation".to_string(),
+            })
+        }
+
+        async fn consult(&self, request: ConsultationRequest) -> Result<ConsultationResult> {
+            self.seen_provider.lock().unwrap().push((
+                request.provider,
+                request.effort,
+                request.prompt,
+            ));
+            Ok(ConsultationResult {
+                provider: request.provider,
+                model: request.model,
+                final_text: "The interface hides a cancellation edge case.".to_string(),
+                usage: Default::default(),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentTurnExecutor for CrossProviderCompactionExecutor {
+        async fn execute(
+            &self,
+            turn: AgentTurn,
+            events: mpsc::Sender<SessionEventKind>,
+            _controls: Option<mpsc::Receiver<AgentTurnControl>>,
+        ) -> Result<AgentTurnResult> {
+            self.seen.lock().unwrap().push((
+                turn.provider,
+                turn.provider_session_id.clone(),
+                turn.prompt.clone(),
+            ));
+            events
+                .send(SessionEventKind::Message {
+                    message_id: Uuid::new_v4(),
+                    actor: EventActor::Assistant,
+                    text: format!("response to {}", turn.prompt),
+                    attachments: Vec::new(),
+                    status: MessageStatus::Complete,
+                    delivery: None,
+                })
+                .await
+                .unwrap();
+            Ok(AgentTurnResult {
+                provider_session_id: Some(format!("{:?}-session", turn.provider)),
+                final_text: format!("response to {}", turn.prompt),
+            })
+        }
+
+        async fn compact_retained_context(&self, turn: AgentTurn) -> Result<AgentCompaction> {
+            assert_eq!(turn.provider, CodingProvider::Codex);
+            assert!(turn.prompt.contains("first"));
+            assert!(turn.prompt.contains("response to first"));
+            self.compacted.notify_one();
+            Ok(AgentCompaction {
+                summary: "retained summary".to_string(),
+                usage: Default::default(),
+                provider_session_id: Some("codex-compacted-session".to_string()),
             })
         }
     }
@@ -6398,6 +6771,151 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compaction_after_provider_switch_rehydrates_the_new_provider_session() {
+        let root = tempdir().unwrap();
+        let journal_path = root.path().join("session.jsonl");
+        let session_id = Uuid::new_v4();
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let compacted = Arc::new(Notify::new());
+        let executor = Arc::new(CrossProviderCompactionExecutor {
+            seen: Arc::clone(&seen),
+            compacted: Arc::clone(&compacted),
+        });
+        let actor = tokio::spawn({
+            let cwd = root.path().to_path_buf();
+            async move {
+                run_agent_session_with_executor(
+                    &journal_path,
+                    session_id,
+                    LaunchSession {
+                        request_id: Uuid::new_v4(),
+                        cwd,
+                        provider: CodingProvider::Claude,
+                        model: Some("claude-test".to_string()),
+                        effort: Some("medium".to_string()),
+                        fast: Some(false),
+                        response_language: crate::ResponseLanguage::Auto,
+                        permission_mode: PermissionMode::FullAccess,
+                        name: None,
+                        initial_prompt: None,
+                        capabilities: Default::default(),
+                        subagent_concurrency_limit: None,
+                        extension_skill_roots: Vec::new(),
+                        team_policy: None,
+                    },
+                    command_rx,
+                    event_tx,
+                    executor,
+                )
+                .await
+            }
+        });
+
+        let first_id = Uuid::new_v4();
+        command_tx
+            .send(HostCommand::Prompt {
+                session_id,
+                message_id: first_id,
+                text: "first".to_string(),
+                attachments: Vec::new(),
+                output_schema: None,
+                delivery: PromptDelivery::Steer,
+            })
+            .await
+            .unwrap();
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+                .await
+                .expect("first turn completes")
+                .expect("session remains open");
+            if matches!(
+                event.kind,
+                SessionEventKind::TurnCompleted { message_id, error: None, .. }
+                    if message_id == first_id
+            ) {
+                break;
+            }
+        }
+
+        command_tx
+            .send(HostCommand::Configure {
+                session_id,
+                action: crate::SessionConfigAction::SetProvider {
+                    provider: CodingProvider::Codex,
+                    model: Some("gpt-test".to_string()),
+                },
+            })
+            .await
+            .unwrap();
+        command_tx
+            .send(HostCommand::Compact { session_id })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), compacted.notified())
+            .await
+            .expect("cross-provider compaction is invoked");
+
+        let mut observed_compaction = false;
+        while !observed_compaction {
+            let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+                .await
+                .expect("compaction completes")
+                .expect("session remains open");
+            observed_compaction = matches!(
+                event.kind,
+                SessionEventKind::ProviderEvent { kind, .. } if kind == "context_compaction"
+            );
+        }
+
+        let followup_id = Uuid::new_v4();
+        command_tx
+            .send(HostCommand::Prompt {
+                session_id,
+                message_id: followup_id,
+                text: "continue".to_string(),
+                attachments: Vec::new(),
+                output_schema: None,
+                delivery: PromptDelivery::Steer,
+            })
+            .await
+            .unwrap();
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+                .await
+                .expect("follow-up turn completes")
+                .expect("session remains open");
+            if matches!(
+                event.kind,
+                SessionEventKind::TurnCompleted { message_id, error: None, .. }
+                    if message_id == followup_id
+            ) {
+                break;
+            }
+        }
+
+        command_tx
+            .send(HostCommand::Stop { session_id })
+            .await
+            .unwrap();
+        drop(command_tx);
+        actor.await.unwrap().unwrap();
+
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            [
+                (CodingProvider::Claude, None, "first".to_string()),
+                (
+                    CodingProvider::Codex,
+                    Some("codex-compacted-session".to_string()),
+                    "continue".to_string(),
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn clear_context_starts_the_next_turn_without_provider_or_retained_context() {
         let root = tempdir().unwrap();
         let journal_path = root.path().join("session.jsonl");
@@ -6888,6 +7406,86 @@ mod tests {
                 && effort.is_none()
                 && prompt == "peer topic"
         }));
+
+        command_tx
+            .send(HostCommand::Stop { session_id })
+            .await
+            .unwrap();
+        actor.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn model_consultation_dispatches_a_freeform_briefing_to_an_isolated_provider() {
+        let root = tempdir().unwrap();
+        let journal_path = root.path().join("session.jsonl");
+        let session_id = Uuid::new_v4();
+        let (command_tx, command_rx) = mpsc::channel(4);
+        let (event_tx, _event_rx) = mpsc::channel(64);
+        let seen_tool = Arc::new(Mutex::new(Vec::new()));
+        let seen_provider = Arc::new(Mutex::new(Vec::new()));
+        let called = Arc::new(Notify::new());
+        let executor = Arc::new(ConsultingExecutor {
+            seen_tool: Arc::clone(&seen_tool),
+            seen_provider: Arc::clone(&seen_provider),
+            called: Arc::clone(&called),
+        });
+        let launch = LaunchSession {
+            request_id: Uuid::new_v4(),
+            cwd: root.path().to_path_buf(),
+            provider: CodingProvider::Codex,
+            model: Some("gpt-test".to_string()),
+            effort: Some("medium".to_string()),
+            fast: Some(false),
+            response_language: crate::ResponseLanguage::Auto,
+            permission_mode: PermissionMode::FullAccess,
+            name: None,
+            initial_prompt: None,
+            capabilities: Default::default(),
+            subagent_concurrency_limit: None,
+            extension_skill_roots: Vec::new(),
+            team_policy: None,
+        };
+        let actor = tokio::spawn(async move {
+            run_agent_session_with_executor(
+                &journal_path,
+                session_id,
+                launch,
+                command_rx,
+                event_tx,
+                executor,
+            )
+            .await
+        });
+        command_tx
+            .send(HostCommand::Prompt {
+                session_id,
+                message_id: Uuid::new_v4(),
+                text: "/ask claude review the design".to_string(),
+                attachments: Vec::new(),
+                output_schema: None,
+                delivery: PromptDelivery::Steer,
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), called.notified())
+            .await
+            .expect("main executor received the consultation result");
+
+        assert_eq!(
+            seen_provider.lock().unwrap().as_slice(),
+            [(
+                CodingProvider::Claude,
+                Some("high".to_string()),
+                "Review the selected interface and call out hidden risks.".to_string()
+            )]
+        );
+        assert_eq!(
+            seen_tool.lock().unwrap().as_slice(),
+            [(
+                "claude".to_string(),
+                "The interface hides a cancellation edge case.".to_string()
+            )]
+        );
 
         command_tx
             .send(HostCommand::Stop { session_id })
@@ -8013,6 +8611,44 @@ mod tests {
     }
 
     #[test]
+    fn retained_context_restarts_from_the_latest_cross_provider_summary() {
+        let session_id = Uuid::new_v4();
+        let message = |sequence: u64, actor: EventActor, text: &str| {
+            SessionEvent::new(
+                session_id,
+                sequence,
+                SessionEventKind::Message {
+                    message_id: Uuid::new_v4(),
+                    actor,
+                    text: text.to_string(),
+                    attachments: Vec::new(),
+                    status: MessageStatus::Complete,
+                    delivery: None,
+                },
+            )
+        };
+        let events = vec![
+            message(1, EventActor::User, "old request"),
+            message(2, EventActor::Assistant, "old response"),
+            SessionEvent::new(
+                session_id,
+                3,
+                SessionEventKind::ProviderEvent {
+                    provider: CodingProvider::Codex,
+                    kind: "context_compaction".to_string(),
+                    payload: json!({ "summary": "preserved decisions" }),
+                },
+            ),
+            message(4, EventActor::User, "new request"),
+        ];
+
+        assert_eq!(
+            retained_conversation_context(&events).as_deref(),
+            Some("Previous conversation summary:\n\npreserved decisions\n\nUser: new request")
+        );
+    }
+
+    #[test]
     fn native_auto_compaction_starts_at_ten_percent_effective_context_remaining() {
         let state = |context_tokens, context_window_tokens| SessionState {
             usage: crate::SessionUsage {
@@ -8026,6 +8662,51 @@ mod tests {
         assert!(native_auto_compaction_needed(&state(90_000, 100_000)));
         assert!(native_auto_compaction_needed(&state(100_000, 100_000)));
         assert!(!native_auto_compaction_needed(&SessionState::default()));
+    }
+
+    #[test]
+    fn consultation_profiles_resolve_aliases_and_catalog_models() {
+        assert_eq!(
+            resolve_consultation_profile("claude").unwrap(),
+            (
+                CodingProvider::Claude,
+                Some("claude-sonnet-5".to_string()),
+                None
+            )
+        );
+        assert_eq!(
+            resolve_consultation_profile("gpt").unwrap(),
+            (
+                CodingProvider::Codex,
+                Some("gpt-5.6-luna".to_string()),
+                None
+            )
+        );
+        assert_eq!(
+            resolve_consultation_profile("claude/claude-opus-5").unwrap(),
+            (
+                CodingProvider::Claude,
+                Some("claude-opus-5".to_string()),
+                None
+            )
+        );
+        assert_eq!(
+            resolve_consultation_profile("claude-opus-5@high").unwrap(),
+            (
+                CodingProvider::Claude,
+                Some("claude-opus-5".to_string()),
+                Some("high".to_string())
+            )
+        );
+        assert_eq!(
+            resolve_consultation_profile("gpt-5.6-sol@xhigh").unwrap(),
+            (
+                CodingProvider::Codex,
+                Some("gpt-5.6-sol".to_string()),
+                Some("xhigh".to_string())
+            )
+        );
+        assert!(resolve_consultation_profile("not-a-provider").is_err());
     }
 
     #[tokio::test]

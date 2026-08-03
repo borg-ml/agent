@@ -74,7 +74,7 @@ pub fn project_tool_presentation(
         detail.clone_from(&edit.detail);
     }
     ToolPresentation {
-        category: tool_category(name, &label),
+        category: tool_category(name, &label, input),
         input: input_body,
         output: edit_result.map(|edit| edit.body).or_else(|| {
             output.and_then(|output| {
@@ -289,7 +289,7 @@ pub fn is_subagent_tool(display_name: &str) -> bool {
 /// which is what lets the transcript describe an edit before its patch has
 /// arrived.
 pub fn is_edit_tool(name: &str, display_name: &str) -> bool {
-    tool_category(name, display_name) == ToolPresentationCategory::Edit
+    tool_category(name, display_name, &Value::Null) == ToolPresentationCategory::Edit
 }
 
 pub fn is_diff_language(language: &str) -> bool {
@@ -331,6 +331,14 @@ pub fn tool_call_summary(name: &str, input: &Value) -> (String, String) {
 
     if tool == "get_goal" {
         return ("Read goal".to_string(), String::new());
+    }
+
+    if tool == "consult_model" {
+        let profile = string_field(input, "profile").unwrap_or("model");
+        return (
+            "Consult model".to_string(),
+            format!("{} · second opinion", compact_text(profile, 80)),
+        );
     }
 
     if tool == "create_goal" {
@@ -468,12 +476,14 @@ pub fn tool_call_summary(name: &str, input: &Value) -> (String, String) {
                 format!("“{}”", compact_text(&query, 120)),
             );
         }
+        let label = if command_is_read_only(command) {
+            "Read"
+        } else {
+            "Run"
+        };
         return (
-            "Run".to_string(),
-            string_field(input, "description")
-                .filter(|description| !description.trim().is_empty())
-                .map(|description| compact_text(description, 160))
-                .unwrap_or_else(|| compact_text(&unwrapped_shell_command(command), 160)),
+            label.to_string(),
+            compact_text(&unwrapped_shell_command(command), 160),
         );
     }
 
@@ -616,7 +626,7 @@ fn product_tool_summary(name: &str, input: &Value) -> Option<(String, String)> {
     Some((label.to_string(), compact_text(&detail, 200)))
 }
 
-fn tool_category(name: &str, label: &str) -> ToolPresentationCategory {
+fn tool_category(name: &str, label: &str, input: &Value) -> ToolPresentationCategory {
     let leaf = tool_leaf_name(name);
     if is_subagent_tool(label)
         || matches!(
@@ -629,6 +639,8 @@ fn tool_category(name: &str, label: &str) -> ToolPresentationCategory {
                 | "collabagenttoolcall"
         )
     {
+        ToolPresentationCategory::Agent
+    } else if leaf == "consult_model" {
         ToolPresentationCategory::Agent
     } else if matches!(
         leaf.as_str(),
@@ -657,7 +669,17 @@ fn tool_category(name: &str, label: &str) -> ToolPresentationCategory {
             "bash" | "command_execution" | "exec_command" | "exec"
         )
     {
-        ToolPresentationCategory::Execute
+        if let Some(command) = command_from_input(input)
+            && command_is_read_only(command)
+        {
+            if search_query(command).is_some() {
+                ToolPresentationCategory::Search
+            } else {
+                ToolPresentationCategory::Read
+            }
+        } else {
+            ToolPresentationCategory::Execute
+        }
     } else if leaf.contains("edit") || leaf.contains("patch") || leaf.contains("write") {
         ToolPresentationCategory::Edit
     } else if leaf.contains("read") || leaf.contains("fetch") || leaf.contains("get_document") {
@@ -1361,6 +1383,68 @@ fn shell_script(words: &[String]) -> Option<&str> {
         })
 }
 
+/// Classify only shell commands whose primary effect is reading data and
+/// whose syntax does not compose additional commands or redirections. This is
+/// intentionally conservative: a command that is not obviously a read stays
+/// an execution so the UI never hides a potentially mutating operation.
+fn command_is_read_only(command: &str) -> bool {
+    let command = unwrapped_shell_command(command);
+    if command_has_shell_control_operator(&command) {
+        return false;
+    }
+    let words = shell_words(&command);
+    let Some(executable) = words.first().and_then(|word| word.rsplit('/').next()) else {
+        return false;
+    };
+    let arguments = &words[1..];
+    match executable {
+        "cat" | "head" | "tail" | "cut" | "tr" | "sort" | "uniq" | "wc" | "od" | "xxd" | "file"
+        | "ls" | "pwd" | "stat" | "du" => true,
+        "sed" => !arguments.iter().any(|argument| {
+            argument == "--in-place"
+                || argument == "-i"
+                || argument.starts_with("--in-place=")
+                || argument.starts_with("-i")
+        }),
+        "awk" | "gawk" => !command.contains("system(") && !command.contains("system ("),
+        "find" => !arguments.iter().any(|argument| {
+            matches!(
+                argument.as_str(),
+                "-delete" | "-exec" | "-execdir" | "-ok" | "-okdir"
+            )
+        }),
+        "rg" | "grep" => true,
+        _ => false,
+    }
+}
+
+fn command_has_shell_control_operator(command: &str) -> bool {
+    let mut quote = None;
+    let mut escaped = false;
+    for character in command.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if character == '\\' && quote != Some('\'') {
+            escaped = true;
+            continue;
+        }
+        if quote == Some(character) {
+            quote = None;
+            continue;
+        }
+        if quote.is_none() && matches!(character, '\'' | '"') {
+            quote = Some(character);
+            continue;
+        }
+        if quote.is_none() && matches!(character, ';' | '|' | '>' | '<' | '&') {
+            return true;
+        }
+    }
+    escaped || quote.is_some()
+}
+
 fn unwrapped_shell_command(command: &str) -> String {
     let words = shell_words(command);
     shell_script(&words).unwrap_or(command).to_string()
@@ -1790,6 +1874,19 @@ mod tests {
     }
 
     #[test]
+    fn presents_model_consultation_as_an_agent_action() {
+        let presentation = project_tool_presentation(
+            "mcp__borg_agent__consult_model",
+            &json!({"profile": "claude", "prompt": "Review the tradeoffs."}),
+            Some(r#"{"provider":"claude","response":"Use the narrower interface."}"#),
+            false,
+        );
+        assert_eq!(presentation.label, "Consult model");
+        assert_eq!(presentation.detail, "claude · second opinion");
+        assert_eq!(presentation.category, ToolPresentationCategory::Agent);
+    }
+
+    #[test]
     fn generic_code_view_unwraps_structured_mcp_results() {
         let output = json!({
             "_meta": null,
@@ -1853,6 +1950,71 @@ mod tests {
                 "{command}"
             );
         }
+    }
+
+    #[test]
+    fn presents_safe_read_only_shell_commands_as_reads() {
+        let read = project_tool_presentation(
+            "functions.exec_command",
+            &json!({"cmd": "sed -n '1,400p' docs/model-adaptation/CLOSED-ROUTES.md"}),
+            None,
+            false,
+        );
+        assert_eq!(read.label, "Read");
+        assert_eq!(read.category, ToolPresentationCategory::Read);
+        assert_eq!(
+            read.detail,
+            "sed -n '1,400p' docs/model-adaptation/CLOSED-ROUTES.md"
+        );
+
+        let wrapped = project_tool_presentation(
+            "functions.exec_command",
+            &json!({"cmd": "bash -lc 'sed -n \"1,4p\" README.md'"}),
+            None,
+            false,
+        );
+        assert_eq!(wrapped.label, "Read");
+        assert_eq!(wrapped.category, ToolPresentationCategory::Read);
+    }
+
+    #[test]
+    fn keeps_mutating_or_composed_shell_commands_as_execution() {
+        for command in [
+            "sed -i 's/old/new/' README.md",
+            "sed -n '1,4p' README.md && rm -f /tmp/output",
+        ] {
+            let presentation = project_tool_presentation(
+                "functions.exec_command",
+                &json!({"cmd": command}),
+                None,
+                false,
+            );
+            assert_eq!(presentation.label, "Run", "{command}");
+            assert_eq!(
+                presentation.category,
+                ToolPresentationCategory::Execute,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn command_summary_preserves_the_shell_command_over_generated_description() {
+        let presentation = project_tool_presentation(
+            "functions.exec_command",
+            &json!({
+                "cmd": "git add docs/model-adaptation/review.md && git commit -m 'Prefer donor-preserving functionality'",
+                "description": "docs/model-adaptation/review.md · && · git · commit · Prefer donor-preserving functionality"
+            }),
+            None,
+            false,
+        );
+        assert_eq!(presentation.label, "Run");
+        assert_eq!(
+            presentation.detail,
+            "git add docs/model-adaptation/review.md && git commit -m 'Prefer donor-preserving functionality'"
+        );
+        assert_eq!(presentation.category, ToolPresentationCategory::Execute);
     }
 
     #[test]

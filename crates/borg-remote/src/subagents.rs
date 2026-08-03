@@ -24,11 +24,12 @@ use uuid::Uuid;
 use crate::{
     ApprovalDecision, AtomicWorkClaim, Audience, CodingProvider, DeliveryMode, EventActor,
     HostCommand, LaunchSession, MessageStatus, ModelGoalStatus, PromptDelivery, Provenance,
-    SessionEvent, SessionEventKind, SessionGoalToolRequest, SessionGoalTools, SessionStatus,
-    SessionStore, SessionTodoToolRequest, SessionTodoTools, SharedWork, SqliteWorkspaceStore,
-    StructuredMention, TodoItemUpdate, WorkDependency, WorkReview, WorkspaceArtifact,
-    WorkspaceDecision, WorkspaceEvent, WorkspaceEventKind, WorkspaceMessage, WorkspaceMessageBody,
-    WorkspaceReference, WorkspaceReviewRequest, WorkspaceStore,
+    SessionConsultationTools, SessionEvent, SessionEventKind, SessionGoalToolRequest,
+    SessionGoalTools, SessionStatus, SessionStore, SessionTodoToolRequest, SessionTodoTools,
+    SharedWork, SqliteWorkspaceStore, StructuredMention, TodoItemUpdate, WorkDependency,
+    WorkReview, WorkspaceArtifact, WorkspaceDecision, WorkspaceEvent, WorkspaceEventKind,
+    WorkspaceMessage, WorkspaceMessageBody, WorkspaceReference, WorkspaceReviewRequest,
+    WorkspaceStore,
 };
 
 pub const DEFAULT_MAX_SUBAGENTS: usize = 16;
@@ -129,6 +130,7 @@ pub struct SpawnSubagent {
 pub struct AgentToolDispatcher {
     goals: SessionGoalTools,
     todos: SessionTodoTools,
+    consultation: Option<SessionConsultationTools>,
     subagents: Option<SubagentCoordinator>,
     subagents_enabled: bool,
     shared_work: Option<SharedWorkToolContext>,
@@ -399,10 +401,12 @@ impl AgentToolDispatcher {
         shared_work: Option<SharedWorkToolContext>,
         team_policy: Option<crate::TeamPolicy>,
         cwd: PathBuf,
+        consultation: Option<SessionConsultationTools>,
     ) -> Self {
         Self {
             goals,
             todos,
+            consultation,
             subagents,
             subagents_enabled,
             shared_work,
@@ -449,6 +453,21 @@ impl AgentToolDispatcher {
                         })
                         .await,
                 )
+            }
+            "consult_model" => {
+                let args: ConsultModelArgs = serde_json::from_value(arguments)?;
+                let consultation = self
+                    .consultation
+                    .as_ref()
+                    .context("model consultation is disabled for this session")?
+                    .call(args.profile, args.prompt)
+                    .await
+                    .map_err(|error| anyhow::anyhow!(error))?;
+                Ok(json!({
+                    "provider": consultation.provider.catalog_backend(),
+                    "model": consultation.model,
+                    "response": consultation.final_text,
+                }))
             }
             "get_plan" => {
                 let _: NoArgs = serde_json::from_value(arguments)?;
@@ -1385,6 +1404,123 @@ impl SubagentCoordinator {
         Ok(snapshot)
     }
 
+    /// Return the durable child for a provider-specific sidecar, creating it
+    /// without an initial model turn when this is the first request. The task
+    /// name is deliberately deterministic so every future `/claude` or `/gpt`
+    /// command resolves to the same child session after hydration.
+    pub async fn ensure_sidecar(
+        &self,
+        task_name: &str,
+        provider: CodingProvider,
+        model: Option<String>,
+        effort: Option<String>,
+    ) -> Result<SubagentSnapshot> {
+        let task_name = canonical_task_name(task_name)?;
+        let existing = {
+            let table = self.table.lock().await;
+            table
+                .task_names
+                .get(&task_name)
+                .and_then(|session_id| table.entries.get(session_id))
+                .map(|entry| entry.snapshot.clone())
+        };
+        if let Some(snapshot) = existing {
+            anyhow::ensure!(
+                snapshot.provider == provider,
+                "sidecar {} is pinned to {}, not {}",
+                snapshot.task_name,
+                snapshot.provider.label(),
+                provider.label()
+            );
+            if let Some(model) = model.as_deref() {
+                anyhow::ensure!(
+                    snapshot.model.as_deref() == Some(model),
+                    "sidecar {} is pinned to model {}, not {}",
+                    snapshot.task_name,
+                    snapshot.model.as_deref().unwrap_or("<none>"),
+                    model
+                );
+            }
+            if let Some(effort) = effort.as_deref() {
+                anyhow::ensure!(
+                    snapshot.effort.as_deref() == Some(effort),
+                    "sidecar {} is pinned to effort {}, not {}",
+                    snapshot.task_name,
+                    snapshot.effort.as_deref().unwrap_or("<none>"),
+                    effort
+                );
+            }
+            if snapshot.status.is_terminal() {
+                let mut revived = snapshot.clone();
+                revived.status = SubagentStatus::Starting;
+                revived.detail = Some("Waking persistent sidecar after resume".to_string());
+                revived.updated_at = Utc::now();
+                let mut launch = self.root_launch.clone();
+                launch.request_id = Uuid::new_v4();
+                launch.initial_prompt = None;
+                launch.provider = snapshot.provider;
+                launch.model = snapshot.model.clone();
+                launch.effort = snapshot.effort.clone();
+                launch.cwd = snapshot.cwd.clone();
+                launch.name = Some(snapshot.task_name.clone());
+                {
+                    let mut table = self.table.lock().await;
+                    let entry = table
+                        .entries
+                        .get_mut(&snapshot.session_id)
+                        .expect("existing sidecar remains in the coordinator");
+                    entry.snapshot = revived.clone();
+                    entry.commands = None;
+                    entry.dormant = false;
+                }
+                if let Err(error) = self.start_reserved(revived, launch, true).await {
+                    let mut table = self.table.lock().await;
+                    if let Some(entry) = table.entries.get_mut(&snapshot.session_id) {
+                        entry.snapshot.status = SubagentStatus::Stopped;
+                        entry.snapshot.detail = Some(format!("Could not wake: {error:#}"));
+                        entry.snapshot.updated_at = Utc::now();
+                        entry.dormant = false;
+                    }
+                    return Err(error);
+                }
+                return Ok(self
+                    .get(snapshot.session_id)
+                    .await
+                    .expect("revived sidecar remains in the coordinator"));
+            }
+            self.ensure_child_actor(snapshot.session_id).await?;
+            return Ok(self
+                .get(snapshot.session_id)
+                .await
+                .expect("ensured sidecar remains in the coordinator"));
+        }
+
+        let mut launch = self.root_launch.clone();
+        launch.request_id = Uuid::new_v4();
+        launch.initial_prompt = None;
+        launch.provider = provider;
+        launch.model = model.or_else(|| default_model_for_cross_provider_peer(provider));
+        launch.effort = effort.or_else(|| default_effort_for_cross_provider_peer(provider));
+        validate_subagent_overrides(
+            launch.provider,
+            launch.model.as_deref(),
+            launch.effort.as_deref(),
+        )?;
+        anyhow::ensure!(
+            !launch.provider.uses_native_harness() || launch.model.is_some(),
+            "{} sidecar requires an explicit model",
+            provider.label()
+        );
+        launch.name = Some(task_name.clone());
+        let snapshot = self
+            .table
+            .lock()
+            .await
+            .reserve(task_name.trim_start_matches("/root/"), &launch)?;
+        self.start_reserved(snapshot.clone(), launch, true).await?;
+        Ok(snapshot)
+    }
+
     /// Lazily start one metadata-only child after an explicit action targets
     /// it. Concurrent callers either own the wake transition or wait for the
     /// command channel installed by that owner.
@@ -2082,6 +2218,13 @@ impl SubagentCoordinator {
             .map_err(|_| anyhow::anyhow!("subagent command channel closed"))
     }
 
+    pub async fn clear_context(&self, target: &str) -> Result<()> {
+        self.send_command(target, |session_id| HostCommand::ClearContext {
+            session_id,
+        })
+        .await
+    }
+
     pub async fn wait(&self, timeout: Duration) -> Result<Option<SubagentActivity>> {
         let timeout = timeout.clamp(Duration::from_millis(100), Duration::from_secs(60));
         if let Some(agent) = self
@@ -2262,6 +2405,7 @@ fn boxed_agent_store_session(
 /// Claude and OpenCode consume the same catalog through the local MCP bridge.
 pub fn subagent_tool_specs(provider: CodingProvider) -> Vec<Value> {
     let description = subagent_tool_description(provider);
+    let model_description = subagent_model_override_description();
     vec![
         tool(
             "spawn_agent",
@@ -2282,7 +2426,18 @@ pub fn subagent_tool_specs(provider: CodingProvider) -> Vec<Value> {
                             "open_ai_compatible"
                         ]
                     },
-                    "model": { "type": "string" },
+                    "model": {
+                        "type": "string",
+                        "description": model_description,
+                        "examples": [
+                            "gpt-5.6-sol",
+                            "gpt-5.6-terra",
+                            "gpt-5.6-luna",
+                            "claude-opus-5",
+                            "claude-sonnet-5",
+                            "kimi-k3"
+                        ]
+                    },
                     "reasoning_effort": { "type": "string" }
                 },
                 "required": ["task_name", "message"],
@@ -2365,8 +2520,28 @@ fn subagent_tool_description(provider: CodingProvider) -> String {
         });
     format!(
         "Spawn an isolated child Borg session for a concrete, bounded task. \
-         Omit provider, model, and reasoning_effort to inherit the parent. {inheritance}"
+         Omit provider, model, and reasoning_effort to inherit the parent. {inheritance} \
+         All catalog-backed subagent choices are also available explicitly: {}",
+        subagent_model_override_description()
     )
+}
+
+fn subagent_model_override_description() -> String {
+    CodingProvider::CATALOG_PROVIDERS
+        .into_iter()
+        .filter_map(|provider| {
+            provider.model_catalog().map(|catalog| {
+                let models = catalog
+                    .selectable_models
+                    .iter()
+                    .map(|(model, label)| format!("{model} ({label})"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{}: {models}", provider.catalog_backend())
+            })
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 fn validate_subagent_overrides(
@@ -2443,6 +2618,29 @@ pub fn agent_tool_specs_with_capabilities(
     team_policy: Option<&crate::TeamPolicy>,
 ) -> Vec<Value> {
     let mut specs = vec![
+        tool(
+            "consult_model",
+            "Ask another configured model for a second opinion. The caller must choose the complete freeform briefing: include whatever context, excerpts, constraints, and questions the other model needs. The response is returned to the calling model for reconciliation; this does not switch the main session provider.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "profile": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 128,
+                        "description": "Provider alias or model id, optionally with @EFFORT; examples: claude, gpt, claude-opus-5@high, or gpt-5.6-sol@xhigh."
+                    },
+                    "prompt": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 200000,
+                        "description": "The complete freeform briefing to send to the consultant."
+                    }
+                },
+                "required": ["profile", "prompt"],
+                "additionalProperties": false
+            }),
+        ),
         tool(
             "get_goal",
             "Get the current durable goal, status, usage, and remaining token budget.",
@@ -2752,6 +2950,13 @@ fn shared_work_tool_specs() -> Vec<Value> {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NoArgs {}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConsultModelArgs {
+    profile: String,
+    prompt: String,
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -3305,6 +3510,67 @@ mod tests {
         assert_eq!(table.resolve("/root/review_api").unwrap(), child.session_id);
     }
 
+    #[tokio::test]
+    async fn ensuring_a_sidecar_reuses_one_idle_provider_session() {
+        let directory = tempdir().unwrap();
+        let root = Uuid::new_v4();
+        let store = Arc::new(
+            crate::SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
+                .await
+                .unwrap(),
+        );
+        store.create_session(root).await.unwrap();
+        let mut root_launch = launch();
+        root_launch.capabilities.multiplayer = false;
+        let coordinator = SubagentCoordinator::new_with_store_and_executor(
+            directory.path(),
+            root,
+            root_launch,
+            3,
+            Arc::new(crate::LocalAgentTurnExecutor::default()),
+            store,
+        )
+        .unwrap();
+
+        let first = coordinator
+            .ensure_sidecar(
+                "claude",
+                CodingProvider::Claude,
+                Some("claude-opus-5".to_string()),
+                Some("high".to_string()),
+            )
+            .await
+            .unwrap();
+        let second = coordinator
+            .ensure_sidecar(
+                "claude",
+                CodingProvider::Claude,
+                Some("claude-opus-5".to_string()),
+                Some("high".to_string()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(first.session_id, second.session_id);
+        assert_eq!(second.task_name, "/root/claude");
+        assert_eq!(second.provider, CodingProvider::Claude);
+        assert_eq!(second.model.as_deref(), Some("claude-opus-5"));
+        assert_eq!(second.effort.as_deref(), Some("high"));
+
+        coordinator.stop("/root/claude").await.unwrap();
+        let resumed = coordinator
+            .ensure_sidecar(
+                "claude",
+                CodingProvider::Claude,
+                Some("claude-opus-5".to_string()),
+                Some("high".to_string()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resumed.session_id, first.session_id);
+        coordinator.stop("/root/claude").await.unwrap();
+    }
+
     #[test]
     fn cross_provider_peer_does_not_inherit_an_incompatible_model_or_effort() {
         assert_eq!(
@@ -3721,6 +3987,7 @@ mod tests {
     #[test]
     fn every_execution_lane_exposes_the_same_borg_control_plane() {
         let common = [
+            "consult_model",
             "get_goal",
             "get_plan",
             "update_plan",
@@ -3916,6 +4183,32 @@ mod tests {
             validate_subagent_overrides(CodingProvider::Codex, Some("not-a-codex-model"), None)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn every_parent_model_can_see_codex_luna_as_a_subagent_option() {
+        for parent in [
+            CodingProvider::Codex,
+            CodingProvider::Claude,
+            CodingProvider::OpenRouter,
+        ] {
+            let spawn = subagent_tool_specs(parent)
+                .into_iter()
+                .find(|tool| tool["name"] == "spawn_agent")
+                .expect("spawn_agent tool");
+            assert!(
+                spawn["description"]
+                    .as_str()
+                    .is_some_and(|description| description.contains("gpt-5.6-luna (Luna)")),
+                "parent {parent:?} omitted Luna from its orchestration instructions"
+            );
+            assert!(
+                spawn["inputSchema"]["properties"]["model"]["description"]
+                    .as_str()
+                    .is_some_and(|description| description.contains("gpt-5.6-luna")),
+                "parent {parent:?} omitted Luna from the model argument metadata"
+            );
+        }
     }
 
     #[tokio::test]

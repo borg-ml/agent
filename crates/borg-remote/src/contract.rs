@@ -710,6 +710,17 @@ pub enum SessionConfigAction {
 #[serde(tag = "type", rename_all = "snake_case")]
 #[ts(export)]
 pub enum SubagentAction {
+    /// Ensure one deterministic, provider-pinned child exists. This is used
+    /// by client-side persistent lanes such as `/claude` and `/gpt`; unlike
+    /// `spawn_agent`, it creates an idle child without spending a turn on an
+    /// initial task message.
+    Ensure {
+        request_id: Uuid,
+        task_name: String,
+        provider: CodingProvider,
+        model: Option<String>,
+        effort: Option<String>,
+    },
     List {
         request_id: Uuid,
         path_prefix: Option<String>,
@@ -740,6 +751,12 @@ pub enum SubagentAction {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message_id: Option<Uuid>,
     },
+    /// Clear a child session's provider context while preserving its durable
+    /// identity, journal, and lane routing.
+    ClearContext {
+        request_id: Uuid,
+        target: String,
+    },
     Interrupt {
         request_id: Uuid,
         target: String,
@@ -759,10 +776,12 @@ pub enum SubagentAction {
 impl SubagentAction {
     pub fn request_id(&self) -> Uuid {
         match self {
-            Self::List { request_id, .. }
+            Self::Ensure { request_id, .. }
+            | Self::List { request_id, .. }
             | Self::Message { request_id, .. }
             | Self::Prompt { request_id, .. }
             | Self::RecallPrompt { request_id, .. }
+            | Self::ClearContext { request_id, .. }
             | Self::Interrupt { request_id, .. }
             | Self::Stop { request_id, .. }
             | Self::Approve { request_id, .. } => *request_id,
