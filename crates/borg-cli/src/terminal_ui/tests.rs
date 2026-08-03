@@ -2501,20 +2501,19 @@ fn active_subagent_count_tracks_only_working_children() {
 
 #[test]
 fn agents_status_label_counts_only_working_children() {
-    let working = agents_status_label_with_persistent_sidecars(1, 0).expect("one child is working");
-    let larger_team =
-        agents_status_label_with_persistent_sidecars(2, 0).expect("two children are working");
-    let idle = agents_status_label_with_persistent_sidecars(0, 0);
+    let working = agents_status_label(1).expect("one agent is working");
+    let larger_team = agents_status_label(2).expect("two agents are working");
+    let idle = agents_status_label(0);
 
-    assert_eq!(working, "1 subagent");
-    assert_eq!(larger_team, "2 subagents");
+    assert_eq!(working, "1 agent");
+    assert_eq!(larger_team, "2 agents");
     assert_eq!(idle, None);
 }
 
 #[test]
-fn persistent_sidecars_remain_visible_when_ready() {
+fn persistent_peers_follow_ordinary_agent_visibility() {
     let now = chrono::Utc::now();
-    let sidecar = SubagentSnapshot {
+    let mut peer = SubagentSnapshot {
         session_id: Uuid::new_v4(),
         parent_session_id: Uuid::new_v4(),
         task_name: "/root/claude".to_string(),
@@ -2530,22 +2529,35 @@ fn persistent_sidecars_remain_visible_when_ready() {
         usage: borg_remote::SubagentUsage::default(),
     };
     let mut transcript = Transcript::default();
-    transcript
-        .subagent_snapshots
-        .insert(sidecar.session_id, sidecar);
+    transcript.upsert_subagent_snapshot(&peer);
 
-    let rows = transcript
+    let ready_rows = transcript
         .agent_roster_entries()
         .into_iter()
         .map(|(row, _)| row)
         .collect::<Vec<_>>();
 
-    assert_eq!(rows.len(), 2);
-    assert!(rows[1].starts_with("Claude  claude-opus-5  high  ready"));
-    assert_eq!(transcript.persistent_sidecar_count(), 1);
+    assert_eq!(ready_rows.len(), 1);
+    assert_eq!(transcript.active_subagent_count(), 0);
     assert_eq!(
-        agents_status_label_with_persistent_sidecars(0, 1).as_deref(),
-        Some("1 persistent peer")
+        agents_status_label(transcript.active_subagent_count()),
+        None
+    );
+
+    peer.status = SubagentStatus::Running;
+    transcript.upsert_subagent_snapshot(&peer);
+    let running_rows = transcript
+        .agent_roster_entries()
+        .into_iter()
+        .map(|(row, _)| row)
+        .collect::<Vec<_>>();
+
+    assert_eq!(running_rows.len(), 2);
+    assert!(running_rows[1].starts_with("Claude  claude-opus-5  high  running"));
+    assert_eq!(transcript.active_subagent_count(), 1);
+    assert_eq!(
+        agents_status_label(transcript.active_subagent_count()).as_deref(),
+        Some("1 agent")
     );
 }
 
@@ -2811,13 +2823,55 @@ fn transcript_copy_selection_can_move_beyond_last_assistant_message() {
         time: "12:01".to_string(),
     });
 
-    assert_eq!(transcript.copy_text(), Some("answer"));
+    assert_eq!(transcript.copy_text().as_deref(), Some("answer"));
     transcript.select_previous();
-    assert_eq!(transcript.copy_text(), Some("subagent · completed"));
+    assert_eq!(
+        transcript.copy_text().as_deref(),
+        Some("subagent · completed")
+    );
     transcript.select_previous();
-    assert_eq!(transcript.copy_text(), Some("answer"));
+    assert_eq!(transcript.copy_text().as_deref(), Some("answer"));
     transcript.select_next();
-    assert_eq!(transcript.copy_text(), Some("subagent · completed"));
+    assert_eq!(
+        transcript.copy_text().as_deref(),
+        Some("subagent · completed")
+    );
+}
+
+#[test]
+fn copied_markdown_message_omits_fenced_code_markers() {
+    let markdown = "Run this:\n\n```bash\nenv -u WAYLAND_DISPLAY cargo run --release\n```";
+    assert_eq!(
+        markdown_plain_text(markdown),
+        "Run this:\nenv -u WAYLAND_DISPLAY cargo run --release"
+    );
+
+    let entry = TranscriptEntry::Message {
+        actor: EventActor::Assistant,
+        text: markdown.to_string(),
+        attachments: Vec::new(),
+        model: None,
+        effort: None,
+        time: "12:00".to_string(),
+        status: MessageStatus::Complete,
+        complete: true,
+    };
+    assert_eq!(
+        entry.copy_text_owned().as_deref(),
+        Some("Run this:\nenv -u WAYLAND_DISPLAY cargo run --release")
+    );
+
+    let mut transcript = Transcript::default();
+    transcript.order.push(entry);
+    assert_eq!(
+        transcript.copy_text().as_deref(),
+        Some("Run this:\nenv -u WAYLAND_DISPLAY cargo run --release")
+    );
+    transcript.select_previous();
+    assert_eq!(
+        transcript.copy_text().as_deref(),
+        Some("Run this:\nenv -u WAYLAND_DISPLAY cargo run --release")
+    );
 }
 
 #[test]

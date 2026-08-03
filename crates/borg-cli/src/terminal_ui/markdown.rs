@@ -246,6 +246,74 @@ pub(super) fn markdown_lines(
     lines
 }
 
+/// Return the readable text represented by Markdown without copying its
+/// presentation syntax. In particular, fenced code contributes only its
+/// source, not the opening language marker or closing fence.
+pub(super) fn markdown_plain_text(markdown: &str) -> String {
+    let mut output = String::new();
+    let mut list_indices = Vec::new();
+
+    for event in Parser::new_ext(markdown, Options::all()) {
+        match event {
+            MarkdownEvent::Start(Tag::CodeBlock(_)) => append_line_break(&mut output),
+            MarkdownEvent::End(TagEnd::CodeBlock) => append_line_break(&mut output),
+            MarkdownEvent::Start(Tag::List(start)) => list_indices.push(start),
+            MarkdownEvent::End(TagEnd::List(_)) => {
+                list_indices.pop();
+                append_line_break(&mut output);
+            }
+            MarkdownEvent::Start(Tag::Item) => {
+                append_line_break(&mut output);
+                let depth = list_indices.len().saturating_sub(1);
+                if depth > 0 {
+                    output.push_str(&"  ".repeat(depth));
+                }
+                match list_indices.last_mut() {
+                    Some(Some(index)) => {
+                        output.push_str(&format!("{index}. "));
+                        *index += 1;
+                    }
+                    _ => output.push_str("• "),
+                }
+            }
+            MarkdownEvent::End(TagEnd::Item | TagEnd::Paragraph | TagEnd::Heading(_)) => {
+                append_line_break(&mut output);
+            }
+            MarkdownEvent::Start(Tag::TableRow) => append_line_break(&mut output),
+            MarkdownEvent::End(TagEnd::TableRow | TagEnd::Table) => {
+                append_line_break(&mut output);
+            }
+            MarkdownEvent::End(TagEnd::TableCell) => output.push('\t'),
+            MarkdownEvent::Text(text) | MarkdownEvent::Code(text) => output.push_str(&text),
+            MarkdownEvent::InlineMath(source) | MarkdownEvent::DisplayMath(source) => {
+                output.push_str(&source)
+            }
+            MarkdownEvent::SoftBreak => output.push(' '),
+            MarkdownEvent::HardBreak | MarkdownEvent::Rule => append_line_break(&mut output),
+            MarkdownEvent::TaskListMarker(checked) => {
+                output.push_str(if checked { "[x] " } else { "[ ] " });
+            }
+            MarkdownEvent::Html(html) => output.push_str(&html),
+            _ => {}
+        }
+    }
+
+    let mut lines = output.split('\n').collect::<Vec<_>>();
+    while lines.first().is_some_and(|line| line.trim().is_empty()) {
+        lines.remove(0);
+    }
+    while lines.last().is_some_and(|line| line.trim().is_empty()) {
+        lines.pop();
+    }
+    lines.join("\n")
+}
+
+fn append_line_break(output: &mut String) {
+    if !output.is_empty() && !output.ends_with('\n') {
+        output.push('\n');
+    }
+}
+
 pub(super) fn markdown_link_ranges(markdown: &str, lines: &[Line<'_>]) -> Vec<LinkRowRange> {
     let mut targets = Vec::new();
     let mut active: Option<(Option<String>, String)> = None;

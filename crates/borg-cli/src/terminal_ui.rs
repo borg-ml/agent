@@ -58,7 +58,9 @@ use unicode_width::UnicodeWidthStr;
 use uuid::Uuid;
 
 use self::cache_diagnostics::{CacheDiagnostics, CacheSignature, CacheStatus, CacheUsage};
-use self::markdown::{markdown_lines, markdown_link_ranges, open_http_link, truncate_table_cell};
+use self::markdown::{
+    markdown_lines, markdown_link_ranges, markdown_plain_text, open_http_link, truncate_table_cell,
+};
 use self::terminal_input::TerminalInput;
 pub(crate) use self::terminal_input::TerminalInputEvent;
 use crate::agent_config::KeybindingConfig;
@@ -1983,6 +1985,7 @@ impl BorgTerminal {
 
     fn focus_director_transcript(&mut self) {
         let Some(child_id) = self.focused_child.take() else {
+            self.notice = None;
             return;
         };
         switch_to_director_transcript(
@@ -1993,7 +1996,10 @@ impl BorgTerminal {
         );
         self.team_switcher_open = false;
         self.reset_transcript_focus();
-        self.notice = Some("Viewing director transcript".to_string());
+        // The director transcript is the default view. A persistent banner
+        // saying that we are viewing it is both redundant and obscures the
+        // statusline's useful state.
+        self.notice = None;
     }
 
     #[must_use]
@@ -3700,7 +3706,6 @@ impl BorgTerminal {
             .as_deref()
             .unwrap_or(&self.transcript);
         let active_subagents = team_transcript.active_subagent_count();
-        let persistent_sidecars = team_transcript.persistent_sidecar_count();
         let agent_roster_entries = team_transcript.agent_roster_entries();
         let focused_agent_name = self.focused_child.and_then(|child| {
             team_transcript
@@ -4437,8 +4442,7 @@ impl BorgTerminal {
                 status_duration.as_deref(),
             );
             let status_width = status_spans.iter().map(|span| span.width()).sum::<usize>();
-            let agents_status =
-                agents_status_label_with_persistent_sidecars(active_subagents, persistent_sidecars);
+            let agents_status = agents_status_label(active_subagents);
             let agents_status_width = agents_status
                 .as_ref()
                 .map(|status| activity_glyph(SessionStatus::Running).width() + 1 + status.width());
@@ -5382,7 +5386,7 @@ impl BorgTerminal {
         }
         if self.keymap.matches(KeyAction::Copy, &key) {
             if let Some(text) = self.transcript.copy_text() {
-                match clipboard::copy(text) {
+                match clipboard::copy(&text) {
                     Ok(lease) => {
                         self.clipboard_lease = lease;
                         self.show_copy_notice(self.transcript.copy_notice());
@@ -5802,13 +5806,6 @@ fn display_agent_name(task_name: &str) -> String {
         "gpt" => "GPT".to_string(),
         name => name.to_string(),
     }
-}
-
-fn is_persistent_sidecar_task_name(task_name: &str) -> bool {
-    matches!(
-        task_name.strip_prefix("/root/").unwrap_or(task_name),
-        "claude" | "gpt"
-    )
 }
 
 fn team_roster_row_style(focused: bool, hovered: bool, is_subagent: bool) -> Style {
@@ -7662,13 +7659,6 @@ impl Transcript {
             .count()
     }
 
-    fn persistent_sidecar_count(&self) -> usize {
-        self.subagent_snapshots
-            .values()
-            .filter(|agent| is_persistent_sidecar_task_name(&agent.task_name))
-            .count()
-    }
-
     fn agent_roster_entries(&self) -> Vec<(String, Option<Uuid>)> {
         let mut rows = Vec::new();
         if let Some(config) = self.config.as_ref() {
@@ -7689,10 +7679,7 @@ impl Transcript {
         let mut agents = self
             .subagent_snapshots
             .values()
-            .filter(|agent| {
-                subagent_is_working(agent.status)
-                    || is_persistent_sidecar_task_name(&agent.task_name)
-            })
+            .filter(|agent| subagent_is_working(agent.status))
             .collect::<Vec<_>>();
         agents.sort_by(|left, right| left.task_name.cmp(&right.task_name));
         rows.extend(agents.into_iter().map(|agent| {
@@ -8628,17 +8615,17 @@ impl Transcript {
         windows
     }
 
-    fn copy_text(&self) -> Option<&str> {
+    fn copy_text(&self) -> Option<String> {
         self.selected
             .and_then(|index| self.order.get(index))
-            .and_then(TranscriptEntry::copy_text)
+            .and_then(TranscriptEntry::copy_text_owned)
             .or_else(|| {
                 self.order.iter().rev().find_map(|entry| match entry {
                     TranscriptEntry::Message {
                         actor: EventActor::Assistant,
                         text,
                         ..
-                    } => Some(text.as_str()),
+                    } => Some(markdown_plain_text(text)),
                     _ => None,
                 })
             })
@@ -9353,18 +9340,11 @@ fn context_remaining_percent(tokens: u64, window: u64) -> u8 {
 }
 
 impl TranscriptEntry {
-    fn copy_text(&self) -> Option<&str> {
-        match self {
-            Self::Message { text, .. } | Self::Activity { text, .. } | Self::Info { text, .. } => {
-                Some(text)
-            }
-            Self::Compaction { .. } | Self::Plan { .. } | Self::Goal { .. } => None,
-            Self::Tool { detail, .. } => Some(detail),
-        }
-    }
-
     fn copy_text_owned(&self) -> Option<String> {
         match self {
+            Self::Message { text, .. } | Self::Activity { text, .. } | Self::Info { text, .. } => {
+                Some(markdown_plain_text(text))
+            }
             Self::Plan { items, .. } => Some(
                 items
                     .iter()
@@ -9388,7 +9368,7 @@ impl TranscriptEntry {
                     .map(|(_, source)| source.clone())
                     .unwrap_or_else(|| detail.clone()),
             ),
-            _ => self.copy_text().map(str::to_string),
+            Self::Compaction { .. } => None,
         }
     }
 }
@@ -11045,28 +11025,13 @@ fn history_loading_line() -> Line<'static> {
     ])
 }
 
-fn agents_status_label_with_persistent_sidecars(
-    active_subagents: usize,
-    persistent_sidecars: usize,
-) -> Option<String> {
-    if active_subagents == 0 && persistent_sidecars == 0 {
-        return None;
-    }
-    if persistent_sidecars == 0 {
-        return Some(format!(
-            "{active_subagents} subagent{}",
-            if active_subagents == 1 { "" } else { "s" }
-        ));
-    }
-    if active_subagents == 0 {
-        return Some(format!(
-            "{persistent_sidecars} persistent peer{}",
-            if persistent_sidecars == 1 { "" } else { "s" }
-        ));
-    }
-    Some(format!(
-        "{active_subagents} active · {persistent_sidecars} persistent"
-    ))
+fn agents_status_label(active_agents: usize) -> Option<String> {
+    (active_agents > 0).then(|| {
+        format!(
+            "{active_agents} agent{}",
+            if active_agents == 1 { "" } else { "s" }
+        )
+    })
 }
 
 fn subagent_is_working(status: SubagentStatus) -> bool {
