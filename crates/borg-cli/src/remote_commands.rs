@@ -45,7 +45,10 @@ const ACTIVITY_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_m
 /// Keep first paint bounded while retaining enough context to include a real
 /// recent exchange instead of an empty shell made only of projection events.
 const RICH_TUI_HISTORY_EVENT_LIMIT: usize = 128;
-const RICH_TUI_HISTORY_BOOTSTRAP_SCAN_LIMIT: usize = 4_096;
+// Keep first paint from deserializing a whole tool-heavy turn. The visible
+// tail is still capped separately; this scan only supplies a few recent real
+// conversation messages that may sit behind tool activity.
+const RICH_TUI_HISTORY_BOOTSTRAP_SCAN_LIMIT: usize = 512;
 const RICH_TUI_HISTORY_MESSAGE_LIMIT: usize = 8;
 const RICH_TUI_HISTORY_PAGE_SIZE: usize = 512;
 const RICH_TUI_PROMPT_HISTORY_LIMIT: usize = 64;
@@ -911,13 +914,6 @@ async fn run_local_agent_session(
     } else {
         store.read(session_id).await?
     };
-    let composer_history = if can_prompt && !fallback_terminal {
-        store
-            .recent_user_messages(session_id, RICH_TUI_PROMPT_HISTORY_LIMIT)
-            .await?
-    } else {
-        Vec::new()
-    };
     let mut history_start_reached = session_state.latest_sequence == 0
         || history.first().is_some_and(|event| event.sequence <= 1);
     let (team_history, mut team_snapshots) = if can_prompt && !fallback_terminal {
@@ -1124,7 +1120,6 @@ async fn run_local_agent_session(
         .tui_active
         .store(terminal.is_some(), Ordering::Release);
     if let Some(terminal) = terminal.as_mut() {
-        terminal.seed_composer_history(&composer_history);
         terminal.seed_history(&history);
         terminal.seed_team_roster(&team_snapshots);
         terminal.seed_session_state(&session_state);
@@ -1156,6 +1151,19 @@ async fn run_local_agent_session(
         }
         terminal.draw()?;
     }
+    // Prompt recall is not part of first paint. The bounded transcript tail
+    // already seeds the composer with the newest prompts; older prompts are
+    // only needed when the user presses Up. Loading them here used to scan the
+    // entire session event table before the first frame, which made long chats
+    // feel like they were eagerly replaying their whole history.
+    let mut composer_history_task = (resuming && terminal.is_some()).then(|| {
+        let composer_store = Arc::clone(&store);
+        tokio::spawn(async move {
+            composer_store
+                .recent_user_messages(session_id, RICH_TUI_PROMPT_HISTORY_LIMIT)
+                .await
+        })
+    });
     // Team recovery can involve the entire root projection plus one child-tail
     // query per roster entry. Start it only after the latest root tail is on
     // screen so it can never delay the first frame.
@@ -1228,6 +1236,27 @@ async fn run_local_agent_session(
     let mut shutdown_signal_open = true;
     loop {
         tokio::select! {
+            composer_history_result = async {
+                composer_history_task
+                    .as_mut()
+                    .expect("composer-history task branch is guarded")
+                    .await
+            }, if composer_history_task.is_some() => {
+                composer_history_task = None;
+                match composer_history_result {
+                    Ok(Ok(composer_history)) => {
+                        if let Some(terminal) = terminal.as_mut() {
+                            terminal.seed_composer_history(&composer_history);
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        tracing::warn!(%error, "could not hydrate composer history after first paint");
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "composer history hydration task failed");
+                    }
+                }
+            }
             team_state_result = async {
                 team_state_task
                     .as_mut()
@@ -2378,6 +2407,9 @@ async fn run_local_agent_session(
                                 cwd.clone(),
                                 &agent_config.keybindings,
                             )?;
+                            let composer_history = store
+                                .recent_user_messages(session_id, RICH_TUI_PROMPT_HISTORY_LIMIT)
+                                .await?;
                             restored.seed_composer_history(&composer_history);
                             restored.seed_history(&latest);
                             let (_, agents, histories) = load_subagent_thread_state(
@@ -3260,6 +3292,12 @@ async fn run_local_agent_session(
                                             cwd.clone(),
                                             &agent_config.keybindings,
                                         )?;
+                                        let composer_history = store
+                                            .recent_user_messages(
+                                                session_id,
+                                                RICH_TUI_PROMPT_HISTORY_LIMIT,
+                                            )
+                                            .await?;
                                         restored.seed_composer_history(&composer_history);
                                         restored.seed_history(&latest);
                                         let (_, agents, histories) =
@@ -3311,6 +3349,12 @@ async fn run_local_agent_session(
                                             cwd.clone(),
                                             &agent_config.keybindings,
                                         )?;
+                                        let composer_history = store
+                                            .recent_user_messages(
+                                                session_id,
+                                                RICH_TUI_PROMPT_HISTORY_LIMIT,
+                                            )
+                                            .await?;
                                         restored.seed_composer_history(&composer_history);
                                         restored.seed_history(&latest);
                                         let (_, agents, histories) =
@@ -5598,7 +5642,7 @@ mod tests {
     fn first_resume_scan_is_bounded_before_history_is_selected() {
         assert_eq!(recent_tui_history_after(10), 0);
         assert_eq!(recent_tui_history_after(100), 0);
-        assert_eq!(recent_tui_history_after(60_000), 55_904);
+        assert_eq!(recent_tui_history_after(60_000), 59_488);
     }
 
     #[test]

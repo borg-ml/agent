@@ -42,6 +42,23 @@ type Control =
     }
   | { type: "start"; config: ProviderConfig };
 
+type QueryWithCancellation = ReturnType<typeof query> & {
+  cancelAsyncMessage(messageUuid: string): Promise<boolean>;
+};
+
+async function cancelQueuedMessage(
+  stream: ReturnType<typeof query>,
+  messageUuid: string,
+): Promise<void> {
+  // The runtime exposes cancelAsyncMessage alongside interrupt(), but older
+  // SDK declaration files omitted it from Query. Keep the cast local and
+  // feature-detect so the adapter remains compatible with those versions.
+  const cancellable = stream as QueryWithCancellation;
+  if (typeof cancellable.cancelAsyncMessage === "function") {
+    await cancellable.cancelAsyncMessage(messageUuid);
+  }
+}
+
 type UserMessage = {
   type: "user";
   message: {
@@ -72,6 +89,11 @@ class AsyncQueue<T> implements AsyncIterable<T> {
     for (const waiter of this.waiters.splice(0)) {
       waiter({ value: undefined, done: true });
     }
+  }
+
+  /** Drop values that match a predicate before they reach the SDK transport. */
+  removeWhere(predicate: (value: T) => boolean): void {
+    this.values = this.values.filter((value) => !predicate(value));
   }
 
   [Symbol.asyncIterator](): AsyncIterator<T> {
@@ -160,6 +182,9 @@ async function main(): Promise<void> {
   let activeInputIds: Set<string> | undefined;
   let activeBoundary: TurnMessageBoundary | undefined;
   let activeStream: ReturnType<typeof query> | undefined;
+  let acceptingSteers = false;
+  let activeSteerIds = new Set<string>();
+  const pendingSteers: UserMessage[] = [];
   const pendingApprovals = new Map<
     string,
     {
@@ -254,14 +279,37 @@ async function main(): Promise<void> {
           const message = userMessage(
             promptText(control.text, control.attachments),
           );
-          activeInputIds?.add(message.uuid);
-          activeInput?.push(message);
+          if (acceptingSteers) {
+            activeSteerIds.add(message.uuid);
+            activeInputIds?.add(message.uuid);
+            activeInput?.push(message);
+          } else {
+            // A result can race the control reader while the session is
+            // already waiting for the next `start`. Preserve that steer for
+            // the next turn instead of injecting it into the old SDK queue.
+            pendingSteers.push(message);
+          }
         } else if (control.type === "interrupt") {
           const stream = activeStream;
           if (stream) {
+            // Remove only steers which are still local to this adapter before
+            // interrupting; the initial prompt may also still be buffered.
+            // The SDK receipt covers messages already handed to the CLI.
+            activeInput?.removeWhere((message) =>
+              activeSteerIds.has(message.uuid),
+            );
+            activeSteerIds.clear();
+            const interrupt = await Promise.allSettled([stream.interrupt()]);
+            const receipt =
+              interrupt[0]?.status === "fulfilled"
+                ? interrupt[0].value
+                : undefined;
+            const queued = receipt?.still_queued ?? [];
             await Promise.allSettled(
               [
-                stream.interrupt(),
+                ...queued.map((messageUuid) =>
+                  cancelQueuedMessage(stream, messageUuid),
+                ),
                 ...(activeBoundary?.backgroundTaskIds() ?? []).map((taskId) =>
                   stream.stopTask(taskId),
                 ),
@@ -317,9 +365,17 @@ async function main(): Promise<void> {
       activeInputIds = inputIds;
       activeBoundary = boundary;
       input.push(initialMessage);
+      for (const steer of pendingSteers.splice(0)) {
+        activeSteerIds.add(steer.uuid);
+        inputIds.add(steer.uuid);
+        input.push(steer);
+      }
+      acceptingSteers = true;
       while (true) {
         const nextMessage = await messages.next();
         if (nextMessage.done) {
+          acceptingSteers = false;
+          activeSteerIds.clear();
           config = undefined;
           break;
         }
@@ -347,7 +403,11 @@ async function main(): Promise<void> {
             // authoritative in that case.
           }
         }
-        if (action === "terminal") break;
+        if (action === "terminal") {
+          acceptingSteers = false;
+          activeSteerIds.clear();
+          break;
+        }
       }
       if (!config) break;
       const next = await turns[Symbol.asyncIterator]().next();
@@ -362,6 +422,8 @@ async function main(): Promise<void> {
     activeInputIds = undefined;
     activeBoundary = undefined;
     activeStream = undefined;
+    acceptingSteers = false;
+    activeSteerIds.clear();
     input.close();
     stream.close();
   }

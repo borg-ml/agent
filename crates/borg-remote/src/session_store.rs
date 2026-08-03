@@ -2049,21 +2049,35 @@ impl SessionStore for SqliteSessionStore {
         if limit == 0 {
             return Ok(Vec::new());
         }
+        // Use the existing message-id partial index to avoid walking every
+        // tool/reasoning event in a long session. We sort the much smaller
+        // message set in memory because the legacy index is keyed by message
+        // id rather than sequence.
         let rows = sqlx::query(
             "select event_json from session_events \
-             where session_id = ? and event_kind = 'message' \
-               and json_extract(event_json, '$.kind.actor') = 'user' \
-               and json_extract(event_json, '$.kind.status') = 'complete' \
-             order by sequence desc limit ?",
+             where session_id = ? and message_id is not null",
         )
         .bind(session_id.to_string())
-        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
         .fetch_all(&self.pool)
         .await?;
         let mut messages = rows
             .into_iter()
             .map(|row| serde_json::from_str(row.try_get("event_json")?).map_err(Into::into))
-            .collect::<Result<Vec<SessionEvent>>>()?;
+            .collect::<Result<Vec<SessionEvent>>>()?
+            .into_iter()
+            .filter(|event| {
+                matches!(
+                    event.kind,
+                    SessionEventKind::Message {
+                        actor: crate::EventActor::User,
+                        status: crate::MessageStatus::Complete,
+                        ..
+                    }
+                )
+            })
+            .collect::<Vec<_>>();
+        messages.sort_unstable_by(|left, right| right.sequence.cmp(&left.sequence));
+        messages.truncate(limit);
         messages.reverse();
         Ok(messages)
     }

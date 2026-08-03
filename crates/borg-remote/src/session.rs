@@ -1117,6 +1117,7 @@ async fn run_agent_session_store_kernel(
                             },
                         )
                         .await?;
+                        let mut direct_compaction_usage = None;
                         let result: Result<Option<crate::AgentCompaction>> = async {
                             if launch.provider.uses_native_harness() {
                                 let model = launch
@@ -1144,10 +1145,12 @@ async fn run_agent_session_store_kernel(
                                     .map(Some)
                             } else {
                                 match provider_session_id.as_deref() {
-                                    Some(provider_session_id) => executor
-                                        .compact(launch.provider, provider_session_id)
-                                        .await
-                                        .map(|()| None),
+                                    Some(provider_session_id) => {
+                                        direct_compaction_usage = executor
+                                            .compact(launch.provider, provider_session_id)
+                                            .await?;
+                                        Ok(None)
+                                    }
                                     None => {
                                         let context =
                                             retained_conversation_context(journal.context_events())
@@ -1186,6 +1189,15 @@ async fn run_agent_session_store_kernel(
                         .await;
                         match result {
                             Ok(native) => {
+                                if let Some(usage) = direct_compaction_usage.as_ref() {
+                                    record(
+                                        &mut journal,
+                                        &events,
+                                        session_id,
+                                        native_usage_event(usage),
+                                    )
+                                    .await?;
+                                }
                                 if let Some(native) = native.as_ref() {
                                     record(
                                         &mut journal,

@@ -158,7 +158,11 @@ pub trait AgentTurnExecutor: Send + Sync {
         anyhow::bail!("model consultation is not supported by this executor")
     }
 
-    async fn compact(&self, _provider: CodingProvider, _provider_session_id: &str) -> Result<()> {
+    async fn compact(
+        &self,
+        _provider: CodingProvider,
+        _provider_session_id: &str,
+    ) -> Result<Option<ProviderCallUsage>> {
         anyhow::bail!("manual context compaction is not supported by this provider")
     }
 
@@ -397,9 +401,13 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
         })
     }
 
-    async fn compact(&self, provider: CodingProvider, provider_session_id: &str) -> Result<()> {
+    async fn compact(
+        &self,
+        provider: CodingProvider,
+        provider_session_id: &str,
+    ) -> Result<Option<ProviderCallUsage>> {
         match provider {
-            CodingProvider::Codex => self.codex_pool.compact(provider_session_id),
+            CodingProvider::Codex => self.codex_pool.compact(provider_session_id).map(|()| None),
             CodingProvider::Claude => {
                 let snapshot = self
                     .claude_sessions
@@ -408,7 +416,9 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
                     .get(provider_session_id)
                     .cloned()
                     .context("Claude context is not available until the current turn finishes")?;
-                compact_claude_session(snapshot, provider_session_id).await
+                compact_claude_session(snapshot, provider_session_id)
+                    .await
+                    .map(Some)
             }
             _ => bail!("manual context compaction is not supported by this provider"),
         }
@@ -494,28 +504,35 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
             .provider_session_id
             .context("provider compaction preparation did not create a conversation")?;
 
-        match provider {
-            CodingProvider::Codex => self.codex_pool.compact(&provider_session_id)?,
-            CodingProvider::Claude => {
+        let compaction_usage = match provider {
+            CodingProvider::Codex => {
+                self.codex_pool.compact(&provider_session_id)?;
+                None
+            }
+            CodingProvider::Claude => Some(
                 compact_claude_session(
                     self.claude_session_snapshot(&provider_session_id)?,
                     &provider_session_id,
                 )
-                .await?;
-            }
+                .await?,
+            ),
             _ => unreachable!("provider was validated above"),
-        }
+        };
 
         anyhow::ensure!(
             !result.final_text.trim().is_empty(),
             "provider compaction preparation returned an empty summary"
         );
+        let mut usage = usage
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(compaction_usage) = compaction_usage.as_ref() {
+            add_provider_usage(&mut usage, compaction_usage);
+        }
         Ok(AgentCompaction {
             summary: result.final_text,
-            usage: usage
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .clone(),
+            usage,
             provider_session_id: Some(provider_session_id),
         })
     }
@@ -1268,7 +1285,7 @@ fn usage_from_session_event(event: &SessionEventKind) -> Option<ProviderCallUsag
 async fn compact_claude_session(
     snapshot: ClaudeSessionSnapshot,
     provider_session_id: &str,
-) -> Result<()> {
+) -> Result<ProviderCallUsage> {
     let mut request = snapshot.request;
     request.prompt = "/compact".to_string();
     request.attachments.clear();
@@ -1284,12 +1301,36 @@ async fn compact_claude_session(
     };
     while let Some(event) = stream.recv().await {
         match event {
-            ChatStreamEvent::Done { .. } => return Ok(()),
+            ChatStreamEvent::Done { usage, .. } => return Ok(usage.unwrap_or_default()),
             ChatStreamEvent::Failed { error } => bail!("Claude context compaction failed: {error}"),
             _ => {}
         }
     }
     bail!("Claude context compaction ended without confirmation")
+}
+
+fn add_provider_usage(total: &mut ProviderCallUsage, additional: &ProviderCallUsage) {
+    total.duration_ms = total.duration_ms.saturating_add(additional.duration_ms);
+    total.input_tokens = total.input_tokens.saturating_add(additional.input_tokens);
+    total.cached_input_tokens = total
+        .cached_input_tokens
+        .saturating_add(additional.cached_input_tokens);
+    total.cache_creation_input_tokens = total
+        .cache_creation_input_tokens
+        .saturating_add(additional.cache_creation_input_tokens);
+    total.output_tokens = total.output_tokens.saturating_add(additional.output_tokens);
+    total.total_tokens = total.total_tokens.saturating_add(additional.total_tokens);
+    total.context_tokens = additional.context_tokens.or(total.context_tokens);
+    total.context_window_tokens = additional
+        .context_window_tokens
+        .or(total.context_window_tokens);
+    total.cost_microusd = match (total.cost_microusd, additional.cost_microusd) {
+        (Some(left), Some(right)) => Some(left.saturating_add(right)),
+        (left, right) => right.or(left),
+    };
+    if additional.cost_microusd.is_some() {
+        total.cost_basis = additional.cost_basis;
+    }
 }
 
 fn provider_event_is_transient(kind: &str) -> bool {
@@ -1503,6 +1544,43 @@ mod tests {
         let next_turn = executor.runtime_extensions.read().unwrap();
         assert_eq!(next_turn.external_mcp_servers[0].name, "new");
         assert_eq!(next_turn.skill_roots, [PathBuf::from("new-skills")]);
+    }
+
+    #[test]
+    fn compaction_usage_is_added_to_preparation_usage() {
+        let mut preparation = ProviderCallUsage {
+            duration_ms: 10,
+            input_tokens: 100,
+            cached_input_tokens: 40,
+            cache_creation_input_tokens: 5,
+            output_tokens: 20,
+            total_tokens: 165,
+            cost_microusd: Some(100),
+            cost_basis: CostBasis::ProviderReported,
+            ..Default::default()
+        };
+        let compaction = ProviderCallUsage {
+            duration_ms: 25,
+            input_tokens: 200,
+            cached_input_tokens: 80,
+            cache_creation_input_tokens: 7,
+            output_tokens: 30,
+            total_tokens: 317,
+            cost_microusd: Some(200),
+            cost_basis: CostBasis::ProviderReported,
+            ..Default::default()
+        };
+
+        add_provider_usage(&mut preparation, &compaction);
+
+        assert_eq!(preparation.duration_ms, 35);
+        assert_eq!(preparation.input_tokens, 300);
+        assert_eq!(preparation.cached_input_tokens, 120);
+        assert_eq!(preparation.cache_creation_input_tokens, 12);
+        assert_eq!(preparation.output_tokens, 50);
+        assert_eq!(preparation.total_tokens, 482);
+        assert_eq!(preparation.cost_microusd, Some(300));
+        assert_eq!(preparation.cost_basis, CostBasis::ProviderReported);
     }
 
     #[tokio::test]
