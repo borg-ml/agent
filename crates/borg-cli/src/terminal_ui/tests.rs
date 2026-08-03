@@ -993,6 +993,141 @@ fn large_transcript_live_tail_render_p95_gate() {
 }
 
 #[test]
+#[ignore = "manual resume-ingest and transcript-scroll profile"]
+fn large_resume_ingest_and_transcript_scroll_profile() {
+    const RESUME_TURNS: usize = 5_000;
+    const CHILD_REPORTS: usize = 4_000;
+    const CHILD_COUNT: usize = 32;
+    const VIEWPORT_HEIGHT: usize = 24;
+
+    let session_id = Uuid::new_v4();
+    let child_ids = (0..CHILD_COUNT).map(|_| Uuid::new_v4()).collect::<Vec<_>>();
+    let mut events = Vec::with_capacity(RESUME_TURNS * 2 + CHILD_REPORTS);
+    for turn in 0..RESUME_TURNS {
+        let user_sequence = (turn * 2 + 1) as u64;
+        events.push(SessionEvent::new(
+            session_id,
+            user_sequence,
+            SessionEventKind::Message {
+                message_id: Uuid::new_v4(),
+                actor: EventActor::User,
+                text: format!(
+                    "Please inspect resume fixture {turn}. Include the relevant file and explain the next step."
+                ),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            },
+        ));
+        events.push(SessionEvent::new(
+            session_id,
+            user_sequence + 1,
+            SessionEventKind::Message {
+                message_id: Uuid::new_v4(),
+                actor: EventActor::Assistant,
+                text: format!(
+                    "## Resume result {turn}\n\nThe fixture is healthy.\n\n- checked the input\n- preserved the context\n- queued the next action"
+                ),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            },
+        ));
+    }
+    for report in 0..CHILD_REPORTS {
+        let child_id = child_ids[report % CHILD_COUNT];
+        let agent = SubagentSnapshot {
+            session_id: child_id,
+            parent_session_id: session_id,
+            task_name: format!("/root/profile_worker_{}", report % CHILD_COUNT),
+            status: SubagentStatus::Running,
+            provider: CodingProvider::Codex,
+            model: Some("profile-fixture".to_string()),
+            effort: Some("medium".to_string()),
+            cwd: PathBuf::from("/workspace"),
+            detail: None,
+            final_text: None,
+            usage: Default::default(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let child_event = SessionEvent::new(
+            child_id,
+            report as u64 + 1,
+            SessionEventKind::Message {
+                message_id: Uuid::new_v4(),
+                actor: EventActor::Assistant,
+                text: format!("worker report {report}: completed checkpoint"),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            },
+        );
+        events.push(SessionEvent::new(
+            session_id,
+            (RESUME_TURNS * 2 + report + 1) as u64,
+            SessionEventKind::SubagentActivity {
+                activity: SubagentActivityKind::Updated,
+                agent,
+                event: Some(Box::new(child_event)),
+            },
+        ));
+    }
+
+    let mut transcript = Transcript::default();
+    transcript.reserve_history(events.len());
+    let ingest_started = Instant::now();
+    for event in &events {
+        transcript.apply(event);
+    }
+    let ingest = ingest_started.elapsed();
+    assert_eq!(transcript.messages.len(), RESUME_TURNS * 2);
+    assert_eq!(transcript.subagent_entries.len(), CHILD_COUNT);
+
+    let first_render_started = Instant::now();
+    let first_render = transcript.render(120, None, None, None);
+    let first_render_time = first_render_started.elapsed();
+    assert!(first_render.0.len() > VIEWPORT_HEIGHT);
+
+    let cached_render_started = Instant::now();
+    let cached_render = transcript.render(120, None, None, None);
+    let cached_render_time = cached_render_started.elapsed();
+    assert_eq!(cached_render.0.len(), first_render.0.len());
+
+    let reflow_started = Instant::now();
+    let mut reflow_rows = 0usize;
+    for width in [96, 144, 80, 120, 110, 132] {
+        let rendered = transcript.render(width, None, None, None);
+        reflow_rows = reflow_rows.saturating_add(rendered.0.len());
+        std::hint::black_box(rendered);
+    }
+    let reflow_time = reflow_started.elapsed();
+
+    let scroll_started = Instant::now();
+    let max_scroll = first_render.0.len().saturating_sub(VIEWPORT_HEIGHT);
+    let mut scroll_checksum = 0usize;
+    for offset in (0..=max_scroll).step_by(37) {
+        let viewport_end = offset
+            .saturating_add(VIEWPORT_HEIGHT)
+            .min(first_render.0.len());
+        scroll_checksum = scroll_checksum.saturating_add(
+            first_render.0[offset..viewport_end]
+                .iter()
+                .map(Line::width)
+                .sum::<usize>(),
+        );
+    }
+    let scroll_time = scroll_started.elapsed();
+    std::hint::black_box((reflow_rows, scroll_checksum));
+
+    eprintln!(
+        "large resume/profile: events={} entries={} ingest={ingest:?} first_render={first_render_time:?} cached_render={cached_render_time:?} reflow={reflow_time:?} scroll={scroll_time:?}",
+        events.len(),
+        transcript.order.len(),
+    );
+}
+
+#[test]
 fn projection_only_events_keep_the_transcript_layout_cache() {
     assert!(!session_event_changes_transcript(
         &SessionEventKind::UsageUpdated {
@@ -2769,7 +2904,7 @@ fn subagent_activity_collapses_chatter_and_keeps_terminal_result() {
     assert!(matches!(
         &transcript.order[0],
         TranscriptEntry::Activity { text, .. }
-            if text == "Message agent · inspect_ui · report · Found the renderer issue without another user prompt."
+            if text == "agent · inspect_ui · report ready"
     ));
     agent.status = SubagentStatus::WaitingForApproval;
     transcript.apply(&activity(

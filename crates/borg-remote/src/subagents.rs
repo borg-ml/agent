@@ -33,6 +33,7 @@ use crate::{
 };
 
 pub const DEFAULT_MAX_SUBAGENTS: usize = 16;
+const ROOT_MESSAGE_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
@@ -941,6 +942,7 @@ pub struct SubagentCoordinator {
     activity_tx: broadcast::Sender<SubagentActivity>,
     root_inbox: Arc<Mutex<Vec<TeamInboxMessage>>>,
     root_message_tx: broadcast::Sender<TeamInboxMessage>,
+    root_message_dispatches: Arc<Mutex<HashMap<Uuid, Instant>>>,
     projected_root_messages: Arc<Mutex<HashSet<Uuid>>>,
     consultation_lock: Arc<Mutex<()>>,
 }
@@ -975,6 +977,7 @@ impl SubagentCoordinator {
             activity_tx,
             root_inbox: Arc::new(Mutex::new(Vec::new())),
             root_message_tx,
+            root_message_dispatches: Arc::new(Mutex::new(HashMap::new())),
             projected_root_messages: Arc::new(Mutex::new(HashSet::new())),
             consultation_lock: Arc::new(Mutex::new(())),
         })
@@ -996,6 +999,50 @@ impl SubagentCoordinator {
         std::mem::take(&mut *self.root_inbox.lock().await)
     }
 
+    async fn broadcast_root_message(&self, message: TeamInboxMessage) {
+        match self.root_message_tx.send(message.clone()) {
+            Ok(_) => {
+                self.root_message_dispatches
+                    .lock()
+                    .await
+                    .insert(message.message_id, Instant::now());
+                self.root_inbox
+                    .lock()
+                    .await
+                    .retain(|queued| queued.message_id != message.message_id);
+            }
+            Err(error) => {
+                self.root_inbox.lock().await.push(error.0);
+            }
+        }
+    }
+
+    /// Re-emit durable wake/boundary messages that could not reach the root's
+    /// in-memory receiver. Queue/next-turn messages remain dormant until the
+    /// root explicitly reaches its next normal boundary.
+    pub(crate) async fn wake_pending_root_messages(&self) {
+        let messages = {
+            let dispatched = self.root_message_dispatches.lock().await;
+            let mut inbox = self.root_inbox.lock().await;
+            let mut wake = Vec::new();
+            let mut retained = Vec::with_capacity(inbox.len());
+            for message in inbox.drain(..) {
+                if message.delivery == PromptDelivery::Steer
+                    && !dispatched.contains_key(&message.message_id)
+                {
+                    wake.push(message);
+                } else {
+                    retained.push(message);
+                }
+            }
+            *inbox = retained;
+            wake
+        };
+        for message in messages {
+            self.broadcast_root_message(message).await;
+        }
+    }
+
     async fn workspace_store(&self) -> Result<&SqliteWorkspaceStore> {
         let path = self.journal_root.join("workspaces.sqlite3");
         self.workspace_store
@@ -1004,10 +1051,10 @@ impl SubagentCoordinator {
     }
 
     /// Reconcile durable workspace deliveries into the director's local
-    /// inbox and return any queued child reports that still need a root
-    /// transcript projection. This is deliberately pollable: agent MCP calls
-    /// may run outside the director process, where an in-memory broadcast
-    /// cannot wake the root session.
+    /// inbox and return any child reports that still need a root transcript
+    /// projection. This is deliberately pollable: agent MCP calls may run
+    /// outside the director process, where an in-memory broadcast cannot wake
+    /// or project into the root session.
     pub(crate) async fn refresh_root_inbox_reports(&self) -> Result<Vec<(Uuid, SubagentActivity)>> {
         let root_session_id = self.table.lock().await.root_session_id;
         let pending = self.pending_messages_for_session(root_session_id).await?;
@@ -1019,10 +1066,31 @@ impl SubagentCoordinator {
                 .contains_message(root_session_id, message.message_id)
                 .await?
             {
+                self.root_message_dispatches
+                    .lock()
+                    .await
+                    .remove(&message.message_id);
+                self.root_inbox
+                    .lock()
+                    .await
+                    .retain(|queued| queued.message_id != message.message_id);
                 self.acknowledge_message_for_session(root_session_id, message.message_id)
                     .await?;
                 continue;
             }
+            let dispatch_is_recent = self
+                .root_message_dispatches
+                .lock()
+                .await
+                .get(&message.message_id)
+                .is_some_and(|sent_at| sent_at.elapsed() < ROOT_MESSAGE_RETRY_INTERVAL);
+            if dispatch_is_recent {
+                continue;
+            }
+            self.root_message_dispatches
+                .lock()
+                .await
+                .remove(&message.message_id);
             {
                 let mut inbox = self.root_inbox.lock().await;
                 if !inbox
@@ -1032,8 +1100,7 @@ impl SubagentCoordinator {
                     inbox.push(message.clone());
                 }
             }
-            if message.delivery != PromptDelivery::Queue || projected.contains(&message.message_id)
-            {
+            if projected.contains(&message.message_id) {
                 continue;
             }
             let Some(agent) = self.get(message.sender_session_id).await else {
@@ -2108,7 +2175,8 @@ impl SubagentCoordinator {
         Ok(message_id)
     }
 
-    /// Queue a team-attributed message without waking an idle recipient.
+    /// Send a team-attributed message. Child reports addressed to `/root` use
+    /// the wake path; sibling and child messages remain next-turn queue work.
     pub async fn send_message_as(
         &self,
         actor_session_id: Uuid,
@@ -2142,25 +2210,36 @@ impl SubagentCoordinator {
         if status.is_some_and(SubagentStatus::is_terminal) {
             bail!("subagent {target} is not running");
         }
+        let wakes_root = id == root_session_id && actor_session_id != root_session_id;
         let inbox_message = self
             .persist_team_message(
                 actor_session_id,
                 id,
                 &actor,
                 &message,
-                PromptDelivery::Queue,
-                DeliveryMode::NextTurn,
+                if wakes_root {
+                    PromptDelivery::Steer
+                } else {
+                    PromptDelivery::Queue
+                },
+                if wakes_root {
+                    DeliveryMode::Wake
+                } else {
+                    DeliveryMode::NextTurn
+                },
                 options,
             )
             .await?;
         if id == root_session_id {
-            self.root_inbox.lock().await.push(inbox_message.clone());
+            if wakes_root {
+                self.broadcast_root_message(inbox_message.clone()).await;
+            } else {
+                self.root_inbox.lock().await.push(inbox_message.clone());
+            }
             if actor_session_id != root_session_id {
-                // Queue delivery intentionally does not wake the director, but
-                // the report must still be observable immediately. Project a
-                // child-authored message through the existing activity stream;
-                // the root actor records and renders it without admitting the
-                // queued inbox message to the model until the next turn.
+                // Project a child-authored report through the activity stream;
+                // the root actor also receives the durable Wake delivery above
+                // and can reconcile it without requiring a human relay.
                 let _ = self.activity_tx.send(SubagentActivity::SessionEvent {
                     parent_session_id: root_session_id,
                     task_name: actor,
@@ -2259,9 +2338,7 @@ impl SubagentCoordinator {
             let mut messages = self.take_root_inbox().await;
             messages.push(inbox_message);
             for message in messages {
-                if let Err(error) = self.root_message_tx.send(message) {
-                    self.root_inbox.lock().await.push(error.0);
-                }
+                self.broadcast_root_message(message).await;
             }
             return Ok(());
         }
@@ -2683,7 +2760,7 @@ pub fn subagent_tool_specs(provider: CodingProvider) -> Vec<Value> {
         ),
         message_tool(
             "send_message",
-            "Queue a message for a child without waking an idle child.",
+            "Queue a message for a child without waking an idle child. Reports sent by a child to /root wake the director for reconciliation.",
         ),
         message_tool("followup_task", "Send a follow-up and wake an idle child."),
         tool(
@@ -4092,23 +4169,22 @@ mod tests {
         ));
         assert!(matches!(
             wake.try_recv(),
-            Err(broadcast::error::TryRecvError::Empty)
+            Ok(message)
+                if message.delivery == PromptDelivery::Steer
+                    && message.text.contains("blocked on an API decision")
         ));
 
         coordinator
             .followup_task_as(worker.session_id, "/root", "please review")
             .await
             .unwrap();
-        let queued = wake.recv().await.unwrap();
         let followup = wake.recv().await.unwrap();
-        assert!(queued.text.contains("Team message from /root/worker"));
-        assert!(queued.text.contains("blocked on an API decision"));
         assert!(followup.text.contains("please review"));
         assert!(coordinator.take_root_inbox().await.is_empty());
     }
 
     #[tokio::test]
-    async fn durable_root_inbox_poll_recovers_a_report_without_a_process_local_receiver() {
+    async fn durable_root_inbox_poll_replays_a_report_when_wake_delivery_was_missed() {
         let directory = tempdir().unwrap();
         let root = Uuid::new_v4();
         let store = Arc::new(
@@ -4134,17 +4210,18 @@ mod tests {
             .unwrap();
         bind_test_team(directory.path(), store.as_ref(), root, &[worker.session_id]).await;
 
-        // No activity receiver exists. The immediate in-memory projection is
-        // therefore lost exactly as it would be across an MCP process boundary.
+        // No root receiver exists. The durable inbox must retain the wake and
+        // replay it when the root session reconnects.
         coordinator
             .send_message_as(worker.session_id, "/root", "durable result")
             .await
             .unwrap();
 
+        let mut wake = coordinator.subscribe_root_messages();
         let reports = coordinator.refresh_root_inbox_reports().await.unwrap();
         assert_eq!(reports.len(), 1);
         let (message_id, SubagentActivity::SessionEvent { event, .. }) = &reports[0] else {
-            panic!("expected a recovered child report");
+            panic!("expected a durable child report projection");
         };
         assert!(matches!(
             &event.kind,
@@ -4156,15 +4233,61 @@ mod tests {
             } if text == "durable result"
         ));
         coordinator.mark_root_message_projected(*message_id).await;
-        assert!(
-            coordinator
-                .refresh_root_inbox_reports()
+        coordinator.wake_pending_root_messages().await;
+        let wake = wake.recv().await.unwrap();
+        assert_eq!(wake.delivery, PromptDelivery::Steer);
+        assert!(wake.text.contains("durable result"));
+        assert!(coordinator.take_root_inbox().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn durable_root_wake_retries_after_the_receiver_is_lost() {
+        let directory = tempdir().unwrap();
+        let root = Uuid::new_v4();
+        let store = Arc::new(
+            crate::SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
                 .await
-                .unwrap()
-                .is_empty(),
-            "a projected durable report must not repeat on every poll"
+                .unwrap(),
         );
-        assert_eq!(coordinator.take_root_inbox().await.len(), 1);
+        store.create_session(root).await.unwrap();
+        let coordinator = SubagentCoordinator::new_with_store_and_executor(
+            directory.path(),
+            root,
+            launch(),
+            3,
+            Arc::new(crate::LocalAgentTurnExecutor::default()),
+            store.clone(),
+        )
+        .unwrap();
+        let worker = coordinator
+            .table
+            .lock()
+            .await
+            .reserve("worker", &launch())
+            .unwrap();
+        bind_test_team(directory.path(), store.as_ref(), root, &[worker.session_id]).await;
+
+        // A broadcast can report success even when the receiver disappears
+        // before reading it. The durable poll must retry after the grace
+        // interval instead of treating that send as an acknowledgement.
+        let first_wake = coordinator.subscribe_root_messages();
+        coordinator
+            .send_message_as(worker.session_id, "/root", "retry this report")
+            .await
+            .unwrap();
+        drop(first_wake);
+
+        tokio::time::sleep(ROOT_MESSAGE_RETRY_INTERVAL + Duration::from_millis(25)).await;
+        let mut wake = coordinator.subscribe_root_messages();
+        let reports = coordinator.refresh_root_inbox_reports().await.unwrap();
+        assert_eq!(reports.len(), 1);
+        let (message_id, _) = &reports[0];
+        coordinator.mark_root_message_projected(*message_id).await;
+        coordinator.wake_pending_root_messages().await;
+
+        let message = wake.recv().await.unwrap();
+        assert_eq!(message.delivery, PromptDelivery::Steer);
+        assert!(message.text.contains("retry this report"));
     }
 
     #[tokio::test]

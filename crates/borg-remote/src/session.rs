@@ -981,6 +981,7 @@ async fn run_agent_session_store_kernel(
                             EventActor::User
                         };
                         if actor == EventActor::System
+                            && delivery == PromptDelivery::Queue
                             && !goal
                                 .as_ref()
                                 .is_some_and(|goal| goal.status == GoalStatus::Active)
@@ -2874,14 +2875,14 @@ fn recall_visible_queued_prompts(
     recalled
 }
 
-/// Withdraw steers that the provider has not acknowledged yet.
+/// Withdraw steers that have not crossed the provider's user-message commit
+/// boundary.
 ///
-/// The acknowledgement is the session's acceptance boundary. Before that
-/// point the request may still be sitting in the provider-control queue, so a
-/// recall removes it from the visible pending work. Once the provider has
-/// acknowledged it, the active turn owns it and recall must not pretend it was
-/// withdrawn. A rejected one remains withdrawable while it waits for retry at
-/// the next boundary.
+/// A transport acknowledgement only means that the provider accepted the
+/// control request. Codex emits a separate `item/completed:userMessage` event
+/// when the steer becomes part of the provider conversation. Until that event,
+/// the prompt remains visible and recallable. A rejected one remains
+/// withdrawable while it waits for retry at the next boundary.
 fn recall_withdrawable_steers(
     pending_steers: &mut VecDeque<PendingSteer>,
     message_id: Option<Uuid>,
@@ -2891,7 +2892,9 @@ fn recall_withdrawable_steers(
     while let Some(steer) = pending_steers.pop_front() {
         let recallable = matches!(
             steer.state,
-            PendingSteerState::AwaitingAcknowledgement | PendingSteerState::RetryAtBoundary { .. }
+            PendingSteerState::AwaitingAcknowledgement
+                | PendingSteerState::Accepted
+                | PendingSteerState::RetryAtBoundary { .. }
         ) && steer.prompt.visible
             && message_id.is_none_or(|target| target == steer.prompt.message_id);
         if recallable {
@@ -2951,7 +2954,7 @@ async fn settle_inactive_team_notifications(
 ) -> Result<()> {
     let mut retained = VecDeque::with_capacity(pending.len());
     while let Some(prompt) = pending.pop_front() {
-        if prompt.actor == EventActor::System {
+        if prompt.actor == EventActor::System && prompt.delivery == PromptDelivery::Queue {
             settle_team_notification(journal, events, session_id, prompt).await?;
         } else {
             retained.push_back(prompt);
@@ -3673,6 +3676,7 @@ async fn refresh_durable_root_inbox(
     for (_, activity) in subagents.refresh_root_inbox_reports().await? {
         record_subagent_activity(journal, events, session_id, subagents, activity).await?;
     }
+    subagents.wake_pending_root_messages().await;
     Ok(())
 }
 
@@ -7827,10 +7831,11 @@ mod tests {
     }
 
     /// ↑ on an empty composer must give back exactly the pending work the
-    /// provider has not acknowledged. An in-flight steer is still recallable;
-    /// one the provider has acknowledged is not.
+    /// provider has not committed. Both an in-flight and transport-accepted
+    /// steer are still recallable; only the provider's committed user-message
+    /// event makes it owned by the active turn.
     #[test]
-    fn only_an_unacknowledged_steer_is_withdrawable_from_the_active_turn() {
+    fn only_an_uncommitted_steer_is_withdrawable_from_the_active_turn() {
         let rejected_id = Uuid::new_v4();
         let awaiting_id = Uuid::new_v4();
         let accepted_id = Uuid::new_v4();
@@ -7858,9 +7863,15 @@ mod tests {
             steer(accepted_id, PendingSteerState::Accepted),
         ]);
 
-        // Targeting one the turn owns withdraws nothing at all.
-        assert!(recall_withdrawable_steers(&mut pending_steers, Some(accepted_id)).is_empty());
-        assert_eq!(pending_steers.len(), 3);
+        let recalled = recall_withdrawable_steers(&mut pending_steers, Some(accepted_id));
+        assert_eq!(
+            recalled
+                .iter()
+                .map(|prompt| prompt.message_id)
+                .collect::<Vec<_>>(),
+            [accepted_id]
+        );
+        assert_eq!(pending_steers.len(), 2);
 
         let recalled = recall_withdrawable_steers(&mut pending_steers, None);
         assert_eq!(
@@ -7870,14 +7881,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [awaiting_id, rejected_id]
         );
-        assert_eq!(
-            pending_steers
-                .iter()
-                .map(|steer| steer.prompt.message_id)
-                .collect::<Vec<_>>(),
-            [accepted_id],
-            "only provider-accepted steers remain owned by the active turn"
-        );
+        assert!(pending_steers.is_empty());
     }
 
     #[test]
@@ -8090,6 +8094,37 @@ mod tests {
                 .iter()
                 .any(|event| { matches!(event.kind, SessionEventKind::TurnStarted { .. }) })
         );
+    }
+
+    #[tokio::test]
+    async fn inactive_wake_report_is_retained_for_the_root_provider_turn() {
+        let root = tempdir().unwrap();
+        let journal = SessionJournal::open(root.path().join("session.jsonl")).unwrap();
+        let store: Arc<dyn SessionStore> = Arc::new(
+            crate::session_store::JsonlSessionStore::from_journal(journal),
+        );
+        let mut runtime = RuntimeSessionStore::new(Arc::clone(&store), Vec::new());
+        let session_id = Uuid::new_v4();
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let message_id = Uuid::new_v4();
+        let mut pending = VecDeque::from([QueuedPrompt {
+            message_id,
+            text: "Team message from /root/worker:\n\nfinished".to_string(),
+            actor: EventActor::System,
+            attachments: Vec::new(),
+            output_schema: None,
+            delivery: PromptDelivery::Steer,
+            visible: true,
+            interrupt_batch: false,
+        }]);
+
+        settle_inactive_team_notifications(&mut runtime, &event_tx, session_id, &mut pending)
+            .await
+            .unwrap();
+
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].message_id, message_id);
+        assert!(event_rx.try_recv().is_err());
     }
 
     #[tokio::test]

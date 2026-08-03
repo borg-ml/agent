@@ -5545,9 +5545,9 @@ impl BorgTerminal {
                     });
                 }
                 if has_pending_steer_prompts(&self.composer.text, self.active_queued_prompts()) {
-                    // Only the session knows whether the provider has accepted
-                    // the steer. Ask it to recall; an unacknowledged request
-                    // comes back, while an accepted one is safely ignored.
+                    // Only the session knows whether the provider has committed
+                    // the steer. Transport acceptance is still recallable, so
+                    // ask the session to reconcile it at the provider boundary.
                     return Ok(UiAction::RecallQueuedPrompts {
                         target: self.focused_child,
                     });
@@ -8959,10 +8959,7 @@ pub(crate) fn subagent_activity_summary(
                 text,
                 status: MessageStatus::Complete,
                 ..
-            }) if !text.trim().is_empty() => Some(format!(
-                "Message agent · {task} · report · {}",
-                compact_text(text, 120)
-            )),
+            }) if !text.trim().is_empty() => Some(format!("agent · {task} · report ready")),
             Some(SessionEventKind::ApprovalRequested { title, detail, .. }) => Some(format!(
                 "agent · {task} · needs approval · {}",
                 compact_text(
@@ -9023,12 +9020,7 @@ fn hydrated_subagent_activity_summary(agent: &SubagentSnapshot) -> Option<String
             .final_text
             .as_deref()
             .filter(|text| !text.trim().is_empty())
-            .map(|text| {
-                format!(
-                    "Message agent · {task} · report · {}",
-                    compact_text(text, 120)
-                )
-            }),
+            .map(|_| format!("agent · {task} · report ready")),
     }
 }
 
