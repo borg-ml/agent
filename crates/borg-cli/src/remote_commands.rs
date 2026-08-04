@@ -440,6 +440,9 @@ fn systemd_quote(value: &str) -> String {
 
 pub(crate) async fn run_local_agent(args: LocalAgentCliArgs) -> Result<()> {
     let agent_config = AgentConfig::load(args.config.as_deref())?;
+    // Publish `[local]` provider settings before any session or worker thread
+    // reads the provider environment.
+    agent_config.apply_local_provider_env();
     crate::updater::spawn_background(agent_config.updates.clone());
     let ephemeral_sessions = args.ephemeral.then(tempfile::tempdir).transpose()?;
     let crash_context = Arc::new(TuiCrashContext::default());

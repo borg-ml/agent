@@ -1263,15 +1263,24 @@ fn model_picker_options(
             }
         }
         provider @ (Some(CodingProvider::OpenAiCompatible | CodingProvider::OpenCode) | None) => {
-            let model = current.unwrap_or("model-id");
-            let mut option = PickerOption::new(model, model);
-            option.section = Some(
-                provider
-                    .map(CodingProvider::label)
-                    .unwrap_or("Current")
-                    .to_string(),
-            );
-            options.push(option);
+            let backend = provider
+                .map(CodingProvider::label)
+                .unwrap_or("openai-compatible");
+            let discovered: Vec<borg_provider::DynamicModelEntry> = Vec::new(); // Phase 2 fills
+            let entries = borg_provider::dynamic_models_for_backend(backend, current, &discovered);
+            for (index, entry) in entries.into_iter().enumerate() {
+                let mut option = PickerOption::new(entry.id.clone(), entry.id);
+                option.preview = Some(entry.label);
+                if index == 0 {
+                    option.section = Some(
+                        provider
+                            .map(CodingProvider::label)
+                            .unwrap_or("Current")
+                            .to_string(),
+                    );
+                }
+                options.push(option);
+            }
         }
         Some(CodingProvider::Codex | CodingProvider::Claude | CodingProvider::Kimi) => {
             unreachable!("catalog-backed providers are handled above")

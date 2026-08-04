@@ -16,6 +16,32 @@ pub(crate) struct AgentConfig {
     pub(crate) mcp: McpConfig,
     pub(crate) approvals: ApprovalConfig,
     pub(crate) updates: UpdateConfig,
+    pub(crate) local: LocalProviderConfig,
+}
+
+/// Declarative setup for a locally hosted OpenAI-compatible server
+/// (`llama-server`, vLLM, Ollama). Without this, pointing Borg at a local
+/// model requires exporting `BORG_OPENAI_COMPATIBLE_*` by hand before every
+/// run, which is not a configuration story.
+///
+/// Applied by [`AgentConfig::apply_local_provider_env`]. The process
+/// environment always wins, so an explicit export or `--model` still
+/// overrides the file.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct LocalProviderConfig {
+    /// Base URL of the OpenAI-compatible endpoint, including `/v1`.
+    /// Defaults to `http://127.0.0.1:8000/v1` in the provider when unset.
+    pub(crate) base_url: Option<String>,
+    /// Model name to request. For Ollama this is the tag (`qwen3.6:35b-a3b`);
+    /// for `llama-server` it is whatever `/v1/models` reports.
+    pub(crate) model: Option<String>,
+    /// Advertised context window. The `Generic` profile reports no context
+    /// metadata, so without this Borg cannot size auto-compaction and long
+    /// local sessions fail at the wall instead of compacting.
+    pub(crate) context_window_tokens: Option<u64>,
+    /// Most local servers ignore this; the `Generic` profile is keyless.
+    pub(crate) api_key: Option<String>,
 }
 
 /// Trust controls for declarative extension catalogs.
@@ -311,7 +337,54 @@ impl AgentConfig {
             (1..=24 * 30).contains(&self.updates.check_interval_hours),
             "updates.check_interval_hours must be between 1 and 720"
         );
+        if let Some(base_url) = &self.local.base_url {
+            let trimmed = base_url.trim();
+            anyhow::ensure!(!trimmed.is_empty(), "local.base_url must not be empty");
+            anyhow::ensure!(
+                trimmed.starts_with("http://") || trimmed.starts_with("https://"),
+                "local.base_url must start with http:// or https://"
+            );
+        }
+        if let Some(model) = &self.local.model {
+            anyhow::ensure!(!model.trim().is_empty(), "local.model must not be empty");
+        }
+        if let Some(context_window_tokens) = self.local.context_window_tokens {
+            anyhow::ensure!(
+                context_window_tokens > 0,
+                "local.context_window_tokens must be positive"
+            );
+        }
         Ok(())
+    }
+
+    /// Export `[local]` settings into the process environment so the
+    /// `OpenAiCompatible` provider picks them up. Existing environment values
+    /// are never overwritten: an explicit export or `--model` still wins.
+    pub(crate) fn apply_local_provider_env(&self) {
+        let entries = [
+            ("BORG_OPENAI_COMPATIBLE_BASE_URL", self.local.base_url.clone()),
+            ("BORG_OPENAI_COMPATIBLE_MODEL", self.local.model.clone()),
+            ("BORG_OPENAI_COMPATIBLE_API_KEY", self.local.api_key.clone()),
+            (
+                "BORG_OPENAI_COMPATIBLE_CONTEXT_WINDOW_TOKENS",
+                self.local.context_window_tokens.map(|value| value.to_string()),
+            ),
+        ];
+        for (key, value) in entries {
+            let Some(value) = value else {
+                continue;
+            };
+            let value = value.trim();
+            if value.is_empty() {
+                continue;
+            }
+            if std::env::var_os(key).is_some_and(|existing| !existing.is_empty()) {
+                continue;
+            }
+            // SAFETY: called once during startup, before worker threads that
+            // read provider environment are spawned.
+            unsafe { std::env::set_var(key, value) };
+        }
     }
 
     pub(crate) fn autonomous_team_policy(
@@ -468,6 +541,54 @@ fn valid_allowed_tool(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_block_configures_an_openai_compatible_endpoint() {
+        let config: AgentConfig = toml::from_str(
+            r#"
+[local]
+base_url = "http://127.0.0.1:11434/v1"
+model = "qwen3.6:35b-a3b"
+context_window_tokens = 32768
+"#,
+        )
+        .expect("local block parses");
+        config.validate().expect("local block is valid");
+        assert_eq!(
+            config.local.base_url.as_deref(),
+            Some("http://127.0.0.1:11434/v1")
+        );
+        assert_eq!(config.local.model.as_deref(), Some("qwen3.6:35b-a3b"));
+        assert_eq!(config.local.context_window_tokens, Some(32768));
+    }
+
+    #[test]
+    fn local_defaults_stay_empty_so_hosted_providers_are_untouched() {
+        let config = AgentConfig::default();
+        config.validate().expect("empty config is valid");
+        assert_eq!(config.local, LocalProviderConfig::default());
+        assert!(config.local.model.is_none());
+    }
+
+    #[test]
+    fn local_base_url_must_be_an_http_endpoint() {
+        let config: AgentConfig =
+            toml::from_str("[local]\nbase_url = \"127.0.0.1:11434\"\n").expect("parses");
+        let error = config.validate().expect_err("scheme is required");
+        assert!(
+            error.to_string().contains("http://"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn local_context_window_must_be_positive() {
+        let config: AgentConfig =
+            toml::from_str("[local]\ncontext_window_tokens = 0\n").expect("parses");
+        config
+            .validate()
+            .expect_err("zero context window is rejected");
+    }
 
     #[test]
     fn aliases_preserve_user_arguments() {

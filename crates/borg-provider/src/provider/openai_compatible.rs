@@ -391,6 +391,17 @@ impl OpenAiCompatibleProvider {
                 extract_chat_completions_usage(&streamed.raw, duration_ms, None)
             }
         };
+        if profile == OpenAiCompatibleProfile::Generic {
+            // Local servers report no model metadata, so the context window has
+            // to be declared. Without it `context_window_tokens` stays `None`
+            // and auto-compaction never engages, which strands long local
+            // sessions at the context wall instead of compacting them.
+            if let Some(context_window_tokens) = generic_context_window_tokens() {
+                usage.context_tokens =
+                    Some(usage.input_tokens.saturating_add(usage.cached_input_tokens));
+                usage.context_window_tokens = Some(context_window_tokens);
+            }
+        }
         if profile == OpenAiCompatibleProfile::OpenRouter {
             usage.context_tokens =
                 Some(usage.input_tokens.saturating_add(usage.cached_input_tokens));
@@ -625,6 +636,15 @@ impl OpenAiCompatibleProvider {
     fn is_kimi(&self) -> bool {
         self.model == crate::kimi_product_model()
     }
+}
+
+/// Declared context window for a local OpenAI-compatible server, set from the
+/// `[local]` agent-config block or exported directly. Local servers do not
+/// advertise this, so it cannot be probed the way OpenRouter's is.
+fn generic_context_window_tokens() -> Option<u64> {
+    nonempty_env("BORG_OPENAI_COMPATIBLE_CONTEXT_WINDOW_TOKENS")
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|tokens| *tokens > 0)
 }
 
 async fn openrouter_model_limits(

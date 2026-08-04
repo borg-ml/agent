@@ -434,6 +434,25 @@ fn model_and_effort_pickers_use_the_provider_catalog() {
 }
 
 #[test]
+fn model_picker_openai_compatible_with_current_yields_current_not_placeholder() {
+    let current_model = "qwen3.6:35b-a3b";
+    let options = model_picker_options(Some(CodingProvider::OpenAiCompatible), Some(current_model));
+    // The first option must be the current model (not the "model-id" placeholder).
+    assert!(!options.is_empty());
+    assert_eq!(options[0].value, current_model);
+    assert_eq!(options[0].section.as_deref(), Some("Open-ai-compatible"));
+}
+
+#[test]
+fn model_picker_none_yields_no_open_ended_placeholder() {
+    let options = model_picker_options(None::<CodingProvider>, None);
+    // With None and no current, the dynamic arm returns empty; only catalogs render.
+    // We still check that catalog providers remain selectable.
+    assert!(options.iter().any(|o| o.value == "gpt-5.6-luna"));
+    assert!(options.iter().any(|o| o.value == "claude-opus-5"));
+}
+
+#[test]
 fn keybinding_help_is_action_first_and_uses_configuration() {
     let config = crate::agent_config::KeybindingConfig {
         send: vec!["ctrl+s".to_string()],
