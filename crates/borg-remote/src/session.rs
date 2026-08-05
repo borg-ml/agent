@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -27,6 +27,27 @@ use crate::{
 
 const ROOT_INBOX_REFRESH_INTERVAL: Duration = Duration::from_millis(50);
 const RETAINED_COMPACTION_SYSTEM_PROMPT: &str = "This is an internal context-compaction preparation turn. Do not use tools, modify files, or answer the user. Return only a compact continuation summary of the supplied prior provider conversation.";
+const SUBSCRIPTION_TRANSCRIPT_HEADER: &str = "Borg canonical conversation transcript v1 (JSONL). Each line is one persisted message in chronological order. The final line is the current request; respond to it normally.\n";
+
+#[derive(serde::Serialize)]
+struct SubscriptionTranscriptLine<'a> {
+    role: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<SubscriptionTranscriptToolCall<'a>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<&'a str>,
+}
+
+#[derive(serde::Serialize)]
+struct SubscriptionTranscriptToolCall<'a> {
+    id: &'a str,
+    name: &'a str,
+    arguments: &'a str,
+}
 
 #[derive(Clone)]
 struct QueuedPrompt {
@@ -714,10 +735,13 @@ async fn run_agent_session_store_kernel(
     // Set when a provider switch lands mid-turn; drained at the next turn
     // boundary once the in-flight turn has reported its own session id.
     let mut provider_switch_pending = false;
-    let mut retained_context = (provider_session_id.is_none()
-        && !launch.provider.uses_native_harness())
-    .then(|| retained_conversation_context(journal.context_events()))
-    .flatten();
+    // Subscription providers are deliberately fed from Borg's durable
+    // conversation branch. Their own session files are an optimization at
+    // best and can diverge from the journal after a crash, provider switch,
+    // or an interrupted tool round.
+    let mut retained_context = (!launch.provider.uses_native_harness())
+        .then(|| retained_conversation_context(journal.context_events()))
+        .flatten();
     let mut goal = state.goal;
     let mut todos = state.todos;
     let mut goal_active_since = goal
@@ -1118,7 +1142,6 @@ async fn run_agent_session_store_kernel(
                             },
                         )
                         .await?;
-                        let mut direct_compaction_usage = None;
                         let result: Result<Option<crate::AgentCompaction>> = async {
                             if launch.provider.uses_native_harness() {
                                 let model = launch
@@ -1145,60 +1168,39 @@ async fn run_agent_session_store_kernel(
                                     .await
                                     .map(Some)
                             } else {
-                                match provider_session_id.as_deref() {
-                                    Some(provider_session_id) => {
-                                        direct_compaction_usage = executor
-                                            .compact(launch.provider, provider_session_id)
-                                            .await?;
-                                        Ok(None)
-                                    }
-                                    None => {
-                                        let context =
-                                            retained_conversation_context(journal.context_events())
-                                                .context(
-                                                    "there is no conversation to compact yet",
-                                                )?;
-                                        executor
-                                            .compact_retained_context(AgentTurn {
-                                                session_id,
-                                                message_id: Uuid::new_v4(),
-                                                provider: launch.provider,
-                                                provider_session_id: None,
-                                                cwd: launch.cwd.clone(),
-                                                prompt: retained_compaction_prompt(&context),
-                                                attachments: Vec::new(),
-                                                output_schema: None,
-                                                model: launch.model.clone(),
-                                                effort: launch.effort.clone(),
-                                                fast: launch.fast,
-                                                response_language: launch.response_language,
-                                                permission_mode: launch.permission_mode,
-                                                conversation: Vec::new(),
-                                                agent_mcp_server: agent_mcp_server.clone(),
-                                                agent_tools: dispatcher.clone(),
-                                                external_mcp_servers: Vec::new(),
-                                                extension_skill_roots: Vec::new(),
-                                                system_prompt_appendix:
-                                                    RETAINED_COMPACTION_SYSTEM_PROMPT.to_string(),
-                                            })
-                                            .await
-                                            .map(Some)
-                                    }
-                                }
+                                let context =
+                                    retained_conversation_context(journal.context_events())
+                                        .context("there is no conversation to compact yet")?;
+                                executor
+                                    .compact_retained_context(AgentTurn {
+                                        session_id,
+                                        message_id: Uuid::new_v4(),
+                                        provider: launch.provider,
+                                        provider_session_id: None,
+                                        cwd: launch.cwd.clone(),
+                                        prompt: retained_compaction_prompt(&context),
+                                        attachments: Vec::new(),
+                                        output_schema: None,
+                                        model: launch.model.clone(),
+                                        effort: launch.effort.clone(),
+                                        fast: launch.fast,
+                                        response_language: launch.response_language,
+                                        permission_mode: launch.permission_mode,
+                                        conversation: Vec::new(),
+                                        agent_mcp_server: agent_mcp_server.clone(),
+                                        agent_tools: dispatcher.clone(),
+                                        external_mcp_servers: Vec::new(),
+                                        extension_skill_roots: Vec::new(),
+                                        system_prompt_appendix: RETAINED_COMPACTION_SYSTEM_PROMPT
+                                            .to_string(),
+                                    })
+                                    .await
+                                    .map(Some)
                             }
                         }
                         .await;
                         match result {
                             Ok(native) => {
-                                if let Some(usage) = direct_compaction_usage.as_ref() {
-                                    record(
-                                        &mut journal,
-                                        &events,
-                                        session_id,
-                                        native_usage_event(usage),
-                                    )
-                                    .await?;
-                                }
                                 if let Some(native) = native.as_ref() {
                                     record(
                                         &mut journal,
@@ -1211,6 +1213,8 @@ async fn run_agent_session_store_kernel(
                                 let compacted_provider_session_id = native
                                     .as_ref()
                                     .and_then(|native| native.provider_session_id.clone());
+                                let has_compacted_provider_session =
+                                    compacted_provider_session_id.is_some();
                                 let summary = native
                                     .as_ref()
                                     .map(|native| native.summary.clone())
@@ -1258,14 +1262,19 @@ async fn run_agent_session_store_kernel(
                                     )
                                     .await?;
                                     provider_session_id = Some(new_provider_session_id);
+                                }
+                                if !launch.provider.uses_native_harness() {
+                                    // The summary is already durable in the
+                                    // journal. Rebuild the same canonical tree
+                                    // projection used after every turn so a
+                                    // compaction boundary cannot introduce a
+                                    // different prompt shape. A provider
+                                    // session id is only an adapter detail; it
+                                    // must never replace Borg's context.
+                                    retained_context =
+                                        retained_conversation_context(journal.context_events());
+                                } else if has_compacted_provider_session {
                                     retained_context = None;
-                                } else if let Some(native) = native.as_ref()
-                                    && !launch.provider.uses_native_harness()
-                                {
-                                    retained_context = Some(format!(
-                                        "Previous conversation summary:\n\n{}",
-                                        native.summary
-                                    ));
                                 }
                             }
                             Err(error) => {
@@ -1458,13 +1467,15 @@ async fn run_agent_session_store_kernel(
 
         let (provider_events_tx, mut provider_events) = mpsc::channel(128);
         let (control_tx, control_rx) = mpsc::channel(32);
-        let provider_prompt = if let Some(context) = retained_context.take() {
-            format!(
-                "<retained_conversation>\n{context}\n</retained_conversation>\n\n{}",
-                prompt.text
-            )
+        let retained_for_turn = retained_context.take();
+        let provider_prompt = if launch.provider.uses_native_harness() {
+            prompt.text.clone()
         } else {
-            prompt.text
+            format_subscription_provider_prompt(
+                retained_for_turn.as_deref(),
+                prompt.actor,
+                &prompt.text,
+            )
         };
         record(
             &mut journal,
@@ -2442,6 +2453,14 @@ async fn run_agent_session_store_kernel(
             &mut goal_active_since,
         )
         .await?;
+        if !launch.provider.uses_native_harness() {
+            // Pi rebuilds the provider message branch from its persisted
+            // session entries before every request. Do the same for Borg's
+            // subscription lanes so queued turns, restarts, and provider
+            // session loss all see the exact durable prefix through the last
+            // compaction boundary.
+            retained_context = retained_conversation_context(journal.context_events());
+        }
         at_turn_boundary = true;
         if std::mem::take(&mut provider_switch_pending) {
             provider_session_id = None;
@@ -2507,8 +2526,6 @@ fn resolve_consultation_profile(
     let provider = match provider_hint {
         "gpt" | "codex" | "openai" => CodingProvider::Codex,
         "claude" | "anthropic" => CodingProvider::Claude,
-        "opencode" | "open-code" => CodingProvider::OpenCode,
-        "kimi" => CodingProvider::Kimi,
         "openrouter" | "open-router" => CodingProvider::OpenRouter,
         "openai-compatible" | "open-ai-compatible" => CodingProvider::OpenAiCompatible,
         _ => CodingProvider::for_model(profile)
@@ -2548,9 +2565,8 @@ fn resolve_consultation_profile(
 fn default_consultation_effort(provider: CodingProvider) -> Option<String> {
     match provider {
         CodingProvider::Codex => Some(borg_provider::codex_default_effort().to_string()),
-        CodingProvider::Kimi => Some(borg_provider::kimi_default_effort().to_string()),
         CodingProvider::OpenRouter | CodingProvider::OpenAiCompatible => Some("medium".to_string()),
-        CodingProvider::Claude | CodingProvider::OpenCode => None,
+        CodingProvider::Claude => None,
     }
 }
 
@@ -2652,47 +2668,161 @@ fn validate_session_state(session_id: Uuid, state: &SessionState) -> Result<()> 
 
 fn native_conversation(
     events: &[SessionEvent],
-    provider: CodingProvider,
+    _provider: CodingProvider,
 ) -> Result<Vec<borg_provider::provider::ModelMessage>> {
-    if !provider.uses_native_harness() {
-        return Ok(Vec::new());
-    }
+    // Borg's event journal is the source of truth for the conversation. Native
+    // providers already emit structured model messages; subscription CLIs
+    // emit durable generic Message/Tool events, which are normalized into the
+    // same provider-neutral model contract here.
+    //
+    // Walk every provider in the branch so switching from Codex to Claude or
+    // an OpenAI-compatible model carries the same durable transcript forward.
+    let turn_providers = events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            SessionEventKind::TurnStarted {
+                message_id,
+                provider,
+                ..
+            } => Some((*message_id, *provider)),
+            _ => None,
+        })
+        .collect::<HashMap<_, _>>();
     let mut conversation = Vec::new();
-    let mut pending = Vec::new();
+    let mut pending_native = Vec::new();
+    let mut pending_generic = Vec::new();
+    let mut active_provider = None;
+    let mut native_structured_in_turn = false;
     for event in events {
         match &event.kind {
             SessionEventKind::ProviderEvent { kind, payload, .. }
                 if kind == "context_compaction" =>
             {
-                pending.clear();
+                pending_native.clear();
+                pending_generic.clear();
                 conversation.clear();
                 if let Some(summary) = payload.get("summary").and_then(Value::as_str) {
                     conversation.push(borg_provider::provider::ModelMessage::user(format!(
                         "Previous conversation summary:\n\n{summary}"
                     )));
                 }
+                native_structured_in_turn = false;
             }
-            SessionEventKind::ProviderEvent {
-                provider: event_provider,
-                kind,
-                payload,
-            } if *event_provider == provider && kind == "native_model_message" => {
-                pending.push(serde_json::from_value(payload.clone()).context(
+            SessionEventKind::ContextCleared => {
+                pending_native.clear();
+                pending_generic.clear();
+                conversation.clear();
+                active_provider = None;
+                native_structured_in_turn = false;
+            }
+            SessionEventKind::TurnStarted { provider, .. } => {
+                active_provider = Some(*provider);
+                native_structured_in_turn = false;
+            }
+            SessionEventKind::ProviderEvent { kind, payload, .. }
+                if kind == "native_model_message" =>
+            {
+                native_structured_in_turn = true;
+                pending_native.push(serde_json::from_value(payload.clone()).context(
                     "durable native model message does not match the model-turn contract",
                 )?);
             }
-            SessionEventKind::ProviderEvent {
-                provider: event_provider,
-                kind,
+            SessionEventKind::ProviderEvent { kind, .. }
+                if kind == "native_tool_round_completed" =>
+            {
+                conversation.append(&mut pending_native);
+            }
+            SessionEventKind::Message {
+                message_id,
+                actor,
+                text,
+                status: MessageStatus::Complete,
                 ..
-            } if *event_provider == provider && kind == "native_tool_round_completed" => {
-                conversation.append(&mut pending);
+            } if active_provider
+                .or_else(|| turn_providers.get(message_id).copied())
+                .is_some()
+                && matches!(
+                    actor,
+                    EventActor::User | EventActor::System | EventActor::Assistant
+                ) =>
+            {
+                let message = match actor {
+                    EventActor::System => borg_provider::provider::ModelMessage::System {
+                        content: text.clone(),
+                    },
+                    EventActor::User => borg_provider::provider::ModelMessage::user(text.clone()),
+                    EventActor::Assistant => borg_provider::provider::ModelMessage::assistant(
+                        Some(text.clone()),
+                        None,
+                        None,
+                        Vec::new(),
+                    ),
+                    EventActor::Tool => unreachable!("tool messages use ToolCompleted"),
+                };
+                pending_generic.push(message);
+            }
+            SessionEventKind::ToolStarted {
+                tool_call_id,
+                name,
+                input,
+                ..
+            } if active_provider.is_some() => {
+                let tool_call = borg_provider::provider::ModelToolCall::function(
+                    tool_call_id.clone(),
+                    name.clone(),
+                    serde_json::to_string(input)?,
+                );
+                let can_extend = matches!(
+                    pending_generic.last(),
+                    Some(borg_provider::provider::ModelMessage::Assistant {
+                        content: None,
+                        reasoning_content: None,
+                        reasoning_details: None,
+                        tool_calls,
+                    }) if !tool_calls.is_empty()
+                );
+                if can_extend {
+                    if let Some(borg_provider::provider::ModelMessage::Assistant {
+                        tool_calls,
+                        ..
+                    }) = pending_generic.last_mut()
+                    {
+                        tool_calls.push(tool_call);
+                    }
+                } else {
+                    pending_generic.push(borg_provider::provider::ModelMessage::assistant(
+                        None,
+                        None,
+                        None,
+                        vec![tool_call],
+                    ));
+                }
+            }
+            SessionEventKind::ToolCompleted {
+                tool_call_id,
+                output,
+                ..
+            } if active_provider.is_some() => {
+                pending_generic.push(borg_provider::provider::ModelMessage::Tool {
+                    tool_call_id: tool_call_id.clone(),
+                    content: output.clone(),
+                });
             }
             SessionEventKind::TurnCompleted { error: None, .. } => {
-                conversation.append(&mut pending);
+                conversation.append(&mut pending_native);
+                if native_structured_in_turn {
+                    pending_generic.clear();
+                } else {
+                    conversation.append(&mut pending_generic);
+                }
+                active_provider = None;
+                native_structured_in_turn = false;
             }
             SessionEventKind::TurnCompleted { error: Some(_), .. } => {
-                pending.clear();
+                pending_native.clear();
+                pending_generic.clear();
+                active_provider = None;
+                native_structured_in_turn = false;
             }
             _ => {}
         }
@@ -2732,15 +2862,32 @@ fn native_usage_event(usage: &borg_provider::ProviderCallUsage) -> SessionEventK
 }
 
 fn retained_conversation_context(events: &[SessionEvent]) -> Option<String> {
-    let mut messages = Vec::new();
+    // Newer journals carry TurnStarted boundaries, allowing the structured
+    // provider-neutral replay path to include subscription tool calls/results
+    // alongside native model messages. Keep the legacy text fallback for
+    // pre-boundary sessions already on disk.
+    if events
+        .iter()
+        .any(|event| matches!(&event.kind, SessionEventKind::TurnStarted { .. }))
+    {
+        return native_conversation(events, CodingProvider::OpenRouter)
+            .ok()
+            .filter(|conversation| !conversation.is_empty())
+            .map(|conversation| format_subscription_conversation(&conversation));
+    }
+
+    let mut entries = Vec::new();
     for event in events {
         match &event.kind {
             SessionEventKind::ProviderEvent { kind, payload, .. }
                 if kind == "context_compaction" =>
             {
-                messages.clear();
+                entries.clear();
                 if let Some(summary) = payload.get("summary").and_then(Value::as_str) {
-                    messages.push(format!("Previous conversation summary:\n\n{summary}"));
+                    entries.push(format_subscription_text_line(
+                        "user",
+                        &format!("Previous conversation summary:\n\n{summary}"),
+                    ));
                 }
             }
             SessionEventKind::Message {
@@ -2753,19 +2900,149 @@ fn retained_conversation_context(events: &[SessionEvent]) -> Option<String> {
                 EventActor::User | EventActor::Assistant | EventActor::System
             ) =>
             {
-                messages.push(format!(
-                    "{}: {text}",
-                    if *actor == EventActor::Assistant {
-                        "Assistant"
-                    } else {
-                        "User"
-                    }
-                ))
+                entries.push(format_subscription_actor_line(*actor, text));
             }
+            SessionEventKind::ToolStarted {
+                tool_call_id,
+                name,
+                input,
+                ..
+            } => entries.push(format_subscription_tool_call_line(
+                tool_call_id,
+                name,
+                input,
+            )),
+            SessionEventKind::ToolCompleted {
+                tool_call_id,
+                output,
+                ..
+            } => entries.push(format_subscription_tool_result_line(tool_call_id, output)),
             _ => {}
         }
     }
-    (!messages.is_empty()).then(|| messages.join("\n\n"))
+    (!entries.is_empty()).then(|| entries.join("\n"))
+}
+
+fn format_subscription_conversation(
+    conversation: &[borg_provider::provider::ModelMessage],
+) -> String {
+    conversation
+        .iter()
+        .map(format_subscription_message)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn format_subscription_provider_prompt(
+    retained_context: Option<&str>,
+    actor: EventActor,
+    text: &str,
+) -> String {
+    let mut prompt = String::from(SUBSCRIPTION_TRANSCRIPT_HEADER);
+    if let Some(context) = retained_context.filter(|context| !context.is_empty()) {
+        prompt.push_str(context);
+        prompt.push('\n');
+    }
+    prompt.push_str(&format_subscription_actor_line(actor, text));
+    prompt
+}
+
+fn format_subscription_message(message: &borg_provider::provider::ModelMessage) -> String {
+    use borg_provider::provider::ModelMessage;
+
+    let line = match message {
+        ModelMessage::System { content } => SubscriptionTranscriptLine {
+            role: "system",
+            content: Some(content),
+            thinking: None,
+            tool_calls: None,
+            tool_call_id: None,
+        },
+        ModelMessage::User { content, .. } => SubscriptionTranscriptLine {
+            role: "user",
+            content: Some(content),
+            thinking: None,
+            tool_calls: None,
+            tool_call_id: None,
+        },
+        ModelMessage::Assistant {
+            content,
+            reasoning_content,
+            tool_calls,
+            ..
+        } => SubscriptionTranscriptLine {
+            role: "assistant",
+            content: content.as_deref(),
+            thinking: reasoning_content.as_deref(),
+            tool_calls: (!tool_calls.is_empty()).then(|| {
+                tool_calls
+                    .iter()
+                    .map(|call| SubscriptionTranscriptToolCall {
+                        id: &call.id,
+                        name: &call.function.name,
+                        arguments: &call.function.arguments,
+                    })
+                    .collect()
+            }),
+            tool_call_id: None,
+        },
+        ModelMessage::Tool {
+            tool_call_id,
+            content,
+        } => SubscriptionTranscriptLine {
+            role: "tool",
+            content: Some(content),
+            thinking: None,
+            tool_calls: None,
+            tool_call_id: Some(tool_call_id),
+        },
+    };
+    serde_json::to_string(&line).expect("subscription transcript line is serializable")
+}
+
+fn format_subscription_text_line(role: &'static str, content: &str) -> String {
+    serde_json::to_string(&SubscriptionTranscriptLine {
+        role,
+        content: Some(content),
+        thinking: None,
+        tool_calls: None,
+        tool_call_id: None,
+    })
+    .expect("subscription transcript line is serializable")
+}
+
+fn format_subscription_actor_line(actor: EventActor, text: &str) -> String {
+    let role = match actor {
+        EventActor::User => "user",
+        EventActor::Assistant => "assistant",
+        EventActor::Tool => "tool",
+        EventActor::System => "system",
+    };
+    format_subscription_text_line(role, text)
+}
+
+fn format_subscription_tool_call_line(tool_call_id: &str, name: &str, input: &Value) -> String {
+    let arguments = serde_json::to_string(input).unwrap_or_else(|_| input.to_string());
+    let tool_call = SubscriptionTranscriptToolCall {
+        id: tool_call_id,
+        name,
+        arguments: &arguments,
+    };
+    serde_json::to_string(&SubscriptionTranscriptLine {
+        role: "assistant",
+        content: None,
+        thinking: None,
+        tool_calls: Some(vec![tool_call]),
+        tool_call_id: None,
+    })
+    .expect("subscription transcript line is serializable")
+}
+
+fn format_subscription_tool_result_line(tool_call_id: &str, output: &str) -> String {
+    format_subscription_message(&borg_provider::provider::ModelMessage::Tool {
+        tool_call_id: tool_call_id.to_string(),
+        content: output.to_string(),
+    })
 }
 
 fn retained_compaction_prompt(context: &str) -> String {
@@ -4286,6 +4563,11 @@ mod tests {
         Arc<Mutex<Vec<(CodingProvider, Option<String>, Option<String>, String)>>>;
     type RecordedCompactionTurns = Arc<Mutex<Vec<(CodingProvider, Option<String>, String)>>>;
 
+    fn subscription_prompt_ends_with(prompt: &str, text: &str) -> bool {
+        let encoded = serde_json::to_string(text).unwrap();
+        prompt.ends_with(&format!("{{\"role\":\"user\",\"content\":{encoded}}}"))
+    }
+
     #[tokio::test]
     async fn durable_session_events_project_once_into_the_bound_workspace() {
         let root = tempdir().unwrap();
@@ -4911,7 +5193,7 @@ mod tests {
         async fn compact_retained_context(&self, turn: AgentTurn) -> Result<AgentCompaction> {
             assert_eq!(turn.provider, CodingProvider::Codex);
             assert!(turn.prompt.contains("first"));
-            assert!(turn.prompt.contains("response to first"));
+            assert!(turn.prompt.contains("response to"));
             self.compacted.notify_one();
             Ok(AgentCompaction {
                 summary: "retained summary".to_string(),
@@ -5029,7 +5311,7 @@ mod tests {
                 .unwrap()
                 .push(turn.provider_session_id.clone());
             self.called.notify_one();
-            if turn.prompt == "first" {
+            if subscription_prompt_ends_with(&turn.prompt, "first") {
                 let mut controls = controls.expect("active turn has controls");
                 while !matches!(
                     controls.recv().await,
@@ -5056,7 +5338,7 @@ mod tests {
                 .unwrap()
                 .push((turn.prompt.clone(), turn.attachments.clone()));
             self.turn_started.notify_one();
-            if turn.prompt == "first" {
+            if subscription_prompt_ends_with(&turn.prompt, "first") {
                 let mut controls = controls.expect("active turn has controls");
                 if let Some(AgentTurnControl::Steer {
                     text,
@@ -5090,7 +5372,7 @@ mod tests {
                 .unwrap()
                 .push((turn.prompt.clone(), turn.attachments));
             self.turn_started.notify_one();
-            if turn.prompt == "first" {
+            if subscription_prompt_ends_with(&turn.prompt, "first") {
                 let mut controls = controls.expect("active turn has controls");
                 let mut held_ack = None;
                 while let Some(control) = controls.recv().await {
@@ -5235,7 +5517,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((turn.prompt.clone(), turn.attachments));
-            if turn.prompt == "first" {
+            if subscription_prompt_ends_with(&turn.prompt, "first") {
                 self.first_started.notify_one();
                 self.release_first.notified().await;
             }
@@ -5254,7 +5536,7 @@ mod tests {
             events: mpsc::Sender<SessionEventKind>,
             _controls: Option<mpsc::Receiver<AgentTurnControl>>,
         ) -> Result<AgentTurnResult> {
-            if turn.prompt == "first" {
+            if subscription_prompt_ends_with(&turn.prompt, "first") {
                 self.first_started.notify_one();
                 self.release_first.notified().await;
             }
@@ -5771,7 +6053,10 @@ mod tests {
         actor.await.unwrap().unwrap();
         assert_eq!(
             turns.lock().unwrap().as_slice(),
-            [("first".to_string(), Vec::new())]
+            [(
+                "Borg canonical conversation transcript v1 (JSONL). Each line is one persisted message in chronological order. The final line is the current request; respond to it normally.\n{\"role\":\"user\",\"content\":\"first\"}".to_string(),
+                Vec::new()
+            )]
         );
     }
 
@@ -5883,7 +6168,11 @@ mod tests {
                 .iter()
                 .map(|(text, _)| text.as_str())
                 .collect::<Vec<_>>(),
-            ["first", "second", "third"]
+            [
+                "Borg canonical conversation transcript v1 (JSONL). Each line is one persisted message in chronological order. The final line is the current request; respond to it normally.\n{\"role\":\"user\",\"content\":\"first\"}",
+                "Borg canonical conversation transcript v1 (JSONL). Each line is one persisted message in chronological order. The final line is the current request; respond to it normally.\n{\"role\":\"user\",\"content\":\"first\"}\n{\"role\":\"user\",\"content\":\"second\"}",
+                "Borg canonical conversation transcript v1 (JSONL). Each line is one persisted message in chronological order. The final line is the current request; respond to it normally.\n{\"role\":\"user\",\"content\":\"first\"}\n{\"role\":\"user\",\"content\":\"second\"}\n{\"role\":\"user\",\"content\":\"third\"}",
+            ]
         );
 
         command_tx
@@ -5988,8 +6277,17 @@ mod tests {
 
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 2);
-        assert_eq!(seen[0], ("first".to_string(), Vec::new()));
-        assert_eq!(seen[1].0, "second [Image 1]\n\nthird");
+        assert_eq!(
+            seen[0],
+            (
+                "Borg canonical conversation transcript v1 (JSONL). Each line is one persisted message in chronological order. The final line is the current request; respond to it normally.\n{\"role\":\"user\",\"content\":\"first\"}".to_string(),
+                Vec::new()
+            )
+        );
+        assert_eq!(
+            seen[1].0,
+            "Borg canonical conversation transcript v1 (JSONL). Each line is one persisted message in chronological order. The final line is the current request; respond to it normally.\n{\"role\":\"user\",\"content\":\"second [Image 1]\\n\\nthird\"}"
+        );
         assert_eq!(
             seen[1].1,
             [PathBuf::from("/tmp/queued-image.png")],
@@ -6200,8 +6498,17 @@ mod tests {
         );
         let turns = turns.lock().unwrap();
         assert_eq!(turns.len(), 2);
-        assert_eq!(turns[0], ("first".to_string(), Vec::new()));
-        assert_eq!(turns[1].0, "inspect this [Image 1]");
+        assert_eq!(
+            turns[0],
+            (
+                "Borg canonical conversation transcript v1 (JSONL). Each line is one persisted message in chronological order. The final line is the current request; respond to it normally.\n{\"role\":\"user\",\"content\":\"first\"}".to_string(),
+                Vec::new()
+            )
+        );
+        assert_eq!(
+            turns[1].0,
+            "Borg canonical conversation transcript v1 (JSONL). Each line is one persisted message in chronological order. The final line is the current request; respond to it normally.\n{\"role\":\"user\",\"content\":\"first\"}\n{\"role\":\"user\",\"content\":\"inspect this [Image 1]\"}"
+        );
         assert_eq!(turns[1].1, [image]);
     }
 
@@ -6541,8 +6848,8 @@ mod tests {
         {
             let turns = turns.lock().unwrap();
             assert_eq!(turns.len(), 2);
-            assert_eq!(turns[0].0, "first");
-            assert_eq!(turns[1].0, "followup");
+            assert!(subscription_prompt_ends_with(&turns[0].0, "first"));
+            assert!(subscription_prompt_ends_with(&turns[1].0, "followup"));
         }
 
         let mut transitions = Vec::new();
@@ -6921,11 +7228,15 @@ mod tests {
         assert_eq!(
             seen.lock().unwrap().as_slice(),
             [
-                (CodingProvider::Claude, None, "first".to_string()),
+                (
+                    CodingProvider::Claude,
+                    None,
+                    "Borg canonical conversation transcript v1 (JSONL). Each line is one persisted message in chronological order. The final line is the current request; respond to it normally.\n{\"role\":\"user\",\"content\":\"first\"}".to_string(),
+                ),
                 (
                     CodingProvider::Codex,
                     Some("codex-compacted-session".to_string()),
-                    "continue".to_string(),
+                    "Borg canonical conversation transcript v1 (JSONL). Each line is one persisted message in chronological order. The final line is the current request; respond to it normally.\n{\"role\":\"user\",\"content\":\"Previous conversation summary:\\n\\nretained summary\"}\n{\"role\":\"user\",\"content\":\"continue\"}".to_string(),
                 ),
             ]
         );
@@ -7021,7 +7332,16 @@ mod tests {
 
         assert_eq!(
             seen.lock().unwrap().as_slice(),
-            [("first".to_string(), None), ("second".to_string(), None),]
+            [
+                (
+                    "Borg canonical conversation transcript v1 (JSONL). Each line is one persisted message in chronological order. The final line is the current request; respond to it normally.\n{\"role\":\"user\",\"content\":\"first\"}".to_string(),
+                    None
+                ),
+                (
+                    "Borg canonical conversation transcript v1 (JSONL). Each line is one persisted message in chronological order. The final line is the current request; respond to it normally.\n{\"role\":\"user\",\"content\":\"second\"}".to_string(),
+                    None
+                ),
+            ]
         );
     }
 
@@ -7414,13 +7734,13 @@ mod tests {
             *provider == CodingProvider::Codex
                 && model.as_deref() == Some("gpt-test")
                 && effort.as_deref() == Some("low")
-                && prompt == "root topic"
+                && subscription_prompt_ends_with(prompt, "root topic")
         }));
         assert!(turns.iter().any(|(provider, model, effort, prompt)| {
             *provider == CodingProvider::Claude
                 && model.is_none()
                 && effort.is_none()
-                && prompt == "peer topic"
+                && subscription_prompt_ends_with(prompt, "peer topic")
         }));
 
         command_tx
@@ -8285,7 +8605,6 @@ mod tests {
         for provider in [
             CodingProvider::Codex,
             CodingProvider::Claude,
-            CodingProvider::Kimi,
             CodingProvider::OpenRouter,
             CodingProvider::OpenAiCompatible,
         ] {
@@ -8295,10 +8614,6 @@ mod tests {
                 PromptDelivery::Queue
             ));
         }
-        assert!(!steers_active_provider_turn(
-            CodingProvider::OpenCode,
-            PromptDelivery::Steer,
-        ));
     }
 
     #[test]
@@ -8485,7 +8800,7 @@ mod tests {
                 session_id,
                 sequence,
                 SessionEventKind::ProviderEvent {
-                    provider: CodingProvider::Kimi,
+                    provider: CodingProvider::OpenRouter,
                     kind: "native_model_message".to_string(),
                     payload: serde_json::to_value(message).unwrap(),
                 },
@@ -8517,7 +8832,7 @@ mod tests {
                 session_id,
                 4,
                 SessionEventKind::ProviderEvent {
-                    provider: CodingProvider::Kimi,
+                    provider: CodingProvider::OpenRouter,
                     kind: "native_tool_round_completed".to_string(),
                     payload: json!({ "round": 1 }),
                 },
@@ -8547,7 +8862,7 @@ mod tests {
             ),
         ];
 
-        let replay = native_conversation(&events, CodingProvider::Kimi).unwrap();
+        let replay = native_conversation(&events, CodingProvider::OpenRouter).unwrap();
         assert_eq!(replay.len(), 3);
         assert!(matches!(replay[0], ModelMessage::User { .. }));
         assert!(matches!(replay[2], ModelMessage::Tool { .. }));
@@ -8691,7 +9006,371 @@ mod tests {
 
         assert_eq!(
             retained_conversation_context(&events).as_deref(),
-            Some("Previous conversation summary:\n\npreserved decisions\n\nUser: new request")
+            Some(
+                "{\"role\":\"user\",\"content\":\"Previous conversation summary:\\n\\npreserved decisions\"}\n{\"role\":\"user\",\"content\":\"new request\"}"
+            )
+        );
+    }
+
+    #[test]
+    fn provider_neutral_replay_carries_subscription_tools_across_provider_switches() {
+        use borg_provider::provider::{ModelMessage, ModelToolCall};
+
+        let session_id = Uuid::new_v4();
+        let first_message_id = Uuid::new_v4();
+        let second_message_id = Uuid::new_v4();
+        let events = vec![
+            SessionEvent::new(
+                session_id,
+                1,
+                SessionEventKind::TurnStarted {
+                    message_id: first_message_id,
+                    provider: CodingProvider::Codex,
+                    model: Some("gpt-5.6-luna".to_string()),
+                    effort: Some("xhigh".to_string()),
+                    fast: false,
+                },
+            ),
+            SessionEvent::new(
+                session_id,
+                2,
+                SessionEventKind::Message {
+                    message_id: first_message_id,
+                    actor: EventActor::User,
+                    text: "inspect the repository".to_string(),
+                    attachments: Vec::new(),
+                    status: MessageStatus::Complete,
+                    delivery: None,
+                },
+            ),
+            SessionEvent::new(
+                session_id,
+                3,
+                SessionEventKind::ToolStarted {
+                    tool_call_id: "call-1".to_string(),
+                    name: "read_file".to_string(),
+                    input: json!({"path": "Cargo.toml"}),
+                    input_ref: None,
+                },
+            ),
+            SessionEvent::new(
+                session_id,
+                4,
+                SessionEventKind::ToolCompleted {
+                    tool_call_id: "call-1".to_string(),
+                    output: "workspace contents".to_string(),
+                    output_ref: None,
+                    is_error: false,
+                    input: None,
+                    input_ref: None,
+                },
+            ),
+            SessionEvent::new(
+                session_id,
+                5,
+                SessionEventKind::Message {
+                    message_id: Uuid::new_v4(),
+                    actor: EventActor::Assistant,
+                    text: "I found the workspace.".to_string(),
+                    attachments: Vec::new(),
+                    status: MessageStatus::Complete,
+                    delivery: None,
+                },
+            ),
+            SessionEvent::new(
+                session_id,
+                6,
+                SessionEventKind::TurnCompleted {
+                    message_id: first_message_id,
+                    provider_session_id: Some("provider-owned-id".to_string()),
+                    final_text: "I found the workspace.".to_string(),
+                    error: None,
+                },
+            ),
+            SessionEvent::new(
+                session_id,
+                7,
+                SessionEventKind::TurnStarted {
+                    message_id: second_message_id,
+                    provider: CodingProvider::OpenRouter,
+                    model: Some("openai/gpt-5".to_string()),
+                    effort: None,
+                    fast: false,
+                },
+            ),
+            SessionEvent::new(
+                session_id,
+                8,
+                SessionEventKind::Message {
+                    message_id: second_message_id,
+                    actor: EventActor::User,
+                    text: "now summarize it".to_string(),
+                    attachments: Vec::new(),
+                    status: MessageStatus::Complete,
+                    delivery: None,
+                },
+            ),
+            SessionEvent::new(
+                session_id,
+                9,
+                SessionEventKind::TurnCompleted {
+                    message_id: second_message_id,
+                    provider_session_id: None,
+                    final_text: "summary".to_string(),
+                    error: None,
+                },
+            ),
+        ];
+
+        let replay = native_conversation(&events, CodingProvider::OpenRouter).unwrap();
+        assert_eq!(replay.len(), 5);
+        assert_eq!(replay[0], ModelMessage::user("inspect the repository"));
+        assert_eq!(
+            replay[1],
+            ModelMessage::assistant(
+                None,
+                None,
+                None,
+                vec![ModelToolCall::function(
+                    "call-1".to_string(),
+                    "read_file".to_string(),
+                    r#"{"path":"Cargo.toml"}"#.to_string(),
+                )],
+            )
+        );
+        assert_eq!(
+            replay[2],
+            ModelMessage::Tool {
+                tool_call_id: "call-1".to_string(),
+                content: "workspace contents".to_string(),
+            }
+        );
+        assert_eq!(
+            replay[3],
+            ModelMessage::assistant(
+                Some("I found the workspace.".to_string()),
+                None,
+                None,
+                Vec::new(),
+            )
+        );
+        assert_eq!(replay[4], ModelMessage::user("now summarize it"));
+    }
+
+    #[test]
+    fn subscription_projection_is_append_only_until_compaction() {
+        let session_id = Uuid::new_v4();
+        let first_message_id = Uuid::new_v4();
+        let events = vec![
+            SessionEvent::new(
+                session_id,
+                1,
+                SessionEventKind::TurnStarted {
+                    message_id: first_message_id,
+                    provider: CodingProvider::Codex,
+                    model: Some("gpt-5.6-luna".to_string()),
+                    effort: Some("xhigh".to_string()),
+                    fast: false,
+                },
+            ),
+            SessionEvent::new(
+                session_id,
+                2,
+                SessionEventKind::Message {
+                    message_id: first_message_id,
+                    actor: EventActor::User,
+                    text: "inspect the repository".to_string(),
+                    attachments: Vec::new(),
+                    status: MessageStatus::Complete,
+                    delivery: None,
+                },
+            ),
+            SessionEvent::new(
+                session_id,
+                3,
+                SessionEventKind::ToolStarted {
+                    tool_call_id: "call-1".to_string(),
+                    name: "read_file".to_string(),
+                    input: json!({"path": "Cargo.toml"}),
+                    input_ref: None,
+                },
+            ),
+            SessionEvent::new(
+                session_id,
+                4,
+                SessionEventKind::ToolCompleted {
+                    tool_call_id: "call-1".to_string(),
+                    output: "workspace contents".to_string(),
+                    output_ref: None,
+                    is_error: false,
+                    input: None,
+                    input_ref: None,
+                },
+            ),
+            SessionEvent::new(
+                session_id,
+                5,
+                SessionEventKind::Message {
+                    message_id: Uuid::new_v4(),
+                    actor: EventActor::Assistant,
+                    text: "I found the workspace.".to_string(),
+                    attachments: Vec::new(),
+                    status: MessageStatus::Complete,
+                    delivery: None,
+                },
+            ),
+            SessionEvent::new(
+                session_id,
+                6,
+                SessionEventKind::TurnCompleted {
+                    message_id: first_message_id,
+                    provider_session_id: Some("codex-session".to_string()),
+                    final_text: "I found the workspace.".to_string(),
+                    error: None,
+                },
+            ),
+        ];
+
+        let first =
+            format_subscription_provider_prompt(None, EventActor::User, "inspect the repository");
+        let retained = retained_conversation_context(&events).expect("completed tree context");
+        let second =
+            format_subscription_provider_prompt(Some(&retained), EventActor::User, "continue");
+
+        assert!(second.starts_with(&first));
+        assert!(second.contains("read_file"));
+        assert!(second.contains("workspace contents"));
+        assert!(second.ends_with("{\"role\":\"user\",\"content\":\"continue\"}"));
+
+        let mut compacted_events = events;
+        compacted_events.push(SessionEvent::new(
+            session_id,
+            7,
+            SessionEventKind::ProviderEvent {
+                provider: CodingProvider::Claude,
+                kind: "context_compaction".to_string(),
+                payload: json!({"summary": "preserved decisions"}),
+            },
+        ));
+        compacted_events.push(SessionEvent::new(
+            session_id,
+            8,
+            SessionEventKind::TurnStarted {
+                message_id: Uuid::new_v4(),
+                provider: CodingProvider::Claude,
+                model: Some("claude-sonnet-5".to_string()),
+                effort: None,
+                fast: false,
+            },
+        ));
+        let after_compaction = retained_conversation_context(&compacted_events)
+            .expect("compaction summary remains in the tree projection");
+        let compacted_prompt = format_subscription_provider_prompt(
+            Some(&after_compaction),
+            EventActor::User,
+            "after compaction",
+        );
+        assert!(compacted_prompt.contains("preserved decisions"));
+        assert!(!compacted_prompt.starts_with(&second));
+    }
+
+    #[test]
+    fn provider_neutral_replay_resets_subscription_history_at_compaction() {
+        use borg_provider::provider::ModelMessage;
+
+        let session_id = Uuid::new_v4();
+        let old_message_id = Uuid::new_v4();
+        let new_message_id = Uuid::new_v4();
+        let events = vec![
+            SessionEvent::new(
+                session_id,
+                1,
+                SessionEventKind::TurnStarted {
+                    message_id: old_message_id,
+                    provider: CodingProvider::Claude,
+                    model: Some("claude-sonnet-5".to_string()),
+                    effort: None,
+                    fast: false,
+                },
+            ),
+            SessionEvent::new(
+                session_id,
+                2,
+                SessionEventKind::Message {
+                    message_id: old_message_id,
+                    actor: EventActor::User,
+                    text: "old request".to_string(),
+                    attachments: Vec::new(),
+                    status: MessageStatus::Complete,
+                    delivery: None,
+                },
+            ),
+            SessionEvent::new(
+                session_id,
+                3,
+                SessionEventKind::TurnCompleted {
+                    message_id: old_message_id,
+                    provider_session_id: None,
+                    final_text: "old response".to_string(),
+                    error: None,
+                },
+            ),
+            SessionEvent::new(
+                session_id,
+                4,
+                SessionEventKind::ProviderEvent {
+                    provider: CodingProvider::Claude,
+                    kind: "context_compaction".to_string(),
+                    payload: json!({"summary": "preserved decisions"}),
+                },
+            ),
+            SessionEvent::new(
+                session_id,
+                5,
+                SessionEventKind::TurnStarted {
+                    message_id: new_message_id,
+                    provider: CodingProvider::OpenRouter,
+                    model: Some("openai/gpt-5".to_string()),
+                    effort: None,
+                    fast: false,
+                },
+            ),
+            SessionEvent::new(
+                session_id,
+                6,
+                SessionEventKind::Message {
+                    message_id: new_message_id,
+                    actor: EventActor::User,
+                    text: "continue".to_string(),
+                    attachments: Vec::new(),
+                    status: MessageStatus::Complete,
+                    delivery: None,
+                },
+            ),
+            SessionEvent::new(
+                session_id,
+                7,
+                SessionEventKind::TurnCompleted {
+                    message_id: new_message_id,
+                    provider_session_id: None,
+                    final_text: "done".to_string(),
+                    error: None,
+                },
+            ),
+        ];
+
+        assert_eq!(
+            native_conversation(&events, CodingProvider::OpenRouter).unwrap(),
+            vec![
+                ModelMessage::user("Previous conversation summary:\n\npreserved decisions"),
+                ModelMessage::user("continue"),
+            ]
+        );
+        assert_eq!(
+            retained_conversation_context(&events).as_deref(),
+            Some(
+                "{\"role\":\"user\",\"content\":\"Previous conversation summary:\\n\\npreserved decisions\"}\n{\"role\":\"user\",\"content\":\"continue\"}"
+            )
         );
     }
 

@@ -1,4 +1,5 @@
 use std::fmt;
+use std::sync::{OnceLock, RwLock};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
@@ -49,20 +50,7 @@ pub const CLAUDE_MODEL_CATALOG: ProviderModelCatalog = ProviderModelCatalog {
     effort_levels: &CLAUDE_EFFORT_LEVELS,
 };
 
-pub const KIMI_SELECTABLE_MODELS: [(&str, &str); 1] = [("kimi-k3", "Kimi K3")];
-pub const KIMI_EFFORT_LEVELS: [&str; 3] = ["low", "high", "max"];
-pub const KIMI_MODEL_CATALOG: ProviderModelCatalog = ProviderModelCatalog {
-    backend: "kimi",
-    default_model: "kimi-k3",
-    selectable_models: &KIMI_SELECTABLE_MODELS,
-    effort_levels: &KIMI_EFFORT_LEVELS,
-};
-
-pub const MODEL_CATALOGS: [ProviderModelCatalog; 3] = [
-    CODEX_MODEL_CATALOG,
-    CLAUDE_MODEL_CATALOG,
-    KIMI_MODEL_CATALOG,
-];
+pub const MODEL_CATALOGS: [ProviderModelCatalog; 2] = [CODEX_MODEL_CATALOG, CLAUDE_MODEL_CATALOG];
 
 pub fn model_catalog_for_backend(backend: &str) -> Option<ProviderModelCatalog> {
     MODEL_CATALOGS
@@ -171,22 +159,6 @@ pub fn codex_effort_supported(value: &str) -> bool {
     CODEX_MODEL_CATALOG.supports_effort(value)
 }
 
-pub fn kimi_product_model() -> &'static str {
-    KIMI_MODEL_CATALOG.default_model
-}
-
-pub fn kimi_default_effort() -> &'static str {
-    "max"
-}
-
-pub fn kimi_effort_levels() -> Vec<String> {
-    KIMI_MODEL_CATALOG
-        .effort_levels
-        .iter()
-        .map(|effort| (*effort).to_string())
-        .collect()
-}
-
 /// OpenRouter's capability-aware router. Individual OpenRouter model slugs
 /// remain valid overrides; this default avoids coupling Borg to one vendor.
 pub fn openrouter_product_model() -> &'static str {
@@ -201,12 +173,113 @@ pub struct DynamicModelEntry {
     pub detail: Option<String>,
 }
 
+static OPENROUTER_MODEL_ENTRIES: OnceLock<RwLock<Vec<DynamicModelEntry>>> = OnceLock::new();
+
+fn openrouter_model_entries_store() -> &'static RwLock<Vec<DynamicModelEntry>> {
+    OPENROUTER_MODEL_ENTRIES.get_or_init(|| RwLock::new(Vec::new()))
+}
+
+/// Return the last successfully fetched OpenRouter catalog for synchronous UI
+/// callers. An empty result means the catalog has not been fetched or the
+/// request failed; callers must retain the current/manual model fallback.
+pub fn openrouter_model_entries() -> Vec<DynamicModelEntry> {
+    openrouter_model_entries_store()
+        .read()
+        .map(|entries| entries.clone())
+        .unwrap_or_default()
+}
+
+pub fn set_openrouter_model_entries(entries: Vec<DynamicModelEntry>) {
+    if let Ok(mut current) = openrouter_model_entries_store().write() {
+        *current = entries;
+    }
+}
+
+/// Fetch OpenRouter's current model catalog when credentials are configured.
+/// Failure is returned to the caller so startup can keep the manual/current
+/// model path usable without making the network a prerequisite for the TUI.
+pub async fn refresh_openrouter_model_catalog() -> anyhow::Result<Vec<DynamicModelEntry>> {
+    let Some(api_key) = std::env::var("OPENROUTER_API_KEY")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    else {
+        set_openrouter_model_entries(Vec::new());
+        return Ok(Vec::new());
+    };
+    let base = std::env::var("BORG_OPENROUTER_BASE_URL")
+        .unwrap_or_else(|_| "https://openrouter.ai/api/v1".to_string());
+    let endpoint = format!("{}/models", base.trim_end_matches('/'));
+    let response = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?
+        .get(endpoint)
+        .bearer_auth(api_key)
+        .send()
+        .await?;
+    let status = response.status();
+    anyhow::ensure!(
+        status.is_success(),
+        "OpenRouter model catalog returned HTTP {status}"
+    );
+    let payload: serde_json::Value = response.json().await?;
+    let entries = openrouter_model_entries_from_response(&payload);
+    set_openrouter_model_entries(entries.clone());
+    Ok(entries)
+}
+
+fn openrouter_model_entries_from_response(payload: &serde_json::Value) -> Vec<DynamicModelEntry> {
+    let mut entries = payload
+        .get("data")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|model| {
+            let id = model.get("id")?.as_str()?.trim();
+            if id.is_empty() {
+                return None;
+            }
+            let label = model
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or(id)
+                .trim()
+                .to_string();
+            let mut details = Vec::new();
+            if let Some(context) = model
+                .get("context_length")
+                .and_then(serde_json::Value::as_u64)
+            {
+                details.push(format!("{context} context"));
+            }
+            if let Some(description) = model
+                .get("description")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|description| !description.is_empty())
+            {
+                details.push(description.to_string());
+            }
+            Some(DynamicModelEntry {
+                id: id.to_string(),
+                label,
+                detail: (!details.is_empty()).then(|| details.join(" · ")),
+            })
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by_cached_key(|entry| entry.label.to_lowercase());
+    entries.dedup_by(|left, right| left.id == right.id);
+    entries
+}
+
 /// Return dynamic model entries for `backend` given a set of discovered models.
 ///
 /// Returns an empty vec for any backend that has a compile-time const catalog,
 /// because those backends must never mix with the dynamic arm.
 ///
-/// For `"openai-compatible"` (and any other backend without a catalog) the rules are:
+/// For an open-ended backend (including `"openai-compatible"`) the rules are:
 /// * `current` is emitted first when `Some`.
 /// * `discovered` entries follow, deduped by `id` against `current`.
 pub fn dynamic_models_for_backend(
@@ -220,33 +293,43 @@ pub fn dynamic_models_for_backend(
         return Vec::new();
     }
 
-    // Special case: "openai-compatible" is the primary open-ended backend we
-    // expose via the picker right now.
-    let vec = match backend {
-        "openai-compatible" => {
-            let mut out = Vec::new();
-            if let Some(cur) = current {
-                out.push(DynamicModelEntry {
-                    id: cur.to_string(),
-                    label: cur.to_string(),
-                    detail: None,
-                });
-            }
-            let seen_ids: std::collections::HashSet<String> = out
-                .iter()
-                .map(|e| e.id.clone())
-                .collect();
-            for entry in discovered {
-                if !seen_ids.contains(&entry.id) {
-                    out.push(entry.clone());
-                }
-            }
-            out
-        }
-        _ => Vec::new(),
-    };
+    // The catalog backend names are stable wire names. Accept the historical
+    // display-label spelling too because picker callers may be older than the
+    // runtime API, but keep the fixed catalogs on their existing path above.
+    let open_ended = matches!(
+        backend,
+        "openai-compatible"
+            | "open-ai-compatible"
+            | "OpenAI-compatible"
+            | "Open-ai-compatible"
+            | "openrouter"
+            | "open-router"
+            | "OpenRouter"
+    );
+    if !open_ended {
+        return Vec::new();
+    }
 
-    vec
+    let mut out = Vec::new();
+    let mut seen_ids = std::collections::HashSet::new();
+    if let Some(cur) = current.filter(|current| !current.is_empty()) {
+        if let Some(discovered_entry) = discovered.iter().find(|entry| entry.id == cur) {
+            out.push(discovered_entry.clone());
+        } else {
+            out.push(DynamicModelEntry {
+                id: cur.to_string(),
+                label: cur.to_string(),
+                detail: None,
+            });
+        }
+        seen_ids.insert(cur.to_string());
+    }
+    for entry in discovered {
+        if seen_ids.insert(entry.id.clone()) {
+            out.push(entry.clone());
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -273,17 +356,19 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_models_kimi_backend_returns_empty() {
-        let result = dynamic_models_for_backend("kimi", Some("kimi-k3"), &[]);
-        assert!(result.is_empty());
-    }
-
-    #[test]
     fn dynamic_models_openai_compatible_current_first() {
         let current = "qwen3.6:35b-a3b";
         let discovered = vec![
-            DynamicModelEntry { id: "llama4".to_string(), label: "Llama 4".to_string(), detail: None },
-            DynamicModelEntry { id: "mixtral".to_string(), label: "Mixtral".to_string(), detail: None },
+            DynamicModelEntry {
+                id: "llama4".to_string(),
+                label: "Llama 4".to_string(),
+                detail: None,
+            },
+            DynamicModelEntry {
+                id: "mixtral".to_string(),
+                label: "Mixtral".to_string(),
+                detail: None,
+            },
         ];
         let result = dynamic_models_for_backend("openai-compatible", Some(current), &discovered);
         assert_eq!(result.len(), 3);
@@ -294,25 +379,104 @@ mod tests {
 
     #[test]
     fn dynamic_models_openai_compatible_no_current() {
-        let discovered = vec![
-            DynamicModelEntry { id: "qwen3".to_string(), label: "Qwen 3".to_string(), detail: None },
-        ];
+        let discovered = vec![DynamicModelEntry {
+            id: "qwen3".to_string(),
+            label: "Qwen 3".to_string(),
+            detail: None,
+        }];
         let result = dynamic_models_for_backend("openai-compatible", None, &discovered);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].id, "qwen3");
     }
 
     #[test]
+    fn dynamic_models_openrouter_current_and_catalog_are_available() {
+        let entries = vec![DynamicModelEntry {
+            id: "anthropic/claude-sonnet".to_string(),
+            label: "Claude Sonnet".to_string(),
+            detail: Some("200000 context".to_string()),
+        }];
+        let result = dynamic_models_for_backend("openrouter", Some("openrouter/auto"), &entries);
+        assert_eq!(result[0].id, "openrouter/auto");
+        assert_eq!(result[1], entries[0]);
+    }
+
+    #[test]
+    fn openrouter_catalog_response_preserves_model_details() {
+        let entries = openrouter_model_entries_from_response(&serde_json::json!({
+            "data": [
+                {
+                    "id": "z/model",
+                    "name": "Z Model",
+                    "context_length": 128000,
+                    "description": "A coding model"
+                },
+                {
+                    "id": "a/model",
+                    "name": "A Model",
+                    "context_length": 32000
+                },
+                {
+                    "id": "a/model",
+                    "name": "Duplicate"
+                }
+            ]
+        }));
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].id, "a/model");
+        assert_eq!(entries[1].label, "Z Model");
+        assert!(
+            entries[1].detail.as_deref().is_some_and(
+                |detail| detail.contains("128000 context") && detail.contains("coding")
+            )
+        );
+    }
+
+    #[test]
     fn dynamic_models_dedup_when_current_in_discovered() {
         let current = "llama4";
         let discovered = vec![
-            DynamicModelEntry { id: "llama4".to_string(), label: "Llama 4".to_string(), detail: None },
-            DynamicModelEntry { id: "qwen3".to_string(), label: "Qwen 3".to_string(), detail: None },
+            DynamicModelEntry {
+                id: "llama4".to_string(),
+                label: "Llama 4".to_string(),
+                detail: None,
+            },
+            DynamicModelEntry {
+                id: "qwen3".to_string(),
+                label: "Qwen 3".to_string(),
+                detail: None,
+            },
         ];
         let result = dynamic_models_for_backend("openai-compatible", Some(current), &discovered);
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].id, current); // current first
         assert_eq!(result[1].id, "qwen3"); // llama4 deduped out
+    }
+
+    #[test]
+    fn dynamic_models_dedup_repeated_discovered_ids_and_keeps_current_details() {
+        let current = "llama4";
+        let discovered = vec![
+            DynamicModelEntry {
+                id: current.to_string(),
+                label: "Llama 4 · Q4_K_M".to_string(),
+                detail: Some("qwen35 · fits".to_string()),
+            },
+            DynamicModelEntry {
+                id: "qwen3".to_string(),
+                label: "Qwen 3".to_string(),
+                detail: None,
+            },
+            DynamicModelEntry {
+                id: "qwen3".to_string(),
+                label: "Duplicate Qwen 3".to_string(),
+                detail: None,
+            },
+        ];
+        let result = dynamic_models_for_backend("openai-compatible", Some(current), &discovered);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].label, "Llama 4 · Q4_K_M");
+        assert_eq!(result[1].id, "qwen3");
     }
 
     #[test]

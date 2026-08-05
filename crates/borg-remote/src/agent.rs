@@ -1,18 +1,15 @@
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use borg_provider::provider::{
-    ChatApprovalDecision, ChatStreamControl, ChatStreamEvent, ChatStreamRequest, ClaudeAgentsPool,
-    CodexAppServerPool, LocalAgentPermission, run_claude_chat_stream_with_control,
-    run_claude_local_chat_stream, run_codex_chat_stream_with_control, run_codex_local_chat_stream,
-    run_opencode_local_chat_stream, run_pooled_claude_local_chat_stream,
-    run_pooled_codex_local_chat_stream,
+    ChatApprovalDecision, ChatStreamControl, ChatStreamEvent, ChatStreamRequest,
+    LocalAgentPermission, run_claude_chat_stream_with_control, run_claude_local_chat_stream,
+    run_codex_chat_stream_with_control, run_codex_local_chat_stream,
 };
-use borg_provider::{CostBasis, ProviderCallUsage, ProviderChannel};
+use borg_provider::{ProviderCallUsage, ProviderChannel};
 use serde_json::Value;
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -193,9 +190,6 @@ pub trait AgentTurnExecutor: Send + Sync {
 /// Direct provider execution used by the CLI and enrolled hosts.
 #[derive(Clone, Default)]
 pub struct LocalAgentTurnExecutor {
-    codex_pool: CodexAppServerPool,
-    claude_pool: ClaudeAgentsPool,
-    claude_sessions: Arc<Mutex<HashMap<String, ClaudeSessionSnapshot>>>,
     native_harness: NativeHarness,
     runtime_extensions: Arc<RwLock<RuntimeExtensions>>,
     runtime_extension_loader: Option<RuntimeExtensionLoader>,
@@ -209,13 +203,6 @@ type RuntimeExtensionLoader = Arc<
 struct RuntimeExtensions {
     external_mcp_servers: Vec<borg_provider::mcp::ExternalMcpServer>,
     skill_roots: Vec<PathBuf>,
-}
-
-#[derive(Clone)]
-struct ClaudeSessionSnapshot {
-    request: ChatStreamRequest,
-    permission: LocalAgentPermission,
-    pool: Option<ClaudeAgentsPool>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -257,9 +244,6 @@ impl LocalAgentTurnExecutor {
         self
     }
 
-    /// Add trusted live skill roots to every subsequent turn. Native runtimes
-    /// rescan them when the turn starts, so no provider/session restart is
-    /// required.
     pub fn with_extension_skill_roots(self, roots: Vec<PathBuf>) -> Self {
         self.runtime_extensions
             .write()
@@ -268,9 +252,6 @@ impl LocalAgentTurnExecutor {
         self
     }
 
-    /// Atomically replace the live extension snapshot. An in-flight turn keeps
-    /// the immutable snapshot it started with; the next turn observes the new
-    /// MCP catalog and skill roots.
     pub fn replace_runtime_extensions(
         &self,
         servers: Vec<borg_provider::mcp::ExternalMcpServer>,
@@ -285,8 +266,6 @@ impl LocalAgentTurnExecutor {
         };
     }
 
-    /// Refresh the extension snapshot at each turn boundary. Failed reloads
-    /// retain the last-known-good snapshot and are retried on the next turn.
     pub fn with_runtime_extension_loader<F>(mut self, loader: F) -> Self
     where
         F: Fn() -> Result<(Vec<borg_provider::mcp::ExternalMcpServer>, Vec<PathBuf>)>
@@ -312,12 +291,6 @@ impl LocalAgentTurnExecutor {
             }
         }
     }
-
-    pub fn prewarm(&self, provider: CodingProvider) {
-        if provider == CodingProvider::Codex {
-            self.codex_pool.prewarm_local(true);
-        }
-    }
 }
 
 #[async_trait::async_trait]
@@ -338,9 +311,6 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
             .extend(runtime_extensions.external_mcp_servers);
         turn.extension_skill_roots
             .extend(runtime_extensions.skill_roots);
-        if turn.provider.uses_native_harness() {
-            return self.native_harness.run(turn, events, controls).await;
-        }
         if !turn.extension_skill_roots.is_empty() {
             turn.system_prompt_appendix.push_str(
                 &crate::native_context::extension_skill_prompt_appendix(
@@ -349,39 +319,40 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
                 .await?,
             );
         }
-        events
-            .send(SessionEventKind::StatusChanged {
-                status: SessionStatus::Running,
-                detail: None,
-            })
-            .await
-            .ok();
-        run_borg_provider_turn(
-            turn,
-            events,
-            controls,
-            BorgProviderTurnRuntime {
-                request_template: None,
-                local: true,
-                codex_pool: Some(self.codex_pool.clone()),
-                claude_pool: Some(self.claude_pool.clone()),
-                claude_sessions: Some(self.claude_sessions.clone()),
-            },
-            true,
-        )
-        .await
+        if turn.provider.uses_native_harness() {
+            return self.native_harness.run(turn, events, controls).await;
+        }
+        match turn.provider {
+            CodingProvider::Codex | CodingProvider::Claude => {
+                run_borg_provider_turn(
+                    turn,
+                    events,
+                    controls,
+                    BorgProviderTurnRuntime {
+                        request_template: None,
+                        local: true,
+                    },
+                    true,
+                )
+                .await
+            }
+            provider => bail!(
+                "{provider:?} execution is unavailable; use OpenRouter or an explicitly configured OpenAI-compatible endpoint"
+            ),
+        }
     }
 
     async fn consult(&self, request: ConsultationRequest) -> Result<ConsultationResult> {
         if request.provider.uses_native_harness() {
+            let model = request
+                .model
+                .as_deref()
+                .context("native consultation requires an explicit model")?;
             let (final_text, usage) = self
                 .native_harness
                 .consult(
                     request.provider,
-                    request
-                        .model
-                        .as_deref()
-                        .context("native consultation requires an explicit model")?,
+                    model,
                     request.effort.as_deref(),
                     request.response_language,
                     &request.prompt,
@@ -394,37 +365,18 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
                 usage,
             });
         }
-
-        let (final_text, usage) = run_local_consultation_stream(&request).await?;
-        Ok(ConsultationResult {
-            provider: request.provider,
-            model: request.model,
-            final_text,
-            usage,
-        })
+        bail!(
+            "{:?} consultation is unavailable without a native provider route",
+            request.provider
+        )
     }
 
     async fn compact(
         &self,
-        provider: CodingProvider,
-        provider_session_id: &str,
+        _provider: CodingProvider,
+        _provider_session_id: &str,
     ) -> Result<Option<ProviderCallUsage>> {
-        match provider {
-            CodingProvider::Codex => self.codex_pool.compact(provider_session_id).map(|()| None),
-            CodingProvider::Claude => {
-                let snapshot = self
-                    .claude_sessions
-                    .lock()
-                    .expect("Claude session registry lock poisoned")
-                    .get(provider_session_id)
-                    .cloned()
-                    .context("Claude context is not available until the current turn finishes")?;
-                compact_claude_session(snapshot, provider_session_id)
-                    .await
-                    .map(Some)
-            }
-            _ => bail!("manual context compaction is not supported by this provider"),
-        }
+        bail!("provider-session compaction is unavailable for subscription CLI sessions")
     }
 
     async fn compact_native(
@@ -451,232 +403,72 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
                 turn.provider,
                 CodingProvider::Codex | CodingProvider::Claude
             ),
-            "cross-provider context compaction is not supported by {:?}",
+            "{:?} does not support subscription context compaction",
             turn.provider
         );
 
-        let mut turn = turn;
-        // The preparation turn must never mutate the workspace. The prompt
-        // also asks the model not to use tools, while this permission mode
-        // makes any accidental tool request require an approval that the
-        // private collector below will deny.
-        turn.permission_mode = PermissionMode::Manual;
-        let (events, mut event_rx) = mpsc::channel(128);
-        let (control_tx, control_rx) = mpsc::channel(16);
-        let usage = Arc::new(Mutex::new(ProviderCallUsage::default()));
-        let usage_sink = Arc::clone(&usage);
-        let collector = tokio::spawn(async move {
-            while let Some(event) = event_rx.recv().await {
-                if let SessionEventKind::ApprovalRequested { approval_id, .. } = &event {
-                    let _ = control_tx
-                        .send(AgentTurnControl::Approval {
-                            approval_id: approval_id.clone(),
-                            decision: crate::ApprovalDecision::Deny,
-                        })
-                        .await;
-                }
-                if let Some(observed) = usage_from_session_event(&event) {
-                    *usage_sink
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = observed;
-                }
-            }
-        });
-
-        let provider = turn.provider;
-        let result = run_borg_provider_turn(
+        // Compaction is another Borg-owned, ephemeral provider call. The CLI
+        // may use the subscription login to generate the summary, but its
+        // session files are not used and the summary is committed by the
+        // session actor as a Borg context_compaction event.
+        let (provider_events_tx, mut provider_events) = mpsc::channel(128);
+        let task = tokio::spawn(run_borg_provider_turn(
             turn,
-            events.clone(),
-            Some(control_rx),
+            provider_events_tx,
+            None,
             BorgProviderTurnRuntime {
                 request_template: None,
                 local: true,
-                codex_pool: Some(self.codex_pool.clone()),
-                claude_pool: Some(self.claude_pool.clone()),
-                claude_sessions: Some(self.claude_sessions.clone()),
             },
             false,
-        )
-        .await;
-        drop(events);
-        collector
-            .await
-            .context("compaction event collector stopped unexpectedly")?;
-        let result = result?;
-        let provider_session_id = result
-            .provider_session_id
-            .context("provider compaction preparation did not create a conversation")?;
-
-        let compaction_usage = match provider {
-            CodingProvider::Codex => {
-                self.codex_pool.compact(&provider_session_id)?;
-                None
+        ));
+        let mut usage = ProviderCallUsage::default();
+        while let Some(event) = provider_events.recv().await {
+            if let SessionEventKind::UsageUpdated {
+                provider_duration_ms,
+                input_tokens,
+                output_tokens,
+                cached_input_tokens,
+                cache_creation_input_tokens,
+                total_tokens,
+                context_tokens,
+                context_window_tokens,
+                cost_microusd,
+                ..
+            } = event
+            {
+                usage = ProviderCallUsage {
+                    duration_ms: provider_duration_ms,
+                    input_tokens,
+                    output_tokens,
+                    cached_input_tokens,
+                    cache_creation_input_tokens,
+                    total_tokens,
+                    context_tokens,
+                    context_window_tokens,
+                    cost_microusd,
+                    ..ProviderCallUsage::default()
+                };
             }
-            CodingProvider::Claude => Some(
-                compact_claude_session(
-                    self.claude_session_snapshot(&provider_session_id)?,
-                    &provider_session_id,
-                )
-                .await?,
-            ),
-            _ => unreachable!("provider was validated above"),
-        };
-
+        }
+        let result = task
+            .await
+            .context("subscription compaction task stopped unexpectedly")??;
         anyhow::ensure!(
             !result.final_text.trim().is_empty(),
-            "provider compaction preparation returned an empty summary"
+            "subscription compaction returned an empty summary"
         );
-        let mut usage = usage
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
-        if let Some(compaction_usage) = compaction_usage.as_ref() {
-            add_provider_usage(&mut usage, compaction_usage);
-        }
         Ok(AgentCompaction {
             summary: result.final_text,
             usage,
-            provider_session_id: Some(provider_session_id),
+            provider_session_id: None,
         })
     }
 
     async fn stop_session(&self, session_id: Uuid) -> Result<()> {
-        let pool = self.codex_pool.clone();
-        let owner_session_id = session_id.to_string();
-        tokio::task::spawn_blocking(move || pool.stop_owner(&owner_session_id))
-            .await
-            .context("Codex provider cleanup worker panicked")??;
         self.native_harness.stop_session(session_id).await;
         Ok(())
     }
-}
-
-impl LocalAgentTurnExecutor {
-    fn claude_session_snapshot(&self, provider_session_id: &str) -> Result<ClaudeSessionSnapshot> {
-        self.claude_sessions
-            .lock()
-            .expect("Claude session registry lock poisoned")
-            .get(provider_session_id)
-            .cloned()
-            .context("Claude context is not available after compaction preparation")
-    }
-}
-
-const CONSULTATION_SYSTEM_PROMPT: &str = "You are a second-opinion consultant in a Borg multi-model workflow. Analyze the complete briefing supplied by the caller, identify important omissions or disagreements, and return a self-contained response that the main agent can reconcile. Do not modify files, call tools, or ask the user for clarification.";
-
-async fn run_local_consultation_stream(
-    request: &ConsultationRequest,
-) -> Result<(String, ProviderCallUsage)> {
-    anyhow::ensure!(
-        matches!(
-            request.provider,
-            CodingProvider::Codex | CodingProvider::Claude | CodingProvider::OpenCode
-        ),
-        "unsupported local consultation provider: {:?}",
-        request.provider
-    );
-
-    let mut system_prompt = CONSULTATION_SYSTEM_PROMPT.to_string();
-    if let Some(instruction) = request.response_language.instruction() {
-        system_prompt.push_str("\n\n");
-        system_prompt.push_str(instruction);
-    }
-    let provider_request = ChatStreamRequest {
-        prompt: request.prompt.clone(),
-        owner_session_id: Some(format!("consultation:{}", request.owner_session_id)),
-        client_user_message_id: Some(request.message_id.to_string()),
-        attachments: Vec::new(),
-        model: request.model.clone(),
-        effort: request.effort.clone(),
-        fast: false,
-        system_prompt,
-        output_schema: None,
-        mcp_owner_id: None,
-        mcp_allowed_scopes: Vec::new(),
-        mcp_user_id: None,
-        mcp_external_servers: Vec::new(),
-        mcp_api_token: None,
-        provider_auth: None,
-        git_credentials: Vec::new(),
-        working_directory: Some(request.cwd.clone()),
-        session_id: None,
-        provider_channel: ProviderChannel::Direct,
-        persist_session: Some(false),
-        web_search_allowed: false,
-        resume_unavailable_prompt: None,
-    };
-
-    let (control_tx, control_rx) = mpsc::channel(16);
-    let mut stream = match request.provider {
-        CodingProvider::Codex => run_codex_local_chat_stream(
-            provider_request,
-            Some(control_rx),
-            LocalAgentPermission::Manual,
-        ),
-        CodingProvider::Claude => run_claude_local_chat_stream(
-            provider_request,
-            Some(control_rx),
-            LocalAgentPermission::Manual,
-        ),
-        CodingProvider::OpenCode => {
-            drop(control_rx);
-            run_opencode_local_chat_stream(provider_request, LocalAgentPermission::Manual)
-        }
-        CodingProvider::Kimi | CodingProvider::OpenRouter | CodingProvider::OpenAiCompatible => {
-            unreachable!("native provider handled above")
-        }
-    };
-
-    let mut text = String::new();
-    let mut final_text = None;
-    let mut usage = ProviderCallUsage::default();
-    while let Some(event) = stream.recv().await {
-        match event {
-            ChatStreamEvent::Delta(delta) => text.push_str(&delta),
-            ChatStreamEvent::Narration { text: narration } => {
-                if text.is_empty() {
-                    text = narration;
-                }
-            }
-            ChatStreamEvent::ApprovalRequested { approval_id, .. } => {
-                control_tx
-                    .send(ChatStreamControl::Approval {
-                        approval_id,
-                        decision: ChatApprovalDecision::Reject,
-                    })
-                    .await
-                    .ok();
-            }
-            ChatStreamEvent::ToolCall { name, .. } => {
-                bail!("consultant attempted to use tool `{name}`")
-            }
-            ChatStreamEvent::ProviderInteractionRequested { title, .. } => {
-                bail!("consultant requested interactive input: {title}")
-            }
-            ChatStreamEvent::Done {
-                final_text: result,
-                usage: result_usage,
-                ..
-            } => {
-                final_text = Some(result);
-                if let Some(result_usage) = result_usage {
-                    usage = result_usage;
-                }
-                break;
-            }
-            ChatStreamEvent::Failed { error } => bail!("{error}"),
-            ChatStreamEvent::ProviderEvent { .. }
-            | ChatStreamEvent::ReasoningDelta(_)
-            | ChatStreamEvent::Phase { .. }
-            | ChatStreamEvent::ToolResult { .. } => {}
-        }
-    }
-    let final_text = final_text.unwrap_or(text);
-    anyhow::ensure!(
-        !final_text.trim().is_empty(),
-        "consultant returned an empty response"
-    );
-    Ok((final_text, usage))
 }
 
 pub async fn run_agent_turn(
@@ -699,7 +491,10 @@ pub async fn run_agent_turn_controlled(
         .await
         .ok();
     match turn.provider {
-        CodingProvider::Codex | CodingProvider::Claude | CodingProvider::OpenCode => {
+        CodingProvider::OpenRouter | CodingProvider::OpenAiCompatible => {
+            NativeHarness::default().run(turn, events, controls).await
+        }
+        CodingProvider::Codex | CodingProvider::Claude => {
             run_borg_provider_turn(
                 turn,
                 events,
@@ -707,16 +502,10 @@ pub async fn run_agent_turn_controlled(
                 BorgProviderTurnRuntime {
                     request_template: None,
                     local: true,
-                    codex_pool: None,
-                    claude_pool: None,
-                    claude_sessions: None,
                 },
                 true,
             )
             .await
-        }
-        CodingProvider::Kimi | CodingProvider::OpenRouter | CodingProvider::OpenAiCompatible => {
-            NativeHarness::default().run(turn, events, controls).await
         }
     }
 }
@@ -724,9 +513,6 @@ pub async fn run_agent_turn_controlled(
 struct BorgProviderTurnRuntime {
     request_template: Option<ChatStreamRequest>,
     local: bool,
-    codex_pool: Option<CodexAppServerPool>,
-    claude_pool: Option<ClaudeAgentsPool>,
-    claude_sessions: Option<Arc<Mutex<HashMap<String, ClaudeSessionSnapshot>>>>,
 }
 
 async fn run_borg_provider_turn(
@@ -739,9 +525,6 @@ async fn run_borg_provider_turn(
     let BorgProviderTurnRuntime {
         request_template,
         local,
-        codex_pool,
-        claude_pool,
-        claude_sessions,
     } = runtime;
     let provider_turn_started = Instant::now();
     let ttft_session_id = turn.session_id;
@@ -760,7 +543,12 @@ async fn run_borg_provider_turn(
                 request.fast = fast;
             }
             request.working_directory = Some(turn.cwd.clone());
-            request.session_id = turn.provider_session_id.clone().or(request.session_id);
+            // Borg's journal is the canonical provider context for
+            // subscription lanes. Replaying a provider-owned session here
+            // would silently omit durable Borg tool events or duplicate the
+            // locally reconstructed prefix.
+            request.session_id = None;
+            request.persist_session = Some(false);
             request.resume_unavailable_prompt = None;
             if tools_enabled {
                 request
@@ -811,40 +599,24 @@ async fn run_borg_provider_turn(
                 provider_auth: None,
                 git_credentials: Vec::new(),
                 working_directory: Some(turn.cwd.clone()),
-                session_id: turn.provider_session_id.clone(),
+                session_id: None,
                 provider_channel: ProviderChannel::Direct,
-                persist_session: Some(true),
+                persist_session: Some(false),
                 web_search_allowed: true,
                 resume_unavailable_prompt: None,
             }
         }
     };
     let permission = local_permission(turn.permission_mode);
-    let claude_snapshot =
-        (turn.provider == CodingProvider::Claude).then(|| ClaudeSessionSnapshot {
-            request: request.clone(),
-            permission,
-            pool: claude_pool.clone(),
-        });
     let interrupted = Arc::new(AtomicBool::new(false));
     let mut stream = match turn.provider {
         CodingProvider::Codex => {
             let control_rx = map_controls(controls, Arc::clone(&interrupted));
-            if local && let Some(pool) = codex_pool {
-                run_pooled_codex_local_chat_stream(request, control_rx, permission, pool)
-            } else if local {
+            if local {
                 run_codex_local_chat_stream(request, control_rx, permission)
             } else {
                 run_codex_chat_stream_with_control(request, control_rx)
             }
-        }
-        CodingProvider::Claude if local && request_can_use_claude_pool(&request) => {
-            run_pooled_claude_local_chat_stream(
-                request,
-                map_controls(controls, Arc::clone(&interrupted)),
-                permission,
-                claude_pool.unwrap_or_default(),
-            )
         }
         CodingProvider::Claude if local => run_claude_local_chat_stream(
             request,
@@ -855,13 +627,7 @@ async fn run_borg_provider_turn(
             request,
             map_controls(controls, Arc::clone(&interrupted)),
         ),
-        CodingProvider::OpenCode if local => run_opencode_local_chat_stream(request, permission),
-        CodingProvider::OpenCode => {
-            bail!("OpenCode execution is only supported on an enrolled host")
-        }
-        CodingProvider::Kimi | CodingProvider::OpenRouter | CodingProvider::OpenAiCompatible => {
-            bail!("native providers must execute through Borg's native harness")
-        }
+        provider => bail!("{provider:?} must use a NativeHarness-compatible route"),
     };
     tracing::debug!(
         target: "borg_ttft",
@@ -1191,16 +957,6 @@ async fn run_borg_provider_turn(
         },
     )
     .await;
-    if let (Some(session_id), Some(snapshot), Some(registry)) = (
-        provider_session_id.as_ref(),
-        claude_snapshot,
-        claude_sessions,
-    ) {
-        registry
-            .lock()
-            .expect("Claude session registry lock poisoned")
-            .insert(session_id.clone(), snapshot);
-    }
     Ok(AgentTurnResult {
         provider_session_id,
         final_text: if final_output.is_empty() {
@@ -1243,96 +999,6 @@ fn terminal_assistant_text(
         Ok(None)
     } else {
         Ok(Some(text.to_string()))
-    }
-}
-
-fn request_can_use_claude_pool(request: &ChatStreamRequest) -> bool {
-    request.provider_auth.is_none() && request.git_credentials.is_empty()
-}
-
-fn usage_from_session_event(event: &SessionEventKind) -> Option<ProviderCallUsage> {
-    let SessionEventKind::UsageUpdated {
-        provider_duration_ms,
-        input_tokens,
-        output_tokens,
-        cached_input_tokens,
-        cache_creation_input_tokens,
-        total_tokens,
-        cost_microusd,
-        cost_basis,
-        context_tokens,
-        context_window_tokens,
-        ..
-    } = event
-    else {
-        return None;
-    };
-    Some(ProviderCallUsage {
-        duration_ms: *provider_duration_ms,
-        input_tokens: *input_tokens,
-        output_tokens: *output_tokens,
-        cached_input_tokens: *cached_input_tokens,
-        cache_creation_input_tokens: *cache_creation_input_tokens,
-        total_tokens: *total_tokens,
-        context_tokens: *context_tokens,
-        context_window_tokens: *context_window_tokens,
-        cost_microusd: *cost_microusd,
-        cost_basis: match cost_basis.as_str() {
-            "provider_reported" => CostBasis::ProviderReported,
-            "estimated_from_pricing" => CostBasis::EstimatedFromPricing,
-            _ => CostBasis::Unavailable,
-        },
-    })
-}
-
-async fn compact_claude_session(
-    snapshot: ClaudeSessionSnapshot,
-    provider_session_id: &str,
-) -> Result<ProviderCallUsage> {
-    let mut request = snapshot.request;
-    request.prompt = "/compact".to_string();
-    request.attachments.clear();
-    request.output_schema = None;
-    request.session_id = Some(provider_session_id.to_string());
-    request.resume_unavailable_prompt = None;
-    let mut stream = if let Some(pool) = snapshot.pool
-        && request_can_use_claude_pool(&request)
-    {
-        run_pooled_claude_local_chat_stream(request, None, snapshot.permission, pool)
-    } else {
-        run_claude_local_chat_stream(request, None, snapshot.permission)
-    };
-    while let Some(event) = stream.recv().await {
-        match event {
-            ChatStreamEvent::Done { usage, .. } => return Ok(usage.unwrap_or_default()),
-            ChatStreamEvent::Failed { error } => bail!("Claude context compaction failed: {error}"),
-            _ => {}
-        }
-    }
-    bail!("Claude context compaction ended without confirmation")
-}
-
-fn add_provider_usage(total: &mut ProviderCallUsage, additional: &ProviderCallUsage) {
-    total.duration_ms = total.duration_ms.saturating_add(additional.duration_ms);
-    total.input_tokens = total.input_tokens.saturating_add(additional.input_tokens);
-    total.cached_input_tokens = total
-        .cached_input_tokens
-        .saturating_add(additional.cached_input_tokens);
-    total.cache_creation_input_tokens = total
-        .cache_creation_input_tokens
-        .saturating_add(additional.cache_creation_input_tokens);
-    total.output_tokens = total.output_tokens.saturating_add(additional.output_tokens);
-    total.total_tokens = total.total_tokens.saturating_add(additional.total_tokens);
-    total.context_tokens = additional.context_tokens.or(total.context_tokens);
-    total.context_window_tokens = additional
-        .context_window_tokens
-        .or(total.context_window_tokens);
-    total.cost_microusd = match (total.cost_microusd, additional.cost_microusd) {
-        (Some(left), Some(right)) => Some(left.saturating_add(right)),
-        (left, right) => right.or(left),
-    };
-    if additional.cost_microusd.is_some() {
-        total.cost_basis = additional.cost_basis;
     }
 }
 
@@ -1547,43 +1213,6 @@ mod tests {
         let next_turn = executor.runtime_extensions.read().unwrap();
         assert_eq!(next_turn.external_mcp_servers[0].name, "new");
         assert_eq!(next_turn.skill_roots, [PathBuf::from("new-skills")]);
-    }
-
-    #[test]
-    fn compaction_usage_is_added_to_preparation_usage() {
-        let mut preparation = ProviderCallUsage {
-            duration_ms: 10,
-            input_tokens: 100,
-            cached_input_tokens: 40,
-            cache_creation_input_tokens: 5,
-            output_tokens: 20,
-            total_tokens: 165,
-            cost_microusd: Some(100),
-            cost_basis: CostBasis::ProviderReported,
-            ..Default::default()
-        };
-        let compaction = ProviderCallUsage {
-            duration_ms: 25,
-            input_tokens: 200,
-            cached_input_tokens: 80,
-            cache_creation_input_tokens: 7,
-            output_tokens: 30,
-            total_tokens: 317,
-            cost_microusd: Some(200),
-            cost_basis: CostBasis::ProviderReported,
-            ..Default::default()
-        };
-
-        add_provider_usage(&mut preparation, &compaction);
-
-        assert_eq!(preparation.duration_ms, 35);
-        assert_eq!(preparation.input_tokens, 300);
-        assert_eq!(preparation.cached_input_tokens, 120);
-        assert_eq!(preparation.cache_creation_input_tokens, 12);
-        assert_eq!(preparation.output_tokens, 50);
-        assert_eq!(preparation.total_tokens, 482);
-        assert_eq!(preparation.cost_microusd, Some(300));
-        assert_eq!(preparation.cost_basis, CostBasis::ProviderReported);
     }
 
     #[tokio::test]

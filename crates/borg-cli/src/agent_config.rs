@@ -27,7 +27,7 @@ pub(crate) struct AgentConfig {
 /// Applied by [`AgentConfig::apply_local_provider_env`]. The process
 /// environment always wins, so an explicit export or `--model` still
 /// overrides the file.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct LocalProviderConfig {
     /// Base URL of the OpenAI-compatible endpoint, including `/v1`.
@@ -42,6 +42,55 @@ pub(crate) struct LocalProviderConfig {
     pub(crate) context_window_tokens: Option<u64>,
     /// Most local servers ignore this; the `Generic` profile is keyless.
     pub(crate) api_key: Option<String>,
+    /// Path to a GGUF selected by the local-model catalog. Relative paths are
+    /// resolved against the active project directory when a server is started.
+    pub(crate) model_path: Option<PathBuf>,
+    /// Directories offered to local-model discovery. Discovery owns the scan;
+    /// this config is the shared seam for that future/runtime integration.
+    pub(crate) model_dirs: Vec<PathBuf>,
+    /// Read Ollama's model blobs without starting the Ollama daemon.
+    pub(crate) include_ollama_store: bool,
+    /// Include the user's Hugging Face cache in local-model discovery.
+    pub(crate) include_hf_cache: bool,
+    /// Binary used when Borg owns a local llama.cpp-compatible server.
+    pub(crate) server_bin: Option<PathBuf>,
+    /// Bind host for an owned server when `base_url` does not specify one.
+    pub(crate) host: Option<String>,
+    /// Bind port for an owned server when `base_url` does not specify one.
+    pub(crate) port: Option<u16>,
+    /// Start/reuse a local server for OpenAI-compatible sessions. This is
+    /// opt-in so existing manually managed endpoints remain unchanged.
+    pub(crate) auto_start: bool,
+    /// llama-server context size. `context_window_tokens` remains the provider
+    /// metadata override; when both are set, this launch setting wins.
+    pub(crate) ctx_size: Option<u64>,
+    /// Enable llama.cpp's Jinja chat template support for tool calling.
+    pub(crate) jinja: bool,
+    /// llama.cpp reasoning output format, normally `deepseek` for models that
+    /// emit `reasoning_content`. `None` uses the server's default.
+    pub(crate) reasoning_format: Option<String>,
+}
+
+impl Default for LocalProviderConfig {
+    fn default() -> Self {
+        Self {
+            base_url: None,
+            model: None,
+            context_window_tokens: None,
+            api_key: None,
+            model_path: None,
+            model_dirs: Vec::new(),
+            include_ollama_store: false,
+            include_hf_cache: false,
+            server_bin: None,
+            host: None,
+            port: None,
+            auto_start: false,
+            ctx_size: None,
+            jinja: true,
+            reasoning_format: Some("deepseek".to_string()),
+        }
+    }
 }
 
 /// Trust controls for declarative extension catalogs.
@@ -354,6 +403,48 @@ impl AgentConfig {
                 "local.context_window_tokens must be positive"
             );
         }
+        if let Some(model_path) = &self.local.model_path {
+            anyhow::ensure!(
+                !model_path.as_os_str().is_empty(),
+                "local.model_path must not be empty"
+            );
+        }
+        anyhow::ensure!(
+            self.local
+                .model_dirs
+                .iter()
+                .all(|path| !path.as_os_str().is_empty()),
+            "local.model_dirs must not contain empty paths"
+        );
+        if let Some(server_bin) = &self.local.server_bin {
+            anyhow::ensure!(
+                !server_bin.as_os_str().is_empty(),
+                "local.server_bin must not be empty"
+            );
+        }
+        if let Some(host) = &self.local.host {
+            anyhow::ensure!(!host.trim().is_empty(), "local.host must not be empty");
+            anyhow::ensure!(
+                !host.contains(['\0', ' ', '\t', '\r', '\n']),
+                "local.host must not contain whitespace or NUL bytes"
+            );
+        }
+        if self.local.port == Some(0) {
+            anyhow::bail!("local.port must be between 1 and 65535");
+        }
+        if let Some(ctx_size) = self.local.ctx_size {
+            anyhow::ensure!(ctx_size > 0, "local.ctx_size must be positive");
+        }
+        if let Some(reasoning_format) = &self.local.reasoning_format {
+            anyhow::ensure!(
+                !reasoning_format.trim().is_empty(),
+                "local.reasoning_format must not be empty"
+            );
+            anyhow::ensure!(
+                !reasoning_format.contains('\0'),
+                "local.reasoning_format must not contain NUL bytes"
+            );
+        }
         Ok(())
     }
 
@@ -362,12 +453,18 @@ impl AgentConfig {
     /// are never overwritten: an explicit export or `--model` still wins.
     pub(crate) fn apply_local_provider_env(&self) {
         let entries = [
-            ("BORG_OPENAI_COMPATIBLE_BASE_URL", self.local.base_url.clone()),
+            (
+                "BORG_OPENAI_COMPATIBLE_BASE_URL",
+                self.local.base_url.clone(),
+            ),
             ("BORG_OPENAI_COMPATIBLE_MODEL", self.local.model.clone()),
             ("BORG_OPENAI_COMPATIBLE_API_KEY", self.local.api_key.clone()),
             (
                 "BORG_OPENAI_COMPATIBLE_CONTEXT_WINDOW_TOKENS",
-                self.local.context_window_tokens.map(|value| value.to_string()),
+                self.local
+                    .ctx_size
+                    .or(self.local.context_window_tokens)
+                    .map(|value| value.to_string()),
             ),
         ];
         for (key, value) in entries {
@@ -376,6 +473,12 @@ impl AgentConfig {
             };
             let value = value.trim();
             if value.is_empty() {
+                continue;
+            }
+            if key == "BORG_OPENAI_COMPATIBLE_CONTEXT_WINDOW_TOKENS"
+                && std::env::var_os("BORG_LOCAL_CTX_SIZE")
+                    .is_some_and(|existing| !existing.is_empty())
+            {
                 continue;
             }
             if std::env::var_os(key).is_some_and(|existing| !existing.is_empty()) {
@@ -588,6 +691,41 @@ context_window_tokens = 32768
         config
             .validate()
             .expect_err("zero context window is rejected");
+    }
+
+    #[test]
+    fn local_server_config_parses_with_discovery_seam() {
+        let config: AgentConfig = toml::from_str(
+            r#"
+[local]
+model_path = "models/qwen.gguf"
+model_dirs = ["models", "/mnt/gguf"]
+include_ollama_store = true
+include_hf_cache = true
+server_bin = "/usr/lib/ollama/llama-server"
+host = "127.0.0.1"
+port = 8123
+auto_start = true
+ctx_size = 32768
+jinja = true
+reasoning_format = "deepseek"
+"#,
+        )
+        .expect("server config parses");
+        config.validate().expect("server config is valid");
+        assert_eq!(config.local.port, Some(8123));
+        assert_eq!(config.local.ctx_size, Some(32768));
+        assert!(config.local.include_ollama_store);
+        assert!(config.local.include_hf_cache);
+    }
+
+    #[test]
+    fn local_server_rejects_zero_port() {
+        let config: AgentConfig =
+            toml::from_str("[local]\nport = 0\n").expect("port parses as u16");
+        config
+            .validate()
+            .expect_err("zero port must not be accepted");
     }
 
     #[test]

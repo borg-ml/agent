@@ -72,7 +72,7 @@ deny = ["n", "esc"]
 
 # Add any local stdio MCP server as a provider-neutral tool extension. Borg
 # starts enabled servers for the active session and exposes them to Codex,
-# Claude, OpenCode, and the native harness. Empty allowed_tools exposes every
+# Claude, and the native harness. Empty allowed_tools exposes every
 # tool advertised by the server.
 #
 # [mcp.servers.docs]

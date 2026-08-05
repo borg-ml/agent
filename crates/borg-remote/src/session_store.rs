@@ -91,8 +91,22 @@ impl SessionEventKind {
                 actor: crate::EventActor::System,
                 status: MessageStatus::Complete,
                 ..
-            } => true,
-            Self::TurnCompleted { .. } | Self::ContextCleared => true,
+            }
+            | Self::ToolStarted { .. }
+            | Self::ToolCompleted { .. }
+            | Self::ApprovalRequested { .. }
+            | Self::ApprovalResolved { .. }
+            | Self::ProviderInteractionRequested { .. }
+            | Self::ProviderInteractionResolved { .. }
+            | Self::PlanUpdated { .. }
+            | Self::GoalUpdated { .. }
+            | Self::GoalCleared { .. } => true,
+            // TurnStarted is not itself model content, but it is the durable
+            // boundary that tells replay which provider produced the generic
+            // message/tool events that follow. Pi keeps the equivalent branch
+            // structure in its session entries; Borg needs this metadata in
+            // the recovered context slice for cross-provider replay.
+            Self::TurnStarted { .. } | Self::TurnCompleted { .. } | Self::ContextCleared => true,
             Self::ProviderEvent { kind, .. } if kind == "context_compaction" => true,
             Self::ProviderEvent { provider, kind, .. } if provider.uses_native_harness() => {
                 matches!(
@@ -2213,27 +2227,44 @@ impl SessionStore for SqliteSessionStore {
         .bind(i64::try_from(limit).unwrap_or(i64::MAX))
         .fetch_all(&self.pool)
         .await?;
-        rows.into_iter()
-            .map(|row| {
-                Ok(SessionSummary {
-                    session_id: parse_uuid(row.try_get("id")?)?,
-                    parent_session_id: row
-                        .try_get::<Option<&str>, _>("parent_session_id")?
-                        .map(parse_uuid)
-                        .transpose()?,
-                    parent_cut_sequence: row
-                        .try_get::<Option<i64>, _>("parent_cut_sequence")?
-                        .map(u64::try_from)
-                        .transpose()
-                        .context("negative parent cut sequence")?,
-                    inherited_event_count: u64::try_from(
-                        row.try_get::<i64, _>("inherited_event_count")?,
-                    )
-                    .context("negative inherited event count")?,
-                    state: serde_json::from_str(row.try_get("state_json")?)?,
-                })
-            })
-            .collect()
+        let mut sessions = Vec::with_capacity(rows.len());
+        for row in rows {
+            let session_id = parse_uuid(row.try_get("id")?)?;
+            let state_json: &str = row.try_get("state_json")?;
+            let state = match serde_json::from_str(state_json) {
+                Ok(state) => state,
+                Err(error) => {
+                    // A provider removed from the runtime can still be present
+                    // in an older session projection. It is not resumable by
+                    // this binary, but it must not make `/resume` take down the
+                    // entire TUI. Keep the row intact for migration/inspection.
+                    tracing::warn!(
+                        %session_id,
+                        %error,
+                        "skipping session with incompatible stored provider state"
+                    );
+                    continue;
+                }
+            };
+            sessions.push(SessionSummary {
+                session_id,
+                parent_session_id: row
+                    .try_get::<Option<&str>, _>("parent_session_id")?
+                    .map(parse_uuid)
+                    .transpose()?,
+                parent_cut_sequence: row
+                    .try_get::<Option<i64>, _>("parent_cut_sequence")?
+                    .map(u64::try_from)
+                    .transpose()
+                    .context("negative parent cut sequence")?,
+                inherited_event_count: u64::try_from(
+                    row.try_get::<i64, _>("inherited_event_count")?,
+                )
+                .context("negative inherited event count")?,
+                state,
+            });
+        }
+        Ok(sessions)
     }
 
     async fn attach_workspace(
@@ -2499,6 +2530,31 @@ mod tests {
             .await
             .unwrap();
         (directory, store)
+    }
+
+    #[tokio::test]
+    async fn list_sessions_skips_state_for_removed_providers() {
+        let (_directory, store) = store().await;
+        let valid = Uuid::new_v4();
+        let incompatible = Uuid::new_v4();
+        store.create_session(valid).await.unwrap();
+        store.create_session(incompatible).await.unwrap();
+        sqlx::query("update sessions set state_json = ? where id = ?")
+            .bind(r#"{"configuration":{"provider":"open_code"}}"#)
+            .bind(incompatible.to_string())
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+        let sessions = store.list_sessions(10).await.unwrap();
+        assert_eq!(
+            sessions
+                .into_iter()
+                .map(|session| session.session_id)
+                .collect::<Vec<_>>(),
+            vec![valid]
+        );
+        assert!(store.contains_session(incompatible).await.unwrap());
     }
 
     #[tokio::test]

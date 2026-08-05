@@ -440,7 +440,84 @@ fn model_picker_openai_compatible_with_current_yields_current_not_placeholder() 
     // The first option must be the current model (not the "model-id" placeholder).
     assert!(!options.is_empty());
     assert_eq!(options[0].value, current_model);
-    assert_eq!(options[0].section.as_deref(), Some("Open-ai-compatible"));
+    assert_eq!(options[0].section.as_deref(), Some("OpenAI-compatible"));
+}
+
+#[test]
+fn model_picker_openai_compatible_merges_discovered_models_after_current() {
+    let discovered = [
+        borg_provider::DynamicModelEntry {
+            id: "gguf:qwen3.6-27b-q4_k_m".to_string(),
+            label: "Qwen3.6-27B · Q4_K_M · 15.7 GiB".to_string(),
+            detail: Some("qwen35 · 42 blocks · fits in available VRAM".to_string()),
+        },
+        borg_provider::DynamicModelEntry {
+            id: "gguf:bonsai-27b-q2_g64".to_string(),
+            label: "Bonsai-27B · Q2_g64 · 7.1 GiB".to_string(),
+            detail: Some("qwen35 · 32k ctx · may spill to system RAM".to_string()),
+        },
+    ];
+    let options = model_picker_options_with_discovered(
+        Some(CodingProvider::OpenAiCompatible),
+        Some("gguf:qwen3.6-27b-q4_k_m"),
+        &discovered,
+    );
+    assert_eq!(options[0].value, "gguf:qwen3.6-27b-q4_k_m");
+    assert!(options[0].label.contains("Q4_K_M"));
+    assert_eq!(options[1].value, "gguf:bonsai-27b-q2_g64");
+    assert!(
+        options[1]
+            .preview
+            .as_deref()
+            .is_some_and(|preview| { preview.contains("32k ctx") && preview.contains("Q2_g64") })
+    );
+}
+
+#[test]
+fn model_picker_openrouter_uses_runtime_entries_and_existing_fuzzy_filter() {
+    let discovered = [borg_provider::DynamicModelEntry {
+        id: "anthropic/claude-sonnet-4".to_string(),
+        label: "Claude Sonnet 4".to_string(),
+        detail: Some("200000 context · strong coding model".to_string()),
+    }];
+    let options = model_picker_options_with_discovered(
+        Some(CodingProvider::OpenRouter),
+        Some("openrouter/auto"),
+        &discovered,
+    );
+    assert_eq!(options[0].value, "openrouter/auto");
+    assert_eq!(options[1].value, "anthropic/claude-sonnet-4");
+    assert_eq!(options[1].label, "Claude Sonnet 4");
+    assert!(
+        options[1]
+            .preview
+            .as_deref()
+            .is_some_and(|preview| preview.contains("200000 context"))
+    );
+
+    let picker = Picker {
+        kind: PickerKind::Model,
+        title: "Choose model",
+        options,
+        selected: 0,
+        query: Some("sonnet".to_string()),
+    };
+    let matches = picker.matches();
+    assert!(matches.contains(&1));
+    assert!(
+        matches
+            .iter()
+            .any(|index| { picker.options[*index].value == "claude-sonnet-5" })
+    );
+    assert_eq!(matches.len(), 2);
+}
+
+#[test]
+fn model_picker_openrouter_keeps_manual_current_when_catalog_is_unavailable() {
+    let current = "provider/custom-model";
+    let options =
+        model_picker_options_with_discovered(Some(CodingProvider::OpenRouter), Some(current), &[]);
+    assert_eq!(options[0].value, current);
 }
 
 #[test]

@@ -18,7 +18,7 @@ use super::{
     read_provider_error_response_text, read_provider_success_response_text, truncate_provider_text,
 };
 
-const KIMI_STREAM_MAX_BYTES: usize = 128 * 1024 * 1024;
+const COMPATIBLE_STREAM_MAX_BYTES: usize = 128 * 1024 * 1024;
 static OPENROUTER_MODEL_LIMITS: OnceLock<Mutex<HashMap<String, OpenRouterModelLimits>>> =
     OnceLock::new();
 
@@ -36,7 +36,6 @@ pub struct ModelGateway {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenAiCompatibleProfile {
-    Kimi,
     OpenRouter,
     Generic,
 }
@@ -44,7 +43,6 @@ pub enum OpenAiCompatibleProfile {
 impl OpenAiCompatibleProfile {
     fn label(self) -> &'static str {
         match self {
-            Self::Kimi => "kimi",
             Self::OpenRouter => "openrouter",
             Self::Generic => "openai-compatible",
         }
@@ -52,19 +50,16 @@ impl OpenAiCompatibleProfile {
 
     fn endpoint(self) -> String {
         match self {
-            Self::Kimi => chat_completions_endpoint(true),
             Self::OpenRouter => openrouter_chat_completions_endpoint(),
-            Self::Generic => chat_completions_endpoint(false),
+            Self::Generic => chat_completions_endpoint(),
         }
     }
 
     fn api_key(self) -> Option<String> {
         match self {
-            Self::Kimi => {
-                nonempty_env("BORG_KIMI_API_KEY").or_else(|| nonempty_env("MOONSHOT_API_KEY"))
-            }
             Self::OpenRouter => nonempty_env("OPENROUTER_API_KEY"),
             Self::Generic => nonempty_env("BORG_OPENAI_COMPATIBLE_API_KEY")
+                .or_else(|| nonempty_env("BORG_OPENAI_API_KEY"))
                 .or_else(|| nonempty_env("OPENAI_API_KEY")),
         }
     }
@@ -125,8 +120,8 @@ impl OpenAiCompatibleProvider {
     /// Execute one provider-neutral model turn without executing tools.
     ///
     /// The Borg harness owns the conversation and tool loop. This adapter only
-    /// translates a typed turn to Kimi's chat-completions wire contract and
-    /// returns the complete assistant message, including reasoning content.
+    /// translates a typed turn to an OpenAI-compatible chat-completions wire
+    /// contract and returns the complete assistant message.
     pub async fn model_turn(
         &self,
         request: ModelTurnRequest,
@@ -141,12 +136,7 @@ impl OpenAiCompatibleProvider {
         progress: Option<UnboundedSender<ProviderProgress>>,
         gateway: Option<&ModelGateway>,
     ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
-        let profile = if gateway.is_some() || self.is_kimi() {
-            OpenAiCompatibleProfile::Kimi
-        } else {
-            OpenAiCompatibleProfile::Generic
-        };
-        self.model_turn_via_profile(request, progress, gateway, profile)
+        self.model_turn_via_profile(request, progress, gateway, OpenAiCompatibleProfile::Generic)
             .await
     }
 
@@ -181,9 +171,6 @@ impl OpenAiCompatibleProvider {
         if api_key.is_none() && profile != OpenAiCompatibleProfile::Generic {
             return Err(ProviderCallError {
                 message: match profile {
-                    OpenAiCompatibleProfile::Kimi => {
-                        "BORG_KIMI_API_KEY or MOONSHOT_API_KEY is not set".to_string()
-                    }
                     OpenAiCompatibleProfile::OpenRouter => {
                         "OPENROUTER_API_KEY is not set".to_string()
                     }
@@ -206,10 +193,6 @@ impl OpenAiCompatibleProvider {
             "stream_options": { "include_usage": true },
         });
         match profile {
-            OpenAiCompatibleProfile::Kimi => {
-                body["reasoning_effort"] = json!(kimi_reasoning_effort(self.effort.as_deref()));
-                body["max_completion_tokens"] = json!(kimi_max_completion_tokens());
-            }
             OpenAiCompatibleProfile::OpenRouter => {
                 if let Some(reasoning) = compatible_reasoning(self.effort.as_deref()) {
                     body["reasoning"] = reasoning;
@@ -253,7 +236,6 @@ impl OpenAiCompatibleProvider {
                 OpenAiCompatibleProfile::Generic => {
                     nonempty_env("BORG_OPENAI_COMPATIBLE_RESPONSE_FORMAT")
                 }
-                OpenAiCompatibleProfile::Kimi => Some("json_schema".to_string()),
             };
             match format.as_deref() {
                 Some("none") => {}
@@ -301,9 +283,9 @@ impl OpenAiCompatibleProvider {
             }
             match apply_provider_request_timeout(request).send().await {
                 Ok(response)
-                    if attempt < max_attempts && kimi_retryable_status(response.status()) =>
+                    if attempt < max_attempts && compatible_retryable_status(response.status()) =>
                 {
-                    let delay = kimi_retry_delay(&response, attempt);
+                    let delay = compatible_retry_delay(&response, attempt);
                     emit_compatible_retry_event(
                         progress.as_ref(),
                         profile,
@@ -320,7 +302,7 @@ impl OpenAiCompatibleProvider {
                 }
                 Ok(response) => break response,
                 Err(error) if attempt < max_attempts && error.is_connect() => {
-                    let delay = kimi_retry_delay_without_response(attempt);
+                    let delay = compatible_retry_delay_without_response(attempt);
                     emit_compatible_retry_event(
                         progress.as_ref(),
                         profile,
@@ -365,7 +347,7 @@ impl OpenAiCompatibleProvider {
             });
         }
 
-        let streamed = read_kimi_model_stream(
+        let streamed = read_compatible_model_stream(
             response,
             progress.as_ref(),
             &self.model,
@@ -381,7 +363,6 @@ impl OpenAiCompatibleProvider {
         trace.exit_status = Some(0);
         let duration_ms = elapsed_millis_u64(started_at);
         let mut usage = match profile {
-            OpenAiCompatibleProfile::Kimi => kimi_usage_from_response(&streamed.raw, duration_ms),
             OpenAiCompatibleProfile::OpenRouter => extract_chat_completions_usage(
                 &streamed.raw,
                 duration_ms,
@@ -396,11 +377,7 @@ impl OpenAiCompatibleProvider {
             // to be declared. Without it `context_window_tokens` stays `None`
             // and auto-compaction never engages, which strands long local
             // sessions at the context wall instead of compacting them.
-            if let Some(context_window_tokens) = generic_context_window_tokens() {
-                usage.context_tokens =
-                    Some(usage.input_tokens.saturating_add(usage.cached_input_tokens));
-                usage.context_window_tokens = Some(context_window_tokens);
-            }
+            apply_generic_context_window(&mut usage);
         }
         if profile == OpenAiCompatibleProfile::OpenRouter {
             usage.context_tokens =
@@ -430,65 +407,8 @@ impl OpenAiCompatibleProvider {
         schema: Option<&Value>,
         progress: Option<UnboundedSender<ProviderProgress>>,
     ) -> std::result::Result<ProviderCallResult, ProviderCallError> {
-        if self.is_kimi() {
-            let mut messages = Vec::new();
-            if !self.system_prompt.trim().is_empty() {
-                messages.push(ModelMessage::System {
-                    content: self.system_prompt.to_string(),
-                });
-            }
-            messages.push(ModelMessage::user(prompt));
-            let result = self
-                .model_turn(
-                    ModelTurnRequest {
-                        request_id: None,
-                        messages,
-                        tools: Vec::new(),
-                        output_schema: schema.cloned(),
-                    },
-                    progress,
-                )
-                .await?;
-            let ModelMessage::Assistant {
-                content,
-                tool_calls,
-                ..
-            } = &result.message
-            else {
-                unreachable!("model_turn always returns an assistant message")
-            };
-            if !tool_calls.is_empty() {
-                return Err(ProviderCallError {
-                    message: "Kimi returned an unexpected tool call for a tool-free request"
-                        .to_string(),
-                    trace: result.trace,
-                    session_id: None,
-                });
-            }
-            let text = content.clone().unwrap_or_default();
-            let value = if schema.is_some() {
-                parse_chat_completion_json_text(&text).ok_or_else(|| ProviderCallError {
-                    message: format!(
-                        "Kimi returned non-JSON content for structured call: {}",
-                        truncate_provider_text(&text, 500)
-                    ),
-                    trace: result.trace.clone(),
-                    session_id: None,
-                })?
-            } else {
-                Value::String(text)
-            };
-            return Ok(ProviderCallResult {
-                value,
-                raw_response: result.raw_response,
-                usage: result.usage,
-                trace: result.trace,
-                session_id: None,
-            });
-        }
-
         let started_at = Instant::now();
-        let endpoint = chat_completions_endpoint(false);
+        let endpoint = chat_completions_endpoint();
         let mut trace = ProviderAttemptTrace {
             invocation: ProviderInvocation {
                 provider_label: self.label().to_string(),
@@ -625,16 +545,15 @@ impl OpenAiCompatibleProvider {
             Value::String(text)
         };
 
+        let mut usage = extract_chat_completions_usage(&raw, elapsed_millis_u64(started_at), None);
+        apply_generic_context_window(&mut usage);
         Ok(ProviderCallResult {
             value,
             raw_response: raw.clone(),
-            usage: extract_chat_completions_usage(&raw, elapsed_millis_u64(started_at), None),
+            usage,
             trace,
             session_id: None,
         })
-    }
-    fn is_kimi(&self) -> bool {
-        self.model == crate::kimi_product_model()
     }
 }
 
@@ -645,6 +564,16 @@ fn generic_context_window_tokens() -> Option<u64> {
     nonempty_env("BORG_OPENAI_COMPATIBLE_CONTEXT_WINDOW_TOKENS")
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|tokens| *tokens > 0)
+}
+
+fn apply_generic_context_window(usage: &mut crate::runtime::ProviderCallUsage) {
+    // Local servers report no model metadata, so the context window must be
+    // declared by Borg or by the server lifecycle. Without it auto-compaction
+    // never engages at the context wall.
+    if let Some(context_window_tokens) = generic_context_window_tokens() {
+        usage.context_tokens = Some(usage.input_tokens.saturating_add(usage.cached_input_tokens));
+        usage.context_window_tokens = Some(context_window_tokens);
+    }
 }
 
 async fn openrouter_model_limits(
@@ -732,14 +661,9 @@ fn model_message_wire_value(message: &ModelMessage) -> Value {
     }
 }
 
-fn chat_completions_endpoint(kimi: bool) -> String {
-    let base = if kimi {
-        nonempty_env("BORG_KIMI_BASE_URL")
-            .unwrap_or_else(|| "https://api.moonshot.ai/v1".to_string())
-    } else {
-        nonempty_env("BORG_OPENAI_COMPATIBLE_BASE_URL")
-            .unwrap_or_else(|| "http://127.0.0.1:8000/v1".to_string())
-    };
+fn chat_completions_endpoint() -> String {
+    let base = nonempty_env("BORG_OPENAI_COMPATIBLE_BASE_URL")
+        .unwrap_or_else(|| "http://127.0.0.1:8000/v1".to_string());
     let trimmed = base.trim_end_matches('/');
     if trimmed.ends_with("/chat/completions") {
         trimmed.to_string()
@@ -759,32 +683,32 @@ fn openrouter_chat_completions_endpoint() -> String {
     }
 }
 
-struct KimiModelStream {
+struct CompatibleModelStream {
     message: ModelMessage,
     finish_reason: String,
     raw: Value,
 }
 
 #[derive(Default)]
-struct PartialKimiToolCall {
+struct PartialToolCall {
     id: String,
     name: String,
     arguments: String,
 }
 
-async fn read_kimi_model_stream(
+async fn read_compatible_model_stream(
     response: reqwest::Response,
     progress: Option<&UnboundedSender<ProviderProgress>>,
     model: &str,
     effort: Option<&str>,
-) -> Result<KimiModelStream, String> {
+) -> Result<CompatibleModelStream, String> {
     let mut stream = response.bytes_stream();
     let mut pending = Vec::new();
     let mut total_bytes = 0_usize;
     let mut content = String::new();
     let mut reasoning_content = String::new();
     let mut reasoning_details = Vec::new();
-    let mut tool_calls = BTreeMap::<usize, PartialKimiToolCall>::new();
+    let mut tool_calls = BTreeMap::<usize, PartialToolCall>::new();
     let mut finish_reason = None;
     let mut usage = None;
     let mut saw_done = false;
@@ -792,9 +716,9 @@ async fn read_kimi_model_stream(
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| error.to_string())?;
         total_bytes = total_bytes.saturating_add(chunk.len());
-        if total_bytes > KIMI_STREAM_MAX_BYTES {
+        if total_bytes > COMPATIBLE_STREAM_MAX_BYTES {
             return Err(format!(
-                "stream exceeded the {KIMI_STREAM_MAX_BYTES} byte response limit"
+                "stream exceeded the {COMPATIBLE_STREAM_MAX_BYTES} byte response limit"
             ));
         }
         pending.extend_from_slice(&chunk);
@@ -943,23 +867,14 @@ async fn read_kimi_model_stream(
         }],
         "usage": usage.unwrap_or_else(|| json!({})),
     });
-    Ok(KimiModelStream {
+    Ok(CompatibleModelStream {
         message,
         finish_reason,
         raw,
     })
 }
 
-fn kimi_reasoning_effort(effort: Option<&str>) -> &'static str {
-    match effort.map(str::trim) {
-        Some("low") => "low",
-        Some("high") => "high",
-        Some("max") | Some("xhigh") | Some("ultra") => "max",
-        _ => "max",
-    }
-}
-
-fn kimi_retryable_status(status: reqwest::StatusCode) -> bool {
+fn compatible_retryable_status(status: reqwest::StatusCode) -> bool {
     status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
 }
 
@@ -1044,59 +959,18 @@ fn openrouter_cost_microusd(raw: &Value) -> Option<u64> {
         .and_then(provider_cost_usd_to_microusd)
 }
 
-fn kimi_retry_delay(response: &reqwest::Response, attempt: u32) -> std::time::Duration {
+fn compatible_retry_delay(response: &reqwest::Response, attempt: u32) -> std::time::Duration {
     response
         .headers()
         .get(reqwest::header::RETRY_AFTER)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.trim().parse::<u64>().ok())
         .map(|seconds| std::time::Duration::from_secs(seconds.min(30)))
-        .unwrap_or_else(|| kimi_retry_delay_without_response(attempt))
+        .unwrap_or_else(|| compatible_retry_delay_without_response(attempt))
 }
 
-fn kimi_retry_delay_without_response(attempt: u32) -> std::time::Duration {
+fn compatible_retry_delay_without_response(attempt: u32) -> std::time::Duration {
     std::time::Duration::from_millis(500_u64.saturating_mul(1_u64 << attempt.saturating_sub(1)))
-}
-
-fn kimi_max_completion_tokens() -> u64 {
-    nonempty_env("BORG_KIMI_MAX_COMPLETION_TOKENS")
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(131_072)
-        .clamp(1, 1_048_576)
-}
-
-pub fn kimi_usage_from_response(
-    raw: &Value,
-    duration_ms: u64,
-) -> crate::runtime::ProviderCallUsage {
-    let mut usage = extract_chat_completions_usage(raw, duration_ms, Some(kimi_cost_microusd(raw)));
-    // Kimi K3 exposes a 1M-token context window. Report the provider's prompt
-    // occupancy so Borg can drive the same context UI and compaction warnings
-    // as provider-native integrations.
-    usage.context_tokens = Some(usage.input_tokens.saturating_add(usage.cached_input_tokens));
-    usage.context_window_tokens = Some(1_048_576_u64.saturating_sub(kimi_max_completion_tokens()));
-    usage
-}
-
-pub fn kimi_cost_microusd(raw: &Value) -> u64 {
-    let input = raw
-        .pointer("/usage/prompt_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let cached = raw
-        .pointer("/usage/prompt_tokens_details/cached_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0)
-        .min(input);
-    let output = raw
-        .pointer("/usage/completion_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    input
-        .saturating_sub(cached)
-        .saturating_mul(3)
-        .saturating_add(cached.saturating_mul(3).div_ceil(10))
-        .saturating_add(output.saturating_mul(15))
 }
 
 fn openai_compatible_max_tokens() -> Option<u64> {
@@ -1202,50 +1076,6 @@ mod tests {
     }
 
     #[test]
-    fn product_kimi_model_selects_the_direct_route() {
-        let provider = OpenAiCompatibleProvider {
-            model: crate::kimi_product_model().to_string(),
-            effort: None,
-            system_prompt: "",
-        };
-        assert!(provider.is_kimi());
-    }
-
-    #[test]
-    fn kimi_cost_accounts_for_cached_input_at_provider_list_price() {
-        let raw = json!({
-            "usage": {
-                "prompt_tokens": 1_000_000,
-                "prompt_tokens_details": { "cached_tokens": 200_000 },
-                "completion_tokens": 100_000
-            }
-        });
-        assert_eq!(kimi_cost_microusd(&raw), 3_960_000);
-    }
-
-    #[test]
-    fn kimi_usage_reports_k3_context_occupancy() {
-        let raw = json!({
-            "usage": {
-                "prompt_tokens": 1_000,
-                "prompt_tokens_details": { "cached_tokens": 200 },
-                "completion_tokens": 100
-            }
-        });
-        let usage = kimi_usage_from_response(&raw, 5);
-        assert_eq!(usage.context_tokens, Some(1_000));
-        assert_eq!(usage.context_window_tokens, Some(917_504));
-    }
-
-    #[test]
-    fn kimi_effort_matches_the_k3_wire_contract() {
-        assert_eq!(kimi_reasoning_effort(Some("low")), "low");
-        assert_eq!(kimi_reasoning_effort(Some("high")), "high");
-        assert_eq!(kimi_reasoning_effort(Some("max")), "max");
-        assert_eq!(kimi_reasoning_effort(None), "max");
-    }
-
-    #[test]
     fn openrouter_is_model_neutral_and_only_requests_reasoning_explicitly() {
         assert_eq!(crate::openrouter_product_model(), "openrouter/auto");
         assert_eq!(compatible_reasoning(None), None);
@@ -1271,24 +1101,26 @@ mod tests {
     }
 
     #[test]
-    fn kimi_retries_only_rate_limits_and_server_failures() {
-        assert!(kimi_retryable_status(
+    fn compatible_retries_only_rate_limits_and_server_failures() {
+        assert!(compatible_retryable_status(
             reqwest::StatusCode::TOO_MANY_REQUESTS
         ));
-        assert!(kimi_retryable_status(
+        assert!(compatible_retryable_status(
             reqwest::StatusCode::SERVICE_UNAVAILABLE
         ));
-        assert!(!kimi_retryable_status(reqwest::StatusCode::BAD_REQUEST));
+        assert!(!compatible_retryable_status(
+            reqwest::StatusCode::BAD_REQUEST
+        ));
     }
 
     #[test]
-    fn kimi_retry_event_carries_structured_attempt_and_backoff() {
+    fn compatible_retry_event_carries_structured_attempt_and_backoff() {
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
 
         emit_compatible_retry_event(
             Some(&sender),
-            OpenAiCompatibleProfile::Kimi,
-            "kimi-k3",
+            OpenAiCompatibleProfile::Generic,
+            "local-model",
             CompatibleRetryAttempt {
                 attempt: 1,
                 max_attempts: 3,
@@ -1304,7 +1136,7 @@ mod tests {
             panic!("expected provider event");
         };
         assert_eq!(kind, "provider_retry");
-        assert_eq!(payload["provider"], "kimi");
+        assert_eq!(payload["provider"], "openai-compatible");
         assert_eq!(payload["status"], 429);
         assert_eq!(payload["attempt"], 1);
         assert_eq!(payload["max_attempts"], 3);
@@ -1312,7 +1144,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn kimi_stream_preserves_reasoning_and_incremental_tool_calls() {
+    async fn compatible_stream_preserves_reasoning_and_incremental_tool_calls() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind test server");
@@ -1344,7 +1176,7 @@ mod tests {
         let response = reqwest::get(format!("http://{address}"))
             .await
             .expect("request test stream");
-        let streamed = read_kimi_model_stream(response, None, "kimi-k3", Some("high"))
+        let streamed = read_compatible_model_stream(response, None, "local-model", Some("high"))
             .await
             .expect("parse stream");
         server.await.expect("test server task");

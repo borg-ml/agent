@@ -1,36 +1,23 @@
 pub mod chat_stream;
-mod codex_app_server;
 mod model_turn;
 mod openai_compatible;
-mod openrouter;
-mod sdk_providers;
 
 pub use chat_stream::{
     ChatApprovalDecision, ChatGitCredential, ChatProviderAuth, ChatStreamControl, ChatStreamEvent,
-    ChatStreamRequest, ClaudeAgentsPool, CodexAppServerPool, LocalAgentPermission,
-    run_claude_chat_stream, run_claude_chat_stream_with_control, run_claude_local_chat_stream,
-    run_codex_chat_stream, run_codex_chat_stream_with_control, run_codex_freeform_chat_stream,
-    run_codex_local_chat_stream, run_opencode_local_chat_stream,
-    run_pooled_claude_local_chat_stream, run_pooled_codex_local_chat_stream,
+    ChatStreamRequest, LocalAgentPermission, run_claude_chat_stream,
+    run_claude_chat_stream_with_control, run_claude_local_chat_stream, run_codex_chat_stream,
+    run_codex_chat_stream_with_control, run_codex_freeform_chat_stream,
+    run_codex_local_chat_stream,
 };
-pub use codex_app_server::{CodexAppServerClient, CodexWeeklyUsage, TokenUsage};
 pub use model_turn::{
     ModelFunctionCall, ModelInputAttachment, ModelMessage, ModelToolCall, ModelToolDefinition,
     ModelTurnRequest, ModelTurnResult,
 };
-pub use openai_compatible::{
-    ModelGateway, OpenAiCompatibleProfile, OpenAiCompatibleProvider, kimi_cost_microusd,
-    kimi_usage_from_response,
-};
-pub use openrouter::OpenRouterProvider;
-pub use sdk_providers::{
-    ClaudeAgentsProvider, CodexAppServerProvider, await_freeform_result, await_structured_result,
-};
+pub use openai_compatible::{ModelGateway, OpenAiCompatibleProfile, OpenAiCompatibleProvider};
 
 use std::collections::VecDeque;
 use std::error::Error as StdError;
 use std::fmt;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -40,7 +27,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, mpsc::UnboundedSender};
 
-use crate::bounded_io::read_file_text_with_limit;
 pub(crate) use crate::env::nonempty_var as nonempty_env;
 use crate::runtime::{CostBasis, ProviderCallUsage};
 
@@ -57,7 +43,6 @@ const PROVIDER_STALL_TIMEOUT_DEFAULT_SECS: u64 = 1200;
 const PROVIDER_CALL_TIMEOUT_DEFAULT_SECS: u64 = 3600;
 const PROVIDER_HTTP_ERROR_BODY_MAX_BYTES: usize = 64 * 1024;
 const PROVIDER_HTTP_SUCCESS_BODY_MAX_BYTES: usize = 128 * 1024 * 1024;
-const PROVIDER_MCP_CONFIG_MAX_BYTES: u64 = 1024 * 1024;
 
 pub fn provider_stall_timeout() -> Option<Duration> {
     provider_timeout_from_env(
@@ -122,10 +107,6 @@ pub(crate) async fn read_provider_success_response_text(
     .await
 }
 
-pub(super) fn read_provider_mcp_config_text(path: &Path) -> Result<String> {
-    read_file_text_with_limit(path, "provider MCP config", PROVIDER_MCP_CONFIG_MAX_BYTES)
-}
-
 async fn read_provider_response_text_with_limit(
     mut response: reqwest::Response,
     label: &'static str,
@@ -178,10 +159,6 @@ pub(crate) fn chat_completion_response_format(
             },
         }),
     }
-}
-
-pub(crate) fn managed_openai_api_key() -> Option<String> {
-    nonempty_env("BORG_OPENAI_API_KEY").or_else(|| nonempty_env("OPENAI_API_KEY"))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -359,32 +336,6 @@ impl ProviderCallError {
             trace,
             session_id: None,
         }
-    }
-
-    fn with_session(
-        message: impl Into<String>,
-        trace: ProviderAttemptTrace,
-        session_id: Option<String>,
-    ) -> Self {
-        Self {
-            message: message.into(),
-            trace,
-            session_id,
-        }
-    }
-}
-
-fn trace_from_buffers(
-    invocation: ProviderInvocation,
-    exit_status: Option<i32>,
-    stdout: &[u8],
-    stderr: &[u8],
-) -> ProviderAttemptTrace {
-    ProviderAttemptTrace {
-        invocation,
-        exit_status,
-        stdout: String::from_utf8_lossy(stdout).into_owned(),
-        stderr: String::from_utf8_lossy(stderr).into_owned(),
     }
 }
 
@@ -587,49 +538,6 @@ pub(crate) fn extract_chat_completions_usage(
     }
 }
 
-fn estimate_openai_cost_microusd(model: &str, usage: &ProviderCallUsage) -> Option<u64> {
-    let pricing = openai_model_pricing(model)?;
-    let long_context_pricing = pricing
-        .long_context_input_threshold
-        .is_some_and(|threshold| {
-            usage.input_tokens.saturating_add(usage.cached_input_tokens) > threshold
-        });
-    let input_rate = if long_context_pricing {
-        pricing.input_microusd_per_million.saturating_mul(2)
-    } else {
-        pricing.input_microusd_per_million
-    };
-    let cached_input_rate = if long_context_pricing {
-        pricing.cached_input_microusd_per_million.saturating_mul(2)
-    } else {
-        pricing.cached_input_microusd_per_million
-    };
-    let cache_creation_input_rate = if long_context_pricing {
-        pricing
-            .cache_creation_input_microusd_per_million
-            .saturating_mul(2)
-    } else {
-        pricing.cache_creation_input_microusd_per_million
-    };
-    let output_rate = if long_context_pricing {
-        pricing.output_microusd_per_million.saturating_mul(3) / 2
-    } else {
-        pricing.output_microusd_per_million
-    };
-    Some(
-        microusd_for_tokens(usage.input_tokens, input_rate)
-            .saturating_add(microusd_for_tokens(
-                usage.cached_input_tokens,
-                cached_input_rate,
-            ))
-            .saturating_add(microusd_for_tokens(
-                usage.cache_creation_input_tokens,
-                cache_creation_input_rate,
-            ))
-            .saturating_add(microusd_for_tokens(usage.output_tokens, output_rate)),
-    )
-}
-
 /// Estimate the extra API-equivalent cost of reprocessing tokens that would
 /// otherwise have been served from OpenAI's prompt cache.
 pub fn estimate_openai_cache_miss_microusd(
@@ -673,8 +581,6 @@ fn provider_cost_usd_to_microusd(cost_usd: f64) -> Option<u64> {
 struct OpenAiModelPricing {
     input_microusd_per_million: u64,
     cached_input_microusd_per_million: u64,
-    cache_creation_input_microusd_per_million: u64,
-    output_microusd_per_million: u64,
     long_context_input_threshold: Option<u64>,
 }
 
@@ -684,15 +590,11 @@ fn openai_model_pricing(model: &str) -> Option<OpenAiModelPricing> {
         "gpt-5.5" => Some(OpenAiModelPricing {
             input_microusd_per_million: 5_000_000,
             cached_input_microusd_per_million: 500_000,
-            cache_creation_input_microusd_per_million: 5_000_000,
-            output_microusd_per_million: 30_000_000,
             long_context_input_threshold: Some(272_000),
         }),
         model if model == crate::codex_product_model() => Some(OpenAiModelPricing {
             input_microusd_per_million: 5_000_000,
             cached_input_microusd_per_million: 500_000,
-            cache_creation_input_microusd_per_million: 6_250_000,
-            output_microusd_per_million: 30_000_000,
             long_context_input_threshold: Some(272_000),
         }),
         _ => None,
@@ -835,11 +737,9 @@ mod tests {
 
     use super::{
         CLAUDE_DEFAULT_MODEL, CLAUDE_SELECTABLE_MODELS, PROVIDER_HTTP_ERROR_BODY_MAX_BYTES,
-        PROVIDER_MCP_CONFIG_MAX_BYTES, estimate_openai_cache_miss_microusd,
-        estimate_openai_cost_microusd, extract_chat_completions_usage, microusd_for_tokens,
+        estimate_openai_cache_miss_microusd, extract_chat_completions_usage, microusd_for_tokens,
         parse_chat_completion_json_text, provider_cost_usd_to_microusd,
-        provider_response_body_would_exceed_limit, read_provider_mcp_config_text,
-        truncate_provider_text,
+        provider_response_body_would_exceed_limit, truncate_provider_text,
     };
 
     #[test]
@@ -854,63 +754,6 @@ mod tests {
             1,
             PROVIDER_HTTP_ERROR_BODY_MAX_BYTES,
         ));
-    }
-
-    #[test]
-    fn provider_mcp_config_reader_rejects_oversized_file() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("config.json");
-        let file = std::fs::File::create(&path).expect("create sparse config");
-        file.set_len(PROVIDER_MCP_CONFIG_MAX_BYTES + 1)
-            .expect("set sparse config length");
-
-        let error = read_provider_mcp_config_text(&path)
-            .expect_err("oversized provider MCP config should fail")
-            .to_string();
-
-        assert!(
-            error.contains("provider MCP config")
-                && error.contains("exceeds")
-                && error.contains("byte limit"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn openai_cost_estimate_uses_current_codex_pricing() {
-        let usage = crate::runtime::ProviderCallUsage {
-            input_tokens: 100_000,
-            cached_input_tokens: 100_000,
-            output_tokens: 100_000,
-            ..Default::default()
-        };
-
-        let cost = estimate_openai_cost_microusd(crate::codex_product_model(), &usage).unwrap();
-        assert_eq!(cost, 3_550_000);
-    }
-
-    #[test]
-    fn openai_cost_estimate_rejects_non_gpt_5_5_models() {
-        let usage = crate::runtime::ProviderCallUsage {
-            input_tokens: 1_000,
-            output_tokens: 1_000,
-            ..Default::default()
-        };
-
-        assert!(estimate_openai_cost_microusd("gpt-5.4", &usage).is_none());
-    }
-
-    #[test]
-    fn openai_cost_estimate_applies_long_context_uplift() {
-        let usage = crate::runtime::ProviderCallUsage {
-            input_tokens: 272_001,
-            cached_input_tokens: 0,
-            output_tokens: 1_000_000,
-            ..Default::default()
-        };
-
-        let cost = estimate_openai_cost_microusd(crate::codex_product_model(), &usage).unwrap();
-        assert_eq!(cost, 47_720_010);
     }
 
     #[test]

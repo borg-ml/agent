@@ -11,14 +11,6 @@ pub(crate) fn nonempty_var(name: &str) -> Option<String> {
     }
 }
 
-pub(crate) fn bool_var(name: &str) -> Option<bool> {
-    nonempty_var(name).map(|value| match value.to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" => true,
-        "0" | "false" | "no" => false,
-        _ => panic!("{name} must be a boolean value"),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -33,14 +25,6 @@ mod tests {
             let previous = std::env::var(name).ok();
             unsafe {
                 std::env::set_var(name, value);
-            }
-            Self { name, previous }
-        }
-
-        fn unset(name: &'static str) -> Self {
-            let previous = std::env::var(name).ok();
-            unsafe {
-                std::env::remove_var(name);
             }
             Self { name, previous }
         }
@@ -68,20 +52,5 @@ mod tests {
 
         let _guard = EnvGuard::set("BORG_TEST_EMPTY_VAR", "   ");
         assert_eq!(nonempty_var("BORG_TEST_EMPTY_VAR"), None);
-    }
-
-    #[test]
-    fn bool_var_distinguishes_false_from_missing_or_invalid() {
-        let _guard = EnvGuard::unset("BORG_TEST_BOOL_VAR");
-        assert_eq!(bool_var("BORG_TEST_BOOL_VAR"), None);
-
-        let _guard = EnvGuard::set("BORG_TEST_BOOL_VAR", " no ");
-        assert_eq!(bool_var("BORG_TEST_BOOL_VAR"), Some(false));
-
-        let _guard = EnvGuard::set("BORG_TEST_BOOL_VAR", "YES");
-        assert_eq!(bool_var("BORG_TEST_BOOL_VAR"), Some(true));
-
-        let _guard = EnvGuard::set("BORG_TEST_BOOL_VAR", "maybe");
-        assert!(std::panic::catch_unwind(|| bool_var("BORG_TEST_BOOL_VAR")).is_err());
     }
 }

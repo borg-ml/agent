@@ -103,13 +103,6 @@ impl NativeHarness {
             .model
             .clone()
             .context("native provider sessions require an explicit model")?;
-        if turn.provider == crate::CodingProvider::Kimi {
-            anyhow::ensure!(
-                model == borg_provider::kimi_product_model(),
-                "native Kimi sessions require model `{}`",
-                borg_provider::kimi_product_model()
-            );
-        }
         let runtime = NativeToolRuntime::start(
             turn.session_id,
             turn.cwd.clone(),
@@ -626,12 +619,9 @@ impl NativeModelClient for CompatibleModelClient {
         progress: Option<mpsc::UnboundedSender<ProviderProgress>>,
     ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
         let profile = match provider {
-            crate::CodingProvider::Kimi => OpenAiCompatibleProfile::Kimi,
             crate::CodingProvider::OpenRouter => OpenAiCompatibleProfile::OpenRouter,
             crate::CodingProvider::OpenAiCompatible => OpenAiCompatibleProfile::Generic,
-            crate::CodingProvider::Codex
-            | crate::CodingProvider::Claude
-            | crate::CodingProvider::OpenCode => {
+            crate::CodingProvider::Codex | crate::CodingProvider::Claude => {
                 return Err(ProviderCallError {
                     message: format!("{provider:?} does not use Borg's native model client"),
                     trace: ProviderAttemptTrace {
@@ -1782,7 +1772,7 @@ mod tests {
             let mut controls = None;
             call_model_streaming(
                 &client,
-                crate::CodingProvider::Kimi,
+                crate::CodingProvider::OpenRouter,
                 "test-model",
                 None,
                 ModelTurnRequest {
@@ -1792,7 +1782,7 @@ mod tests {
                     output_schema: None,
                 },
                 ModelStreamContext {
-                    coding_provider: crate::CodingProvider::Kimi,
+                    coding_provider: crate::CodingProvider::OpenRouter,
                     assistant_message_id: Uuid::new_v4(),
                     events: &events_tx,
                     controls: &mut controls,

@@ -14,8 +14,6 @@ pub const REMOTE_PROTOCOL_VERSION: u16 = 5;
 pub enum CodingProvider {
     Codex,
     Claude,
-    OpenCode,
-    Kimi,
     OpenRouter,
     OpenAiCompatible,
 }
@@ -174,8 +172,6 @@ impl CodingProvider {
         match self {
             Self::Codex => "codex",
             Self::Claude => "claude",
-            Self::OpenCode => "opencode",
-            Self::Kimi => "kimi",
             Self::OpenRouter => "openrouter",
             Self::OpenAiCompatible => "openai-compatible",
         }
@@ -189,15 +185,13 @@ impl CodingProvider {
         match self {
             Self::Codex => "Codex",
             Self::Claude => "Claude",
-            Self::OpenCode => "OpenCode",
-            Self::Kimi => "Kimi",
             Self::OpenRouter => "OpenRouter",
             Self::OpenAiCompatible => "OpenAI-compatible",
         }
     }
 
     /// Every provider that publishes a fixed model catalog, in picker order.
-    pub const CATALOG_PROVIDERS: [Self; 3] = [Self::Codex, Self::Claude, Self::Kimi];
+    pub const CATALOG_PROVIDERS: [Self; 2] = [Self::Codex, Self::Claude];
 
     /// The provider whose catalog lists `model`, if any. Model ids are unique
     /// across catalogs, so this is what lets the model picker offer models
@@ -215,8 +209,7 @@ impl CodingProvider {
         match self {
             Self::Codex => "codex",
             Self::Claude => "claude",
-            Self::OpenCode => "opencode",
-            Self::Kimi | Self::OpenRouter | Self::OpenAiCompatible => "borg",
+            Self::OpenRouter | Self::OpenAiCompatible => "borg",
         }
     }
 
@@ -225,7 +218,7 @@ impl CodingProvider {
     }
 
     pub fn uses_native_harness(self) -> bool {
-        matches!(self, Self::Kimi | Self::OpenRouter | Self::OpenAiCompatible)
+        matches!(self, Self::OpenRouter | Self::OpenAiCompatible)
     }
 }
 

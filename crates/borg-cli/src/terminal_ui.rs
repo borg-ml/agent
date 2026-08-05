@@ -1230,6 +1230,21 @@ fn model_picker_options(
     provider: Option<CodingProvider>,
     current: Option<&str>,
 ) -> Vec<PickerOption> {
+    let discovered =
+        if provider.is_none_or(|provider| matches!(provider, CodingProvider::OpenAiCompatible)) {
+            let config = borg_provider::LocalModelDiscoveryConfig::from_standard_environment();
+            borg_provider::discover_dynamic_model_entries(&config).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+    model_picker_options_with_discovered(provider, current, &discovered)
+}
+
+fn model_picker_options_with_discovered(
+    provider: Option<CodingProvider>,
+    current: Option<&str>,
+    discovered: &[borg_provider::DynamicModelEntry],
+) -> Vec<PickerOption> {
     let mut options = Vec::new();
     let push_catalog = |options: &mut Vec<PickerOption>, target: CodingProvider| {
         let Some(catalog) = target.model_catalog() else {
@@ -1248,29 +1263,47 @@ fn model_picker_options(
     match provider {
         Some(provider) if provider.model_catalog().is_some() => {}
         Some(CodingProvider::OpenRouter) => {
-            let mut models = vec![borg_provider::openrouter_product_model()];
-            if let Some(current) = current
-                && !models.contains(&current)
-            {
-                models.insert(0, current);
+            let runtime_entries = if discovered.is_empty() {
+                borg_provider::openrouter_model_entries()
+            } else {
+                discovered.to_vec()
+            };
+            let mut models =
+                borg_provider::dynamic_models_for_backend("openrouter", current, &runtime_entries);
+            if models.is_empty() {
+                models.push(borg_provider::DynamicModelEntry {
+                    id: borg_provider::openrouter_product_model().to_string(),
+                    label: borg_provider::openrouter_product_model().to_string(),
+                    detail: None,
+                });
             }
             for (index, model) in models.into_iter().enumerate() {
-                let mut option = PickerOption::new(model, model);
+                let mut option = PickerOption::new(model.label.clone(), model.id);
+                if let Some(detail) = model.detail {
+                    option.preview = Some(detail);
+                }
                 if index == 0 {
                     option.section = Some(CodingProvider::OpenRouter.label().to_string());
                 }
                 options.push(option);
             }
         }
-        provider @ (Some(CodingProvider::OpenAiCompatible | CodingProvider::OpenCode) | None) => {
+        provider @ (Some(CodingProvider::OpenAiCompatible) | None) => {
             let backend = provider
-                .map(CodingProvider::label)
+                .map(CodingProvider::catalog_backend)
                 .unwrap_or("openai-compatible");
-            let discovered: Vec<borg_provider::DynamicModelEntry> = Vec::new(); // Phase 2 fills
-            let entries = borg_provider::dynamic_models_for_backend(backend, current, &discovered);
+            let entries = borg_provider::dynamic_models_for_backend(backend, current, discovered);
             for (index, entry) in entries.into_iter().enumerate() {
-                let mut option = PickerOption::new(entry.id.clone(), entry.id);
-                option.preview = Some(entry.label);
+                let label = entry.label;
+                let mut option = PickerOption::new(label.clone(), entry.id);
+                option.preview = Some(label);
+                if let Some(detail) = entry.detail {
+                    option.preview = Some(format!(
+                        "{}\n{}",
+                        option.preview.as_deref().unwrap_or_default(),
+                        detail
+                    ));
+                }
                 if index == 0 {
                     option.section = Some(
                         provider
@@ -1282,7 +1315,7 @@ fn model_picker_options(
                 options.push(option);
             }
         }
-        Some(CodingProvider::Codex | CodingProvider::Claude | CodingProvider::Kimi) => {
+        Some(CodingProvider::Codex | CodingProvider::Claude) => {
             unreachable!("catalog-backed providers are handled above")
         }
     }

@@ -612,23 +612,18 @@ pub async fn enroll_host(
 }
 
 pub async fn probe_capabilities(roots: Vec<PathBuf>) -> HostCapabilities {
-    probe_capabilities_with_managed_kimi(roots, false).await
+    probe_capabilities_for_roots(roots).await
 }
 
-async fn probe_capabilities_with_managed_kimi(
-    roots: Vec<PathBuf>,
-    managed_kimi: bool,
-) -> HostCapabilities {
+async fn probe_capabilities_for_roots(roots: Vec<PathBuf>) -> HostCapabilities {
     let mut providers = Vec::new();
     for provider in [
         CodingProvider::Codex,
         CodingProvider::Claude,
-        CodingProvider::OpenCode,
-        CodingProvider::Kimi,
         CodingProvider::OpenRouter,
         CodingProvider::OpenAiCompatible,
     ] {
-        providers.push(probe_provider(provider, managed_kimi).await);
+        providers.push(probe_provider(provider).await);
     }
     HostCapabilities {
         protocol_version: REMOTE_PROTOCOL_VERSION,
@@ -648,22 +643,13 @@ fn workspace_attachment_capabilities() -> crate::WorkspaceAttachmentCapabilities
     }
 }
 
-async fn probe_provider(provider: CodingProvider, managed_kimi: bool) -> ProviderCapability {
+async fn probe_provider(provider: CodingProvider) -> ProviderCapability {
     let version = command_output(provider.executable(), &["--version"])
         .await
         .ok()
         .filter(|value| !value.is_empty());
     let auth = match provider {
-        CodingProvider::Codex | CodingProvider::Claude | CodingProvider::OpenCode => {
-            provider_auth_status(provider).await
-        }
-        CodingProvider::Kimi if managed_kimi => {
-            Ok("Borg gateway credentials available".to_string())
-        }
-        CodingProvider::Kimi => std::env::var("BORG_KIMI_API_KEY")
-            .or_else(|_| std::env::var("MOONSHOT_API_KEY"))
-            .map(|_| "Local Kimi credentials available".to_string())
-            .map_err(anyhow::Error::from),
+        CodingProvider::Codex | CodingProvider::Claude => provider_auth_status(provider).await,
         CodingProvider::OpenRouter => std::env::var("OPENROUTER_API_KEY")
             .map(|_| "OpenRouter credentials available".to_string())
             .map_err(anyhow::Error::from),
@@ -671,10 +657,6 @@ async fn probe_provider(provider: CodingProvider, managed_kimi: bool) -> Provide
     };
     let authenticated = auth.as_ref().is_ok_and(|output| match provider {
         CodingProvider::Claude => claude_auth_status_authenticated(output),
-        // OpenCode prints a non-empty table header even with zero credentials.
-        // A bullet represents either a stored credential or a usable provider
-        // environment variable.
-        CodingProvider::OpenCode => output.lines().any(|line| line.contains('●')),
         _ => !output.trim().is_empty(),
     });
     ProviderCapability {
@@ -690,7 +672,6 @@ async fn provider_auth_status(provider: CodingProvider) -> Result<String> {
     match provider {
         CodingProvider::Codex => command_output("codex", &["login", "status"]).await,
         CodingProvider::Claude => command_output("claude", &["auth", "status", "--json"]).await,
-        CodingProvider::OpenCode => command_output("opencode", &["providers", "list"]).await,
         _ => bail!("{provider:?} does not use an interactive provider login"),
     }
 }
@@ -760,10 +741,7 @@ pub async fn login_provider(provider: CodingProvider) -> Result<()> {
             .args(["login", "--device-auth"])
             .status(),
         CodingProvider::Claude => Command::new("claude").args(["auth", "login"]).status(),
-        CodingProvider::OpenCode => Command::new("opencode")
-            .args(["providers", "login"])
-            .status(),
-        CodingProvider::Kimi | CodingProvider::OpenRouter | CodingProvider::OpenAiCompatible => {
+        CodingProvider::OpenRouter | CodingProvider::OpenAiCompatible => {
             unreachable!("handled above")
         }
     }
@@ -781,7 +759,6 @@ pub async fn login_provider(provider: CodingProvider) -> Result<()> {
     anyhow::ensure!(
         match provider {
             CodingProvider::Claude => claude_auth_status_authenticated(&auth),
-            CodingProvider::OpenCode => auth.lines().any(|line| line.contains('●')),
             _ => !auth.trim().is_empty(),
         },
         "{} login completed but no authenticated session is available",
@@ -797,7 +774,7 @@ fn default_host_executor_factory() -> HostExecutorFactory {
     Arc::new(|config, _launch| {
         Ok(Arc::new(crate::LocalAgentTurnExecutor::with_model_gateway(
             borg_provider::provider::ModelGateway {
-                endpoint: endpoint(&config.server, "/api/remote/host/kimi/chat/completions"),
+                endpoint: endpoint(&config.server, "/api/remote/host/chat/completions"),
                 bearer_token: config.host_token.clone(),
             },
         )))
@@ -828,11 +805,11 @@ pub async fn run_host_with_executor_factory(
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join("sessions");
-    let mut capabilities = probe_capabilities_with_managed_kimi(config.roots.clone(), true).await;
+    let mut capabilities = probe_capabilities_for_roots(config.roots.clone()).await;
     let mut capabilities_probed_at = Instant::now();
     loop {
         if capabilities_probed_at.elapsed() >= Duration::from_secs(300) {
-            capabilities = probe_capabilities_with_managed_kimi(config.roots.clone(), true).await;
+            capabilities = probe_capabilities_for_roots(config.roots.clone()).await;
             capabilities_probed_at = Instant::now();
         }
         if let Err(error) = heartbeat(

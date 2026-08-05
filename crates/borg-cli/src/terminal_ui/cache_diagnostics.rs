@@ -348,10 +348,7 @@ fn cache_window(provider: CodingProvider) -> Option<Duration> {
     match provider {
         CodingProvider::Codex => Some(CODEX_CACHE_WINDOW),
         CodingProvider::Claude => Some(CLAUDE_CACHE_WINDOW),
-        CodingProvider::OpenCode
-        | CodingProvider::Kimi
-        | CodingProvider::OpenRouter
-        | CodingProvider::OpenAiCompatible => None,
+        CodingProvider::OpenRouter | CodingProvider::OpenAiCompatible => None,
     }
 }
 
@@ -624,7 +621,7 @@ mod tests {
     fn noise_floor_and_providers_without_cache_telemetry_do_not_false_alarm() {
         let mut diagnostics = CacheDiagnostics::default();
         let at = Utc::now();
-        let unknown = CacheSignature::new(CodingProvider::Kimi, Some("model"), None);
+        let unknown = CacheSignature::new(CodingProvider::OpenRouter, Some("model"), None);
         diagnostics.observe(at, unknown.clone(), usage(50_000, 0));
         assert!(
             diagnostics

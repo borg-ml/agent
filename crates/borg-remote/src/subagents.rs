@@ -2603,8 +2603,7 @@ impl SubagentCoordinator {
 fn default_model_for_cross_provider_peer(provider: CodingProvider) -> Option<String> {
     match provider {
         CodingProvider::Codex => Some(borg_provider::codex_product_model().to_string()),
-        CodingProvider::Claude | CodingProvider::OpenCode => None,
-        CodingProvider::Kimi => Some(borg_provider::kimi_product_model().to_string()),
+        CodingProvider::Claude => None,
         CodingProvider::OpenRouter => Some(borg_provider::openrouter_product_model().to_string()),
         CodingProvider::OpenAiCompatible => None,
     }
@@ -2613,11 +2612,9 @@ fn default_model_for_cross_provider_peer(provider: CodingProvider) -> Option<Str
 fn default_effort_for_cross_provider_peer(provider: CodingProvider) -> Option<String> {
     match provider {
         CodingProvider::Codex => Some(borg_provider::codex_default_effort().to_string()),
-        CodingProvider::Kimi => Some(borg_provider::kimi_default_effort().to_string()),
-        CodingProvider::Claude
-        | CodingProvider::OpenCode
-        | CodingProvider::OpenRouter
-        | CodingProvider::OpenAiCompatible => None,
+        CodingProvider::Claude | CodingProvider::OpenRouter | CodingProvider::OpenAiCompatible => {
+            None
+        }
     }
 }
 
@@ -2706,8 +2703,7 @@ fn boxed_agent_store_session(
     })
 }
 
-/// Provider-neutral schemas: Codex consumes these as app-server dynamic tools;
-/// Claude and OpenCode consume the same catalog through the local MCP bridge.
+/// Provider-neutral schemas exposed to every supported execution lane.
 pub fn subagent_tool_specs(provider: CodingProvider) -> Vec<Value> {
     let description = subagent_tool_description(provider);
     let model_description = subagent_model_override_description();
@@ -2725,8 +2721,6 @@ pub fn subagent_tool_specs(provider: CodingProvider) -> Vec<Value> {
                         "enum": [
                             "codex",
                             "claude",
-                            "open_code",
-                            "kimi",
                             "open_router",
                             "open_ai_compatible"
                         ]
@@ -2739,8 +2733,7 @@ pub fn subagent_tool_specs(provider: CodingProvider) -> Vec<Value> {
                             "gpt-5.6-terra",
                             "gpt-5.6-luna",
                             "claude-opus-5",
-                            "claude-sonnet-5",
-                            "kimi-k3"
+                            "claude-sonnet-5"
                         ]
                     },
                     "reasoning_effort": { "type": "string" }
@@ -4055,14 +4048,6 @@ mod tests {
             Some(borg_provider::codex_product_model())
         );
         assert_eq!(
-            default_model_for_cross_provider_peer(CodingProvider::Kimi).as_deref(),
-            Some(borg_provider::kimi_product_model())
-        );
-        assert_eq!(
-            default_effort_for_cross_provider_peer(CodingProvider::Kimi).as_deref(),
-            Some(borg_provider::kimi_default_effort())
-        );
-        assert_eq!(
             default_model_for_cross_provider_peer(CodingProvider::OpenRouter).as_deref(),
             Some(borg_provider::openrouter_product_model())
         );
@@ -4095,7 +4080,6 @@ mod tests {
         assert_eq!(provider, CodingProvider::Claude);
         assert_eq!(model.as_deref(), Some("claude-opus-5"));
         assert_eq!(effort.as_deref(), Some("high"));
-        assert!(resolve_persistent_peer_profile(CodingProvider::Codex, Some("kimi")).is_err());
     }
 
     #[test]
@@ -4542,8 +4526,6 @@ mod tests {
         for provider in [
             CodingProvider::Codex,
             CodingProvider::Claude,
-            CodingProvider::OpenCode,
-            CodingProvider::Kimi,
             CodingProvider::OpenRouter,
             CodingProvider::OpenAiCompatible,
         ] {

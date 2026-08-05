@@ -11,13 +11,13 @@ use std::sync::{
 use anyhow::{Context, Result};
 use borg_remote::{
     AgentTurnExecutor, ApprovalDecision, CodingProvider, EventActor, GoalAction, GoalStatus,
-    HostCommand, HostConfig, HostExecutorFactory, JsonlSessionStore, LaunchSession,
-    LocalAgentSettings, LocalAgentTurnExecutor, LocalSessionControlServer, MessageStatus,
-    PermissionMode, PlanItem, PlanItemStatus, PromptDelivery, ResponseLanguage,
-    SessionConfigAction, SessionEvent, SessionEventKind, SessionGoal, SessionState, SessionStatus,
-    SessionStore, SessionWriterLease, SpawnSubagent, SqliteSessionStore, SqliteWorkspaceStore,
-    SubagentAction, SubagentSnapshot, SubagentStatus, TodoAction, default_host_config_path,
-    enroll_host, local_session_owner_uses_current_binary, login_provider, mirror_local_session,
+    HostCommand, HostExecutorFactory, JsonlSessionStore, LaunchSession, LocalAgentSettings,
+    LocalAgentTurnExecutor, LocalSessionControlServer, MessageStatus, PermissionMode, PlanItem,
+    PlanItemStatus, PromptDelivery, ResponseLanguage, SessionConfigAction, SessionEvent,
+    SessionEventKind, SessionGoal, SessionState, SessionStatus, SessionStore, SessionWriterLease,
+    SpawnSubagent, SqliteSessionStore, SqliteWorkspaceStore, SubagentAction, SubagentSnapshot,
+    SubagentStatus, TodoAction, default_host_config_path, enroll_host,
+    local_session_owner_uses_current_binary, login_provider, mirror_local_session,
     probe_capabilities, provider_credentials_present, run_agent_session_with_store_and_writer,
     run_agent_session_with_store_writer_and_peers, run_attached_session,
     run_host_with_executor_factory, send_local_session_command, session_control_socket_path,
@@ -38,6 +38,9 @@ use crate::sleep_inhibitor::SleepInhibitor;
 use crate::terminal_ui::{
     BorgTerminal, ProviderAuthChoice, ResumeSessionOption, TerminalInputEvent, UiAction,
 };
+
+#[path = "local_server.rs"]
+mod local_server;
 
 const MIN_TUI_FPS: u64 = 15;
 const MAX_TUI_FPS: u64 = 240;
@@ -312,7 +315,7 @@ fn blu_host_executor_factory() -> HostExecutorFactory {
         let executor = LocalAgentTurnExecutor::with_model_gateway_and_settings(
             borg_provider::provider::ModelGateway {
                 endpoint: format!(
-                    "{}/api/remote/host/kimi/chat/completions",
+                    "{}/api/remote/host/chat/completions",
                     host.server.trim_end_matches('/')
                 ),
                 bearer_token: host.host_token.clone(),
@@ -440,9 +443,8 @@ fn systemd_quote(value: &str) -> String {
 
 pub(crate) async fn run_local_agent(args: LocalAgentCliArgs) -> Result<()> {
     let agent_config = AgentConfig::load(args.config.as_deref())?;
-    // Publish `[local]` provider settings before any session or worker thread
-    // reads the provider environment.
-    agent_config.apply_local_provider_env();
+    // Provider environment is applied inside each owned session, after resume
+    // configuration is resolved and before the server/executor starts.
     crate::updater::spawn_background(agent_config.updates.clone());
     let ephemeral_sessions = args.ephemeral.then(tempfile::tempdir).transpose()?;
     let crash_context = Arc::new(TuiCrashContext::default());
@@ -676,6 +678,7 @@ async fn run_local_agent_session(
     crash_context: Arc<TuiCrashContext>,
 ) -> Result<Option<(Uuid, Option<(String, Vec<PathBuf>)>)>> {
     let mut agent_config = AgentConfig::load(args.config.as_deref())?;
+    agent_config.apply_local_provider_env();
     let agent_config_path = AgentConfig::path(args.config.as_deref());
     let mut agent_config_signature = agent_config_file_signature(agent_config_path.as_deref());
     let mut editor_preferences = EditorPreferences::load()?;
@@ -782,47 +785,71 @@ async fn run_local_agent_session(
     let requested_provider = args.provider.into();
     let requested_model = args.model.clone().or_else(|| match requested_provider {
         CodingProvider::Codex => Some(borg_provider::codex_product_model().to_string()),
-        CodingProvider::Kimi => Some(borg_provider::kimi_product_model().to_string()),
         CodingProvider::OpenRouter => Some(borg_provider::openrouter_product_model().to_string()),
         CodingProvider::OpenAiCompatible => std::env::var("BORG_OPENAI_COMPATIBLE_MODEL")
             .ok()
             .filter(|model| !model.trim().is_empty()),
-        CodingProvider::Claude | CodingProvider::OpenCode => None,
+        CodingProvider::Claude => None,
     });
     let requested_effort = args.effort.clone().or_else(|| match requested_provider {
         CodingProvider::Codex => Some(borg_provider::codex_default_effort().to_string()),
-        CodingProvider::Kimi => Some(borg_provider::kimi_default_effort().to_string()),
         // OpenRouter spans reasoning and non-reasoning models. Only send its
         // optional reasoning parameter after an explicit user selection.
         CodingProvider::OpenRouter => None,
         CodingProvider::OpenAiCompatible => None,
-        CodingProvider::Claude | CodingProvider::OpenCode => None,
+        CodingProvider::Claude => None,
     });
-    let (recorded_cwd, mut provider, model, mut effort, fast, response_language, permission_mode) =
-        if let Some(recorded_config) = recorded_config {
-            recorded_config
-        } else {
-            (
-                requested_cwd
-                    .clone()
-                    .context("new sessions require a project directory")?,
-                requested_provider,
-                requested_model,
-                requested_effort,
-                Some(args.fast),
-                ResponseLanguage::Auto,
-                args.permission.into(),
-            )
-        };
+    let (
+        recorded_cwd,
+        mut provider,
+        mut model,
+        mut effort,
+        fast,
+        response_language,
+        permission_mode,
+    ) = if let Some(recorded_config) = recorded_config {
+        recorded_config
+    } else {
+        (
+            requested_cwd
+                .clone()
+                .context("new sessions require a project directory")?,
+            requested_provider,
+            requested_model,
+            requested_effort,
+            Some(args.fast),
+            ResponseLanguage::Auto,
+            args.permission.into(),
+        )
+    };
     anyhow::ensure!(
         !fast.unwrap_or(false) || provider.supports_fast(),
         "--fast is not supported by the {provider:?} transport"
     );
+    let cwd = requested_cwd.unwrap_or(recorded_cwd);
+    anyhow::ensure!(
+        cwd.is_dir(),
+        "recorded project directory no longer exists: {}; pass --cwd to resume the session in its new location",
+        cwd.display()
+    );
+    let local_server =
+        if provider == CodingProvider::OpenAiCompatible && !session_access.is_attached() {
+            let lease = local_server::ensure(&agent_config.local, &cwd, model.as_deref()).await?;
+            if model.is_none() {
+                if let Some(lease) = lease.as_ref()
+                    && !lease.model().is_empty()
+                {
+                    model = Some(lease.model().to_string());
+                }
+            }
+            lease
+        } else {
+            None
+        };
     anyhow::ensure!(
         !provider.uses_native_harness() || model.is_some(),
         "{provider:?} requires --model or BORG_OPENAI_COMPATIBLE_MODEL"
     );
-    let cwd = requested_cwd.unwrap_or(recorded_cwd);
     let capabilities = borg_remote::SessionCapabilities::from(&agent_config.capabilities);
     let team_policy = agent_config.autonomous_team_policy(&capabilities, provider, session_id);
     if !resuming
@@ -838,11 +865,6 @@ async fn run_local_agent_session(
     let mut current_effort = effort.clone();
     let mut current_fast = fast.unwrap_or(false);
     let mut current_response_language = response_language;
-    anyhow::ensure!(
-        cwd.is_dir(),
-        "recorded project directory no longer exists: {}; pass --cwd to resume the session in its new location",
-        cwd.display()
-    );
     let local_settings = LocalAgentSettings {
         approval_reviewer_model: agent_config.approvals.reviewer_model.clone(),
         approval_reviewer_effort: agent_config.approvals.reviewer_effort.clone(),
@@ -855,32 +877,13 @@ async fn run_local_agent_session(
     let extension_skill_roots = extension_catalog.active_skill_roots();
     let mut observed_extension_revision = extension_catalog.revision.clone();
     let mut last_blu_discovery_error: Option<String> = None;
-    let local_executor = if provider == CodingProvider::Kimi && host_config_path.is_file() {
-        let config: HostConfig = serde_json::from_slice(
-            &fs::read(&host_config_path)
-                .with_context(|| format!("failed to read {}", host_config_path.display()))?,
-        )
-        .with_context(|| format!("invalid host config {}", host_config_path.display()))?;
-        LocalAgentTurnExecutor::with_model_gateway_and_settings(
-            borg_provider::provider::ModelGateway {
-                endpoint: format!(
-                    "{}/api/remote/host/kimi/chat/completions",
-                    config.server.trim_end_matches('/')
-                ),
-                bearer_token: config.host_token,
-            },
-            local_settings,
-        )
-    } else {
-        LocalAgentTurnExecutor::with_settings(local_settings)
-    }
-    .with_external_mcp_servers({
-        let mut servers = agent_config.external_mcp_servers();
-        servers.extend(extension_servers);
-        servers
-    })
-    .with_extension_skill_roots(extension_skill_roots);
-    local_executor.prewarm(provider);
+    let local_executor = LocalAgentTurnExecutor::with_settings(local_settings)
+        .with_external_mcp_servers({
+            let mut servers = agent_config.external_mcp_servers();
+            servers.extend(extension_servers);
+            servers
+        })
+        .with_extension_skill_roots(extension_skill_roots);
     let live_extension_executor = local_executor.clone();
     let executor: Arc<dyn AgentTurnExecutor> = Arc::new(local_executor);
     let mut rendered = HashMap::new();
@@ -889,6 +892,11 @@ async fn run_local_agent_session(
     let rich_tui_allowed =
         rich_terminal_can_prompt(stdin_is_terminal, io::stdout().is_terminal(), args.json)
             && !BorgTerminal::fallback_requested();
+    if rich_tui_allowed {
+        if let Err(error) = borg_provider::refresh_openrouter_model_catalog().await {
+            tracing::warn!(%error, "OpenRouter model catalog unavailable; keeping current/manual model fallback");
+        }
+    }
     let fallback_terminal = can_prompt && !rich_tui_allowed;
     let mut initial_prompt = if !args.prompt.is_empty() {
         Some(args.prompt.join(" "))
@@ -3856,6 +3864,12 @@ async fn run_local_agent_session(
     if let Some(task) = mirror_task {
         task.await.context("remote mirror task failed")?;
     }
+    if let Some(server) = local_server {
+        server
+            .shutdown()
+            .await
+            .context("failed to stop Borg-owned local llama-server")?;
+    }
     if should_print_exit_resume(user_requested_exit, resume_session, args.ephemeral) {
         if let Some(notice) = exit_notice {
             println!("\n  {notice}");
@@ -5270,50 +5284,8 @@ impl SessionUsage {
 }
 
 async fn usage_summary(provider: CodingProvider, session: &SessionUsage) -> String {
-    let session = session.summary();
-    if provider != CodingProvider::Codex {
-        return session;
-    }
-    match codex_weekly_usage_summary().await {
-        Ok(account) => format!("{account}\n{session}"),
-        Err(error) => format!(
-            "Codex weekly · unavailable: {}\n{session}",
-            error.root_cause()
-        ),
-    }
-}
-
-async fn codex_weekly_usage_summary() -> Result<String> {
-    let usage = tokio::time::timeout(
-        std::time::Duration::from_secs(15),
-        tokio::task::spawn_blocking(|| {
-            let mut client = borg_provider::provider::CodexAppServerClient::start(
-                false,
-                false,
-                None,
-                false,
-                &[],
-            )?;
-            client.account_weekly_usage()
-        }),
-    )
-    .await
-    .context("Codex account usage request timed out")?
-    .context("Codex account usage task failed")??;
-    let reset = usage
-        .resets_at
-        .and_then(|timestamp| chrono::DateTime::<Utc>::from_timestamp(timestamp, 0))
-        .map(|timestamp| {
-            format!(
-                " · resets {}",
-                timestamp.with_timezone(&Local).format("%a %-d %b %H:%M %Z")
-            )
-        })
-        .unwrap_or_default();
-    Ok(format!(
-        "Codex weekly · {}% left{reset}",
-        usage.remaining_percent()
-    ))
+    let _ = provider;
+    session.summary()
 }
 
 fn parse_todo_action(line: &str, items: &[PlanItem]) -> Result<TodoAction> {
@@ -5455,8 +5427,6 @@ fn provider_name(provider: CodingProvider) -> &'static str {
     match provider {
         CodingProvider::Codex => "codex",
         CodingProvider::Claude => "claude",
-        CodingProvider::OpenCode => "opencode",
-        CodingProvider::Kimi => "kimi",
         CodingProvider::OpenRouter => "openrouter",
         CodingProvider::OpenAiCompatible => "openai-compatible",
     }

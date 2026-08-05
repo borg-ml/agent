@@ -28,7 +28,8 @@ configurable.
 
 - a responsive terminal UI with durable resume, steering, compaction, image
   input, transcript selection, and configurable keybindings;
-- Codex, Claude, OpenCode, Kimi, OpenRouter, and OpenAI-compatible providers;
+- Codex and Claude subscription providers, plus OpenRouter and explicitly
+  configured OpenAI-compatible providers;
 - a native harness with bounded file tools, background
   processes, LSP, goals, plans, subagents, MCP, project guidance, and skills;
 - Blu live extensions with dependency-aware skill and MCP packages, typed
@@ -91,7 +92,7 @@ Blu is Borg's inspectable, live extension system:
 - enable, disable, configure, update, remove, validate, and inspect packages
   with the corresponding `borg extensions` subcommands;
 - add standalone stdio servers under `[mcp.servers.<name>]` in `agent.toml` to
-  expose arbitrary tools across Codex, Claude, OpenCode, and Borg's native
+  expose arbitrary tools across Codex, Claude, and Borg's native
   providers;
 - define slash-command aliases and remap every primary TUI action in the same
   typed config; and

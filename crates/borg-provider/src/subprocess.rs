@@ -10,7 +10,9 @@
 
 use std::io;
 use std::path::Path;
-use std::process::{Child, Command, ExitStatus, Stdio};
+#[cfg(test)]
+use std::process::{Child, ExitStatus};
+use std::process::{Command, Stdio};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -242,6 +244,7 @@ fn kill_process_group(pid: u32) {
 fn kill_process_group(_pid: u32) {}
 
 #[cfg(unix)]
+#[cfg(test)]
 fn process_group_exists(pid: u32) -> bool {
     // Signal 0 performs existence/permission checking without changing the
     // process group. EPERM still proves that the group exists.
@@ -256,6 +259,7 @@ fn process_group_exists(pid: u32) -> bool {
 /// plain `Child::kill` only signals the group leader and can leave an active
 /// shell/tool running after the adapter has disappeared. Cancellation paths
 /// must use this helper before they report the owning turn as settled.
+#[cfg(test)]
 pub(crate) fn terminate_std_process_tree(child: &mut Child) -> io::Result<ExitStatus> {
     let pid = child.id();
     let status = child.try_wait()?;

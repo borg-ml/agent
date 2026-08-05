@@ -559,8 +559,6 @@ pub(crate) enum RemoteCommand {
 pub(crate) enum RemoteProviderArg {
     Codex,
     Claude,
-    OpenCode,
-    Kimi,
     OpenRouter,
     OpenAiCompatible,
 }
@@ -570,8 +568,6 @@ impl From<RemoteProviderArg> for borg_remote::CodingProvider {
         match value {
             RemoteProviderArg::Codex => Self::Codex,
             RemoteProviderArg::Claude => Self::Claude,
-            RemoteProviderArg::OpenCode => Self::OpenCode,
-            RemoteProviderArg::Kimi => Self::Kimi,
             RemoteProviderArg::OpenRouter => Self::OpenRouter,
             RemoteProviderArg::OpenAiCompatible => Self::OpenAiCompatible,
         }
