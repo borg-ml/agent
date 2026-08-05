@@ -10,8 +10,6 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::time::Sleep;
 use uuid::Uuid;
 
-#[cfg(test)]
-use crate::SessionJournal;
 use crate::subagents::{SharedWorkToolContext, TeamInboxMessage};
 use crate::{
     AgentTurn, AgentTurnControl, AgentTurnExecutor, CodingProvider, ConsultationRequest,
@@ -388,14 +386,14 @@ impl SessionConsultationTools {
 /// provide typed commands and observe durable events; terminal rendering,
 /// relay upload, and database projection remain adapters outside this kernel.
 pub async fn run_agent_session(
-    journal_path: &Path,
+    lock_path: &Path,
     session_id: Uuid,
     launch: LaunchSession,
     commands: mpsc::Receiver<HostCommand>,
     events: mpsc::Sender<SessionEvent>,
 ) -> Result<()> {
     run_agent_session_with_executor(
-        journal_path,
+        lock_path,
         session_id,
         launch,
         commands,
@@ -410,7 +408,7 @@ pub async fn run_agent_session(
 /// Local launchers use this after deciding whether to own or attach so the
 /// ownership decision remains valid through actor startup.
 pub async fn run_agent_session_with_writer(
-    journal_path: &Path,
+    lock_path: &Path,
     session_id: Uuid,
     launch: LaunchSession,
     commands: mpsc::Receiver<HostCommand>,
@@ -418,7 +416,7 @@ pub async fn run_agent_session_with_writer(
     writer: SessionWriterLease,
 ) -> Result<()> {
     run_agent_session_kernel(
-        journal_path,
+        lock_path,
         session_id,
         launch,
         commands,
@@ -432,7 +430,7 @@ pub async fn run_agent_session_with_writer(
 /// Run a local session with both an acquired writer lease and an explicit
 /// execution adapter.
 pub async fn run_agent_session_with_executor_and_writer(
-    journal_path: &Path,
+    lock_path: &Path,
     session_id: Uuid,
     launch: LaunchSession,
     commands: mpsc::Receiver<HostCommand>,
@@ -441,7 +439,7 @@ pub async fn run_agent_session_with_executor_and_writer(
     writer: SessionWriterLease,
 ) -> Result<()> {
     run_agent_session_kernel(
-        journal_path,
+        lock_path,
         session_id,
         launch,
         commands,
@@ -457,7 +455,7 @@ pub async fn run_agent_session_with_executor_and_writer(
 /// Different hosts share this actor while injecting the execution adapter
 /// appropriate to their provider credentials and process location.
 pub async fn run_agent_session_with_executor(
-    journal_path: &Path,
+    lock_path: &Path,
     session_id: Uuid,
     launch: LaunchSession,
     commands: mpsc::Receiver<HostCommand>,
@@ -465,13 +463,7 @@ pub async fn run_agent_session_with_executor(
     executor: Arc<dyn AgentTurnExecutor>,
 ) -> Result<()> {
     run_agent_session_kernel(
-        journal_path,
-        session_id,
-        launch,
-        commands,
-        events,
-        executor,
-        None,
+        lock_path, session_id, launch, commands, events, executor, None,
     )
     .await
 }
@@ -576,7 +568,7 @@ pub(crate) async fn run_agent_session_with_store_and_writer_and_team(
 }
 
 async fn run_agent_session_kernel(
-    journal_path: &Path,
+    lock_path: &Path,
     session_id: Uuid,
     launch: LaunchSession,
     commands: mpsc::Receiver<HostCommand>,
@@ -590,26 +582,13 @@ async fn run_agent_session_kernel(
         launch.provider
     );
     let _writer_lease = match writer {
-        Some(writer) => {
-            writer.ensure_journal(journal_path)?;
-            writer
-        }
-        None => SessionWriterLease::acquire(journal_path)?,
+        Some(writer) => writer,
+        None => SessionWriterLease::acquire(lock_path)?,
     };
-    let session_root = journal_path.parent().unwrap_or_else(|| Path::new("."));
+    let session_root = lock_path.parent().unwrap_or_else(|| Path::new("."));
     let store = Arc::new(SqliteSessionStore::open(session_root.join("sessions.sqlite3")).await?);
     if !store.contains_session(session_id).await? {
-        if journal_path.is_file() && tokio::fs::metadata(journal_path).await?.len() > 0 {
-            let imported = store.import_jsonl(journal_path).await?;
-            anyhow::ensure!(
-                imported.session_id == session_id,
-                "journal {} contains session {}, expected {session_id}",
-                journal_path.display(),
-                imported.session_id
-            );
-        } else {
-            store.create_session(session_id).await?;
-        }
+        store.create_session(session_id).await?;
     }
     let runtime_store: Arc<dyn SessionStore> = store;
     run_agent_session_store_kernel(
@@ -4568,6 +4547,21 @@ mod tests {
         prompt.ends_with(&format!("{{\"role\":\"user\",\"content\":{encoded}}}"))
     }
 
+    async fn sqlite_runtime_store(
+        root: &tempfile::TempDir,
+        session_id: Uuid,
+    ) -> (Arc<dyn SessionStore>, RuntimeSessionStore) {
+        let sqlite = Arc::new(
+            SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+                .await
+                .unwrap(),
+        );
+        sqlite.create_session(session_id).await.unwrap();
+        let store: Arc<dyn SessionStore> = sqlite;
+        let runtime = RuntimeSessionStore::new(Arc::clone(&store), Vec::new());
+        (store, runtime)
+    }
+
     #[tokio::test]
     async fn durable_session_events_project_once_into_the_bound_workspace() {
         let root = tempdir().unwrap();
@@ -5575,7 +5569,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn ready_is_emitted_only_after_all_queued_turn_events_are_complete() {
         let root = tempdir().unwrap();
-        let journal_path = root.path().join("session.jsonl");
+        let journal_path = root.path().join("session.lock");
         let cwd = root.path().to_path_buf();
         let session_id = Uuid::new_v4();
         let initial_message_id = Uuid::new_v4();
@@ -5747,7 +5741,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn provider_setup_stall_has_a_durable_terminal_boundary() {
         let root = tempdir().unwrap();
-        let journal_path = root.path().join("session.jsonl");
+        let journal_path = root.path().join("session.lock");
         let session_id = Uuid::new_v4();
         let message_id = Uuid::new_v4();
         let (command_tx, command_rx) = mpsc::channel(8);
@@ -5846,7 +5840,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn detached_live_projection_cannot_block_durable_turn_terminalization() {
         let root = tempdir().unwrap();
-        let journal_path = root.path().join("session.jsonl");
+        let journal_path = root.path().join("session.lock");
         let session_id = Uuid::new_v4();
         let message_id = Uuid::new_v4();
         let (command_tx, command_rx) = mpsc::channel(2);
@@ -5936,7 +5930,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn all_queued_prompts_can_be_recalled_at_the_turn_completion_boundary() {
         let root = tempdir().unwrap();
-        let journal_path = root.path().join("session.jsonl");
+        let journal_path = root.path().join("session.lock");
         let session_id = Uuid::new_v4();
         let queued_message_ids = [Uuid::new_v4(), Uuid::new_v4()];
         let (command_tx, command_rx) = mpsc::channel(8);
@@ -6063,7 +6057,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn multiple_queue_mode_prompts_drain_fifo_after_a_natural_turn_boundary() {
         let root = tempdir().unwrap();
-        let journal_path = root.path().join("session.jsonl");
+        let journal_path = root.path().join("session.lock");
         let session_id = Uuid::new_v4();
         let queued_message_ids = [Uuid::new_v4(), Uuid::new_v4()];
         let (command_tx, command_rx) = mpsc::channel(8);
@@ -6185,7 +6179,7 @@ mod tests {
     #[tokio::test]
     async fn interrupted_turn_reaches_fifo_drain_boundary() {
         let root = tempdir().unwrap();
-        let journal_path = root.path().join("session.jsonl");
+        let journal_path = root.path().join("session.lock");
         let session_id = Uuid::new_v4();
         let (command_tx, command_rx) = mpsc::channel(8);
         let (event_tx, mut event_rx) = mpsc::channel(32);
@@ -6303,7 +6297,7 @@ mod tests {
     #[tokio::test]
     async fn interrupt_timeout_cannot_publish_ready_before_provider_cleanup_finishes() {
         let root = tempdir().unwrap();
-        let journal_path = root.path().join("session.jsonl");
+        let journal_path = root.path().join("session.lock");
         let session_id = Uuid::new_v4();
         let (command_tx, command_rx) = mpsc::channel(8);
         let (event_tx, mut event_rx) = mpsc::channel(64);
@@ -6413,7 +6407,7 @@ mod tests {
     #[tokio::test]
     async fn rejected_multimodal_steer_falls_back_to_the_front_of_the_fifo() {
         let root = tempdir().unwrap();
-        let journal_path = root.path().join("session.jsonl");
+        let journal_path = root.path().join("session.lock");
         let session_id = Uuid::new_v4();
         let (command_tx, command_rx) = mpsc::channel(8);
         let (event_tx, _event_rx) = mpsc::channel(32);
@@ -6515,7 +6509,7 @@ mod tests {
     #[tokio::test]
     async fn accepted_codex_steer_stays_pending_until_the_user_message_commits() {
         let root = tempdir().unwrap();
-        let journal_path = root.path().join("session.jsonl");
+        let journal_path = root.path().join("session.lock");
         let session_id = Uuid::new_v4();
         let followup_id = Uuid::new_v4();
         let (command_tx, command_rx) = mpsc::channel(8);
@@ -6636,7 +6630,7 @@ mod tests {
     #[tokio::test]
     async fn rejected_codex_steer_retries_at_the_next_tool_boundary() {
         let root = tempdir().unwrap();
-        let journal_path = root.path().join("session.jsonl");
+        let journal_path = root.path().join("session.lock");
         let session_id = Uuid::new_v4();
         let followup_id = Uuid::new_v4();
         let (command_tx, command_rx) = mpsc::channel(8);
@@ -6763,7 +6757,7 @@ mod tests {
     #[tokio::test]
     async fn unacknowledged_steer_does_not_block_interrupt_or_fifo_fallback() {
         let root = tempdir().unwrap();
-        let journal_path = root.path().join("session.jsonl");
+        let journal_path = root.path().join("session.lock");
         let session_id = Uuid::new_v4();
         let (command_tx, command_rx) = mpsc::channel(8);
         let (event_tx, mut event_rx) = mpsc::channel(32);
@@ -6878,7 +6872,7 @@ mod tests {
     #[tokio::test]
     async fn recalling_unacknowledged_active_steer_emits_prompt_recalled() {
         let root = tempdir().unwrap();
-        let journal_path = root.path().join("session.jsonl");
+        let journal_path = root.path().join("session.lock");
         let session_id = Uuid::new_v4();
         let (command_tx, command_rx) = mpsc::channel(8);
         let (event_tx, mut event_rx) = mpsc::channel(32);
@@ -6982,7 +6976,7 @@ mod tests {
     #[tokio::test]
     async fn session_semantics_are_independent_of_turn_execution_location() {
         let root = tempdir().unwrap();
-        let journal_path = root.path().join("session.jsonl");
+        let journal_path = root.path().join("session.lock");
         std::fs::create_dir_all(root.path().join("managed-workspace")).unwrap();
         let session_id = Uuid::new_v4();
         let (command_tx, command_rx) = mpsc::channel(2);
@@ -7096,7 +7090,7 @@ mod tests {
     #[tokio::test]
     async fn compaction_after_provider_switch_rehydrates_the_new_provider_session() {
         let root = tempdir().unwrap();
-        let journal_path = root.path().join("session.jsonl");
+        let journal_path = root.path().join("session.lock");
         let session_id = Uuid::new_v4();
         let (command_tx, command_rx) = mpsc::channel(8);
         let (event_tx, mut event_rx) = mpsc::channel(64);
@@ -7245,7 +7239,7 @@ mod tests {
     #[tokio::test]
     async fn clear_context_starts_the_next_turn_without_provider_or_retained_context() {
         let root = tempdir().unwrap();
-        let journal_path = root.path().join("session.jsonl");
+        let journal_path = root.path().join("session.lock");
         let session_id = Uuid::new_v4();
         let (command_tx, command_rx) = mpsc::channel(8);
         let (event_tx, mut event_rx) = mpsc::channel(32);
@@ -7348,7 +7342,7 @@ mod tests {
     #[tokio::test]
     async fn fresh_idle_session_has_one_durable_lifecycle() {
         let root = tempdir().unwrap();
-        let journal_path = root.path().join("session.jsonl");
+        let journal_path = root.path().join("session.lock");
         let session_id = Uuid::new_v4();
         let (command_tx, command_rx) = mpsc::channel(2);
         let (event_tx, mut event_rx) = mpsc::channel(8);
@@ -7429,9 +7423,8 @@ mod tests {
     async fn sqlite_store_runs_the_canonical_session_actor() {
         let root = tempdir().unwrap();
         let session_id = Uuid::new_v4();
-        let lock_journal =
-            SessionJournal::open(root.path().join(format!("{session_id}.jsonl"))).unwrap();
-        let writer = lock_journal.acquire_writer().unwrap();
+        let writer =
+            SessionWriterLease::acquire(root.path().join(format!("{session_id}.lock"))).unwrap();
         let store = Arc::new(
             crate::SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
                 .await
@@ -7550,16 +7543,17 @@ mod tests {
         let child_path = root
             .path()
             .join("subagents")
-            .join(format!("{child_id}.jsonl"));
-        let mut child_journal = SessionJournal::open(&child_path).unwrap();
-        child_journal
+            .join(format!("{child_id}.lock"));
+        store.create_session(child_id).await.unwrap();
+        store
             .append(SessionEvent::new(
                 child_id,
                 0,
                 SessionEventKind::SessionStarted,
             ))
+            .await
             .unwrap();
-        child_journal
+        store
             .append(SessionEvent::new(
                 child_id,
                 0,
@@ -7573,8 +7567,9 @@ mod tests {
                     permission_mode: PermissionMode::Manual,
                 },
             ))
+            .await
             .unwrap();
-        child_journal
+        store
             .append(SessionEvent::new(
                 child_id,
                 0,
@@ -7583,11 +7578,11 @@ mod tests {
                     detail: Some("crash cleanup completed".to_string()),
                 },
             ))
+            .await
             .unwrap();
 
-        let root_journal =
-            SessionJournal::open(root.path().join(format!("{session_id}.jsonl"))).unwrap();
-        let writer = root_journal.acquire_writer().unwrap();
+        let writer =
+            SessionWriterLease::acquire(root.path().join(format!("{session_id}.lock"))).unwrap();
         let (command_tx, command_rx) = mpsc::channel(2);
         let (event_tx, mut event_rx) = mpsc::channel(16);
         command_tx
@@ -7664,9 +7659,8 @@ mod tests {
     async fn initial_mixed_provider_peer_starts_with_isolated_provider_configuration() {
         let root = tempdir().unwrap();
         let session_id = Uuid::new_v4();
-        let journal =
-            SessionJournal::open(root.path().join(format!("{session_id}.jsonl"))).unwrap();
-        let writer = journal.acquire_writer().unwrap();
+        let writer =
+            SessionWriterLease::acquire(root.path().join(format!("{session_id}.lock"))).unwrap();
         let store = Arc::new(
             SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
                 .await
@@ -7753,7 +7747,7 @@ mod tests {
     #[tokio::test]
     async fn model_consultation_dispatches_a_freeform_briefing_to_an_isolated_provider() {
         let root = tempdir().unwrap();
-        let journal_path = root.path().join("session.jsonl");
+        let journal_path = root.path().join("session.lock");
         let session_id = Uuid::new_v4();
         let (command_tx, command_rx) = mpsc::channel(4);
         let (event_tx, _event_rx) = mpsc::channel(64);
@@ -7833,13 +7827,8 @@ mod tests {
     #[tokio::test]
     async fn goal_state_is_recoverable_from_the_session_journal() {
         let root = tempdir().unwrap();
-        let journal_path = root.path().join("session.jsonl");
         let session_id = Uuid::new_v4();
-        let journal = SessionJournal::open(&journal_path).unwrap();
-        let store: Arc<dyn SessionStore> = Arc::new(
-            crate::session_store::JsonlSessionStore::from_journal(journal),
-        );
-        let mut journal = RuntimeSessionStore::new(store, Vec::new());
+        let (store, mut journal) = sqlite_runtime_store(&root, session_id).await;
         let (event_tx, mut event_rx) = mpsc::channel(16);
         let mut goal = None;
         let mut active_since = None;
@@ -7870,12 +7859,7 @@ mod tests {
         assert_eq!(goal.as_ref().unwrap().status, GoalStatus::Paused);
         assert!(active_since.is_none());
         assert_eq!(
-            SessionJournal::open(&journal_path)
-                .unwrap()
-                .goal()
-                .unwrap()
-                .unwrap()
-                .status,
+            store.state(session_id).await.unwrap().goal.unwrap().status,
             GoalStatus::Paused
         );
         apply_goal_action(
@@ -7900,11 +7884,7 @@ mod tests {
         .await
         .unwrap();
 
-        let recovered = SessionJournal::open(&journal_path)
-            .unwrap()
-            .goal()
-            .unwrap()
-            .unwrap();
+        let recovered = store.state(session_id).await.unwrap().goal.unwrap();
         assert_eq!(recovered.objective, "Ship it");
         assert_eq!(recovered.tokens_used, 100);
         assert_eq!(recovered.status, GoalStatus::BudgetLimited);
@@ -7919,13 +7899,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(
-            SessionJournal::open(&journal_path)
-                .unwrap()
-                .goal()
-                .unwrap()
-                .is_none()
-        );
+        assert!(store.state(session_id).await.unwrap().goal.is_none());
 
         drop(event_tx);
         let mut kinds = Vec::new();
@@ -7947,13 +7921,8 @@ mod tests {
     #[tokio::test]
     async fn model_can_mark_an_active_goal_blocked() {
         let root = tempdir().unwrap();
-        let journal_path = root.path().join("session.jsonl");
         let session_id = Uuid::new_v4();
-        let journal = SessionJournal::open(&journal_path).unwrap();
-        let store: Arc<dyn SessionStore> = Arc::new(
-            crate::session_store::JsonlSessionStore::from_journal(journal),
-        );
-        let mut journal = RuntimeSessionStore::new(store, Vec::new());
+        let (store, mut journal) = sqlite_runtime_store(&root, session_id).await;
         let (event_tx, _event_rx) = mpsc::channel(16);
         let mut goal = Some(SessionGoal::new("Need user input".to_string(), None));
         let mut active_since = Some(Instant::now());
@@ -7977,12 +7946,7 @@ mod tests {
         );
         assert!(active_since.is_none());
         assert_eq!(
-            SessionJournal::open(&journal_path)
-                .unwrap()
-                .goal()
-                .unwrap()
-                .unwrap()
-                .status,
+            store.state(session_id).await.unwrap().goal.unwrap().status,
             GoalStatus::Blocked
         );
     }
@@ -8017,13 +7981,8 @@ mod tests {
     #[tokio::test]
     async fn usage_limit_failure_stops_an_active_goal() {
         let root = tempdir().unwrap();
-        let journal_path = root.path().join("session.jsonl");
         let session_id = Uuid::new_v4();
-        let journal = SessionJournal::open(&journal_path).unwrap();
-        let store: Arc<dyn SessionStore> = Arc::new(
-            crate::session_store::JsonlSessionStore::from_journal(journal),
-        );
-        let mut journal = RuntimeSessionStore::new(store, Vec::new());
+        let (store, mut journal) = sqlite_runtime_store(&root, session_id).await;
         let (event_tx, _event_rx) = mpsc::channel(16);
         let mut goal = Some(SessionGoal::new("Keep working".to_string(), None));
         let mut active_since = Some(Instant::now());
@@ -8044,12 +8003,7 @@ mod tests {
         );
         assert!(active_since.is_none());
         assert_eq!(
-            SessionJournal::open(&journal_path)
-                .unwrap()
-                .goal()
-                .unwrap()
-                .unwrap()
-                .status,
+            store.state(session_id).await.unwrap().goal.unwrap().status,
             GoalStatus::UsageLimited
         );
     }
@@ -8374,12 +8328,8 @@ mod tests {
     #[tokio::test]
     async fn inactive_team_reports_settle_without_starting_a_provider_turn() {
         let root = tempdir().unwrap();
-        let journal = SessionJournal::open(root.path().join("session.jsonl")).unwrap();
-        let store: Arc<dyn SessionStore> = Arc::new(
-            crate::session_store::JsonlSessionStore::from_journal(journal),
-        );
-        let mut runtime = RuntimeSessionStore::new(Arc::clone(&store), Vec::new());
         let session_id = Uuid::new_v4();
+        let (store, mut runtime) = sqlite_runtime_store(&root, session_id).await;
         let (event_tx, mut event_rx) = mpsc::channel(8);
         let mut pending = VecDeque::from([QueuedPrompt {
             message_id: Uuid::new_v4(),
@@ -8419,12 +8369,8 @@ mod tests {
     #[tokio::test]
     async fn inactive_wake_report_is_retained_for_the_root_provider_turn() {
         let root = tempdir().unwrap();
-        let journal = SessionJournal::open(root.path().join("session.jsonl")).unwrap();
-        let store: Arc<dyn SessionStore> = Arc::new(
-            crate::session_store::JsonlSessionStore::from_journal(journal),
-        );
-        let mut runtime = RuntimeSessionStore::new(Arc::clone(&store), Vec::new());
         let session_id = Uuid::new_v4();
+        let (_store, mut runtime) = sqlite_runtime_store(&root, session_id).await;
         let (event_tx, mut event_rx) = mpsc::channel(8);
         let message_id = Uuid::new_v4();
         let mut pending = VecDeque::from([QueuedPrompt {
@@ -8450,12 +8396,8 @@ mod tests {
     #[tokio::test]
     async fn turn_boundary_collects_all_emitted_prompts_before_escape() {
         let root = tempdir().unwrap();
-        let journal = SessionJournal::open(root.path().join("session.jsonl")).unwrap();
-        let store: Arc<dyn SessionStore> = Arc::new(
-            crate::session_store::JsonlSessionStore::from_journal(journal),
-        );
-        let mut journal = RuntimeSessionStore::new(store, Vec::new());
         let session_id = Uuid::new_v4();
+        let (_store, mut journal) = sqlite_runtime_store(&root, session_id).await;
         let (event_tx, _event_rx) = mpsc::channel(8);
         let (command_tx, mut command_rx) = mpsc::channel(8);
         let last_id = Uuid::new_v4();
@@ -9438,12 +9380,8 @@ mod tests {
     #[tokio::test]
     async fn cancelling_a_turn_resolves_its_pending_approval_as_denied() {
         let root = tempdir().unwrap();
-        let journal = SessionJournal::open(root.path().join("session.jsonl")).unwrap();
-        let store: Arc<dyn SessionStore> = Arc::new(
-            crate::session_store::JsonlSessionStore::from_journal(journal),
-        );
-        let mut journal = RuntimeSessionStore::new(store, Vec::new());
         let session_id = Uuid::new_v4();
+        let (_store, mut journal) = sqlite_runtime_store(&root, session_id).await;
         let (events, mut event_rx) = mpsc::channel(4);
         let mut pending = Some("approval-1".to_string());
 
@@ -9465,12 +9403,8 @@ mod tests {
     #[tokio::test]
     async fn cancelling_a_turn_resolves_its_pending_provider_interaction() {
         let root = tempdir().unwrap();
-        let journal = SessionJournal::open(root.path().join("session.jsonl")).unwrap();
-        let store: Arc<dyn SessionStore> = Arc::new(
-            crate::session_store::JsonlSessionStore::from_journal(journal),
-        );
-        let mut journal = RuntimeSessionStore::new(store, Vec::new());
         let session_id = Uuid::new_v4();
+        let (_store, mut journal) = sqlite_runtime_store(&root, session_id).await;
         let (events, mut event_rx) = mpsc::channel(4);
         let mut pending = Some("interaction-1".to_string());
 

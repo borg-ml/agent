@@ -251,8 +251,220 @@ fn run_subscription_stream(
 
 async fn run_subscription_process(
     request: ChatStreamRequest,
-    mut controls: Option<mpsc::Receiver<ChatStreamControl>>,
+    controls: Option<mpsc::Receiver<ChatStreamControl>>,
     provider: SubscriptionProvider,
+    permission: LocalAgentPermission,
+    events: mpsc::Sender<ChatStreamEvent>,
+) -> Result<()> {
+    match provider {
+        SubscriptionProvider::Claude => {
+            run_claude_subscription_process(request, controls, permission, events).await
+        }
+        SubscriptionProvider::Codex => {
+            run_codex_subscription_process(request, controls, permission, events).await
+        }
+    }
+}
+
+async fn run_claude_subscription_process(
+    request: ChatStreamRequest,
+    controls: Option<mpsc::Receiver<ChatStreamControl>>,
+    permission: LocalAgentPermission,
+    events: mpsc::Sender<ChatStreamEvent>,
+) -> Result<()> {
+    let auth_home = restore_auth_home(request.provider_auth.as_ref())?;
+    let command = build_claude_command_spec(&request, permission, auth_home.as_ref())?;
+    let claude_request = claude_agents::ChatStreamRequest {
+        prompt: request.prompt,
+        attachments: request.attachments,
+        system_prompt: request.system_prompt,
+        command,
+        runtime_directory: None,
+        lifecycle_key: "borg-claude-subscription".to_string(),
+    };
+
+    let (native_events, mut native_events_receiver) = mpsc::channel(64);
+    let (native_controls, mut control_forwarder) = match controls {
+        Some(mut controls) => {
+            let (sender, receiver) = mpsc::channel(64);
+            let forwarder = tokio::spawn(async move {
+                while let Some(control) = controls.recv().await {
+                    if sender.send(map_claude_control(control)).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            (Some(receiver), Some(forwarder))
+        }
+        None => (None, None),
+    };
+    let mut runner = Some(tokio::spawn(claude_agents::run(
+        claude_request,
+        native_events,
+        native_controls,
+    )));
+
+    while let Some(event) = native_events_receiver.recv().await {
+        if events.send(map_claude_event(event)).await.is_err() {
+            if let Some(runner) = runner.take() {
+                runner.abort();
+                let _ = runner.await;
+            }
+            if let Some(forwarder) = control_forwarder.take() {
+                forwarder.abort();
+                let _ = forwarder.await;
+            }
+            return Ok(());
+        }
+    }
+
+    let runner_result = runner
+        .expect("Claude subscription runner should still be active")
+        .await;
+    if let Some(forwarder) = control_forwarder.take() {
+        forwarder.abort();
+        let _ = forwarder.await;
+    }
+    runner_result.context("Claude subscription runtime task failed")??;
+    Ok(())
+}
+
+fn map_claude_control(control: ChatStreamControl) -> claude_agents::ChatStreamControl {
+    match control {
+        ChatStreamControl::Steer {
+            client_user_message_id: _,
+            text,
+            attachments,
+            ack,
+        } => claude_agents::ChatStreamControl::Steer {
+            text,
+            attachments,
+            ack,
+        },
+        ChatStreamControl::Approval {
+            approval_id,
+            decision,
+        } => claude_agents::ChatStreamControl::Approval {
+            approval_id,
+            decision: match decision {
+                ChatApprovalDecision::ApproveOnce => {
+                    claude_agents::ChatApprovalDecision::ApproveOnce
+                }
+                ChatApprovalDecision::ApproveSession => {
+                    claude_agents::ChatApprovalDecision::ApproveSession
+                }
+                ChatApprovalDecision::Reject => claude_agents::ChatApprovalDecision::Reject,
+            },
+        },
+        ChatStreamControl::ProviderInteractionResponse {
+            interaction_id,
+            response,
+        } => claude_agents::ChatStreamControl::ProviderInteractionResponse {
+            interaction_id,
+            response,
+        },
+        ChatStreamControl::Interrupt => claude_agents::ChatStreamControl::Interrupt,
+    }
+}
+
+fn map_claude_event(event: claude_agents::ChatStreamEvent) -> ChatStreamEvent {
+    match event {
+        claude_agents::ChatStreamEvent::ProviderEvent {
+            kind,
+            payload,
+            raw_payload,
+            stream_channel,
+            content_text,
+            provider_item_id,
+            tool_use_id,
+            tool_name,
+        } => ChatStreamEvent::ProviderEvent {
+            kind,
+            payload,
+            raw_payload,
+            stream_channel,
+            content_text,
+            provider_item_id,
+            tool_use_id,
+            tool_name,
+        },
+        claude_agents::ChatStreamEvent::Delta(text) => ChatStreamEvent::Delta(text),
+        claude_agents::ChatStreamEvent::ReasoningDelta(text) => {
+            ChatStreamEvent::ReasoningDelta(text)
+        }
+        claude_agents::ChatStreamEvent::Narration { text } => ChatStreamEvent::Narration { text },
+        claude_agents::ChatStreamEvent::Phase { name, input } => {
+            ChatStreamEvent::Phase { name, input }
+        }
+        claude_agents::ChatStreamEvent::ToolCall { id, name, input } => {
+            ChatStreamEvent::ToolCall { id, name, input }
+        }
+        claude_agents::ChatStreamEvent::ToolResult {
+            tool_use_id,
+            output,
+            is_error,
+            input,
+        } => ChatStreamEvent::ToolResult {
+            tool_use_id,
+            output,
+            is_error,
+            input,
+        },
+        claude_agents::ChatStreamEvent::ApprovalRequested {
+            approval_id,
+            title,
+            detail,
+            command,
+        } => ChatStreamEvent::ApprovalRequested {
+            approval_id,
+            title,
+            detail,
+            command,
+        },
+        claude_agents::ChatStreamEvent::ProviderInteractionRequested {
+            interaction_id,
+            kind,
+            title,
+            detail,
+            payload,
+        } => ChatStreamEvent::ProviderInteractionRequested {
+            interaction_id,
+            kind,
+            title,
+            detail,
+            payload,
+        },
+        claude_agents::ChatStreamEvent::Done {
+            final_text,
+            usage,
+            session_id,
+        } => ChatStreamEvent::Done {
+            final_text,
+            usage: usage.map(map_claude_usage),
+            session_id,
+        },
+        claude_agents::ChatStreamEvent::Failed { error } => ChatStreamEvent::Failed { error },
+    }
+}
+
+fn map_claude_usage(usage: claude_agents::ProviderCallUsage) -> ProviderCallUsage {
+    ProviderCallUsage {
+        duration_ms: usage.duration_ms,
+        input_tokens: usage.input_tokens,
+        cached_input_tokens: usage.cached_input_tokens,
+        cache_creation_input_tokens: usage.cache_creation_input_tokens,
+        output_tokens: usage.output_tokens,
+        total_tokens: usage.total_tokens,
+        context_tokens: usage.context_tokens,
+        context_window_tokens: usage.context_window_tokens,
+        cost_microusd: usage.cost_microusd,
+        ..ProviderCallUsage::default()
+    }
+}
+
+async fn run_codex_subscription_process(
+    request: ChatStreamRequest,
+    mut controls: Option<mpsc::Receiver<ChatStreamControl>>,
     permission: LocalAgentPermission,
     events: mpsc::Sender<ChatStreamEvent>,
 ) -> Result<()> {
@@ -260,16 +472,14 @@ async fn run_subscription_process(
     let auth_home = restore_auth_home(request.provider_auth.as_ref())?;
     let output_file =
         tempfile::NamedTempFile::new().context("failed to create subscription output file")?;
-    let mut command = build_command(
-        &request,
-        provider,
-        permission,
-        output_file.path(),
-        auth_home.as_ref(),
-    )?;
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("failed to start {}", provider.executable()))?;
+    let mut command =
+        build_codex_command(&request, permission, output_file.path(), auth_home.as_ref())?;
+    let mut child = command.spawn().with_context(|| {
+        format!(
+            "failed to start {}",
+            SubscriptionProvider::Codex.executable()
+        )
+    })?;
     let mut stdin = child
         .stdin
         .take()
@@ -290,7 +500,7 @@ async fn run_subscription_process(
         output
     });
 
-    let prompt = subscription_prompt(&request);
+    let prompt = codex_prompt(&request);
     stdin
         .write_all(prompt.as_bytes())
         .await
@@ -317,14 +527,13 @@ async fn run_subscription_process(
                     continue;
                 }
                 let value = serde_json::from_str::<Value>(&line).unwrap_or_else(|_| Value::String(line.clone()));
-                emit_provider_event(&events, provider, &value).await;
-                if provider == SubscriptionProvider::Codex {
-                    emit_codex_events(&events, &value).await;
-                } else if let Some(delta) = event_delta(provider, &value) {
+                emit_provider_event(&events, &value).await;
+                emit_codex_events(&events, &value).await;
+                if let Some(delta) = codex_event_delta(&value) {
                     text.push_str(&delta);
                     events.send(ChatStreamEvent::Delta(delta)).await.ok();
                 }
-                if let Some(result) = event_result(provider, &value) {
+                if let Some(result) = codex_event_result(&value) {
                     final_text = Some(result);
                 }
                 if let Some(id) = event_session_id(&value) {
@@ -363,7 +572,7 @@ async fn run_subscription_process(
         let detail = String::from_utf8_lossy(&stderr).trim().to_string();
         bail!(
             "{} exited with {}{}",
-            provider.executable(),
+            SubscriptionProvider::Codex.executable(),
             status,
             if detail.is_empty() {
                 String::new()
@@ -380,7 +589,7 @@ async fn run_subscription_process(
     anyhow::ensure!(
         !final_text.trim().is_empty(),
         "{} returned an empty response",
-        provider.executable()
+        SubscriptionProvider::Codex.executable()
     );
 
     usage.duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -395,62 +604,30 @@ async fn run_subscription_process(
     Ok(())
 }
 
-fn build_command(
+fn build_codex_command(
     request: &ChatStreamRequest,
-    provider: SubscriptionProvider,
     permission: LocalAgentPermission,
     output_file: &std::path::Path,
     auth_home: Option<&TempDir>,
 ) -> Result<Command> {
-    let mut command = match provider {
-        SubscriptionProvider::Codex => {
-            let mut command = Command::new("codex");
-            command.args([
-                "exec",
-                "--json",
-                "--color",
-                "never",
-                "--skip-git-repo-check",
-                "--output-last-message",
-            ]);
-            command.arg(output_file);
-            if permission == LocalAgentPermission::FullAccess {
-                command.arg("--dangerously-bypass-approvals-and-sandbox");
-            } else {
-                command.args(["-a", "on-request", "-s", "workspace-write"]);
-            }
-            if request.persist_session == Some(false) {
-                command.arg("--ephemeral");
-            }
-            command
-        }
-        SubscriptionProvider::Claude => {
-            let mut command = Command::new("claude");
-            command.args([
-                "--print",
-                "--output-format",
-                "stream-json",
-                "--verbose",
-                "--include-partial-messages",
-            ]);
-            if permission == LocalAgentPermission::FullAccess {
-                command.arg("--dangerously-skip-permissions");
-            } else {
-                command.args([
-                    "--permission-mode",
-                    match permission {
-                        LocalAgentPermission::Auto => "auto",
-                        LocalAgentPermission::Manual => "manual",
-                        LocalAgentPermission::FullAccess => unreachable!(),
-                    },
-                ]);
-            }
-            if request.persist_session == Some(false) {
-                command.arg("--no-session-persistence");
-            }
-            command
-        }
-    };
+    let mut command = Command::new("codex");
+    command.args([
+        "exec",
+        "--json",
+        "--color",
+        "never",
+        "--skip-git-repo-check",
+        "--output-last-message",
+    ]);
+    command.arg(output_file);
+    if permission == LocalAgentPermission::FullAccess {
+        command.arg("--dangerously-bypass-approvals-and-sandbox");
+    } else {
+        command.args(["-a", "on-request", "-s", "workspace-write"]);
+    }
+    if request.persist_session == Some(false) {
+        command.arg("--ephemeral");
+    }
     if let Some(model) = request
         .model
         .as_deref()
@@ -463,34 +640,15 @@ fn build_command(
         .as_deref()
         .filter(|effort| !effort.trim().is_empty())
     {
-        match provider {
-            SubscriptionProvider::Codex => {
-                command.args(["-c", &format!("model_reasoning_effort=\"{effort}\"")])
-            }
-            SubscriptionProvider::Claude => command.args(["--effort", effort]),
-        };
+        command.args(["-c", &format!("model_reasoning_effort=\"{effort}\"")]);
     }
     if let Some(cwd) = request.working_directory.as_deref() {
         command.current_dir(cwd);
     }
-    if let Some(session_id) = request
-        .session_id
-        .as_deref()
-        .filter(|id| !id.trim().is_empty())
-    {
-        match provider {
-            SubscriptionProvider::Codex => {}
-            SubscriptionProvider::Claude => {
-                command.args(["--resume", session_id]);
-            }
-        }
-    }
     if let Some(auth_home) = auth_home {
         command.env("HOME", auth_home.path());
-        if provider == SubscriptionProvider::Codex {
-            let codex_home = crate::provider_auth::ensure_codex_home(auth_home.path())?;
-            command.env("CODEX_HOME", codex_home);
-        }
+        let codex_home = crate::provider_auth::ensure_codex_home(auth_home.path())?;
+        command.env("CODEX_HOME", codex_home);
     }
     // Both subscription CLIs consume the prompt from stdin in this adapter
     // mode. Explicitly pipe all three standard streams so the async runner
@@ -503,6 +661,87 @@ fn build_command(
     Ok(command)
 }
 
+fn codex_prompt(request: &ChatStreamRequest) -> String {
+    let mut prompt = String::new();
+    if !request.system_prompt.trim().is_empty() {
+        prompt.push_str(request.system_prompt.trim());
+        prompt.push_str("\n\n");
+    }
+    prompt.push_str(&request.prompt);
+    prompt
+}
+
+fn claude_command_args(
+    request: &ChatStreamRequest,
+    permission: LocalAgentPermission,
+) -> Vec<String> {
+    let mut args = vec![
+        "--print".to_string(),
+        "--output-format".to_string(),
+        "stream-json".to_string(),
+        "--verbose".to_string(),
+        "--include-partial-messages".to_string(),
+    ];
+    if permission == LocalAgentPermission::FullAccess {
+        args.push("--dangerously-skip-permissions".to_string());
+    } else {
+        args.extend([
+            "--permission-mode".to_string(),
+            match permission {
+                LocalAgentPermission::Auto => "auto".to_string(),
+                LocalAgentPermission::Manual => "manual".to_string(),
+                LocalAgentPermission::FullAccess => unreachable!(),
+            },
+        ]);
+    }
+    if request.persist_session == Some(false) {
+        args.push("--no-session-persistence".to_string());
+    }
+    if let Some(model) = request
+        .model
+        .as_deref()
+        .filter(|model| !model.trim().is_empty())
+    {
+        args.extend(["--model".to_string(), model.to_string()]);
+    }
+    if let Some(effort) = request
+        .effort
+        .as_deref()
+        .filter(|effort| !effort.trim().is_empty())
+    {
+        args.extend(["--effort".to_string(), effort.to_string()]);
+    }
+    if let Some(session_id) = request
+        .session_id
+        .as_deref()
+        .filter(|id| !id.trim().is_empty())
+    {
+        args.extend(["--resume".to_string(), session_id.to_string()]);
+    }
+    args
+}
+
+fn build_claude_command_spec(
+    request: &ChatStreamRequest,
+    permission: LocalAgentPermission,
+    auth_home: Option<&TempDir>,
+) -> Result<claude_agents::CommandSpec> {
+    let mut environment = Vec::new();
+    if let Some(auth_home) = auth_home {
+        environment.push(("HOME".to_string(), auth_home.path().display().to_string()));
+    }
+    Ok(claude_agents::CommandSpec {
+        program: PathBuf::from("claude"),
+        args: claude_command_args(request, permission),
+        current_dir: request
+            .working_directory
+            .clone()
+            .unwrap_or(std::env::current_dir().context("failed to resolve current directory")?),
+        environment,
+        environment_remove: Vec::new(),
+    })
+}
+
 fn restore_auth_home(auth: Option<&ChatProviderAuth>) -> Result<Option<TempDir>> {
     let Some(auth) = auth else {
         return Ok(None);
@@ -513,29 +752,15 @@ fn restore_auth_home(auth: Option<&ChatProviderAuth>) -> Result<Option<TempDir>>
     Ok(Some(home))
 }
 
-fn subscription_prompt(request: &ChatStreamRequest) -> String {
-    let mut prompt = String::new();
-    if !request.system_prompt.trim().is_empty() {
-        prompt.push_str(request.system_prompt.trim());
-        prompt.push_str("\n\n");
-    }
-    prompt.push_str(&request.prompt);
-    prompt
-}
-
 async fn receive_control(
     controls: &mut Option<mpsc::Receiver<ChatStreamControl>>,
 ) -> Option<ChatStreamControl> {
     controls.as_mut()?.recv().await
 }
 
-async fn emit_provider_event(
-    events: &mpsc::Sender<ChatStreamEvent>,
-    provider: SubscriptionProvider,
-    value: &Value,
-) {
+async fn emit_provider_event(events: &mpsc::Sender<ChatStreamEvent>, value: &Value) {
     let raw_kind = value.get("type").and_then(Value::as_str).unwrap_or("event");
-    let kind = subscription_event_kind(provider, value, raw_kind);
+    let kind = codex_subscription_event_kind(value, raw_kind);
     let item = value.get("item");
     events
         .send(ChatStreamEvent::ProviderEvent {
@@ -548,7 +773,7 @@ async fn emit_provider_event(
                     .unwrap_or(raw_kind)
                     .to_string(),
             ),
-            content_text: event_delta(provider, value),
+            content_text: codex_event_delta(value),
             provider_item_id: item
                 .and_then(|item| item.get("id"))
                 .and_then(Value::as_str)
@@ -561,30 +786,23 @@ async fn emit_provider_event(
         .ok();
 }
 
-fn subscription_event_kind(
-    provider: SubscriptionProvider,
-    value: &Value,
-    raw_kind: &str,
-) -> String {
-    match provider {
-        // Keep Codex's event names in the same shape as its app-server events.
-        // The remote agent already uses the `method:item_type` suffix to
-        // recognize compaction lifecycle events and transient deltas.
-        SubscriptionProvider::Codex => value
-            .get("item")
-            .and_then(|item| item.get("type"))
-            .and_then(Value::as_str)
-            .filter(|_| matches!(raw_kind, "item.started" | "item.completed"))
-            .map(|item_type| {
-                let method = raw_kind
-                    .replace('.', "/")
-                    .strip_prefix("item/")
-                    .map_or_else(|| raw_kind.to_string(), str::to_string);
-                format!("item/{method}:{item_type}")
-            })
-            .unwrap_or_else(|| raw_kind.replace('.', "/")),
-        SubscriptionProvider::Claude => format!("{}/{}", provider.executable(), raw_kind),
-    }
+// Keep Codex's event names in the same shape as its app-server events. The
+// remote agent already uses the `method:item_type` suffix to recognize
+// compaction lifecycle events and transient deltas.
+fn codex_subscription_event_kind(value: &Value, raw_kind: &str) -> String {
+    value
+        .get("item")
+        .and_then(|item| item.get("type"))
+        .and_then(Value::as_str)
+        .filter(|_| matches!(raw_kind, "item.started" | "item.completed"))
+        .map(|item_type| {
+            let method = raw_kind
+                .replace('.', "/")
+                .strip_prefix("item/")
+                .map_or_else(|| raw_kind.to_string(), str::to_string);
+            format!("item/{method}:{item_type}")
+        })
+        .unwrap_or_else(|| raw_kind.replace('.', "/"))
 }
 
 async fn emit_codex_events(events: &mpsc::Sender<ChatStreamEvent>, value: &Value) {
@@ -938,48 +1156,30 @@ fn codex_tool_is_error(item_type: &str, item: &Value) -> bool {
         .is_some_and(|code| code != 0)
 }
 
-fn event_delta(provider: SubscriptionProvider, value: &Value) -> Option<String> {
-    let candidates = match provider {
-        SubscriptionProvider::Claude => [
-            value.pointer("/event/delta/text").and_then(Value::as_str),
-            value.pointer("/delta/text").and_then(Value::as_str),
+fn codex_event_delta(value: &Value) -> Option<String> {
+    value
+        .get("delta")
+        .and_then(Value::as_str)
+        .filter(|_| {
             value
-                .pointer("/message/content/0/text")
-                .and_then(Value::as_str),
-        ],
-        SubscriptionProvider::Codex => [
-            value.get("delta").and_then(Value::as_str).filter(|_| {
-                value
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .is_some_and(|kind| kind.to_ascii_lowercase().contains("delta"))
-            }),
-            None,
-            None,
-        ],
-    };
-    candidates.into_iter().flatten().next().map(str::to_string)
-}
-
-fn event_result(provider: SubscriptionProvider, value: &Value) -> Option<String> {
-    match provider {
-        SubscriptionProvider::Claude => value
-            .get("result")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        SubscriptionProvider::Codex => {
-            if let Some(result) = value.get("result").and_then(Value::as_str) {
-                return Some(result.to_string());
-            }
-            let is_completed = value
                 .get("type")
                 .and_then(Value::as_str)
-                .is_some_and(|kind| matches!(kind, "item.completed" | "item/completed"));
-            is_completed
-                .then(|| value.get("item").and_then(codex_agent_message_text))
-                .flatten()
-        }
+                .is_some_and(|kind| kind.to_ascii_lowercase().contains("delta"))
+        })
+        .map(str::to_string)
+}
+
+fn codex_event_result(value: &Value) -> Option<String> {
+    if let Some(result) = value.get("result").and_then(Value::as_str) {
+        return Some(result.to_string());
     }
+    let is_completed = value
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| matches!(kind, "item.completed" | "item/completed"));
+    is_completed
+        .then(|| value.get("item").and_then(codex_agent_message_text))
+        .flatten()
 }
 
 fn event_session_id(value: &Value) -> Option<String> {
@@ -1034,7 +1234,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn subscription_prompt_includes_system_prompt() {
+    fn claude_command_preserves_subscription_flags() {
         let request = ChatStreamRequest {
             prompt: "hello".to_string(),
             owner_session_id: None,
@@ -1053,24 +1253,56 @@ mod tests {
             provider_auth: None,
             git_credentials: Vec::new(),
             working_directory: None,
-            session_id: None,
+            session_id: Some("session-1".to_string()),
             provider_channel: ProviderChannel::Direct,
-            persist_session: None,
+            persist_session: Some(false),
             web_search_allowed: false,
             resume_unavailable_prompt: None,
         };
-        assert_eq!(subscription_prompt(&request), "system\n\nhello");
+        assert_eq!(
+            claude_command_args(&request, LocalAgentPermission::Manual),
+            vec![
+                "--print",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+                "--include-partial-messages",
+                "--permission-mode",
+                "manual",
+                "--no-session-persistence",
+                "--resume",
+                "session-1",
+            ]
+        );
     }
 
     #[test]
-    fn claude_json_result_is_extracted() {
-        assert_eq!(
-            event_result(
-                SubscriptionProvider::Claude,
-                &serde_json::json!({"result":"done"})
-            ),
-            Some("done".to_string())
-        );
+    fn claude_agent_events_map_to_borg_contract() {
+        let event = claude_agents::ChatStreamEvent::Done {
+            final_text: "done".to_string(),
+            usage: Some(claude_agents::ProviderCallUsage {
+                input_tokens: 12,
+                cached_input_tokens: 4,
+                output_tokens: 8,
+                total_tokens: 20,
+                ..Default::default()
+            }),
+            session_id: Some("session-1".to_string()),
+        };
+        assert!(matches!(
+            map_claude_event(event),
+            ChatStreamEvent::Done {
+                final_text,
+                usage: Some(ProviderCallUsage {
+                    input_tokens: 12,
+                    cached_input_tokens: 4,
+                    output_tokens: 8,
+                    total_tokens: 20,
+                    ..
+                }),
+                session_id: Some(session_id),
+            } if final_text == "done" && session_id == "session-1"
+        ));
     }
 
     #[test]
@@ -1088,7 +1320,7 @@ mod tests {
             "item": {"id": "item-1", "type": "command_execution"}
         });
         assert_eq!(
-            subscription_event_kind(SubscriptionProvider::Codex, &value, "item.completed"),
+            codex_subscription_event_kind(&value, "item.completed"),
             "item/completed:command_execution"
         );
     }
@@ -1170,7 +1402,7 @@ mod tests {
             "type": "item.completed",
             "item": {"type": "reasoning", "summary": ["checking the plan"]}
         });
-        assert_eq!(event_result(SubscriptionProvider::Codex, &value), None);
+        assert_eq!(codex_event_result(&value), None);
         assert_eq!(
             codex_reasoning_text(value.get("item").unwrap()),
             Some("checking the plan".to_string())

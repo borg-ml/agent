@@ -1648,16 +1648,12 @@ async fn run_session(
 ) -> Result<()> {
     launch.cwd = validate_host_cwd(&config.roots, &launch.cwd)?;
     discard_serialized_extension_roots(&mut launch);
-    let journal_path = session_root.join(format!("{session_id}.jsonl"));
-    let writer = SessionWriterLease::acquire(&journal_path)?;
+    let lock_path = session_root.join(format!("{session_id}.lock"));
+    let writer = SessionWriterLease::acquire(&lock_path)?;
     let sqlite_store =
         Arc::new(SqliteSessionStore::open(session_root.join("sessions.sqlite3")).await?);
     if !sqlite_store.contains_session(session_id).await? {
-        if journal_path.is_file() {
-            sqlite_store.import_jsonl(&journal_path).await?;
-        } else {
-            sqlite_store.create_session(session_id).await?;
-        }
+        sqlite_store.create_session(session_id).await?;
     }
     let store: Arc<dyn SessionStore> = sqlite_store.clone();
     let cursor = load_session_sync(&client, &config, session_id).await?;

@@ -11,16 +11,16 @@ use std::sync::{
 use anyhow::{Context, Result};
 use borg_remote::{
     AgentTurnExecutor, ApprovalDecision, CodingProvider, EventActor, GoalAction, GoalStatus,
-    HostCommand, HostExecutorFactory, JsonlSessionStore, LaunchSession, LocalAgentSettings,
-    LocalAgentTurnExecutor, LocalSessionControlServer, MessageStatus, PermissionMode, PlanItem,
-    PlanItemStatus, PromptDelivery, ResponseLanguage, SessionConfigAction, SessionEvent,
-    SessionEventKind, SessionGoal, SessionState, SessionStatus, SessionStore, SessionWriterLease,
-    SpawnSubagent, SqliteSessionStore, SqliteWorkspaceStore, SubagentAction, SubagentSnapshot,
-    SubagentStatus, TodoAction, default_host_config_path, enroll_host,
-    local_session_owner_uses_current_binary, login_provider, mirror_local_session,
-    probe_capabilities, provider_credentials_present, run_agent_session_with_store_and_writer,
-    run_agent_session_with_store_writer_and_peers, run_attached_session,
-    run_host_with_executor_factory, send_local_session_command, session_control_socket_path,
+    HostCommand, HostExecutorFactory, LaunchSession, LocalAgentSettings, LocalAgentTurnExecutor,
+    LocalSessionControlServer, MessageStatus, PermissionMode, PlanItem, PlanItemStatus,
+    PromptDelivery, ResponseLanguage, SessionConfigAction, SessionEvent, SessionEventKind,
+    SessionGoal, SessionState, SessionStatus, SessionStore, SessionWriterLease, SpawnSubagent,
+    SqliteSessionStore, SqliteWorkspaceStore, SubagentAction, SubagentSnapshot, SubagentStatus,
+    TodoAction, default_host_config_path, enroll_host, local_session_owner_uses_current_binary,
+    login_provider, mirror_local_session, probe_capabilities, provider_credentials_present,
+    run_agent_session_with_store_and_writer, run_agent_session_with_store_writer_and_peers,
+    run_attached_session, run_host_with_executor_factory, send_local_session_command,
+    session_control_socket_path,
 };
 use chrono::{Local, Utc};
 use futures_util::FutureExt;
@@ -646,7 +646,7 @@ fn local_prompt_submission_pending(
 }
 
 async fn stop_stale_local_owner_and_acquire(
-    journal_path: &Path,
+    lock_path: &Path,
     control_socket_path: &Path,
     session_id: Uuid,
 ) -> Result<SessionWriterLease> {
@@ -659,7 +659,7 @@ async fn stop_stale_local_owner_and_acquire(
     .context("failed to ask the obsolete local session owner to stop")?;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
-        if let Some(writer) = SessionWriterLease::try_acquire(journal_path)? {
+        if let Some(writer) = SessionWriterLease::try_acquire(lock_path)? {
             return Ok(writer);
         }
         anyhow::ensure!(
@@ -695,7 +695,7 @@ async fn run_local_agent_session(
     let sqlite_store =
         Arc::new(SqliteSessionStore::open(sessions_dir.join("sessions.sqlite3")).await?);
     let session_id = if let Some(session_id) = selected_session.or(args.resume) {
-        session_id_if_present(&sessions_dir, sqlite_store.as_ref(), session_id).await?
+        session_id_if_present(sqlite_store.as_ref(), session_id).await?
     } else if args.continue_latest {
         latest_session_id(&sessions_dir, sqlite_store.as_ref())
             .await?
@@ -704,26 +704,20 @@ async fn run_local_agent_session(
         Uuid::new_v4()
     };
     crash_context.set_session_id(session_id);
-    let journal_path = sessions_dir.join(format!("{session_id}.jsonl"));
+    let lock_path = sessions_dir.join(format!("{session_id}.lock"));
     let control_socket_path = session_control_socket_path(&sessions_dir, session_id);
     let remote_launch_path = sessions_dir.join(format!("{session_id}.launch.json"));
-    let mut writer = SessionWriterLease::try_acquire(&journal_path)?;
+    let mut writer = SessionWriterLease::try_acquire(&lock_path)?;
     let mut session_access = if writer.is_some() {
         LocalSessionAccess::Owned
     } else {
         LocalSessionAccess::Attached
     };
-    let store: Arc<dyn SessionStore> = if sqlite_store.contains_session(session_id).await? {
-        sqlite_store.clone()
-    } else if journal_path.is_file() && !session_access.is_attached() {
-        sqlite_store.import_jsonl(&journal_path).await?;
-        sqlite_store.clone()
-    } else if journal_path.is_file() {
-        anyhow::bail!(
-            "legacy JSONL session {session_id} is active in another Borg process; \
-             stop that process and resume it once to migrate it to SQLite"
-        )
-    } else {
+    if !sqlite_store.contains_session(session_id).await? {
+        anyhow::ensure!(
+            !session_access.is_attached(),
+            "local Borg session {session_id} has no SQLite state"
+        );
         if let Some(workspace_id) = args.workspace {
             sqlite_store
                 .create_session_in_workspace(session_id, workspace_id)
@@ -731,8 +725,8 @@ async fn run_local_agent_session(
         } else {
             sqlite_store.create_session(session_id).await?;
         }
-        sqlite_store.clone()
-    };
+    }
+    let store: Arc<dyn SessionStore> = sqlite_store.clone();
     let mut session_state = store.state(session_id).await?;
     let mut stale_local_owner = session_access.is_attached()
         && !remote_launch_path.is_file()
@@ -747,7 +741,7 @@ async fn run_local_agent_session(
         if stale_local_owner_can_handoff(session_state.status) {
             tracing::info!(%session_id, "replacing obsolete local session owner before attach");
             writer = Some(
-                stop_stale_local_owner_and_acquire(&journal_path, &control_socket_path, session_id)
+                stop_stale_local_owner_and_acquire(&lock_path, &control_socket_path, session_id)
                     .await?,
             );
             session_access = LocalSessionAccess::Owned;
@@ -1038,7 +1032,7 @@ async fn run_local_agent_session(
             session_id,
         );
         if remote_open {
-            println!("  Remote mirror enabled (journal-first and offline-safe).");
+            println!("  Remote mirror enabled (durable-store-first and offline-safe).");
         }
         if resuming {
             if !can_prompt || fallback_terminal {
@@ -1069,7 +1063,7 @@ async fn run_local_agent_session(
     // reader observes it and permanently desynchronise the owner UI.
     let (session_event_tx, mut session_events) = mpsc::channel(4_096);
     let local_prompt_admissions = Arc::new(Mutex::new(HashSet::new()));
-    let actor_journal_path = journal_path.clone();
+    let actor_lock_path = lock_path.clone();
     let registration_template = launch.clone();
     let control_server = if session_access.is_attached() {
         None
@@ -1086,7 +1080,7 @@ async fn run_local_agent_session(
         tokio::spawn(run_attached_session(
             Arc::clone(&store),
             session_id,
-            actor_journal_path,
+            actor_lock_path,
             control_socket_path.clone(),
             session_state.latest_sequence,
             session_commands,
@@ -4106,7 +4100,7 @@ async fn resolve_resume_target(
         let target = value
             .parse::<Uuid>()
             .with_context(|| format!("invalid Borg session id: {value}"))?;
-        session_id_if_present(sessions_dir, store, target).await?
+        session_id_if_present(store, target).await?
     };
     anyhow::ensure!(target != current, "that Borg session is already active");
     Ok(target)
@@ -4138,42 +4132,6 @@ async fn latest_session_id_excluding(
 
 async fn recent_session_ids(sessions_dir: &Path, store: &SqliteSessionStore) -> Result<Vec<Uuid>> {
     fs::create_dir_all(sessions_dir)?;
-    let stored = store
-        .list_sessions(10_000)
-        .await?
-        .into_iter()
-        .map(|session| session.session_id)
-        .collect::<std::collections::HashSet<_>>();
-    for entry in fs::read_dir(sessions_dir)?.filter_map(|entry| entry.ok()) {
-        let path = entry.path();
-        if path.extension().and_then(|value| value.to_str()) != Some("jsonl")
-            || entry
-                .metadata()
-                .map_or(true, |metadata| metadata.len() == 0)
-        {
-            continue;
-        }
-        let Some(session_id) = path
-            .file_stem()
-            .and_then(|value| value.to_str())
-            .and_then(|value| value.parse::<Uuid>().ok())
-        else {
-            continue;
-        };
-        if !stored.contains(&session_id) {
-            let Some(_writer) = SessionWriterLease::try_acquire(&path)? else {
-                continue;
-            };
-            if let Err(error) = store.import_jsonl(&path).await {
-                tracing::warn!(
-                    %session_id,
-                    path = %path.display(),
-                    error = %format!("{error:#}"),
-                    "skipping incompatible legacy session during discovery"
-                );
-            }
-        }
-    }
     Ok(store
         .list_sessions(10_000)
         .await?
@@ -4535,40 +4493,11 @@ async fn load_subagent_thread_state(
                 child_histories.insert(agent.session_id, events);
             }
             Err(store_error) => {
-                let legacy_path = sessions_dir
-                    .join("subagents")
-                    .join(format!("{}.jsonl", agent.session_id));
-                if !legacy_path.is_file() {
-                    tracing::warn!(
-                        child_session_id = %agent.session_id,
-                        %store_error,
-                        "could not load subagent transcript history"
-                    );
-                    continue;
-                }
-                match JsonlSessionStore::open(&legacy_path) {
-                    Ok(legacy) => match legacy.read(agent.session_id).await {
-                        Ok(events) => {
-                            child_histories.insert(agent.session_id, events);
-                        }
-                        Err(legacy_error) => {
-                            tracing::warn!(
-                                child_session_id = %agent.session_id,
-                                %store_error,
-                                %legacy_error,
-                                "could not load subagent transcript history"
-                            );
-                        }
-                    },
-                    Err(legacy_error) => {
-                        tracing::warn!(
-                            child_session_id = %agent.session_id,
-                            %store_error,
-                            %legacy_error,
-                            "could not load subagent transcript history"
-                        );
-                    }
-                }
+                tracing::warn!(
+                    child_session_id = %agent.session_id,
+                    %store_error,
+                    "could not load subagent transcript history"
+                );
             }
         }
     }
@@ -4623,7 +4552,7 @@ fn reconcile_dormant_subagent_snapshot(sessions_dir: &Path, agent: &mut Subagent
     }
     let path = sessions_dir
         .join("subagents")
-        .join(format!("{}.jsonl", agent.session_id));
+        .join(format!("{}.lock", agent.session_id));
     if let Ok(Some(writer)) = SessionWriterLease::try_acquire(&path) {
         drop(writer);
         agent.status = SubagentStatus::Ready;
@@ -5114,14 +5043,9 @@ fn default_active_delivery(provider: CodingProvider, steer_active_turn: bool) ->
     }
 }
 
-async fn session_id_if_present(
-    sessions_dir: &Path,
-    store: &SqliteSessionStore,
-    session_id: Uuid,
-) -> Result<Uuid> {
+async fn session_id_if_present(store: &SqliteSessionStore, session_id: Uuid) -> Result<Uuid> {
     anyhow::ensure!(
-        store.contains_session(session_id).await?
-            || sessions_dir.join(format!("{session_id}.jsonl")).is_file(),
+        store.contains_session(session_id).await?,
         "local Borg session {session_id} does not exist"
     );
     Ok(session_id)
@@ -6156,7 +6080,7 @@ mod tests {
         let child_path = directory
             .path()
             .join("subagents")
-            .join(format!("{child}.jsonl"));
+            .join(format!("{child}.lock"));
         let _writer = SessionWriterLease::try_acquire(&child_path)
             .unwrap()
             .expect("test owns child");
@@ -6482,12 +6406,13 @@ mod tests {
     async fn owner_shutdown_hands_active_turn_to_an_attached_viewer() {
         let root = tempdir().unwrap();
         let session_id = Uuid::new_v4();
-        let journal_path = root.path().join(format!("{session_id}.jsonl"));
+        let journal_path = root.path().join(format!("{session_id}.lock"));
         let socket_path = session_control_socket_path(root.path(), session_id);
         let presence_path =
             borg_remote::session_control_presence_socket_path(root.path(), session_id);
-        let journal = borg_remote::SessionJournal::open(&journal_path).unwrap();
-        let writer = journal.try_acquire_writer().unwrap().unwrap();
+        let writer = SessionWriterLease::try_acquire(&journal_path)
+            .unwrap()
+            .unwrap();
         let (commands, _received) = mpsc::channel(1);
         let server =
             LocalSessionControlServer::start(socket_path, session_id, &writer, commands).unwrap();
@@ -6559,10 +6484,11 @@ mod tests {
     async fn obsolete_owner_handoff_releases_and_reacquires_the_writer_lease() {
         let root = tempdir().unwrap();
         let session_id = Uuid::new_v4();
-        let journal_path = root.path().join(format!("{session_id}.jsonl"));
+        let journal_path = root.path().join(format!("{session_id}.lock"));
         let socket_path = session_control_socket_path(root.path(), session_id);
-        let journal = borg_remote::SessionJournal::open(&journal_path).unwrap();
-        let writer = journal.try_acquire_writer().unwrap().unwrap();
+        let writer = SessionWriterLease::try_acquire(&journal_path)
+            .unwrap()
+            .unwrap();
         let (commands, mut received) = mpsc::channel(1);
         let _server =
             LocalSessionControlServer::start(socket_path.clone(), session_id, &writer, commands)
@@ -6708,18 +6634,10 @@ mod tests {
                     },
                 ),
             ];
-            fs::write(
-                dir.path().join(format!("{session_id}.jsonl")),
-                format!(
-                    "{}\n",
-                    events
-                        .iter()
-                        .map(|event| serde_json::to_string(event).unwrap())
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                ),
-            )
-            .expect("saved session");
+            store.create_session(session_id).await.unwrap();
+            for event in events {
+                store.append(event).await.unwrap();
+            }
         }
 
         assert_eq!(
@@ -6751,8 +6669,12 @@ mod tests {
         let recent_message = Uuid::new_v4();
         let now = Utc::now();
 
-        let write_events = |session_id, events: Vec<(chrono::DateTime<Utc>, SessionEventKind)>| {
-            let path = dir.path().join(format!("{session_id}.jsonl"));
+        async fn write_events(
+            store: &SqliteSessionStore,
+            cwd: &Path,
+            session_id: Uuid,
+            events: Vec<(chrono::DateTime<Utc>, SessionEventKind)>,
+        ) {
             let started_at = events.first().map_or_else(Utc::now, |(created_at, _)| {
                 *created_at - chrono::TimeDelta::nanoseconds(2)
             });
@@ -6761,7 +6683,7 @@ mod tests {
                 (
                     started_at + chrono::TimeDelta::nanoseconds(1),
                     SessionEventKind::SessionConfigured {
-                        cwd: dir.path().to_path_buf(),
+                        cwd: cwd.to_path_buf(),
                         provider: CodingProvider::Codex,
                         model: None,
                         effort: None,
@@ -6774,21 +6696,22 @@ mod tests {
             .into_iter()
             .chain(events)
             .enumerate()
-            .map(|(index, (created_at, kind))| {
-                serde_json::to_string(&SessionEvent {
-                    id: Uuid::new_v4(),
-                    session_id,
-                    sequence: index as u64 + 1,
-                    created_at,
-                    kind,
-                })
-                .unwrap()
+            .map(|(index, (created_at, kind))| SessionEvent {
+                id: Uuid::new_v4(),
+                session_id,
+                sequence: index as u64 + 1,
+                created_at,
+                kind,
             })
-            .collect::<Vec<_>>()
-            .join("\n");
-            fs::write(path, format!("{records}\n")).unwrap();
-        };
+            .collect::<Vec<_>>();
+            store.create_session(session_id).await.unwrap();
+            for event in records {
+                store.append(event).await.unwrap();
+            }
+        }
         write_events(
+            &store,
+            dir.path(),
             recently_active,
             vec![
                 (
@@ -6810,8 +6733,11 @@ mod tests {
                     },
                 ),
             ],
-        );
+        )
+        .await;
         write_events(
+            &store,
+            dir.path(),
             recent_message,
             vec![(
                 now - chrono::TimeDelta::minutes(1),
@@ -6824,7 +6750,8 @@ mod tests {
                     delivery: None,
                 },
             )],
-        );
+        )
+        .await;
 
         assert_eq!(
             recent_session_ids(dir.path(), &store).await.unwrap(),
@@ -6957,7 +6884,7 @@ mod tests {
         assert_eq!(sessions, vec![real]);
         assert!(
             store.contains_session(probe).await.unwrap(),
-            "filtering the resume surface must not destructively delete legacy rows"
+            "filtering the resume surface must not destructively delete stored sessions"
         );
     }
 
@@ -7074,66 +7001,6 @@ mod tests {
             options.iter().map(|option| option.id).collect::<Vec<_>>(),
             session_ids.into_iter().rev().collect::<Vec<_>>()
         );
-    }
-
-    #[tokio::test]
-    async fn incompatible_legacy_session_does_not_block_discovery_or_mutate_source() {
-        let dir = tempdir().expect("session directory");
-        let store = SqliteSessionStore::open(dir.path().join("sessions.sqlite3"))
-            .await
-            .unwrap();
-        let valid = Uuid::new_v4();
-        store.create_session(valid).await.unwrap();
-        store
-            .append(SessionEvent::new(
-                valid,
-                0,
-                SessionEventKind::SessionStarted,
-            ))
-            .await
-            .unwrap();
-        store
-            .append(SessionEvent::new(
-                valid,
-                0,
-                SessionEventKind::Message {
-                    message_id: Uuid::new_v4(),
-                    actor: EventActor::User,
-                    text: "valid resumable work".to_string(),
-                    attachments: Vec::new(),
-                    status: MessageStatus::Complete,
-                    delivery: None,
-                },
-            ))
-            .await
-            .unwrap();
-        let incompatible = Uuid::new_v4();
-        let path = dir.path().join(format!("{incompatible}.jsonl"));
-        let bytes = format!(
-            "{}\n",
-            serde_json::to_string(&SessionEvent::new(
-                incompatible,
-                1,
-                SessionEventKind::Message {
-                    message_id: Uuid::new_v4(),
-                    actor: EventActor::User,
-                    text: "legacy partial stream".to_string(),
-                    attachments: Vec::new(),
-                    status: MessageStatus::Complete,
-                    delivery: None,
-                },
-            ))
-            .unwrap()
-        );
-        fs::write(&path, &bytes).unwrap();
-
-        assert_eq!(
-            recent_session_ids(dir.path(), &store).await.unwrap(),
-            vec![valid]
-        );
-        assert_eq!(fs::read_to_string(&path).unwrap(), bytes);
-        assert!(!path.with_extension("jsonl.bak").exists());
-        assert!(!store.contains_session(incompatible).await.unwrap());
     }
 
     #[tokio::test]

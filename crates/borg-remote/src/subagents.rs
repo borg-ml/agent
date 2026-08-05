@@ -1344,21 +1344,16 @@ impl SubagentCoordinator {
                 continue;
             }
             let mirrored_status = snapshot.status;
-            let actor_path = child_journal_path(&self.journal_root, snapshot.session_id);
+            let actor_path = child_lock_path(&self.journal_root, snapshot.session_id);
             let mut recovery_failed = false;
             if !snapshot.status.is_terminal() {
                 let recovered = async {
-                    let writer = crate::SessionWriterLease::try_acquire(&actor_path)?
+                    let _writer = crate::SessionWriterLease::try_acquire(&actor_path)?
                         .with_context(|| {
                             format!("subagent session {} is already active", snapshot.session_id)
                         })?;
                     self.store
-                        .register_child_session(
-                            root_session_id,
-                            snapshot.session_id,
-                            &actor_path,
-                            &writer,
-                        )
+                        .register_child_session(root_session_id, snapshot.session_id)
                         .await?;
                     self.store.state(snapshot.session_id).await
                 }
@@ -1835,17 +1830,12 @@ impl SubagentCoordinator {
     ) -> Result<()> {
         let (command_tx, command_rx) = mpsc::channel(64);
         let (event_tx, mut event_rx) = mpsc::channel(256);
-        let actor_path = child_journal_path(&self.journal_root, snapshot.session_id);
+        let actor_path = child_lock_path(&self.journal_root, snapshot.session_id);
         let actor_session_id = snapshot.session_id;
         let writer = crate::SessionWriterLease::try_acquire(&actor_path)?
             .with_context(|| format!("subagent session {actor_session_id} is already active"))?;
         self.store
-            .register_child_session(
-                snapshot.parent_session_id,
-                actor_session_id,
-                &actor_path,
-                &writer,
-            )
+            .register_child_session(snapshot.parent_session_id, actor_session_id)
             .await?;
         if self.root_launch.capabilities.multiplayer {
             let binding = self
@@ -3626,8 +3616,8 @@ fn attributed_team_message(actor: &str, message: &str) -> String {
     format!("Team message from {actor}:\n\n{message}")
 }
 
-fn child_journal_path(root: &Path, session_id: Uuid) -> PathBuf {
-    root.join("subagents").join(format!("{session_id}.jsonl"))
+fn child_lock_path(root: &Path, session_id: Uuid) -> PathBuf {
+    root.join("subagents").join(format!("{session_id}.lock"))
 }
 
 async fn send_prompt(
@@ -3874,12 +3864,9 @@ mod tests {
             .await
             .unwrap();
         for child in children {
-            let journal = child_journal_path(directory, *child);
-            let writer = crate::SessionWriterLease::acquire(&journal).unwrap();
-            store
-                .register_child_session(root, *child, &journal, &writer)
-                .await
-                .unwrap();
+            let lock_path = child_lock_path(directory, *child);
+            let _writer = crate::SessionWriterLease::acquire(&lock_path).unwrap();
+            store.register_child_session(root, *child).await.unwrap();
             workspace
                 .ensure_execution_workspace(root, "test team", human, "Human", *child, "Worker")
                 .await
@@ -4918,47 +4905,35 @@ mod tests {
                 event: None,
             },
         );
-        let child_path = child_journal_path(directory.path(), child_id);
-        let mut child_journal = crate::SessionJournal::open(&child_path).unwrap();
-        child_journal
-            .append(SessionEvent::new(
-                child_id,
-                0,
-                SessionEventKind::SessionStarted,
-            ))
-            .unwrap();
-        child_journal
-            .append(SessionEvent::new(
-                child_id,
-                0,
-                SessionEventKind::SessionConfigured {
-                    cwd: workspace,
-                    provider: CodingProvider::Codex,
-                    model: Some("gpt-test".into()),
-                    effort: Some("high".into()),
-                    fast: false,
-                    response_language: crate::ResponseLanguage::Auto,
-                    permission_mode: PermissionMode::Manual,
-                },
-            ))
-            .unwrap();
-        child_journal
-            .append(SessionEvent::new(
-                child_id,
-                0,
-                SessionEventKind::StatusChanged {
-                    status: SessionStatus::Stopped,
-                    detail: Some("crash cleanup completed".into()),
-                },
-            ))
-            .unwrap();
-
+        let child_path = child_lock_path(directory.path(), child_id);
         let store = Arc::new(
             crate::SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
                 .await
                 .unwrap(),
         );
         store.create_session(root).await.unwrap();
+        store.create_session(child_id).await.unwrap();
+        for kind in [
+            SessionEventKind::SessionStarted,
+            SessionEventKind::SessionConfigured {
+                cwd: workspace,
+                provider: CodingProvider::Codex,
+                model: Some("gpt-test".into()),
+                effort: Some("high".into()),
+                fast: false,
+                response_language: crate::ResponseLanguage::Auto,
+                permission_mode: PermissionMode::Manual,
+            },
+            SessionEventKind::StatusChanged {
+                status: SessionStatus::Stopped,
+                detail: Some("crash cleanup completed".into()),
+            },
+        ] {
+            store
+                .append(SessionEvent::new(child_id, 0, kind))
+                .await
+                .unwrap();
+        }
         let session_store: Arc<dyn SessionStore> = store;
         let coordinator = SubagentCoordinator::new_with_store_and_executor(
             directory.path(),
@@ -5024,47 +4999,34 @@ mod tests {
                 event: None,
             },
         );
-        let child_path = child_journal_path(directory.path(), child_id);
-        let mut child_journal = crate::SessionJournal::open(&child_path).unwrap();
-        child_journal
-            .append(SessionEvent::new(
-                child_id,
-                0,
-                SessionEventKind::SessionStarted,
-            ))
-            .unwrap();
-        child_journal
-            .append(SessionEvent::new(
-                child_id,
-                0,
-                SessionEventKind::SessionConfigured {
-                    cwd: workspace,
-                    provider: CodingProvider::Codex,
-                    model: Some("gpt-test".into()),
-                    effort: Some("high".into()),
-                    fast: false,
-                    response_language: crate::ResponseLanguage::Auto,
-                    permission_mode: PermissionMode::Manual,
-                },
-            ))
-            .unwrap();
-        child_journal
-            .append(SessionEvent::new(
-                child_id,
-                0,
-                SessionEventKind::StatusChanged {
-                    status: SessionStatus::Ready,
-                    detail: None,
-                },
-            ))
-            .unwrap();
-
         let store = Arc::new(
             crate::SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
                 .await
                 .unwrap(),
         );
         store.create_session(root).await.unwrap();
+        store.create_session(child_id).await.unwrap();
+        for kind in [
+            SessionEventKind::SessionStarted,
+            SessionEventKind::SessionConfigured {
+                cwd: workspace,
+                provider: CodingProvider::Codex,
+                model: Some("gpt-test".into()),
+                effort: Some("high".into()),
+                fast: false,
+                response_language: crate::ResponseLanguage::Auto,
+                permission_mode: PermissionMode::Manual,
+            },
+            SessionEventKind::StatusChanged {
+                status: SessionStatus::Ready,
+                detail: None,
+            },
+        ] {
+            store
+                .append(SessionEvent::new(child_id, 0, kind))
+                .await
+                .unwrap();
+        }
         let session_store: Arc<dyn SessionStore> = store.clone();
         let coordinator = SubagentCoordinator::new_with_store_and_executor(
             directory.path(),
@@ -5080,12 +5042,8 @@ mod tests {
             .restore_from_events(&[parent_event])
             .await
             .unwrap();
+        let child_path = child_lock_path(directory.path(), child_id);
         assert!(store.contains_session(child_id).await.unwrap());
-        assert!(child_path.with_extension("jsonl.bak").is_file());
-        let idle_writer = crate::SessionWriterLease::try_acquire(&child_path)
-            .unwrap()
-            .expect("restoring the root must not start or lock the child actor");
-        drop(idle_writer);
         let restored = coordinator
             .resolve_snapshot(&child_id.to_string())
             .await

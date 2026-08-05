@@ -179,8 +179,8 @@ pub async fn send_local_session_command(
 
 /// Single-owner local command endpoint for a durable session.
 ///
-/// The journal writer remains exclusive. Additional terminals tail the
-/// journal and send typed commands through this endpoint.
+/// The session lock remains exclusive. Additional terminals tail SQLite
+/// events and send typed commands through this endpoint.
 #[cfg(unix)]
 pub struct LocalSessionControlServer {
     task: tokio::task::JoinHandle<()>,
@@ -204,11 +204,11 @@ impl LocalSessionControlServer {
     pub fn start_with_prompt_admissions(
         socket_path: PathBuf,
         session_id: Uuid,
-        writer: &SessionWriterLease,
+        _writer: &SessionWriterLease,
         commands: mpsc::Sender<HostCommand>,
         _prompt_admissions: Option<Arc<Mutex<HashSet<Uuid>>>>,
     ) -> Result<Self> {
-        Self::start(socket_path, session_id, writer, commands)
+        Self::start(socket_path, session_id, _writer, commands)
     }
 
     pub fn has_attached_viewers(&self) -> bool {
@@ -230,7 +230,7 @@ impl LocalSessionControlServer {
     pub fn start_with_prompt_admissions(
         socket_path: PathBuf,
         session_id: Uuid,
-        writer: &SessionWriterLease,
+        _writer: &SessionWriterLease,
         commands: mpsc::Sender<HostCommand>,
         prompt_admissions: Option<Arc<Mutex<HashSet<Uuid>>>>,
     ) -> Result<Self> {
@@ -238,11 +238,6 @@ impl LocalSessionControlServer {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::UnixListener;
 
-        let journal_path = socket_path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join(format!("{session_id}.jsonl"));
-        writer.ensure_journal(&journal_path)?;
         if socket_path.exists() {
             fs::remove_file(&socket_path)
                 .with_context(|| format!("failed to remove stale {}", socket_path.display()))?;
@@ -403,7 +398,7 @@ impl Drop for LocalSessionControlServer {
 pub async fn run_attached_session(
     store: Arc<dyn SessionStore>,
     session_id: Uuid,
-    journal_path: PathBuf,
+    lock_path: PathBuf,
     socket_path: PathBuf,
     mut last_sequence: u64,
     mut commands: mpsc::Receiver<HostCommand>,
@@ -463,18 +458,18 @@ pub async fn run_attached_session(
                 if matches!(command, HostCommand::Stop { .. }) {
                     return Ok(());
                 }
-                if !writer_is_active(&journal_path)? {
+                if !writer_is_active(&lock_path)? {
                     tracing::info!(
-                        journal_path = %journal_path.display(),
+                        lock_path = %lock_path.display(),
                         "local session owner released its writer lease; detaching terminal"
                     );
                     return Ok(());
                 }
                 let mut stream = match UnixStream::connect(&socket_path).await {
                     Ok(stream) => stream,
-                    Err(_) if !writer_is_active(&journal_path)? => {
+                    Err(_) if !writer_is_active(&lock_path)? => {
                         tracing::info!(
-                            journal_path = %journal_path.display(),
+                            lock_path = %lock_path.display(),
                             "local session owner exited before accepting a command; detaching terminal"
                         );
                         return Ok(());
@@ -534,9 +529,9 @@ pub async fn run_attached_session(
                         return Ok(());
                     }
                 }
-                if !writer_is_active(&journal_path)? {
+                if !writer_is_active(&lock_path)? {
                     tracing::info!(
-                        journal_path = %journal_path.display(),
+                        lock_path = %lock_path.display(),
                         "local session owner released its writer lease; detaching terminal"
                     );
                     return Ok(());
@@ -565,15 +560,15 @@ fn reasoning_delta_from_snapshot(
     Some(event)
 }
 
-fn writer_is_active(journal_path: &Path) -> Result<bool> {
-    Ok(SessionWriterLease::try_acquire(journal_path)?.is_none())
+fn writer_is_active(lock_path: &Path) -> Result<bool> {
+    Ok(SessionWriterLease::try_acquire(lock_path)?.is_none())
 }
 
 #[cfg(not(unix))]
 pub async fn run_attached_session(
     _store: Arc<dyn SessionStore>,
     _session_id: Uuid,
-    _journal_path: PathBuf,
+    _lock_path: PathBuf,
     _socket_path: PathBuf,
     _last_sequence: u64,
     _commands: mpsc::Receiver<HostCommand>,
@@ -586,17 +581,18 @@ pub async fn run_attached_session(
 #[cfg(unix)]
 mod tests {
     use super::*;
-    use crate::{PromptDelivery, SessionJournal};
+    use crate::PromptDelivery;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
     async fn owner_metadata_prevents_silent_attachment_to_an_obsolete_binary() {
         let root = tempfile::tempdir().unwrap();
         let session_id = Uuid::new_v4();
-        let journal_path = root.path().join(format!("{session_id}.jsonl"));
+        let journal_path = root.path().join(format!("{session_id}.lock"));
         let socket_path = session_control_socket_path(root.path(), session_id);
-        let journal = SessionJournal::open(&journal_path).unwrap();
-        let writer = journal.try_acquire_writer().unwrap().unwrap();
+        let writer = SessionWriterLease::try_acquire(&journal_path)
+            .unwrap()
+            .unwrap();
         assert!(!local_session_owner_uses_current_binary(root.path(), session_id).unwrap());
 
         let (commands, _rx) = mpsc::channel(1);
@@ -622,9 +618,10 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let session_id = Uuid::new_v4();
         let socket_path = session_control_socket_path(root.path(), session_id);
-        let journal =
-            SessionJournal::open(root.path().join(format!("{session_id}.jsonl"))).unwrap();
-        let writer = journal.try_acquire_writer().unwrap().unwrap();
+        let journal_path = root.path().join(format!("{session_id}.lock"));
+        let writer = SessionWriterLease::try_acquire(&journal_path)
+            .unwrap()
+            .unwrap();
         let (owner_tx, mut owner_rx) = mpsc::channel(1);
         let admissions = Arc::new(Mutex::new(HashSet::new()));
         let _server = LocalSessionControlServer::start_with_prompt_admissions(
@@ -694,11 +691,12 @@ mod tests {
     async fn presence_channel_tracks_idle_attached_viewers() {
         let root = tempfile::tempdir().unwrap();
         let session_id = Uuid::new_v4();
-        let journal_path = root.path().join(format!("{session_id}.jsonl"));
+        let journal_path = root.path().join(format!("{session_id}.lock"));
         let socket_path = session_control_socket_path(root.path(), session_id);
         let presence_path = session_control_presence_socket_path(root.path(), session_id);
-        let journal = SessionJournal::open(&journal_path).unwrap();
-        let writer = journal.try_acquire_writer().unwrap().unwrap();
+        let writer = SessionWriterLease::try_acquire(&journal_path)
+            .unwrap()
+            .unwrap();
         let (owner_tx, _owner_rx) = mpsc::channel(1);
         let server =
             LocalSessionControlServer::start(socket_path, session_id, &writer, owner_tx).unwrap();
@@ -725,14 +723,20 @@ mod tests {
     async fn attachment_ends_cleanly_when_the_writer_disappears() {
         let root = tempfile::tempdir().unwrap();
         let session_id = Uuid::new_v4();
-        let journal_path = root.path().join(format!("{session_id}.jsonl"));
+        let journal_path = root.path().join(format!("{session_id}.lock"));
         let socket_path = session_control_socket_path(root.path(), session_id);
-        let journal = SessionJournal::open(&journal_path).unwrap();
-        let writer = journal.try_acquire_writer().unwrap().unwrap();
+        let writer = SessionWriterLease::try_acquire(&journal_path)
+            .unwrap()
+            .unwrap();
         let (_command_tx, command_rx) = mpsc::channel(1);
         let (event_tx, _event_rx) = mpsc::channel(1);
-        let store: Arc<dyn SessionStore> =
-            Arc::new(crate::JsonlSessionStore::open(&journal_path).unwrap());
+        let sqlite = Arc::new(
+            crate::SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+                .await
+                .unwrap(),
+        );
+        sqlite.create_session(session_id).await.unwrap();
+        let store: Arc<dyn SessionStore> = sqlite;
 
         let attachment = tokio::spawn(run_attached_session(
             store,
@@ -758,9 +762,10 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let session_id = Uuid::new_v4();
         let socket_path = session_control_socket_path(root.path(), session_id);
-        let journal =
-            SessionJournal::open(root.path().join(format!("{session_id}.jsonl"))).unwrap();
-        let writer = journal.try_acquire_writer().unwrap().unwrap();
+        let lock_path = root.path().join(format!("{session_id}.lock"));
+        let writer = SessionWriterLease::try_acquire(&lock_path)
+            .unwrap()
+            .unwrap();
 
         let stale = tokio::net::UnixListener::bind(&socket_path).unwrap();
         drop(stale);
@@ -778,10 +783,11 @@ mod tests {
     async fn attachment_delivers_durable_status_before_live_projection_state() {
         let root = tempfile::tempdir().unwrap();
         let session_id = Uuid::new_v4();
-        let journal_path = root.path().join(format!("{session_id}.jsonl"));
+        let journal_path = root.path().join(format!("{session_id}.lock"));
         let socket_path = session_control_socket_path(root.path(), session_id);
-        let journal = SessionJournal::open(&journal_path).unwrap();
-        let _writer = journal.try_acquire_writer().unwrap().unwrap();
+        let _writer = SessionWriterLease::try_acquire(&journal_path)
+            .unwrap()
+            .unwrap();
         let sqlite = Arc::new(
             crate::SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
                 .await

@@ -481,8 +481,8 @@ impl AcpRuntime {
             .with_context(|| format!("ACP session cwd does not exist: {}", cwd.display()))?;
         let id = Uuid::new_v4();
         self.store.create_session(id).await?;
-        let journal_path = self.sessions_dir.join(format!("{id}.jsonl"));
-        let writer = SessionWriterLease::try_acquire(&journal_path)?
+        let lock_path = self.sessions_dir.join(format!("{id}.lock"));
+        let writer = SessionWriterLease::try_acquire(&lock_path)?
             .context("new ACP session unexpectedly has another writer")?;
         let (commands, command_rx) = mpsc::channel(64);
         let (event_tx, mut event_rx) = mpsc::channel(256);
@@ -512,17 +512,11 @@ impl AcpRuntime {
             extension_skill_roots: Vec::new(),
             team_policy: None,
         };
-        let actor_journal = journal_path;
+        let actor_lock = lock_path;
         tokio::spawn(async move {
-            if let Err(error) = run_agent_session_with_writer(
-                &actor_journal,
-                id,
-                launch,
-                command_rx,
-                event_tx,
-                writer,
-            )
-            .await
+            if let Err(error) =
+                run_agent_session_with_writer(&actor_lock, id, launch, command_rx, event_tx, writer)
+                    .await
             {
                 tracing::error!(session_id = %id, %error, "ACP session actor failed");
             }
@@ -548,8 +542,8 @@ impl AcpRuntime {
         if let Some(session) = self.sessions.lock().await.get(&protocol_id).cloned() {
             return Ok(session);
         }
-        let journal_path = self.sessions_dir.join(format!("{id}.jsonl"));
-        let writer = SessionWriterLease::try_acquire(&journal_path)?
+        let lock_path = self.sessions_dir.join(format!("{id}.lock"));
+        let writer = SessionWriterLease::try_acquire(&lock_path)?
             .context("ACP session is already owned by another Borg process")?;
         let (commands, command_rx) = mpsc::channel(64);
         let (event_tx, mut event_rx) = mpsc::channel(256);
@@ -581,15 +575,9 @@ impl AcpRuntime {
             team_policy: None,
         };
         tokio::spawn(async move {
-            if let Err(error) = run_agent_session_with_writer(
-                &journal_path,
-                id,
-                launch,
-                command_rx,
-                event_tx,
-                writer,
-            )
-            .await
+            if let Err(error) =
+                run_agent_session_with_writer(&lock_path, id, launch, command_rx, event_tx, writer)
+                    .await
             {
                 tracing::error!(session_id = %id, %error, "resumed ACP session actor failed");
             }

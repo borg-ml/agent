@@ -1,22 +1,19 @@
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::str::FromStr;
-use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 use uuid::Uuid;
 
 use crate::{
     CodingProvider, MessageStatus, PermissionMode, PlanItem, ResponseLanguage, SessionEvent,
-    SessionEventKind, SessionGoal, SessionJournal, SessionPayloadKind, SessionPayloadRef,
-    SessionStatus,
+    SessionEventKind, SessionGoal, SessionPayloadKind, SessionPayloadRef, SessionStatus,
 };
 
 pub(crate) const INLINE_SESSION_PAYLOAD_BYTES: usize = 64 * 1024;
@@ -429,15 +426,6 @@ pub struct SessionStoreFork {
     pub inherited_event_count: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionImport {
-    pub session_id: Uuid,
-    pub event_count: u64,
-    pub source_fingerprint: String,
-    pub backup_path: PathBuf,
-    pub imported: bool,
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionSummary {
     pub session_id: Uuid,
@@ -497,8 +485,6 @@ pub trait SessionStore: Send + Sync {
         &self,
         _owner_session_id: Uuid,
         session_id: Uuid,
-        _legacy_jsonl: &Path,
-        _writer: &crate::SessionWriterLease,
     ) -> Result<()> {
         anyhow::bail!("session store cannot register child session {session_id}")
     }
@@ -609,126 +595,6 @@ impl SessionStoreHealth {
             && self.synchronous >= 2
             && self.foreign_keys
             && self.wal_busy == 0
-    }
-}
-
-pub struct JsonlSessionStore {
-    journal: Mutex<SessionJournal>,
-}
-
-impl JsonlSessionStore {
-    pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
-        Ok(Self::from_journal(SessionJournal::open(path)?))
-    }
-
-    pub(crate) fn from_journal(journal: SessionJournal) -> Self {
-        Self {
-            journal: Mutex::new(journal),
-        }
-    }
-
-    fn journal(&self) -> Result<std::sync::MutexGuard<'_, SessionJournal>> {
-        self.journal
-            .lock()
-            .map_err(|_| anyhow::anyhow!("JSONL session store lock was poisoned"))
-    }
-}
-
-#[async_trait]
-impl SessionStore for JsonlSessionStore {
-    async fn create_session(&self, _session_id: Uuid) -> Result<()> {
-        Ok(())
-    }
-
-    async fn append(&self, event: SessionEvent) -> Result<SessionEvent> {
-        self.journal()?.append(event)
-    }
-
-    async fn read(&self, session_id: Uuid) -> Result<Vec<SessionEvent>> {
-        let events = self.journal()?.read()?;
-        anyhow::ensure!(
-            events.iter().all(|event| event.session_id == session_id),
-            "JSONL session store contains events for another session"
-        );
-        Ok(events)
-    }
-
-    async fn events_after(
-        &self,
-        session_id: Uuid,
-        sequence: u64,
-        limit: usize,
-    ) -> Result<Vec<SessionEvent>> {
-        Ok(self
-            .read(session_id)
-            .await?
-            .into_iter()
-            .skip(usize::try_from(sequence).unwrap_or(usize::MAX))
-            .take(limit)
-            .collect())
-    }
-
-    async fn state(&self, session_id: Uuid) -> Result<SessionState> {
-        SessionState::reduce(&self.read(session_id).await?)
-    }
-
-    async fn recovery(&self, session_id: Uuid) -> Result<SessionRecovery> {
-        Ok(SessionRecovery::from_events(self.read(session_id).await?))
-    }
-
-    async fn live_events_after(
-        &self,
-        _session_id: Uuid,
-        _revision: u64,
-    ) -> Result<Vec<SessionLiveEvent>> {
-        Ok(Vec::new())
-    }
-
-    async fn load_payload(&self, payload: &SessionPayloadRef) -> Result<Vec<u8>> {
-        anyhow::bail!(
-            "payload {} is not available in the JSONL compatibility store",
-            payload.id
-        )
-    }
-
-    async fn contains_message(&self, session_id: Uuid, message_id: Uuid) -> Result<bool> {
-        Ok(self.read(session_id).await?.iter().any(|event| {
-            matches!(
-                event.kind,
-                SessionEventKind::Message {
-                    message_id: existing,
-                    ..
-                } if existing == message_id
-            )
-        }))
-    }
-
-    async fn fork_before(
-        &self,
-        _parent_session_id: Uuid,
-        session_id: Uuid,
-        sequence: u64,
-    ) -> Result<SessionStoreFork> {
-        anyhow::bail!(
-            "JSONL compatibility store cannot create metadata lineage for session {session_id} at {sequence}"
-        )
-    }
-
-    async fn list_sessions(&self, limit: usize) -> Result<Vec<SessionSummary>> {
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
-        let events = self.journal()?.read()?;
-        let Some(session_id) = events.first().map(|event| event.session_id) else {
-            return Ok(Vec::new());
-        };
-        Ok(vec![SessionSummary {
-            session_id,
-            parent_session_id: None,
-            parent_cut_sequence: None,
-            inherited_event_count: 0,
-            state: SessionState::reduce(&events)?,
-        }])
     }
 }
 
@@ -889,7 +755,6 @@ impl SqliteSessionStore {
                 live_revision integer not null default 0,
                 state_json text not null,
                 projection_version integer not null default 3,
-                source_fingerprint text,
                 created_at text not null,
                 updated_at text not null
             );
@@ -962,14 +827,6 @@ impl SqliteSessionStore {
         let columns = sqlx::query("pragma table_info(sessions)")
             .fetch_all(&self.pool)
             .await?;
-        if !columns
-            .iter()
-            .any(|row| row.get::<&str, _>("name") == "source_fingerprint")
-        {
-            sqlx::query("alter table sessions add column source_fingerprint text")
-                .execute(&self.pool)
-                .await?;
-        }
         if !columns
             .iter()
             .any(|row| row.get::<&str, _>("name") == "projection_version")
@@ -1162,143 +1019,17 @@ impl SqliteSessionStore {
         Ok(())
     }
 
-    pub async fn import_jsonl(&self, path: impl AsRef<Path>) -> Result<SessionImport> {
-        let path = path.as_ref();
-        let bytes = tokio::fs::read(path)
-            .await
-            .with_context(|| format!("failed to read {}", path.display()))?;
-        let source_fingerprint = format!("{:x}", Sha256::digest(&bytes));
-        let events = crate::journal::decode_events(bytes.clone(), path)?;
-        let session_id = validate_import_events(path, &events)?;
-        let backup_path = preserve_journal_backup(path, &bytes, &source_fingerprint).await?;
-
-        let mut transaction = self.begin_write().await?;
-        if let Some(existing_fingerprint) = sqlx::query_scalar::<_, Option<String>>(
-            "select source_fingerprint from sessions where id = ?",
-        )
-        .bind(session_id.to_string())
-        .fetch_optional(&mut *transaction)
-        .await?
-        .flatten()
-        {
-            anyhow::ensure!(
-                existing_fingerprint == source_fingerprint,
-                "session {session_id} was already imported from a different JSONL source"
-            );
-            transaction.rollback().await?;
-            return Ok(SessionImport {
-                session_id,
-                event_count: events.len() as u64,
-                source_fingerprint,
-                backup_path,
-                imported: false,
-            });
-        }
-        let already_exists: i64 =
-            sqlx::query_scalar("select exists(select 1 from sessions where id = ?)")
-                .bind(session_id.to_string())
-                .fetch_one(&mut *transaction)
-                .await?;
-        anyhow::ensure!(
-            already_exists == 0,
-            "session {session_id} already exists without matching migration provenance"
-        );
-
-        let mut state = SessionState::default();
-        let created_at = events
-            .first()
-            .map(|event| event.created_at)
-            .unwrap_or_else(Utc::now);
-        let updated_at = events
-            .last()
-            .map(|event| event.created_at)
-            .unwrap_or(created_at);
-        sqlx::query(
-            "insert into sessions \
-             (id, next_sequence, state_json, projection_version, source_fingerprint, \
-              created_at, updated_at) values (?, ?, ?, 3, ?, ?, ?)",
-        )
-        .bind(session_id.to_string())
-        .bind(
-            i64::try_from(events.len())
-                .unwrap_or(i64::MAX)
-                .saturating_add(1),
-        )
-        .bind(serde_json::to_string(&state)?)
-        .bind(&source_fingerprint)
-        .bind(created_at.to_rfc3339())
-        .bind(updated_at.to_rfc3339())
-        .execute(&mut *transaction)
-        .await?;
-        for event in &events {
-            state.apply(event)?;
-            let compact_event = self.compact_payloads(&mut transaction, event).await?;
-            let message_id = match &event.kind {
-                SessionEventKind::Message { message_id, .. } => Some(message_id.to_string()),
-                _ => None,
-            };
-            sqlx::query(
-                "insert into session_events \
-                 (session_id, sequence, event_id, event_kind, event_json, projection_json, \
-                  fork_inheritable, recovery_relevant, message_id, created_at) \
-                  values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            )
-            .bind(session_id.to_string())
-            .bind(i64::try_from(event.sequence).context("session sequence exceeds SQLite integer")?)
-            .bind(event.id.to_string())
-            .bind(event_kind(&event.kind)?)
-            .bind(serde_json::to_string(&compact_event)?)
-            .bind(serde_json::to_string(&state)?)
-            .bind(if event.kind.is_fork_inheritable() {
-                1_i64
-            } else {
-                0_i64
-            })
-            .bind(i64::from(event.kind.is_recovery_relevant()))
-            .bind(message_id)
-            .bind(event.created_at.to_rfc3339())
-            .execute(&mut *transaction)
-            .await?;
-        }
-        sqlx::query("update sessions set state_json = ? where id = ?")
-            .bind(serde_json::to_string(&state)?)
-            .bind(session_id.to_string())
-            .execute(&mut *transaction)
-            .await?;
-        transaction.commit().await?;
-        Ok(SessionImport {
-            session_id,
-            event_count: events.len() as u64,
-            source_fingerprint,
-            backup_path,
-            imported: true,
-        })
-    }
-
     pub async fn register_child_session(
         &self,
         owner_session_id: Uuid,
         session_id: Uuid,
-        legacy_jsonl: &Path,
-        writer: &crate::SessionWriterLease,
     ) -> Result<()> {
-        writer.ensure_journal(legacy_jsonl)?;
         anyhow::ensure!(
             self.contains_session(owner_session_id).await?,
             "owner session {owner_session_id} does not exist"
         );
         if !self.contains_session(session_id).await? {
-            if legacy_jsonl.is_file() {
-                let imported = self.import_jsonl(legacy_jsonl).await?;
-                anyhow::ensure!(
-                    imported.session_id == session_id,
-                    "child journal {} contains session {}, expected {session_id}",
-                    legacy_jsonl.display(),
-                    imported.session_id
-                );
-            } else {
-                self.create_session(session_id).await?;
-            }
+            self.create_session(session_id).await?;
         }
         let existing_owner: Option<String> =
             sqlx::query_scalar("select owner_session_id from sessions where id = ?")
@@ -1922,21 +1653,8 @@ impl SessionStore for SqliteSessionStore {
         Ok(())
     }
 
-    async fn register_child_session(
-        &self,
-        owner_session_id: Uuid,
-        session_id: Uuid,
-        legacy_jsonl: &Path,
-        writer: &crate::SessionWriterLease,
-    ) -> Result<()> {
-        SqliteSessionStore::register_child_session(
-            self,
-            owner_session_id,
-            session_id,
-            legacy_jsonl,
-            writer,
-        )
-        .await
+    async fn register_child_session(&self, owner_session_id: Uuid, session_id: Uuid) -> Result<()> {
+        SqliteSessionStore::register_child_session(self, owner_session_id, session_id).await
     }
 
     async fn append(&self, mut event: SessionEvent) -> Result<SessionEvent> {
@@ -2432,89 +2150,6 @@ fn event_kind(kind: &SessionEventKind) -> Result<String> {
         .context("session event kind has no typed discriminant")
 }
 
-fn validate_import_events(path: &Path, events: &[SessionEvent]) -> Result<Uuid> {
-    let first = events
-        .first()
-        .with_context(|| format!("session journal {} is empty", path.display()))?;
-    let session_id = first.session_id;
-    anyhow::ensure!(
-        matches!(first.kind, SessionEventKind::SessionStarted),
-        "session journal {} does not start with session_started",
-        path.display()
-    );
-    anyhow::ensure!(
-        events.iter().all(|event| event.session_id == session_id),
-        "session journal {} contains multiple session IDs",
-        path.display()
-    );
-    anyhow::ensure!(
-        events
-            .iter()
-            .any(|event| matches!(event.kind, SessionEventKind::SessionConfigured { .. })),
-        "session journal {} is missing session configuration",
-        path.display()
-    );
-    SessionState::reduce(events)?;
-    Ok(session_id)
-}
-
-async fn preserve_journal_backup(path: &Path, bytes: &[u8], fingerprint: &str) -> Result<PathBuf> {
-    let backup_path = path.with_extension("jsonl.bak");
-    match tokio::fs::read(&backup_path).await {
-        Ok(existing) => {
-            anyhow::ensure!(
-                format!("{:x}", Sha256::digest(&existing)) == fingerprint,
-                "preserved backup {} differs from {}",
-                backup_path.display(),
-                path.display()
-            );
-            return Ok(backup_path);
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("failed to read backup {}", backup_path.display()));
-        }
-    }
-    let temporary = backup_path.with_extension(format!("jsonl.bak.tmp-{}", Uuid::new_v4()));
-    tokio::fs::write(&temporary, bytes)
-        .await
-        .with_context(|| format!("failed to write backup {}", temporary.display()))?;
-    let file = tokio::fs::OpenOptions::new()
-        .read(true)
-        // Windows requires write access for FlushFileBuffers, which backs
-        // `sync_all`; keep the handle writable even though the bytes were
-        // already written by the preceding operation.
-        .write(true)
-        .open(&temporary)
-        .await?;
-    file.sync_all()
-        .await
-        .with_context(|| format!("failed to flush backup {}", temporary.display()))?;
-    drop(file);
-    tokio::fs::rename(&temporary, &backup_path)
-        .await
-        .with_context(|| {
-            format!(
-                "failed to publish backup {} from {}",
-                backup_path.display(),
-                temporary.display()
-            )
-        })?;
-    // Directory fsync is not supported by Windows. The file itself has
-    // already been flushed before the atomic rename; Unix additionally
-    // flushes the containing directory so the rename survives a crash.
-    #[cfg(not(windows))]
-    if let Some(parent) = backup_path.parent() {
-        let directory = tokio::fs::OpenOptions::new()
-            .read(true)
-            .open(parent)
-            .await?;
-        directory.sync_all().await?;
-    }
-    Ok(backup_path)
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant};
@@ -2601,12 +2236,9 @@ mod tests {
         let child_journal = directory
             .path()
             .join("subagents")
-            .join(format!("{child}.jsonl"));
-        let writer = crate::SessionWriterLease::acquire(&child_journal).unwrap();
-        store
-            .register_child_session(root, child, &child_journal, &writer)
-            .await
-            .unwrap();
+            .join(format!("{child}.lock"));
+        let _writer = crate::SessionWriterLease::acquire(&child_journal).unwrap();
+        store.register_child_session(root, child).await.unwrap();
         let child_binding = store.workspace_binding(child).await.unwrap().unwrap();
         assert_eq!(child_binding.workspace_id, root);
         assert_eq!(child_binding.participant_id, child);
@@ -2691,7 +2323,6 @@ mod tests {
                 live_revision integer not null default 0,
                 state_json text not null,
                 projection_version integer not null default 1,
-                source_fingerprint text,
                 created_at text not null,
                 updated_at text not null
             )",
@@ -3545,59 +3176,6 @@ mod tests {
             store.load_payload(payload).await.unwrap(),
             serde_json::to_vec(&input).unwrap()
         );
-    }
-
-    #[tokio::test]
-    async fn jsonl_import_is_atomic_backed_up_and_idempotent() {
-        let (directory, store) = store().await;
-        let session_id = Uuid::new_v4();
-        let journal_path = directory.path().join(format!("{session_id}.jsonl"));
-        let mut journal = crate::SessionJournal::open(&journal_path).unwrap();
-        for kind in [
-            SessionEventKind::SessionStarted,
-            configured(directory.path()),
-            message(Uuid::new_v4(), "migrate me"),
-        ] {
-            journal
-                .append(SessionEvent::new(session_id, 0, kind))
-                .unwrap();
-        }
-
-        let imported = store.import_jsonl(&journal_path).await.unwrap();
-        assert!(imported.imported);
-        assert_eq!(imported.session_id, session_id);
-        assert_eq!(imported.event_count, 3);
-        assert_eq!(
-            tokio::fs::read(&imported.backup_path).await.unwrap(),
-            tokio::fs::read(&journal_path).await.unwrap()
-        );
-        assert_eq!(store.read(session_id).await.unwrap().len(), 3);
-
-        let repeated = store.import_jsonl(&journal_path).await.unwrap();
-        assert!(!repeated.imported);
-        assert_eq!(repeated.source_fingerprint, imported.source_fingerprint);
-    }
-
-    #[tokio::test]
-    async fn invalid_jsonl_does_not_create_a_session_or_backup() {
-        let (directory, store) = store().await;
-        let session_id = Uuid::new_v4();
-        let journal_path = directory.path().join(format!("{session_id}.jsonl"));
-        let event = SessionEvent::new(
-            session_id,
-            1,
-            message(Uuid::new_v4(), "missing session start"),
-        );
-        tokio::fs::write(
-            &journal_path,
-            format!("{}\n", serde_json::to_string(&event).unwrap()),
-        )
-        .await
-        .unwrap();
-
-        assert!(store.import_jsonl(&journal_path).await.is_err());
-        assert!(!journal_path.with_extension("jsonl.bak").exists());
-        assert!(store.list_sessions(10).await.unwrap().is_empty());
     }
 
     #[test]

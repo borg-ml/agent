@@ -11,7 +11,6 @@ mod command;
 mod contract;
 mod filesystem;
 mod host;
-mod journal;
 mod local_control;
 mod lsp;
 mod native_context;
@@ -23,6 +22,7 @@ mod orchestration;
 mod receipt;
 mod self_service;
 mod session;
+mod session_lock;
 mod session_store;
 mod subagents;
 mod tool_presentation;
@@ -41,7 +41,6 @@ pub use host::{
     mirror_local_session, probe_capabilities, provider_credentials_present, run_host,
     run_host_with_executor_factory,
 };
-pub use journal::{SessionJournal, SessionWriterLease};
 pub use local_control::{
     LocalSessionControlServer, local_session_owner_uses_current_binary, run_attached_session,
     send_local_session_command, session_control_presence_socket_path, session_control_socket_path,
@@ -54,10 +53,11 @@ pub use session::{
     run_agent_session_with_store_and_writer, run_agent_session_with_store_writer_and_peers,
     run_agent_session_with_writer,
 };
+pub use session_lock::SessionWriterLease;
 pub use session_store::{
-    EventPersistence, JsonlSessionStore, SESSION_PROJECTION_VERSION, SessionConfiguration,
-    SessionImport, SessionLiveEvent, SessionRecovery, SessionState, SessionStore, SessionStoreFork,
-    SessionStoreHealth, SessionSummary, SessionUsage, SessionWorkspaceBinding, SqliteSessionStore,
+    EventPersistence, SESSION_PROJECTION_VERSION, SessionConfiguration, SessionLiveEvent,
+    SessionRecovery, SessionState, SessionStore, SessionStoreFork, SessionStoreHealth,
+    SessionSummary, SessionUsage, SessionWorkspaceBinding, SqliteSessionStore,
 };
 pub use subagents::{
     AgentToolDispatcher, AgentToolServer, DEFAULT_MAX_SUBAGENTS, SpawnSubagent, SubagentActivity,

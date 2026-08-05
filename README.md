@@ -149,7 +149,7 @@ decisions, reviews, references, and provenance records.
 ## Repository layout
 
 - `borg-provider`: provider-neutral messages, tools, usage and local adapters;
-- `borg-remote`: session protocol, journal, actor, host and local tools; and
+- `borg-remote`: session protocol, store, actor, host and local tools; and
 - `borg`: public CLI commands and terminal UI.
 
 ## Development

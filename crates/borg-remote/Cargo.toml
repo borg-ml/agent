@@ -1,6 +1,6 @@
 [package]
 name = "borg-remote"
-description = "Durable local and remote agent session protocol, journal, host, and tools"
+description = "Durable local and remote agent session protocol, store, host, and tools"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -23,7 +23,6 @@ regex.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sha2.workspace = true
 sqlx.workspace = true
 tempfile.workspace = true
 toml.workspace = true
