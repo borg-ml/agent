@@ -1,22 +1,23 @@
 //! External command adapters for the subscription-backed Codex and Claude routes.
 //!
 //! These adapters intentionally keep subscription authentication and execution at
-//! the CLI boundary. They do not embed a provider SDK or app-server, and they
-//! do not own Borg's tool/runtime loop; the provider-neutral NativeHarness owns
-//! API-key/OpenAI-compatible model routes.
+//! the CLI boundary. They launch the providers' native streaming protocols as
+//! thin wire adapters and do not own Borg's tool/runtime loop; the
+//! provider-neutral NativeHarness owns API-key/OpenAI-compatible model routes.
 
-use crate::mcp::ExternalMcpServer;
+use crate::mcp::{ExternalMcpServer, prepare_external_provider_mcp};
 use crate::runtime::ProviderCallUsage;
 use crate::{ProviderAuthBundle, ProviderAuthProvider, ProviderChannel};
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::Command;
+use tokio::process::{ChildStdin, Command};
 use tokio::sync::mpsc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -273,7 +274,19 @@ async fn run_claude_subscription_process(
     events: mpsc::Sender<ChatStreamEvent>,
 ) -> Result<()> {
     let auth_home = restore_auth_home(request.provider_auth.as_ref())?;
-    let command = build_claude_command_spec(&request, permission, auth_home.as_ref())?;
+    let mcp_setup = if request.mcp_external_servers.is_empty() {
+        None
+    } else {
+        let directory = tempfile::tempdir().context("failed to create Claude MCP directory")?;
+        let setup = prepare_external_provider_mcp(directory.path(), &request.mcp_external_servers)
+            .context("failed to prepare Claude MCP config")?;
+        Some((directory, setup))
+    };
+    let mcp_config_path = mcp_setup
+        .as_ref()
+        .and_then(|(_, setup)| setup.claude_config_path.as_deref());
+    let command =
+        build_claude_command_spec(&request, permission, auth_home.as_ref(), mcp_config_path)?;
     let claude_request = claude_agents::ChatStreamRequest {
         prompt: request.prompt,
         attachments: request.attachments,
@@ -470,10 +483,7 @@ async fn run_codex_subscription_process(
 ) -> Result<()> {
     let started_at = Instant::now();
     let auth_home = restore_auth_home(request.provider_auth.as_ref())?;
-    let output_file =
-        tempfile::NamedTempFile::new().context("failed to create subscription output file")?;
-    let mut command =
-        build_codex_command(&request, permission, output_file.path(), auth_home.as_ref())?;
+    let mut command = codex_app_server_command(&request, auth_home.as_ref())?;
     let mut child = command.spawn().with_context(|| {
         format!(
             "failed to start {}",
@@ -493,29 +503,83 @@ async fn run_codex_subscription_process(
         .take()
         .context("subscription stderr pipe missing")?;
 
-    let stderr_task = tokio::spawn(async move {
+    let mut stderr_task = tokio::spawn(async move {
         let mut stderr = stderr;
         let mut output = Vec::new();
         let _ = tokio::io::AsyncReadExt::read_to_end(&mut stderr, &mut output).await;
         output
     });
 
-    let prompt = codex_prompt(&request);
     stdin
-        .write_all(prompt.as_bytes())
+        .write_all(
+            serde_json::to_string(&serde_json::json!({
+                "method": "initialize",
+                "id": 1,
+                "params": {
+                    "clientInfo": {
+                        "name": "borg",
+                        "title": "Borg",
+                        "version": env!("CARGO_PKG_VERSION")
+                    },
+                    "capabilities": {
+                        "experimentalApi": true,
+                        "optOutNotificationMethods": []
+                    }
+                }
+            }))?
+            .as_bytes(),
+        )
         .await
-        .context("failed to write subscription prompt")?;
-    stdin
-        .shutdown()
-        .await
-        .context("failed to close subscription prompt")?;
-    drop(stdin);
+        .context("failed to initialize Codex app server")?;
+    stdin.write_all(b"\n").await?;
 
     let mut lines = BufReader::new(stdout).lines();
+    read_codex_response(&mut lines, 1).await?;
+    write_codex_notification(&mut stdin, "initialized", Value::Object(Default::default())).await?;
+
+    let thread_request_id = 2;
+    write_codex_request(
+        &mut stdin,
+        thread_request_id,
+        "thread/start",
+        codex_thread_start_params(&request, permission),
+    )
+    .await?;
+    let thread_response = read_codex_response(&mut lines, thread_request_id).await?;
+    let thread_id = thread_response
+        .pointer("/result/thread/id")
+        .or_else(|| thread_response.pointer("/thread/id"))
+        .and_then(Value::as_str)
+        .context("Codex app server did not return a thread id")?
+        .to_string();
+
+    let turn_request_id = 3;
+    write_codex_request(
+        &mut stdin,
+        turn_request_id,
+        "turn/start",
+        codex_turn_start_params(&request, permission, &thread_id),
+    )
+    .await?;
+    let turn_response = read_codex_response(&mut lines, turn_request_id).await?;
+    let turn_id = turn_response
+        .pointer("/result/turn/id")
+        .or_else(|| turn_response.pointer("/turn/id"))
+        .and_then(Value::as_str)
+        .context("Codex app server did not return a turn id")?
+        .to_string();
+
     let mut text = String::new();
     let mut final_text = None;
-    let mut session_id = request.session_id.clone();
+    let session_id = Some(thread_id.clone());
     let mut usage = ProviderCallUsage::default();
+    let mut next_request_id = 4_u64;
+    let mut pending_steers: HashMap<
+        u64,
+        tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+    > = HashMap::new();
+    let mut pending_approvals = HashMap::new();
+    let mut turn_completed = false;
 
     loop {
         tokio::select! {
@@ -527,20 +591,59 @@ async fn run_codex_subscription_process(
                     continue;
                 }
                 let value = serde_json::from_str::<Value>(&line).unwrap_or_else(|_| Value::String(line.clone()));
+                if let Some(response_id) = codex_response_id(&value) {
+                    if let Some(ack) = pending_steers.remove(&response_id) {
+                        let result = value.get("error")
+                            .map(codex_rpc_error)
+                            .map_or(Ok(()), Err);
+                        let _ = ack.send(result);
+                    }
+                    continue;
+                }
                 emit_provider_event(&events, &value).await;
                 emit_codex_events(&events, &value).await;
                 if let Some(delta) = codex_event_delta(&value) {
-                    text.push_str(&delta);
-                    events.send(ChatStreamEvent::Delta(delta)).await.ok();
+                    if codex_event_is_reasoning_delta(&value) {
+                        events.send(ChatStreamEvent::ReasoningDelta(delta)).await.ok();
+                    } else {
+                        text.push_str(&delta);
+                        events.send(ChatStreamEvent::Delta(delta)).await.ok();
+                    }
                 }
                 if let Some(result) = codex_event_result(&value) {
                     final_text = Some(result);
                 }
-                if let Some(id) = event_session_id(&value) {
-                    session_id = Some(id);
-                }
                 if let Some(event_usage) = event_usage(&value) {
                     usage = event_usage;
+                }
+                if let Some(method) = codex_event_kind(&value)
+                    && method == "turn/completed"
+                {
+                    turn_completed = true;
+                    break;
+                }
+                if let Some(method) = codex_event_kind(&value)
+                    && method.ends_with("/requestApproval")
+                {
+                    if let Some(rpc_id) = value.get("id") {
+                        let params = value.get("params").cloned().unwrap_or(Value::Null);
+                        let approval_id = params
+                            .get("approvalId")
+                            .or_else(|| params.get("itemId"))
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                            .unwrap_or_else(|| rpc_id.to_string());
+                        pending_approvals.insert(approval_id.clone(), rpc_id.clone());
+                        events.send(ChatStreamEvent::ApprovalRequested {
+                            approval_id,
+                            title: method.to_string(),
+                            detail: params.get("reason")
+                                .and_then(Value::as_str)
+                                .unwrap_or("Codex requested approval")
+                                .to_string(),
+                            command: params.get("command").and_then(Value::as_str).map(str::to_string),
+                        }).await.ok();
+                    }
                 }
             }
             control = receive_control(&mut controls), if controls.is_some() => {
@@ -550,30 +653,84 @@ async fn run_codex_subscription_process(
                 };
                 match control {
                     ChatStreamControl::Interrupt => {
-                        child.kill().await.ok();
-                        bail!("subscription provider interrupted");
+                        write_codex_request(
+                            &mut stdin,
+                            next_request_id,
+                            "turn/interrupt",
+                            serde_json::json!({"threadId": thread_id, "turnId": turn_id}),
+                        ).await?;
+                        next_request_id += 1;
                     }
-                    ChatStreamControl::Steer { ack, .. } => {
-                        let _ = ack.send(Err("subscription provider does not support live steering".to_string()));
+                    ChatStreamControl::Steer {
+                        client_user_message_id,
+                        text: steer_text,
+                        attachments,
+                        ack,
+                    } => {
+                        let request_id = next_request_id;
+                        next_request_id += 1;
+                        write_codex_request(
+                            &mut stdin,
+                            request_id,
+                            "turn/steer",
+                            codex_turn_steer_params(
+                                &thread_id,
+                                &turn_id,
+                                &steer_text,
+                                &attachments,
+                                client_user_message_id.as_deref(),
+                            ),
+                        ).await?;
+                        pending_steers.insert(request_id, ack);
                     }
-                    ChatStreamControl::Approval { .. }
-                    | ChatStreamControl::ProviderInteractionResponse { .. } => {}
+                    ChatStreamControl::Approval { approval_id, decision } => {
+                        if let Some(rpc_id) = pending_approvals.remove(&approval_id) {
+                            let decision = match decision {
+                                ChatApprovalDecision::ApproveOnce => "accept",
+                                ChatApprovalDecision::ApproveSession => "acceptForSession",
+                                ChatApprovalDecision::Reject => "decline",
+                            };
+                            write_codex_response(
+                                &mut stdin,
+                                rpc_id,
+                                serde_json::json!({"decision": decision}),
+                            ).await?;
+                        }
+                    }
+                    ChatStreamControl::ProviderInteractionResponse { .. } => {}
                 }
             }
         }
     }
 
-    let status = child
-        .wait()
+    for (_, ack) in pending_steers {
+        let _ = ack.send(Err(
+            "Codex turn completed before the steer was delivered".to_string()
+        ));
+    }
+    child.start_kill().ok();
+    let status = tokio::time::timeout(Duration::from_secs(3), child.wait())
         .await
+        .ok()
+        .transpose()
         .context("failed waiting for subscription provider")?;
-    let stderr = stderr_task.await.unwrap_or_default();
-    if !status.success() {
+    let stderr = match tokio::time::timeout(Duration::from_secs(2), &mut stderr_task).await {
+        Ok(Ok(output)) => output,
+        _ => {
+            stderr_task.abort();
+            Vec::new()
+        }
+    };
+    if !turn_completed && status.is_some_and(|status| !status.success()) {
         let detail = String::from_utf8_lossy(&stderr).trim().to_string();
+        let status_detail = status.map_or_else(
+            || "shutdown timed out".to_string(),
+            |status| status.to_string(),
+        );
         bail!(
             "{} exited with {}{}",
             SubscriptionProvider::Codex.executable(),
-            status,
+            status_detail,
             if detail.is_empty() {
                 String::new()
             } else {
@@ -582,10 +739,7 @@ async fn run_codex_subscription_process(
         );
     }
 
-    let output_text = std::fs::read_to_string(output_file.path()).unwrap_or_default();
-    let final_text = final_text
-        .or_else(|| (!output_text.trim().is_empty()).then_some(output_text))
-        .unwrap_or(text);
+    let final_text = final_text.unwrap_or(text);
     anyhow::ensure!(
         !final_text.trim().is_empty(),
         "{} returned an empty response",
@@ -604,56 +758,101 @@ async fn run_codex_subscription_process(
     Ok(())
 }
 
-fn build_codex_command(
+async fn read_codex_response(
+    lines: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    request_id: u64,
+) -> Result<Value> {
+    loop {
+        let line = lines
+            .next_line()
+            .await
+            .context("failed to read Codex app-server response")?
+            .context("Codex app server closed before replying")?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value: Value = serde_json::from_str(&line)
+            .with_context(|| format!("invalid Codex app-server JSON: {line}"))?;
+        if codex_response_id(&value) == Some(request_id) {
+            if value.get("error").is_some() {
+                bail!(
+                    "Codex app-server request failed: {}",
+                    codex_rpc_error(&value)
+                );
+            }
+            return Ok(value);
+        }
+    }
+}
+
+async fn write_codex_request(
+    stdin: &mut ChildStdin,
+    id: u64,
+    method: &str,
+    params: Value,
+) -> Result<()> {
+    let mut value = serde_json::json!({"id": id, "method": method, "params": params});
+    write_codex_value(stdin, &mut value).await
+}
+
+async fn write_codex_notification(
+    stdin: &mut ChildStdin,
+    method: &str,
+    params: Value,
+) -> Result<()> {
+    let mut value = serde_json::json!({"method": method, "params": params});
+    write_codex_value(stdin, &mut value).await
+}
+
+async fn write_codex_response(stdin: &mut ChildStdin, id: Value, result: Value) -> Result<()> {
+    let mut value = serde_json::json!({"id": id, "result": result});
+    write_codex_value(stdin, &mut value).await
+}
+
+async fn write_codex_value(stdin: &mut ChildStdin, value: &mut Value) -> Result<()> {
+    let mut line = serde_json::to_vec(value)?;
+    line.push(b'\n');
+    stdin
+        .write_all(&line)
+        .await
+        .context("failed to write Codex app-server message")?;
+    stdin
+        .flush()
+        .await
+        .context("failed to flush Codex app-server message")?;
+    Ok(())
+}
+
+fn codex_response_id(value: &Value) -> Option<u64> {
+    value.get("id").and_then(Value::as_u64)
+}
+
+fn codex_rpc_error(value: &Value) -> String {
+    value
+        .pointer("/error/message")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            value
+                .get("error")
+                .map_or_else(|| "unknown error".to_string(), Value::to_string)
+        })
+}
+
+fn codex_app_server_command(
     request: &ChatStreamRequest,
-    permission: LocalAgentPermission,
-    output_file: &std::path::Path,
     auth_home: Option<&TempDir>,
 ) -> Result<Command> {
     let mut command = Command::new("codex");
-    command.args([
-        "exec",
-        "--json",
-        "--color",
-        "never",
-        "--skip-git-repo-check",
-        "--output-last-message",
-    ]);
-    command.arg(output_file);
-    if permission == LocalAgentPermission::FullAccess {
-        command.arg("--dangerously-bypass-approvals-and-sandbox");
-    } else {
-        command.args(["-a", "on-request", "-s", "workspace-write"]);
-    }
-    if request.persist_session == Some(false) {
-        command.arg("--ephemeral");
-    }
-    if let Some(model) = request
-        .model
-        .as_deref()
-        .filter(|model| !model.trim().is_empty())
-    {
-        command.args(["--model", model]);
-    }
-    if let Some(effort) = request
-        .effort
-        .as_deref()
-        .filter(|effort| !effort.trim().is_empty())
-    {
-        command.args(["-c", &format!("model_reasoning_effort=\"{effort}\"")]);
-    }
-    if let Some(cwd) = request.working_directory.as_deref() {
-        command.current_dir(cwd);
-    }
+    command.args(["app-server", "--stdio"]);
     if let Some(auth_home) = auth_home {
         command.env("HOME", auth_home.path());
         let codex_home = crate::provider_auth::ensure_codex_home(auth_home.path())?;
         command.env("CODEX_HOME", codex_home);
     }
-    // Both subscription CLIs consume the prompt from stdin in this adapter
-    // mode. Explicitly pipe all three standard streams so the async runner
-    // can write the prompt and drain provider diagnostics without inheriting
-    // Borg's terminal descriptors.
+    if let Some(cwd) = request.working_directory.as_deref() {
+        command.current_dir(cwd);
+    }
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -661,19 +860,118 @@ fn build_codex_command(
     Ok(command)
 }
 
-fn codex_prompt(request: &ChatStreamRequest) -> String {
-    let mut prompt = String::new();
-    if !request.system_prompt.trim().is_empty() {
-        prompt.push_str(request.system_prompt.trim());
-        prompt.push_str("\n\n");
+fn codex_thread_start_params(
+    request: &ChatStreamRequest,
+    permission: LocalAgentPermission,
+) -> Value {
+    let mut params = serde_json::json!({
+        "model": request.model,
+        "cwd": request.working_directory.as_ref().map(|path| path.to_string_lossy().into_owned()),
+        "ephemeral": request.persist_session == Some(false),
+        "approvalPolicy": match permission {
+            LocalAgentPermission::FullAccess => "never",
+            LocalAgentPermission::Auto | LocalAgentPermission::Manual => "on-request",
+        },
+        "sandbox": match permission {
+            LocalAgentPermission::FullAccess => "danger-full-access",
+            LocalAgentPermission::Auto | LocalAgentPermission::Manual => "workspace-write",
+        },
+        "baseInstructions": request.system_prompt,
+    });
+    let mut config = serde_json::Map::new();
+    if !request.mcp_external_servers.is_empty() {
+        if let Some(mcp_config) =
+            codex_app_server_mcp_config(&request.mcp_external_servers).as_object()
+        {
+            config.extend(mcp_config.clone());
+        }
     }
-    prompt.push_str(&request.prompt);
-    prompt
+    if request.web_search_allowed {
+        config.insert(
+            "features".to_string(),
+            serde_json::json!({"web_search_request": true}),
+        );
+    }
+    if !config.is_empty() {
+        params["config"] = Value::Object(config);
+    }
+    params
+}
+
+fn codex_turn_start_params(
+    request: &ChatStreamRequest,
+    _permission: LocalAgentPermission,
+    thread_id: &str,
+) -> Value {
+    serde_json::json!({
+        "threadId": thread_id,
+        "input": codex_user_input(&request.prompt, &request.attachments),
+        "model": request.model,
+        "cwd": request.working_directory.as_ref().map(|path| path.to_string_lossy().into_owned()),
+        "effort": request.effort,
+        "summary": "detailed",
+        "outputSchema": request.output_schema,
+    })
+}
+
+fn codex_turn_steer_params(
+    thread_id: &str,
+    turn_id: &str,
+    text: &str,
+    attachments: &[PathBuf],
+    client_user_message_id: Option<&str>,
+) -> Value {
+    serde_json::json!({
+        "threadId": thread_id,
+        "expectedTurnId": turn_id,
+        "input": codex_user_input(text, attachments),
+        "clientUserMessageId": client_user_message_id,
+    })
+}
+
+fn codex_user_input(text: &str, attachments: &[PathBuf]) -> Vec<Value> {
+    let mut input = vec![serde_json::json!({"type": "text", "text": text})];
+    input.extend(
+        attachments
+            .iter()
+            .map(|path| serde_json::json!({"type": "localImage", "path": path.to_string_lossy()})),
+    );
+    input
+}
+
+fn codex_app_server_mcp_config(servers: &[ExternalMcpServer]) -> Value {
+    let mut configs = serde_json::Map::new();
+    for server in servers {
+        if server.name.trim().is_empty() || configs.contains_key(&server.name) {
+            continue;
+        }
+        let mut config = serde_json::json!({
+            "command": server.command,
+            "args": server.args,
+            "env": server.env,
+        });
+        if !server.allowed_tools.is_empty() {
+            config["enabled_tools"] = Value::Array(
+                server
+                    .allowed_tools
+                    .iter()
+                    .filter_map(|tool| {
+                        tool.strip_prefix(&format!("mcp__{}__", server.name))
+                            .or_else(|| (!tool.starts_with("mcp__")).then_some(tool.as_str()))
+                            .map(|tool| Value::String(tool.to_string()))
+                    })
+                    .collect(),
+            );
+        }
+        configs.insert(server.name.clone(), config);
+    }
+    serde_json::json!({"mcp_servers": configs})
 }
 
 fn claude_command_args(
     request: &ChatStreamRequest,
     permission: LocalAgentPermission,
+    mcp_config_path: Option<&Path>,
 ) -> Vec<String> {
     let mut args = vec![
         "--print".to_string(),
@@ -718,6 +1016,12 @@ fn claude_command_args(
     {
         args.extend(["--resume".to_string(), session_id.to_string()]);
     }
+    if let Some(mcp_config_path) = mcp_config_path {
+        args.extend([
+            "--mcp-config".to_string(),
+            mcp_config_path.to_string_lossy().into_owned(),
+        ]);
+    }
     args
 }
 
@@ -725,6 +1029,7 @@ fn build_claude_command_spec(
     request: &ChatStreamRequest,
     permission: LocalAgentPermission,
     auth_home: Option<&TempDir>,
+    mcp_config_path: Option<&Path>,
 ) -> Result<claude_agents::CommandSpec> {
     let mut environment = Vec::new();
     if let Some(auth_home) = auth_home {
@@ -732,7 +1037,7 @@ fn build_claude_command_spec(
     }
     Ok(claude_agents::CommandSpec {
         program: PathBuf::from("claude"),
-        args: claude_command_args(request, permission),
+        args: claude_command_args(request, permission, mcp_config_path),
         current_dir: request
             .working_directory
             .clone()
@@ -759,9 +1064,9 @@ async fn receive_control(
 }
 
 async fn emit_provider_event(events: &mpsc::Sender<ChatStreamEvent>, value: &Value) {
-    let raw_kind = value.get("type").and_then(Value::as_str).unwrap_or("event");
+    let raw_kind = codex_event_kind(value).unwrap_or("event");
     let kind = codex_subscription_event_kind(value, raw_kind);
-    let item = value.get("item");
+    let item = codex_event_item(value);
     events
         .send(ChatStreamEvent::ProviderEvent {
             kind,
@@ -790,11 +1095,15 @@ async fn emit_provider_event(events: &mpsc::Sender<ChatStreamEvent>, value: &Val
 // remote agent already uses the `method:item_type` suffix to recognize
 // compaction lifecycle events and transient deltas.
 fn codex_subscription_event_kind(value: &Value, raw_kind: &str) -> String {
-    value
-        .get("item")
+    codex_event_item(value)
         .and_then(|item| item.get("type"))
         .and_then(Value::as_str)
-        .filter(|_| matches!(raw_kind, "item.started" | "item.completed"))
+        .filter(|_| {
+            matches!(
+                raw_kind.replace('.', "/").as_str(),
+                "item/started" | "item/completed"
+            )
+        })
         .map(|item_type| {
             let method = raw_kind
                 .replace('.', "/")
@@ -806,44 +1115,17 @@ fn codex_subscription_event_kind(value: &Value, raw_kind: &str) -> String {
 }
 
 async fn emit_codex_events(events: &mpsc::Sender<ChatStreamEvent>, value: &Value) {
-    let Some(kind) = value.get("type").and_then(Value::as_str) else {
+    let Some(kind) = codex_event_kind(value) else {
         return;
     };
+    let normalized = kind.replace('.', "/").to_ascii_lowercase();
 
-    match kind {
-        // These are emitted by Codex app-server versions that stream text,
-        // while current `codex exec --json` generally emits completed items.
-        "item/agentMessage/delta" | "item.agentMessage.delta" => {
-            if let Some(delta) = value
-                .pointer("/params/delta")
-                .or_else(|| value.get("delta"))
-                .and_then(Value::as_str)
-                && !delta.is_empty()
-            {
-                events
-                    .send(ChatStreamEvent::Delta(delta.to_string()))
-                    .await
-                    .ok();
-            }
-        }
-        "item/reasoning/summaryTextDelta"
-        | "item/reasoning/textDelta"
-        | "item.reasoning.summaryTextDelta"
-        | "item.reasoning.textDelta" => {
-            if let Some(delta) = value
-                .pointer("/params/delta")
-                .or_else(|| value.get("delta"))
-                .and_then(Value::as_str)
-                && !delta.is_empty()
-            {
-                events
-                    .send(ChatStreamEvent::ReasoningDelta(delta.to_string()))
-                    .await
-                    .ok();
-            }
-        }
-        "item.started" | "item/started" => {
-            let Some(item) = value.get("item") else {
+    match normalized.as_str() {
+        // Text and reasoning deltas are emitted by the outer stream loop so
+        // they are appended exactly once and reasoning never becomes answer
+        // text. This function handles item lifecycle events only.
+        "item/started" => {
+            let Some(item) = codex_event_item(value) else {
                 return;
             };
             let item_type = codex_item_type(item);
@@ -861,21 +1143,17 @@ async fn emit_codex_events(events: &mpsc::Sender<ChatStreamEvent>, value: &Value
                 .await
                 .ok();
         }
-        "item.completed" | "item/completed" => {
-            let Some(item) = value.get("item") else {
+        "item/completed" => {
+            let Some(item) = codex_event_item(value) else {
                 return;
             };
             let item_type = codex_item_type(item);
             if codex_item_is_agent_message(item_type) {
                 if let Some(message) = codex_agent_message_text(item) {
-                    // `codex exec --json` reports the complete assistant item,
-                    // not token deltas. Commit it as a narration segment so a
-                    // later tool/assistant item cannot be replaced by the
-                    // aggregate final answer at turn completion.
-                    events
-                        .send(ChatStreamEvent::Delta(message.clone()))
-                        .await
-                        .ok();
+                    // App-server streams the item deltas separately. Emit
+                    // only the completed narration here; this also keeps the
+                    // adapter correct for Codex versions that send only the
+                    // aggregate completed item.
                     events
                         .send(ChatStreamEvent::Narration { text: message })
                         .await
@@ -933,14 +1211,15 @@ fn codex_item_id(item: &Value) -> String {
 }
 
 fn codex_item_is_agent_message(item_type: &str) -> bool {
-    matches!(item_type, "agentMessage" | "agent_message")
+    matches!(
+        item_type,
+        "agentMessage" | "agent_message" | "assistantMessage" | "assistant_message"
+    )
 }
 
 fn codex_item_is_reasoning(item_type: &str) -> bool {
-    matches!(
-        item_type,
-        "reasoning" | "reasoningSummary" | "reasoning_item" | "reasoningItem"
-    )
+    let normalized = item_type.replace('_', "").to_ascii_lowercase();
+    normalized == "reasoning" || normalized.contains("reasoningsummary")
 }
 
 fn codex_item_is_non_rendered(item_type: &str) -> bool {
@@ -1158,28 +1437,45 @@ fn codex_tool_is_error(item_type: &str, item: &Value) -> bool {
 
 fn codex_event_delta(value: &Value) -> Option<String> {
     value
-        .get("delta")
+        .pointer("/params/delta")
+        .or_else(|| value.get("delta"))
         .and_then(Value::as_str)
         .filter(|_| {
-            value
-                .get("type")
-                .and_then(Value::as_str)
-                .is_some_and(|kind| kind.to_ascii_lowercase().contains("delta"))
+            codex_event_kind(value).is_some_and(|kind| kind.to_ascii_lowercase().contains("delta"))
         })
         .map(str::to_string)
 }
 
+fn codex_event_is_reasoning_delta(value: &Value) -> bool {
+    codex_event_kind(value).is_some_and(|kind| {
+        let kind = kind.to_ascii_lowercase();
+        kind.contains("reasoning") && kind.contains("delta")
+    })
+}
+
 fn codex_event_result(value: &Value) -> Option<String> {
-    if let Some(result) = value.get("result").and_then(Value::as_str) {
-        return Some(result.to_string());
+    let is_completed = codex_event_kind(value)
+        .is_some_and(|kind| matches!(kind.replace('.', "/").as_str(), "item/completed"));
+    if !is_completed {
+        return value
+            .get("result")
+            .and_then(Value::as_str)
+            .map(str::to_string);
     }
-    let is_completed = value
+    codex_event_item(value)
+        .filter(|item| codex_item_is_agent_message(codex_item_type(item)))
+        .and_then(codex_agent_message_text)
+}
+
+fn codex_event_kind(value: &Value) -> Option<&str> {
+    value
         .get("type")
+        .or_else(|| value.get("method"))
         .and_then(Value::as_str)
-        .is_some_and(|kind| matches!(kind, "item.completed" | "item/completed"));
-    is_completed
-        .then(|| value.get("item").and_then(codex_agent_message_text))
-        .flatten()
+}
+
+fn codex_event_item(value: &Value) -> Option<&Value> {
+    value.get("item").or_else(|| value.pointer("/params/item"))
 }
 
 fn event_session_id(value: &Value) -> Option<String> {
@@ -1197,25 +1493,90 @@ fn event_session_id(value: &Value) -> Option<String> {
 }
 
 fn event_usage(value: &Value) -> Option<ProviderCallUsage> {
-    let usage = value
+    let container = value
         .get("usage")
-        .or_else(|| value.pointer("/event/usage"))?;
+        .or_else(|| value.pointer("/event/usage"))
+        .or_else(|| value.pointer("/params/usage"))
+        .or_else(|| value.pointer("/params/tokenUsage"))
+        .or_else(|| value.get("tokenUsage"))?;
+    let app_server_usage =
+        value.pointer("/params/tokenUsage").is_some() || value.get("tokenUsage").is_some();
+    let usage = if app_server_usage {
+        container
+            .get("last")
+            .or_else(|| container.get("total"))
+            .unwrap_or(container)
+    } else {
+        container
+    };
+    let cached_input_tokens = usage
+        .get("cached_input_tokens")
+        .or_else(|| usage.get("cachedInputTokens"))
+        .or_else(|| usage.pointer("/input_tokens_details/cached_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let cache_creation_input_tokens = usage
+        .get("cache_write_input_tokens")
+        .or_else(|| usage.get("cacheWriteInputTokens"))
+        .or_else(|| usage.get("cache_creation_input_tokens"))
+        .or_else(|| usage.get("cacheCreationInputTokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let reported_input_tokens = usage
+        .get("input_tokens")
+        .or_else(|| usage.get("inputTokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    // `codex exec --json` reports input_tokens as the whole input bucket and
+    // exposes cached and cache-write portions alongside it. App-server's
+    // TokenUsageBreakdown reports inputTokens as its own exclusive bucket.
+    let input_tokens = if app_server_usage {
+        reported_input_tokens
+    } else {
+        reported_input_tokens
+            .saturating_sub(cached_input_tokens)
+            .saturating_sub(cache_creation_input_tokens)
+    };
+    let output_tokens = usage
+        .get("output_tokens")
+        .or_else(|| usage.get("outputTokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let reported_total_tokens = usage
+        .get("total_tokens")
+        .or_else(|| usage.get("totalTokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let prompt_tokens = if app_server_usage {
+        reported_input_tokens
+    } else {
+        reported_input_tokens.max(
+            input_tokens
+                .saturating_add(cached_input_tokens)
+                .saturating_add(cache_creation_input_tokens),
+        )
+    };
+    let total_tokens = if reported_total_tokens > 0 {
+        reported_total_tokens
+    } else {
+        prompt_tokens.saturating_add(output_tokens)
+    };
+    let context_window_tokens = container
+        .get("modelContextWindow")
+        .or_else(|| container.get("model_context_window"))
+        .or_else(|| container.get("contextWindowTokens"))
+        .or_else(|| container.get("context_window_tokens"))
+        .or_else(|| value.pointer("/params/modelContextWindow"))
+        .or_else(|| value.pointer("/params/model_context_window"))
+        .and_then(Value::as_u64);
     Some(ProviderCallUsage {
-        input_tokens: usage
-            .get("input_tokens")
-            .or_else(|| usage.get("inputTokens"))
-            .and_then(Value::as_u64)
-            .unwrap_or_default(),
-        output_tokens: usage
-            .get("output_tokens")
-            .or_else(|| usage.get("outputTokens"))
-            .and_then(Value::as_u64)
-            .unwrap_or_default(),
-        total_tokens: usage
-            .get("total_tokens")
-            .or_else(|| usage.get("totalTokens"))
-            .and_then(Value::as_u64)
-            .unwrap_or_default(),
+        input_tokens,
+        cached_input_tokens,
+        cache_creation_input_tokens,
+        output_tokens,
+        total_tokens,
+        context_tokens: (total_tokens > 0).then_some(total_tokens),
+        context_window_tokens,
         ..ProviderCallUsage::default()
     })
 }
@@ -1260,7 +1621,7 @@ mod tests {
             resume_unavailable_prompt: None,
         };
         assert_eq!(
-            claude_command_args(&request, LocalAgentPermission::Manual),
+            claude_command_args(&request, LocalAgentPermission::Manual, None),
             vec![
                 "--print",
                 "--output-format",
@@ -1273,6 +1634,105 @@ mod tests {
                 "--resume",
                 "session-1",
             ]
+        );
+    }
+
+    #[test]
+    fn subscription_commands_attach_provider_mcp_config() {
+        let root = tempfile::tempdir().expect("temporary provider home");
+        let server = ExternalMcpServer {
+            name: "borg_agent".to_string(),
+            command: "/bin/borg".to_string(),
+            args: vec!["__agent-mcp".to_string()],
+            env: std::collections::BTreeMap::from([(
+                "BORG_AGENT_TOOL_SOCKET".to_string(),
+                "/tmp/borg.sock".to_string(),
+            )]),
+            allowed_tools: vec![
+                "mcp__borg_agent__get_goal".to_string(),
+                "mcp__borg_agent__update_plan".to_string(),
+            ],
+        };
+        let request = ChatStreamRequest {
+            prompt: "hello".to_string(),
+            owner_session_id: None,
+            client_user_message_id: None,
+            attachments: Vec::new(),
+            model: None,
+            effort: None,
+            fast: false,
+            system_prompt: "system".to_string(),
+            output_schema: None,
+            mcp_owner_id: None,
+            mcp_allowed_scopes: Vec::new(),
+            mcp_user_id: None,
+            mcp_external_servers: vec![server.clone()],
+            mcp_api_token: None,
+            provider_auth: None,
+            git_credentials: Vec::new(),
+            working_directory: Some(root.path().to_path_buf()),
+            session_id: None,
+            provider_channel: ProviderChannel::Direct,
+            persist_session: Some(false),
+            web_search_allowed: false,
+            resume_unavailable_prompt: None,
+        };
+
+        let codex_config = codex_thread_start_params(&request, LocalAgentPermission::FullAccess);
+        assert_eq!(
+            codex_config
+                .get("config")
+                .and_then(|value| value.get("mcp_servers"))
+                .and_then(|value| value.get("borg_agent"))
+                .and_then(|value| value.get("enabled_tools"))
+                .and_then(Value::as_array)
+                .expect("Codex enabled tools")
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>(),
+            ["get_goal", "update_plan"]
+        );
+        let codex_command = codex_app_server_command(&request, None).expect("Codex command");
+        let codex_args = codex_command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            codex_args
+                .windows(2)
+                .any(|args| args[0] == "app-server" && args[1] == "--stdio")
+        );
+
+        let mcp_setup =
+            prepare_external_provider_mcp(root.path(), &[server]).expect("Claude MCP config");
+        let claude_args = claude_command_args(
+            &request,
+            LocalAgentPermission::FullAccess,
+            mcp_setup.claude_config_path.as_deref(),
+        );
+        let config_path = mcp_setup
+            .claude_config_path
+            .expect("Claude MCP path")
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            claude_args
+                .windows(2)
+                .any(|args| { args[0] == "--mcp-config" && args[1] == config_path })
+        );
+        let claude_config = serde_json::from_slice::<serde_json::Value>(
+            &std::fs::read(&config_path).expect("Claude MCP config contents"),
+        )
+        .expect("Claude MCP config should be valid JSON");
+        assert_eq!(
+            claude_config
+                .get("mcpServers")
+                .and_then(|value| value.get("borg_agent"))
+                .and_then(|value| value.get("env"))
+                .and_then(|value| value.get("BORG_AGENT_TOOL_SOCKET"))
+                .and_then(serde_json::Value::as_str),
+            Some("/tmp/borg.sock")
         );
     }
 
@@ -1303,6 +1763,79 @@ mod tests {
                 session_id: Some(session_id),
             } if final_text == "done" && session_id == "session-1"
         ));
+    }
+
+    #[test]
+    fn codex_usage_preserves_cached_input_counters() {
+        let usage = event_usage(&serde_json::json!({
+            "usage": {
+                "input_tokens": 222_000,
+                "cached_input_tokens": 210_000,
+                "cache_write_input_tokens": 1_024,
+                "output_tokens": 800,
+                "total_tokens": 222_800
+            }
+        }))
+        .expect("Codex usage");
+        assert_eq!(usage.input_tokens, 10_976);
+        assert_eq!(usage.cached_input_tokens, 210_000);
+        assert_eq!(usage.cache_creation_input_tokens, 1_024);
+        assert_eq!(usage.total_tokens, 222_800);
+        assert_eq!(usage.context_tokens, Some(222_800));
+    }
+
+    #[test]
+    fn codex_usage_derives_context_when_exec_omits_total_tokens() {
+        let usage = event_usage(&serde_json::json!({
+            "usage": {
+                "input_tokens": 222_000,
+                "cached_input_tokens": 210_000,
+                "cache_write_input_tokens": 1_024,
+                "output_tokens": 800
+            }
+        }))
+        .expect("Codex usage");
+        assert_eq!(usage.total_tokens, 222_800);
+        assert_eq!(usage.context_tokens, Some(222_800));
+        assert_eq!(usage.context_window_tokens, None);
+    }
+
+    #[test]
+    fn codex_app_server_usage_keeps_breakdown_buckets_and_context_window() {
+        let usage = event_usage(&serde_json::json!({
+            "method": "thread/tokenUsage/updated",
+            "params": {
+                "tokenUsage": {
+                    "last": {
+                        "inputTokens": 6_741,
+                        "cachedInputTokens": 0,
+                        "cacheWriteInputTokens": 6_738,
+                        "outputTokens": 5,
+                        "totalTokens": 6_746
+                    },
+                    "modelContextWindow": 258_400
+                }
+            }
+        }))
+        .expect("Codex app-server usage");
+        assert_eq!(usage.input_tokens, 6_741);
+        assert_eq!(usage.cache_creation_input_tokens, 6_738);
+        assert_eq!(usage.total_tokens, 6_746);
+        assert_eq!(usage.context_tokens, Some(6_746));
+        assert_eq!(usage.context_window_tokens, Some(258_400));
+    }
+
+    #[test]
+    fn codex_app_server_reasoning_deltas_are_not_answer_deltas() {
+        let value = serde_json::json!({
+            "method": "item/reasoning/summaryTextDelta",
+            "params": {"delta": "checking the plan"}
+        });
+        assert_eq!(
+            codex_event_delta(&value).as_deref(),
+            Some("checking the plan")
+        );
+        assert!(codex_event_is_reasoning_delta(&value));
     }
 
     #[test]
@@ -1388,10 +1921,6 @@ mod tests {
 
         assert!(matches!(
             receiver.recv().await,
-            Some(ChatStreamEvent::Delta(text)) if text == "done"
-        ));
-        assert!(matches!(
-            receiver.recv().await,
             Some(ChatStreamEvent::Narration { text }) if text == "done"
         ));
     }
@@ -1407,5 +1936,19 @@ mod tests {
             codex_reasoning_text(value.get("item").unwrap()),
             Some("checking the plan".to_string())
         );
+    }
+
+    #[test]
+    fn codex_command_items_never_become_the_assistant_result() {
+        let value = serde_json::json!({
+            "type": "item.completed",
+            "item": {
+                "id": "command-1",
+                "type": "command_execution",
+                "text": "Finished `cargo check`",
+                "content": "tool output"
+            }
+        });
+        assert_eq!(codex_event_result(&value), None);
     }
 }

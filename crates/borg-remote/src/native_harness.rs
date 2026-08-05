@@ -371,6 +371,20 @@ impl NativeHarness {
             if native_usage_needs_auto_compaction(&result.usage) {
                 let context_tokens = result.usage.context_tokens.unwrap_or_default();
                 let context_window_tokens = result.usage.context_window_tokens.unwrap_or_default();
+                send(
+                    &events,
+                    SessionEventKind::ProviderEvent {
+                        provider: turn.provider,
+                        kind: "context_compaction".to_string(),
+                        payload: json!({
+                            "status": "started",
+                            "summary": "Compacting context…",
+                            "automatic": true,
+                            "trigger": "tool_round_context_threshold",
+                        }),
+                    },
+                )
+                .await;
                 let compacted = self
                     .compact(
                         turn.provider,
@@ -409,6 +423,7 @@ impl NativeHarness {
                         provider: turn.provider,
                         kind: "context_compaction".to_string(),
                         payload: json!({
+                            "status": "completed",
                             "summary": summary,
                             "native": true,
                             "automatic": true,

@@ -43,7 +43,11 @@ impl SessionEventKind {
             {
                 EventPersistence::Durable
             }
-            Self::ProviderEvent { kind, .. } if kind == "context_compaction" => {
+            Self::ProviderEvent { kind, payload, .. }
+                if kind == "context_compaction"
+                    && payload.get("status").and_then(serde_json::Value::as_str)
+                        != Some("started") =>
+            {
                 EventPersistence::Durable
             }
             Self::ProviderEvent { .. } => EventPersistence::Ephemeral,
@@ -104,7 +108,9 @@ impl SessionEventKind {
             // structure in its session entries; Borg needs this metadata in
             // the recovered context slice for cross-provider replay.
             Self::TurnStarted { .. } | Self::TurnCompleted { .. } | Self::ContextCleared => true,
-            Self::ProviderEvent { kind, .. } if kind == "context_compaction" => true,
+            Self::ProviderEvent { kind, payload, .. } if kind == "context_compaction" => {
+                payload.get("status").and_then(serde_json::Value::as_str) != Some("started")
+            }
             Self::ProviderEvent { provider, kind, .. } if provider.uses_native_harness() => {
                 matches!(
                     kind.as_str(),
@@ -1378,6 +1384,46 @@ impl SqliteSessionStore {
             projection.latest_sequence =
                 u64::try_from(inherited_event_count).context("negative inherited event count")?;
             return Ok((projection.latest_sequence, projection));
+        }
+        // A compaction checkpoint in a resumed/forked session is normally a
+        // local durable event. Its projection_json is already the exact
+        // SessionState at that boundary, so do not rebuild the entire
+        // inherited transcript just to fork after it. The old recursive path
+        // is retained for checkpoints that fall inside inherited ancestry.
+        let cut = sequence.saturating_sub(1);
+        if cut > parent.inherited_event_count {
+            let projection = sqlx::query(
+                "select projection_json, created_at from session_events \
+                 where session_id = ? and sequence > ? and sequence <= ? \
+                 order by sequence desc limit 1",
+            )
+            .bind(parent_session_id.to_string())
+            .bind(i64::try_from(parent.inherited_event_count).unwrap_or(i64::MAX))
+            .bind(i64::try_from(cut).unwrap_or(i64::MAX))
+            .fetch_optional(&self.pool)
+            .await?;
+            if let Some(row) = projection {
+                let local_inherited: i64 = sqlx::query_scalar(
+                    "select count(*) from session_events \
+                     where session_id = ? and sequence > ? and sequence <= ? \
+                     and fork_inheritable = 1",
+                )
+                .bind(parent_session_id.to_string())
+                .bind(i64::try_from(parent.inherited_event_count).unwrap_or(i64::MAX))
+                .bind(i64::try_from(cut).unwrap_or(i64::MAX))
+                .fetch_one(&self.pool)
+                .await?;
+                let inherited_event_count = parent
+                    .inherited_event_count
+                    .saturating_add(u64::try_from(local_inherited).unwrap_or(0));
+                let mut state: SessionState =
+                    serde_json::from_str(row.try_get("projection_json")?)?;
+                state.activity_at = Some(
+                    DateTime::parse_from_rfc3339(row.try_get("created_at")?)?.with_timezone(&Utc),
+                );
+                state.latest_sequence = inherited_event_count;
+                return Ok((inherited_event_count, state));
+            }
         }
         let events = self
             .projected_events(parent_session_id, sequence.checked_sub(1))
@@ -3196,6 +3242,26 @@ mod tests {
             .persistence(),
             EventPersistence::Ephemeral
         );
+        let compaction_started = SessionEventKind::ProviderEvent {
+            provider: CodingProvider::Codex,
+            kind: "context_compaction".to_string(),
+            payload: serde_json::json!({"status": "started"}),
+        };
+        assert_eq!(
+            compaction_started.persistence(),
+            EventPersistence::Ephemeral
+        );
+        assert!(!compaction_started.is_context_relevant());
+        let compaction_completed = SessionEventKind::ProviderEvent {
+            provider: CodingProvider::Codex,
+            kind: "context_compaction".to_string(),
+            payload: serde_json::json!({"status": "completed", "summary": "done"}),
+        };
+        assert_eq!(
+            compaction_completed.persistence(),
+            EventPersistence::Durable
+        );
+        assert!(compaction_completed.is_context_relevant());
         assert!(
             !SessionEventKind::ProviderSessionLinked {
                 provider_session_id: "provider".to_string()

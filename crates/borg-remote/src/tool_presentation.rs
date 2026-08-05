@@ -232,6 +232,21 @@ pub fn tool_code_view(name: &str, input: &Value) -> Option<(String, String)> {
             .unwrap_or_else(|| "diff".to_string());
         return Some((language, source));
     }
+    if matches!(tool_leaf_name(name).as_str(), "write" | "write_file")
+        && input.get("overwrite").and_then(Value::as_bool) != Some(true)
+        && let (Some(path), Some(content)) = (
+            input.get("path").and_then(Value::as_str),
+            input.get("content").and_then(Value::as_str),
+        )
+        && !content.is_empty()
+    {
+        let language = Path::new(path)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| format!("diff:{extension}"))
+            .unwrap_or_else(|| "diff".to_string());
+        return Some((language, file_body_as_diff(path, content, true)));
+    }
     if let Some(source) = edit_source(input) {
         let is_edit = name.to_ascii_lowercase().contains("edit")
             || name.to_ascii_lowercase().contains("patch")
@@ -307,7 +322,7 @@ pub fn tool_call_summary(name: &str, input: &Value) -> (String, String) {
     }
 
     if let Some(git) = git_call(name, input) {
-        return (git.action.label().to_string(), git.detail);
+        return (git.label, git.detail);
     }
 
     if matches!(
@@ -907,26 +922,23 @@ impl GitAction {
 }
 
 struct GitCall {
-    action: GitAction,
+    label: String,
     detail: String,
 }
 
 fn git_call(name: &str, input: &Value) -> Option<GitCall> {
     if let Some(command) = command_from_input(input)
-        && let Some((action, arguments)) = if tool_leaf_name(name) == "git" {
-            git_command(&format!("git {command}"))
+        && let Some(call) = if tool_leaf_name(name) == "git" {
+            git_summary(&format!("git {command}"))
         } else {
-            git_command(command)
+            git_summary(command)
         }
     {
-        return Some(GitCall {
-            action,
-            detail: git_command_detail(action, &arguments),
-        });
+        return Some(call);
     }
     let action = git_action_from_tool_name(name)?;
     Some(GitCall {
-        action,
+        label: action.label().to_string(),
         detail: git_tool_detail(action, input),
     })
 }
@@ -951,21 +963,88 @@ fn git_action_from_tool_name(name: &str) -> Option<GitAction> {
     git_action_from_parts(&normalized.split('_').collect::<Vec<_>>())
 }
 
-fn git_command(command: &str) -> Option<(GitAction, Vec<String>)> {
+struct GitInvocation {
+    action: GitAction,
+    arguments: Vec<String>,
+}
+
+fn git_summary(command: &str) -> Option<GitCall> {
+    let words = shell_words(command);
+    let invocations = git_invocations(command);
+    let first = invocations.first()?;
+    if words
+        .split(|word| is_shell_operator(word))
+        .filter(|segment| {
+            segment
+                .iter()
+                .any(|word| word.rsplit('/').next() == Some("git"))
+        })
+        .any(|segment| git_invocation(segment).is_none())
+    {
+        return None;
+    }
+    let same_action = invocations
+        .iter()
+        .all(|invocation| invocation.action == first.action);
+    let label = if invocations.len() == 1 {
+        first.action.label().to_string()
+    } else if same_action {
+        repeated_git_label(first.action)
+    } else if invocations
+        .iter()
+        .all(|invocation| git_action_is_read_only(invocation.action))
+    {
+        "Inspect repository".to_string()
+    } else {
+        "Run Git operations".to_string()
+    };
+    let detail = if same_action {
+        invocations
+            .iter()
+            .map(|invocation| git_invocation_detail(invocation.action, &invocation.arguments))
+            .filter(|detail| !detail.is_empty())
+            .collect::<Vec<_>>()
+            .join(", ")
+    } else {
+        invocations
+            .iter()
+            .map(|invocation| {
+                let detail = git_invocation_detail(invocation.action, &invocation.arguments);
+                if detail.is_empty() {
+                    git_action_name(invocation.action).to_string()
+                } else {
+                    format!("{}: {detail}", git_action_name(invocation.action))
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    Some(GitCall { label, detail })
+}
+
+fn git_invocations(command: &str) -> Vec<GitInvocation> {
     let words = shell_words(command);
     if let Some(script) = shell_script(&words) {
-        return git_command(script);
+        return git_invocations(script);
     }
-    let git_index = words.iter().enumerate().find_map(|(index, word)| {
-        let executable = word.rsplit('/').next();
-        let starts_command = index == 0
-            || matches!(
-                words.get(index.wrapping_sub(1)).map(String::as_str),
-                Some("&&" | ";" | "||")
-            );
-        (starts_command && executable == Some("git")).then_some(index)
+    words
+        .split(|word| is_shell_operator(word))
+        .filter_map(git_invocation)
+        .collect()
+}
+
+fn git_invocation(segment: &[String]) -> Option<GitInvocation> {
+    let git_index = segment.iter().enumerate().find_map(|(index, word)| {
+        (word.rsplit('/').next() == Some("git")
+            && segment[..index]
+                .iter()
+                .all(|prefix| prefix == "env" || prefix.contains('=')))
+        .then_some(index)
     })?;
-    let mut parts = words[git_index + 1..].iter().map(String::as_str).peekable();
+    let mut parts = segment[git_index + 1..]
+        .iter()
+        .map(String::as_str)
+        .peekable();
     while let Some(part) = parts.peek().copied() {
         if matches!(
             part,
@@ -979,10 +1058,12 @@ fn git_command(command: &str) -> Option<(GitAction, Vec<String>)> {
             break;
         }
     }
-    let remaining = parts.map(str::to_string).collect::<Vec<_>>();
-    let refs = remaining.iter().map(String::as_str).collect::<Vec<_>>();
-    let action = git_action_from_parts(&refs)?;
-    Some((action, remaining))
+    let arguments = parts.map(str::to_string).collect::<Vec<_>>();
+    let refs = arguments.iter().map(String::as_str).collect::<Vec<_>>();
+    Some(GitInvocation {
+        action: git_action_from_parts(&refs)?,
+        arguments,
+    })
 }
 
 fn git_action_from_parts(parts: &[&str]) -> Option<GitAction> {
@@ -1026,7 +1107,8 @@ fn git_action_from_parts(parts: &[&str]) -> Option<GitAction> {
     }
 }
 
-fn git_command_detail(action: GitAction, arguments: &[String]) -> String {
+fn git_invocation_detail(action: GitAction, arguments: &[String]) -> String {
+    let mut details = Vec::new();
     let skip = if matches!(
         action,
         GitAction::WorktreeAdd
@@ -1040,14 +1122,113 @@ fn git_command_detail(action: GitAction, arguments: &[String]) -> String {
     } else {
         1
     };
-    let detail = arguments
-        .iter()
-        .skip(skip)
-        .filter(|argument| !argument.starts_with('-'))
-        .cloned()
-        .collect::<Vec<_>>()
-        .join(" · ");
-    compact_text(&detail, 160)
+    let mut arguments = arguments.iter().skip(skip);
+    let mut after_separator = false;
+    while let Some(argument) = arguments.next() {
+        if argument == "--" {
+            after_separator = true;
+            continue;
+        }
+        if !after_separator && argument.starts_with('-') {
+            if git_option_takes_value(action, argument) {
+                if let Some(value) = arguments.next()
+                    && git_option_value_is_detail(action, argument)
+                {
+                    details.push(value.clone());
+                }
+            }
+            continue;
+        }
+        details.push(argument.clone());
+    }
+    compact_text(&details.join(" · "), 160)
+}
+
+fn git_option_takes_value(action: GitAction, option: &str) -> bool {
+    match option {
+        "-b" => matches!(
+            action,
+            GitAction::WorktreeAdd | GitAction::Branch | GitAction::Switch | GitAction::Checkout
+        ),
+        "-m" | "--message" => matches!(action, GitAction::Commit),
+        "-n" | "--max-count" => matches!(action, GitAction::Log | GitAction::Show),
+        "-S" | "-L" | "--grep" | "--since" | "--until" => {
+            matches!(action, GitAction::Log | GitAction::Diff | GitAction::Show)
+        }
+        "--author" | "--committer" | "--date" | "--format" | "--pretty" => {
+            matches!(action, GitAction::Log | GitAction::Show)
+        }
+        "--output" | "--upload-pack" | "--whence" => true,
+        _ => false,
+    }
+}
+
+fn git_option_value_is_detail(action: GitAction, option: &str) -> bool {
+    matches!(
+        (action, option),
+        (
+            GitAction::WorktreeAdd | GitAction::Switch | GitAction::Checkout,
+            "-b"
+        ) | (GitAction::Commit, "-m" | "--message")
+    )
+}
+
+fn repeated_git_label(action: GitAction) -> String {
+    match action {
+        GitAction::Status => "Inspect working tree",
+        GitAction::Diff => "Compare revisions",
+        GitAction::Log => "Review history",
+        GitAction::Branch => "Inspect branches",
+        GitAction::Show => "Show revisions",
+        GitAction::Tag => "Inspect tags",
+        GitAction::Remote => "Inspect remotes",
+        GitAction::RepositoryInfo => "Inspect repository",
+        GitAction::WorktreeList => "Inspect worktrees",
+        _ => "Run Git operations",
+    }
+    .to_string()
+}
+
+fn git_action_is_read_only(action: GitAction) -> bool {
+    matches!(
+        action,
+        GitAction::WorktreeList
+            | GitAction::Status
+            | GitAction::Diff
+            | GitAction::Log
+            | GitAction::Branch
+            | GitAction::Show
+            | GitAction::Tag
+            | GitAction::Remote
+            | GitAction::RepositoryInfo
+    )
+}
+
+fn git_action_name(action: GitAction) -> &'static str {
+    match action {
+        GitAction::WorktreeAdd => "add worktree",
+        GitAction::WorktreeList => "list worktrees",
+        GitAction::WorktreeRemove => "remove worktree",
+        GitAction::WorktreePrune => "prune worktrees",
+        GitAction::WorktreeLock => "lock worktree",
+        GitAction::WorktreeUnlock => "unlock worktree",
+        GitAction::Status => "status",
+        GitAction::Diff => "diff",
+        GitAction::Log => "log",
+        GitAction::Branch => "branch",
+        GitAction::Switch => "switch",
+        GitAction::Checkout => "checkout",
+        GitAction::Commit => "commit",
+        GitAction::Fetch => "fetch",
+        GitAction::Pull => "pull",
+        GitAction::Push => "push",
+        GitAction::Merge => "merge",
+        GitAction::Rebase => "rebase",
+        GitAction::Show => "show",
+        GitAction::Tag => "tag",
+        GitAction::Remote => "remote",
+        GitAction::RepositoryInfo => "repository info",
+    }
 }
 
 fn git_tool_detail(_action: GitAction, input: &Value) -> String {
@@ -1486,7 +1667,8 @@ fn shell_words(command: &str) -> Vec<String> {
     let mut current = String::new();
     let mut quote = None;
     let mut escaped = false;
-    for character in command.chars() {
+    let mut characters = command.chars().peekable();
+    while let Some(character) = characters.next() {
         if escaped {
             current.push(character);
             escaped = false;
@@ -1496,6 +1678,15 @@ fn shell_words(command: &str) -> Vec<String> {
             quote = None;
         } else if quote.is_none() && matches!(character, '\'' | '"') {
             quote = Some(character);
+        } else if quote.is_none() && matches!(character, ';' | '|' | '&' | '<' | '>') {
+            if !current.is_empty() {
+                words.push(std::mem::take(&mut current));
+            }
+            let mut operator = character.to_string();
+            if characters.peek() == Some(&character) && matches!(character, '|' | '&' | '<' | '>') {
+                operator.push(characters.next().expect("peeked shell operator"));
+            }
+            words.push(operator);
         } else if quote.is_none() && character.is_whitespace() {
             if !current.is_empty() {
                 words.push(std::mem::take(&mut current));
@@ -1511,6 +1702,13 @@ fn shell_words(command: &str) -> Vec<String> {
         words.push(current);
     }
     words
+}
+
+fn is_shell_operator(word: &str) -> bool {
+    matches!(
+        word,
+        ";" | "&&" | "||" | "|" | "&" | "<" | ">" | "<<" | ">>"
+    )
 }
 
 fn humanize_tool_name(name: &str) -> String {
@@ -1585,8 +1783,14 @@ fn claude_edit_diff(value: &Value) -> Option<(String, String)> {
             let path = ["file_path", "path", "filename"]
                 .into_iter()
                 .find_map(|key| fields.get(key).and_then(Value::as_str));
-            let old = fields.get("old_string").and_then(Value::as_str);
-            let new = fields.get("new_string").and_then(Value::as_str);
+            let old = fields
+                .get("old_string")
+                .or_else(|| fields.get("old_text"))
+                .and_then(Value::as_str);
+            let new = fields
+                .get("new_string")
+                .or_else(|| fields.get("new_text"))
+                .and_then(Value::as_str);
             if let (Some(path), Some(old), Some(new)) = (path, old, new)
                 && old != new
             {
@@ -1757,6 +1961,55 @@ mod tests {
         assert_eq!(
             edit.input.as_ref().map(|body| body.text.as_str()),
             Some("--- docs/review.md\n+++ docs/review.md\n-old line\n+new line")
+        );
+    }
+
+    #[test]
+    fn presents_native_edit_file_replacements_as_a_diff() {
+        let edit = project_tool_presentation(
+            "edit_file",
+            &json!({
+                "path": "src/main.rs",
+                "old_text": "old line\n",
+                "new_text": "new line\n"
+            }),
+            None,
+            false,
+        );
+
+        assert_eq!(edit.category, ToolPresentationCategory::Edit);
+        assert_eq!(
+            edit.input.as_ref().map(|body| body.language.as_str()),
+            Some("diff:rs")
+        );
+        assert_eq!(
+            edit.input.as_ref().map(|body| body.text.as_str()),
+            Some("--- src/main.rs\n+++ src/main.rs\n-old line\n+new line")
+        );
+    }
+
+    #[test]
+    fn presents_native_new_file_writes_as_addition_diffs() {
+        let write = project_tool_presentation(
+            "write_file",
+            &json!({
+                "path": "src/new.rs",
+                "content": "fn main() {}\n"
+            }),
+            None,
+            false,
+        );
+
+        assert_eq!(write.category, ToolPresentationCategory::Edit);
+        assert_eq!(
+            write.input.as_ref().map(|body| body.language.as_str()),
+            Some("diff:rs")
+        );
+        assert!(
+            write
+                .input
+                .as_ref()
+                .is_some_and(|body| body.text.contains("+fn main() {}"))
         );
     }
 
@@ -1954,6 +2207,21 @@ mod tests {
             ("git -C /repo diff --stat HEAD~1", "Git diff", "HEAD~1"),
             ("cd /repo && git switch feature", "Switch branch", "feature"),
             ("git rev-parse --show-toplevel", "Repository info", ""),
+            (
+                "git show HEAD; git show HEAD:src/main.rs | sed -n '1,180p'",
+                "Show revisions",
+                "HEAD, HEAD:src/main.rs",
+            ),
+            (
+                "git status && rg '!*target*' . | sed -n '1,160p'",
+                "Git status",
+                "",
+            ),
+            (
+                "git status && git diff --stat HEAD",
+                "Inspect repository",
+                "status, diff: HEAD",
+            ),
         ];
 
         for (command, label, detail) in cases {

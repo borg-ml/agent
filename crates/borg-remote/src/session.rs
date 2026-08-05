@@ -12,20 +12,28 @@ use uuid::Uuid;
 
 use crate::subagents::{SharedWorkToolContext, TeamInboxMessage};
 use crate::{
-    AgentTurn, AgentTurnControl, AgentTurnExecutor, CodingProvider, ConsultationRequest,
-    ConsultationResult, EventActor, GoalAction, GoalStatus, HostCommand, LaunchSession,
-    LocalAgentTurnExecutor, MessageStatus, ModelGoalStatus, PlanItem, PlanItemStatus,
-    PromptDelivery, SessionEvent, SessionEventKind, SessionGoal, SessionGoalToolRequest,
-    SessionGoalToolResponse, SessionState, SessionStatus, SessionStore, SessionTodoToolRequest,
-    SessionTodoToolResponse, SessionWriterLease, SqliteSessionStore, SqliteWorkspaceStore,
-    SubagentAction, SubagentActivity, SubagentActivityKind, SubagentControlOutcome,
-    SubagentCoordinator, TodoAction, TodoItemUpdate, WorkspaceEvent, WorkspaceEventKind,
-    WorkspaceStore,
+    AgentCompaction, AgentTurn, AgentTurnControl, AgentTurnExecutor, CodingProvider,
+    ConsultationRequest, ConsultationResult, EventActor, GoalAction, GoalStatus, HostCommand,
+    LaunchSession, LocalAgentTurnExecutor, MessageStatus, ModelGoalStatus, PlanItem,
+    PlanItemStatus, PromptDelivery, SessionEvent, SessionEventKind, SessionGoal,
+    SessionGoalToolRequest, SessionGoalToolResponse, SessionState, SessionStatus, SessionStore,
+    SessionTodoToolRequest, SessionTodoToolResponse, SessionWriterLease, SqliteSessionStore,
+    SqliteWorkspaceStore, SubagentAction, SubagentActivity, SubagentActivityKind,
+    SubagentControlOutcome, SubagentCoordinator, TodoAction, TodoItemUpdate, WorkspaceEvent,
+    WorkspaceEventKind, WorkspaceStore,
 };
+use borg_provider::ProviderCallUsage;
 
 const ROOT_INBOX_REFRESH_INTERVAL: Duration = Duration::from_millis(50);
 const RETAINED_COMPACTION_SYSTEM_PROMPT: &str = "This is an internal context-compaction preparation turn. Do not use tools, modify files, or answer the user. Return only a compact continuation summary of the supplied prior provider conversation.";
 const SUBSCRIPTION_TRANSCRIPT_HEADER: &str = "Borg canonical conversation transcript v1 (JSONL). Each line is one persisted message in chronological order. The final line is the current request; respond to it normally.\n";
+// Codex app-server rejects a single input at 1 MiB. Leave room for the JSON-RPC
+// envelope and the current request so a resumed Borg journal never hits that
+// hard provider boundary. The journal itself remains complete; this is only the
+// serialized provider-context budget.
+const SUBSCRIPTION_INPUT_BUDGET_BYTES: usize = 900 * 1024;
+const SUBSCRIPTION_COMPACTION_CHUNK_BYTES: usize = 600 * 1024;
+const MAX_SUBSCRIPTION_COMPACTION_ROUNDS: usize = 4;
 
 #[derive(serde::Serialize)]
 struct SubscriptionTranscriptLine<'a> {
@@ -1121,6 +1129,20 @@ async fn run_agent_session_store_kernel(
                             },
                         )
                         .await?;
+                        record(
+                            &mut journal,
+                            &events,
+                            session_id,
+                            SessionEventKind::ProviderEvent {
+                                provider: launch.provider,
+                                kind: "context_compaction".to_string(),
+                                payload: serde_json::json!({
+                                    "status": "started",
+                                    "summary": "Compacting context…",
+                                }),
+                            },
+                        )
+                        .await?;
                         let result: Result<Option<crate::AgentCompaction>> = async {
                             if launch.provider.uses_native_harness() {
                                 let model = launch
@@ -1208,6 +1230,7 @@ async fn run_agent_session_store_kernel(
                                         provider: launch.provider,
                                         kind: "context_compaction".to_string(),
                                         payload: serde_json::json!({
+                                            "status": "completed",
                                             "summary": summary,
                                             "native": launch.provider.uses_native_harness(),
                                         }),
@@ -1354,6 +1377,22 @@ async fn run_agent_session_store_kernel(
                     },
                 )
                 .await?;
+                record(
+                    &mut journal,
+                    &events,
+                    session_id,
+                    SessionEventKind::ProviderEvent {
+                        provider: launch.provider,
+                        kind: "context_compaction".to_string(),
+                        payload: serde_json::json!({
+                            "status": "started",
+                            "summary": "Compacting context…",
+                            "automatic": true,
+                            "trigger": "context_threshold",
+                        }),
+                    },
+                )
+                .await?;
                 let result = async {
                     executor
                         .compact_native(
@@ -1385,6 +1424,7 @@ async fn run_agent_session_store_kernel(
                                 provider: launch.provider,
                                 kind: "context_compaction".to_string(),
                                 payload: serde_json::json!({
+                                    "status": "completed",
                                     "summary": compaction.summary,
                                     "native": true,
                                     "automatic": true,
@@ -1440,6 +1480,115 @@ async fn run_agent_session_store_kernel(
                         )
                         .await?;
                     }
+                }
+            }
+        }
+
+        if !launch.provider.uses_native_harness()
+            && retained_context.as_deref().is_some_and(|context| {
+                subscription_prompt_bytes(Some(context), prompt.actor, &prompt.text)
+                    > SUBSCRIPTION_INPUT_BUDGET_BYTES
+            })
+        {
+            let context = retained_context
+                .take()
+                .expect("oversized subscription context was present");
+            let context_bytes = context.len();
+            record(
+                &mut journal,
+                &events,
+                session_id,
+                SessionEventKind::StatusChanged {
+                    status: SessionStatus::Running,
+                    detail: Some("Automatically compacting retained context".to_string()),
+                },
+            )
+            .await?;
+            record(
+                &mut journal,
+                &events,
+                session_id,
+                SessionEventKind::ProviderEvent {
+                    provider: launch.provider,
+                    kind: "context_compaction".to_string(),
+                    payload: serde_json::json!({
+                        "status": "started",
+                        "summary": "Compacting context…",
+                        "automatic": true,
+                        "trigger": "provider_input_size",
+                    }),
+                },
+            )
+            .await?;
+            match compact_subscription_context_for_budget(
+                &executor,
+                session_id,
+                &launch,
+                &agent_mcp_server,
+                &dispatcher,
+                &context,
+                prompt.actor,
+                &prompt.text,
+            )
+            .await
+            {
+                Ok(compaction) => {
+                    record(
+                        &mut journal,
+                        &events,
+                        session_id,
+                        native_usage_event(&compaction.usage),
+                    )
+                    .await?;
+                    record(
+                        &mut journal,
+                        &events,
+                        session_id,
+                        SessionEventKind::ProviderEvent {
+                            provider: launch.provider,
+                            kind: "context_compaction".to_string(),
+                            payload: serde_json::json!({
+                                "status": "completed",
+                                "summary": compaction.summary,
+                                "native": false,
+                                "automatic": true,
+                                "trigger": "provider_input_size",
+                                "context_bytes_before": context_bytes,
+                                "input_budget_bytes": SUBSCRIPTION_INPUT_BUDGET_BYTES,
+                            }),
+                        },
+                    )
+                    .await?;
+                    retained_context = retained_conversation_context(journal.context_events());
+                }
+                Err(error) => {
+                    let message = format!(
+                        "Automatic subscription context compaction failed; retaining the full journal: {error:#}"
+                    );
+                    tracing::warn!(
+                        session_id = %session_id,
+                        context_bytes,
+                        error = %error,
+                        "automatic subscription context compaction failed"
+                    );
+                    retained_context = Some(context);
+                    record(
+                        &mut journal,
+                        &events,
+                        session_id,
+                        SessionEventKind::ProviderEvent {
+                            provider: launch.provider,
+                            kind: "context_compaction_failed".to_string(),
+                            payload: serde_json::json!({
+                                "automatic": true,
+                                "trigger": "provider_input_size",
+                                "context_bytes_before": context_bytes,
+                                "input_budget_bytes": SUBSCRIPTION_INPUT_BUDGET_BYTES,
+                                "error": message,
+                            }),
+                        },
+                    )
+                    .await?;
                 }
             }
         }
@@ -2840,6 +2989,175 @@ fn native_usage_event(usage: &borg_provider::ProviderCallUsage) -> SessionEventK
     }
 }
 
+fn subscription_prompt_bytes(
+    retained_context: Option<&str>,
+    actor: EventActor,
+    text: &str,
+) -> usize {
+    format_subscription_provider_prompt(retained_context, actor, text).len()
+}
+
+/// Split retained transcript text without dropping it. Normal JSONL records stay
+/// intact; an unusually large tool result is split at UTF-8 boundaries only for
+/// the intermediate compaction request, where a partial record is still useful
+/// evidence for the summarizer.
+fn split_retained_context(context: &str, max_bytes: usize) -> Vec<String> {
+    assert!(
+        max_bytes > 0,
+        "retained context chunk size must be positive"
+    );
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+
+    for piece in context.split_inclusive('\n') {
+        if piece.len() <= max_bytes {
+            if !current.is_empty() && current.len() + piece.len() > max_bytes {
+                chunks.push(std::mem::take(&mut current));
+            }
+            current.push_str(piece);
+            continue;
+        }
+
+        if !current.is_empty() {
+            chunks.push(std::mem::take(&mut current));
+        }
+        let pieces = split_utf8_chunks(piece, max_bytes);
+        let piece_count = pieces.len();
+        for (index, segment) in pieces.into_iter().enumerate() {
+            if index + 1 == piece_count {
+                current = segment;
+            } else {
+                chunks.push(segment);
+            }
+        }
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+fn split_utf8_chunks(text: &str, max_bytes: usize) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    while start < text.len() {
+        let mut end = start;
+        for (offset, character) in text[start..].char_indices() {
+            let candidate = start + offset + character.len_utf8();
+            if candidate - start > max_bytes && end > start {
+                break;
+            }
+            end = candidate;
+            if end - start == max_bytes {
+                break;
+            }
+        }
+        if end == start {
+            end = text[start..]
+                .chars()
+                .next()
+                .map_or(text.len(), |character| start + character.len_utf8());
+        }
+        chunks.push(text[start..end].to_string());
+        start = end;
+    }
+    chunks
+}
+
+async fn compact_subscription_context_for_budget(
+    executor: &Arc<dyn AgentTurnExecutor>,
+    session_id: Uuid,
+    launch: &LaunchSession,
+    agent_mcp_server: &borg_provider::mcp::ExternalMcpServer,
+    dispatcher: &crate::AgentToolDispatcher,
+    context: &str,
+    actor: EventActor,
+    current_prompt: &str,
+) -> Result<AgentCompaction> {
+    let mut chunks = split_retained_context(context, SUBSCRIPTION_COMPACTION_CHUNK_BYTES);
+    anyhow::ensure!(!chunks.is_empty(), "retained context is empty");
+    let mut usage = ProviderCallUsage::default();
+
+    for _ in 0..MAX_SUBSCRIPTION_COMPACTION_ROUNDS {
+        let mut summaries = Vec::with_capacity(chunks.len());
+        for chunk in chunks {
+            let compaction = executor
+                .compact_retained_context(AgentTurn {
+                    session_id,
+                    message_id: Uuid::new_v4(),
+                    provider: launch.provider,
+                    provider_session_id: None,
+                    cwd: launch.cwd.clone(),
+                    prompt: retained_compaction_prompt(&chunk),
+                    attachments: Vec::new(),
+                    output_schema: None,
+                    model: launch.model.clone(),
+                    effort: launch.effort.clone(),
+                    fast: launch.fast,
+                    response_language: launch.response_language,
+                    permission_mode: launch.permission_mode,
+                    conversation: Vec::new(),
+                    agent_mcp_server: agent_mcp_server.clone(),
+                    agent_tools: dispatcher.clone(),
+                    external_mcp_servers: Vec::new(),
+                    extension_skill_roots: Vec::new(),
+                    system_prompt_appendix: RETAINED_COMPACTION_SYSTEM_PROMPT.to_string(),
+                })
+                .await?;
+            anyhow::ensure!(
+                !compaction.summary.trim().is_empty(),
+                "subscription context compaction returned an empty summary"
+            );
+            accumulate_provider_usage(&mut usage, &compaction.usage);
+            summaries.push(compaction.summary);
+        }
+
+        let combined = summaries.join("\n\n--- retained context segment ---\n\n");
+        if subscription_prompt_bytes(Some(&combined), actor, current_prompt)
+            <= SUBSCRIPTION_INPUT_BUDGET_BYTES
+        {
+            return Ok(AgentCompaction {
+                summary: combined,
+                usage,
+                provider_session_id: None,
+            });
+        }
+        chunks = split_retained_context(&combined, SUBSCRIPTION_COMPACTION_CHUNK_BYTES);
+    }
+
+    anyhow::bail!(
+        "compacted subscription context still exceeds the {}-byte provider input budget after {} passes",
+        SUBSCRIPTION_INPUT_BUDGET_BYTES,
+        MAX_SUBSCRIPTION_COMPACTION_ROUNDS
+    )
+}
+
+fn accumulate_provider_usage(total: &mut ProviderCallUsage, next: &ProviderCallUsage) {
+    total.duration_ms = total.duration_ms.saturating_add(next.duration_ms);
+    total.input_tokens = total.input_tokens.saturating_add(next.input_tokens);
+    total.cached_input_tokens = total
+        .cached_input_tokens
+        .saturating_add(next.cached_input_tokens);
+    total.cache_creation_input_tokens = total
+        .cache_creation_input_tokens
+        .saturating_add(next.cache_creation_input_tokens);
+    total.output_tokens = total.output_tokens.saturating_add(next.output_tokens);
+    total.total_tokens = total.total_tokens.saturating_add(next.total_tokens);
+    total.context_window_tokens = match (total.context_window_tokens, next.context_window_tokens) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (Some(window), None) | (None, Some(window)) => Some(window),
+        (None, None) => None,
+    };
+    total.cost_microusd = match (total.cost_microusd, next.cost_microusd) {
+        (Some(left), Some(right)) => Some(left.saturating_add(right)),
+        (Some(cost), None) | (None, Some(cost)) => Some(cost),
+        (None, None) => None,
+    };
+    if next.cost_microusd.is_some() {
+        total.cost_basis = next.cost_basis;
+    }
+}
+
 fn retained_conversation_context(events: &[SessionEvent]) -> Option<String> {
     // Newer journals carry TurnStarted boundaries, allowing the structured
     // provider-neutral replay path to include subscription tool calls/results
@@ -3427,13 +3745,26 @@ fn provider_event_is_steer_boundary(kind: &SessionEventKind) -> bool {
 }
 
 fn context_compaction_status(kind: &SessionEventKind) -> Option<&str> {
-    let SessionEventKind::ProviderEvent { kind, payload, .. } = kind else {
+    let SessionEventKind::ProviderEvent {
+        kind: provider_kind,
+        payload,
+        ..
+    } = kind
+    else {
         return None;
     };
-    if kind != "context_compaction" {
-        return None;
+    if provider_kind == "context_compaction" {
+        return payload.get("status").and_then(serde_json::Value::as_str);
     }
-    payload.get("status").and_then(serde_json::Value::as_str)
+    let (method, item_type) = provider_kind.split_once(':')?;
+    let item_type = item_type.to_ascii_lowercase().replace(['-', '_'], "");
+    (item_type == "contextcompaction")
+        .then(|| match method {
+            "item/started" => "started",
+            "item/completed" => "completed",
+            _ => "",
+        })
+        .filter(|status| !status.is_empty())
 }
 
 async fn dispatch_steer(
@@ -3520,7 +3851,14 @@ fn committed_codex_user_message_id(kind: &SessionEventKind) -> Option<Uuid> {
         return None;
     };
     (kind == "item/completed:userMessage")
-        .then(|| payload.get("client_id").and_then(Value::as_str))
+        .then(|| {
+            payload
+                .get("client_id")
+                .or_else(|| payload.get("clientId"))
+                .or_else(|| payload.pointer("/params/item/clientId"))
+                .or_else(|| payload.pointer("/params/item/client_id"))
+                .and_then(Value::as_str)
+        })
         .flatten()
         .and_then(|client_id| Uuid::parse_str(client_id).ok())
 }
@@ -8028,6 +8366,26 @@ mod tests {
     }
 
     #[test]
+    fn codex_app_server_user_message_client_id_commits_a_steer() {
+        let message_id = Uuid::new_v4();
+        let event = SessionEventKind::ProviderEvent {
+            provider: CodingProvider::Codex,
+            kind: "item/completed:userMessage".to_string(),
+            payload: json!({
+                "method": "item/completed",
+                "params": {
+                    "item": {
+                        "type": "userMessage",
+                        "clientId": message_id.to_string()
+                    }
+                }
+            }),
+        };
+
+        assert_eq!(committed_codex_user_message_id(&event), Some(message_id));
+    }
+
+    #[test]
     fn recalling_prompts_targets_the_exact_queue_entry_and_skips_steers() {
         let first_visible_id = Uuid::new_v4();
         let internal_id = Uuid::new_v4();
@@ -9314,6 +9672,29 @@ mod tests {
                 "{\"role\":\"user\",\"content\":\"Previous conversation summary:\\n\\npreserved decisions\"}\n{\"role\":\"user\",\"content\":\"continue\"}"
             )
         );
+    }
+
+    #[test]
+    fn subscription_context_budget_detects_oversized_resumed_transcripts() {
+        let context = format!(
+            "{{\"role\":\"tool\",\"content\":\"{}\"}}",
+            "x".repeat(SUBSCRIPTION_INPUT_BUDGET_BYTES)
+        );
+        assert!(
+            subscription_prompt_bytes(Some(&context), EventActor::User, "continue")
+                > SUBSCRIPTION_INPUT_BUDGET_BYTES
+        );
+    }
+
+    #[test]
+    fn retained_context_chunking_preserves_every_byte_and_utf8() {
+        let context = format!("first αβγ\n{}\nlast", "🛠️".repeat(2_000));
+        let chunks = split_retained_context(&context, 97);
+
+        assert!(chunks.iter().all(|chunk| chunk.len() <= 97));
+        assert_eq!(chunks.concat(), context);
+        assert!(chunks.iter().any(|chunk| chunk.contains("αβγ")));
+        assert!(chunks.iter().any(|chunk| chunk.contains("🛠️")));
     }
 
     #[test]

@@ -694,6 +694,53 @@ fn completed_file_creation_replaces_null_diff_placeholder() {
 }
 
 #[test]
+fn native_edit_file_keeps_the_replacement_diff_after_its_mutation_receipt() {
+    let session_id = Uuid::new_v4();
+    let input = serde_json::json!({
+        "path": "src/main.rs",
+        "old_text": "old line\n",
+        "new_text": "new line\n"
+    });
+    let mut transcript = Transcript::default();
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::ToolStarted {
+            tool_call_id: "native-edit-1".to_string(),
+            name: "edit_file".to_string(),
+            input: input.clone(),
+            input_ref: None,
+        },
+    ));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::ToolCompleted {
+            tool_call_id: "native-edit-1".to_string(),
+            output:
+                r#"{"type":"mutated","operation":"edit_file","path":"src/main.rs","changed":true}"#
+                    .to_string(),
+            output_ref: None,
+            is_error: false,
+            input: Some(input),
+            input_ref: None,
+        },
+    ));
+
+    assert!(matches!(
+        transcript.order.last(),
+        Some(TranscriptEntry::Tool {
+            code_view: Some((language, text)),
+            output_view: None,
+            expanded: true,
+            ..
+        }) if language == "diff:rs"
+            && text.contains("-old line")
+            && text.contains("+new line")
+    ));
+}
+
+#[test]
 fn running_tool_uses_animated_spinner() {
     let mut transcript = Transcript::default();
     transcript.apply(&SessionEvent::new(
@@ -4440,6 +4487,7 @@ fn copied_terminal_regions_drop_screen_padding_and_right_gutters() {
 fn context_percentage_matches_codex_compaction_headroom() {
     assert_eq!(context_remaining_percent(12_000, 258_400), 100);
     assert_eq!(context_remaining_percent(135_200, 258_400), 50);
+    assert_eq!(context_remaining_percent(222_800, 258_400), 14);
     assert_eq!(context_remaining_percent(258_400, 258_400), 0);
 }
 
@@ -4512,7 +4560,7 @@ fn provider_compaction_events_become_status_cards() {
     assert!(matches!(
         transcript.order.last(),
         Some(TranscriptEntry::Compaction { summary, .. })
-            if summary == "Earlier conversation was compacted"
+            if summary == "Compacted context: Earlier conversation was compacted"
     ));
     let rendered = transcript
         .lines(100)
@@ -4535,7 +4583,10 @@ fn automatic_compaction_event_reports_work_in_progress() {
         SessionEventKind::ProviderEvent {
             provider: CodingProvider::Codex,
             kind: "context_compaction".to_string(),
-            payload: serde_json::json!({}),
+            payload: serde_json::json!({
+                "status": "started",
+                "summary": "Compacting context…"
+            }),
         },
     ));
 
@@ -4544,6 +4595,85 @@ fn automatic_compaction_event_reports_work_in_progress() {
         Some(TranscriptEntry::Compaction { summary, .. })
             if summary == "Compacting context…"
     ));
+}
+
+#[test]
+fn compaction_completion_updates_the_live_card_and_can_expand() {
+    let session_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::ProviderEvent {
+            provider: CodingProvider::Codex,
+            kind: "context_compaction".to_string(),
+            payload: serde_json::json!({
+                "status": "started",
+                "summary": "Compacting context…"
+            }),
+        },
+    ));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::ProviderEvent {
+            provider: CodingProvider::Codex,
+            kind: "context_compaction".to_string(),
+            payload: serde_json::json!({
+                "status": "completed",
+                "summary": "Retained the durable conversation and dropped stale tool detail."
+            }),
+        },
+    ));
+
+    assert_eq!(
+        transcript
+            .order
+            .iter()
+            .filter(|entry| matches!(entry, TranscriptEntry::Compaction { .. }))
+            .count(),
+        1
+    );
+    let index = transcript.order.len() - 1;
+    assert!(matches!(
+        transcript.order.last(),
+        Some(TranscriptEntry::Compaction {
+            summary,
+            complete: true,
+            expanded: false,
+            ..
+        }) if summary == "Compacted context: Retained the durable conversation and dropped stale tool detail."
+    ));
+
+    assert_eq!(transcript.compaction_revert_sequence(index), Some(3));
+    assert_eq!(
+        transcript
+            .order
+            .last()
+            .and_then(TranscriptEntry::copy_text_owned),
+        Some(
+            "Compacted context: Retained the durable conversation and dropped stale tool detail."
+                .to_string()
+        )
+    );
+
+    transcript.toggle_compaction_expansion(index);
+    assert!(matches!(
+        transcript.order.last(),
+        Some(TranscriptEntry::Compaction {
+            complete: true,
+            expanded: true,
+            ..
+        })
+    ));
+    let rendered = transcript
+        .lines(100)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("Compacted context:"));
+    assert!(rendered.contains("Retained the durable conversation"));
 }
 
 #[test]

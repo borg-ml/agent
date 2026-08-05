@@ -870,6 +870,18 @@ async fn run_borg_provider_turn(
                     .await;
                 }
                 if let Some(usage) = usage {
+                    if let (Some(context_tokens), Some(context_window_tokens)) =
+                        (usage.context_tokens, usage.context_window_tokens)
+                    {
+                        send(
+                            &events,
+                            SessionEventKind::ContextWindowUpdated {
+                                context_tokens,
+                                context_window_tokens,
+                            },
+                        )
+                        .await;
+                    }
                     send(
                         &events,
                         SessionEventKind::UsageUpdated {
@@ -1003,9 +1015,6 @@ fn terminal_assistant_text(
 }
 
 fn provider_event_is_transient(kind: &str) -> bool {
-    if provider_event_is_compaction_lifecycle(kind) {
-        return true;
-    }
     let method = kind.split_once(':').map_or(kind, |(method, _)| method);
     let event_name = method.rsplit('/').next().unwrap_or(method);
     event_name.eq_ignore_ascii_case("delta")
@@ -1036,25 +1045,28 @@ fn live_context_usage(kind: &str, payload: &serde_json::Value) -> Option<LiveCon
     if kind != "thread/tokenUsage/updated" {
         return None;
     }
-    let last = payload.get("last")?;
+    let token_usage = payload
+        .get("tokenUsage")
+        .or_else(|| payload.get("token_usage"))
+        .or_else(|| payload.pointer("/params/tokenUsage"))
+        .or_else(|| payload.pointer("/params/token_usage"))
+        .unwrap_or(payload);
+    let last = token_usage
+        .get("last")
+        .or_else(|| token_usage.get("total"))
+        .unwrap_or(token_usage);
     Some(LiveContextUsage {
-        total_tokens: last.get("totalTokens")?.as_u64()?,
-        context_window_tokens: payload.get("model_context_window")?.as_u64()?,
+        total_tokens: last
+            .get("totalTokens")
+            .or_else(|| last.get("total_tokens"))
+            .and_then(serde_json::Value::as_u64)?,
+        context_window_tokens: token_usage
+            .get("modelContextWindow")
+            .or_else(|| token_usage.get("model_context_window"))
+            .or_else(|| payload.get("modelContextWindow"))
+            .or_else(|| payload.get("model_context_window"))
+            .and_then(serde_json::Value::as_u64)?,
     })
-}
-
-fn provider_event_is_compaction_lifecycle(kind: &str) -> bool {
-    let Some((method, item_type)) = kind.split_once(':') else {
-        return false;
-    };
-    matches!(method, "item/started" | "item/completed")
-        && matches!(
-            item_type
-                .to_ascii_lowercase()
-                .replace(['-', '_'], "")
-                .as_str(),
-            "contextcompaction"
-        )
 }
 
 fn user_facing_provider_error(provider: CodingProvider, error: &str) -> String {
@@ -1282,10 +1294,10 @@ mod tests {
         assert!(!provider_event_is_transient(
             "item/completed:commandExecution"
         ));
-        assert!(provider_event_is_transient(
+        assert!(!provider_event_is_transient(
             "item/started:contextCompaction"
         ));
-        assert!(provider_event_is_transient(
+        assert!(!provider_event_is_transient(
             "item/completed:contextCompaction"
         ));
     }
@@ -1307,6 +1319,28 @@ mod tests {
         .expect("live usage");
 
         assert_eq!(usage.total_tokens, 43_000);
+        assert_eq!(usage.context_window_tokens, 258_400);
+    }
+
+    #[test]
+    fn codex_nested_context_usage_is_available_before_turn_completion() {
+        let usage = live_context_usage(
+            "thread/tokenUsage/updated",
+            &serde_json::json!({
+                "tokenUsage": {
+                    "last": {
+                        "inputTokens": 12_000,
+                        "cachedInputTokens": 210_000,
+                        "outputTokens": 800,
+                        "totalTokens": 222_800
+                    },
+                    "modelContextWindow": 258_400
+                }
+            }),
+        )
+        .expect("nested live usage");
+
+        assert_eq!(usage.total_tokens, 222_800);
         assert_eq!(usage.context_window_tokens, 258_400);
     }
 

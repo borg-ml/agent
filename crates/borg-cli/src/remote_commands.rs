@@ -60,6 +60,7 @@ type BluDiscoveryResult = Result<(
     Vec<borg_provider::mcp::ExternalMcpServer>,
 )>;
 type BluDiscoveryTask = tokio::task::JoinHandle<BluDiscoveryResult>;
+type RevertForkTask = tokio::task::JoinHandle<Result<Uuid>>;
 /// Resume filtering is local and eager, so load enough history to make search useful while
 /// keeping picker construction and per-keystroke filtering bounded.
 const RESUME_PICKER_SESSION_LIMIT: usize = 1_000;
@@ -1257,6 +1258,8 @@ async fn run_local_agent_session(
         editor_preferences.interaction.active_messages == ActiveMessageBehavior::Steer;
     let mut resume_session = None;
     let mut rewind_prompt = None;
+    let mut pending_revert_sequence = None;
+    let mut revert_fork_task: Option<RevertForkTask> = None;
     let mut sleep_inhibitor = SleepInhibitor::new(prevent_sleep);
     let mut render_frame_interval = tui_frame_interval(tui_fps);
     let mut render_tick = tui_render_interval(render_frame_interval);
@@ -1356,6 +1359,33 @@ async fn run_local_agent_session(
                     }
                     Err(error) => {
                         tracing::warn!(%error, "older transcript page task failed");
+                    }
+                }
+            }
+            revert_result = async {
+                revert_fork_task
+                    .as_mut()
+                    .expect("revert-fork task branch is guarded")
+                    .await
+            }, if revert_fork_task.is_some() => {
+                match revert_result {
+                    Ok(Ok(fork_id)) => {
+                        resume_session = Some(fork_id);
+                        break;
+                    }
+                    Ok(Err(error)) => {
+                        let message = format!("Revert failed; keeping the original session: {error:#}");
+                        tracing::warn!(%session_id, %error, "compaction checkpoint revert failed");
+                        resume_session = Some(session_id);
+                        exit_notice = Some(message);
+                        break;
+                    }
+                    Err(error) => {
+                        let message = format!("Revert failed; keeping the original session: {error}");
+                        tracing::warn!(%session_id, %error, "compaction checkpoint revert task failed");
+                        resume_session = Some(session_id);
+                        exit_notice = Some(message);
+                        break;
                     }
                 }
             }
@@ -1542,7 +1572,28 @@ async fn run_local_agent_session(
             }
             event = session_events.recv() => {
                 let Some(event) = event else {
-                    break;
+                    if let Some(sequence) = pending_revert_sequence.take() {
+                        if status == SessionStatus::Stopped && revert_fork_task.is_none() {
+                            let fork_id = Uuid::new_v4();
+                            let revert_store = Arc::clone(&store);
+                            revert_fork_task = Some(tokio::spawn(async move {
+                                revert_store
+                                    .fork_before(session_id, fork_id, sequence)
+                                    .await
+                                    .map(|_| fork_id)
+                            }));
+                        } else {
+                            resume_session = Some(session_id);
+                            exit_notice = Some(
+                                "Revert could not reach a stopped session; keeping the original session"
+                                    .to_string(),
+                            );
+                        }
+                    }
+                    if revert_fork_task.is_none() {
+                        break;
+                    }
+                    continue;
                 };
                 let handoff_stale_owner = stale_local_owner
                     && matches!(
@@ -1604,6 +1655,25 @@ async fn run_local_agent_session(
                             | SessionStatus::Running
                             | SessionStatus::WaitingForApproval
                     ));
+                    if *next == SessionStatus::Stopped
+                        && let Some(sequence) = pending_revert_sequence.take()
+                        && revert_fork_task.is_none()
+                    {
+                        let fork_id = Uuid::new_v4();
+                        let revert_store = Arc::clone(&store);
+                        revert_fork_task = Some(tokio::spawn(async move {
+                            revert_store
+                                .fork_before(session_id, fork_id, sequence)
+                                .await
+                                .map(|_| fork_id)
+                        }));
+                        if let Some(terminal) = terminal.as_mut() {
+                            terminal.set_notice(
+                                "Compaction checkpoint stopped · creating reverted session…",
+                            );
+                            terminal_dirty = true;
+                        }
+                    }
                 }
                 match &event.kind {
                     SessionEventKind::ApprovalRequested { approval_id, .. } => {
@@ -2405,6 +2475,45 @@ async fn run_local_agent_session(
                             rewind_prompt = Some((text, attachments));
                             stop_sent = true;
                             session_command_tx.send(HostCommand::Stop { session_id }).await.ok();
+                        }
+                    }
+                    UiAction::RevertTo { sequence } => {
+                        if pending_revert_sequence.is_some() || revert_fork_task.is_some() {
+                            terminal
+                                .as_mut()
+                                .expect("terminal")
+                                .set_notice("A revert is already in progress".to_string());
+                        } else if status == SessionStatus::Stopped {
+                            let fork_id = Uuid::new_v4();
+                            let revert_store = Arc::clone(&store);
+                            revert_fork_task = Some(tokio::spawn(async move {
+                                revert_store
+                                    .fork_before(session_id, fork_id, sequence)
+                                    .await
+                                    .map(|_| fork_id)
+                            }));
+                            terminal.as_mut().expect("terminal").set_notice(
+                                "Creating reverted session…".to_string(),
+                            );
+                        } else {
+                            pending_revert_sequence = Some(sequence);
+                            terminal.as_mut().expect("terminal").set_notice(
+                                "Stopping session before reverting…".to_string(),
+                            );
+                            if !stop_sent {
+                                stop_sent = true;
+                                if session_command_tx
+                                    .send(HostCommand::Stop { session_id })
+                                    .await
+                                    .is_err()
+                                {
+                                    pending_revert_sequence = None;
+                                    stop_sent = false;
+                                    terminal.as_mut().expect("terminal").set_notice(
+                                        "Could not stop the session for revert".to_string(),
+                                    );
+                                }
+                            }
                         }
                     }
                     UiAction::SetModel(model) => {
@@ -3863,6 +3972,12 @@ async fn run_local_agent_session(
             .shutdown()
             .await
             .context("failed to stop Borg-owned local llama-server")?;
+    }
+    if resume_session == Some(session_id)
+        && !user_requested_exit
+        && let Some(notice) = exit_notice.take()
+    {
+        println!("\n  {notice}");
     }
     if should_print_exit_resume(user_requested_exit, resume_session, args.ephemeral) {
         if let Some(notice) = exit_notice {

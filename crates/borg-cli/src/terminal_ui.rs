@@ -452,6 +452,10 @@ pub enum UiAction {
         text: String,
         attachments: Vec<PathBuf>,
     },
+    /// Fork the session immediately after a completed compaction checkpoint.
+    RevertTo {
+        sequence: u64,
+    },
     SetModel(String),
     /// The user picked a model from a provider whose credentials are missing
     /// and chose how to supply them.
@@ -2611,6 +2615,17 @@ impl BorgTerminal {
             Some(TranscriptEntry::Goal { .. }) => ("Goal actions", vec!["Copy goal"]),
             Some(TranscriptEntry::Plan { .. }) => ("Plan actions", vec!["Copy todo list"]),
             Some(TranscriptEntry::Info { .. }) => ("Card actions", vec!["Copy details"]),
+            Some(TranscriptEntry::Compaction {
+                complete: true,
+                sequence,
+                ..
+            }) if *sequence > 0 => (
+                "Compaction actions",
+                vec!["Revert to after compaction", "Copy compaction summary"],
+            ),
+            Some(TranscriptEntry::Compaction { complete: true, .. }) => {
+                ("Compaction actions", vec!["Copy compaction summary"])
+            }
             _ => return UiAction::None,
         };
         self.transcript.selected = Some(index);
@@ -2788,6 +2803,12 @@ impl BorgTerminal {
                         text: GOAL_CLEAR_COMMAND.to_string(),
                         attachments: Vec::new(),
                     });
+                }
+                if !background_hover_suppressed
+                    && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right))
+                    && let Some(index) = self.hovered_entry
+                {
+                    return Ok(self.open_entry_actions(index));
                 }
                 if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
                     if self.picker.is_none()
@@ -3040,7 +3061,11 @@ impl BorgTerminal {
                     }
                     MouseEventKind::Down(MouseButton::Left) if self.hovered_entry.is_some() => {
                         let index = self.hovered_entry.expect("checked above");
-                        if self.transcript.plan_is_clippable(index) {
+                        if self.transcript.compaction_is_expandable(index) {
+                            self.capture_transcript_anchor_for_collapse();
+                            self.transcript.toggle_compaction_expansion(index);
+                            self.transcript_render_cache = None;
+                        } else if self.transcript.plan_is_clippable(index) {
                             self.transcript.toggle_plan_expansion(index);
                             self.transcript_render_cache = None;
                         } else {
@@ -3466,6 +3491,14 @@ impl BorgTerminal {
         }
     }
 
+    fn revert_compaction_action(&mut self, index: usize) -> UiAction {
+        let Some(sequence) = self.transcript.compaction_revert_sequence(index) else {
+            self.notice = Some("This compaction checkpoint is not revertable".to_string());
+            return UiAction::None;
+        };
+        UiAction::RevertTo { sequence }
+    }
+
     fn run_selected_message_action(&mut self) -> UiAction {
         let Some(index) = self.transcript.selected else {
             self.picker = None;
@@ -3475,6 +3508,7 @@ impl BorgTerminal {
         self.transcript.selected = None;
         match selected.as_deref() {
             Some("Revert to here") => self.rewind_action_for_output(index),
+            Some("Revert to after compaction") => self.revert_compaction_action(index),
             Some(selected) if selected.starts_with("Copy ") => {
                 self.copy_transcript_entry(index);
                 UiAction::None
@@ -5671,6 +5705,12 @@ impl BorgTerminal {
         }
         self.terminal_restored = true;
         self.input.abort();
+        // Inline viewports share the shell's scrollback. Clear the viewport
+        // before restoring the terminal so the last rendered agent summary
+        // and composer do not remain above the copyable resume handoff.
+        if self.mode == ScreenMode::Inline {
+            let _ = self.terminal.clear();
+        }
         let _ = execute!(self.terminal.backend_mut(), SetTitle("Borg CLI"));
         let _ = execute!(self.terminal.backend_mut(), DisableMouseCapture);
         let _ = execute!(self.terminal.backend_mut(), DisableBracketedPaste);
@@ -6565,6 +6605,9 @@ enum TranscriptEntry {
     Compaction {
         summary: String,
         time: String,
+        sequence: u64,
+        expanded: bool,
+        complete: bool,
     },
     Tool {
         source_name: String,
@@ -6771,6 +6814,35 @@ impl Transcript {
         if let Some(TranscriptEntry::Plan { expanded, .. }) = self.order.get_mut(index) {
             *expanded = !*expanded;
         }
+    }
+
+    fn toggle_compaction_expansion(&mut self, index: usize) {
+        if let Some(TranscriptEntry::Compaction {
+            expanded, complete, ..
+        }) = self.order.get_mut(index)
+            && *complete
+        {
+            *expanded = !*expanded;
+        }
+    }
+
+    fn compaction_is_expandable(&self, index: usize) -> bool {
+        matches!(
+            self.order.get(index),
+            Some(TranscriptEntry::Compaction { complete: true, .. })
+        )
+    }
+
+    fn compaction_revert_sequence(&self, index: usize) -> Option<u64> {
+        let TranscriptEntry::Compaction {
+            sequence, complete, ..
+        } = self.order.get(index)?
+        else {
+            return None;
+        };
+        (*complete && *sequence > 0)
+            .then(|| sequence.checked_add(1))
+            .flatten()
     }
 
     fn plan_is_clippable(&self, index: usize) -> bool {
@@ -7276,16 +7348,33 @@ impl Transcript {
                     {
                         *detail = completion_presentation.detail.clone();
                     }
-                    if completion_presentation.category == ToolPresentationCategory::Edit
-                        && let Some(body) = completion_presentation
+                    let input_is_diff = code_view
+                        .as_ref()
+                        .is_some_and(|(language, _)| is_diff_language(language));
+                    if completion_presentation.category == ToolPresentationCategory::Edit {
+                        if let Some(body) = completion_presentation
                             .output
                             .filter(|body| is_diff_language(&body.language))
-                    {
-                        *name = completion_presentation.label;
-                        *detail = completion_presentation.detail;
-                        *code_view = Some((body.language, body.text));
-                        *output_view = None;
-                        *expanded = auto_expand_edits;
+                        {
+                            *name = completion_presentation.label;
+                            *detail = completion_presentation.detail;
+                            *code_view = Some((body.language, body.text));
+                            *output_view = None;
+                            *expanded = auto_expand_edits;
+                        } else if input_is_diff && !*is_error {
+                            // Native edit tools return a mutation receipt rather
+                            // than a second diff. Keep the useful proposed diff
+                            // as the sole expanded body instead of appending an
+                            // opaque JSON receipt below it.
+                            *output_view = None;
+                            *expanded = auto_expand_edits;
+                        } else {
+                            *output_view = if *is_error && !output.trim().is_empty() {
+                                Some(("text".to_string(), output.trim_end().to_string()))
+                            } else {
+                                tool_output_code_view(name, output)
+                            };
+                        }
                     } else {
                         *output_view = if *is_error && !output.trim().is_empty() {
                             Some(("text".to_string(), output.trim_end().to_string()))
@@ -7374,20 +7463,66 @@ impl Transcript {
             {
                 self.finish_reasoning(event.created_at);
                 self.cache_diagnostics.reset();
-                let summary = context_compaction_summary(payload);
-                if matches!(
-                    self.order.last(),
-                    Some(TranscriptEntry::Compaction {
+                let started = context_compaction_started(kind, payload);
+                if started {
+                    if let Some(TranscriptEntry::Compaction {
+                        summary,
+                        time,
+                        sequence,
+                        expanded,
+                        complete,
+                    }) = self.order.last_mut()
+                        && !*complete
+                    {
+                        *summary = "Compacting context…".to_string();
+                        *time = local_event_time(event);
+                        *sequence = event.sequence;
+                        *expanded = false;
+                    } else {
+                        self.order.push(TranscriptEntry::Compaction {
+                            summary: "Compacting context…".to_string(),
+                            time: local_event_time(event),
+                            sequence: event.sequence,
+                            expanded: false,
+                            complete: false,
+                        });
+                    }
+                } else {
+                    let summary = format!(
+                        "Compacted context: {}",
+                        context_compaction_full_summary(payload)
+                    );
+                    if let Some(TranscriptEntry::Compaction {
                         summary: previous,
-                        ..
-                    }) if previous == &summary
-                ) {
-                    return removed_entry;
+                        time,
+                        sequence,
+                        complete,
+                        expanded,
+                    }) = self.order.last_mut()
+                        && !*complete
+                    {
+                        *previous = summary;
+                        *time = local_event_time(event);
+                        *sequence = event.sequence;
+                        *complete = true;
+                        *expanded = false;
+                    } else if !matches!(
+                        self.order.last(),
+                        Some(TranscriptEntry::Compaction {
+                            summary: previous,
+                            complete: true,
+                            ..
+                        }) if previous == &summary
+                    ) {
+                        self.order.push(TranscriptEntry::Compaction {
+                            summary,
+                            time: local_event_time(event),
+                            sequence: event.sequence,
+                            expanded: false,
+                            complete: true,
+                        });
+                    }
                 }
-                self.order.push(TranscriptEntry::Compaction {
-                    summary,
-                    time: local_event_time(event),
-                });
             }
             SessionEventKind::SubagentActivity {
                 activity,
@@ -8277,17 +8412,52 @@ impl Transcript {
                     selection_rows.push((index, entry_start, lines.len(), 0));
                     lines.push(Line::default());
                 }
-                TranscriptEntry::Compaction { summary, time } => {
+                TranscriptEntry::Compaction {
+                    summary,
+                    time,
+                    expanded,
+                    complete,
+                    ..
+                } => {
                     let time = display_local_time(time, today);
+                    let action_hint = if *complete {
+                        if *expanded {
+                            " · click to collapse · right-click for actions"
+                        } else {
+                            " · click to expand · right-click for actions"
+                        }
+                    } else {
+                        ""
+                    };
                     lines.push(Line::from(vec![
                         Span::styled(
-                            format!("▌ {summary}"),
+                            format!("▌ {}", compact_text(summary, 180)),
                             Style::default()
                                 .fg(BORG_ORANGE)
                                 .add_modifier(Modifier::BOLD),
                         ),
-                        Span::styled(format!("  {time}"), Style::default().fg(Color::DarkGray)),
+                        Span::styled(
+                            format!("  {time}{action_hint}"),
+                            Style::default().fg(Color::DarkGray),
+                        ),
                     ]));
+                    if *expanded && *complete {
+                        let detail = summary
+                            .strip_prefix("Compacted context: ")
+                            .unwrap_or(summary);
+                        for line in wrap_display(detail, width.saturating_sub(6)) {
+                            lines.push(Line::from(vec![
+                                Span::raw("  │ "),
+                                Span::styled(line, Style::default().fg(Color::Gray)),
+                            ]));
+                        }
+                    }
+                    if hovered_entry == Some(index) {
+                        for line in &mut lines[entry_start..] {
+                            apply_line_background(line, width, MESSAGE_HOVER_BG);
+                        }
+                    }
+                    entry_rows.push((index, entry_start, lines.len()));
                     selection_rows.push((index, entry_start, lines.len(), 0));
                     lines.push(Line::default());
                 }
@@ -8973,18 +9143,45 @@ fn session_event_changes_transcript(kind: &SessionEventKind) -> bool {
     }
 }
 
-fn context_compaction_summary(payload: &serde_json::Value) -> String {
-    ["summary", "message", "detail"]
-        .into_iter()
-        .find_map(|field| {
-            payload
-                .get(field)
-                .and_then(serde_json::Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-        })
-        .map(|summary| compact_text(summary, 180))
-        .unwrap_or_else(|| "Compacting context…".to_string())
+fn context_compaction_started(kind: &str, payload: &serde_json::Value) -> bool {
+    payload
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|status| status.eq_ignore_ascii_case("started"))
+        || (kind
+            .rsplit(['.', ':', '/'])
+            .next()
+            .unwrap_or(kind)
+            .eq_ignore_ascii_case("contextCompaction")
+            && kind.to_ascii_lowercase().contains("started"))
+}
+
+fn context_compaction_full_summary(payload: &serde_json::Value) -> String {
+    [
+        "summary",
+        "message",
+        "detail",
+        "/item/summary",
+        "/item/message",
+        "/item/detail",
+        "/params/item/summary",
+        "/params/item/message",
+        "/params/item/detail",
+    ]
+    .into_iter()
+    .find_map(|field| {
+        let value = if field.starts_with('/') {
+            payload.pointer(field)
+        } else {
+            payload.get(field)
+        };
+        value
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    })
+    .map(str::to_string)
+    .unwrap_or_else(|| "Context was compacted.".to_string())
 }
 
 pub(crate) fn subagent_activity_summary(
@@ -9402,7 +9599,7 @@ impl TranscriptEntry {
                     .map(|(_, source)| source.clone())
                     .unwrap_or_else(|| detail.clone()),
             ),
-            Self::Compaction { .. } => None,
+            Self::Compaction { summary, .. } => Some(summary.clone()),
         }
     }
 }
