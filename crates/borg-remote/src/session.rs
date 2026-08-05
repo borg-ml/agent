@@ -5,9 +5,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use chrono::Utc;
 use serde_json::Value;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::time::Sleep;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::subagents::{SharedWorkToolContext, TeamInboxMessage};
@@ -26,30 +28,128 @@ use borg_provider::ProviderCallUsage;
 
 const ROOT_INBOX_REFRESH_INTERVAL: Duration = Duration::from_millis(50);
 const RETAINED_COMPACTION_SYSTEM_PROMPT: &str = "This is an internal context-compaction preparation turn. Do not use tools, modify files, or answer the user. Return only a compact continuation summary of the supplied prior provider conversation.";
-const SUBSCRIPTION_TRANSCRIPT_HEADER: &str = "Borg canonical conversation transcript v1 (JSONL). Each line is one persisted message in chronological order. The final line is the current request; respond to it normally.\n";
+const SUBSCRIPTION_CONTEXT_HEADER: &str = "Borg canonical provider context v2. The history below is a read-only, provider-neutral projection of durable Borg state; answer the current request normally.\n";
 // Codex app-server rejects a single input at 1 MiB. Leave room for the JSON-RPC
 // envelope and the current request so a resumed Borg journal never hits that
 // hard provider boundary. The journal itself remains complete; this is only the
 // serialized provider-context budget.
-const SUBSCRIPTION_INPUT_BUDGET_BYTES: usize = 900 * 1024;
+// Codex app-server and Claude's stream wrapper add JSON-RPC/envelope,
+// instruction, and tool metadata around the canonical prompt. Keep a
+// conservative headroom below the 1 MiB transport ceiling so a resumed or
+// tool-heavy turn is compacted before the provider rejects it.
+const SUBSCRIPTION_INPUT_BUDGET_BYTES: usize = 700 * 1024;
 const SUBSCRIPTION_COMPACTION_CHUNK_BYTES: usize = 600 * 1024;
 const MAX_SUBSCRIPTION_COMPACTION_ROUNDS: usize = 4;
 
+struct SessionAutonomyDispatch {
+    job: crate::AutonomyJob,
+    result: oneshot::Sender<Result<Value>>,
+}
+
+struct SessionAutonomyHandler {
+    session_id: Uuid,
+    dispatch: mpsc::Sender<SessionAutonomyDispatch>,
+    cancel: CancellationToken,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BluWorkflowJobPayload {
+    workflow_id: Option<Uuid>,
+    name: String,
+    source: String,
+}
+
+struct SessionAutonomyShutdown(CancellationToken);
+
+impl Drop for SessionAutonomyShutdown {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::AutonomyJobHandler for SessionAutonomyHandler {
+    async fn execute(&self, job: crate::AutonomyJob) -> Result<Value> {
+        anyhow::ensure!(
+            job.session_id == Some(self.session_id),
+            "autonomy job {} is not owned by session {}",
+            job.job_id,
+            self.session_id
+        );
+        let (result_tx, result_rx) = oneshot::channel();
+        self.dispatch
+            .send(SessionAutonomyDispatch {
+                job,
+                result: result_tx,
+            })
+            .await
+            .context("session autonomy dispatch channel closed")?;
+        tokio::select! {
+            _ = self.cancel.cancelled() => {
+                bail!("session autonomy supervisor was cancelled")
+            }
+            result = result_rx => result.context("session stopped before autonomy job completion")?,
+        }
+    }
+}
+
+fn autonomy_job_prompt(job: &crate::AutonomyJob, session_id: Uuid) -> Result<String> {
+    anyhow::ensure!(
+        job.session_id == Some(session_id),
+        "autonomy job {} is not owned by session {}",
+        job.job_id,
+        session_id
+    );
+    let prompt = job
+        .payload
+        .get("prompt")
+        .or_else(|| job.payload.get("text"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .context("session autonomy jobs require a non-empty payload.prompt or payload.text")?;
+    anyhow::ensure!(
+        prompt.chars().count() <= 200_000,
+        "session autonomy prompt is too long"
+    );
+    Ok(prompt.to_string())
+}
+
+fn autonomy_blu_workflow(
+    job: &crate::AutonomyJob,
+    session_id: Uuid,
+) -> Result<crate::BluWorkflowRequest> {
+    anyhow::ensure!(
+        job.session_id == Some(session_id),
+        "Blu workflow job {} is not owned by session {}",
+        job.job_id,
+        session_id
+    );
+    let payload: BluWorkflowJobPayload = serde_json::from_value(job.payload.clone())
+        .context("blu_workflow jobs require payload.name and payload.source")?;
+    Ok(crate::BluWorkflowRequest {
+        workflow_id: payload.workflow_id.unwrap_or(job.job_id),
+        name: payload.name,
+        source: payload.source,
+    })
+}
+
 #[derive(serde::Serialize)]
-struct SubscriptionTranscriptLine<'a> {
-    role: &'static str,
+struct SubscriptionContextMessage<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tool_calls: Option<Vec<SubscriptionTranscriptToolCall<'a>>>,
+    tool_calls: Option<Vec<SubscriptionContextToolCall<'a>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<&'a str>,
+    role: &'static str,
 }
 
 #[derive(serde::Serialize)]
-struct SubscriptionTranscriptToolCall<'a> {
+struct SubscriptionContextToolCall<'a> {
     id: &'a str,
     name: &'a str,
     arguments: &'a str,
@@ -629,13 +729,19 @@ async fn run_agent_session_store_kernel(
 ) -> Result<()> {
     validate_launch_session(&mut launch)?;
     store.create_session(session_id).await?;
+    // A provider process can die after the durable TurnStarted boundary but
+    // before its worker lease is installed. Requeue both unleased and expired
+    // in-flight actions before rebuilding the actor's prompt queue.
+    let recovered_actions = store.recover_expired_actions(Utc::now(), 256).await?;
     let workspace_projection = if launch.capabilities.multiplayer {
         let binding = store
             .workspace_binding(session_id)
             .await?
             .with_context(|| format!("session {session_id} has no workspace binding"))?;
-        let workspace_store =
-            SqliteWorkspaceStore::open(session_root.join("workspaces.sqlite3")).await?;
+        let workspace_store = store
+            .workspace_store()
+            .await?
+            .with_context(|| "multiplayer requires a SQLite workspace projection on the canonical session database")?;
         let human_display_name = std::env::var("USER").unwrap_or_else(|_| "Local user".to_string());
         let human_participant_id = crate::local_human_participant_id(&human_display_name);
         let workspace_name = launch
@@ -682,13 +788,20 @@ async fn run_agent_session_store_kernel(
     };
     let initial_state = store.state(session_id).await?;
     let fresh = initial_state.latest_sequence == 0;
+    // Local and enrolled hosts populate this from their own environment. A
+    // resumed session that predates the snapshot event can still reuse the
+    // durable state until the host supplies a fresh observation.
+    if launch.capabilities.provider_capabilities.is_empty() {
+        launch.capabilities.provider_capabilities = initial_state.provider_capabilities.clone();
+    }
     let recovery = if fresh {
         crate::SessionRecovery::default()
     } else {
         store.recovery(session_id).await?
     };
     let subagent_store = Arc::clone(&store);
-    let mut journal = RuntimeSessionStore::new(store, recovery.context_events);
+    let autonomy_store = store.autonomy_store().await?;
+    let mut journal = RuntimeSessionStore::new(Arc::clone(&store), recovery.context_events);
     if let Some(projection) = workspace_projection.clone() {
         journal = journal.with_workspace_projection(projection);
     }
@@ -716,8 +829,22 @@ async fn run_agent_session_store_kernel(
         )
         .await?;
     }
+    if !launch.capabilities.provider_capabilities.is_empty()
+        && initial_state.provider_capabilities != launch.capabilities.provider_capabilities
+    {
+        record(
+            &mut journal,
+            &events,
+            session_id,
+            SessionEventKind::ProviderCapabilitiesUpdated {
+                providers: launch.capabilities.provider_capabilities.clone(),
+            },
+        )
+        .await?;
+    }
     let state = journal.state(session_id).await?;
     validate_session_state(session_id, &state)?;
+    let initial_context_generation = state.context_generation;
     let mut provider_session_id = state.provider_session_id;
     // Set when a provider switch lands mid-turn; drained at the next turn
     // boundary once the in-flight turn has reported its own session id.
@@ -737,6 +864,15 @@ async fn run_agent_session_store_kernel(
         .then(Instant::now);
     let mut goal_turn_failures = ConsecutiveGoalTurnFailures::default();
     let mut pending = recover_queued_prompts(&recovery.queue_events);
+    for action in recovered_actions {
+        if let Some(prompt) = queued_prompt_from_action(&action)
+            && !pending
+                .iter()
+                .any(|existing| existing.message_id == prompt.message_id)
+        {
+            pending.push_back(prompt);
+        }
+    }
     let mut deferred_commands = VecDeque::new();
     let mut team_message_ids = HashSet::new();
     let mut at_turn_boundary = !pending.is_empty();
@@ -825,10 +961,36 @@ async fn run_agent_session_store_kernel(
         launch.team_policy.clone(),
         launch.cwd.clone(),
         Some(consultation_tools),
+        autonomy_store.clone(),
+        launch.capabilities.provider_capabilities.clone(),
     );
+    let workflow_autonomy_store = autonomy_store.clone();
+    let workflow_processes = crate::native_process::ProcessManager::default();
     let agent_tool_server =
         crate::AgentToolServer::start(session_root, session_id, dispatcher.clone()).await?;
     let agent_mcp_server = agent_tool_server.external_mcp_server();
+    let (autonomy_dispatch_tx, mut autonomy_dispatch_rx) = mpsc::channel(16);
+    let autonomy_cancel = CancellationToken::new();
+    let _autonomy_shutdown = SessionAutonomyShutdown(autonomy_cancel.clone());
+    if let Some(autonomy_store) = autonomy_store {
+        let handler = Arc::new(SessionAutonomyHandler {
+            session_id,
+            dispatch: autonomy_dispatch_tx,
+            cancel: autonomy_cancel.clone(),
+        });
+        let supervisor = crate::SqliteAutonomySupervisor::new(
+            autonomy_store,
+            handler,
+            format!("session-actor:{session_id}"),
+        )?
+        .for_session(session_id);
+        let cancel = autonomy_cancel.clone();
+        tokio::spawn(async move {
+            supervisor.run_until_cancelled(cancel).await;
+        });
+    }
+    let mut autonomy_prompt_ids = HashSet::new();
+    let mut autonomy_completions = HashMap::<Uuid, oneshot::Sender<Result<Value>>>::new();
     if let Some(prompt) = launch
         .initial_prompt
         .take()
@@ -949,6 +1111,67 @@ async fn run_agent_session_store_kernel(
                         ).await?;
                         continue;
                     }
+                    autonomy = autonomy_dispatch_rx.recv() => {
+                        let Some(dispatch) = autonomy else {
+                            continue;
+                        };
+                        if dispatch.job.kind == "blu_workflow" {
+                            let request = match autonomy_blu_workflow(&dispatch.job, session_id) {
+                                Ok(request) => request,
+                                Err(error) => {
+                                    let _ = dispatch.result.send(Err(error));
+                                    continue;
+                                }
+                            };
+                            let Some(autonomy_store) = workflow_autonomy_store.clone() else {
+                                let _ = dispatch.result.send(Err(anyhow::anyhow!(
+                                    "Blu workflow jobs require durable autonomy storage"
+                                )));
+                                continue;
+                            };
+                            let workflow_store = autonomy_store.session_store();
+                            let runner = crate::blu_workflow::BluWorkflowRunner::new(
+                                session_id,
+                                workflow_store,
+                                autonomy_store,
+                                Some(dispatcher.clone()),
+                                workflow_processes.clone(),
+                                launch.cwd.clone(),
+                                launch.permission_mode,
+                            );
+                            tokio::spawn(async move {
+                                let result = runner.run(request).await.and_then(|result| {
+                                    if result.success {
+                                        Ok(serde_json::to_value(result)?)
+                                    } else {
+                                        Err(anyhow::anyhow!(result.error.unwrap_or_else(|| {
+                                            "Blu workflow completed unsuccessfully".to_string()
+                                        })))
+                                    }
+                                });
+                                let _ = dispatch.result.send(result);
+                            });
+                            continue;
+                        }
+                        let job_id = dispatch.job.job_id;
+                        let text = match autonomy_job_prompt(&dispatch.job, session_id) {
+                            Ok(text) => text,
+                            Err(error) => {
+                                let _ = dispatch.result.send(Err(error));
+                                continue;
+                            }
+                        };
+                        autonomy_prompt_ids.insert(job_id);
+                        autonomy_completions.insert(job_id, dispatch.result);
+                        Some(HostCommand::Prompt {
+                            session_id,
+                            message_id: job_id,
+                            text,
+                            attachments: Vec::new(),
+                            output_schema: None,
+                            delivery: PromptDelivery::Queue,
+                        })
+                    }
                 };
                 match command {
                     Some(HostCommand::Prompt {
@@ -959,7 +1182,10 @@ async fn run_agent_session_store_kernel(
                         output_schema,
                         delivery,
                     }) if command_session_id == session_id => {
-                        if journal.contains_message(session_id, message_id).await? {
+                        let is_autonomy = autonomy_prompt_ids.contains(&message_id);
+                        let already_recorded =
+                            journal.contains_message(session_id, message_id).await?;
+                        if already_recorded && !is_autonomy {
                             continue;
                         }
                         if owns_team {
@@ -986,13 +1212,14 @@ async fn run_agent_session_store_kernel(
                                 continue;
                             }
                         }
-                        let actor = if team_message_ids.remove(&message_id) {
+                        let actor = if is_autonomy || team_message_ids.remove(&message_id) {
                             EventActor::System
                         } else {
                             EventActor::User
                         };
                         if actor == EventActor::System
                             && delivery == PromptDelivery::Queue
+                            && !is_autonomy
                             && !goal
                                 .as_ref()
                                 .is_some_and(|goal| goal.status == GoalStatus::Active)
@@ -1022,7 +1249,7 @@ async fn run_agent_session_store_kernel(
                             attachments,
                             output_schema,
                             delivery,
-                            visible: true,
+                            visible: !is_autonomy,
                             interrupt_batch: actor == EventActor::User,
                         });
                     }
@@ -1176,6 +1403,7 @@ async fn run_agent_session_store_kernel(
                                     .compact_retained_context(AgentTurn {
                                         session_id,
                                         message_id: Uuid::new_v4(),
+                                        context_generation: initial_context_generation,
                                         provider: launch.provider,
                                         provider_session_id: None,
                                         cwd: launch.cwd.clone(),
@@ -1192,8 +1420,12 @@ async fn run_agent_session_store_kernel(
                                         agent_tools: dispatcher.clone(),
                                         external_mcp_servers: Vec::new(),
                                         extension_skill_roots: Vec::new(),
-                                        system_prompt_appendix: RETAINED_COMPACTION_SYSTEM_PROMPT
-                                            .to_string(),
+                                        system_prompt_appendix: format!(
+                                            "{RETAINED_COMPACTION_SYSTEM_PROMPT}\n\n{}",
+                                            crate::provider_capabilities_prompt(
+                                                &launch.capabilities.provider_capabilities
+                                            )
+                                        ),
                                     })
                                     .await
                                     .map(Some)
@@ -1344,6 +1576,12 @@ async fn run_agent_session_store_kernel(
             stop(&mut journal, &events, session_id).await?;
             return Ok(());
         };
+        let autonomy_job_id = autonomy_prompt_ids
+            .remove(&prompt.message_id)
+            .then_some(prompt.message_id);
+        let autonomy_result_sender =
+            autonomy_job_id.and_then(|job_id| autonomy_completions.remove(&job_id));
+        let mut autonomy_result: Option<Result<Value>> = None;
         next_ready_detail = None;
         if prompt.visible {
             record(
@@ -1605,6 +1843,48 @@ async fn run_agent_session_store_kernel(
                 &prompt.text,
             )
         };
+        if !launch.provider.uses_native_harness()
+            && provider_prompt.len() > SUBSCRIPTION_INPUT_BUDGET_BYTES
+        {
+            let message = format!(
+                "provider context remains {} bytes after compaction; refusing an over-limit subscription request (budget {} bytes)",
+                provider_prompt.len(),
+                SUBSCRIPTION_INPUT_BUDGET_BYTES
+            );
+            tracing::error!(session_id = %session_id, %message, "subscription request exceeds safe input budget");
+            record(
+                &mut journal,
+                &events,
+                session_id,
+                SessionEventKind::Error {
+                    message: message.clone(),
+                },
+            )
+            .await?;
+            record(
+                &mut journal,
+                &events,
+                session_id,
+                SessionEventKind::TurnCompleted {
+                    message_id: prompt.message_id,
+                    provider_session_id: provider_session_id.clone(),
+                    final_text: String::new(),
+                    error: Some(message),
+                },
+            )
+            .await?;
+            record(
+                &mut journal,
+                &events,
+                session_id,
+                SessionEventKind::StatusChanged {
+                    status: SessionStatus::Ready,
+                    detail: None,
+                },
+            )
+            .await?;
+            continue;
+        }
         record(
             &mut journal,
             &events,
@@ -1628,9 +1908,45 @@ async fn run_agent_session_store_kernel(
             },
         )
         .await?;
+        if let Some(action) = store
+            .claim_action(
+                session_id,
+                prompt.message_id,
+                &format!("session-actor:{session_id}"),
+                Duration::from_secs(60),
+            )
+            .await?
+        {
+            if let Some(action_lease_token) = action.lease_token {
+                let heartbeat_store = Arc::clone(&store);
+                let heartbeat_owner = format!("session-actor:{session_id}");
+                let heartbeat_action_id = prompt.message_id;
+                tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(Duration::from_secs(15));
+                    interval.tick().await;
+                    loop {
+                        interval.tick().await;
+                        if heartbeat_store
+                            .heartbeat_action(
+                                session_id,
+                                heartbeat_action_id,
+                                &heartbeat_owner,
+                                action_lease_token,
+                                Duration::from_secs(60),
+                            )
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
+            }
+        }
         let turn = AgentTurn {
             session_id,
             message_id: prompt.message_id,
+            context_generation: journal.state(session_id).await?.context_generation,
             provider: launch.provider,
             provider_session_id: provider_session_id.clone(),
             cwd: launch.cwd.clone(),
@@ -1647,7 +1963,9 @@ async fn run_agent_session_store_kernel(
             agent_tools: dispatcher.clone(),
             external_mcp_servers: Vec::new(),
             extension_skill_roots: launch.extension_skill_roots.clone(),
-            system_prompt_appendix: String::new(),
+            system_prompt_appendix: crate::provider_capabilities_prompt(
+                &launch.capabilities.provider_capabilities,
+            ),
         };
         let turn_executor = Arc::clone(&executor);
         let mut running = tokio::spawn(async move {
@@ -1739,10 +2057,20 @@ async fn run_agent_session_store_kernel(
                         interrupted,
                     )
                     .await?;
-                    match result {
+                        match result {
                         Ok(outcome) => {
                             goal_turn_failures.reset();
                             provider_session_id = outcome.provider_session_id.clone();
+                            let final_text = outcome.final_text;
+                            if autonomy_result_sender.is_some() {
+                                autonomy_result = Some(if interrupted {
+                                    Err(anyhow::anyhow!("autonomy turn interrupted"))
+                                } else {
+                                    Ok(serde_json::json!({
+                                        "final_text": final_text.clone(),
+                                    }))
+                                });
+                            }
                             record(
                                 &mut journal,
                                 &events,
@@ -1750,7 +2078,7 @@ async fn run_agent_session_store_kernel(
                                 SessionEventKind::TurnCompleted {
                                     message_id: prompt.message_id,
                                     provider_session_id: outcome.provider_session_id,
-                                    final_text: outcome.final_text,
+                                    final_text,
                                     error: interrupted.then(|| "turn interrupted".to_string()),
                                 },
                             )
@@ -1758,6 +2086,9 @@ async fn run_agent_session_store_kernel(
                         }
                         Err(error) => {
                             let error = format!("{error:#}");
+                            if autonomy_result_sender.is_some() {
+                                autonomy_result = Some(Err(anyhow::anyhow!(error.clone())));
+                            }
                             let ready_detail =
                                 format!("Turn failed; the session remains available: {error}");
                             if provider_error_is_usage_limited(&error) {
@@ -1921,6 +2252,9 @@ async fn run_agent_session_store_kernel(
                         &mut pending_provider_interaction,
                     )
                     .await?;
+                    if autonomy_result_sender.is_some() {
+                        autonomy_result = Some(Err(anyhow::anyhow!("autonomy turn interrupted")));
+                    }
                     record(
                         &mut journal,
                         &events,
@@ -1961,6 +2295,11 @@ async fn run_agent_session_store_kernel(
                         session_id,
                         &mut pending_provider_interaction,
                     ).await?;
+                    if autonomy_result_sender.is_some() {
+                        autonomy_result = Some(Err(anyhow::anyhow!(
+                            "autonomy turn liveness timeout"
+                        )));
+                    }
                     promote_uncommitted_steers(
                         &mut journal,
                         &events,
@@ -2570,6 +2909,11 @@ async fn run_agent_session_store_kernel(
                 }
             }
         }
+        if let Some(sender) = autonomy_result_sender {
+            let result = autonomy_result
+                .unwrap_or_else(|| Err(anyhow::anyhow!("autonomy turn ended without a result")));
+            let _ = sender.send(result);
+        }
         if batch_pending_after_interrupt {
             coalesce_queued_prompts(&mut pending);
         }
@@ -2997,10 +3341,10 @@ fn subscription_prompt_bytes(
     format_subscription_provider_prompt(retained_context, actor, text).len()
 }
 
-/// Split retained transcript text without dropping it. Normal JSONL records stay
-/// intact; an unusually large tool result is split at UTF-8 boundaries only for
-/// the intermediate compaction request, where a partial record is still useful
-/// evidence for the summarizer.
+/// Split retained provider-context bytes without dropping them. An unusually
+/// large record is split at UTF-8 boundaries only for the intermediate
+/// compaction request, where a partial record is still useful evidence for the
+/// summarizer.
 fn split_retained_context(context: &str, max_bytes: usize) -> Vec<String> {
     assert!(
         max_bytes > 0,
@@ -3085,6 +3429,7 @@ async fn compact_subscription_context_for_budget(
                 .compact_retained_context(AgentTurn {
                     session_id,
                     message_id: Uuid::new_v4(),
+                    context_generation: 0,
                     provider: launch.provider,
                     provider_session_id: None,
                     cwd: launch.cwd.clone(),
@@ -3101,7 +3446,12 @@ async fn compact_subscription_context_for_budget(
                     agent_tools: dispatcher.clone(),
                     external_mcp_servers: Vec::new(),
                     extension_skill_roots: Vec::new(),
-                    system_prompt_appendix: RETAINED_COMPACTION_SYSTEM_PROMPT.to_string(),
+                    system_prompt_appendix: format!(
+                        "{RETAINED_COMPACTION_SYSTEM_PROMPT}\n\n{}",
+                        crate::provider_capabilities_prompt(
+                            &launch.capabilities.provider_capabilities
+                        )
+                    ),
                 })
                 .await?;
             anyhow::ensure!(
@@ -3181,7 +3531,7 @@ fn retained_conversation_context(events: &[SessionEvent]) -> Option<String> {
             {
                 entries.clear();
                 if let Some(summary) = payload.get("summary").and_then(Value::as_str) {
-                    entries.push(format_subscription_text_line(
+                    entries.push(format_subscription_text_value(
                         "user",
                         &format!("Previous conversation summary:\n\n{summary}"),
                     ));
@@ -3197,14 +3547,14 @@ fn retained_conversation_context(events: &[SessionEvent]) -> Option<String> {
                 EventActor::User | EventActor::Assistant | EventActor::System
             ) =>
             {
-                entries.push(format_subscription_actor_line(*actor, text));
+                entries.push(format_subscription_actor_value(*actor, text));
             }
             SessionEventKind::ToolStarted {
                 tool_call_id,
                 name,
                 input,
                 ..
-            } => entries.push(format_subscription_tool_call_line(
+            } => entries.push(format_subscription_tool_call_value(
                 tool_call_id,
                 name,
                 input,
@@ -3213,11 +3563,17 @@ fn retained_conversation_context(events: &[SessionEvent]) -> Option<String> {
                 tool_call_id,
                 output,
                 ..
-            } => entries.push(format_subscription_tool_result_line(tool_call_id, output)),
+            } => entries.push(format_subscription_tool_result_value(tool_call_id, output)),
             _ => {}
         }
     }
-    (!entries.is_empty()).then(|| entries.join("\n"))
+    (!entries.is_empty()).then(|| {
+        entries
+            .iter()
+            .map(format_subscription_frame)
+            .collect::<Vec<_>>()
+            .join("\n")
+    })
 }
 
 fn format_subscription_conversation(
@@ -3226,6 +3582,7 @@ fn format_subscription_conversation(
     conversation
         .iter()
         .map(format_subscription_message)
+        .map(|value| format_subscription_frame(&value))
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -3235,27 +3592,29 @@ fn format_subscription_provider_prompt(
     actor: EventActor,
     text: &str,
 ) -> String {
-    let mut prompt = String::from(SUBSCRIPTION_TRANSCRIPT_HEADER);
+    let mut prompt = String::from(SUBSCRIPTION_CONTEXT_HEADER);
     if let Some(context) = retained_context.filter(|context| !context.is_empty()) {
         prompt.push_str(context);
         prompt.push('\n');
     }
-    prompt.push_str(&format_subscription_actor_line(actor, text));
+    prompt.push_str(&format_subscription_frame(
+        &format_subscription_actor_value(actor, text),
+    ));
     prompt
 }
 
-fn format_subscription_message(message: &borg_provider::provider::ModelMessage) -> String {
+fn format_subscription_message(message: &borg_provider::provider::ModelMessage) -> Value {
     use borg_provider::provider::ModelMessage;
 
     let line = match message {
-        ModelMessage::System { content } => SubscriptionTranscriptLine {
+        ModelMessage::System { content } => SubscriptionContextMessage {
             role: "system",
             content: Some(content),
             thinking: None,
             tool_calls: None,
             tool_call_id: None,
         },
-        ModelMessage::User { content, .. } => SubscriptionTranscriptLine {
+        ModelMessage::User { content, .. } => SubscriptionContextMessage {
             role: "user",
             content: Some(content),
             thinking: None,
@@ -3267,14 +3626,14 @@ fn format_subscription_message(message: &borg_provider::provider::ModelMessage) 
             reasoning_content,
             tool_calls,
             ..
-        } => SubscriptionTranscriptLine {
+        } => SubscriptionContextMessage {
             role: "assistant",
             content: content.as_deref(),
             thinking: reasoning_content.as_deref(),
             tool_calls: (!tool_calls.is_empty()).then(|| {
                 tool_calls
                     .iter()
-                    .map(|call| SubscriptionTranscriptToolCall {
+                    .map(|call| SubscriptionContextToolCall {
                         id: &call.id,
                         name: &call.function.name,
                         arguments: &call.function.arguments,
@@ -3286,7 +3645,7 @@ fn format_subscription_message(message: &borg_provider::provider::ModelMessage) 
         ModelMessage::Tool {
             tool_call_id,
             content,
-        } => SubscriptionTranscriptLine {
+        } => SubscriptionContextMessage {
             role: "tool",
             content: Some(content),
             thinking: None,
@@ -3294,52 +3653,63 @@ fn format_subscription_message(message: &borg_provider::provider::ModelMessage) 
             tool_call_id: Some(tool_call_id),
         },
     };
-    serde_json::to_string(&line).expect("subscription transcript line is serializable")
+    serde_json::to_value(line).expect("subscription context message is serializable")
 }
 
-fn format_subscription_text_line(role: &'static str, content: &str) -> String {
-    serde_json::to_string(&SubscriptionTranscriptLine {
+fn format_subscription_text_value(role: &'static str, content: &str) -> Value {
+    serde_json::to_value(SubscriptionContextMessage {
         role,
         content: Some(content),
         thinking: None,
         tool_calls: None,
         tool_call_id: None,
     })
-    .expect("subscription transcript line is serializable")
+    .expect("subscription context message is serializable")
 }
 
-fn format_subscription_actor_line(actor: EventActor, text: &str) -> String {
+fn format_subscription_actor_value(actor: EventActor, text: &str) -> Value {
     let role = match actor {
         EventActor::User => "user",
         EventActor::Assistant => "assistant",
         EventActor::Tool => "tool",
         EventActor::System => "system",
     };
-    format_subscription_text_line(role, text)
+    format_subscription_text_value(role, text)
 }
 
-fn format_subscription_tool_call_line(tool_call_id: &str, name: &str, input: &Value) -> String {
+fn format_subscription_tool_call_value(tool_call_id: &str, name: &str, input: &Value) -> Value {
     let arguments = serde_json::to_string(input).unwrap_or_else(|_| input.to_string());
-    let tool_call = SubscriptionTranscriptToolCall {
+    let tool_call = SubscriptionContextToolCall {
         id: tool_call_id,
         name,
         arguments: &arguments,
     };
-    serde_json::to_string(&SubscriptionTranscriptLine {
+    serde_json::to_value(SubscriptionContextMessage {
         role: "assistant",
         content: None,
         thinking: None,
         tool_calls: Some(vec![tool_call]),
         tool_call_id: None,
     })
-    .expect("subscription transcript line is serializable")
+    .expect("subscription context message is serializable")
 }
 
-fn format_subscription_tool_result_line(tool_call_id: &str, output: &str) -> String {
+fn format_subscription_tool_result_value(tool_call_id: &str, output: &str) -> Value {
     format_subscription_message(&borg_provider::provider::ModelMessage::Tool {
         tool_call_id: tool_call_id.to_string(),
         content: output.to_string(),
     })
+}
+
+/// A provider adapter receives one text prompt, but its history is still a
+/// sequence of typed records. Framing each canonical record keeps the prefix
+/// byte-for-byte stable as new records are appended, without making a provider
+/// transcript format part of Borg's persistence model.
+fn format_subscription_frame(value: &Value) -> String {
+    format!(
+        "<borg-message>{}</borg-message>",
+        serde_json::to_string(value).expect("subscription context frame is serializable")
+    )
 }
 
 fn retained_compaction_prompt(context: &str) -> String {
@@ -3417,6 +3787,47 @@ fn recover_queued_prompts(events: &[SessionEvent]) -> VecDeque<QueuedPrompt> {
         prompt.delivery = PromptDelivery::Queue;
     }
     pending
+}
+
+fn queued_prompt_from_action(action: &crate::SessionAction) -> Option<QueuedPrompt> {
+    if !matches!(
+        action.kind,
+        crate::SessionActionKind::Prompt
+            | crate::SessionActionKind::Steering
+            | crate::SessionActionKind::FollowUp
+            | crate::SessionActionKind::AgentMessage
+    ) {
+        return None;
+    }
+    let message_id = action
+        .payload
+        .get("message_id")
+        .and_then(Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok())?;
+    let text = action.payload.get("text")?.as_str()?.to_string();
+    let attachments = action
+        .payload
+        .get("attachments")
+        .cloned()
+        .map(serde_json::from_value::<Vec<PathBuf>>)
+        .transpose()
+        .ok()?
+        .unwrap_or_default();
+    let actor = if action.kind == crate::SessionActionKind::AgentMessage {
+        EventActor::System
+    } else {
+        EventActor::User
+    };
+    Some(QueuedPrompt {
+        message_id,
+        text,
+        actor,
+        attachments,
+        output_schema: None,
+        delivery: PromptDelivery::Queue,
+        visible: false,
+        interrupt_batch: false,
+    })
 }
 
 fn recall_visible_queued_prompts(
@@ -4881,8 +5292,9 @@ mod tests {
     type RecordedCompactionTurns = Arc<Mutex<Vec<(CodingProvider, Option<String>, String)>>>;
 
     fn subscription_prompt_ends_with(prompt: &str, text: &str) -> bool {
-        let encoded = serde_json::to_string(text).unwrap();
-        prompt.ends_with(&format!("{{\"role\":\"user\",\"content\":{encoded}}}"))
+        let frame =
+            format_subscription_frame(&format_subscription_actor_value(EventActor::User, text));
+        prompt.ends_with(&frame)
     }
 
     async fn sqlite_runtime_store(
@@ -4915,9 +5327,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let workspace_store = SqliteWorkspaceStore::open(root.path().join("workspaces.sqlite3"))
-            .await
-            .unwrap();
+        let workspace_store = session_store.workspace_store().await.unwrap().unwrap();
         let human_id = crate::local_human_participant_id("Human");
         workspace_store
             .ensure_execution_workspace(
@@ -5109,9 +5519,7 @@ mod tests {
         );
         session_store.create_session(session_id).await.unwrap();
         let projection = WorkspaceProjection {
-            store: SqliteWorkspaceStore::open(root.path().join("workspaces.sqlite3"))
-                .await
-                .unwrap(),
+            store: session_store.workspace_store().await.unwrap().unwrap(),
             workspace_id: Uuid::new_v4(),
             agent_participant_id: Uuid::new_v4(),
             human_participant_id: Uuid::new_v4(),
@@ -5171,9 +5579,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let workspace_store = SqliteWorkspaceStore::open(root.path().join("workspaces.sqlite3"))
-            .await
-            .unwrap();
+        let workspace_store = session_store.workspace_store().await.unwrap().unwrap();
         let human_id = crate::local_human_participant_id("Human");
         workspace_store
             .ensure_execution_workspace(
@@ -5359,6 +5765,26 @@ mod tests {
     struct CrossProviderCompactionExecutor {
         seen: RecordedCompactionTurns,
         compacted: Arc<Notify>,
+    }
+
+    fn test_provider_capabilities() -> Vec<crate::ProviderCapability> {
+        [
+            CodingProvider::Codex,
+            CodingProvider::Claude,
+            CodingProvider::OpenRouter,
+            CodingProvider::OpenAiCompatible,
+        ]
+        .into_iter()
+        .map(|provider| crate::ProviderCapability {
+            provider,
+            installed: true,
+            version: Some("test".to_string()),
+            authenticated: true,
+            auth_detail: Some("test credentials".to_string()),
+            auth_methods: vec![crate::ProviderAuthMethod::Subscription],
+            can_spawn: true,
+        })
+        .collect()
     }
 
     #[async_trait::async_trait]
@@ -6386,7 +6812,7 @@ mod tests {
         assert_eq!(
             turns.lock().unwrap().as_slice(),
             [(
-                "Borg canonical conversation transcript v1 (JSONL). Each line is one persisted message in chronological order. The final line is the current request; respond to it normally.\n{\"role\":\"user\",\"content\":\"first\"}".to_string(),
+                "Borg canonical provider context v2. The history below is a read-only, provider-neutral projection of durable Borg state; answer the current request normally.\n<borg-message>{\"content\":\"first\",\"role\":\"user\"}</borg-message>".to_string(),
                 Vec::new()
             )]
         );
@@ -6501,9 +6927,9 @@ mod tests {
                 .map(|(text, _)| text.as_str())
                 .collect::<Vec<_>>(),
             [
-                "Borg canonical conversation transcript v1 (JSONL). Each line is one persisted message in chronological order. The final line is the current request; respond to it normally.\n{\"role\":\"user\",\"content\":\"first\"}",
-                "Borg canonical conversation transcript v1 (JSONL). Each line is one persisted message in chronological order. The final line is the current request; respond to it normally.\n{\"role\":\"user\",\"content\":\"first\"}\n{\"role\":\"user\",\"content\":\"second\"}",
-                "Borg canonical conversation transcript v1 (JSONL). Each line is one persisted message in chronological order. The final line is the current request; respond to it normally.\n{\"role\":\"user\",\"content\":\"first\"}\n{\"role\":\"user\",\"content\":\"second\"}\n{\"role\":\"user\",\"content\":\"third\"}",
+                "Borg canonical provider context v2. The history below is a read-only, provider-neutral projection of durable Borg state; answer the current request normally.\n<borg-message>{\"content\":\"first\",\"role\":\"user\"}</borg-message>",
+                "Borg canonical provider context v2. The history below is a read-only, provider-neutral projection of durable Borg state; answer the current request normally.\n<borg-message>{\"content\":\"first\",\"role\":\"user\"}</borg-message>\n<borg-message>{\"content\":\"second\",\"role\":\"user\"}</borg-message>",
+                "Borg canonical provider context v2. The history below is a read-only, provider-neutral projection of durable Borg state; answer the current request normally.\n<borg-message>{\"content\":\"first\",\"role\":\"user\"}</borg-message>\n<borg-message>{\"content\":\"second\",\"role\":\"user\"}</borg-message>\n<borg-message>{\"content\":\"third\",\"role\":\"user\"}</borg-message>",
             ]
         );
 
@@ -6612,13 +7038,13 @@ mod tests {
         assert_eq!(
             seen[0],
             (
-                "Borg canonical conversation transcript v1 (JSONL). Each line is one persisted message in chronological order. The final line is the current request; respond to it normally.\n{\"role\":\"user\",\"content\":\"first\"}".to_string(),
+                "Borg canonical provider context v2. The history below is a read-only, provider-neutral projection of durable Borg state; answer the current request normally.\n<borg-message>{\"content\":\"first\",\"role\":\"user\"}</borg-message>".to_string(),
                 Vec::new()
             )
         );
         assert_eq!(
             seen[1].0,
-            "Borg canonical conversation transcript v1 (JSONL). Each line is one persisted message in chronological order. The final line is the current request; respond to it normally.\n{\"role\":\"user\",\"content\":\"second [Image 1]\\n\\nthird\"}"
+            "Borg canonical provider context v2. The history below is a read-only, provider-neutral projection of durable Borg state; answer the current request normally.\n<borg-message>{\"content\":\"second [Image 1]\\n\\nthird\",\"role\":\"user\"}</borg-message>"
         );
         assert_eq!(
             seen[1].1,
@@ -6833,13 +7259,13 @@ mod tests {
         assert_eq!(
             turns[0],
             (
-                "Borg canonical conversation transcript v1 (JSONL). Each line is one persisted message in chronological order. The final line is the current request; respond to it normally.\n{\"role\":\"user\",\"content\":\"first\"}".to_string(),
+                "Borg canonical provider context v2. The history below is a read-only, provider-neutral projection of durable Borg state; answer the current request normally.\n<borg-message>{\"content\":\"first\",\"role\":\"user\"}</borg-message>".to_string(),
                 Vec::new()
             )
         );
         assert_eq!(
             turns[1].0,
-            "Borg canonical conversation transcript v1 (JSONL). Each line is one persisted message in chronological order. The final line is the current request; respond to it normally.\n{\"role\":\"user\",\"content\":\"first\"}\n{\"role\":\"user\",\"content\":\"inspect this [Image 1]\"}"
+            "Borg canonical provider context v2. The history below is a read-only, provider-neutral projection of durable Borg state; answer the current request normally.\n<borg-message>{\"content\":\"first\",\"role\":\"user\"}</borg-message>\n<borg-message>{\"content\":\"inspect this [Image 1]\",\"role\":\"user\"}</borg-message>"
         );
         assert_eq!(turns[1].1, [image]);
     }
@@ -7563,12 +7989,12 @@ mod tests {
                 (
                     CodingProvider::Claude,
                     None,
-                    "Borg canonical conversation transcript v1 (JSONL). Each line is one persisted message in chronological order. The final line is the current request; respond to it normally.\n{\"role\":\"user\",\"content\":\"first\"}".to_string(),
+                    "Borg canonical provider context v2. The history below is a read-only, provider-neutral projection of durable Borg state; answer the current request normally.\n<borg-message>{\"content\":\"first\",\"role\":\"user\"}</borg-message>".to_string(),
                 ),
                 (
                     CodingProvider::Codex,
                     Some("codex-compacted-session".to_string()),
-                    "Borg canonical conversation transcript v1 (JSONL). Each line is one persisted message in chronological order. The final line is the current request; respond to it normally.\n{\"role\":\"user\",\"content\":\"Previous conversation summary:\\n\\nretained summary\"}\n{\"role\":\"user\",\"content\":\"continue\"}".to_string(),
+                    "Borg canonical provider context v2. The history below is a read-only, provider-neutral projection of durable Borg state; answer the current request normally.\n<borg-message>{\"content\":\"Previous conversation summary:\\n\\nretained summary\",\"role\":\"user\"}</borg-message>\n<borg-message>{\"content\":\"continue\",\"role\":\"user\"}</borg-message>".to_string(),
                 ),
             ]
         );
@@ -7666,11 +8092,11 @@ mod tests {
             seen.lock().unwrap().as_slice(),
             [
                 (
-                    "Borg canonical conversation transcript v1 (JSONL). Each line is one persisted message in chronological order. The final line is the current request; respond to it normally.\n{\"role\":\"user\",\"content\":\"first\"}".to_string(),
+                    "Borg canonical provider context v2. The history below is a read-only, provider-neutral projection of durable Borg state; answer the current request normally.\n<borg-message>{\"content\":\"first\",\"role\":\"user\"}</borg-message>".to_string(),
                     None
                 ),
                 (
-                    "Borg canonical conversation transcript v1 (JSONL). Each line is one persisted message in chronological order. The final line is the current request; respond to it normally.\n{\"role\":\"user\",\"content\":\"second\"}".to_string(),
+                    "Borg canonical provider context v2. The history below is a read-only, provider-neutral projection of durable Borg state; answer the current request normally.\n<borg-message>{\"content\":\"second\",\"role\":\"user\"}</borg-message>".to_string(),
                     None
                 ),
             ]
@@ -7824,6 +8250,200 @@ mod tests {
             store.state(session_id).await.unwrap().status,
             Some(SessionStatus::Stopped)
         );
+    }
+
+    #[tokio::test]
+    async fn sqlite_autonomy_job_runs_through_the_session_turn_boundary() {
+        let root = tempdir().unwrap();
+        let session_id = Uuid::new_v4();
+        let writer =
+            SessionWriterLease::acquire(root.path().join(format!("{session_id}.lock"))).unwrap();
+        let store = Arc::new(
+            crate::SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+                .await
+                .unwrap(),
+        );
+        let autonomy = store.autonomy_store().await.unwrap();
+        let job = autonomy
+            .enqueue(crate::EnqueueAutonomyJob {
+                job_id: None,
+                idempotency_key: format!("scheduled-{session_id}"),
+                kind: "prompt".to_string(),
+                payload: json!({"prompt": "run the scheduled verification"}),
+                due_at: Utc::now(),
+                max_attempts: 2,
+                session_id: Some(session_id),
+                goal_id: None,
+            })
+            .await
+            .unwrap();
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(32);
+        let actor = tokio::spawn({
+            let root = root.path().to_path_buf();
+            let store = Arc::clone(&store);
+            async move {
+                run_agent_session_with_store_and_writer(
+                    &root,
+                    session_id,
+                    LaunchSession {
+                        request_id: Uuid::new_v4(),
+                        cwd: root.clone(),
+                        provider: CodingProvider::Codex,
+                        model: None,
+                        effort: None,
+                        fast: Some(false),
+                        response_language: crate::ResponseLanguage::Auto,
+                        permission_mode: PermissionMode::Manual,
+                        name: None,
+                        initial_prompt: None,
+                        capabilities: Default::default(),
+                        subagent_concurrency_limit: None,
+                        extension_skill_roots: Vec::new(),
+                        team_policy: None,
+                    },
+                    command_rx,
+                    event_tx,
+                    Arc::new(RecordingExecutor {
+                        seen: Arc::new(Mutex::new(Vec::new())),
+                        called: Arc::new(Notify::new()),
+                    }),
+                    store,
+                    writer,
+                )
+                .await
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if autonomy
+                    .get(job.job_id)
+                    .await
+                    .unwrap()
+                    .is_some_and(|job| job.state == crate::AutonomyJobState::Completed)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("scheduled job completes through the actor");
+        let completed = autonomy.get(job.job_id).await.unwrap().unwrap();
+        assert_eq!(
+            completed.result,
+            Some(json!({"final_text": "managed executor response"}))
+        );
+        assert!(completed.attempt >= 1);
+        command_tx
+            .send(HostCommand::Stop { session_id })
+            .await
+            .unwrap();
+        actor.await.unwrap().unwrap();
+        while event_rx.try_recv().is_ok() {}
+    }
+
+    #[tokio::test]
+    async fn sqlite_blu_workflow_job_runs_without_blocking_the_session_actor() {
+        let root = tempdir().unwrap();
+        let session_id = Uuid::new_v4();
+        let writer =
+            SessionWriterLease::acquire(root.path().join(format!("{session_id}.lock"))).unwrap();
+        let store = Arc::new(
+            crate::SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+                .await
+                .unwrap(),
+        );
+        let autonomy = store.autonomy_store().await.unwrap();
+        let job = autonomy
+            .enqueue(crate::EnqueueAutonomyJob {
+                job_id: None,
+                idempotency_key: format!("blu-scheduled-{session_id}"),
+                kind: "blu_workflow".to_string(),
+                payload: json!({"name": "scheduled", "source": "return 7"}),
+                due_at: Utc::now(),
+                max_attempts: 1,
+                session_id: Some(session_id),
+                goal_id: None,
+            })
+            .await
+            .unwrap();
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(32);
+        let actor = tokio::spawn({
+            let root = root.path().to_path_buf();
+            let store = Arc::clone(&store);
+            async move {
+                run_agent_session_with_store_and_writer(
+                    &root,
+                    session_id,
+                    LaunchSession {
+                        request_id: Uuid::new_v4(),
+                        cwd: root.clone(),
+                        provider: CodingProvider::OpenRouter,
+                        model: Some("openrouter/auto".to_string()),
+                        effort: None,
+                        fast: Some(false),
+                        response_language: crate::ResponseLanguage::Auto,
+                        permission_mode: PermissionMode::FullAccess,
+                        name: None,
+                        initial_prompt: None,
+                        capabilities: Default::default(),
+                        subagent_concurrency_limit: None,
+                        extension_skill_roots: Vec::new(),
+                        team_policy: None,
+                    },
+                    command_rx,
+                    event_tx,
+                    Arc::new(LocalAgentTurnExecutor::default()),
+                    store,
+                    writer,
+                )
+                .await
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if autonomy
+                    .get(job.job_id)
+                    .await
+                    .unwrap()
+                    .is_some_and(|job| job.state == crate::AutonomyJobState::Completed)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("Blu workflow job completes");
+        let completed = autonomy.get(job.job_id).await.unwrap().unwrap();
+        assert_eq!(
+            completed
+                .result
+                .as_ref()
+                .and_then(|value| value["success"].as_bool()),
+            Some(true)
+        );
+        let events = store.read(session_id).await.unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.kind, SessionEventKind::BluWorkflowStarted { .. }))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.kind, SessionEventKind::BluWorkflowCompleted { .. }))
+        );
+        command_tx
+            .send(HostCommand::Stop { session_id })
+            .await
+            .unwrap();
+        actor.await.unwrap().unwrap();
+        while event_rx.try_recv().is_ok() {}
     }
 
     #[tokio::test]
@@ -8014,6 +8634,8 @@ mod tests {
         let (event_tx, _event_rx) = mpsc::channel(256);
         let actor_root = root.path().to_path_buf();
         let actor_store = store.clone();
+        let mut capabilities = crate::SessionCapabilities::default();
+        capabilities.provider_capabilities = test_provider_capabilities();
         let actor = tokio::spawn(async move {
             run_agent_session_with_store_writer_and_peers(
                 &actor_root,
@@ -8029,7 +8651,7 @@ mod tests {
                     permission_mode: PermissionMode::FullAccess,
                     name: None,
                     initial_prompt: Some("root topic".to_string()),
-                    capabilities: Default::default(),
+                    capabilities,
                     subagent_concurrency_limit: None,
                     extension_skill_roots: Vec::new(),
                     team_policy: None,
@@ -9307,7 +9929,7 @@ mod tests {
         assert_eq!(
             retained_conversation_context(&events).as_deref(),
             Some(
-                "{\"role\":\"user\",\"content\":\"Previous conversation summary:\\n\\npreserved decisions\"}\n{\"role\":\"user\",\"content\":\"new request\"}"
+                "<borg-message>{\"content\":\"Previous conversation summary:\\n\\npreserved decisions\",\"role\":\"user\"}</borg-message>\n<borg-message>{\"content\":\"new request\",\"role\":\"user\"}</borg-message>"
             )
         );
     }
@@ -9540,7 +10162,9 @@ mod tests {
         assert!(second.starts_with(&first));
         assert!(second.contains("read_file"));
         assert!(second.contains("workspace contents"));
-        assert!(second.ends_with("{\"role\":\"user\",\"content\":\"continue\"}"));
+        assert!(second.ends_with(
+            "<borg-message>{\"content\":\"continue\",\"role\":\"user\"}</borg-message>"
+        ));
 
         let mut compacted_events = events;
         compacted_events.push(SessionEvent::new(
@@ -9669,7 +10293,7 @@ mod tests {
         assert_eq!(
             retained_conversation_context(&events).as_deref(),
             Some(
-                "{\"role\":\"user\",\"content\":\"Previous conversation summary:\\n\\npreserved decisions\"}\n{\"role\":\"user\",\"content\":\"continue\"}"
+                "<borg-message>{\"content\":\"Previous conversation summary:\\n\\npreserved decisions\",\"role\":\"user\"}</borg-message>\n<borg-message>{\"content\":\"continue\",\"role\":\"user\"}</borg-message>"
             )
         );
     }

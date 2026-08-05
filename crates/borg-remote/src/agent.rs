@@ -51,6 +51,10 @@ remain the sole voice that answers the user.";
 pub struct AgentTurn {
     pub session_id: Uuid,
     pub message_id: Uuid,
+    /// Durable canonical-context epoch used to derive provider cache identity.
+    /// It changes only at an explicit context boundary, not on reconnect or
+    /// ordinary tool rounds.
+    pub context_generation: u64,
     pub provider: CodingProvider,
     pub provider_session_id: Option<String>,
     pub cwd: PathBuf,
@@ -645,6 +649,7 @@ async fn run_borg_provider_turn(
     let mut provider_session_id = turn.provider_session_id;
     let mut first_model_output = true;
     let mut terminal_seen = false;
+    let mut reasoning_text = String::new();
     while let Some(event) = stream.recv().await {
         match event {
             ChatStreamEvent::ProviderEvent { kind, payload, .. } => {
@@ -703,6 +708,9 @@ async fn run_borg_provider_turn(
                 }
             }
             ChatStreamEvent::ReasoningDelta(delta) => {
+                let Some(delta) = normalize_reasoning_delta(&mut reasoning_text, &delta) else {
+                    continue;
+                };
                 if first_model_output {
                     first_model_output = false;
                     tracing::debug!(
@@ -720,6 +728,7 @@ async fn run_borg_provider_turn(
             ChatStreamEvent::Narration {
                 text: narration_text,
             } => {
+                reasoning_text.clear();
                 if first_model_output {
                     first_model_output = false;
                     tracing::debug!(
@@ -752,6 +761,7 @@ async fn run_borg_provider_turn(
             }
             ChatStreamEvent::Phase { name, input } => {
                 if name == "reasoning_completed" {
+                    reasoning_text.clear();
                     send(&events, SessionEventKind::ReasoningCompleted).await;
                     continue;
                 }
@@ -766,6 +776,7 @@ async fn run_borg_provider_turn(
                 .await;
             }
             ChatStreamEvent::ToolCall { id, name, input } => {
+                reasoning_text.clear();
                 if first_model_output {
                     first_model_output = false;
                     tracing::debug!(
@@ -985,6 +996,23 @@ fn require_provider_stream_terminal(terminal_seen: bool) -> Result<()> {
         "provider stream closed without a terminal Done or Failed event"
     );
     Ok(())
+}
+
+fn normalize_reasoning_delta(accumulated: &mut String, incoming: &str) -> Option<String> {
+    if incoming.is_empty() || incoming == accumulated {
+        return None;
+    }
+    if incoming.starts_with(accumulated.as_str()) {
+        let delta = incoming[accumulated.len()..].to_string();
+        accumulated.clear();
+        accumulated.push_str(incoming);
+        return (!delta.is_empty()).then_some(delta);
+    }
+    if accumulated.starts_with(incoming) {
+        return None;
+    }
+    accumulated.push_str(incoming);
+    Some(incoming.to_string())
 }
 
 fn terminal_assistant_text(
@@ -1393,6 +1421,33 @@ mod tests {
                 .unwrap_err()
                 .to_string(),
             "provider stream closed without a terminal Done or Failed event"
+        );
+    }
+
+    #[test]
+    fn cumulative_reasoning_snapshots_are_not_appended_twice() {
+        let mut accumulated = String::new();
+        assert_eq!(
+            normalize_reasoning_delta(&mut accumulated, "Considering code modifications"),
+            Some("Considering code modifications".to_string())
+        );
+        assert_eq!(
+            normalize_reasoning_delta(
+                &mut accumulated,
+                "Considering code modifications\nI’m checking the repository"
+            ),
+            Some("\nI’m checking the repository".to_string())
+        );
+        assert_eq!(
+            normalize_reasoning_delta(
+                &mut accumulated,
+                "Considering code modifications\nI’m checking the repository"
+            ),
+            None
+        );
+        assert_eq!(
+            accumulated,
+            "Considering code modifications\nI’m checking the repository"
         );
     }
 

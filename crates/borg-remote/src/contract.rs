@@ -198,11 +198,20 @@ impl CodingProvider {
     /// from providers other than the session's current one.
     pub fn for_model(model: &str) -> Option<Self> {
         let model = model.trim();
-        Self::CATALOG_PROVIDERS.into_iter().find(|provider| {
-            provider
-                .model_catalog()
-                .is_some_and(|catalog| catalog.selectable_models.iter().any(|(id, _)| *id == model))
-        })
+        Self::CATALOG_PROVIDERS
+            .into_iter()
+            .find(|provider| {
+                provider.model_catalog().is_some_and(|catalog| {
+                    catalog.selectable_models.iter().any(|(id, _)| *id == model)
+                })
+            })
+            .or_else(|| {
+                (model == borg_provider::openrouter_product_model()
+                    || borg_provider::openrouter_model_entries()
+                        .iter()
+                        .any(|entry| entry.id == model))
+                .then_some(Self::OpenRouter)
+            })
     }
 
     pub fn executable(self) -> &'static str {
@@ -277,14 +286,46 @@ pub enum HostStatus {
     Offline,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct ProviderCapability {
     pub provider: CodingProvider,
     pub installed: bool,
     pub version: Option<String>,
+    /// True when at least one credential or endpoint which can authorize this
+    /// lane is present. This is deliberately a boolean: no secret or token is
+    /// ever sent to a model or persisted in the session journal.
     pub authenticated: bool,
     pub auth_detail: Option<String>,
+    /// The authenticated/configured mechanisms currently usable on the host.
+    /// Older remote payloads omitted this field, so an empty list means that
+    /// the mechanism was not classified by that older host.
+    #[serde(default)]
+    pub auth_methods: Vec<ProviderAuthMethod>,
+    /// Whether the host can admit a child on this provider right now. This is
+    /// stronger than `authenticated`: a provider CLI or endpoint may still be
+    /// missing even when credentials exist.
+    #[serde(default)]
+    pub can_spawn: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum ProviderAuthMethod {
+    Subscription,
+    ApiKey,
+    Endpoint,
+}
+
+impl ProviderAuthMethod {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Subscription => "subscription",
+            Self::ApiKey => "API key",
+            Self::Endpoint => "endpoint",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -450,6 +491,11 @@ pub struct SessionCapabilities {
     pub cloud_sync: bool,
     pub web_relay: bool,
     pub telemetry: bool,
+    /// Host-local provider authentication and admission state. This is safe
+    /// model metadata, never a credential, and is refreshed at session launch
+    /// by local and enrolled hosts.
+    #[serde(default)]
+    pub provider_capabilities: Vec<ProviderCapability>,
 }
 
 impl Default for SessionCapabilities {
@@ -463,8 +509,62 @@ impl Default for SessionCapabilities {
             cloud_sync: true,
             web_relay: true,
             telemetry: false,
+            provider_capabilities: Vec::new(),
         }
     }
+}
+
+/// Render the secret-free provider admission snapshot that is appended to a
+/// model's system instructions. Keep the order stable so a status refresh does
+/// not perturb unrelated prompt bytes and provider caches.
+pub fn provider_capabilities_prompt(capabilities: &[ProviderCapability]) -> String {
+    if capabilities.is_empty() {
+        return "Provider/subagent admission status is unavailable in this session. Do not assume a provider is usable; call `get_provider_capabilities` before spawning a child.".to_string();
+    }
+
+    let mut prompt = String::from(
+        "Host-local provider/subagent admission status (safe metadata; never request or expose credentials):\n",
+    );
+    for provider in [
+        CodingProvider::Codex,
+        CodingProvider::Claude,
+        CodingProvider::OpenRouter,
+        CodingProvider::OpenAiCompatible,
+    ] {
+        let Some(capability) = capabilities.iter().find(|item| item.provider == provider) else {
+            prompt.push_str(&format!(
+                "- {}: status unknown; do not spawn until checked\n",
+                provider.label()
+            ));
+            continue;
+        };
+        let methods = capability
+            .auth_methods
+            .iter()
+            .map(|method| method.label())
+            .collect::<Vec<_>>();
+        let mechanism = if methods.is_empty() {
+            if capability.authenticated {
+                "credentials available (mechanism not classified)".to_string()
+            } else {
+                "no authenticated mechanism detected".to_string()
+            }
+        } else {
+            format!("authenticated via {}", methods.join(" + "))
+        };
+        let status = if capability.can_spawn {
+            "READY"
+        } else if capability.authenticated {
+            "NOT READY (credential present, but the provider executable/endpoint is unavailable)"
+        } else {
+            "NOT READY (not authenticated/configured)"
+        };
+        prompt.push_str(&format!("- {}: {status}; {mechanism}.\n", provider.label()));
+    }
+    prompt.push_str(
+        "Only use `spawn_agent` for a provider marked READY; it performs the same admission check and returns a clear remediation error otherwise. Use `get_provider_capabilities` for the complete structured snapshot.",
+    );
+    prompt
 }
 
 /// Provider-neutral runtime capability names exposed to hosts and clients.
@@ -1224,6 +1324,25 @@ pub struct SessionPayloadRef {
     pub byte_len: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum RuntimeProcessStream {
+    Stdout,
+    Stderr,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum RuntimeProcessStatus {
+    Exited,
+    TimedOut,
+    Terminated,
+    Failed,
+    Orphaned,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[ts(export)]
@@ -1239,6 +1358,13 @@ pub enum SessionEventKind {
         #[serde(default)]
         response_language: ResponseLanguage,
         permission_mode: PermissionMode,
+    },
+    /// Host-local, secret-free provider admission state captured when the
+    /// session actor starts or resumes. It is durable metadata, not model
+    /// context, so every provider lane can make the same spawn decision after
+    /// a crash or reconnect.
+    ProviderCapabilitiesUpdated {
+        providers: Vec<ProviderCapability>,
     },
     /// Effective provider configuration captured for one admitted turn.
     ///
@@ -1289,6 +1415,60 @@ pub enum SessionEventKind {
         input: Option<Value>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         input_ref: Option<SessionPayloadRef>,
+    },
+    /// A native process has been admitted to the session runtime. Process
+    /// handles are host-local, so these events are durable for recovery but
+    /// deliberately never become model context or fork history.
+    RuntimeProcessStarted {
+        process_id: Uuid,
+        pid: u32,
+        command: String,
+        cwd: PathBuf,
+    },
+    RuntimeProcessOutput {
+        process_id: Uuid,
+        stream: RuntimeProcessStream,
+        chunk: String,
+    },
+    RuntimeProcessCompleted {
+        process_id: Uuid,
+        pid: u32,
+        status: RuntimeProcessStatus,
+        exit_code: Option<i32>,
+        timed_out: bool,
+        stdout: String,
+        stderr: String,
+        stdout_omitted_bytes: usize,
+        stderr_omitted_bytes: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    /// Durable lifecycle for an embedded Blu workflow. These events are
+    /// runtime journal entries rather than model transcript content.
+    BluWorkflowStarted {
+        workflow_id: Uuid,
+        source_hash: String,
+        name: String,
+    },
+    BluWorkflowCallRequested {
+        workflow_id: Uuid,
+        call_id: u64,
+        operation: String,
+        request: Value,
+    },
+    BluWorkflowCallCompleted {
+        workflow_id: Uuid,
+        call_id: u64,
+        operation: String,
+        response: Option<Value>,
+        error: Option<String>,
+    },
+    BluWorkflowCompleted {
+        workflow_id: Uuid,
+        source_hash: String,
+        success: bool,
+        result: Option<Value>,
+        error: Option<String>,
     },
     ApprovalRequested {
         approval_id: String,
@@ -1466,6 +1646,10 @@ mod tests {
         assert_eq!(
             CodingProvider::for_model("gpt-5.6-sol"),
             Some(CodingProvider::Codex)
+        );
+        assert_eq!(
+            CodingProvider::for_model("openrouter/auto"),
+            Some(CodingProvider::OpenRouter)
         );
         assert_eq!(CodingProvider::for_model("some/openrouter-model"), None);
     }
@@ -1694,6 +1878,36 @@ mod tests {
                 .get("extension_skill_roots")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn provider_prompt_exposes_safe_auth_and_spawn_state_without_secrets() {
+        let secret = "sk-do-not-render";
+        let prompt = provider_capabilities_prompt(&[
+            ProviderCapability {
+                provider: CodingProvider::Codex,
+                installed: true,
+                version: Some("test".to_string()),
+                authenticated: true,
+                auth_detail: Some("Codex subscription authenticated".to_string()),
+                auth_methods: vec![ProviderAuthMethod::Subscription],
+                can_spawn: true,
+            },
+            ProviderCapability {
+                provider: CodingProvider::OpenRouter,
+                installed: true,
+                version: Some("test".to_string()),
+                authenticated: true,
+                auth_detail: Some(format!("API key configured: {secret}")),
+                auth_methods: vec![ProviderAuthMethod::ApiKey],
+                can_spawn: true,
+            },
+        ]);
+        assert!(prompt.contains("Codex: READY"));
+        assert!(prompt.contains("subscription"));
+        assert!(prompt.contains("OpenRouter: READY"));
+        assert!(prompt.contains("API key"));
+        assert!(!prompt.contains(secret));
     }
 }
 

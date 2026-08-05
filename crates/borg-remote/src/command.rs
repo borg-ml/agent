@@ -7,7 +7,6 @@ use chrono::Utc;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use uuid::Uuid;
 
-use crate::receipt::atomic_write_secure;
 use crate::{
     WorkspaceCommandErrorCode, WorkspaceCommandOutcome, WorkspaceCommandOutput,
     WorkspaceCommandRequest, WorkspaceCommandResponse,
@@ -111,10 +110,11 @@ async fn execute(
         .and_then(|result| result)
         .map_err(anyhow_failure)?;
     let finished_at = Utc::now();
-    let manifest_path = root
-        .join("artifacts")
-        .join("commands")
-        .join(format!("{command_id}.json"));
+    // The complete output is persisted by the host's SQLite receipt in the
+    // same transaction as the mutation identity. Keep only a stable virtual
+    // locator in the wire contract; writing a second JSON manifest beside the
+    // workspace would create an untracked, non-transactional source of truth.
+    let manifest_path = PathBuf::from(format!("borg://artifact/command/{command_id}"));
     let output = WorkspaceCommandOutput {
         id: command_id,
         workspace_id: request.workspace_id,
@@ -133,8 +133,6 @@ async fn execute(
         finished_at,
         manifest_path: manifest_path.clone(),
     };
-    let bytes = serde_json::to_vec_pretty(&output).map_err(|error| anyhow_failure(error.into()))?;
-    atomic_write_secure(&manifest_path, &bytes).map_err(anyhow_failure)?;
     Ok(output)
 }
 
@@ -331,6 +329,9 @@ mod tests {
         };
         assert_eq!(output.stdout, "1234");
         assert!(output.stdout_truncated);
-        assert!(output.manifest_path.is_file());
+        assert_eq!(
+            output.manifest_path,
+            PathBuf::from(format!("borg://artifact/command/{}", output.id))
+        );
     }
 }

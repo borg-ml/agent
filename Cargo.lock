@@ -153,7 +153,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -164,7 +164,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -425,6 +425,71 @@ dependencies = [
 ]
 
 [[package]]
+name = "blu-bytecode"
+version = "0.1.0"
+source = "git+https://github.com/borg-ml/blu.git?branch=main#9cf2a6b187d868471d50155ad37a5e5342006e66"
+dependencies = [
+ "blu-core",
+]
+
+[[package]]
+name = "blu-compiler"
+version = "0.1.0"
+source = "git+https://github.com/borg-ml/blu.git?branch=main#9cf2a6b187d868471d50155ad37a5e5342006e66"
+dependencies = [
+ "blu-bytecode",
+ "blu-core",
+ "blu-syntax",
+ "cc",
+ "luau0-src",
+ "sha2",
+]
+
+[[package]]
+name = "blu-core"
+version = "0.1.0"
+source = "git+https://github.com/borg-ml/blu.git?branch=main#9cf2a6b187d868471d50155ad37a5e5342006e66"
+
+[[package]]
+name = "blu-lang"
+version = "0.1.0"
+source = "git+https://github.com/borg-ml/blu.git?branch=main#9cf2a6b187d868471d50155ad37a5e5342006e66"
+dependencies = [
+ "blu-bytecode",
+ "blu-compiler",
+ "blu-core",
+ "blu-package",
+ "blu-runtime",
+]
+
+[[package]]
+name = "blu-package"
+version = "0.1.0"
+source = "git+https://github.com/borg-ml/blu.git?branch=main#9cf2a6b187d868471d50155ad37a5e5342006e66"
+dependencies = [
+ "blu-bytecode",
+ "blu-core",
+ "sha2",
+]
+
+[[package]]
+name = "blu-runtime"
+version = "0.1.0"
+source = "git+https://github.com/borg-ml/blu.git?branch=main#9cf2a6b187d868471d50155ad37a5e5342006e66"
+dependencies = [
+ "blu-bytecode",
+ "blu-core",
+]
+
+[[package]]
+name = "blu-syntax"
+version = "0.1.0"
+source = "git+https://github.com/borg-ml/blu.git?branch=main#9cf2a6b187d868471d50155ad37a5e5342006e66"
+dependencies = [
+ "blu-core",
+]
+
+[[package]]
 name = "borg"
 version = "0.1.39"
 dependencies = [
@@ -501,6 +566,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "base64",
+ "blu-lang",
  "borg-provider",
  "chrono",
  "futures",
@@ -510,6 +576,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "tempfile",
  "tokio",
@@ -592,6 +659,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5add81bb678e6cb321aff7fa0dc7689ad82b112dbc032cea19f91d6b8e3582b9"
 dependencies = [
  "find-msvc-tools",
+ "jobserver",
+ "libc",
  "shlex 2.0.1",
 ]
 
@@ -685,7 +754,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 [[package]]
 name = "claude-agents"
 version = "0.1.0"
-source = "git+https://github.com/borg-ml/claude-agents.git?rev=0e41be9#0e41be9eed5ffe91b77b79c6742b192b0d917f07"
+source = "git+https://github.com/borg-ml/claude-agents.git?branch=main#0e41be9eed5ffe91b77b79c6742b192b0d917f07"
 dependencies = [
  "anyhow",
  "serde",
@@ -1089,7 +1158,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1968,6 +2037,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
+name = "jobserver"
+version = "0.1.35"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c00acbd29eabad4a2392fa0e921c874934dbbf4194312ad20f04a0ed67a3cb3"
+dependencies = [
+ "getrandom 0.4.3",
+ "libc",
+]
+
+[[package]]
 name = "js-sys"
 version = "0.3.103"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2095,6 +2174,15 @@ name = "lru-slab"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
+
+[[package]]
+name = "luau0-src"
+version = "0.20.7+luau728"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6aa644236297645ba62215330b2a2d60cf7ee6263c33578baf8e54662868ed59"
+dependencies = [
+ "cc",
+]
 
 [[package]]
 name = "mac_address"
@@ -2238,7 +2326,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -2419,7 +2507,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d8fae84b431384b68627d0f9b3b1245fcf9f46f6c0e3dc902e9dce64edd1967"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -2842,7 +2930,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3227,7 +3315,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3573,7 +3661,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -3941,7 +4029,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3974,7 +4062,7 @@ dependencies = [
  "parking_lot",
  "rustix",
  "signal-hook",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -4941,7 +5029,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

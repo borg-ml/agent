@@ -15,16 +15,16 @@ use tokio::process::Command;
 use tokio::sync::{Mutex, mpsc, watch};
 use uuid::Uuid;
 
-use crate::receipt::{ReceiptState, ReceiptStore, atomic_write_secure};
+use crate::receipt::{ReceiptState, SqliteReceiptStore};
 use crate::{
     AgentTurnExecutor, CodingProvider, HostCapabilities, HostCommand, HostCommandEnvelope,
-    HostHeartbeat, LaunchSession, ProviderCapability, REMOTE_PROTOCOL_VERSION, RemoteHost,
-    RemoteHostIdentity, SessionEvent, SessionLiveEvent, SessionPayloadRef, SessionStore,
-    SessionWriterLease, SqliteSessionStore, WorkspaceAttachment, WorkspaceCommandErrorCode,
-    WorkspaceCommandOutcome, WorkspaceCommandRequest, WorkspaceCommandResponse,
-    WorkspaceFilesystemErrorCode, WorkspaceFilesystemOutcome, WorkspaceFilesystemRequest,
-    WorkspaceFilesystemResponse, execute_workspace_command, execute_workspace_filesystem,
-    run_agent_session_with_store_and_writer,
+    HostHeartbeat, LaunchSession, ProviderAuthMethod, ProviderCapability, REMOTE_PROTOCOL_VERSION,
+    RemoteHost, RemoteHostIdentity, SessionEvent, SessionLiveEvent, SessionPayloadRef,
+    SessionStore, SessionWriterLease, SqliteSessionStore, WorkspaceAttachment,
+    WorkspaceCommandErrorCode, WorkspaceCommandOutcome, WorkspaceCommandRequest,
+    WorkspaceCommandResponse, WorkspaceFilesystemErrorCode, WorkspaceFilesystemOutcome,
+    WorkspaceFilesystemRequest, WorkspaceFilesystemResponse, execute_workspace_command,
+    execute_workspace_filesystem, run_agent_session_with_store_and_writer,
 };
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -114,25 +114,6 @@ struct PersistedLaunchMetadata {
     request: LaunchSession,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     attachment: Option<WorkspaceAttachment>,
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum StoredLaunchMetadata {
-    Current(Box<PersistedLaunchMetadata>),
-    Legacy(Box<LaunchSession>),
-}
-
-impl StoredLaunchMetadata {
-    fn into_current(self) -> PersistedLaunchMetadata {
-        match self {
-            Self::Current(metadata) => *metadata,
-            Self::Legacy(request) => PersistedLaunchMetadata {
-                request: *request,
-                attachment: None,
-            },
-        }
-    }
 }
 
 async fn upload_event_payloads(
@@ -616,15 +597,7 @@ pub async fn probe_capabilities(roots: Vec<PathBuf>) -> HostCapabilities {
 }
 
 async fn probe_capabilities_for_roots(roots: Vec<PathBuf>) -> HostCapabilities {
-    let mut providers = Vec::new();
-    for provider in [
-        CodingProvider::Codex,
-        CodingProvider::Claude,
-        CodingProvider::OpenRouter,
-        CodingProvider::OpenAiCompatible,
-    ] {
-        providers.push(probe_provider(provider).await);
-    }
+    let providers = probe_provider_capabilities().await;
     HostCapabilities {
         protocol_version: REMOTE_PROTOCOL_VERSION,
         providers,
@@ -632,6 +605,19 @@ async fn probe_capabilities_for_roots(roots: Vec<PathBuf>) -> HostCapabilities {
         can_launch: true,
         workspace_attachment: Some(workspace_attachment_capabilities()),
     }
+}
+
+/// Probe every provider lane concurrently and return only secret-free
+/// admission metadata. This is used at local launch and again at an enrolled
+/// host boundary; a controller-supplied snapshot is never trusted.
+pub async fn probe_provider_capabilities() -> Vec<ProviderCapability> {
+    let (codex, claude, openrouter, compatible) = tokio::join!(
+        probe_provider(CodingProvider::Codex),
+        probe_provider(CodingProvider::Claude),
+        probe_provider(CodingProvider::OpenRouter),
+        probe_provider(CodingProvider::OpenAiCompatible),
+    );
+    vec![codex, claude, openrouter, compatible]
 }
 
 fn workspace_attachment_capabilities() -> crate::WorkspaceAttachmentCapabilities {
@@ -648,24 +634,95 @@ async fn probe_provider(provider: CodingProvider) -> ProviderCapability {
         .await
         .ok()
         .filter(|value| !value.is_empty());
-    let auth = match provider {
-        CodingProvider::Codex | CodingProvider::Claude => provider_auth_status(provider).await,
-        CodingProvider::OpenRouter => std::env::var("OPENROUTER_API_KEY")
-            .map(|_| "OpenRouter credentials available".to_string())
-            .map_err(anyhow::Error::from),
-        CodingProvider::OpenAiCompatible => Ok("OpenAI-compatible endpoint available".to_string()),
+    let mut auth_methods = Vec::new();
+    let mut detail = Vec::new();
+    match provider {
+        CodingProvider::Codex => {
+            if provider_auth_status(provider)
+                .await
+                .is_ok_and(|output| codex_auth_status_authenticated(&output))
+            {
+                auth_methods.push(ProviderAuthMethod::Subscription);
+                detail.push("Codex subscription authenticated");
+            }
+            if nonempty_env("OPENAI_API_KEY").is_some() {
+                auth_methods.push(ProviderAuthMethod::ApiKey);
+                detail.push("OpenAI API key configured");
+            }
+        }
+        CodingProvider::Claude => {
+            if provider_auth_status(provider)
+                .await
+                .is_ok_and(|output| claude_auth_status_authenticated(&output))
+            {
+                auth_methods.push(ProviderAuthMethod::Subscription);
+                detail.push("Claude subscription authenticated");
+            }
+            if borg_provider::credentials::api_key(
+                borg_provider::credentials::ApiKeyCredential::Anthropic,
+            )
+            .is_some()
+            {
+                auth_methods.push(ProviderAuthMethod::ApiKey);
+                detail.push("Anthropic API key configured");
+            }
+        }
+        CodingProvider::OpenRouter => {
+            if borg_provider::credentials::api_key(
+                borg_provider::credentials::ApiKeyCredential::OpenRouter,
+            )
+            .is_some()
+            {
+                auth_methods.push(ProviderAuthMethod::ApiKey);
+                detail.push("OpenRouter API key configured");
+            }
+        }
+        CodingProvider::OpenAiCompatible => {
+            // The native generic route deliberately has a localhost default,
+            // but it is only an advertised lane after the caller configured an
+            // endpoint or model (the local-server bootstrap does that before
+            // probing). A local endpoint does not require a bearer key.
+            let endpoint_configured = nonempty_env("BORG_OPENAI_COMPATIBLE_BASE_URL").is_some()
+                || nonempty_env("BORG_OPENAI_COMPATIBLE_MODEL").is_some();
+            if endpoint_configured {
+                auth_methods.push(ProviderAuthMethod::Endpoint);
+                detail.push("OpenAI-compatible endpoint configured");
+                if nonempty_env("BORG_OPENAI_COMPATIBLE_API_KEY")
+                    .or_else(|| nonempty_env("BORG_OPENAI_API_KEY"))
+                    .or_else(|| nonempty_env("OPENAI_API_KEY"))
+                    .is_some()
+                {
+                    auth_methods.push(ProviderAuthMethod::ApiKey);
+                    detail.push("endpoint API key configured");
+                }
+            }
+        }
+    }
+    let authenticated = !auth_methods.is_empty();
+    let installed = match provider {
+        // These routes execute in Borg's native harness; they do not depend
+        // on a separately installed `borg` executable being discoverable in a
+        // service user's PATH.
+        CodingProvider::OpenRouter | CodingProvider::OpenAiCompatible => true,
+        CodingProvider::Codex | CodingProvider::Claude => version.is_some(),
     };
-    let authenticated = auth.as_ref().is_ok_and(|output| match provider {
-        CodingProvider::Claude => claude_auth_status_authenticated(output),
-        _ => !output.trim().is_empty(),
-    });
+    let can_spawn = installed && authenticated;
     ProviderCapability {
         provider,
-        installed: version.is_some(),
+        installed,
         version,
         authenticated,
-        auth_detail: authenticated.then(|| "Provider credentials available".to_string()),
+        auth_detail: (!detail.is_empty()).then(|| detail.join("; ")),
+        auth_methods,
+        can_spawn,
     }
+}
+
+fn nonempty_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 async fn provider_auth_status(provider: CodingProvider) -> Result<String> {
@@ -690,6 +747,26 @@ fn claude_auth_status_authenticated(output: &str) -> bool {
                 && !normalized.contains("logged out")
         }
     }
+}
+
+fn codex_auth_status_authenticated(output: &str) -> bool {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(output)
+        && let Some(authenticated) = value
+            .get("loggedIn")
+            .or_else(|| value.get("logged_in"))
+            .or_else(|| value.get("authenticated"))
+            .and_then(serde_json::Value::as_bool)
+    {
+        return authenticated;
+    }
+    let normalized = output.to_ascii_lowercase();
+    !normalized.trim().is_empty()
+        && !normalized.contains("not logged in")
+        && !normalized.contains("logged out")
+        && !normalized.contains("unauthenticated")
+        && (normalized.contains("logged in")
+            || normalized.contains("authenticated")
+            || normalized.contains("success"))
 }
 
 async fn command_output(executable: &str, args: &[&str]) -> Result<String> {
@@ -725,8 +802,18 @@ pub fn provider_credentials_present(provider: CodingProvider) -> bool {
             .is_some()
                 || home.is_some_and(|home| home.join(".claude/.credentials.json").is_file())
         }
-        CodingProvider::Codex => home.is_some_and(|home| home.join(".codex/auth.json").is_file()),
-        _ => true,
+        CodingProvider::Codex => {
+            nonempty_env("OPENAI_API_KEY").is_some()
+                || home.is_some_and(|home| home.join(".codex/auth.json").is_file())
+        }
+        CodingProvider::OpenRouter => borg_provider::credentials::api_key(
+            borg_provider::credentials::ApiKeyCredential::OpenRouter,
+        )
+        .is_some(),
+        CodingProvider::OpenAiCompatible => {
+            nonempty_env("BORG_OPENAI_COMPATIBLE_BASE_URL").is_some()
+                || nonempty_env("BORG_OPENAI_COMPATIBLE_MODEL").is_some()
+        }
     }
 }
 
@@ -805,6 +892,9 @@ pub async fn run_host_with_executor_factory(
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join("sessions");
+    let session_store =
+        Arc::new(SqliteSessionStore::open(session_root.join("sessions.sqlite3")).await?);
+    let receipts = Arc::new(SqliteReceiptStore::open(session_store.pool().clone()).await?);
     let mut capabilities = probe_capabilities_for_roots(config.roots.clone()).await;
     let mut capabilities_probed_at = Instant::now();
     loop {
@@ -859,6 +949,8 @@ pub async fn run_host_with_executor_factory(
                 config.clone(),
                 session_root.clone(),
                 sessions.clone(),
+                Arc::clone(&session_store),
+                Arc::clone(&receipts),
                 Arc::clone(&executor_factory),
                 envelope.command,
             )
@@ -1166,16 +1258,12 @@ async fn dispatch(
     config: HostConfig,
     session_root: PathBuf,
     sessions: Arc<Mutex<HashMap<Uuid, mpsc::Sender<HostCommand>>>>,
+    session_store: Arc<SqliteSessionStore>,
+    receipts: Arc<SqliteReceiptStore>,
     executor_factory: HostExecutorFactory,
     command: HostCommand,
 ) -> bool {
     if let HostCommand::WorkspaceFilesystem { request } = &command {
-        let receipts = ReceiptStore::new(
-            session_root
-                .parent()
-                .unwrap_or(&session_root)
-                .join("filesystem-receipts"),
-        );
         let Some(response) = filesystem_response(&receipts, &config, request).await else {
             return false;
         };
@@ -1221,12 +1309,6 @@ async fn dispatch(
         return true;
     }
     if let HostCommand::WorkspaceCommand { request } = &command {
-        let receipts = ReceiptStore::new(
-            session_root
-                .parent()
-                .unwrap_or(&session_root)
-                .join("command-receipts"),
-        );
         let Some(response) = workspace_command_response(&receipts, &config, request).await else {
             return false;
         };
@@ -1277,9 +1359,13 @@ async fn dispatch(
         attachment,
     } = command
     {
-        let metadata_path = session_root.join(format!("{session_id}.launch.json"));
         if let Err(error) = validate_workspace_attachment(&config, session_id, attachment.as_ref())
-            .and_then(|()| persist_launch_metadata(&metadata_path, &request, attachment.as_ref()))
+        {
+            tracing::error!(%error, %session_id, "failed to persist remote session launch");
+            return false;
+        }
+        if let Err(error) =
+            persist_launch_metadata(&session_store, session_id, &request, attachment.as_ref()).await
         {
             tracing::error!(%error, %session_id, "failed to persist remote session launch");
             return false;
@@ -1300,12 +1386,16 @@ async fn dispatch(
         return true;
     }
     if let Some(session_id) = command.session_id() {
-        let metadata_path = session_root.join(format!("{session_id}.launch.json"));
-        let attachment = fs::read(&metadata_path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<StoredLaunchMetadata>(&bytes).ok())
-            .map(StoredLaunchMetadata::into_current)
-            .and_then(|metadata| metadata.attachment);
+        let metadata = match load_launch_metadata(&session_store, session_id).await {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                tracing::error!(%error, %session_id, "failed to load stored launch metadata");
+                return false;
+            }
+        };
+        let attachment = metadata
+            .as_ref()
+            .and_then(|metadata| metadata.attachment.as_ref());
         if let Some(attachment) = attachment.as_ref()
             && let Err(error) = authorize_workspace_command(attachment, &command)
         {
@@ -1319,12 +1409,7 @@ async fn dispatch(
         let session = match existing {
             Some(session) => Some(session),
             None => {
-                let metadata_path = session_root.join(format!("{session_id}.launch.json"));
-                let request = fs::read(&metadata_path)
-                    .ok()
-                    .and_then(|bytes| serde_json::from_slice::<StoredLaunchMetadata>(&bytes).ok())
-                    .map(StoredLaunchMetadata::into_current);
-                if let Some(metadata) = request {
+                if let Some(metadata) = metadata {
                     if let Err(error) = validate_workspace_attachment(
                         &config,
                         session_id,
@@ -1358,11 +1443,11 @@ async fn dispatch(
 }
 
 async fn filesystem_response(
-    receipts: &ReceiptStore,
+    receipts: &SqliteReceiptStore,
     config: &HostConfig,
     request: &WorkspaceFilesystemRequest,
 ) -> Option<WorkspaceFilesystemResponse> {
-    let state = match receipts.load(request.request_id, request) {
+    let state = match receipts.load(request.request_id, request).await {
         Ok(state) => state,
         Err(error) => {
             tracing::warn!(%error, request_id = %request.request_id, "failed to read filesystem receipt");
@@ -1370,13 +1455,13 @@ async fn filesystem_response(
         }
     };
     match state {
-        ReceiptState::Terminal(response) | ReceiptState::Legacy(response) => Some(response),
+        ReceiptState::Terminal(response) => Some(response),
         ReceiptState::Started => {
             let response = indeterminate_filesystem_response(
                 request,
                 "the host restarted after this mutation began; Borg will not replay it because its outcome cannot be proven",
             );
-            persist_filesystem_terminal(receipts, request, &response)
+            persist_filesystem_terminal(receipts, request, &response).await
         }
         ReceiptState::Conflict => Some(indeterminate_filesystem_response(
             request,
@@ -1390,23 +1475,23 @@ async fn filesystem_response(
         }
         ReceiptState::Missing | ReceiptState::Corrupt => {
             if request.operation.is_mutating()
-                && let Err(error) = receipts.begin(request.request_id, request)
+                && let Err(error) = receipts.begin(request.request_id, request).await
             {
                 tracing::warn!(%error, request_id = %request.request_id, "failed to durably begin filesystem mutation");
                 return None;
             }
             let response = execute_workspace_filesystem(&config.roots, request.clone()).await;
-            persist_filesystem_terminal(receipts, request, &response)
+            persist_filesystem_terminal(receipts, request, &response).await
         }
     }
 }
 
-fn persist_filesystem_terminal(
-    receipts: &ReceiptStore,
+async fn persist_filesystem_terminal(
+    receipts: &SqliteReceiptStore,
     request: &WorkspaceFilesystemRequest,
     response: &WorkspaceFilesystemResponse,
 ) -> Option<WorkspaceFilesystemResponse> {
-    if let Err(error) = receipts.finish(request.request_id, request, response) {
+    if let Err(error) = receipts.finish(request.request_id, request, response).await {
         tracing::warn!(%error, request_id = %request.request_id, "failed to persist terminal filesystem receipt");
         return None;
     }
@@ -1429,11 +1514,11 @@ fn indeterminate_filesystem_response(
 }
 
 async fn workspace_command_response(
-    receipts: &ReceiptStore,
+    receipts: &SqliteReceiptStore,
     config: &HostConfig,
     request: &WorkspaceCommandRequest,
 ) -> Option<WorkspaceCommandResponse> {
-    let state = match receipts.load(request.request_id, request) {
+    let state = match receipts.load(request.request_id, request).await {
         Ok(state) => state,
         Err(error) => {
             tracing::warn!(%error, request_id = %request.request_id, "failed to read workspace command receipt");
@@ -1441,13 +1526,13 @@ async fn workspace_command_response(
         }
     };
     match state {
-        ReceiptState::Terminal(response) | ReceiptState::Legacy(response) => Some(response),
+        ReceiptState::Terminal(response) => Some(response),
         ReceiptState::Started => {
             let response = indeterminate_command_response(
                 request,
                 "the host restarted after this command began; Borg will not replay it because its side effects cannot be proven",
             );
-            persist_command_terminal(receipts, request, &response)
+            persist_command_terminal(receipts, request, &response).await
         }
         ReceiptState::Conflict => Some(indeterminate_command_response(
             request,
@@ -1458,22 +1543,22 @@ async fn workspace_command_response(
             "the durable command receipt is unreadable; Borg will not replay the command",
         )),
         ReceiptState::Missing => {
-            if let Err(error) = receipts.begin(request.request_id, request) {
+            if let Err(error) = receipts.begin(request.request_id, request).await {
                 tracing::warn!(%error, request_id = %request.request_id, "failed to durably begin workspace command");
                 return None;
             }
             let response = execute_workspace_command(&config.roots, request.clone()).await;
-            persist_command_terminal(receipts, request, &response)
+            persist_command_terminal(receipts, request, &response).await
         }
     }
 }
 
-fn persist_command_terminal(
-    receipts: &ReceiptStore,
+async fn persist_command_terminal(
+    receipts: &SqliteReceiptStore,
     request: &WorkspaceCommandRequest,
     response: &WorkspaceCommandResponse,
 ) -> Option<WorkspaceCommandResponse> {
-    if let Err(error) = receipts.finish(request.request_id, request, response) {
+    if let Err(error) = receipts.finish(request.request_id, request, response).await {
         tracing::warn!(%error, request_id = %request.request_id, "failed to persist terminal workspace command receipt");
         return None;
     }
@@ -1567,8 +1652,9 @@ fn authorize_workspace_command(
     Ok(())
 }
 
-fn persist_launch_metadata(
-    path: &Path,
+async fn persist_launch_metadata(
+    store: &SqliteSessionStore,
+    session_id: Uuid,
     request: &LaunchSession,
     attachment: Option<&WorkspaceAttachment>,
 ) -> Result<()> {
@@ -1576,21 +1662,22 @@ fn persist_launch_metadata(
         request: request.clone(),
         attachment: attachment.cloned(),
     };
-    if path.exists() {
-        let bytes = fs::read(path)
-            .with_context(|| format!("failed to read launch metadata {}", path.display()))?;
-        let existing: StoredLaunchMetadata = serde_json::from_slice(&bytes)
-            .with_context(|| format!("invalid launch metadata {}", path.display()))?;
-        if serde_json::to_value(existing.into_current())? != serde_json::to_value(&current)? {
-            bail!(
-                "session launch metadata already exists for a different launch request: {}",
-                path.display()
-            );
-        }
-        return Ok(());
-    }
-    atomic_write_secure(path, &serde_json::to_vec_pretty(&current)?)
-        .with_context(|| format!("failed to atomically write {}", path.display()))
+    store
+        .persist_host_launch_metadata(session_id, &serde_json::to_value(current)?)
+        .await
+}
+
+async fn load_launch_metadata(
+    store: &SqliteSessionStore,
+    session_id: Uuid,
+) -> Result<Option<PersistedLaunchMetadata>> {
+    store
+        .load_host_launch_metadata(session_id)
+        .await?
+        .map(|metadata| {
+            serde_json::from_value(metadata).context("invalid persisted host launch metadata")
+        })
+        .transpose()
 }
 
 fn discard_serialized_extension_roots(launch: &mut LaunchSession) {
@@ -1648,6 +1735,10 @@ async fn run_session(
 ) -> Result<()> {
     launch.cwd = validate_host_cwd(&config.roots, &launch.cwd)?;
     discard_serialized_extension_roots(&mut launch);
+    // The controller may have sent a stale or malicious capability snapshot.
+    // Authentication is a host-local fact, so refresh it after the workspace
+    // boundary and before constructing the child coordinator.
+    launch.capabilities.provider_capabilities = probe_provider_capabilities().await;
     let lock_path = session_root.join(format!("{session_id}.lock"));
     let writer = SessionWriterLease::acquire(&lock_path)?;
     let sqlite_store =
@@ -1816,12 +1907,22 @@ fn platform() -> String {
 #[cfg(test)]
 mod tests {
     use chrono::Duration as ChronoDuration;
+    use sqlx::sqlite::SqlitePoolOptions;
     use tempfile::tempdir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
 
     use super::*;
     use crate::WorkspaceFilesystemOperation;
+
+    async fn sqlite_receipts() -> SqliteReceiptStore {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        SqliteReceiptStore::open(pool).await.unwrap()
+    }
 
     #[test]
     fn host_boundary_discards_controller_supplied_extension_roots() {
@@ -2521,13 +2622,16 @@ mod tests {
             extension_skill_roots: Vec::new(),
             team_policy: None,
         };
-        persist_launch_metadata(
-            &root.path().join(format!("{session_id}.launch.json")),
-            &launch,
-            Some(&attachment),
-        )
-        .unwrap();
+        let session_store = Arc::new(
+            SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+                .await
+                .unwrap(),
+        );
+        persist_launch_metadata(&session_store, session_id, &launch, Some(&attachment))
+            .await
+            .unwrap();
         let sessions = Arc::new(Mutex::new(HashMap::new()));
+        let receipts = Arc::new(sqlite_receipts().await);
 
         assert!(
             dispatch(
@@ -2535,6 +2639,8 @@ mod tests {
                 config,
                 root.path().to_path_buf(),
                 Arc::clone(&sessions),
+                session_store,
+                receipts,
                 default_host_executor_factory(),
                 HostCommand::Stop { session_id },
             )
@@ -2623,8 +2729,8 @@ mod tests {
                 recursive: false,
             },
         };
-        let receipts = ReceiptStore::new(root.path().join("receipts"));
-        receipts.begin(request.request_id, &request).unwrap();
+        let receipts = sqlite_receipts().await;
+        receipts.begin(request.request_id, &request).await.unwrap();
 
         let response = filesystem_response(&receipts, &test_config(root.path()), &request)
             .await
@@ -2642,6 +2748,7 @@ mod tests {
         assert!(matches!(
             receipts
                 .load::<_, WorkspaceFilesystemResponse>(request.request_id, &request)
+                .await
                 .unwrap(),
             ReceiptState::Terminal(_)
         ));
@@ -2665,8 +2772,8 @@ mod tests {
             timeout_ms: 1_000,
             output_max_bytes: 1_024,
         };
-        let receipts = ReceiptStore::new(root.path().join("receipts"));
-        receipts.begin(request.request_id, &request).unwrap();
+        let receipts = sqlite_receipts().await;
+        receipts.begin(request.request_id, &request).await.unwrap();
 
         let response = workspace_command_response(&receipts, &test_config(root.path()), &request)
             .await
@@ -2705,6 +2812,14 @@ mod tests {
         ));
         assert!(!claude_auth_status_authenticated(""));
         assert!(!claude_auth_status_authenticated("Logged out"));
+    }
+
+    #[test]
+    fn codex_auth_status_rejects_non_authenticated_status_text() {
+        assert!(codex_auth_status_authenticated("Logged in using ChatGPT"));
+        assert!(codex_auth_status_authenticated("authenticated"));
+        assert!(!codex_auth_status_authenticated("Not logged in"));
+        assert!(!codex_auth_status_authenticated(""));
     }
 
     fn test_config(root: &Path) -> HostConfig {

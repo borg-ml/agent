@@ -3,10 +3,14 @@
 //! This module decides *what* a team may do. Hosts turn approved decisions
 //! into processes, sessions, and provider calls.
 
+use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet};
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use sqlx::sqlite::SqliteRow;
+use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 use uuid::Uuid;
 
 /// Stable identifier for a provider adapter, not a provider-specific enum.
@@ -977,6 +981,414 @@ impl TeamPolicyRuntime {
     }
 }
 
+/// Upper bound for the number of policy events retained by one runtime.
+pub const MAX_TEAM_POLICY_EVENTS: usize = 10_000;
+/// Upper bound for one page returned by [`SqliteTeamPolicyStore::events_after`].
+pub const MAX_TEAM_POLICY_PAGE_SIZE: usize = 256;
+/// Upper bound for a serialized policy.
+pub const MAX_TEAM_POLICY_BYTES: usize = 1024 * 1024;
+/// Upper bound for one serialized event.
+pub const MAX_TEAM_EVENT_BYTES: usize = 256 * 1024;
+/// Upper bound for a caller-supplied event idempotency key.
+pub const MAX_TEAM_IDEMPOTENCY_KEY_BYTES: usize = 256;
+
+/// One append-only event together with the identity used to make retries safe.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamPolicyEventRecord {
+    pub team_id: Uuid,
+    pub sequence: u64,
+    pub event_id: Uuid,
+    pub idempotency_key: String,
+    pub event: TeamEvent,
+}
+
+/// SQLite persistence for provider-neutral team policy runtimes.
+///
+/// The caller owns the pool and its lifetime. This store owns only the two
+/// `team_*` tables it creates and never starts provider processes or sessions.
+#[derive(Clone)]
+pub struct SqliteTeamPolicyStore {
+    pool: SqlitePool,
+}
+
+impl SqliteTeamPolicyStore {
+    /// Construct a store around a caller-supplied SQLite pool.
+    ///
+    /// Schema creation is lazy so this constructor remains synchronous; every
+    /// public async operation ensures the schema before accessing it.
+    pub fn new(pool: SqlitePool) -> Self {
+        Self { pool }
+    }
+
+    /// Construct and eagerly create the store tables.
+    pub async fn open(pool: SqlitePool) -> Result<Self> {
+        let store = Self::new(pool);
+        store.ensure_schema().await?;
+        Ok(store)
+    }
+
+    pub fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
+
+    /// Persist a new policy runtime with an empty event log.
+    pub async fn create<P>(&self, policy: P) -> Result<TeamPolicyRuntime>
+    where
+        P: Borrow<TeamPolicy>,
+    {
+        let policy = policy.borrow().clone();
+        let team_id = policy.topology.team_id;
+        validate_team_id(team_id)?;
+        let policy_json = serialize_bounded(&policy, MAX_TEAM_POLICY_BYTES, "team policy")?;
+        let mut transaction = self.begin_write().await?;
+        let exists: i64 =
+            sqlx::query_scalar("select exists(select 1 from team_runtimes where team_id = ?)")
+                .bind(team_id.to_string())
+                .fetch_one(&mut *transaction)
+                .await?;
+        ensure!(exists == 0, "team runtime {team_id} already exists");
+
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "insert into team_runtimes(team_id,policy_json,next_sequence,created_at,updated_at) \
+             values(?,?,0,?,?)",
+        )
+        .bind(team_id.to_string())
+        .bind(policy_json)
+        .bind(&now)
+        .bind(&now)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(TeamPolicyRuntime::new(policy))
+    }
+
+    /// Load and replay a runtime. A missing team is represented by `None`.
+    pub async fn load(&self, team_id: Uuid) -> Result<Option<TeamPolicyRuntime>> {
+        validate_team_id(team_id)?;
+        self.ensure_schema().await?;
+        let mut transaction = self.pool.begin().await?;
+        let Some(row) =
+            sqlx::query("select policy_json,next_sequence from team_runtimes where team_id = ?")
+                .bind(team_id.to_string())
+                .fetch_optional(&mut *transaction)
+                .await?
+        else {
+            transaction.commit().await?;
+            return Ok(None);
+        };
+        let policy_json: String = row.try_get("policy_json")?;
+        let next_sequence: i64 = row.try_get("next_sequence")?;
+        let policy: TeamPolicy =
+            serde_json::from_str(&policy_json).context("failed to decode persisted team policy")?;
+        let records = read_records_from_transaction(&mut transaction, team_id).await?;
+        validate_sequence_projection(next_sequence, &records)?;
+        let runtime = replay_records(team_id, policy, records)?;
+        transaction.commit().await?;
+        Ok(Some(runtime))
+    }
+
+    /// Append one validated event, returning the existing record for an exact
+    /// event-id/idempotency-key retry.
+    pub async fn append<E>(
+        &self,
+        team_id: Uuid,
+        event_id: Uuid,
+        idempotency_key: impl AsRef<str>,
+        event: E,
+    ) -> Result<TeamPolicyEventRecord>
+    where
+        E: Borrow<TeamEvent>,
+    {
+        validate_team_id(team_id)?;
+        ensure!(!event_id.is_nil(), "team event id must not be nil");
+        let idempotency_key = idempotency_key.as_ref().to_owned();
+        ensure!(
+            !idempotency_key.trim().is_empty(),
+            "team event idempotency key must not be empty"
+        );
+        ensure!(
+            idempotency_key.len() <= MAX_TEAM_IDEMPOTENCY_KEY_BYTES,
+            "team event idempotency key exceeds {MAX_TEAM_IDEMPOTENCY_KEY_BYTES} bytes"
+        );
+        let event = event.borrow().clone();
+        let event_json = serialize_bounded(&event, MAX_TEAM_EVENT_BYTES, "team event")?;
+        self.ensure_schema().await?;
+        let mut transaction = self.begin_write().await?;
+
+        let Some(runtime_row) =
+            sqlx::query("select policy_json,next_sequence from team_runtimes where team_id = ?")
+                .bind(team_id.to_string())
+                .fetch_optional(&mut *transaction)
+                .await?
+        else {
+            bail!("team runtime {team_id} does not exist");
+        };
+        let policy_json: String = runtime_row.try_get("policy_json")?;
+        let next_sequence: i64 = runtime_row.try_get("next_sequence")?;
+        let policy: TeamPolicy =
+            serde_json::from_str(&policy_json).context("failed to decode persisted team policy")?;
+        let records = read_records_from_transaction(&mut transaction, team_id).await?;
+        validate_sequence_projection(next_sequence, &records)?;
+        let runtime = replay_records(team_id, policy, records.clone())?;
+
+        let by_event_id = sqlx::query(
+            "select team_id,sequence,event_id,idempotency_key,event_json \
+             from team_events where team_id=? and event_id=?",
+        )
+        .bind(team_id.to_string())
+        .bind(event_id.to_string())
+        .fetch_optional(&mut *transaction)
+        .await?
+        .map(|row| decode_event_record(&row))
+        .transpose()?;
+        let by_idempotency_key = sqlx::query(
+            "select team_id,sequence,event_id,idempotency_key,event_json \
+             from team_events where team_id=? and idempotency_key=?",
+        )
+        .bind(team_id.to_string())
+        .bind(&idempotency_key)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .map(|row| decode_event_record(&row))
+        .transpose()?;
+
+        match (by_event_id, by_idempotency_key) {
+            (Some(existing_by_id), Some(existing_by_key)) => {
+                ensure!(
+                    existing_by_id == existing_by_key,
+                    "team event identity indexes disagree for event {event_id}"
+                );
+                ensure!(
+                    serde_json::to_string(&existing_by_id.event)? == event_json,
+                    "event id {event_id} was reused with a different event"
+                );
+                transaction.commit().await?;
+                return Ok(existing_by_id);
+            }
+            (Some(_), None) => {
+                bail!("event id {event_id} was reused with a different idempotency key")
+            }
+            (None, Some(_existing)) => {
+                bail!("idempotency key {idempotency_key:?} was reused with a different event id")
+            }
+            (None, None) => {}
+        }
+
+        ensure!(
+            records.len() < MAX_TEAM_POLICY_EVENTS,
+            "team runtime {team_id} reached the {MAX_TEAM_POLICY_EVENTS}-event limit"
+        );
+        let mut next_runtime = runtime;
+        next_runtime.apply_event(event.clone())?;
+        let sequence = u64::try_from(next_sequence)
+            .context("persisted team runtime sequence is negative")?
+            .checked_add(1)
+            .context("team runtime sequence overflow")?;
+        let stored = TeamPolicyEventRecord {
+            team_id,
+            sequence,
+            event_id,
+            idempotency_key,
+            event,
+        };
+        sqlx::query(
+            "insert into team_events \
+             (team_id,sequence,event_id,idempotency_key,event_json,created_at) \
+             values(?,?,?,?,?,?)",
+        )
+        .bind(stored.team_id.to_string())
+        .bind(i64::try_from(stored.sequence).context("team event sequence exceeds SQLite range")?)
+        .bind(stored.event_id.to_string())
+        .bind(&stored.idempotency_key)
+        .bind(event_json)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query("update team_runtimes set next_sequence=?,updated_at=? where team_id=?")
+            .bind(
+                i64::try_from(stored.sequence)
+                    .context("team event sequence exceeds SQLite range")?,
+            )
+            .bind(Utc::now().to_rfc3339())
+            .bind(stored.team_id.to_string())
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        Ok(stored)
+    }
+
+    /// Return a bounded page of events with sequence strictly greater than
+    /// `after_sequence`.
+    pub async fn events_after(
+        &self,
+        team_id: Uuid,
+        after_sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<TeamPolicyEventRecord>> {
+        validate_team_id(team_id)?;
+        ensure!(
+            limit <= MAX_TEAM_POLICY_PAGE_SIZE,
+            "team policy event page exceeds {MAX_TEAM_POLICY_PAGE_SIZE} records"
+        );
+        let Some(_) = self.load(team_id).await? else {
+            bail!("team runtime {team_id} does not exist");
+        };
+        let after_sequence =
+            i64::try_from(after_sequence).context("event sequence exceeds SQLite range")?;
+        let rows = sqlx::query(
+            "select team_id,sequence,event_id,idempotency_key,event_json \
+             from team_events where team_id=? and sequence>? order by sequence limit ?",
+        )
+        .bind(team_id.to_string())
+        .bind(after_sequence)
+        .bind(i64::try_from(limit).context("event page size exceeds SQLite range")?)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(decode_event_record).collect()
+    }
+
+    async fn begin_write(&self) -> Result<Transaction<'static, Sqlite>> {
+        Ok(self.pool.begin_with("BEGIN IMMEDIATE").await?)
+    }
+
+    async fn ensure_schema(&self) -> Result<()> {
+        sqlx::query(
+            "create table if not exists team_runtimes (\
+                team_id text primary key not null,\
+                policy_json text not null,\
+                next_sequence integer not null default 0,\
+                created_at text not null,\
+                updated_at text not null\
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "create table if not exists team_events (\
+                team_id text not null,\
+                sequence integer not null,\
+                event_id text not null,\
+                idempotency_key text not null,\
+                event_json text not null,\
+                created_at text not null,\
+                primary key(team_id, sequence),\
+                unique(team_id, event_id),\
+                unique(team_id, idempotency_key),\
+                foreign key(team_id) references team_runtimes(team_id) on delete cascade\
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "create index if not exists team_events_after_idx \
+             on team_events(team_id, sequence)",
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+}
+
+async fn read_records_from_transaction(
+    transaction: &mut Transaction<'_, Sqlite>,
+    team_id: Uuid,
+) -> Result<Vec<TeamPolicyEventRecord>> {
+    let rows = sqlx::query(
+        "select team_id,sequence,event_id,idempotency_key,event_json \
+         from team_events where team_id=? order by sequence limit ?",
+    )
+    .bind(team_id.to_string())
+    .bind(i64::try_from(MAX_TEAM_POLICY_EVENTS + 1)?)
+    .fetch_all(&mut **transaction)
+    .await?;
+    let records: Vec<_> = rows
+        .iter()
+        .map(decode_event_record)
+        .collect::<Result<_>>()?;
+    ensure!(
+        records.len() <= MAX_TEAM_POLICY_EVENTS,
+        "team runtime {team_id} exceeds the {MAX_TEAM_POLICY_EVENTS}-event limit"
+    );
+    Ok(records)
+}
+
+fn validate_team_id(team_id: Uuid) -> Result<()> {
+    ensure!(!team_id.is_nil(), "team id must not be nil");
+    Ok(())
+}
+
+fn serialize_bounded<T: Serialize>(value: &T, limit: usize, label: &str) -> Result<String> {
+    let json = serde_json::to_string(value).with_context(|| format!("failed to encode {label}"))?;
+    ensure!(
+        json.len() <= limit,
+        "serialized {label} exceeds {limit} bytes"
+    );
+    Ok(json)
+}
+
+fn decode_event_record(row: &SqliteRow) -> Result<TeamPolicyEventRecord> {
+    let team_id = Uuid::parse_str(row.try_get::<String, _>("team_id")?.as_str())?;
+    let sequence = u64::try_from(row.try_get::<i64, _>("sequence")?)
+        .context("persisted team event sequence is negative")?;
+    let event_id = Uuid::parse_str(row.try_get::<String, _>("event_id")?.as_str())?;
+    let idempotency_key: String = row.try_get("idempotency_key")?;
+    ensure!(
+        !idempotency_key.trim().is_empty(),
+        "persisted idempotency key is empty"
+    );
+    ensure!(
+        idempotency_key.len() <= MAX_TEAM_IDEMPOTENCY_KEY_BYTES,
+        "persisted idempotency key exceeds {MAX_TEAM_IDEMPOTENCY_KEY_BYTES} bytes"
+    );
+    let event_json: String = row.try_get("event_json")?;
+    ensure!(
+        event_json.len() <= MAX_TEAM_EVENT_BYTES,
+        "persisted team event exceeds {MAX_TEAM_EVENT_BYTES} bytes"
+    );
+    let event =
+        serde_json::from_str(&event_json).context("failed to decode persisted team event")?;
+    Ok(TeamPolicyEventRecord {
+        team_id,
+        sequence,
+        event_id,
+        idempotency_key,
+        event,
+    })
+}
+
+fn validate_sequence_projection(
+    next_sequence: i64,
+    records: &[TeamPolicyEventRecord],
+) -> Result<()> {
+    let next_sequence =
+        u64::try_from(next_sequence).context("persisted team runtime sequence is negative")?;
+    for (index, record) in records.iter().enumerate() {
+        ensure!(
+            record.sequence == u64::try_from(index + 1)?,
+            "team event sequence is not contiguous at {}",
+            record.sequence
+        );
+    }
+    ensure!(
+        next_sequence == records.last().map_or(0, |record| record.sequence),
+        "team runtime sequence does not match its event log"
+    );
+    Ok(())
+}
+
+fn replay_records(
+    team_id: Uuid,
+    policy: TeamPolicy,
+    records: Vec<TeamPolicyEventRecord>,
+) -> Result<TeamPolicyRuntime> {
+    ensure!(
+        policy.topology.team_id == team_id,
+        "team policy belongs to a different team"
+    );
+    TeamPolicyRuntime::replay(policy, records.into_iter().map(|record| record.event))
+}
+
 fn request_handoff(request: &TeamPolicyToolRequest) -> &Handoff {
     match request {
         TeamPolicyToolRequest::Assign { handoff, .. }
@@ -1011,6 +1423,7 @@ fn event_handoff(event: &TeamEvent) -> &Handoff {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::sqlite::SqlitePoolOptions;
 
     fn fixture() -> (TeamPolicy, Uuid, Uuid) {
         let director = Uuid::new_v4();
@@ -1189,6 +1602,25 @@ mod tests {
             evidence: Vec::new(),
             continuation: None,
         }
+    }
+
+    fn assignment_event(policy: &TeamPolicy, director: Uuid, worker: Uuid) -> TeamEvent {
+        TeamEvent::Assignment {
+            assignment_id: Uuid::new_v4(),
+            work_id: Uuid::new_v4(),
+            assigned_by: director,
+            assigned_to: worker,
+            handoff: handoff(policy.topology.workspace_id),
+        }
+    }
+
+    async fn sqlite_store() -> SqliteTeamPolicyStore {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        SqliteTeamPolicyStore::open(pool).await.unwrap()
     }
 
     #[test]
@@ -1374,5 +1806,122 @@ mod tests {
             ]
         ));
         assert_eq!(runtime.state.total_escalations, 1);
+    }
+
+    #[tokio::test]
+    async fn sqlite_team_store_creates_replays_and_pages_events() {
+        let store = sqlite_store().await;
+        let (mut policy, director, worker) = fixture();
+        policy.review_conditions.clear();
+        let team_id = policy.topology.team_id;
+        store.create(&policy).await.unwrap();
+        let event = assignment_event(&policy, director, worker);
+        let event_id = Uuid::new_v4();
+        let record = store
+            .append(team_id, event_id, "assignment-1", &event)
+            .await
+            .unwrap();
+
+        assert_eq!(record.sequence, 1);
+        assert_eq!(record.event_id, event_id);
+        let loaded = store.load(team_id).await.unwrap().unwrap();
+        assert_eq!(loaded.events, vec![event.clone()]);
+        assert_eq!(loaded.state.active_assignments, 1);
+
+        let page = store.events_after(team_id, 0, 1).await.unwrap();
+        assert_eq!(page, vec![record]);
+        assert!(store.events_after(team_id, 1, 1).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sqlite_team_store_makes_event_retries_idempotent_and_rejects_conflicts() {
+        let store = sqlite_store().await;
+        let (mut policy, director, worker) = fixture();
+        policy.review_conditions.clear();
+        let team_id = policy.topology.team_id;
+        store.create(&policy).await.unwrap();
+        let event = assignment_event(&policy, director, worker);
+        let event_id = Uuid::new_v4();
+        let first = store
+            .append(team_id, event_id, "assignment-1", &event)
+            .await
+            .unwrap();
+        let retry = store
+            .append(team_id, event_id, "assignment-1", &event)
+            .await
+            .unwrap();
+        assert_eq!(retry, first);
+
+        let event_id_error = store
+            .append(team_id, event_id, "different-key", &event)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(event_id_error.contains("different idempotency key"));
+        let key_error = store
+            .append(team_id, Uuid::new_v4(), "assignment-1", &event)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(key_error.contains("different event id"));
+
+        let count: i64 = sqlx::query_scalar("select count(*) from team_events")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn sqlite_team_store_validates_replay_and_bounds_inputs() {
+        let store = sqlite_store().await;
+        let (mut policy, director, worker) = fixture();
+        policy.review_conditions.clear();
+        let team_id = policy.topology.team_id;
+        store.create(&policy).await.unwrap();
+        let invalid = TeamEvent::Assignment {
+            assignment_id: Uuid::new_v4(),
+            work_id: Uuid::new_v4(),
+            assigned_by: director,
+            assigned_to: worker,
+            handoff: handoff(Uuid::new_v4()),
+        };
+        assert!(
+            store
+                .append(team_id, Uuid::new_v4(), "invalid", invalid.clone())
+                .await
+                .is_err()
+        );
+        assert!(store.events_after(team_id, 0, 1).await.unwrap().is_empty());
+        assert!(
+            store
+                .events_after(team_id, 0, MAX_TEAM_POLICY_PAGE_SIZE + 1)
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .append(
+                    team_id,
+                    Uuid::new_v4(),
+                    "",
+                    assignment_event(&policy, director, worker)
+                )
+                .await
+                .is_err()
+        );
+
+        let event = assignment_event(&policy, director, worker);
+        store
+            .append(team_id, Uuid::new_v4(), "valid", &event)
+            .await
+            .unwrap();
+        sqlx::query("update team_events set event_json=? where team_id=?")
+            .bind(serde_json::to_string(&invalid).unwrap())
+            .bind(team_id.to_string())
+            .execute(store.pool())
+            .await
+            .unwrap();
+        assert!(store.load(team_id).await.is_err());
     }
 }

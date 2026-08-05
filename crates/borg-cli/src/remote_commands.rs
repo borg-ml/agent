@@ -15,12 +15,12 @@ use borg_remote::{
     LocalSessionControlServer, MessageStatus, PermissionMode, PlanItem, PlanItemStatus,
     PromptDelivery, ResponseLanguage, SessionConfigAction, SessionEvent, SessionEventKind,
     SessionGoal, SessionState, SessionStatus, SessionStore, SessionWriterLease, SpawnSubagent,
-    SqliteSessionStore, SqliteWorkspaceStore, SubagentAction, SubagentSnapshot, SubagentStatus,
-    TodoAction, default_host_config_path, enroll_host, local_session_owner_uses_current_binary,
-    login_provider, mirror_local_session, probe_capabilities, provider_credentials_present,
-    run_agent_session_with_store_and_writer, run_agent_session_with_store_writer_and_peers,
-    run_attached_session, run_host_with_executor_factory, send_local_session_command,
-    session_control_socket_path,
+    SqliteSessionStore, SubagentAction, SubagentSnapshot, SubagentStatus, TodoAction,
+    default_host_config_path, enroll_host, local_session_owner_uses_current_binary, login_provider,
+    mirror_local_session, probe_capabilities, probe_provider_capabilities,
+    provider_credentials_present, run_agent_session_with_store_and_writer,
+    run_agent_session_with_store_writer_and_peers, run_attached_session,
+    run_host_with_executor_factory, send_local_session_command, session_control_socket_path,
 };
 use chrono::{Local, Utc};
 use futures_util::FutureExt;
@@ -500,9 +500,13 @@ pub(crate) async fn print_local_workspaces(json: bool) -> Result<()> {
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join("sessions");
-    let workspace_path = sessions_dir.join("workspaces.sqlite3");
-    let workspaces = if workspace_path.is_file() {
-        let store = SqliteWorkspaceStore::open(&workspace_path).await?;
+    let session_path = sessions_dir.join("sessions.sqlite3");
+    let workspaces = if session_path.is_file() {
+        let session_store = SqliteSessionStore::open(&session_path).await?;
+        let store = session_store
+            .workspace_store()
+            .await?
+            .context("canonical session database has no workspace projection")?;
         let display_name = std::env::var("USER").unwrap_or_else(|_| "Local user".to_string());
         store
             .list_workspaces_for_participant(borg_remote::local_human_participant_id(&display_name))
@@ -707,7 +711,10 @@ async fn run_local_agent_session(
     crash_context.set_session_id(session_id);
     let lock_path = sessions_dir.join(format!("{session_id}.lock"));
     let control_socket_path = session_control_socket_path(&sessions_dir, session_id);
-    let remote_launch_path = sessions_dir.join(format!("{session_id}.launch.json"));
+    let remote_launch_present = sqlite_store
+        .load_host_launch_metadata(session_id)
+        .await?
+        .is_some();
     let mut writer = SessionWriterLease::try_acquire(&lock_path)?;
     let mut session_access = if writer.is_some() {
         LocalSessionAccess::Owned
@@ -730,7 +737,7 @@ async fn run_local_agent_session(
     let store: Arc<dyn SessionStore> = sqlite_store.clone();
     let mut session_state = store.state(session_id).await?;
     let mut stale_local_owner = session_access.is_attached()
-        && !remote_launch_path.is_file()
+        && !remote_launch_present
         && !local_session_owner_uses_current_binary(&sessions_dir, session_id)?;
     if stale_local_owner && stale_local_owner_can_handoff(session_state.status) {
         // Prompt admission intentionally precedes the durable Starting event.
@@ -845,7 +852,8 @@ async fn run_local_agent_session(
         !provider.uses_native_harness() || model.is_some(),
         "{provider:?} requires --model or BORG_OPENAI_COMPATIBLE_MODEL"
     );
-    let capabilities = borg_remote::SessionCapabilities::from(&agent_config.capabilities);
+    let mut capabilities = borg_remote::SessionCapabilities::from(&agent_config.capabilities);
+    capabilities.provider_capabilities = probe_provider_capabilities().await;
     let team_policy = agent_config.autonomous_team_policy(&capabilities, provider, session_id);
     if !resuming
         && args.effort.is_none()
@@ -972,7 +980,7 @@ async fn run_local_agent_session(
         team_policy,
     };
     if session_access.is_attached() {
-        if remote_launch_path.is_file() {
+        if remote_launch_present {
             anyhow::bail!(
                 "this session is still owned by the background Borg remote host; reopen it from the connected remote chat instead of starting a second local writer"
             );
@@ -4054,6 +4062,7 @@ async fn send_model_selection(
 fn prompt_and_store_api_key(provider: CodingProvider) -> Result<PathBuf> {
     let credential = match provider {
         CodingProvider::Claude => borg_provider::credentials::ApiKeyCredential::Anthropic,
+        CodingProvider::OpenRouter => borg_provider::credentials::ApiKeyCredential::OpenRouter,
         other => anyhow::bail!("{} does not use a borg-managed API key", other.label()),
     };
     println!(

@@ -1330,6 +1330,30 @@ fn model_picker_options_with_discovered(
             push_catalog(&mut options, target);
         }
     }
+
+    // OpenRouter is open-ended rather than a compile-time catalog, but it is
+    // still a first-class destination from every provider. Keep the cached
+    // catalog in the same picker so `/model` is a real fuzzy switcher instead
+    // of requiring the user to know a provider-specific slash command.
+    if provider != Some(CodingProvider::OpenRouter) {
+        let discovered = borg_provider::openrouter_model_entries();
+        let mut models = borg_provider::dynamic_models_for_backend("openrouter", None, &discovered);
+        if models.is_empty() {
+            models.push(borg_provider::DynamicModelEntry {
+                id: borg_provider::openrouter_product_model().to_string(),
+                label: borg_provider::openrouter_product_model().to_string(),
+                detail: None,
+            });
+        }
+        for (index, model) in models.into_iter().enumerate() {
+            let mut option = PickerOption::new(model.label, model.id);
+            option.preview = model.detail;
+            if index == 0 {
+                option.section = Some(CodingProvider::OpenRouter.label().to_string());
+            }
+            options.push(option);
+        }
+    }
     options
 }
 
@@ -6467,6 +6491,7 @@ struct Transcript {
     assistant_label_color: Color,
     assistant_message_color: Color,
     context_remaining_percent: u8,
+    context_known: bool,
     cache_diagnostics: CacheDiagnostics,
     tool_run_offsets: HashMap<usize, usize>,
     expanded_tool_runs: HashSet<usize>,
@@ -6524,6 +6549,7 @@ impl Default for Transcript {
             assistant_label_color: BORG_ORANGE,
             assistant_message_color: Color::White,
             context_remaining_percent: 100,
+            context_known: false,
             cache_diagnostics: CacheDiagnostics::default(),
             tool_run_offsets: HashMap::new(),
             expanded_tool_runs: HashSet::new(),
@@ -6705,6 +6731,7 @@ impl Transcript {
             state.usage.context_tokens,
             state.usage.context_window_tokens,
         ) {
+            self.context_known = true;
             self.context_remaining_percent =
                 context_remaining_percent(context_tokens, context_window_tokens);
         }
@@ -7071,6 +7098,7 @@ impl Transcript {
                 if let (Some(context_tokens), Some(context_window_tokens)) =
                     (context_tokens, context_window_tokens)
                 {
+                    self.context_known = true;
                     self.context_remaining_percent =
                         context_remaining_percent(*context_tokens, *context_window_tokens);
                 }
@@ -7106,12 +7134,14 @@ impl Transcript {
                 context_tokens,
                 context_window_tokens,
             } => {
+                self.context_known = true;
                 self.context_remaining_percent =
                     context_remaining_percent(*context_tokens, *context_window_tokens);
             }
             SessionEventKind::ContextCleared => {
                 self.clear_visible_entries();
                 self.context_remaining_percent = 100;
+                self.context_known = true;
                 self.cache_diagnostics.reset();
             }
             SessionEventKind::PromptRecalled { message_id, .. } => {
@@ -7630,7 +7660,7 @@ impl Transcript {
             && language == "reasoning"
             && !*complete
         {
-            source.push_str(text);
+            Self::merge_reasoning_snapshot(source, text);
             return;
         }
         if text.trim().is_empty() {
@@ -7654,6 +7684,23 @@ impl Transcript {
             expanded: true,
         });
         self.active_reasoning = Some(index);
+    }
+
+    fn merge_reasoning_snapshot(source: &mut String, incoming: &str) {
+        if incoming.is_empty() || incoming == source {
+            return;
+        }
+        // Most providers emit deltas, but subscription adapters may replay a
+        // cumulative reasoning snapshot at a lifecycle boundary. Reconcile
+        // that snapshot instead of appending the already-rendered prefix.
+        if incoming.starts_with(source.as_str()) {
+            source.clear();
+            source.push_str(incoming);
+        } else if source.starts_with(incoming) {
+            // An older snapshot arrived after a newer one during reconnect.
+        } else {
+            source.push_str(incoming);
+        }
     }
 
     fn finish_reasoning(&mut self, completed_at: DateTime<Utc>) {
@@ -7809,6 +7856,9 @@ impl Transcript {
     }
 
     fn context_status(&self) -> (String, bool) {
+        if !self.context_known {
+            return ("context unknown".to_string(), false);
+        }
         let imminent = self.context_remaining_percent <= 20;
         let status = if imminent {
             format!(
@@ -9104,12 +9154,20 @@ fn session_event_changes_transcript(kind: &SessionEventKind) -> bool {
     match kind {
         SessionEventKind::SessionStarted
         | SessionEventKind::SessionConfigured { .. }
+        | SessionEventKind::ProviderCapabilitiesUpdated { .. }
         | SessionEventKind::ApprovalResolved { .. }
         | SessionEventKind::ProviderInteractionResolved { .. }
         | SessionEventKind::UsageUpdated { .. }
         | SessionEventKind::ContextWindowUpdated { .. }
         | SessionEventKind::SubagentControl { .. }
         | SessionEventKind::ProviderSessionLinked { .. }
+        | SessionEventKind::RuntimeProcessStarted { .. }
+        | SessionEventKind::RuntimeProcessOutput { .. }
+        | SessionEventKind::RuntimeProcessCompleted { .. }
+        | SessionEventKind::BluWorkflowStarted { .. }
+        | SessionEventKind::BluWorkflowCallRequested { .. }
+        | SessionEventKind::BluWorkflowCallCompleted { .. }
+        | SessionEventKind::BluWorkflowCompleted { .. }
         | SessionEventKind::TurnStarted { .. } => false,
         SessionEventKind::StatusChanged {
             status:

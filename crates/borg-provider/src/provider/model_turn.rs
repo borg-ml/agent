@@ -177,6 +177,10 @@ pub struct ModelTurnRequest {
     /// this value when retrying the same model turn and choose a new value for
     /// the next tool round.
     pub request_id: Option<String>,
+    /// Stable cache identity for the canonical session prefix. This is
+    /// intentionally separate from `request_id`: retries and tool rounds may
+    /// have different request ids while the session prefix remains cacheable.
+    pub prompt_cache_key: Option<String>,
     pub messages: Vec<ModelMessage>,
     pub tools: Vec<ModelToolDefinition>,
     pub output_schema: Option<Value>,

@@ -26,18 +26,21 @@ const CREDENTIALS_FILE_MAX_BYTES: u64 = 256 * 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApiKeyCredential {
     Anthropic,
+    OpenRouter,
 }
 
 impl ApiKeyCredential {
     pub fn env_var(self) -> &'static str {
         match self {
             Self::Anthropic => "ANTHROPIC_API_KEY",
+            Self::OpenRouter => "OPENROUTER_API_KEY",
         }
     }
 
     fn storage_key(self) -> &'static str {
         match self {
             Self::Anthropic => "anthropic_api_key",
+            Self::OpenRouter => "openrouter_api_key",
         }
     }
 }

@@ -1,15 +1,21 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{ChildStdin, Command};
 use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+
+use crate::{
+    RuntimeProcessStatus, RuntimeProcessStream, SessionEvent, SessionEventKind, SessionStore,
+    SqliteSessionStore,
+};
 
 const MAX_ACTIVE_PROCESSES: usize = 8;
 const CAPTURE_BYTES: usize = 512 * 1024;
@@ -17,6 +23,7 @@ const DEFAULT_YIELD_MS: u64 = 10_000;
 const MAX_YIELD_MS: u64 = 30_000;
 const DEFAULT_OUTPUT_TOKENS: usize = 10_000;
 const MAX_OUTPUT_TOKENS: usize = 64_000;
+const JOURNAL_OUTPUT_TOKENS: usize = 16_384;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ProcessManager {
@@ -26,10 +33,12 @@ pub(crate) struct ProcessManager {
 #[derive(Debug)]
 struct ProcessManagerInner {
     processes: Mutex<HashMap<Uuid, Arc<ProcessEntry>>>,
+    recovered_sessions: Mutex<HashSet<Uuid>>,
 }
 
 #[derive(Debug)]
 struct ProcessEntry {
+    process_id: Uuid,
     session_id: Uuid,
     command: String,
     cwd: PathBuf,
@@ -41,10 +50,12 @@ struct ProcessEntry {
     finished: Notify,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 struct ProcessOutput {
     stdout: HeadTailBuffer,
     stderr: HeadTailBuffer,
+    journaled_stdout_bytes: usize,
+    journaled_stderr_bytes: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -52,10 +63,11 @@ struct ProcessStatus {
     running: bool,
     exit_code: Option<i32>,
     timed_out: bool,
+    terminated: bool,
     error: Option<String>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 struct HeadTailBuffer {
     head: Vec<u8>,
     tail: VecDeque<u8>,
@@ -83,6 +95,7 @@ impl Default for ProcessManager {
         Self {
             inner: Arc::new(ProcessManagerInner {
                 processes: Mutex::new(HashMap::new()),
+                recovered_sessions: Mutex::new(HashSet::new()),
             }),
         }
     }
@@ -99,7 +112,36 @@ impl ProcessManager {
         yield_time_ms: Option<u64>,
         max_output_tokens: Option<usize>,
         timeout_ms: u64,
+        journal: Option<SqliteSessionStore>,
     ) -> Result<ProcessSnapshot> {
+        self.exec_with_cancel(
+            owner_session_id,
+            root,
+            command,
+            workdir,
+            yield_time_ms,
+            max_output_tokens,
+            timeout_ms,
+            journal,
+            CancellationToken::new(),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn exec_with_cancel(
+        &self,
+        owner_session_id: Uuid,
+        root: &Path,
+        command: String,
+        workdir: Option<&str>,
+        yield_time_ms: Option<u64>,
+        max_output_tokens: Option<usize>,
+        timeout_ms: u64,
+        journal: Option<SqliteSessionStore>,
+        cancel: CancellationToken,
+    ) -> Result<ProcessSnapshot> {
+        ensure!(!cancel.is_cancelled(), "process execution was cancelled");
         let cwd = resolve_workdir(root, workdir)?;
         let active = self
             .inner
@@ -145,6 +187,7 @@ impl ProcessManager {
         let stdout = child.stdout.take().context("command stdout pipe missing")?;
         let stderr = child.stderr.take().context("command stderr pipe missing")?;
         let entry = Arc::new(ProcessEntry {
+            process_id,
             session_id: owner_session_id,
             command,
             cwd,
@@ -164,14 +207,50 @@ impl ProcessManager {
             .expect("native process registry lock poisoned")
             .insert(process_id, Arc::clone(&entry));
 
-        let stdout_task = tokio::spawn(read_pipe(stdout, Arc::clone(&entry), OutputStream::Stdout));
-        let stderr_task = tokio::spawn(read_pipe(stderr, Arc::clone(&entry), OutputStream::Stderr));
+        if let Some(store) = journal.as_ref()
+            && let Err(error) = append_runtime_event(
+                store,
+                owner_session_id,
+                SessionEventKind::RuntimeProcessStarted {
+                    process_id,
+                    pid,
+                    command: entry.command.clone(),
+                    cwd: entry.cwd.clone(),
+                },
+            )
+            .await
+        {
+            self.inner
+                .processes
+                .lock()
+                .expect("native process registry lock poisoned")
+                .remove(&process_id);
+            entry.stdin.lock().await.take();
+            terminate_process_tree(pid).await;
+            let _ = child.wait().await;
+            return Err(error.context("failed to journal native process start"));
+        }
+
+        let stdout_task = tokio::spawn(read_pipe(
+            stdout,
+            Arc::clone(&entry),
+            OutputStream::Stdout,
+            journal.clone(),
+        ));
+        let stderr_task = tokio::spawn(read_pipe(
+            stderr,
+            Arc::clone(&entry),
+            OutputStream::Stderr,
+            journal.clone(),
+        ));
         tokio::spawn(supervise_process(
             child,
             Arc::clone(&entry),
             Duration::from_millis(timeout_ms),
             stdout_task,
             stderr_task,
+            process_id,
+            journal,
         ));
 
         let yield_for =
@@ -182,7 +261,40 @@ impl ProcessManager {
             .expect("native process status lock poisoned")
             .running
         {
-            let _ = tokio::time::timeout(yield_for, entry.finished.notified()).await;
+            tokio::select! {
+                _ = tokio::time::timeout(yield_for, entry.finished.notified()) => {}
+                _ = cancel.cancelled() => {
+                    {
+                        let mut status = entry
+                            .status
+                            .lock()
+                            .expect("native process status lock poisoned");
+                        if status.running {
+                            status.terminated = true;
+                        }
+                    }
+                    terminate_process_tree(entry.pid).await;
+                    entry.stdin.lock().await.take();
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(2),
+                        wait_for_process_finish(&entry),
+                    )
+                    .await;
+                    if !entry
+                        .status
+                        .lock()
+                        .expect("native process status lock poisoned")
+                        .running
+                    {
+                        self.inner
+                            .processes
+                            .lock()
+                            .expect("native process registry lock poisoned")
+                            .remove(&process_id);
+                    }
+                    bail!("process execution was cancelled");
+                }
+            }
         }
         let result = snapshot(
             process_id,
@@ -210,6 +322,15 @@ impl ProcessManager {
     ) -> Result<ProcessSnapshot> {
         let entry = self.entry(owner_session_id, process_id)?;
         if terminate {
+            {
+                let mut status = entry
+                    .status
+                    .lock()
+                    .expect("native process status lock poisoned");
+                if status.running {
+                    status.terminated = true;
+                }
+            }
             terminate_process_tree(entry.pid).await;
             entry.stdin.lock().await.take();
         } else if let Some(chars) = chars {
@@ -275,6 +396,15 @@ impl ProcessManager {
                 .filter_map(|id| processes.remove(&id))
                 .collect::<Vec<_>>()
         };
+        for entry in &entries {
+            let mut status = entry
+                .status
+                .lock()
+                .expect("native process status lock poisoned");
+            if status.running {
+                status.terminated = true;
+            }
+        }
         futures::future::join_all(
             entries
                 .iter()
@@ -284,6 +414,81 @@ impl ProcessManager {
         for entry in entries {
             entry.stdin.lock().await.take();
         }
+    }
+
+    pub(crate) async fn recover_session(
+        &self,
+        session_id: Uuid,
+        store: SqliteSessionStore,
+    ) -> Result<()> {
+        {
+            let mut recovered = self
+                .inner
+                .recovered_sessions
+                .lock()
+                .expect("native process recovery lock poisoned");
+            if !recovered.insert(session_id) {
+                return Ok(());
+            }
+        }
+
+        let result = self.recover_session_inner(session_id, store).await;
+        if result.is_err() {
+            self.inner
+                .recovered_sessions
+                .lock()
+                .expect("native process recovery lock poisoned")
+                .remove(&session_id);
+        }
+        result
+    }
+
+    async fn recover_session_inner(
+        &self,
+        session_id: Uuid,
+        store: SqliteSessionStore,
+    ) -> Result<()> {
+        let processes = replay_process_events(&store.read(session_id).await?);
+        for process in processes.into_values().filter(|process| !process.completed) {
+            if self.has_process(session_id, process.process_id) {
+                continue;
+            }
+            if process_is_alive(process.pid) {
+                terminate_process_tree(process.pid).await;
+            }
+            let (stdout, stdout_omitted_bytes) =
+                process.output.stdout.render(JOURNAL_OUTPUT_TOKENS);
+            let (stderr, stderr_omitted_bytes) =
+                process.output.stderr.render(JOURNAL_OUTPUT_TOKENS);
+            append_runtime_completed(
+                &store,
+                session_id,
+                process.process_id,
+                process.pid,
+                RuntimeProcessStatus::Orphaned,
+                None,
+                false,
+                stdout,
+                stderr,
+                stdout_omitted_bytes,
+                stderr_omitted_bytes,
+                Some(
+                    "native process owner was lost; the process was recovered and terminated"
+                        .to_string(),
+                ),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    fn has_process(&self, session_id: Uuid, process_id: Uuid) -> bool {
+        self.inner
+            .processes
+            .lock()
+            .expect("native process registry lock poisoned")
+            .get(&process_id)
+            .is_some_and(|entry| entry.session_id == session_id)
     }
 }
 
@@ -300,6 +505,12 @@ impl Drop for ProcessManagerInner {
 }
 
 impl HeadTailBuffer {
+    fn from_text(text: &str) -> Self {
+        let mut buffer = Self::default();
+        buffer.push(text.as_bytes());
+        buffer
+    }
+
     fn push(&mut self, bytes: &[u8]) {
         self.total_bytes = self.total_bytes.saturating_add(bytes.len());
         let half = CAPTURE_BYTES / 2;
@@ -366,14 +577,190 @@ fn snapshot(process_id: Uuid, entry: &ProcessEntry, max_output_tokens: usize) ->
     }
 }
 
+fn snapshot_output(
+    entry: &ProcessEntry,
+    max_output_tokens: usize,
+    stdout: bool,
+) -> (String, usize) {
+    let output = entry
+        .output
+        .lock()
+        .expect("native process output lock poisoned");
+    if stdout {
+        output.stdout.render(max_output_tokens)
+    } else {
+        output.stderr.render(max_output_tokens)
+    }
+}
+
+async fn wait_for_process_finish(entry: &Arc<ProcessEntry>) {
+    loop {
+        if !entry
+            .status
+            .lock()
+            .expect("native process status lock poisoned")
+            .running
+        {
+            return;
+        }
+        let notified = entry.finished.notified();
+        if !entry
+            .status
+            .lock()
+            .expect("native process status lock poisoned")
+            .running
+        {
+            return;
+        }
+        notified.await;
+    }
+}
+
+fn runtime_process_status(status: &ProcessStatus) -> RuntimeProcessStatus {
+    if status.timed_out {
+        RuntimeProcessStatus::TimedOut
+    } else if status.terminated {
+        RuntimeProcessStatus::Terminated
+    } else if status.error.is_some() {
+        RuntimeProcessStatus::Failed
+    } else {
+        RuntimeProcessStatus::Exited
+    }
+}
+
+async fn append_runtime_event(
+    store: &SqliteSessionStore,
+    session_id: Uuid,
+    kind: SessionEventKind,
+) -> Result<SessionEvent> {
+    store.append(SessionEvent::new(session_id, 0, kind)).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn append_runtime_completed(
+    store: &SqliteSessionStore,
+    session_id: Uuid,
+    process_id: Uuid,
+    pid: u32,
+    status: RuntimeProcessStatus,
+    exit_code: Option<i32>,
+    timed_out: bool,
+    stdout: String,
+    stderr: String,
+    stdout_omitted_bytes: usize,
+    stderr_omitted_bytes: usize,
+    error: Option<String>,
+) -> Result<SessionEvent> {
+    append_runtime_event(
+        store,
+        session_id,
+        SessionEventKind::RuntimeProcessCompleted {
+            process_id,
+            pid,
+            status,
+            exit_code,
+            timed_out,
+            stdout,
+            stderr,
+            stdout_omitted_bytes,
+            stderr_omitted_bytes,
+            error,
+        },
+    )
+    .await
+}
+
+#[derive(Debug, Clone)]
+struct PersistedProcess {
+    process_id: Uuid,
+    pid: u32,
+    output: ProcessOutput,
+    completed: bool,
+}
+
+fn replay_process_events(events: &[SessionEvent]) -> HashMap<Uuid, PersistedProcess> {
+    let mut processes = HashMap::new();
+    for event in events {
+        match &event.kind {
+            SessionEventKind::RuntimeProcessStarted {
+                process_id, pid, ..
+            } => {
+                processes.insert(
+                    *process_id,
+                    PersistedProcess {
+                        process_id: *process_id,
+                        pid: *pid,
+                        output: ProcessOutput::default(),
+                        completed: false,
+                    },
+                );
+            }
+            SessionEventKind::RuntimeProcessOutput {
+                process_id, chunk, ..
+            } => {
+                if let Some(process) = processes.get_mut(process_id)
+                    && !process.completed
+                {
+                    match &event.kind {
+                        SessionEventKind::RuntimeProcessOutput {
+                            stream: RuntimeProcessStream::Stdout,
+                            ..
+                        } => process.output.stdout.push(chunk.as_bytes()),
+                        SessionEventKind::RuntimeProcessOutput {
+                            stream: RuntimeProcessStream::Stderr,
+                            ..
+                        } => process.output.stderr.push(chunk.as_bytes()),
+                        _ => unreachable!("matched runtime output event"),
+                    }
+                }
+            }
+            SessionEventKind::RuntimeProcessCompleted {
+                process_id,
+                pid,
+                stdout,
+                stderr,
+                ..
+            } => {
+                let process = processes
+                    .entry(*process_id)
+                    .or_insert_with(|| PersistedProcess {
+                        process_id: *process_id,
+                        pid: *pid,
+                        output: ProcessOutput::default(),
+                        completed: false,
+                    });
+                process.pid = *pid;
+                process.output.stdout = HeadTailBuffer::from_text(stdout);
+                process.output.stderr = HeadTailBuffer::from_text(stderr);
+                process.completed = true;
+            }
+            _ => {}
+        }
+    }
+    processes
+}
+
 #[derive(Clone, Copy)]
 enum OutputStream {
     Stdout,
     Stderr,
 }
 
-async fn read_pipe<R>(mut reader: R, entry: Arc<ProcessEntry>, stream: OutputStream)
-where
+impl From<OutputStream> for RuntimeProcessStream {
+    fn from(stream: OutputStream) -> Self {
+        match stream {
+            OutputStream::Stdout => Self::Stdout,
+            OutputStream::Stderr => Self::Stderr,
+        }
+    }
+}
+
+async fn read_pipe<R>(
+    mut reader: R,
+    entry: Arc<ProcessEntry>,
+    stream: OutputStream,
+    journal: Option<SqliteSessionStore>,
+) where
     R: AsyncRead + Unpin,
 {
     let mut buffer = [0_u8; 8 * 1024];
@@ -381,15 +768,65 @@ where
         match reader.read(&mut buffer).await {
             Ok(0) => break,
             Ok(read) => {
-                let mut output = entry
-                    .output
-                    .lock()
-                    .expect("native process output lock poisoned");
-                match stream {
-                    OutputStream::Stdout => output.stdout.push(&buffer[..read]),
-                    OutputStream::Stderr => output.stderr.push(&buffer[..read]),
+                let journal_chunk = {
+                    let mut output = entry
+                        .output
+                        .lock()
+                        .expect("native process output lock poisoned");
+                    let journal_bytes = match stream {
+                        OutputStream::Stdout => {
+                            let keep = CAPTURE_BYTES
+                                .saturating_sub(output.journaled_stdout_bytes)
+                                .min(read);
+                            output.journaled_stdout_bytes =
+                                output.journaled_stdout_bytes.saturating_add(keep);
+                            keep
+                        }
+                        OutputStream::Stderr => {
+                            let keep = CAPTURE_BYTES
+                                .saturating_sub(output.journaled_stderr_bytes)
+                                .min(read);
+                            output.journaled_stderr_bytes =
+                                output.journaled_stderr_bytes.saturating_add(keep);
+                            keep
+                        }
+                    };
+                    match stream {
+                        OutputStream::Stdout => output.stdout.push(&buffer[..read]),
+                        OutputStream::Stderr => output.stderr.push(&buffer[..read]),
+                    }
+                    (journal_bytes > 0 && journal.is_some()).then(|| {
+                        (
+                            RuntimeProcessStream::from(stream),
+                            String::from_utf8_lossy(&buffer[..journal_bytes]).into_owned(),
+                        )
+                    })
+                };
+                if let (Some(store), Some((stream, chunk))) = (journal.as_ref(), journal_chunk)
+                    && let Err(error) = append_runtime_event(
+                        store,
+                        entry.session_id,
+                        SessionEventKind::RuntimeProcessOutput {
+                            process_id: entry.process_id,
+                            stream,
+                            chunk,
+                        },
+                    )
+                    .await
+                {
+                    {
+                        let mut status = entry
+                            .status
+                            .lock()
+                            .expect("native process status lock poisoned");
+                        if status.error.is_none() {
+                            status.error =
+                                Some(format!("failed to journal process output: {error}"));
+                        }
+                    }
+                    terminate_process_tree(entry.pid).await;
+                    break;
                 }
-                drop(output);
                 entry.changed.notify_waiters();
             }
             Err(error) => {
@@ -411,6 +848,8 @@ async fn supervise_process(
     timeout: Duration,
     stdout_task: tokio::task::JoinHandle<()>,
     stderr_task: tokio::task::JoinHandle<()>,
+    process_id: Uuid,
+    journal: Option<SqliteSessionStore>,
 ) {
     let result = match tokio::time::timeout(timeout, child.wait()).await {
         Ok(result) => result,
@@ -428,16 +867,42 @@ async fn supervise_process(
     };
     entry.stdin.lock().await.take();
     let _ = tokio::join!(stdout_task, stderr_task);
-    let mut status = entry
-        .status
-        .lock()
-        .expect("native process status lock poisoned");
-    status.running = false;
-    match result {
-        Ok(exit) => status.exit_code = exit.code(),
-        Err(error) => status.error = Some(format!("failed to wait for process: {error}")),
+    let (runtime_status, exit_code, timed_out, error) = {
+        let mut status = entry
+            .status
+            .lock()
+            .expect("native process status lock poisoned");
+        status.running = false;
+        match result {
+            Ok(exit) => status.exit_code = exit.code(),
+            Err(error) => status.error = Some(format!("failed to wait for process: {error}")),
+        }
+        (
+            runtime_process_status(&status),
+            status.exit_code,
+            status.timed_out,
+            status.error.clone(),
+        )
+    };
+    if let Some(store) = journal.as_ref() {
+        let (stdout, stdout_omitted_bytes) = snapshot_output(&entry, JOURNAL_OUTPUT_TOKENS, true);
+        let (stderr, stderr_omitted_bytes) = snapshot_output(&entry, JOURNAL_OUTPUT_TOKENS, false);
+        let _ = append_runtime_completed(
+            store,
+            entry.session_id,
+            process_id,
+            entry.pid,
+            runtime_status,
+            exit_code,
+            timed_out,
+            stdout,
+            stderr,
+            stdout_omitted_bytes,
+            stderr_omitted_bytes,
+            error,
+        )
+        .await;
     }
-    drop(status);
     entry.changed.notify_waiters();
     entry.finished.notify_waiters();
 }
@@ -462,6 +927,22 @@ fn resolve_workdir(root: &Path, workdir: Option<&str>) -> Result<PathBuf> {
         bail!("workdir must be an existing directory inside the workspace");
     }
     Ok(cwd)
+}
+
+#[cfg(unix)]
+fn process_is_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    // SAFETY: signal zero performs no mutation and only probes process
+    // existence/permission for the recorded process id.
+    let result = unsafe { libc::kill(pid as i32, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(windows)]
+fn process_is_alive(pid: u32) -> bool {
+    pid != 0
 }
 
 #[cfg(unix)]
@@ -552,6 +1033,7 @@ mod tests {
                 Some(5),
                 Some(1_000),
                 10_000,
+                None,
             )
             .await
             .expect("spawn");
@@ -599,11 +1081,229 @@ mod tests {
                 Some(1),
                 Some(100),
                 60_000,
+                None,
             )
             .await
             .expect("spawn");
         assert!(process.running);
         manager.terminate_session(owner).await;
         assert!(manager.entry(owner, process.session_id).is_err());
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn cancellable_process_execution_reaps_the_workflow_child() {
+        let root = tempfile::tempdir().expect("workspace");
+        let manager = ProcessManager::default();
+        let owner = Uuid::new_v4();
+        let cancel = CancellationToken::new();
+        let task_manager = manager.clone();
+        let task_cancel = cancel.clone();
+        let task = tokio::spawn(async move {
+            task_manager
+                .exec_with_cancel(
+                    owner,
+                    root.path(),
+                    "sleep 30".to_string(),
+                    None,
+                    Some(30_000),
+                    Some(100),
+                    60_000,
+                    None,
+                    task_cancel,
+                )
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        cancel.cancel();
+        let error = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("cancellation completes")
+            .expect("process task")
+            .expect_err("cancelled process must not return a snapshot");
+        assert!(error.to_string().contains("cancelled"));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            manager
+                .inner
+                .processes
+                .lock()
+                .expect("process registry lock")
+                .values()
+                .all(|entry| entry.session_id != owner)
+        );
+    }
+
+    #[test]
+    fn replay_process_events_keeps_running_processes_recoverable() {
+        let session_id = Uuid::new_v4();
+        let process_id = Uuid::new_v4();
+        let events = vec![
+            SessionEvent::new(
+                session_id,
+                1,
+                SessionEventKind::RuntimeProcessStarted {
+                    process_id,
+                    pid: 42,
+                    command: "sleep 30".to_string(),
+                    cwd: "/workspace".into(),
+                },
+            ),
+            SessionEvent::new(
+                session_id,
+                2,
+                SessionEventKind::RuntimeProcessOutput {
+                    process_id,
+                    stream: RuntimeProcessStream::Stdout,
+                    chunk: "still running\n".to_string(),
+                },
+            ),
+        ];
+        let processes = replay_process_events(&events);
+        let process = processes.get(&process_id).expect("running process");
+        assert!(!process.completed);
+        let (output, _) = process.output.stdout.render(100);
+        assert_eq!(output, "still running\n");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn completed_processes_are_durably_journaled_before_poll_returns() {
+        let directory = tempfile::tempdir().expect("database directory");
+        let store = SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
+            .await
+            .expect("session store");
+        let session_id = Uuid::new_v4();
+        store.create_session(session_id).await.expect("session");
+        let manager = ProcessManager::default();
+        let result = manager
+            .exec(
+                session_id,
+                directory.path(),
+                "printf 'hello'; printf 'warning' >&2".to_string(),
+                None,
+                Some(2_000),
+                Some(1_000),
+                10_000,
+                Some(store.clone()),
+            )
+            .await
+            .expect("command");
+        assert!(!result.running);
+        let events = store.read(session_id).await.expect("journal");
+        assert!(matches!(
+            events.first().map(|event| &event.kind),
+            Some(SessionEventKind::RuntimeProcessStarted { .. })
+        ));
+        assert!(events.iter().any(|event| matches!(
+            event.kind,
+            SessionEventKind::RuntimeProcessOutput {
+                stream: RuntimeProcessStream::Stdout,
+                ..
+            }
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event.kind,
+            SessionEventKind::RuntimeProcessOutput {
+                stream: RuntimeProcessStream::Stderr,
+                ..
+            }
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event.kind,
+            SessionEventKind::RuntimeProcessCompleted {
+                status: RuntimeProcessStatus::Exited,
+                ..
+            }
+        )));
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn concurrent_processes_keep_session_ownership_and_output_separate() {
+        let root = tempfile::tempdir().expect("workspace");
+        let manager = ProcessManager::default();
+        let owner = Uuid::new_v4();
+        let (left, right) = tokio::join!(
+            manager.exec(
+                owner,
+                root.path(),
+                "printf left".to_string(),
+                None,
+                Some(2_000),
+                Some(100),
+                10_000,
+                None,
+            ),
+            manager.exec(
+                owner,
+                root.path(),
+                "printf right".to_string(),
+                None,
+                Some(2_000),
+                Some(100),
+                10_000,
+                None,
+            ),
+        );
+        let left = left.expect("left command");
+        let right = right.expect("right command");
+        assert!(!left.running);
+        assert!(!right.running);
+        assert_eq!(left.stdout, "left");
+        assert_eq!(right.stdout, "right");
+        assert_ne!(left.session_id, right.session_id);
+    }
+
+    #[tokio::test]
+    async fn sqlite_recovery_is_idempotent_for_an_orphaned_process() {
+        let directory = tempfile::tempdir().expect("database directory");
+        let store = SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
+            .await
+            .expect("session store");
+        let session_id = Uuid::new_v4();
+        let process_id = Uuid::new_v4();
+        store.create_session(session_id).await.expect("session");
+        store
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::RuntimeProcessStarted {
+                    process_id,
+                    pid: 0,
+                    command: "sleep 30".to_string(),
+                    cwd: directory.path().to_path_buf(),
+                },
+            ))
+            .await
+            .expect("start journal");
+
+        let manager = ProcessManager::default();
+        manager
+            .recover_session(session_id, store.clone())
+            .await
+            .expect("recover");
+        manager
+            .recover_session(session_id, store.clone())
+            .await
+            .expect("repeat recovery");
+
+        let completions = store
+            .read(session_id)
+            .await
+            .expect("read journal")
+            .into_iter()
+            .filter(|event| {
+                matches!(
+                    event.kind,
+                    SessionEventKind::RuntimeProcessCompleted {
+                        process_id: id,
+                        status: RuntimeProcessStatus::Orphaned,
+                        ..
+                    } if id == process_id
+                )
+            })
+            .count();
+        assert_eq!(completions, 1);
     }
 }

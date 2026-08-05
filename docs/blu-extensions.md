@@ -106,11 +106,18 @@ by default because both skills and MCP commands influence an agent; opt in with:
 allow_project_mcp = true
 ```
 
-Blu never runs package install hooks, update hooks, activation scripts, or an
-embedded scripting VM. MCP commands are direct argv-based stdio processes, not
-shell snippets. Use `allowed_tools` to expose the smallest tool surface; the
-allowlist is enforced by Borg's native runtime and translated to each external
-provider's MCP policy format.
+Blu extension packages never run package install hooks, update hooks, or
+activation scripts. Extension MCP commands are direct argv-based stdio
+processes, not shell snippets. Use `allowed_tools` to expose the smallest tool
+surface; the allowlist is enforced by Borg's native runtime and translated to
+each external provider's MCP policy format.
+
+Separately, the native harness can execute an explicit `run_blu_workflow`
+request in Borg's bounded embedded Blu runtime. That workflow surface is not
+an extension lifecycle hook: its source is admitted with a durable workflow id,
+and every call to Borg tools, processes, autonomy jobs, or checkpoints is
+permission-checked and journaled in the canonical SQLite session store. The
+guest receives no raw filesystem, database, provider, or process handles.
 
 ## Compatibility
 

@@ -14,6 +14,7 @@ publish = false
 anyhow.workspace = true
 async-trait.workspace = true
 base64.workspace = true
+blu-lang.workspace = true
 borg-provider = { path = "../borg-provider" }
 chrono.workspace = true
 futures.workspace = true
@@ -23,6 +24,7 @@ regex.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 sqlx.workspace = true
 tempfile.workspace = true
 toml.workspace = true

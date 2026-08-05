@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const WRITE_TRANSACTION: &str = "BEGIN IMMEDIATE";
+const WORKSPACE_SCHEMA_VERSION: i64 = 2;
 
 /// Stable identity for the local OS user across all personal workspaces in one
 /// Borg installation. Authenticated cloud workspaces replace this projection
@@ -351,7 +352,7 @@ impl SqliteWorkspaceStore {
         let opts = SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))?
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
-            .synchronous(SqliteSynchronous::Normal)
+            .synchronous(SqliteSynchronous::Full)
             .busy_timeout(BUSY_TIMEOUT)
             .foreign_keys(true);
         let pool = SqlitePoolOptions::new()
@@ -359,6 +360,14 @@ impl SqliteWorkspaceStore {
             .connect_with(opts)
             .await
             .with_context(|| format!("failed to open SQLite workspace store {}", path.display()))?;
+        Self::from_pool(pool).await
+    }
+
+    /// Attach the workspace projection to an already-open canonical SQLite
+    /// authority. Production sessions use this path so workspace membership,
+    /// multiplayer delivery, events, actions, and provider history share one
+    /// WAL and one transaction boundary.
+    pub async fn from_pool(pool: SqlitePool) -> Result<Self> {
         let store = Self { pool };
         store.schema().await?;
         Ok(store)
@@ -662,6 +671,7 @@ impl SqliteWorkspaceStore {
     }
     async fn schema(&self) -> Result<()> {
         sqlx::raw_sql(r#"
+      create table if not exists borg_workspace_schema (id integer primary key check(id=1), version integer not null);
       create table if not exists workspace_participants (id text primary key, display_name text not null, kind text not null, created_at text not null);
       create table if not exists workspaces (id text primary key, name text not null, next_sequence integer not null default 1, created_at text not null);
       create table if not exists workspace_members (workspace_id text not null references workspaces(id) on delete cascade, participant_id text not null references workspace_participants(id), role text not null, joined_at text not null, primary key(workspace_id,participant_id));
@@ -679,29 +689,27 @@ impl SqliteWorkspaceStore {
         let columns = sqlx::query("pragma table_info(workspace_deliveries)")
             .fetch_all(&self.pool)
             .await?;
-        if !columns
-            .iter()
-            .any(|column| column.get::<String, _>("name") == "is_message")
-        {
-            let mut tx = self.write().await?;
-            sqlx::query(
-                "alter table workspace_deliveries \
-                 add column is_message integer not null default 0",
-            )
-            .execute(&mut *tx)
-            .await?;
-            sqlx::query(
-                "update workspace_deliveries set is_message=1 \
-                 where exists( \
-                   select 1 from workspace_events e \
-                   where e.workspace_id=workspace_deliveries.workspace_id \
-                     and e.sequence=workspace_deliveries.sequence \
-                     and json_extract(e.event_json, '$.kind.type')='message' \
-                 )",
-            )
-            .execute(&mut *tx)
-            .await?;
-            tx.commit().await?;
+        ensure!(
+            columns
+                .iter()
+                .any(|column| column.get::<String, _>("name") == "is_message"),
+            "workspace database is stale: workspace_deliveries.is_message is missing; recreate or explicitly export/import this database"
+        );
+        let version: Option<i64> =
+            sqlx::query_scalar("select version from borg_workspace_schema where id=1")
+                .fetch_optional(&self.pool)
+                .await?;
+        match version {
+            Some(version) => ensure!(
+                version == WORKSPACE_SCHEMA_VERSION,
+                "workspace database schema version {version} is unsupported; expected {WORKSPACE_SCHEMA_VERSION}"
+            ),
+            None => {
+                sqlx::query("insert into borg_workspace_schema(id,version) values(1,?)")
+                    .bind(WORKSPACE_SCHEMA_VERSION)
+                    .execute(&self.pool)
+                    .await?;
+            }
         }
         sqlx::raw_sql(
             r#"create index if not exists idx_workspace_pending_message_deliveries
@@ -1746,7 +1754,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn existing_workspace_store_backfills_the_message_delivery_bit() {
+    async fn stale_workspace_store_is_rejected_instead_of_migrated() {
         let file = tempfile::NamedTempFile::new().unwrap();
         let opts = SqliteConnectOptions::from_str(&format!("sqlite://{}", file.path().display()))
             .unwrap()
@@ -1759,17 +1767,6 @@ mod tests {
             .unwrap();
         sqlx::raw_sql(
             r#"
-            create table workspace_events (
-              workspace_id text not null,
-              sequence integer not null,
-              id text not null,
-              author_id text not null,
-              idempotency_key text not null,
-              canonical_json text not null,
-              event_json text not null,
-              created_at text not null,
-              primary key(workspace_id,sequence)
-            );
             create table workspace_deliveries (
               workspace_id text not null,
               sequence integer not null,
@@ -1785,40 +1782,16 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        sqlx::query("insert into workspace_events values(?,?,?,?,?,?,?,?)")
-            .bind("workspace")
-            .bind(1_i64)
-            .bind("event")
-            .bind("author")
-            .bind("key")
-            .bind("{}")
-            .bind(r#"{"kind":{"type":"message"}}"#)
-            .bind(Utc::now().to_rfc3339())
-            .execute(&pool)
-            .await
-            .unwrap();
-        sqlx::query("insert into workspace_deliveries values(?,?,?,?,?,?,?)")
-            .bind("workspace")
-            .bind(1_i64)
-            .bind("recipient")
-            .bind(r#""notify""#)
-            .bind(r#""pending""#)
-            .bind(0_i64)
-            .bind(Option::<String>::None)
-            .execute(&pool)
-            .await
-            .unwrap();
         pool.close().await;
 
-        let store = SqliteWorkspaceStore::open(file.path()).await.unwrap();
-        let is_message: i64 = sqlx::query_scalar(
-            "select is_message from workspace_deliveries \
-             where workspace_id='workspace' and sequence=1 and recipient_id='recipient'",
-        )
-        .fetch_one(store.pool())
-        .await
-        .unwrap();
-        assert_eq!(is_message, 1);
+        let error = match SqliteWorkspaceStore::open(file.path()).await {
+            Ok(_) => panic!("stale workspace schema was silently accepted"),
+            Err(error) => error,
+        };
+        assert!(
+            format!("{error:#}").contains("workspace_deliveries.is_message"),
+            "unexpected stale-schema error: {error:#}"
+        );
     }
 
     #[tokio::test]

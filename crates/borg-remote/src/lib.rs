@@ -7,6 +7,8 @@
 //! or interpret provider JSON directly.
 
 mod agent;
+mod autonomy;
+mod blu_workflow;
 mod command;
 mod contract;
 mod filesystem;
@@ -22,6 +24,7 @@ mod orchestration;
 mod receipt;
 mod self_service;
 mod session;
+mod session_action;
 mod session_lock;
 mod session_store;
 mod subagents;
@@ -33,13 +36,19 @@ pub use agent::{
     ConsultationRequest, ConsultationResult, LocalAgentSettings, LocalAgentTurnExecutor,
     run_agent_turn, run_agent_turn_controlled,
 };
+pub use autonomy::{
+    AutonomyCheckpoint, AutonomyJob, AutonomyJobHandler, AutonomyJobState, AutonomyJobTransition,
+    AutonomyLease, EnqueueAutonomyJob, SaveAutonomyCheckpoint, SqliteAutonomyStore,
+    SqliteAutonomySupervisor,
+};
+pub use blu_workflow::{BluWorkflowRequest, BluWorkflowResult};
 pub use command::execute_workspace_command;
 pub use contract::*;
 pub use filesystem::execute_workspace_filesystem;
 pub use host::{
     HostConfig, HostExecutorFactory, default_host_config_path, enroll_host, login_provider,
-    mirror_local_session, probe_capabilities, provider_credentials_present, run_host,
-    run_host_with_executor_factory,
+    mirror_local_session, probe_capabilities, probe_provider_capabilities,
+    provider_credentials_present, run_host, run_host_with_executor_factory,
 };
 pub use local_control::{
     LocalSessionControlServer, local_session_owner_uses_current_binary, run_attached_session,
@@ -52,6 +61,10 @@ pub use session::{
     run_agent_session_with_executor, run_agent_session_with_executor_and_writer,
     run_agent_session_with_store_and_writer, run_agent_session_with_store_writer_and_peers,
     run_agent_session_with_writer,
+};
+pub use session_action::{
+    ActionDeliveryPolicy, ActionWakePolicy, SessionAction, SessionActionKind, SessionActionState,
+    SessionActionTransition,
 };
 pub use session_lock::SessionWriterLease;
 pub use session_store::{

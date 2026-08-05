@@ -141,6 +141,8 @@ pub struct AgentToolDispatcher {
     consultation_enabled: bool,
     team_policy: Option<crate::TeamPolicy>,
     self_service: crate::self_service::SelfServiceContext,
+    autonomy: Option<crate::SqliteAutonomyStore>,
+    provider_capabilities: Vec<crate::ProviderCapability>,
 }
 
 #[derive(Debug)]
@@ -414,6 +416,8 @@ impl AgentToolDispatcher {
         team_policy: Option<crate::TeamPolicy>,
         cwd: PathBuf,
         consultation: Option<SessionConsultationTools>,
+        autonomy: Option<crate::SqliteAutonomyStore>,
+        provider_capabilities: Vec<crate::ProviderCapability>,
     ) -> Self {
         let consultation_enabled = subagents
             .as_ref()
@@ -431,17 +435,29 @@ impl AgentToolDispatcher {
             consultation_enabled,
             team_policy,
             self_service: crate::self_service::SelfServiceContext::new(cwd),
+            autonomy,
+            provider_capabilities,
         }
     }
 
     pub fn specs(&self) -> Vec<Value> {
-        agent_tool_specs_with_capabilities_and_consultation(
+        let mut specs = agent_tool_specs_with_capabilities_and_consultation(
             self.provider,
             self.subagents_enabled,
             self.shared_work.is_some(),
             self.team_policy.as_ref(),
             self.consultation_enabled,
-        )
+        );
+        if self.autonomy.is_some() {
+            specs.extend(autonomy_tool_specs());
+        }
+        specs
+    }
+
+    pub(crate) fn session_store(&self) -> Option<crate::SqliteSessionStore> {
+        self.autonomy
+            .as_ref()
+            .map(crate::SqliteAutonomyStore::session_store)
     }
 
     fn consultation_enabled(&self) -> bool {
@@ -526,6 +542,13 @@ impl AgentToolDispatcher {
                 let _: NoArgs = serde_json::from_value(arguments)?;
                 Ok(self.lsp.status().await)
             }
+            "get_provider_capabilities" => {
+                let _: NoArgs = serde_json::from_value(arguments)?;
+                Ok(json!({
+                    "providers": self.provider_capabilities,
+                    "instruction": "Only providers with can_spawn=true are eligible for subagent admission."
+                }))
+            }
             "lsp_diagnostics" => {
                 let args: LspPathArgs = serde_json::from_value(arguments)?;
                 self.lsp.diagnostics(&args.path).await
@@ -562,6 +585,13 @@ impl AgentToolDispatcher {
                     .await
             }
             name if crate::self_service::is_tool(name) => self.self_service.call(name, arguments),
+            name if is_autonomy_tool(name) => {
+                let store = self
+                    .autonomy
+                    .as_ref()
+                    .context("durable autonomous runtime is unavailable")?;
+                call_autonomy_tool(store, self.actor_session_id, name, arguments).await
+            }
             _ => {
                 if !self.subagents_enabled {
                     bail!("subagent tools are disabled by session capabilities");
@@ -1044,9 +1074,12 @@ impl SubagentCoordinator {
     }
 
     async fn workspace_store(&self) -> Result<&SqliteWorkspaceStore> {
-        let path = self.journal_root.join("workspaces.sqlite3");
         self.workspace_store
-            .get_or_try_init(|| async move { SqliteWorkspaceStore::open(path).await })
+            .get_or_try_init(|| async {
+                self.store.workspace_store().await?.with_context(
+                    || "subagent multiplayer requires the canonical SQLite workspace projection",
+                )
+            })
             .await
     }
 
@@ -1480,6 +1513,7 @@ impl SubagentCoordinator {
         launch.initial_prompt = Some(message);
         let parent_provider = launch.provider;
         launch.provider = request.provider.unwrap_or(parent_provider);
+        ensure_provider_can_spawn(&launch, launch.provider)?;
         validate_subagent_overrides(
             launch.provider,
             request.model.as_deref(),
@@ -1525,6 +1559,7 @@ impl SubagentCoordinator {
         model: Option<String>,
         effort: Option<String>,
     ) -> Result<SubagentSnapshot> {
+        ensure_provider_can_spawn(&self.root_launch, provider)?;
         let task_name = canonical_task_name(task_name)?;
         let existing = {
             let table = self.table.lock().await;
@@ -2867,6 +2902,30 @@ fn validate_subagent_overrides(
     Ok(())
 }
 
+fn ensure_provider_can_spawn(launch: &LaunchSession, provider: CodingProvider) -> Result<()> {
+    let capability = launch
+        .capabilities
+        .provider_capabilities
+        .iter()
+        .find(|capability| capability.provider == provider)
+        .with_context(|| {
+            format!(
+                "{} provider capability is unknown on this host; call get_provider_capabilities before spawning",
+                provider.label()
+            )
+        })?;
+    anyhow::ensure!(
+        capability.can_spawn,
+        "{} cannot spawn on this host: {}",
+        provider.label(),
+        capability
+            .auth_detail
+            .as_deref()
+            .unwrap_or("no authenticated subscription, API key, or configured endpoint")
+    );
+    Ok(())
+}
+
 fn effective_worker_effort(
     launch: &LaunchSession,
     requested_effort: Option<String>,
@@ -2942,6 +3001,15 @@ pub fn agent_tool_specs_with_capabilities_and_consultation(
                     }
                 },
                 "required": ["profile", "prompt"],
+                "additionalProperties": false
+            }),
+        ),
+        tool(
+            "get_provider_capabilities",
+            "Read the host-local, secret-free authentication and admission snapshot. It distinguishes authenticated Codex/Claude subscriptions, configured API-key routes, and OpenAI-compatible endpoints. Only providers with can_spawn=true can be used for a child; never ask for or expose credentials.",
+            json!({
+                "type": "object",
+                "properties": {},
                 "additionalProperties": false
             }),
         ),
@@ -3494,6 +3562,183 @@ struct WaitAgentArgs {
     timeout_ms: Option<u64>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EnqueueRuntimeJobArgs {
+    idempotency_key: String,
+    kind: String,
+    payload: Value,
+    due_at: Option<String>,
+    max_attempts: Option<u32>,
+    goal_id: Option<Uuid>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeJobArgs {
+    job_id: Uuid,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SaveRuntimeCheckpointArgs {
+    job_id: Uuid,
+    checkpoint_key: String,
+    kind: String,
+    state: Value,
+    evidence: Value,
+}
+
+fn is_autonomy_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "enqueue_runtime_job"
+            | "get_runtime_job"
+            | "save_runtime_checkpoint"
+            | "list_runtime_checkpoints"
+    )
+}
+
+fn autonomy_tool_specs() -> Vec<Value> {
+    vec![
+        tool(
+            "enqueue_runtime_job",
+            "Durably schedule an idempotent provider-neutral runtime job for later execution or verification.",
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["idempotency_key", "kind", "payload"],
+                "properties": {
+                    "idempotency_key": {"type": "string", "minLength": 1, "maxLength": 256},
+                    "kind": {"type": "string", "minLength": 1, "maxLength": 128},
+                    "payload": {"type": "object"},
+                    "due_at": {"type": "string", "format": "date-time"},
+                    "max_attempts": {"type": "integer", "minimum": 1, "maximum": 32},
+                    "goal_id": {"type": "string", "format": "uuid"}
+                }
+            }),
+        ),
+        tool(
+            "get_runtime_job",
+            "Read one durable runtime job owned by this session, including its lease and retry state.",
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["job_id"],
+                "properties": {"job_id": {"type": "string", "format": "uuid"}}
+            }),
+        ),
+        tool(
+            "save_runtime_checkpoint",
+            "Persist reproducible runtime state and verification evidence for an owned job; repeated keys are idempotent.",
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["job_id", "checkpoint_key", "kind", "state", "evidence"],
+                "properties": {
+                    "job_id": {"type": "string", "format": "uuid"},
+                    "checkpoint_key": {"type": "string", "minLength": 1, "maxLength": 256},
+                    "kind": {"type": "string", "minLength": 1, "maxLength": 128},
+                    "state": {"type": "object"},
+                    "evidence": {"type": "object"}
+                }
+            }),
+        ),
+        tool(
+            "list_runtime_checkpoints",
+            "List reproducible checkpoints and evidence for an owned runtime job.",
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["job_id"],
+                "properties": {"job_id": {"type": "string", "format": "uuid"}}
+            }),
+        ),
+    ]
+}
+
+async fn owned_runtime_job(
+    store: &crate::SqliteAutonomyStore,
+    session_id: Uuid,
+    job_id: Uuid,
+) -> Result<crate::AutonomyJob> {
+    let job = store
+        .get(job_id)
+        .await?
+        .with_context(|| format!("unknown runtime job {job_id}"))?;
+    anyhow::ensure!(
+        job.session_id == Some(session_id),
+        "runtime job {job_id} belongs to another session"
+    );
+    Ok(job)
+}
+
+async fn call_autonomy_tool(
+    store: &crate::SqliteAutonomyStore,
+    session_id: Uuid,
+    name: &str,
+    arguments: Value,
+) -> Result<Value> {
+    match name {
+        "enqueue_runtime_job" => {
+            let args: EnqueueRuntimeJobArgs = serde_json::from_value(arguments)?;
+            let due_at = args
+                .due_at
+                .as_deref()
+                .map(DateTime::parse_from_rfc3339)
+                .transpose()
+                .context("due_at must be an RFC3339 timestamp")?
+                .map(|value| value.with_timezone(&Utc))
+                .unwrap_or_else(Utc::now);
+            let job = store
+                .enqueue(crate::EnqueueAutonomyJob {
+                    job_id: None,
+                    idempotency_key: args.idempotency_key,
+                    kind: args.kind,
+                    payload: args.payload,
+                    due_at,
+                    max_attempts: args.max_attempts.unwrap_or(3).clamp(1, 32),
+                    session_id: Some(session_id),
+                    goal_id: args.goal_id,
+                })
+                .await?;
+            Ok(serde_json::to_value(job)?)
+        }
+        "get_runtime_job" => {
+            let args: RuntimeJobArgs = serde_json::from_value(arguments)?;
+            Ok(serde_json::to_value(
+                owned_runtime_job(store, session_id, args.job_id).await?,
+            )?)
+        }
+        "save_runtime_checkpoint" => {
+            let args: SaveRuntimeCheckpointArgs = serde_json::from_value(arguments)?;
+            let job = owned_runtime_job(store, session_id, args.job_id).await?;
+            let checkpoint = store
+                .save_checkpoint(crate::SaveAutonomyCheckpoint {
+                    checkpoint_id: None,
+                    job_id: args.job_id,
+                    checkpoint_key: args.checkpoint_key,
+                    session_id: Some(session_id),
+                    goal_id: job.goal_id,
+                    kind: args.kind,
+                    state: args.state,
+                    evidence: args.evidence,
+                    created_at: Utc::now(),
+                })
+                .await?;
+            Ok(serde_json::to_value(checkpoint)?)
+        }
+        "list_runtime_checkpoints" => {
+            let args: RuntimeJobArgs = serde_json::from_value(arguments)?;
+            owned_runtime_job(store, session_id, args.job_id).await?;
+            Ok(serde_json::to_value(
+                store.list_checkpoints(args.job_id).await?,
+            )?)
+        }
+        _ => bail!("unknown autonomous runtime tool `{name}`"),
+    }
+}
+
 fn goal_response(
     response: std::result::Result<crate::SessionGoalToolResponse, String>,
 ) -> Result<Value> {
@@ -3830,7 +4075,29 @@ mod tests {
         }
     }
 
+    fn test_provider_capabilities() -> Vec<crate::ProviderCapability> {
+        [
+            CodingProvider::Codex,
+            CodingProvider::Claude,
+            CodingProvider::OpenRouter,
+            CodingProvider::OpenAiCompatible,
+        ]
+        .into_iter()
+        .map(|provider| crate::ProviderCapability {
+            provider,
+            installed: true,
+            version: Some("test".to_string()),
+            authenticated: true,
+            auth_detail: Some("test credentials".to_string()),
+            auth_methods: vec![crate::ProviderAuthMethod::Subscription],
+            can_spawn: true,
+        })
+        .collect()
+    }
+
     fn launch() -> LaunchSession {
+        let mut capabilities = crate::SessionCapabilities::default();
+        capabilities.provider_capabilities = test_provider_capabilities();
         LaunchSession {
             request_id: Uuid::new_v4(),
             cwd: PathBuf::from("/workspace"),
@@ -3842,7 +4109,7 @@ mod tests {
             permission_mode: PermissionMode::Manual,
             name: None,
             initial_prompt: None,
-            capabilities: Default::default(),
+            capabilities,
             subagent_concurrency_limit: None,
             extension_skill_roots: Vec::new(),
             team_policy: None,
@@ -3855,9 +4122,11 @@ mod tests {
         root: Uuid,
         children: &[Uuid],
     ) {
-        let workspace = crate::SqliteWorkspaceStore::open(directory.join("workspaces.sqlite3"))
+        let workspace = store
+            .workspace_store()
             .await
-            .unwrap();
+            .unwrap()
+            .expect("SQLite session store exposes the canonical workspace projection");
         let human = crate::local_human_participant_id("Human");
         workspace
             .ensure_execution_workspace(root, "test team", human, "Human", root, "Director")
@@ -3951,6 +4220,51 @@ mod tests {
             .unwrap();
         assert_eq!(resumed.session_id, first.session_id);
         coordinator.stop("/root/claude").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn subagent_admission_rejects_a_provider_without_host_authentication() {
+        let directory = tempdir().unwrap();
+        let root = Uuid::new_v4();
+        let store = Arc::new(
+            crate::SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
+                .await
+                .unwrap(),
+        );
+        store.create_session(root).await.unwrap();
+        let mut root_launch = launch();
+        let claude = root_launch
+            .capabilities
+            .provider_capabilities
+            .iter_mut()
+            .find(|capability| capability.provider == CodingProvider::Claude)
+            .unwrap();
+        claude.authenticated = false;
+        claude.auth_methods.clear();
+        claude.can_spawn = false;
+        claude.auth_detail = Some("Claude subscription is not authenticated".to_string());
+        let coordinator = SubagentCoordinator::new_with_store_and_executor(
+            directory.path(),
+            root,
+            root_launch,
+            2,
+            Arc::new(crate::LocalAgentTurnExecutor::default()),
+            store,
+        )
+        .unwrap();
+
+        let error = coordinator
+            .ensure_sidecar(
+                "claude",
+                CodingProvider::Claude,
+                Some("claude-opus-5".to_string()),
+                Some("high".to_string()),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Claude cannot spawn"));
+        assert!(error.contains("not authenticated"));
     }
 
     #[tokio::test]
@@ -4326,10 +4640,11 @@ mod tests {
             coordinator.take_root_inbox().await[0].message_id,
             broadcast_id
         );
-        let workspace =
-            crate::SqliteWorkspaceStore::open(directory.path().join("workspaces.sqlite3"))
-                .await
-                .unwrap();
+        let workspace = store
+            .workspace_store()
+            .await
+            .unwrap()
+            .expect("SQLite session store exposes the canonical workspace projection");
         let binding = store
             .workspace_binding(recipient.session_id)
             .await
@@ -4563,7 +4878,7 @@ mod tests {
         let workspace_id = Uuid::new_v4();
         let human_id = Uuid::new_v4();
         let agent_id = Uuid::new_v4();
-        let store = SqliteWorkspaceStore::open(directory.path().join("workspaces.sqlite3"))
+        let store = SqliteWorkspaceStore::open(directory.path().join("sessions.sqlite3"))
             .await
             .unwrap();
         store

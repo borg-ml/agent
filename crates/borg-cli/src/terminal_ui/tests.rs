@@ -4708,6 +4708,7 @@ fn adjacent_provider_notifications_render_one_compaction_card() {
 fn low_context_status_announces_imminent_compaction() {
     let transcript = Transcript {
         context_remaining_percent: 20,
+        context_known: true,
         ..Default::default()
     };
 
@@ -5608,6 +5609,35 @@ fn reasoning_is_one_live_muted_disclosure_that_collapses_at_a_tool_boundary() {
     assert!(matches!(
         &transcript.order[0],
         TranscriptEntry::Tool { expanded: true, .. }
+    ));
+}
+
+#[test]
+fn cumulative_reasoning_snapshots_replace_the_live_prefix() {
+    let session_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::ReasoningDelta {
+            text: "Considering code modifications".to_string(),
+        },
+    ));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::ReasoningDelta {
+            text: "Considering code modifications\nI’m checking the repository".to_string(),
+        },
+    ));
+
+    assert!(matches!(
+        &transcript.order[0],
+        TranscriptEntry::Tool {
+            code_view: Some((language, source)),
+            ..
+        } if language == "reasoning"
+            && source == "Considering code modifications\nI’m checking the repository"
     ));
 }
 

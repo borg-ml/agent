@@ -57,7 +57,9 @@ impl OpenAiCompatibleProfile {
 
     fn api_key(self) -> Option<String> {
         match self {
-            Self::OpenRouter => nonempty_env("OPENROUTER_API_KEY"),
+            Self::OpenRouter => {
+                crate::credentials::api_key(crate::credentials::ApiKeyCredential::OpenRouter)
+            }
             Self::Generic => nonempty_env("BORG_OPENAI_COMPATIBLE_API_KEY")
                 .or_else(|| nonempty_env("BORG_OPENAI_API_KEY"))
                 .or_else(|| nonempty_env("OPENAI_API_KEY")),
@@ -192,6 +194,12 @@ impl OpenAiCompatibleProvider {
             "stream": true,
             "stream_options": { "include_usage": true },
         });
+        if profile == OpenAiCompatibleProfile::OpenRouter
+            && let Some(prompt_cache_key) = request.prompt_cache_key.as_deref()
+            && !prompt_cache_key.trim().is_empty()
+        {
+            body["prompt_cache_key"] = json!(prompt_cache_key);
+        }
         match profile {
             OpenAiCompatibleProfile::OpenRouter => {
                 if let Some(reasoning) = compatible_reasoning(self.effort.as_deref()) {
@@ -1282,6 +1290,7 @@ mod tests {
             .model_turn_via_profile(
                 ModelTurnRequest {
                     request_id: Some("openrouter-test".to_string()),
+                    prompt_cache_key: Some("borg-session:test".to_string()),
                     messages: vec![ModelMessage::user("inspect the repository")],
                     tools: vec![
                         super::super::ModelToolDefinition::new(
@@ -1320,6 +1329,7 @@ mod tests {
         let body: Value =
             serde_json::from_slice(&request[header_end + 4..]).expect("request JSON body");
         assert_eq!(body["model"], "vendor/future-model");
+        assert_eq!(body["prompt_cache_key"], "borg-session:test");
         assert_eq!(body["reasoning"]["effort"], "high");
         assert_eq!(body["tool_choice"], "auto");
         assert_eq!(body["response_format"]["type"], "json_schema");

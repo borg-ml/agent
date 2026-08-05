@@ -125,6 +125,31 @@ TUI, while Blu skills and MCP servers reload at the next turn boundary.
 the native skill context rescans it at the start of the next native turn
 without a restart.
 
+### Durable Blu workflows
+
+The native harness also exposes `run_blu_workflow` for bounded, programmatic
+agent workflows. A workflow is identified by an explicit `workflow_id` and is
+executed inside Borg's embedded Blu runtime. Blu supplies control flow; Borg
+remains authoritative for permissions, tools, processes, autonomy jobs,
+checkpoints, and SQLite journaling.
+
+Guest host calls use stable call ids so a completed effect can be replayed
+without running it twice:
+
+```text
+borg_emit(call_id, kind, payload_json)
+borg_tool(call_id, name, arguments_json)
+borg_enqueue(call_id, idempotency_key, kind, payload_json, delay_ms, max_attempts)
+borg_job(call_id, job_uuid)
+borg_checkpoint(call_id, job_uuid, checkpoint_key, kind, state_json, evidence_json)
+borg_exec(call_id, command, workdir, yield_time_ms, timeout_ms, max_output_tokens)
+```
+
+Every workflow and host call has durable start/request and terminal records.
+`blu_workflow` autonomy jobs are supervised through the same SQLite lease and
+retry state machine. Workflow code does not receive raw filesystem, database,
+provider, or process handles.
+
 ## Cross-model peer consultation
 
 The active GPT or Claude thread remains the primary conversation. `/claude TEXT`

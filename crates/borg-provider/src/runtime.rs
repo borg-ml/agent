@@ -199,10 +199,8 @@ pub fn set_openrouter_model_entries(entries: Vec<DynamicModelEntry>) {
 /// Failure is returned to the caller so startup can keep the manual/current
 /// model path usable without making the network a prerequisite for the TUI.
 pub async fn refresh_openrouter_model_catalog() -> anyhow::Result<Vec<DynamicModelEntry>> {
-    let Some(api_key) = std::env::var("OPENROUTER_API_KEY")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
+    let Some(api_key) =
+        crate::credentials::api_key(crate::credentials::ApiKeyCredential::OpenRouter)
     else {
         set_openrouter_model_entries(Vec::new());
         return Ok(Vec::new());

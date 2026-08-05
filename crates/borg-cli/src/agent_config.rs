@@ -157,6 +157,7 @@ impl From<&CapabilityConfig> for borg_remote::SessionCapabilities {
             cloud_sync: value.cloud_sync,
             web_relay: value.web_relay,
             telemetry: value.telemetry,
+            provider_capabilities: Vec::new(),
         }
     }
 }

@@ -1,16 +1,21 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::str::FromStr;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
+use sqlx::sqlite::{
+    SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow, SqliteSynchronous,
+};
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 use uuid::Uuid;
 
+use crate::session_action::{SessionAction, SessionActionState, SessionActionTransition};
 use crate::{
     CodingProvider, MessageStatus, PermissionMode, PlanItem, ResponseLanguage, SessionEvent,
     SessionEventKind, SessionGoal, SessionPayloadKind, SessionPayloadRef, SessionStatus,
@@ -20,9 +25,9 @@ pub(crate) const INLINE_SESSION_PAYLOAD_BYTES: usize = 64 * 1024;
 pub(crate) const SESSION_PAYLOAD_PREVIEW_BYTES: usize = 4 * 1024;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const SQLITE_WRITE_TRANSACTION: &str = "BEGIN IMMEDIATE";
+const MAX_HOST_LAUNCH_METADATA_BYTES: usize = 512 * 1024;
 pub const SESSION_PROJECTION_VERSION: i32 = 3;
-/// `pragma user_version` marking the queued-prompt inheritance backfill.
-const QUEUED_PROMPT_INHERITANCE_VERSION: i64 = 1;
+const SESSION_SCHEMA_VERSION: i64 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventPersistence {
@@ -43,10 +48,11 @@ impl SessionEventKind {
             {
                 EventPersistence::Durable
             }
-            Self::ProviderEvent { kind, payload, .. }
-                if kind == "context_compaction"
-                    && payload.get("status").and_then(serde_json::Value::as_str)
-                        != Some("started") =>
+            Self::ProviderEvent { kind, .. }
+                if matches!(
+                    kind.as_str(),
+                    "context_compaction" | "context_compaction_failed"
+                ) =>
             {
                 EventPersistence::Durable
             }
@@ -65,10 +71,18 @@ impl SessionEventKind {
         !matches!(
             self,
             Self::ProviderSessionLinked { .. }
+                | Self::ProviderCapabilitiesUpdated { .. }
                 | Self::TurnStarted { .. }
                 | Self::StatusChanged { .. }
                 | Self::SubagentActivity { .. }
                 | Self::SubagentControl { .. }
+                | Self::RuntimeProcessStarted { .. }
+                | Self::RuntimeProcessOutput { .. }
+                | Self::RuntimeProcessCompleted { .. }
+                | Self::BluWorkflowStarted { .. }
+                | Self::BluWorkflowCallRequested { .. }
+                | Self::BluWorkflowCallCompleted { .. }
+                | Self::BluWorkflowCompleted { .. }
                 // A fork cuts immediately before the admission of the prompt it
                 // rewinds to, which would otherwise leave that prompt's earlier
                 // queue entry inside the inherited history: the fork would then
@@ -241,9 +255,19 @@ pub struct SessionUsage {
 #[serde(default)]
 pub struct SessionState {
     pub latest_sequence: u64,
+    /// Monotonic identity for the canonical provider-context prefix. A
+    /// compaction, explicit context clear, or provider/model change starts a
+    /// new cache epoch; reconnects and ordinary turns retain it.
+    #[serde(default)]
+    pub context_generation: u64,
     pub started_at: Option<DateTime<Utc>>,
     pub activity_at: Option<DateTime<Utc>>,
     pub configuration: Option<SessionConfiguration>,
+    /// Latest host-local provider admission snapshot. Authentication metadata
+    /// is durable for recovery and UI inspection but excluded from model
+    /// context and fork inheritance.
+    #[serde(default)]
+    pub provider_capabilities: Vec<crate::ProviderCapability>,
     pub status: Option<SessionStatus>,
     pub status_detail: Option<String>,
     pub provider_session_id: Option<String>,
@@ -288,6 +312,9 @@ impl SessionState {
                 response_language,
                 permission_mode,
             } => {
+                let context_identity_changed = self.configuration.as_ref().is_some_and(|old| {
+                    old.provider != *provider || old.model.as_ref() != model.as_ref()
+                });
                 self.configuration = Some(SessionConfiguration {
                     cwd: cwd.clone(),
                     provider: *provider,
@@ -297,6 +324,14 @@ impl SessionState {
                     response_language: *response_language,
                     permission_mode: *permission_mode,
                 });
+                if context_identity_changed {
+                    self.context_generation = self.context_generation.saturating_add(1);
+                    self.provider_session_id = None;
+                    self.usage.context_tokens = Some(0);
+                }
+            }
+            SessionEventKind::ProviderCapabilitiesUpdated { providers } => {
+                self.provider_capabilities = providers.clone();
             }
             SessionEventKind::StatusChanged { status, detail } => {
                 self.status = Some(*status);
@@ -384,6 +419,16 @@ impl SessionState {
                 self.usage.context_window_tokens = Some(*context_window_tokens);
             }
             SessionEventKind::ContextCleared => {
+                self.provider_session_id = None;
+                self.usage.context_tokens = Some(0);
+                self.context_generation = self.context_generation.saturating_add(1);
+            }
+            SessionEventKind::ProviderEvent { kind, payload, .. }
+                if kind == "context_compaction"
+                    && payload.get("status").and_then(serde_json::Value::as_str)
+                        == Some("completed") =>
+            {
+                self.context_generation = self.context_generation.saturating_add(1);
                 self.provider_session_id = None;
                 self.usage.context_tokens = Some(0);
             }
@@ -495,6 +540,60 @@ pub trait SessionStore: Send + Sync {
         anyhow::bail!("session store cannot register child session {session_id}")
     }
     async fn append(&self, event: SessionEvent) -> Result<SessionEvent>;
+    async fn enqueue_action(&self, action: SessionAction) -> Result<SessionAction>;
+    async fn transition_action(
+        &self,
+        session_id: Uuid,
+        action_id: Uuid,
+        expected: Option<SessionActionState>,
+        next: SessionActionState,
+        error: Option<String>,
+    ) -> Result<SessionAction>;
+    /// Atomically reserve one queued or expired non-terminal action for a
+    /// worker. Repeating the call with the same owner while its lease is live
+    /// returns the existing claim; another owner receives `None`.
+    async fn claim_action(
+        &self,
+        session_id: Uuid,
+        action_id: Uuid,
+        lease_owner: &str,
+        lease_duration: Duration,
+    ) -> Result<Option<SessionAction>>;
+    /// Extend a live lease. The token fences a worker that was paused past
+    /// expiry and then resumed after another worker reclaimed the action.
+    async fn heartbeat_action(
+        &self,
+        session_id: Uuid,
+        action_id: Uuid,
+        lease_owner: &str,
+        lease_token: Uuid,
+        lease_duration: Duration,
+    ) -> Result<SessionAction>;
+    /// Transition an action only while the caller still owns its live lease.
+    async fn transition_claimed_action(
+        &self,
+        session_id: Uuid,
+        action_id: Uuid,
+        lease_owner: &str,
+        lease_token: Uuid,
+        expected: Option<SessionActionState>,
+        next: SessionActionState,
+        error: Option<String>,
+    ) -> Result<SessionAction>;
+    /// Requeue expired work left in the in-flight states by a crashed worker.
+    /// The update and its audit transition are committed as one transaction.
+    async fn recover_expired_actions(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<SessionAction>>;
+    async fn action(&self, session_id: Uuid, action_id: Uuid) -> Result<Option<SessionAction>>;
+    async fn action_transitions(
+        &self,
+        session_id: Uuid,
+        action_id: Uuid,
+    ) -> Result<Vec<SessionActionTransition>>;
+    async fn pending_actions(&self, session_id: Uuid, limit: usize) -> Result<Vec<SessionAction>>;
     async fn read(&self, session_id: Uuid) -> Result<Vec<SessionEvent>>;
     async fn events_after(
         &self,
@@ -572,6 +671,18 @@ pub trait SessionStore: Send + Sync {
     ) -> Result<Option<SessionWorkspaceBinding>> {
         Ok(None)
     }
+    /// Return the durable autonomous runtime journal when this session store
+    /// is backed by SQLite. Other implementations may leave it unavailable.
+    async fn autonomy_store(&self) -> Result<Option<crate::SqliteAutonomyStore>> {
+        Ok(None)
+    }
+    /// Return the workspace projection on the same durable authority when the
+    /// store supports it. Keeping this optional preserves the trait's small
+    /// in-memory test seam without allowing production sessions to silently
+    /// create a second workspace database.
+    async fn workspace_store(&self) -> Result<Option<crate::SqliteWorkspaceStore>> {
+        Ok(None)
+    }
 }
 
 #[derive(Clone)]
@@ -590,6 +701,7 @@ pub struct SessionStoreHealth {
     pub wal_checkpointed_frames: i64,
     pub sessions: i64,
     pub events: i64,
+    pub actions: i64,
     pub payloads: i64,
     pub projection_version: i32,
 }
@@ -605,6 +717,10 @@ impl SessionStoreHealth {
 }
 
 impl SqliteSessionStore {
+    pub(crate) fn from_pool(pool: SqlitePool) -> Self {
+        Self { pool }
+    }
+
     pub async fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
@@ -658,6 +774,88 @@ impl SqliteSessionStore {
         &self.pool
     }
 
+    /// Open the provider-neutral team policy journal on this same SQLite
+    /// authority. Keeping one pool makes policy decisions and session/event
+    /// recovery share the same WAL, foreign-key, and durability settings.
+    pub async fn team_policy_store(&self) -> Result<crate::SqliteTeamPolicyStore> {
+        crate::SqliteTeamPolicyStore::open(self.pool.clone()).await
+    }
+
+    /// Open the provider-neutral autonomous runtime journal on this same
+    /// SQLite authority. Jobs, checkpoints, sessions, and their event log
+    /// therefore share one WAL and one crash-recovery boundary.
+    pub async fn autonomy_store(&self) -> Result<crate::SqliteAutonomyStore> {
+        crate::SqliteAutonomyStore::open(self.pool.clone()).await
+    }
+
+    /// Persist host launch authorization in the canonical SQLite authority.
+    /// A launch id is immutable: retries with the same metadata are harmless,
+    /// while reuse with different metadata is rejected.
+    pub async fn persist_host_launch_metadata(
+        &self,
+        session_id: Uuid,
+        metadata: &serde_json::Value,
+    ) -> Result<()> {
+        ensure!(
+            metadata.is_object(),
+            "host launch metadata must be an object"
+        );
+        let metadata_json = serde_json::to_string(metadata)?;
+        ensure!(
+            metadata_json.len() <= MAX_HOST_LAUNCH_METADATA_BYTES,
+            "host launch metadata exceeds {MAX_HOST_LAUNCH_METADATA_BYTES} bytes"
+        );
+        let mut transaction = self.begin_write().await?;
+        let existing: Option<String> =
+            sqlx::query_scalar("select metadata_json from host_launches where session_id=?")
+                .bind(session_id.to_string())
+                .fetch_optional(&mut *transaction)
+                .await?;
+        if let Some(existing) = existing {
+            ensure!(
+                existing == metadata_json,
+                "session launch metadata already exists for a different launch request"
+            );
+        } else {
+            let now = Utc::now().to_rfc3339();
+            sqlx::query(
+                "insert into host_launches \
+                 (session_id, metadata_json, created_at, updated_at) values (?, ?, ?, ?)",
+            )
+            .bind(session_id.to_string())
+            .bind(&metadata_json)
+            .bind(&now)
+            .bind(&now)
+            .execute(&mut *transaction)
+            .await?;
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    /// Load immutable host launch authorization, rejecting malformed rows
+    /// instead of treating them as a missing session.
+    pub async fn load_host_launch_metadata(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Option<serde_json::Value>> {
+        let metadata: Option<String> =
+            sqlx::query_scalar("select metadata_json from host_launches where session_id=?")
+                .bind(session_id.to_string())
+                .fetch_optional(&self.pool)
+                .await?;
+        metadata
+            .map(|metadata| {
+                ensure!(
+                    metadata.len() <= MAX_HOST_LAUNCH_METADATA_BYTES,
+                    "host launch metadata exceeds {MAX_HOST_LAUNCH_METADATA_BYTES} bytes"
+                );
+                serde_json::from_str(&metadata)
+                    .context("host launch metadata contains invalid JSON")
+            })
+            .transpose()
+    }
+
     /// Check the durable authority without reading prompt or tool payload data.
     pub async fn health(&self) -> Result<SessionStoreHealth> {
         let integrity: String = sqlx::query_scalar("pragma quick_check")
@@ -682,6 +880,9 @@ impl SqliteSessionStore {
         let events: i64 = sqlx::query_scalar("select count(*) from session_events")
             .fetch_one(&self.pool)
             .await?;
+        let actions: i64 = sqlx::query_scalar("select count(*) from session_actions")
+            .fetch_one(&self.pool)
+            .await?;
         let payloads: i64 = sqlx::query_scalar("select count(*) from session_payloads")
             .fetch_one(&self.pool)
             .await?;
@@ -695,6 +896,7 @@ impl SqliteSessionStore {
             wal_checkpointed_frames,
             sessions,
             events,
+            actions,
             payloads,
             projection_version: SESSION_PROJECTION_VERSION,
         })
@@ -780,6 +982,44 @@ impl SqliteSessionStore {
                 unique (session_id, event_id)
             );
 
+            create table if not exists session_actions (
+                action_id text primary key,
+                session_id text not null references sessions(id) on delete cascade,
+                action_kind text not null,
+                state text not null,
+                delivery_policy text not null,
+                wake_policy text not null,
+                payload_json text not null,
+                attempt integer not null default 0,
+                error text,
+                created_at text not null,
+                updated_at text not null,
+                accepted_at text,
+                delivered_at text,
+                completed_at text,
+                lease_owner text,
+                lease_token text,
+                lease_heartbeat_at text,
+                lease_expires_at text
+            );
+
+            create index if not exists idx_session_actions_pending
+                on session_actions (session_id, state, created_at);
+
+            create table if not exists session_action_transitions (
+                action_id text not null references session_actions(action_id) on delete cascade,
+                session_id text not null references sessions(id) on delete cascade,
+                transition_no integer not null,
+                from_state text,
+                to_state text not null,
+                error text,
+                created_at text not null,
+                primary key (action_id, transition_no)
+            );
+
+            create index if not exists idx_session_action_transitions_session
+                on session_action_transitions (session_id, created_at, action_id);
+
             create table if not exists session_live_state (
                 session_id text not null references sessions(id) on delete cascade,
                 live_key text not null,
@@ -813,6 +1053,18 @@ impl SqliteSessionStore {
                 on session_events (session_id, sequence)
                 where fork_inheritable = 1;
 
+            create index if not exists idx_session_events_recovery
+                on session_events (session_id, sequence)
+                where recovery_relevant = 1;
+
+            create index if not exists idx_session_events_subagent_recovery
+                on session_events (
+                    session_id,
+                    event_kind,
+                    json_extract(event_json, '$.kind.agent.session_id'),
+                    sequence desc
+                ) where event_kind = 'subagent_activity';
+
             create index if not exists idx_sessions_activity
                 on sessions (updated_at desc);
 
@@ -826,41 +1078,65 @@ impl SqliteSessionStore {
 
             create index if not exists idx_session_workspace_bindings_workspace
                 on session_workspace_bindings (workspace_id, session_id);
+
+            create table if not exists host_launches (
+                session_id text primary key,
+                metadata_json text not null,
+                created_at text not null,
+                updated_at text not null
+            );
             "#,
         )
         .execute(&self.pool)
         .await?;
-        let columns = sqlx::query("pragma table_info(sessions)")
-            .fetch_all(&self.pool)
-            .await?;
-        if !columns
-            .iter()
-            .any(|row| row.get::<&str, _>("name") == "projection_version")
-        {
-            sqlx::query(
-                "alter table sessions add column projection_version integer not null default 0",
-            )
-            .execute(&self.pool)
-            .await?;
-        }
-        if !columns
-            .iter()
-            .any(|row| row.get::<&str, _>("name") == "live_revision")
-        {
-            sqlx::query("alter table sessions add column live_revision integer not null default 0")
-                .execute(&self.pool)
+        sqlx::query(
+            "create table if not exists borg_session_schema (\
+                id integer primary key check(id=1),\
+                version integer not null\
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+        // Keep the only supported forward migration at the same SQLite
+        // boundary as its schema marker. The lease fields are nullable and
+        // additive, so this is safe for existing action rows and idempotent if
+        // a previous process was interrupted after ALTER TABLE but before the
+        // marker update.
+        let mut schema_transaction = self.begin_write().await?;
+        let schema_version: Option<i64> =
+            sqlx::query_scalar("select version from borg_session_schema where id=1")
+                .fetch_optional(&mut *schema_transaction)
                 .await?;
+        if let Some(version) = schema_version {
+            ensure!(
+                version <= SESSION_SCHEMA_VERSION,
+                "unsupported future Borg session schema version {version}; current is {SESSION_SCHEMA_VERSION}"
+            );
         }
-        if !columns
-            .iter()
-            .any(|row| row.get::<&str, _>("name") == "owner_session_id")
-        {
-            sqlx::query(
-                "alter table sessions add column owner_session_id text references sessions(id)",
-            )
-            .execute(&self.pool)
-            .await?;
+        Self::ensure_session_action_lease_columns(&mut schema_transaction).await?;
+        match schema_version {
+            Some(version) if version < SESSION_SCHEMA_VERSION => {
+                sqlx::query("update borg_session_schema set version=? where id=1")
+                    .bind(SESSION_SCHEMA_VERSION)
+                    .execute(&mut *schema_transaction)
+                    .await?;
+            }
+            Some(_) => {}
+            None => {
+                sqlx::query("insert into borg_session_schema(id,version) values(1,?)")
+                    .bind(SESSION_SCHEMA_VERSION)
+                    .execute(&mut *schema_transaction)
+                    .await?;
+            }
         }
+        schema_transaction.commit().await?;
+        self.validate_current_schema().await?;
+        sqlx::query(
+            "create index if not exists idx_session_actions_lease_expiry \
+             on session_actions (state, lease_expires_at, created_at)",
+        )
+        .execute(&self.pool)
+        .await?;
         sqlx::query(
             "create index if not exists idx_sessions_root_activity \
              on sessions (owner_session_id, updated_at desc)",
@@ -878,10 +1154,122 @@ impl SqliteSessionStore {
         .bind(now)
         .execute(&self.pool)
         .await?;
-        self.ensure_recovery_index().await?;
-        self.backfill_queued_prompt_inheritance().await?;
-        self.rebuild_stale_projections().await?;
         self.clear_terminal_live_state().await?;
+        Ok(())
+    }
+
+    async fn ensure_session_action_lease_columns(
+        transaction: &mut Transaction<'_, Sqlite>,
+    ) -> Result<()> {
+        let existing = sqlx::query("pragma table_info(session_actions)")
+            .fetch_all(&mut **transaction)
+            .await?
+            .into_iter()
+            .map(|row| row.get::<String, _>("name"))
+            .collect::<HashSet<_>>();
+        for (name, statement) in [
+            (
+                "lease_owner",
+                "alter table session_actions add column lease_owner text",
+            ),
+            (
+                "lease_token",
+                "alter table session_actions add column lease_token text",
+            ),
+            (
+                "lease_heartbeat_at",
+                "alter table session_actions add column lease_heartbeat_at text",
+            ),
+            (
+                "lease_expires_at",
+                "alter table session_actions add column lease_expires_at text",
+            ),
+        ] {
+            if !existing.contains(name) {
+                sqlx::query(statement).execute(&mut **transaction).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The store rejects unsupported future schemas and schemas missing
+    /// non-additive invariants. The one supported additive repair happens in
+    /// `ensure_schema` before this validation runs.
+    async fn validate_current_schema(&self) -> Result<()> {
+        for (table, required_columns) in [
+            (
+                "sessions",
+                &[
+                    "id",
+                    "parent_session_id",
+                    "parent_cut_sequence",
+                    "owner_session_id",
+                    "inherited_event_count",
+                    "next_sequence",
+                    "live_revision",
+                    "state_json",
+                    "projection_version",
+                    "created_at",
+                    "updated_at",
+                ][..],
+            ),
+            (
+                "session_events",
+                &[
+                    "session_id",
+                    "sequence",
+                    "event_id",
+                    "event_kind",
+                    "event_json",
+                    "projection_json",
+                    "fork_inheritable",
+                    "recovery_relevant",
+                    "message_id",
+                    "created_at",
+                ][..],
+            ),
+            (
+                "session_actions",
+                &[
+                    "action_id",
+                    "session_id",
+                    "action_kind",
+                    "state",
+                    "delivery_policy",
+                    "wake_policy",
+                    "payload_json",
+                    "attempt",
+                    "error",
+                    "created_at",
+                    "updated_at",
+                    "accepted_at",
+                    "delivered_at",
+                    "completed_at",
+                    "lease_owner",
+                    "lease_token",
+                    "lease_heartbeat_at",
+                    "lease_expires_at",
+                ][..],
+            ),
+        ] {
+            let columns = sqlx::query(&format!("pragma table_info({table})"))
+                .fetch_all(&self.pool)
+                .await?
+                .into_iter()
+                .map(|row| row.get::<String, _>("name"))
+                .collect::<HashSet<_>>();
+            let missing = required_columns
+                .iter()
+                .filter(|column| !columns.contains(**column))
+                .copied()
+                .collect::<Vec<_>>();
+            if !missing.is_empty() {
+                bail!(
+                    "Borg session database schema is stale for {table}; missing columns: {}",
+                    missing.join(", ")
+                );
+            }
+        }
         Ok(())
     }
 
@@ -897,128 +1285,6 @@ impl SqliteSessionStore {
                  where json_extract(state_json, '$.status') in \
                        ('ready', 'completed', 'failed', 'stopped') \
                )",
-        )
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    /// `fork_inheritable` caches [`SessionEventKind::is_fork_inheritable`] at
-    /// append time, so rows written before queued prompts became
-    /// non-inheritable still carry the old answer and would resurrect a
-    /// rewound prompt.  `user_version` keeps this to one pass per store.
-    async fn backfill_queued_prompt_inheritance(&self) -> Result<()> {
-        let version: i64 = sqlx::query_scalar("pragma user_version")
-            .fetch_one(&self.pool)
-            .await?;
-        if version >= QUEUED_PROMPT_INHERITANCE_VERSION {
-            return Ok(());
-        }
-        sqlx::query(
-            "update session_events set fork_inheritable = 0 \
-             where fork_inheritable = 1 and event_kind = 'message' \
-               and json_extract(event_json, '$.kind.status') = 'queued'",
-        )
-        .execute(&self.pool)
-        .await?;
-        sqlx::raw_sql(&format!(
-            "pragma user_version = {QUEUED_PROMPT_INHERITANCE_VERSION}"
-        ))
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    async fn rebuild_stale_projections(&self) -> Result<()> {
-        let rows =
-            sqlx::query("select id, parent_session_id from sessions where projection_version < 3")
-                .fetch_all(&self.pool)
-                .await?;
-        for row in &rows {
-            if row
-                .try_get::<Option<&str>, _>("parent_session_id")?
-                .is_some()
-            {
-                continue;
-            }
-            let session_id = parse_uuid(row.try_get("id")?)?;
-            let event_rows = sqlx::query(
-                "select sequence, event_json from session_events \
-                 where session_id = ? order by sequence",
-            )
-            .bind(session_id.to_string())
-            .fetch_all(&self.pool)
-            .await?;
-            let mut state = SessionState::default();
-            let mut transaction = self.begin_write().await?;
-            for event_row in event_rows {
-                let event: SessionEvent = serde_json::from_str(event_row.try_get("event_json")?)?;
-                state.apply(&event)?;
-                sqlx::query(
-                    "update session_events set projection_json = ? \
-                     where session_id = ? and sequence = ?",
-                )
-                .bind(serde_json::to_string(&state)?)
-                .bind(session_id.to_string())
-                .bind(event_row.try_get::<i64, _>("sequence")?)
-                .execute(&mut *transaction)
-                .await?;
-            }
-            transaction.commit().await?;
-        }
-        for row in rows {
-            let session_id = parse_uuid(row.try_get("id")?)?;
-            let state = SessionState::reduce(&self.projected_events(session_id, None).await?)?;
-            sqlx::query("update sessions set state_json = ?, projection_version = 3 where id = ?")
-                .bind(serde_json::to_string(&state)?)
-                .bind(session_id.to_string())
-                .execute(&self.pool)
-                .await?;
-        }
-        Ok(())
-    }
-
-    async fn ensure_recovery_index(&self) -> Result<()> {
-        let columns = sqlx::query("pragma table_info(session_events)")
-            .fetch_all(&self.pool)
-            .await?;
-        let added = !columns
-            .iter()
-            .any(|row| row.get::<&str, _>("name") == "recovery_relevant");
-        if added {
-            sqlx::query("alter table session_events add column recovery_relevant integer")
-                .execute(&self.pool)
-                .await?;
-            let rows = sqlx::query("select session_id, sequence, event_json from session_events")
-                .fetch_all(&self.pool)
-                .await?;
-            let mut transaction = self.begin_write().await?;
-            for row in rows {
-                let event: SessionEvent = serde_json::from_str(row.try_get("event_json")?)?;
-                sqlx::query(
-                    "update session_events set recovery_relevant = ? \
-                     where session_id = ? and sequence = ?",
-                )
-                .bind(i64::from(event.kind.is_recovery_relevant()))
-                .bind(row.try_get::<&str, _>("session_id")?)
-                .bind(row.try_get::<i64, _>("sequence")?)
-                .execute(&mut *transaction)
-                .await?;
-            }
-            transaction.commit().await?;
-        }
-        sqlx::query(
-            "create index if not exists idx_session_events_recovery \
-             on session_events (session_id, sequence) where recovery_relevant = 1",
-        )
-        .execute(&self.pool)
-        .await?;
-        sqlx::query(
-            "create index if not exists idx_session_events_subagent_recovery \
-             on session_events ( \
-               session_id, event_kind, \
-               json_extract(event_json, '$.kind.agent.session_id'), sequence desc \
-             ) where event_kind = 'subagent_activity'",
         )
         .execute(&self.pool)
         .await?;
@@ -1072,9 +1338,8 @@ impl SqliteSessionStore {
         .bind(session_id.to_string())
         .execute(&self.pool)
         .await?;
-        // Legacy child journals are imported after the store migration has
-        // backfilled workspace bindings. Ensure those newly imported rows are
-        // attached before the resumed actor can accept durable team messages.
+        // Attach the child before the resumed actor can accept durable team
+        // messages, including when the registration was retried.
         sqlx::query(
             "insert into session_workspace_bindings \
              (session_id, workspace_id, participant_id, attached_at) values (?, ?, ?, ?) \
@@ -1629,7 +1894,12 @@ impl SqliteSessionStore {
                     _ => None,
                 })
                 .unwrap_or_default();
-            accumulated.push_str(text);
+            if text.starts_with(accumulated.as_str()) {
+                accumulated.clear();
+                accumulated.push_str(text);
+            } else if !accumulated.starts_with(text) {
+                accumulated.push_str(text);
+            }
             let mut snapshot = event.clone();
             snapshot.kind = SessionEventKind::ReasoningDelta { text: accumulated };
             snapshot
@@ -1657,12 +1927,827 @@ impl SqliteSessionStore {
             .execute(&mut *transaction)
             .await?;
         transaction.commit().await?;
+        // Coalesced events are delivered from the same canonical snapshot
+        // that was committed to SQLite. This keeps local and reconnecting
+        // clients on one wire representation and lets the UI replace a
+        // cumulative reasoning snapshot instead of appending it twice.
+        Ok(stored_event)
+    }
+
+    /// Ensure the durable action projection for an embedded workflow exists.
+    /// Older event journals may predate the action projection, so this is an
+    /// idempotent repair at the same SQLite boundary rather than a migration
+    /// or a second source of workflow truth.
+    pub(crate) async fn ensure_workflow_action(
+        &self,
+        session_id: Uuid,
+        workflow_id: Uuid,
+        payload: &serde_json::Value,
+    ) -> Result<SessionAction> {
+        let mut transaction = self.begin_write().await?;
+        if let Some(row) =
+            sqlx::query("select * from session_actions where action_id=? and session_id=?")
+                .bind(workflow_id.to_string())
+                .bind(session_id.to_string())
+                .fetch_optional(&mut *transaction)
+                .await?
+        {
+            let action = decode_action(&row)?;
+            ensure!(
+                action.kind == crate::SessionActionKind::Workflow && action.payload == *payload,
+                "workflow action {workflow_id} has conflicting durable metadata"
+            );
+            ensure!(
+                !action.state.is_terminal(),
+                "workflow action {workflow_id} is terminal without a workflow completion record"
+            );
+            transaction.commit().await?;
+            return Ok(action);
+        }
+        let exists: i64 = sqlx::query_scalar("select exists(select 1 from sessions where id=?)")
+            .bind(session_id.to_string())
+            .fetch_one(&mut *transaction)
+            .await?;
+        ensure!(exists != 0, "session {session_id} does not exist");
+        let action = SessionAction::new(
+            workflow_id,
+            session_id,
+            crate::SessionActionKind::Workflow,
+            crate::ActionDeliveryPolicy::WhenRunIdle,
+            crate::ActionWakePolicy::Immediate,
+            payload.clone(),
+        );
+        create_action_and_advance(&mut transaction, action, SessionActionState::Running, None)
+            .await?;
+        let row = sqlx::query("select * from session_actions where action_id=? and session_id=?")
+            .bind(workflow_id.to_string())
+            .bind(session_id.to_string())
+            .fetch_one(&mut *transaction)
+            .await?;
+        let action = decode_action(&row)?;
+        transaction.commit().await?;
+        Ok(action)
+    }
+
+    /// Append a durable event and its action transition only while the caller
+    /// owns the workflow lease. This is the fenced commit point: a stale
+    /// worker cannot publish a terminal workflow event after another worker
+    /// has reclaimed the execution.
+    pub(crate) async fn append_with_action_lease(
+        &self,
+        event: SessionEvent,
+        action_id: Uuid,
+        lease_owner: &str,
+        lease_token: Uuid,
+    ) -> Result<SessionEvent> {
+        ensure!(
+            event.kind.persistence() == EventPersistence::Durable,
+            "leased workflow events must be durable"
+        );
+        let mut transaction = self.begin_write().await?;
+        let action = load_action_for_update(&mut transaction, event.session_id, action_id).await?;
+        validate_live_lease(&action, lease_owner, lease_token, Utc::now())?;
+        let event = self
+            .append_durable_in_transaction(&mut transaction, event)
+            .await?;
+        transaction.commit().await?;
+        Ok(event)
+    }
+
+    async fn append_durable_in_transaction(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        mut event: SessionEvent,
+    ) -> Result<SessionEvent> {
+        let row = sqlx::query("select next_sequence, state_json from sessions where id = ?")
+            .bind(event.session_id.to_string())
+            .fetch_optional(&mut **transaction)
+            .await?
+            .with_context(|| format!("session {} does not exist", event.session_id))?;
+        let next_sequence = u64::try_from(row.try_get::<i64, _>("next_sequence")?)
+            .context("negative SQLite session sequence")?;
+        if event.sequence == 0 {
+            event.sequence = next_sequence;
+        }
+        anyhow::ensure!(
+            event.sequence == next_sequence,
+            "session event sequence must be {next_sequence}, received {}",
+            event.sequence
+        );
+        let mut state: SessionState = serde_json::from_str(row.try_get("state_json")?)?;
+        state.apply(&event)?;
+        let compact_event = self.compact_payloads(transaction, &event).await?;
+        let event_json = serde_json::to_string(&compact_event)?;
+        let projection_json = serde_json::to_string(&state)?;
+        let message_id = match &event.kind {
+            SessionEventKind::Message { message_id, .. } => Some(message_id.to_string()),
+            _ => None,
+        };
+        sqlx::query(
+            "insert into session_events \
+             (session_id, sequence, event_id, event_kind, event_json, projection_json, \
+              fork_inheritable, recovery_relevant, message_id, created_at) \
+             values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(event.session_id.to_string())
+        .bind(i64::try_from(event.sequence).context("session sequence exceeds SQLite integer")?)
+        .bind(event.id.to_string())
+        .bind(event_kind(&event.kind)?)
+        .bind(event_json)
+        .bind(&projection_json)
+        .bind(i64::from(event.kind.is_fork_inheritable()))
+        .bind(i64::from(event.kind.is_recovery_relevant()))
+        .bind(message_id)
+        .bind(event.created_at.to_rfc3339())
+        .execute(&mut **transaction)
+        .await?;
+        // Keep the action journal and the event proving its admission or
+        // terminal boundary in the same SQLite transaction.
+        sync_session_action(transaction, &event).await?;
+        if event.kind.clears_live_turn_state() {
+            sqlx::query(
+                "delete from session_live_state \
+                 where session_id = ? and live_key <> 'context_window'",
+            )
+            .bind(event.session_id.to_string())
+            .execute(&mut **transaction)
+            .await?;
+        } else {
+            for live_key in event.kind.cleared_live_state_keys() {
+                sqlx::query("delete from session_live_state where session_id = ? and live_key = ?")
+                    .bind(event.session_id.to_string())
+                    .bind(live_key)
+                    .execute(&mut **transaction)
+                    .await?;
+            }
+        }
+        sqlx::query(
+            "update sessions set next_sequence = ?, state_json = ?, projection_version = 3, \
+             updated_at = ? where id = ?",
+        )
+        .bind(i64::try_from(event.sequence.saturating_add(1)).unwrap_or(i64::MAX))
+        .bind(projection_json)
+        .bind(event.created_at.to_rfc3339())
+        .bind(event.session_id.to_string())
+        .execute(&mut **transaction)
+        .await?;
         Ok(event)
     }
 }
 
 fn sqlite_schema_lock(error: &anyhow::Error) -> bool {
     sqlite_lock_text(&error.to_string())
+}
+
+fn enum_text<T: Serialize>(value: &T) -> Result<String> {
+    Ok(serde_json::to_value(value)?
+        .as_str()
+        .context("session action enum did not serialize as a string")?
+        .to_string())
+}
+
+fn parse_enum<T: DeserializeOwned>(value: &str) -> Result<T> {
+    Ok(serde_json::from_value(serde_json::Value::String(
+        value.to_string(),
+    ))?)
+}
+
+fn parse_timestamp(value: Option<&str>) -> Result<Option<DateTime<Utc>>> {
+    value
+        .map(|value| {
+            DateTime::parse_from_rfc3339(value)
+                .map(|timestamp| timestamp.with_timezone(&Utc))
+                .map_err(Into::into)
+        })
+        .transpose()
+}
+
+fn decode_action(row: &SqliteRow) -> Result<SessionAction> {
+    Ok(SessionAction {
+        action_id: parse_uuid(row.try_get("action_id")?)?,
+        session_id: parse_uuid(row.try_get("session_id")?)?,
+        kind: parse_enum(row.try_get("action_kind")?)?,
+        state: parse_enum(row.try_get("state")?)?,
+        delivery: parse_enum(row.try_get("delivery_policy")?)?,
+        wake: parse_enum(row.try_get("wake_policy")?)?,
+        payload: serde_json::from_str(row.try_get("payload_json")?)?,
+        attempt: u32::try_from(row.try_get::<i64, _>("attempt")?)
+            .context("negative session action attempt")?,
+        error: row.try_get("error")?,
+        created_at: parse_timestamp(row.try_get("created_at")?)?
+            .context("missing action created_at")?,
+        updated_at: parse_timestamp(row.try_get("updated_at")?)?
+            .context("missing action updated_at")?,
+        accepted_at: parse_timestamp(row.try_get("accepted_at")?)?,
+        delivered_at: parse_timestamp(row.try_get("delivered_at")?)?,
+        completed_at: parse_timestamp(row.try_get("completed_at")?)?,
+        lease_owner: row.try_get("lease_owner")?,
+        lease_token: row
+            .try_get::<Option<&str>, _>("lease_token")?
+            .map(parse_uuid)
+            .transpose()?,
+        lease_heartbeat_at: parse_timestamp(row.try_get("lease_heartbeat_at")?)?,
+        lease_expires_at: parse_timestamp(row.try_get("lease_expires_at")?)?,
+    })
+}
+
+fn decode_action_transition(row: &SqliteRow) -> Result<SessionActionTransition> {
+    Ok(SessionActionTransition {
+        action_id: parse_uuid(row.try_get("action_id")?)?,
+        session_id: parse_uuid(row.try_get("session_id")?)?,
+        transition_no: u64::try_from(row.try_get::<i64, _>("transition_no")?)
+            .context("negative action transition number")?,
+        from: row
+            .try_get::<Option<&str>, _>("from_state")?
+            .map(parse_enum)
+            .transpose()?,
+        to: parse_enum(row.try_get("to_state")?)?,
+        error: row.try_get("error")?,
+        created_at: parse_timestamp(Some(row.try_get("created_at")?))?
+            .context("missing action transition created_at")?,
+    })
+}
+
+async fn sync_session_action(
+    transaction: &mut Transaction<'_, Sqlite>,
+    event: &SessionEvent,
+) -> Result<()> {
+    match &event.kind {
+        SessionEventKind::SessionConfigured { .. } => {
+            let action = SessionAction::new(
+                event.id,
+                event.session_id,
+                crate::SessionActionKind::ProviderChange,
+                crate::ActionDeliveryPolicy::WhenRunIdle,
+                crate::ActionWakePolicy::Immediate,
+                serde_json::to_value(&event.kind)?,
+            );
+            create_action_and_advance(transaction, action, SessionActionState::Completed, None)
+                .await?;
+        }
+        SessionEventKind::Message {
+            message_id,
+            actor,
+            text,
+            attachments,
+            status: MessageStatus::Queued,
+            delivery,
+        } if matches!(actor, crate::EventActor::User | crate::EventActor::System) => {
+            let delivery = delivery.unwrap_or(crate::PromptDelivery::Queue);
+            let (kind, delivery_policy, wake_policy) = match (*actor, delivery) {
+                (crate::EventActor::System, _) => (
+                    crate::SessionActionKind::AgentMessage,
+                    crate::ActionDeliveryPolicy::NextTurnBoundary,
+                    crate::ActionWakePolicy::OnLowerBoundary,
+                ),
+                (_, crate::PromptDelivery::Steer) => (
+                    crate::SessionActionKind::Steering,
+                    crate::ActionDeliveryPolicy::WhenRunIdle,
+                    crate::ActionWakePolicy::Immediate,
+                ),
+                (_, crate::PromptDelivery::Queue) => (
+                    crate::SessionActionKind::Prompt,
+                    crate::ActionDeliveryPolicy::NextTurnBoundary,
+                    crate::ActionWakePolicy::OnLowerBoundary,
+                ),
+            };
+            let mut action = SessionAction::new(
+                *message_id,
+                event.session_id,
+                kind,
+                delivery_policy,
+                wake_policy,
+                serde_json::json!({
+                    "message_id": message_id,
+                    "text": text,
+                    "attachments": attachments,
+                    "delivery": delivery,
+                }),
+            );
+            action.created_at = event.created_at;
+            action.updated_at = event.created_at;
+            action.transition(
+                Some(SessionActionState::Queued),
+                SessionActionState::Admitted,
+                None,
+            )?;
+            action.created_at = event.created_at;
+            insert_action_row(transaction, &action).await?;
+        }
+        SessionEventKind::TurnStarted { message_id, .. } => {
+            advance_action(
+                transaction,
+                event.session_id,
+                *message_id,
+                SessionActionState::Running,
+                None,
+            )
+            .await?;
+        }
+        SessionEventKind::TurnCompleted {
+            message_id, error, ..
+        } => {
+            let target = if error.is_some() {
+                SessionActionState::Failed
+            } else {
+                SessionActionState::Completed
+            };
+            advance_action(
+                transaction,
+                event.session_id,
+                *message_id,
+                target,
+                error.clone(),
+            )
+            .await?;
+        }
+        SessionEventKind::PromptRecalled { message_id, .. } => {
+            let Some(row) = sqlx::query("select * from session_actions where action_id = ?")
+                .bind(message_id.to_string())
+                .fetch_optional(&mut **transaction)
+                .await?
+            else {
+                return Ok(());
+            };
+            let mut action = decode_action(&row)?;
+            if !action.state.is_terminal() {
+                let current = action.state;
+                action.transition(
+                    Some(current),
+                    SessionActionState::Cancelled,
+                    Some("recalled before execution".to_string()),
+                )?;
+                append_action_transition(transaction, &action, current, action.error.clone())
+                    .await?;
+                update_action_row(transaction, &action).await?;
+            }
+        }
+        SessionEventKind::ProviderEvent { kind, payload, .. } if kind == "context_compaction" => {
+            match payload.get("status").and_then(serde_json::Value::as_str) {
+                Some("started") => {
+                    let action = SessionAction::new(
+                        event.id,
+                        event.session_id,
+                        crate::SessionActionKind::Compaction,
+                        crate::ActionDeliveryPolicy::WhenRunIdle,
+                        crate::ActionWakePolicy::Immediate,
+                        payload.clone(),
+                    );
+                    create_action_and_advance(
+                        transaction,
+                        action,
+                        SessionActionState::Running,
+                        None,
+                    )
+                    .await?;
+                }
+                Some("completed") => {
+                    if let Some(action_id) = latest_action_id(
+                        transaction,
+                        event.session_id,
+                        crate::SessionActionKind::Compaction,
+                    )
+                    .await?
+                    {
+                        advance_action(
+                            transaction,
+                            event.session_id,
+                            action_id,
+                            SessionActionState::Completed,
+                            None,
+                        )
+                        .await?;
+                    }
+                }
+                _ => {}
+            }
+        }
+        SessionEventKind::ProviderEvent { kind, payload, .. }
+            if kind == "context_compaction_failed" =>
+        {
+            if let Some(action_id) = latest_action_id(
+                transaction,
+                event.session_id,
+                crate::SessionActionKind::Compaction,
+            )
+            .await?
+            {
+                advance_action(
+                    transaction,
+                    event.session_id,
+                    action_id,
+                    SessionActionState::Failed,
+                    payload
+                        .get("error")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string),
+                )
+                .await?;
+            }
+        }
+        SessionEventKind::BluWorkflowStarted {
+            workflow_id,
+            source_hash,
+            name,
+        } => {
+            let mut action = SessionAction::new(
+                *workflow_id,
+                event.session_id,
+                crate::SessionActionKind::Workflow,
+                crate::ActionDeliveryPolicy::WhenRunIdle,
+                crate::ActionWakePolicy::Immediate,
+                serde_json::json!({
+                    "workflow_id": workflow_id,
+                    "source_hash": source_hash,
+                    "name": name,
+                }),
+            );
+            action.created_at = event.created_at;
+            action.updated_at = event.created_at;
+            create_action_and_advance(transaction, action, SessionActionState::Running, None)
+                .await?;
+        }
+        SessionEventKind::BluWorkflowCompleted {
+            workflow_id,
+            success,
+            error,
+            ..
+        } => {
+            advance_action(
+                transaction,
+                event.session_id,
+                *workflow_id,
+                if *success {
+                    SessionActionState::Completed
+                } else {
+                    SessionActionState::Failed
+                },
+                error.clone(),
+            )
+            .await?;
+        }
+        SessionEventKind::ContextCleared
+        | SessionEventKind::GoalUpdated { .. }
+        | SessionEventKind::GoalCleared { .. }
+        | SessionEventKind::PlanUpdated { .. }
+        | SessionEventKind::SubagentControl { .. } => {
+            let kind = if matches!(event.kind, SessionEventKind::ContextCleared) {
+                crate::SessionActionKind::Revert
+            } else {
+                crate::SessionActionKind::Command
+            };
+            let action = SessionAction::new(
+                event.id,
+                event.session_id,
+                kind,
+                crate::ActionDeliveryPolicy::WhenRunIdle,
+                crate::ActionWakePolicy::Immediate,
+                serde_json::to_value(&event.kind)?,
+            );
+            create_action_and_advance(transaction, action, SessionActionState::Completed, None)
+                .await?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+async fn create_action_and_advance(
+    transaction: &mut Transaction<'_, Sqlite>,
+    action: SessionAction,
+    target: SessionActionState,
+    error: Option<String>,
+) -> Result<()> {
+    let action_id = action.action_id;
+    let session_id = action.session_id;
+    insert_action_row(transaction, &action).await?;
+    advance_action(transaction, session_id, action_id, target, error).await
+}
+
+async fn latest_action_id(
+    transaction: &mut Transaction<'_, Sqlite>,
+    session_id: Uuid,
+    kind: crate::SessionActionKind,
+) -> Result<Option<Uuid>> {
+    sqlx::query_scalar(
+        "select action_id from session_actions \
+         where session_id=? and action_kind=? \
+           and state not in ('completed', 'failed', 'cancelled') \
+         order by created_at desc, action_id desc limit 1",
+    )
+    .bind(session_id.to_string())
+    .bind(enum_text(&kind)?)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .map(|value: String| parse_uuid(&value))
+    .transpose()
+}
+
+async fn insert_action_row(
+    transaction: &mut Transaction<'_, Sqlite>,
+    action: &SessionAction,
+) -> Result<()> {
+    if let Some(row) = sqlx::query("select * from session_actions where action_id = ?")
+        .bind(action.action_id.to_string())
+        .fetch_optional(&mut **transaction)
+        .await?
+    {
+        let existing = decode_action(&row)?;
+        anyhow::ensure!(
+            existing.session_id == action.session_id,
+            "action {} was reused by a different session",
+            action.action_id
+        );
+        if existing.kind == crate::SessionActionKind::Steering
+            && action.kind == crate::SessionActionKind::Prompt
+            && same_prompt_payload_ignoring_delivery(&existing.payload, &action.payload)
+        {
+            // A rejected or interrupted active-turn steer is deliberately
+            // promoted into the next-turn FIFO. It remains one user action;
+            // only its delivery class changes. Keep the immutable message
+            // identity/content check above and update the durable routing
+            // projection in place so replay cannot duplicate the action.
+            sqlx::query(
+                "update session_actions set action_kind=?, delivery_policy=?, wake_policy=?, \
+                 payload_json=?, updated_at=? where action_id=? and session_id=?",
+            )
+            .bind(enum_text(&action.kind)?)
+            .bind(enum_text(&action.delivery)?)
+            .bind(enum_text(&action.wake)?)
+            .bind(serde_json::to_string(&action.payload)?)
+            .bind(action.updated_at.to_rfc3339())
+            .bind(action.action_id.to_string())
+            .bind(action.session_id.to_string())
+            .execute(&mut **transaction)
+            .await?;
+            return Ok(());
+        }
+        anyhow::ensure!(
+            existing.kind == action.kind && existing.payload == action.payload,
+            "action {} was reused with a different immutable payload",
+            action.action_id
+        );
+        return Ok(());
+    }
+    sqlx::query(
+        "insert into session_actions \
+         (action_id, session_id, action_kind, state, delivery_policy, wake_policy, \
+          payload_json, attempt, error, created_at, updated_at, accepted_at, delivered_at, \
+          completed_at, lease_owner, lease_token, lease_heartbeat_at, lease_expires_at) \
+         values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(action.action_id.to_string())
+    .bind(action.session_id.to_string())
+    .bind(enum_text(&action.kind)?)
+    .bind(enum_text(&action.state)?)
+    .bind(enum_text(&action.delivery)?)
+    .bind(enum_text(&action.wake)?)
+    .bind(serde_json::to_string(&action.payload)?)
+    .bind(i64::from(action.attempt))
+    .bind(action.error.as_deref())
+    .bind(action.created_at.to_rfc3339())
+    .bind(action.updated_at.to_rfc3339())
+    .bind(action.accepted_at.map(|value| value.to_rfc3339()))
+    .bind(action.delivered_at.map(|value| value.to_rfc3339()))
+    .bind(action.completed_at.map(|value| value.to_rfc3339()))
+    .bind(action.lease_owner.as_deref())
+    .bind(action.lease_token.map(|value| value.to_string()))
+    .bind(action.lease_heartbeat_at.map(|value| value.to_rfc3339()))
+    .bind(action.lease_expires_at.map(|value| value.to_rfc3339()))
+    .execute(&mut **transaction)
+    .await?;
+    insert_initial_action_transitions(transaction, action).await?;
+    Ok(())
+}
+
+async fn insert_initial_action_transitions(
+    transaction: &mut Transaction<'_, Sqlite>,
+    action: &SessionAction,
+) -> Result<()> {
+    let queued = SessionActionState::Queued;
+    insert_action_transition(
+        transaction,
+        action,
+        None,
+        queued,
+        None,
+        action.created_at,
+        0,
+    )
+    .await?;
+    if action.state != queued {
+        insert_action_transition(
+            transaction,
+            action,
+            Some(queued),
+            action.state,
+            action.error.clone(),
+            action.accepted_at.unwrap_or(action.updated_at),
+            1,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn insert_action_transition(
+    transaction: &mut Transaction<'_, Sqlite>,
+    action: &SessionAction,
+    from_state: Option<SessionActionState>,
+    to_state: SessionActionState,
+    error: Option<String>,
+    created_at: DateTime<Utc>,
+    transition_no: i64,
+) -> Result<()> {
+    sqlx::query(
+        "insert into session_action_transitions \
+         (action_id, session_id, transition_no, from_state, to_state, error, created_at) \
+         values (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(action.action_id.to_string())
+    .bind(action.session_id.to_string())
+    .bind(transition_no)
+    .bind(from_state.map(|value| enum_text(&value)).transpose()?)
+    .bind(enum_text(&to_state)?)
+    .bind(error.as_deref())
+    .bind(created_at.to_rfc3339())
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+async fn append_action_transition(
+    transaction: &mut Transaction<'_, Sqlite>,
+    action: &SessionAction,
+    from_state: SessionActionState,
+    error: Option<String>,
+) -> Result<()> {
+    let next_no: i64 = sqlx::query_scalar(
+        "select coalesce(max(transition_no) + 1, 0) \
+         from session_action_transitions where action_id=? and session_id=?",
+    )
+    .bind(action.action_id.to_string())
+    .bind(action.session_id.to_string())
+    .fetch_one(&mut **transaction)
+    .await?;
+    insert_action_transition(
+        transaction,
+        action,
+        Some(from_state),
+        action.state,
+        error,
+        action.updated_at,
+        next_no,
+    )
+    .await
+}
+
+fn same_prompt_payload_ignoring_delivery(
+    left: &serde_json::Value,
+    right: &serde_json::Value,
+) -> bool {
+    left.get("message_id") == right.get("message_id")
+        && left.get("text") == right.get("text")
+        && left.get("attachments") == right.get("attachments")
+}
+
+async fn update_action_row(
+    transaction: &mut Transaction<'_, Sqlite>,
+    action: &SessionAction,
+) -> Result<()> {
+    sqlx::query(
+        "update session_actions set state=?, attempt=?, error=?, updated_at=?, \
+         accepted_at=?, delivered_at=?, completed_at=?, lease_owner=?, lease_token=?, \
+         lease_heartbeat_at=?, lease_expires_at=? where action_id=? and session_id=?",
+    )
+    .bind(enum_text(&action.state)?)
+    .bind(i64::from(action.attempt))
+    .bind(action.error.as_deref())
+    .bind(action.updated_at.to_rfc3339())
+    .bind(action.accepted_at.map(|value| value.to_rfc3339()))
+    .bind(action.delivered_at.map(|value| value.to_rfc3339()))
+    .bind(action.completed_at.map(|value| value.to_rfc3339()))
+    .bind(action.lease_owner.as_deref())
+    .bind(action.lease_token.map(|value| value.to_string()))
+    .bind(action.lease_heartbeat_at.map(|value| value.to_rfc3339()))
+    .bind(action.lease_expires_at.map(|value| value.to_rfc3339()))
+    .bind(action.action_id.to_string())
+    .bind(action.session_id.to_string())
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+async fn load_action_for_update(
+    transaction: &mut Transaction<'_, Sqlite>,
+    session_id: Uuid,
+    action_id: Uuid,
+) -> Result<SessionAction> {
+    sqlx::query("select * from session_actions where action_id = ? and session_id = ?")
+        .bind(action_id.to_string())
+        .bind(session_id.to_string())
+        .fetch_optional(&mut **transaction)
+        .await?
+        .with_context(|| format!("action {action_id} does not exist in session {session_id}"))
+        .and_then(|row| decode_action(&row))
+}
+
+fn validate_live_lease(
+    action: &SessionAction,
+    lease_owner: &str,
+    lease_token: Uuid,
+    now: DateTime<Utc>,
+) -> Result<()> {
+    anyhow::ensure!(
+        action.lease_owner.as_deref() == Some(lease_owner)
+            && action.lease_token == Some(lease_token),
+        "action {} lease is not owned by {lease_owner}",
+        action.action_id
+    );
+    anyhow::ensure!(
+        !action.lease_expired_at(now),
+        "action {} lease has expired",
+        action.action_id
+    );
+    anyhow::ensure!(
+        !action.state.is_terminal(),
+        "action {} is already terminal",
+        action.action_id
+    );
+    Ok(())
+}
+
+async fn transition_action_in_transaction(
+    transaction: &mut Transaction<'_, Sqlite>,
+    session_id: Uuid,
+    action_id: Uuid,
+    expected: Option<SessionActionState>,
+    next: SessionActionState,
+    error: Option<String>,
+) -> Result<SessionAction> {
+    let mut action = load_action_for_update(transaction, session_id, action_id).await?;
+    let from_state = action.state;
+    action.transition(expected, next, error)?;
+    append_action_transition(transaction, &action, from_state, action.error.clone()).await?;
+    update_action_row(transaction, &action).await?;
+    Ok(action)
+}
+
+async fn advance_action(
+    transaction: &mut Transaction<'_, Sqlite>,
+    session_id: Uuid,
+    action_id: Uuid,
+    target: SessionActionState,
+    error: Option<String>,
+) -> Result<()> {
+    let Some(row) =
+        sqlx::query("select * from session_actions where action_id = ? and session_id = ?")
+            .bind(action_id.to_string())
+            .bind(session_id.to_string())
+            .fetch_optional(&mut **transaction)
+            .await?
+    else {
+        return Ok(());
+    };
+    let mut action = decode_action(&row)?;
+    if action.state.is_terminal() {
+        return Ok(());
+    }
+    while action.state != target {
+        let from_state = action.state;
+        let next = match action.state {
+            SessionActionState::Queued => SessionActionState::Admitted,
+            SessionActionState::Admitted => {
+                if target == SessionActionState::Failed {
+                    SessionActionState::Failed
+                } else {
+                    SessionActionState::Delivered
+                }
+            }
+            SessionActionState::Delivered => {
+                if target == SessionActionState::Failed {
+                    SessionActionState::Failed
+                } else {
+                    SessionActionState::Preparing
+                }
+            }
+            SessionActionState::Preparing => {
+                if target == SessionActionState::Failed {
+                    SessionActionState::Failed
+                } else {
+                    SessionActionState::Committing
+                }
+            }
+            SessionActionState::Committing => SessionActionState::Running,
+            SessionActionState::Running => target,
+            SessionActionState::Completed
+            | SessionActionState::Failed
+            | SessionActionState::Cancelled => break,
+        };
+        action.transition(Some(action.state), next, error.clone())?;
+        append_action_transition(transaction, &action, from_state, error.clone()).await?;
+    }
+    update_action_row(transaction, &action).await
 }
 
 fn sqlite_lock_text(error: &str) -> bool {
@@ -1672,6 +2757,18 @@ fn sqlite_lock_text(error: &str) -> bool {
 
 #[async_trait]
 impl SessionStore for SqliteSessionStore {
+    async fn autonomy_store(&self) -> Result<Option<crate::SqliteAutonomyStore>> {
+        Ok(Some(
+            crate::SqliteAutonomyStore::open(self.pool.clone()).await?,
+        ))
+    }
+
+    async fn workspace_store(&self) -> Result<Option<crate::SqliteWorkspaceStore>> {
+        Ok(Some(
+            crate::SqliteWorkspaceStore::from_pool(self.pool.clone()).await?,
+        ))
+    }
+
     async fn create_session(&self, session_id: Uuid) -> Result<()> {
         let now = Utc::now().to_rfc3339();
         sqlx::query(
@@ -1713,77 +2810,258 @@ impl SessionStore for SqliteSessionStore {
             EventPersistence::Durable => {}
         }
         let mut transaction = self.begin_write().await?;
-        let row = sqlx::query("select next_sequence, state_json from sessions where id = ?")
-            .bind(event.session_id.to_string())
-            .fetch_optional(&mut *transaction)
-            .await?
-            .with_context(|| format!("session {} does not exist", event.session_id))?;
-        let next_sequence = u64::try_from(row.try_get::<i64, _>("next_sequence")?)
-            .context("negative SQLite session sequence")?;
-        if event.sequence == 0 {
-            event.sequence = next_sequence;
-        }
-        anyhow::ensure!(
-            event.sequence == next_sequence,
-            "session event sequence must be {next_sequence}, received {}",
-            event.sequence
-        );
-        let mut state: SessionState = serde_json::from_str(row.try_get("state_json")?)?;
-        state.apply(&event)?;
-        let compact_event = self.compact_payloads(&mut transaction, &event).await?;
-        let event_json = serde_json::to_string(&compact_event)?;
-        let projection_json = serde_json::to_string(&state)?;
-        let message_id = match &event.kind {
-            SessionEventKind::Message { message_id, .. } => Some(message_id.to_string()),
-            _ => None,
-        };
-        sqlx::query(
-            "insert into session_events \
-             (session_id, sequence, event_id, event_kind, event_json, projection_json, \
-              fork_inheritable, recovery_relevant, message_id, created_at) \
-             values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(event.session_id.to_string())
-        .bind(i64::try_from(event.sequence).context("session sequence exceeds SQLite integer")?)
-        .bind(event.id.to_string())
-        .bind(event_kind(&event.kind)?)
-        .bind(event_json)
-        .bind(&projection_json)
-        .bind(i64::from(event.kind.is_fork_inheritable()))
-        .bind(i64::from(event.kind.is_recovery_relevant()))
-        .bind(message_id)
-        .bind(event.created_at.to_rfc3339())
-        .execute(&mut *transaction)
-        .await?;
-        if event.kind.clears_live_turn_state() {
-            sqlx::query(
-                "delete from session_live_state \
-                 where session_id = ? and live_key <> 'context_window'",
-            )
-            .bind(event.session_id.to_string())
-            .execute(&mut *transaction)
+        event = self
+            .append_durable_in_transaction(&mut transaction, event)
             .await?;
-        } else {
-            for live_key in event.kind.cleared_live_state_keys() {
-                sqlx::query("delete from session_live_state where session_id = ? and live_key = ?")
-                    .bind(event.session_id.to_string())
-                    .bind(live_key)
-                    .execute(&mut *transaction)
-                    .await?;
-            }
-        }
-        sqlx::query(
-            "update sessions set next_sequence = ?, state_json = ?, projection_version = 3, \
-             updated_at = ? where id = ?",
-        )
-        .bind(i64::try_from(event.sequence.saturating_add(1)).unwrap_or(i64::MAX))
-        .bind(projection_json)
-        .bind(event.created_at.to_rfc3339())
-        .bind(event.session_id.to_string())
-        .execute(&mut *transaction)
-        .await?;
         transaction.commit().await?;
         Ok(event)
+    }
+
+    async fn enqueue_action(&self, action: SessionAction) -> Result<SessionAction> {
+        anyhow::ensure!(
+            action.state == SessionActionState::Queued,
+            "newly enqueued action {} must start queued",
+            action.action_id
+        );
+        let mut transaction = self.begin_write().await?;
+        if let Some(row) = sqlx::query("select * from session_actions where action_id = ?")
+            .bind(action.action_id.to_string())
+            .fetch_optional(&mut *transaction)
+            .await?
+        {
+            let existing = decode_action(&row)?;
+            anyhow::ensure!(
+                existing.session_id == action.session_id
+                    && existing.kind == action.kind
+                    && existing.delivery == action.delivery
+                    && existing.wake == action.wake
+                    && existing.payload == action.payload,
+                "action {} was reused with different immutable payload",
+                action.action_id
+            );
+            transaction.commit().await?;
+            return Ok(existing);
+        }
+        let exists: i64 = sqlx::query_scalar("select exists(select 1 from sessions where id = ?)")
+            .bind(action.session_id.to_string())
+            .fetch_one(&mut *transaction)
+            .await?;
+        anyhow::ensure!(exists != 0, "session {} does not exist", action.session_id);
+        sqlx::query(
+            "insert into session_actions \
+             (action_id, session_id, action_kind, state, delivery_policy, wake_policy, \
+              payload_json, attempt, error, created_at, updated_at, accepted_at, delivered_at, \
+              completed_at, lease_owner, lease_token, lease_heartbeat_at, lease_expires_at) \
+             values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(action.action_id.to_string())
+        .bind(action.session_id.to_string())
+        .bind(enum_text(&action.kind)?)
+        .bind(enum_text(&action.state)?)
+        .bind(enum_text(&action.delivery)?)
+        .bind(enum_text(&action.wake)?)
+        .bind(serde_json::to_string(&action.payload)?)
+        .bind(i64::from(action.attempt))
+        .bind(action.error.as_deref())
+        .bind(action.created_at.to_rfc3339())
+        .bind(action.updated_at.to_rfc3339())
+        .bind(action.accepted_at.map(|value| value.to_rfc3339()))
+        .bind(action.delivered_at.map(|value| value.to_rfc3339()))
+        .bind(action.completed_at.map(|value| value.to_rfc3339()))
+        .bind(action.lease_owner.as_deref())
+        .bind(action.lease_token.map(|value| value.to_string()))
+        .bind(action.lease_heartbeat_at.map(|value| value.to_rfc3339()))
+        .bind(action.lease_expires_at.map(|value| value.to_rfc3339()))
+        .execute(&mut *transaction)
+        .await?;
+        insert_initial_action_transitions(&mut transaction, &action).await?;
+        transaction.commit().await?;
+        Ok(action)
+    }
+
+    async fn transition_action(
+        &self,
+        session_id: Uuid,
+        action_id: Uuid,
+        expected: Option<SessionActionState>,
+        next: SessionActionState,
+        error: Option<String>,
+    ) -> Result<SessionAction> {
+        let mut transaction = self.begin_write().await?;
+        let action = transition_action_in_transaction(
+            &mut transaction,
+            session_id,
+            action_id,
+            expected,
+            next,
+            error,
+        )
+        .await?;
+        transaction.commit().await?;
+        Ok(action)
+    }
+
+    async fn claim_action(
+        &self,
+        session_id: Uuid,
+        action_id: Uuid,
+        lease_owner: &str,
+        lease_duration: Duration,
+    ) -> Result<Option<SessionAction>> {
+        anyhow::ensure!(
+            !lease_owner.trim().is_empty(),
+            "action lease owner is empty"
+        );
+        anyhow::ensure!(!lease_duration.is_zero(), "action lease duration is zero");
+        let mut transaction = self.begin_write().await?;
+        let Some(row) =
+            sqlx::query("select * from session_actions where action_id = ? and session_id = ?")
+                .bind(action_id.to_string())
+                .bind(session_id.to_string())
+                .fetch_optional(&mut *transaction)
+                .await?
+        else {
+            transaction.commit().await?;
+            return Ok(None);
+        };
+        let mut action = decode_action(&row)?;
+        let now = Utc::now();
+        if action.state.is_terminal() {
+            transaction.commit().await?;
+            return Ok(None);
+        }
+        if action.lease_owner.as_deref() == Some(lease_owner) && !action.lease_expired_at(now) {
+            transaction.commit().await?;
+            return Ok(Some(action));
+        }
+        if !action.lease_expired_at(now) {
+            transaction.commit().await?;
+            return Ok(None);
+        }
+        action.claim(lease_owner.to_string(), Uuid::new_v4(), now, lease_duration)?;
+        update_action_row(&mut transaction, &action).await?;
+        transaction.commit().await?;
+        Ok(Some(action))
+    }
+
+    async fn heartbeat_action(
+        &self,
+        session_id: Uuid,
+        action_id: Uuid,
+        lease_owner: &str,
+        lease_token: Uuid,
+        lease_duration: Duration,
+    ) -> Result<SessionAction> {
+        let mut transaction = self.begin_write().await?;
+        let mut action = load_action_for_update(&mut transaction, session_id, action_id).await?;
+        action.heartbeat(lease_owner, lease_token, Utc::now(), lease_duration)?;
+        update_action_row(&mut transaction, &action).await?;
+        transaction.commit().await?;
+        Ok(action)
+    }
+
+    async fn transition_claimed_action(
+        &self,
+        session_id: Uuid,
+        action_id: Uuid,
+        lease_owner: &str,
+        lease_token: Uuid,
+        expected: Option<SessionActionState>,
+        next: SessionActionState,
+        error: Option<String>,
+    ) -> Result<SessionAction> {
+        let mut transaction = self.begin_write().await?;
+        let mut action = load_action_for_update(&mut transaction, session_id, action_id).await?;
+        validate_live_lease(&action, lease_owner, lease_token, Utc::now())?;
+        let from_state = action.state;
+        action.transition(expected, next, error)?;
+        append_action_transition(&mut transaction, &action, from_state, action.error.clone())
+            .await?;
+        update_action_row(&mut transaction, &action).await?;
+        transaction.commit().await?;
+        Ok(action)
+    }
+
+    async fn recover_expired_actions(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<SessionAction>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut transaction = self.begin_write().await?;
+        let rows = sqlx::query(
+            "select * from session_actions \
+             where state in ('running', 'committing') \
+               and (lease_expires_at is null or lease_expires_at <= ?) \
+             order by lease_expires_at, created_at, action_id limit ?",
+        )
+        .bind(now.to_rfc3339())
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_all(&mut *transaction)
+        .await?;
+        let mut recovered = Vec::with_capacity(rows.len());
+        for row in rows {
+            let mut action = decode_action(&row)?;
+            if !action.lease_expired_at(now) {
+                continue;
+            }
+            let from_state = action.state;
+            action.transition(
+                Some(from_state),
+                SessionActionState::Queued,
+                Some("action lease expired; requeued for recovery".to_string()),
+            )?;
+            append_action_transition(&mut transaction, &action, from_state, action.error.clone())
+                .await?;
+            update_action_row(&mut transaction, &action).await?;
+            recovered.push(action);
+        }
+        transaction.commit().await?;
+        Ok(recovered)
+    }
+
+    async fn action(&self, session_id: Uuid, action_id: Uuid) -> Result<Option<SessionAction>> {
+        sqlx::query("select * from session_actions where action_id = ? and session_id = ?")
+            .bind(action_id.to_string())
+            .bind(session_id.to_string())
+            .fetch_optional(&self.pool)
+            .await?
+            .map(|row| decode_action(&row))
+            .transpose()
+    }
+
+    async fn action_transitions(
+        &self,
+        session_id: Uuid,
+        action_id: Uuid,
+    ) -> Result<Vec<SessionActionTransition>> {
+        let rows = sqlx::query(
+            "select * from session_action_transitions \
+             where session_id=? and action_id=? order by transition_no",
+        )
+        .bind(session_id.to_string())
+        .bind(action_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(decode_action_transition).collect()
+    }
+
+    async fn pending_actions(&self, session_id: Uuid, limit: usize) -> Result<Vec<SessionAction>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            "select * from session_actions where session_id = ? \
+             and state not in ('completed', 'failed', 'cancelled') \
+             order by created_at, action_id limit ?",
+        )
+        .bind(session_id.to_string())
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(decode_action).collect()
     }
 
     async fn read(&self, session_id: Uuid) -> Result<Vec<SessionEvent>> {
@@ -1829,7 +3107,7 @@ impl SessionStore for SqliteSessionStore {
         }
         // Use the existing message-id partial index to avoid walking every
         // tool/reasoning event in a long session. We sort the much smaller
-        // message set in memory because the legacy index is keyed by message
+        // message set in memory because the message index is keyed by message
         // id rather than sequence.
         let rows = sqlx::query(
             "select event_json from session_events \
@@ -2001,7 +3279,7 @@ impl SessionStore for SqliteSessionStore {
                     // A provider removed from the runtime can still be present
                     // in an older session projection. It is not resumable by
                     // this binary, but it must not make `/resume` take down the
-                    // entire TUI. Keep the row intact for migration/inspection.
+                    // entire TUI. Keep the row intact for explicit inspection.
                     tracing::warn!(
                         %session_id,
                         %error,
@@ -2214,6 +3492,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn opening_schema_v4_repairs_missing_action_lease_columns() {
+        let (directory, store) = store().await;
+        let path = directory.path().join("sessions.sqlite3");
+        sqlx::query("drop index if exists idx_session_actions_lease_expiry")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        for column in [
+            "lease_owner",
+            "lease_token",
+            "lease_heartbeat_at",
+            "lease_expires_at",
+        ] {
+            sqlx::query(&format!("alter table session_actions drop column {column}"))
+                .execute(store.pool())
+                .await
+                .unwrap();
+        }
+        sqlx::query("update borg_session_schema set version=4 where id=1")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        store.pool().close().await;
+
+        let reopened = SqliteSessionStore::open(path).await.unwrap();
+        let columns = sqlx::query("pragma table_info(session_actions)")
+            .fetch_all(reopened.pool())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get::<String, _>("name"))
+            .collect::<HashSet<_>>();
+        assert!(
+            [
+                "lease_owner",
+                "lease_token",
+                "lease_heartbeat_at",
+                "lease_expires_at",
+            ]
+            .into_iter()
+            .all(|column| columns.contains(column))
+        );
+        let version: i64 = sqlx::query_scalar("select version from borg_session_schema where id=1")
+            .fetch_one(reopened.pool())
+            .await
+            .unwrap();
+        assert_eq!(version, SESSION_SCHEMA_VERSION);
+    }
+
+    #[tokio::test]
     async fn list_sessions_skips_state_for_removed_providers() {
         let (_directory, store) = store().await;
         let valid = Uuid::new_v4();
@@ -2236,6 +3564,46 @@ mod tests {
             vec![valid]
         );
         assert!(store.contains_session(incompatible).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn provider_capability_snapshot_is_durable_metadata_not_context() {
+        let (_directory, store) = store().await;
+        let session_id = Uuid::new_v4();
+        store.create_session(session_id).await.unwrap();
+        let providers = vec![crate::ProviderCapability {
+            provider: CodingProvider::Codex,
+            installed: true,
+            version: Some("test".to_string()),
+            authenticated: true,
+            auth_detail: Some("Codex subscription authenticated".to_string()),
+            auth_methods: vec![crate::ProviderAuthMethod::Subscription],
+            can_spawn: true,
+        }];
+        store
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::ProviderCapabilitiesUpdated {
+                    providers: providers.clone(),
+                },
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.state(session_id).await.unwrap().provider_capabilities,
+            providers
+        );
+        assert!(
+            store
+                .recovery(session_id)
+                .await
+                .unwrap()
+                .context_events
+                .is_empty()
+        );
+        assert_eq!(store.read(session_id).await.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -2347,105 +3715,6 @@ mod tests {
         assert_eq!(event.sequence, 1);
     }
 
-    #[tokio::test]
-    async fn existing_sqlite_schema_adds_child_ownership_before_indexing_it() {
-        let directory = tempdir().unwrap();
-        let path = directory.path().join("sessions.sqlite3");
-        let pool = SqlitePoolOptions::new()
-            .connect_with(
-                SqliteConnectOptions::new()
-                    .filename(&path)
-                    .create_if_missing(true),
-            )
-            .await
-            .unwrap();
-        sqlx::query(
-            "create table sessions (
-                id text primary key,
-                parent_session_id text references sessions(id),
-                parent_cut_sequence integer,
-                inherited_event_count integer not null default 0,
-                next_sequence integer not null default 1,
-                live_revision integer not null default 0,
-                state_json text not null,
-                projection_version integer not null default 1,
-                created_at text not null,
-                updated_at text not null
-            )",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        pool.close().await;
-
-        let store = SqliteSessionStore::open(&path).await.unwrap();
-        let owner_column: i64 = sqlx::query_scalar(
-            "select count(*) from pragma_table_info('sessions') where name = 'owner_session_id'",
-        )
-        .fetch_one(store.pool())
-        .await
-        .unwrap();
-        let root_activity_index: i64 = sqlx::query_scalar(
-            "select count(*) from sqlite_master \
-             where type = 'index' and name = 'idx_sessions_root_activity'",
-        )
-        .fetch_one(store.pool())
-        .await
-        .unwrap();
-        assert_eq!(owner_column, 1);
-        assert_eq!(root_activity_index, 1);
-    }
-
-    #[tokio::test]
-    async fn stale_projection_rebuilds_latest_completed_assistant_response() {
-        let directory = tempdir().unwrap();
-        let path = directory.path().join("sessions.sqlite3");
-        let store = SqliteSessionStore::open(&path).await.unwrap();
-        let session_id = Uuid::new_v4();
-        store.create_session(session_id).await.unwrap();
-        store
-            .append(SessionEvent::new(
-                session_id,
-                0,
-                SessionEventKind::SessionStarted,
-            ))
-            .await
-            .unwrap();
-        store
-            .append(SessionEvent::new(
-                session_id,
-                0,
-                SessionEventKind::Message {
-                    message_id: Uuid::new_v4(),
-                    actor: EventActor::Assistant,
-                    text: "persisted response".to_string(),
-                    attachments: Vec::new(),
-                    status: MessageStatus::Complete,
-                    delivery: None,
-                },
-            ))
-            .await
-            .unwrap();
-        sqlx::query("update sessions set state_json = ?, projection_version = 2 where id = ?")
-            .bind(serde_json::to_string(&SessionState::default()).unwrap())
-            .bind(session_id.to_string())
-            .execute(store.pool())
-            .await
-            .unwrap();
-        store.pool().close().await;
-
-        let reopened = SqliteSessionStore::open(&path).await.unwrap();
-        assert_eq!(
-            reopened
-                .state(session_id)
-                .await
-                .unwrap()
-                .latest_response
-                .as_deref(),
-            Some("persisted response")
-        );
-    }
-
     fn configured(directory: &Path) -> SessionEventKind {
         SessionEventKind::SessionConfigured {
             cwd: directory.to_path_buf(),
@@ -2467,6 +3736,405 @@ mod tests {
             status: MessageStatus::Complete,
             delivery: Some(PromptDelivery::Steer),
         }
+    }
+
+    #[tokio::test]
+    async fn prompt_event_boundaries_drive_one_atomic_action_lifecycle() {
+        let (directory, store) = store().await;
+        let session_id = Uuid::new_v4();
+        store.create_session(session_id).await.unwrap();
+        store
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::SessionStarted,
+            ))
+            .await
+            .unwrap();
+        store
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                configured(directory.path()),
+            ))
+            .await
+            .unwrap();
+        let message_id = Uuid::new_v4();
+        store
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::Message {
+                    message_id,
+                    actor: EventActor::User,
+                    text: "do the work".to_string(),
+                    attachments: Vec::new(),
+                    status: MessageStatus::Queued,
+                    delivery: Some(PromptDelivery::Queue),
+                },
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .action(session_id, message_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            SessionActionState::Admitted
+        );
+        store
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::TurnStarted {
+                    message_id,
+                    provider: CodingProvider::Codex,
+                    model: Some("gpt-test".to_string()),
+                    effort: Some("high".to_string()),
+                    fast: false,
+                },
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .action(session_id, message_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            SessionActionState::Running
+        );
+        store
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::TurnCompleted {
+                    message_id,
+                    provider_session_id: Some("provider-session".to_string()),
+                    final_text: "done".to_string(),
+                    error: None,
+                },
+            ))
+            .await
+            .unwrap();
+        let completed = store.action(session_id, message_id).await.unwrap().unwrap();
+        assert_eq!(completed.state, SessionActionState::Completed);
+        assert!(completed.accepted_at.is_some());
+        assert!(completed.delivered_at.is_some());
+        assert!(completed.completed_at.is_some());
+        let transitions = store
+            .action_transitions(session_id, message_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            transitions
+                .iter()
+                .map(|transition| (transition.from, transition.to))
+                .collect::<Vec<_>>(),
+            [
+                (None, SessionActionState::Queued),
+                (
+                    Some(SessionActionState::Queued),
+                    SessionActionState::Admitted
+                ),
+                (
+                    Some(SessionActionState::Admitted),
+                    SessionActionState::Delivered
+                ),
+                (
+                    Some(SessionActionState::Delivered),
+                    SessionActionState::Preparing
+                ),
+                (
+                    Some(SessionActionState::Preparing),
+                    SessionActionState::Committing
+                ),
+                (
+                    Some(SessionActionState::Committing),
+                    SessionActionState::Running
+                ),
+                (
+                    Some(SessionActionState::Running),
+                    SessionActionState::Completed
+                ),
+            ]
+        );
+        assert!(
+            store
+                .pending_actions(session_id, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // Re-admission with the same id/payload is an idempotent read of the
+        // durable terminal action, not a duplicate action.
+        let replay = SessionAction::new(
+            message_id,
+            session_id,
+            completed.kind,
+            completed.delivery,
+            completed.wake,
+            completed.payload.clone(),
+        );
+        assert_eq!(
+            store.enqueue_action(replay).await.unwrap().state,
+            completed.state
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_claims_have_one_winner_and_same_owner_claim_is_idempotent() {
+        let (_directory, store) = store().await;
+        let session_id = Uuid::new_v4();
+        let action_id = Uuid::new_v4();
+        store.create_session(session_id).await.unwrap();
+        store
+            .enqueue_action(SessionAction::new(
+                action_id,
+                session_id,
+                crate::SessionActionKind::Prompt,
+                crate::ActionDeliveryPolicy::NextTurnBoundary,
+                crate::ActionWakePolicy::Immediate,
+                serde_json::json!({"text": "claim once"}),
+            ))
+            .await
+            .unwrap();
+
+        let mut tasks = Vec::new();
+        for worker_number in 0..8 {
+            let contender = store.clone();
+            tasks.push(tokio::spawn(async move {
+                contender
+                    .claim_action(
+                        session_id,
+                        action_id,
+                        &format!("worker-{worker_number}"),
+                        Duration::from_secs(30),
+                    )
+                    .await
+                    .unwrap()
+            }));
+        }
+        let mut winner = None;
+        for task in tasks {
+            if let Some(action) = task.await.unwrap() {
+                assert!(winner.is_none(), "two workers claimed the action");
+                winner = Some(action);
+            }
+        }
+        let winner = winner.expect("one worker should claim the queued action");
+        let replay = store
+            .claim_action(
+                session_id,
+                action_id,
+                winner.lease_owner.as_deref().unwrap(),
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(replay.lease_token, winner.lease_token);
+        assert_eq!(replay.lease_heartbeat_at, winner.lease_heartbeat_at);
+        assert_eq!(
+            store
+                .action_transitions(session_id, action_id)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "claiming must not create duplicate lifecycle transitions"
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_leases_requeue_once_and_fence_stale_workers() {
+        let (_directory, store) = store().await;
+        let session_id = Uuid::new_v4();
+        let action_id = Uuid::new_v4();
+        store.create_session(session_id).await.unwrap();
+        store
+            .enqueue_action(SessionAction::new(
+                action_id,
+                session_id,
+                crate::SessionActionKind::Prompt,
+                crate::ActionDeliveryPolicy::NextTurnBoundary,
+                crate::ActionWakePolicy::Immediate,
+                serde_json::json!({"text": "recover me"}),
+            ))
+            .await
+            .unwrap();
+        let claimed = store
+            .claim_action(session_id, action_id, "worker-a", Duration::from_millis(40))
+            .await
+            .unwrap()
+            .unwrap();
+        let token = claimed.lease_token.unwrap();
+        store
+            .transition_claimed_action(
+                session_id,
+                action_id,
+                "worker-a",
+                token,
+                Some(SessionActionState::Queued),
+                SessionActionState::Admitted,
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .transition_claimed_action(
+                session_id,
+                action_id,
+                "worker-a",
+                token,
+                Some(SessionActionState::Admitted),
+                SessionActionState::Delivered,
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .transition_claimed_action(
+                session_id,
+                action_id,
+                "worker-a",
+                token,
+                Some(SessionActionState::Delivered),
+                SessionActionState::Preparing,
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .transition_claimed_action(
+                session_id,
+                action_id,
+                "worker-a",
+                token,
+                Some(SessionActionState::Preparing),
+                SessionActionState::Committing,
+                None,
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let recovered = store.recover_expired_actions(Utc::now(), 10).await.unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].state, SessionActionState::Queued);
+        assert!(recovered[0].lease_owner.is_none());
+        assert!(
+            store
+                .heartbeat_action(
+                    session_id,
+                    action_id,
+                    "worker-a",
+                    token,
+                    Duration::from_secs(30),
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .recover_expired_actions(Utc::now(), 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let reclaimed = store
+            .claim_action(session_id, action_id, "worker-b", Duration::from_secs(30))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(reclaimed.lease_token, Some(token));
+        assert!(
+            store
+                .transition_claimed_action(
+                    session_id,
+                    action_id,
+                    "worker-a",
+                    token,
+                    Some(SessionActionState::Queued),
+                    SessionActionState::Admitted,
+                    None,
+                )
+                .await
+                .is_err()
+        );
+        let transitions = store
+            .action_transitions(session_id, action_id)
+            .await
+            .unwrap();
+        assert!(transitions.iter().any(|transition| {
+            transition.from == Some(SessionActionState::Committing)
+                && transition.to == SessionActionState::Queued
+        }));
+    }
+
+    #[tokio::test]
+    async fn compaction_events_drive_one_replayable_action_lifecycle() {
+        let (directory, store) = store().await;
+        let session_id = Uuid::new_v4();
+        store.create_session(session_id).await.unwrap();
+        for kind in [
+            SessionEventKind::SessionStarted,
+            configured(directory.path()),
+        ] {
+            store
+                .append(SessionEvent::new(session_id, 0, kind))
+                .await
+                .unwrap();
+        }
+        let mut started = SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::ProviderEvent {
+                provider: CodingProvider::OpenRouter,
+                kind: "context_compaction".to_string(),
+                payload: serde_json::json!({"status": "started"}),
+            },
+        );
+        started = store.append(started).await.unwrap();
+        assert_eq!(
+            store
+                .action(session_id, started.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            SessionActionState::Running
+        );
+        store
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::ProviderEvent {
+                    provider: CodingProvider::OpenRouter,
+                    kind: "context_compaction".to_string(),
+                    payload: serde_json::json!({
+                        "status": "completed",
+                        "summary": "keep the durable decisions"
+                    }),
+                },
+            ))
+            .await
+            .unwrap();
+        let action = store.action(session_id, started.id).await.unwrap().unwrap();
+        assert_eq!(action.state, SessionActionState::Completed);
+        assert_eq!(
+            store
+                .action_transitions(session_id, started.id)
+                .await
+                .unwrap()
+                .last()
+                .unwrap()
+                .to,
+            SessionActionState::Completed
+        );
     }
 
     #[tokio::test]
@@ -2927,18 +4595,44 @@ mod tests {
                 .unwrap();
             assert_eq!(event.sequence, 0);
         }
-        for text in ["thinking ", "carefully"] {
-            store
-                .append(SessionEvent::new(
-                    session_id,
-                    0,
-                    SessionEventKind::ReasoningDelta {
-                        text: text.to_string(),
-                    },
-                ))
-                .await
-                .unwrap();
-        }
+        let first_reasoning = store
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::ReasoningDelta {
+                    text: "thinking ".to_string(),
+                },
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(
+            first_reasoning.kind,
+            SessionEventKind::ReasoningDelta { ref text } if text == "thinking "
+        ));
+        let second_reasoning = store
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::ReasoningDelta {
+                    text: "carefully".to_string(),
+                },
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(
+            second_reasoning.kind,
+            SessionEventKind::ReasoningDelta { ref text } if text == "thinking carefully"
+        ));
+        store
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::ReasoningDelta {
+                    text: "thinking carefully".to_string(),
+                },
+            ))
+            .await
+            .unwrap();
         store
             .append(SessionEvent::new(
                 session_id,
@@ -3247,10 +4941,7 @@ mod tests {
             kind: "context_compaction".to_string(),
             payload: serde_json::json!({"status": "started"}),
         };
-        assert_eq!(
-            compaction_started.persistence(),
-            EventPersistence::Ephemeral
-        );
+        assert_eq!(compaction_started.persistence(), EventPersistence::Durable);
         assert!(!compaction_started.is_context_relevant());
         let compaction_completed = SessionEventKind::ProviderEvent {
             provider: CodingProvider::Codex,
@@ -3268,6 +4959,63 @@ mod tests {
             }
             .is_fork_inheritable()
         );
+    }
+
+    #[test]
+    fn context_generation_changes_only_at_explicit_prefix_boundaries() {
+        let session_id = Uuid::new_v4();
+        let mut state = SessionState::default();
+        state
+            .apply(&SessionEvent::new(
+                session_id,
+                1,
+                SessionEventKind::SessionStarted,
+            ))
+            .unwrap();
+        state
+            .apply(&SessionEvent::new(
+                session_id,
+                2,
+                configured(Path::new("/tmp")),
+            ))
+            .unwrap();
+        assert_eq!(state.context_generation, 0);
+        state
+            .apply(&SessionEvent::new(
+                session_id,
+                3,
+                SessionEventKind::ProviderEvent {
+                    provider: CodingProvider::Codex,
+                    kind: "context_compaction".to_string(),
+                    payload: serde_json::json!({"status": "completed"}),
+                },
+            ))
+            .unwrap();
+        assert_eq!(state.context_generation, 1);
+        state
+            .apply(&SessionEvent::new(
+                session_id,
+                4,
+                SessionEventKind::ContextCleared,
+            ))
+            .unwrap();
+        assert_eq!(state.context_generation, 2);
+        state
+            .apply(&SessionEvent::new(
+                session_id,
+                5,
+                SessionEventKind::SessionConfigured {
+                    cwd: PathBuf::from("/tmp"),
+                    provider: CodingProvider::Claude,
+                    model: Some("claude-test".to_string()),
+                    effort: Some("high".to_string()),
+                    fast: false,
+                    response_language: ResponseLanguage::Auto,
+                    permission_mode: PermissionMode::FullAccess,
+                },
+            ))
+            .unwrap();
+        assert_eq!(state.context_generation, 3);
     }
 
     #[tokio::test]

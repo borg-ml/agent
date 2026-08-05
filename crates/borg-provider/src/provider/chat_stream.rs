@@ -580,6 +580,7 @@ async fn run_codex_subscription_process(
     > = HashMap::new();
     let mut pending_approvals = HashMap::new();
     let mut turn_completed = false;
+    let mut reasoning_state = CodexReasoningState::default();
 
     loop {
         tokio::select! {
@@ -601,11 +602,13 @@ async fn run_codex_subscription_process(
                     continue;
                 }
                 emit_provider_event(&events, &value).await;
-                emit_codex_events(&events, &value).await;
+                emit_codex_events_with_state(&events, &value, &mut reasoning_state).await;
                 if let Some(delta) = codex_event_delta(&value) {
                     if codex_event_is_reasoning_delta(&value) {
-                        events.send(ChatStreamEvent::ReasoningDelta(delta)).await.ok();
-                    } else {
+                        if let Some(delta) = reasoning_state.observe_delta(&value, &delta) {
+                            events.send(ChatStreamEvent::ReasoningDelta(delta)).await.ok();
+                        }
+                    } else if codex_event_is_assistant_text_delta(&value) {
                         text.push_str(&delta);
                         events.send(ChatStreamEvent::Delta(delta)).await.ok();
                     }
@@ -1114,7 +1117,96 @@ fn codex_subscription_event_kind(value: &Value, raw_kind: &str) -> String {
         .unwrap_or_else(|| raw_kind.replace('.', "/"))
 }
 
+#[derive(Debug, Default)]
+struct CodexReasoningState {
+    /// Codex has emitted both incremental deltas and cumulative snapshots
+    /// across app-server versions. Track each reasoning item separately and
+    /// normalize either wire form into one incremental stream.
+    streams: HashMap<String, String>,
+}
+
+impl CodexReasoningState {
+    fn observe_delta(&mut self, value: &Value, incoming: &str) -> Option<String> {
+        let key = codex_reasoning_stream_key(value);
+        let previous = self.streams.entry(key).or_default();
+        let emitted = normalize_provider_delta(previous, incoming);
+        if incoming.starts_with(previous.as_str()) {
+            previous.clear();
+            previous.push_str(incoming);
+        } else if previous.starts_with(incoming) {
+            // A reconnect or lifecycle boundary replayed an older snapshot.
+        } else {
+            previous.push_str(incoming);
+        }
+        if emitted.is_empty() {
+            return None;
+        }
+        Some(emitted)
+    }
+
+    fn completion_suffix(&mut self, value: &Value, aggregate: &str) -> Option<String> {
+        let mut key = codex_reasoning_stream_key(value);
+        if !self.streams.contains_key(&key)
+            && let Some(prefix) = key.strip_suffix(":-")
+        {
+            if let Some(existing) = self
+                .streams
+                .keys()
+                .find(|candidate| candidate.starts_with(&format!("{prefix}:")))
+                .cloned()
+            {
+                key = existing;
+            }
+        }
+        let previous = self.streams.entry(key).or_default();
+        let emitted = normalize_provider_delta(previous, aggregate);
+        if aggregate.starts_with(previous.as_str()) {
+            previous.clear();
+            previous.push_str(aggregate);
+        } else if previous.starts_with(aggregate) {
+            // The completed item carried a shorter snapshot than the stream.
+        } else {
+            previous.push_str(aggregate);
+        }
+        if emitted.is_empty() {
+            return None;
+        }
+        Some(emitted)
+    }
+}
+
+fn normalize_provider_delta(previous: &str, incoming: &str) -> String {
+    if incoming.is_empty() || incoming == previous || previous.starts_with(incoming) {
+        return String::new();
+    }
+    incoming
+        .strip_prefix(previous)
+        .map_or_else(|| incoming.to_string(), str::to_string)
+}
+
+fn codex_reasoning_stream_key(value: &Value) -> String {
+    let item_id = codex_event_item(value)
+        .and_then(|item| item.get("id"))
+        .and_then(Value::as_str)
+        .or_else(|| value.pointer("/params/itemId").and_then(Value::as_str))
+        .unwrap_or("default");
+    let summary_index = value
+        .pointer("/params/summaryIndex")
+        .or_else(|| codex_event_item(value).and_then(|item| item.get("summaryIndex")))
+        .map_or_else(|| "-".to_string(), Value::to_string);
+    format!("{item_id}:{summary_index}")
+}
+
+#[cfg(test)]
 async fn emit_codex_events(events: &mpsc::Sender<ChatStreamEvent>, value: &Value) {
+    emit_codex_events_with_state(events, value, &mut CodexReasoningState::default()).await;
+}
+
+async fn emit_codex_events_with_state(
+    events: &mpsc::Sender<ChatStreamEvent>,
+    value: &Value,
+    reasoning_state: &mut CodexReasoningState,
+) {
     let Some(kind) = codex_event_kind(value) else {
         return;
     };
@@ -1163,10 +1255,14 @@ async fn emit_codex_events(events: &mpsc::Sender<ChatStreamEvent>, value: &Value
             }
             if codex_item_is_reasoning(item_type) {
                 if let Some(reasoning) = codex_reasoning_text(item) {
-                    events
-                        .send(ChatStreamEvent::ReasoningDelta(reasoning))
-                        .await
-                        .ok();
+                    if let Some(reasoning) = reasoning_state.completion_suffix(value, &reasoning) {
+                        if !reasoning.is_empty() {
+                            events
+                                .send(ChatStreamEvent::ReasoningDelta(reasoning))
+                                .await
+                                .ok();
+                        }
+                    }
                 }
                 events
                     .send(ChatStreamEvent::Phase {
@@ -1453,10 +1549,69 @@ fn codex_event_is_reasoning_delta(value: &Value) -> bool {
     })
 }
 
+fn codex_event_is_tool_output_delta(value: &Value) -> bool {
+    let Some(kind) = codex_event_kind(value) else {
+        return false;
+    };
+    let kind = kind.replace('.', "/").to_ascii_lowercase();
+    if !kind.contains("delta") {
+        return false;
+    }
+    if kind.contains("reasoning") || kind.contains("agentmessage") || kind.contains("agent_message")
+    {
+        return false;
+    }
+    let item_type = codex_event_item(value)
+        .map(codex_item_type)
+        .unwrap_or_default()
+        .replace('_', "")
+        .to_ascii_lowercase();
+    item_type.contains("commandexecution")
+        || item_type.contains("toolcall")
+        || item_type.contains("toolresult")
+        || kind.contains("commandexecution")
+        || kind.contains("toolcall")
+        || kind.contains("toolresult")
+        || (kind.contains("output") && !kind.contains("message") && !kind.contains("output_text"))
+}
+
+fn codex_event_is_assistant_text_delta(value: &Value) -> bool {
+    let Some(kind) = codex_event_kind(value) else {
+        return false;
+    };
+    if codex_event_is_tool_output_delta(value) {
+        return false;
+    }
+    let kind = kind
+        .replace('.', "")
+        .replace('_', "")
+        .replace('-', "")
+        .to_ascii_lowercase();
+    if !kind.contains("delta")
+        || kind.contains("reasoning")
+        || kind.contains("commandexecution")
+        || kind.contains("toolcall")
+        || kind.contains("toolresult")
+        || kind.contains("filechange")
+        || kind.contains("processoutput")
+    {
+        return false;
+    }
+    // Codex app-server's visible model stream is item/agentMessage/delta.
+    // Keep the two common assistant spellings for older adapters, but never
+    // treat an unknown output delta as assistant prose.
+    kind.contains("agentmessage")
+        || kind.contains("assistantmessage")
+        || kind == "response/outputtext/delta"
+}
+
 fn codex_event_result(value: &Value) -> Option<String> {
     let is_completed = codex_event_kind(value)
         .is_some_and(|kind| matches!(kind.replace('.', "/").as_str(), "item/completed"));
     if !is_completed {
+        if !codex_event_is_assistant_text_delta(value) {
+            return None;
+        }
         return value
             .get("result")
             .and_then(Value::as_str)
@@ -1836,6 +1991,118 @@ mod tests {
             Some("checking the plan")
         );
         assert!(codex_event_is_reasoning_delta(&value));
+    }
+
+    #[test]
+    fn codex_command_output_deltas_are_not_answer_deltas() {
+        let value = serde_json::json!({
+            "method": "item/commandExecution/outputDelta",
+            "params": {
+                "delta": "Finished cargo test",
+                "item": {"id": "command-1", "type": "commandExecution"}
+            }
+        });
+        assert_eq!(
+            codex_event_delta(&value).as_deref(),
+            Some("Finished cargo test")
+        );
+        assert!(codex_event_is_tool_output_delta(&value));
+        assert!(!codex_event_is_assistant_text_delta(&value));
+    }
+
+    #[test]
+    fn only_known_assistant_delta_channels_enter_the_answer() {
+        let assistant = serde_json::json!({
+            "method": "item/agentMessage/delta",
+            "params": {"delta": "answer", "itemId": "message-1"}
+        });
+        let process = serde_json::json!({
+            "method": "process/outputDelta",
+            "params": {"delta": "tool output", "processId": "process-1"}
+        });
+        let file_change = serde_json::json!({
+            "method": "item/fileChange/outputDelta",
+            "params": {"delta": "patch output", "itemId": "file-1"}
+        });
+        assert!(codex_event_is_assistant_text_delta(&assistant));
+        assert!(!codex_event_is_assistant_text_delta(&process));
+        assert!(!codex_event_is_assistant_text_delta(&file_change));
+    }
+
+    #[test]
+    fn cumulative_reasoning_deltas_are_reduced_to_one_stream() {
+        let mut state = CodexReasoningState::default();
+        let first = serde_json::json!({
+            "method": "item/reasoning/summaryTextDelta",
+            "params": {"delta": "Considering code modifications", "itemId": "reasoning-1", "summaryIndex": 0}
+        });
+        let second = serde_json::json!({
+            "method": "item/reasoning/summaryTextDelta",
+            "params": {"delta": "Considering code modifications\nI’m checking the repository", "itemId": "reasoning-1", "summaryIndex": 0}
+        });
+        let duplicate = second.clone();
+        assert_eq!(
+            state.observe_delta(
+                &first,
+                first.pointer("/params/delta").unwrap().as_str().unwrap()
+            ),
+            Some("Considering code modifications".to_string())
+        );
+        assert_eq!(
+            state.observe_delta(
+                &second,
+                second.pointer("/params/delta").unwrap().as_str().unwrap()
+            ),
+            Some("\nI’m checking the repository".to_string())
+        );
+        assert_eq!(
+            state.observe_delta(
+                &duplicate,
+                duplicate
+                    .pointer("/params/delta")
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+            ),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_reasoning_completion_does_not_replay_streamed_summary() {
+        let (sender, mut receiver) = mpsc::channel(8);
+        let mut state = CodexReasoningState::default();
+        let delta = serde_json::json!({
+            "method": "item/reasoning/summaryTextDelta",
+            "params": {
+                "delta": "checking the plan",
+                "itemId": "reasoning-1",
+                "summaryIndex": 0
+            }
+        });
+        state.observe_delta(
+            &delta,
+            delta.pointer("/params/delta").unwrap().as_str().unwrap(),
+        );
+        emit_codex_events_with_state(
+            &sender,
+            &serde_json::json!({
+                "type": "item.completed",
+                "item": {
+                    "id": "reasoning-1",
+                    "type": "reasoning",
+                    "summary": ["checking the plan"]
+                }
+            }),
+            &mut state,
+        )
+        .await;
+
+        assert!(matches!(
+            receiver.recv().await,
+            Some(ChatStreamEvent::Phase { name, .. }) if name == "reasoning_completed"
+        ));
+        assert!(receiver.try_recv().is_err());
     }
 
     #[test]
