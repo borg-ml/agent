@@ -20,6 +20,7 @@ use uuid::Uuid;
 
 pub const MANIFEST_VERSION: u32 = 1;
 const STATE_VERSION: u32 = 1;
+const MAX_WORKFLOW_SOURCE: u64 = 256 * 1024;
 const PACKAGE_MANIFEST_NAMES: [&str; 2] = ["blu.toml", "extension.toml"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -55,6 +56,14 @@ impl ExtensionCatalog {
             .iter()
             .filter_map(|id| self.extensions.iter().find(|extension| &extension.id == id))
             .flat_map(|extension| extension.skill_roots.iter().cloned())
+            .collect()
+    }
+
+    pub(crate) fn active_workflows(&self) -> Vec<borg_remote::BluWorkflowDefinition> {
+        self.load_order
+            .iter()
+            .filter_map(|id| self.extensions.iter().find(|extension| &extension.id == id))
+            .flat_map(|extension| extension.workflows.iter().cloned())
             .collect()
     }
 
@@ -111,6 +120,9 @@ pub(crate) struct EffectiveExtension {
     pub dependencies: BTreeMap<String, String>,
     pub skill_roots: Vec<PathBuf>,
     pub servers: Vec<String>,
+    pub workflow_names: Vec<String>,
+    #[serde(skip_serializing)]
+    pub workflows: Vec<borg_remote::BluWorkflowDefinition>,
     /// Secret settings are always redacted from catalog output.
     pub settings: BTreeMap<String, String>,
 }
@@ -139,6 +151,8 @@ struct Manifest {
     config: BTreeMap<String, ConfigField>,
     #[serde(default)]
     mcp: BTreeMap<String, Server>,
+    #[serde(default)]
+    workflows: BTreeMap<String, Workflow>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -166,6 +180,14 @@ struct Server {
     env: BTreeMap<String, String>,
     #[serde(default)]
     allowed_tools: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Workflow {
+    entrypoint: PathBuf,
+    #[serde(default)]
+    description: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -203,6 +225,7 @@ struct Candidate {
     reason: Option<String>,
     roots: Vec<PathBuf>,
     servers: Vec<borg_provider::mcp::ExternalMcpServer>,
+    workflows: Vec<borg_remote::BluWorkflowDefinition>,
 }
 
 fn yes() -> bool {
@@ -217,7 +240,11 @@ pub(crate) fn discover(
     cwd: &Path,
     capabilities: &CapabilityConfig,
     allow_project_mcp: bool,
-) -> Result<(ExtensionCatalog, Vec<borg_provider::mcp::ExternalMcpServer>)> {
+) -> Result<(
+    ExtensionCatalog,
+    Vec<borg_provider::mcp::ExternalMcpServer>,
+    Vec<borg_remote::BluWorkflowDefinition>,
+)> {
     let user_root = user_config_root()?;
     discover_in_dirs(
         Some(cwd.join(".borg/extensions")),
@@ -237,7 +264,11 @@ fn discover_in_dirs(
     user_state_path: Option<PathBuf>,
     capabilities: &CapabilityConfig,
     allow_project_mcp: bool,
-) -> Result<(ExtensionCatalog, Vec<borg_provider::mcp::ExternalMcpServer>)> {
+) -> Result<(
+    ExtensionCatalog,
+    Vec<borg_provider::mcp::ExternalMcpServer>,
+    Vec<borg_remote::BluWorkflowDefinition>,
+)> {
     let mut diagnostics = Vec::new();
     let mut digest = Sha256::new();
     digest.update(format!("{capabilities:?}:{allow_project_mcp}").as_bytes());
@@ -350,12 +381,14 @@ fn discover_in_dirs(
     resolve_dependencies(&mut candidates);
     let load_order = dependency_order(&mut candidates);
     let mut external_servers = Vec::new();
+    let mut workflows = Vec::new();
     for id in &load_order {
         if let Some(candidate) = candidates
             .iter()
             .find(|candidate| candidate.active && &candidate.manifest.id == id)
         {
             external_servers.extend(candidate.servers.clone());
+            workflows.extend(candidate.workflows.clone());
         }
     }
 
@@ -366,7 +399,7 @@ fn discover_in_dirs(
         extensions,
         diagnostics,
     };
-    Ok((catalog, external_servers))
+    Ok((catalog, external_servers, workflows))
 }
 
 fn load_candidate(path: &Path, scope: ExtensionScope) -> Result<Candidate> {
@@ -406,6 +439,7 @@ fn load_candidate(path: &Path, scope: ExtensionScope) -> Result<Candidate> {
         reason: None,
         roots: Vec::new(),
         servers: Vec::new(),
+        workflows: Vec::new(),
     };
     Ok(candidate)
 }
@@ -419,6 +453,7 @@ fn evaluate_candidate(
     candidate.reason = None;
     candidate.roots.clear();
     candidate.servers.clear();
+    candidate.workflows.clear();
     // Keep validation inputs detached from the activation fields we mutate as
     // individual gates fail.
     let manifest = candidate.manifest.clone();
@@ -445,7 +480,8 @@ fn evaluate_candidate(
     {
         deactivate(candidate, format!("requires capability `{missing}`"));
     }
-    if candidate.scope == ExtensionScope::Project && !allow_project_mcp {
+    if candidate.scope == ExtensionScope::Project && !allow_project_mcp && !manifest.mcp.is_empty()
+    {
         deactivate(
             candidate,
             "project extension trust is disabled; set [extensions].allow_project_mcp = true",
@@ -546,6 +582,57 @@ fn validate_candidate_declarations(candidate: &mut Candidate, manifest: &Manifes
             "extension skill root escapes its package"
         );
         candidate.roots.push(canonical);
+    }
+    for (name, workflow) in &manifest.workflows {
+        ensure!(
+            valid_id(name),
+            "invalid Blu workflow name {name} in extension {}",
+            manifest.id
+        );
+        validate_relative_path(&workflow.entrypoint, "Blu workflow entrypoint")?;
+        ensure!(
+            workflow
+                .entrypoint
+                .extension()
+                .and_then(|value| value.to_str())
+                == Some("blu"),
+            "extension {} workflow {name} entrypoint must use the .blu extension",
+            manifest.id
+        );
+        let requested = candidate.package_root.join(&workflow.entrypoint);
+        ensure!(
+            requested.is_file(),
+            "extension {} workflow entrypoint does not exist: {}",
+            manifest.id,
+            requested.display()
+        );
+        let canonical = requested.canonicalize()?;
+        ensure!(
+            canonical.starts_with(&candidate.package_root),
+            "Blu workflow entrypoint escapes its package"
+        );
+        let metadata = fs::metadata(&canonical)?;
+        ensure!(
+            metadata.len() <= MAX_WORKFLOW_SOURCE,
+            "extension {} workflow {name} exceeds the {} byte source limit",
+            manifest.id,
+            MAX_WORKFLOW_SOURCE
+        );
+        let source = fs::read_to_string(&canonical)
+            .with_context(|| format!("read Blu workflow {name} for extension {}", manifest.id))?;
+        ensure!(
+            !source.contains('\0'),
+            "extension {} workflow {name} contains NUL bytes",
+            manifest.id
+        );
+        candidate
+            .workflows
+            .push(borg_remote::BluWorkflowDefinition {
+                extension_id: manifest.id.clone(),
+                name: name.clone(),
+                description: workflow.description.clone(),
+                source,
+            });
     }
     for (name, server) in &manifest.mcp {
         ensure!(valid_id(name), "invalid MCP server name `{name}`");
@@ -885,6 +972,8 @@ fn effective(candidate: Candidate) -> EffectiveExtension {
             .keys()
             .map(|name| format!("{}__{name}", candidate.manifest.id))
             .collect(),
+        workflow_names: candidate.manifest.workflows.keys().cloned().collect(),
+        workflows: candidate.workflows,
         settings,
     }
 }
@@ -1581,6 +1670,7 @@ mod tests {
             &CapabilityConfig::default(),
             trusted,
         )
+        .map(|(catalog, servers, _)| (catalog, servers))
         .unwrap()
     }
 
@@ -1600,6 +1690,56 @@ mod tests {
     }
 
     #[test]
+    fn executable_workflows_are_discovered_as_part_of_the_active_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        let package = root.path().join("workflow");
+        fs::create_dir_all(package.join("skills")).unwrap();
+        fs::create_dir_all(package.join("workflows")).unwrap();
+        fs::write(
+            package.join("blu.toml"),
+            r#"
+manifest_version = 1
+id = "workflow"
+version = "1.0.0"
+skill_roots = ["skills"]
+
+[workflows.review]
+entrypoint = "workflows/review.blu"
+description = "Review the current change"
+"#,
+        )
+        .unwrap();
+        fs::write(
+            package.join("workflows/review.blu"),
+            "borg_emit(\"audit\", \"extension.review\", \"{}\")",
+        )
+        .unwrap();
+
+        let (catalog, servers, workflows) = discover_in_dirs(
+            None,
+            Some(root.path().to_path_buf()),
+            None,
+            None,
+            &CapabilityConfig::default(),
+            false,
+        )
+        .unwrap();
+        assert!(servers.is_empty());
+        assert!(catalog.extensions[0].active);
+        assert_eq!(catalog.active_workflows().len(), 1);
+        assert_eq!(workflows[0].extension_id, "workflow");
+        assert_eq!(workflows[0].name, "review");
+        assert_eq!(
+            workflows[0].description.as_deref(),
+            Some("Review the current change")
+        );
+        assert_eq!(
+            workflows[0].source,
+            "borg_emit(\"audit\", \"extension.review\", \"{}\")"
+        );
+    }
+
+    #[test]
     fn invalid_package_is_isolated_without_bricking_valid_catalog() {
         let root = tempfile::tempdir().unwrap();
         package(root.path(), "good", "");
@@ -1616,7 +1756,7 @@ mod tests {
         package(root.path(), "good", "");
         let state_path = root.path().join("state.toml");
         fs::write(&state_path, "not = [valid").unwrap();
-        let (catalog, servers) = discover_in_dirs(
+        let (catalog, servers, _) = discover_in_dirs(
             None,
             Some(root.path().to_path_buf()),
             None,
@@ -1726,7 +1866,7 @@ mod tests {
             "state_version=1\n[extensions.configured.config]\ntoken=\"secret\"\n",
         )
         .unwrap();
-        let (catalog, servers) = discover_in_dirs(
+        let (catalog, servers, _) = discover_in_dirs(
             None,
             Some(root.path().to_path_buf()),
             None,

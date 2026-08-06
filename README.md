@@ -32,8 +32,8 @@ configurable.
   configured OpenAI-compatible providers;
 - a native harness with bounded file tools, background
   processes, LSP, goals, plans, subagents, MCP, project guidance, and skills;
-- Blu live extensions with dependency-aware skill and MCP packages, typed
-  settings, atomic install/update, and turn-boundary hot reload, plus
+- Blu live extensions with dependency-aware skill, MCP, and bounded executable
+  workflow packages, typed settings, atomic install/update, and turn-boundary hot reload, plus
   configurable slash aliases and keybindings;
 - non-blocking, checksum-verified updates that take effect on the next launch;
 - **Full Access** (default), **Auto** model-reviewed commands, and **Manual**
@@ -101,25 +101,31 @@ Blu is Borg's inspectable, live extension system:
 Blu packages live in project `.borg/extensions/<id>/` or user
 `$XDG_CONFIG_HOME/borg/extensions/<id>/` (normally
 `~/.config/borg/extensions/<id>/`); legacy flat manifests remain compatible.
-Project packages are cataloged but inactive unless the user explicitly sets
-`[extensions].allow_project_mcp = true`. Packages may declare semantic-version
-dependencies, Borg/capability requirements, typed settings, skill roots, and
-namespaced stdio MCP servers. Invalid packages are isolated and reported by
-`borg extensions doctor` instead of preventing Borg from starting.
+Project packages that declare MCP servers remain cataloged but inactive unless
+the user explicitly sets [extensions].allow_project_mcp = true; skill-only and
+workflow-only project packages do not need MCP trust. Packages may declare
+semantic-version dependencies, Borg/capability requirements, typed settings,
+skill roots, namespaced stdio MCP servers, and bounded .blu workflows. Invalid
+packages are isolated and reported by borg extensions doctor instead of
+preventing Borg from starting.
 
 Running local sessions watch the effective catalog, and enrolled Remote hosts
-revalidate it at each turn boundary. A validated change swaps skills and MCP
-definitions atomically for the next turn; an in-flight turn keeps the immutable
-snapshot it started with. Invalid changes retain the last-known-good runtime
-and show a TUI notice or host warning. Blu does not execute install or lifecycle
-hooks. See [Blu extensions](docs/blu-extensions.md) and the
+revalidate it at each turn boundary. A validated change swaps skills, MCP
+definitions, and workflow source atomically for the next turn; an in-flight
+turn keeps the immutable snapshot it started with. Invalid changes retain the
+last-known-good runtime and show a TUI notice or host warning. Blu does not
+execute install or lifecycle hooks. See [Blu extensions](docs/blu-extensions.md) and the
 [manifest example](configs/extension.example.toml) for the full contract.
 
-Agents can maintain this setup through the built-in
-`get_agent_settings`, `update_agent_settings`, `list_plugins`, `read_plugin`,
-and `create_plugin` tools.
+Agents can maintain this setup through the built-in get_agent_settings,
+update_agent_settings, list_plugins, read_plugin, create_plugin,
+list_blu_extensions, read_blu_extension, create_blu_extension,
+set_blu_extension_enabled, remove_blu_extension, and reload_blu_extensions
+tools. These package operations write atomically and append a small
+scope-local JSONL audit record.
 Settings writes are atomic; slash aliases and keybindings reload in a running
-TUI, while Blu skills and MCP servers reload at the next turn boundary.
+TUI, while Blu skills, MCP servers, and executable workflows reload at the next
+turn boundary.
 `create_plugin` writes a project
 `.borg/skills/<id>/SKILL.md`; the live list/read tools see it immediately, and
 the native skill context rescans it at the start of the next native turn
@@ -127,11 +133,22 @@ without a restart.
 
 ### Durable Blu workflows
 
-The native harness also exposes `run_blu_workflow` for bounded, programmatic
-agent workflows. A workflow is identified by an explicit `workflow_id` and is
-executed inside Borg's embedded Blu runtime. Blu supplies control flow; Borg
-remains authoritative for permissions, tools, processes, autonomy jobs,
-checkpoints, and SQLite journaling.
+The native harness exposes `run_blu_workflow` for ad-hoc bounded workflows and
+advertises installed package workflows through `run_blu_extension`. A package
+declares an entrypoint such as:
+
+```toml
+[workflows.review]
+entrypoint = "workflows/review.blu"
+description = "Review the current change"
+```
+
+The workflow source is loaded from the immutable turn snapshot and identified
+by an explicit `workflow_id`. It executes inside Borg's embedded Blu runtime.
+Blu supplies control flow; Borg remains authoritative for permissions, tools,
+processes, autonomy jobs, checkpoints, and SQLite journaling. Mutating host
+calls still require the session's Full Access policy or the normal workflow
+approval path.
 
 Guest host calls use stable call ids so a completed effect can be replayed
 without running it twice:

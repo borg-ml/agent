@@ -7634,10 +7634,7 @@ impl Transcript {
                         });
                     }
                 } else {
-                    let summary = format!(
-                        "Compacted context: {}",
-                        context_compaction_full_summary(payload)
-                    );
+                    let summary = context_compaction_card_summary(payload);
                     if let Some(TranscriptEntry::Compaction {
                         summary: previous,
                         time,
@@ -9471,6 +9468,21 @@ fn context_compaction_full_summary(payload: &serde_json::Value) -> String {
     })
     .map(str::to_string)
     .unwrap_or_else(|| "Context was compacted.".to_string())
+}
+
+fn context_compaction_card_summary(payload: &serde_json::Value) -> String {
+    let detail = context_compaction_full_summary(payload);
+    if matches!(
+        detail.trim().to_ascii_lowercase().as_str(),
+        "context was compacted."
+            | "context was compacted"
+            | "context compacted."
+            | "context compacted"
+    ) {
+        "Context compacted".to_string()
+    } else {
+        format!("Compacted context: {detail}")
+    }
 }
 
 pub(crate) fn subagent_activity_summary(

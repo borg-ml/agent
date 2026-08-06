@@ -58,6 +58,7 @@ const RICH_TUI_PROMPT_HISTORY_LIMIT: usize = 64;
 type BluDiscoveryResult = Result<(
     crate::extensions::ExtensionCatalog,
     Vec<borg_provider::mcp::ExternalMcpServer>,
+    Vec<borg_remote::BluWorkflowDefinition>,
 )>;
 type BluDiscoveryTask = tokio::task::JoinHandle<BluDiscoveryResult>;
 type RevertForkTask = tokio::task::JoinHandle<Result<Uuid>>;
@@ -285,7 +286,7 @@ async fn connect_remote_account(
 fn blu_host_executor_factory() -> HostExecutorFactory {
     Arc::new(|host, launch| {
         let agent_config = AgentConfig::load(None)?;
-        let (catalog, extension_servers) = crate::extensions::discover(
+        let (catalog, extension_servers, extension_workflows) = crate::extensions::discover(
             &launch.cwd,
             &agent_config.capabilities,
             agent_config.extensions.allow_project_mcp,
@@ -300,7 +301,7 @@ fn blu_host_executor_factory() -> HostExecutorFactory {
         let reload_cwd = launch.cwd.clone();
         let reload = move || {
             let agent_config = AgentConfig::load(None)?;
-            let (catalog, extension_servers) = crate::extensions::discover(
+            let (catalog, extension_servers, _extension_workflows) = crate::extensions::discover(
                 &reload_cwd,
                 &agent_config.capabilities,
                 agent_config.extensions.allow_project_mcp,
@@ -311,7 +312,11 @@ fn blu_host_executor_factory() -> HostExecutorFactory {
             );
             let mut servers = agent_config.external_mcp_servers();
             servers.extend(extension_servers);
-            Ok((servers, catalog.active_skill_roots()))
+            Ok((
+                servers,
+                catalog.active_skill_roots(),
+                catalog.active_workflows(),
+            ))
         };
         let executor = LocalAgentTurnExecutor::with_model_gateway_and_settings(
             borg_provider::provider::ModelGateway {
@@ -325,6 +330,7 @@ fn blu_host_executor_factory() -> HostExecutorFactory {
         )
         .with_external_mcp_servers(servers)
         .with_extension_skill_roots(roots)
+        .with_extension_workflows(extension_workflows)
         .with_runtime_extension_loader(reload);
         Ok(Arc::new(executor) as Arc<dyn AgentTurnExecutor>)
     })
@@ -887,11 +893,12 @@ async fn run_local_agent_session(
         approval_reviewer_model: agent_config.approvals.reviewer_model.clone(),
         approval_reviewer_effort: agent_config.approvals.reviewer_effort.clone(),
     };
-    let (mut extension_catalog, extension_servers) = crate::extensions::discover(
-        &cwd,
-        &agent_config.capabilities,
-        agent_config.extensions.allow_project_mcp,
-    )?;
+    let (mut extension_catalog, extension_servers, extension_workflows) =
+        crate::extensions::discover(
+            &cwd,
+            &agent_config.capabilities,
+            agent_config.extensions.allow_project_mcp,
+        )?;
     let extension_skill_roots = extension_catalog.active_skill_roots();
     let mut observed_extension_revision = extension_catalog.revision.clone();
     let mut last_blu_discovery_error: Option<String> = None;
@@ -901,7 +908,8 @@ async fn run_local_agent_session(
             servers.extend(extension_servers);
             servers
         })
-        .with_extension_skill_roots(extension_skill_roots);
+        .with_extension_skill_roots(extension_skill_roots)
+        .with_extension_workflows(extension_workflows);
     let live_extension_executor = local_executor.clone();
     let executor: Arc<dyn AgentTurnExecutor> = Arc::new(local_executor);
     let lifecycle_executor = Arc::clone(&executor);
@@ -1530,7 +1538,7 @@ async fn run_local_agent_session(
             }, if blu_discovery_task.is_some() => {
                 blu_discovery_task = None;
                 match blu_result {
-                    Ok(Ok((next_catalog, next_extension_servers)))
+                    Ok(Ok((next_catalog, next_extension_servers, next_extension_workflows)))
                         if next_catalog.revision != observed_extension_revision =>
                     {
                         observed_extension_revision = next_catalog.revision.clone();
@@ -1541,6 +1549,7 @@ async fn run_local_agent_session(
                             live_extension_executor.replace_runtime_extensions(
                                 servers,
                                 next_catalog.active_skill_roots(),
+                                next_extension_workflows,
                             );
                             extension_catalog = next_catalog;
                             if let Some(terminal) = terminal.as_mut() {
@@ -1580,7 +1589,7 @@ async fn run_local_agent_session(
                             }
                         }
                     }
-                    Ok(Ok((next_catalog, _))) => {
+                    Ok(Ok((next_catalog, _, _))) => {
                         if !next_catalog.has_errors() {
                             last_blu_discovery_error = None;
                         }
@@ -5565,13 +5574,20 @@ fn live_extension_summary(
             "Last reload rejected; the running revision is unchanged: {error}"
         ));
     }
+    let workflow_count = catalog
+        .extensions
+        .iter()
+        .filter(|extension| extension.active)
+        .map(|extension| extension.workflows.len())
+        .sum::<usize>();
     lines.push(format!(
-        "{} active · revision {} · changes apply at the next turn boundary",
+        "{} active · {} workflows · revision {} · changes apply at the next turn boundary",
         catalog
             .extensions
             .iter()
             .filter(|extension| extension.active)
             .count(),
+        workflow_count,
         &catalog.revision[..catalog.revision.len().min(12)],
     ));
     lines.join("\n")

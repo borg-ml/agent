@@ -1,12 +1,17 @@
+use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
+use uuid::Uuid;
 
 const MAX_PLUGIN_TEXT: usize = 512 * 1024;
+const MAX_BLU_WORKFLOW_SOURCE: usize = 256 * 1024;
+const MAX_BLU_EXTENSIONS: usize = 128;
 const SETTINGS_SECTIONS: &[&str] = &[
     "capabilities",
     "extensions",
@@ -49,6 +54,42 @@ impl SelfServiceContext {
             "create_plugin" => {
                 let args: CreatePluginArgs = serde_json::from_value(arguments)?;
                 self.create_plugin(args)
+            }
+            "list_blu_extensions" => {
+                let _: NoArgs = serde_json::from_value(arguments)?;
+                self.list_blu_extensions()
+            }
+            "read_blu_extension" => {
+                let args: BluExtensionIdArgs = serde_json::from_value(arguments)?;
+                self.read_blu_extension(&args.id, args.scope.as_deref().unwrap_or("project"))
+            }
+            "create_blu_extension" => {
+                let args: CreateBluExtensionArgs = serde_json::from_value(arguments)?;
+                self.create_blu_extension(args)
+            }
+            "set_blu_extension_enabled" => {
+                let args: SetBluExtensionEnabledArgs = serde_json::from_value(arguments)?;
+                self.set_blu_extension_enabled(
+                    &args.id,
+                    args.scope.as_deref().unwrap_or("project"),
+                    args.enabled,
+                )
+            }
+            "remove_blu_extension" => {
+                let args: BluExtensionIdArgs = serde_json::from_value(arguments)?;
+                self.remove_blu_extension(&args.id, args.scope.as_deref().unwrap_or("project"))
+            }
+            "reload_blu_extensions" => {
+                let args: BluScopeArgs = serde_json::from_value(arguments)?;
+                let scope = args.scope.as_deref().unwrap_or("project");
+                let path = self.reload_blu_extensions(scope)?;
+                let audit = self.audit_blu(scope, "reload", "catalog")?;
+                Ok(json!({
+                    "scope": scope,
+                    "reload_signal": path,
+                    "audit": audit,
+                    "hot_reload": "next native turn boundary",
+                }))
             }
             other => bail!("unknown self-service tool: {other}"),
         }
@@ -241,6 +282,446 @@ impl SelfServiceContext {
         }))
     }
 
+    fn list_blu_extensions(&self) -> Result<Value> {
+        let mut extensions = Vec::new();
+        for scope in ["project", "user"] {
+            let root = self.blu_extensions_root(scope)?;
+            if !root.is_dir() {
+                continue;
+            }
+            let mut entries = fs::read_dir(&root)?.collect::<std::io::Result<Vec<_>>>()?;
+            entries.sort_by_key(|entry| entry.file_name());
+            for entry in entries.into_iter().take(MAX_BLU_EXTENSIONS) {
+                let package = entry.path();
+                if !package.is_dir() {
+                    continue;
+                }
+                let id = entry.file_name().to_string_lossy().to_string();
+                if validate_plugin_id(&id).is_err() {
+                    continue;
+                }
+                let manifest_path = package.join("blu.toml");
+                if !manifest_path.is_file() {
+                    continue;
+                }
+                let manifest = match fs::read_to_string(&manifest_path)
+                    .ok()
+                    .and_then(|source| toml::from_str::<toml::Value>(&source).ok())
+                {
+                    Some(manifest) => manifest,
+                    None => continue,
+                };
+                let state = self.blu_extension_state(scope, &id)?;
+                let enabled = state
+                    .as_ref()
+                    .and_then(|state| state.get("enabled"))
+                    .and_then(toml::Value::as_bool)
+                    .or_else(|| manifest.get("enabled").and_then(toml::Value::as_bool))
+                    .unwrap_or(true);
+                let workflows = manifest
+                    .get("workflows")
+                    .and_then(toml::Value::as_table)
+                    .map(|workflows| workflows.keys().cloned().collect::<Vec<_>>())
+                    .unwrap_or_default();
+                extensions.push(json!({
+                    "id": id,
+                    "scope": scope,
+                    "path": package,
+                    "manifest": manifest_path,
+                    "enabled": enabled,
+                    "workflows": workflows,
+                    "activation": "next native turn boundary",
+                }));
+            }
+        }
+        Ok(json!({ "extensions": extensions }))
+    }
+
+    fn read_blu_extension(&self, id: &str, scope: &str) -> Result<Value> {
+        validate_plugin_id(id)?;
+        let package = self.blu_package_path(scope, id)?;
+        let manifest_path = package.join("blu.toml");
+        let manifest_source = fs::read_to_string(&manifest_path)
+            .with_context(|| format!("Blu extension {id} does not exist"))?;
+        ensure!(
+            manifest_source.len() <= MAX_PLUGIN_TEXT,
+            "Blu manifest is too large"
+        );
+        let manifest: toml::Value = toml::from_str(&manifest_source)
+            .with_context(|| format!("invalid Blu manifest {}", manifest_path.display()))?;
+        let mut files = BTreeMap::new();
+        let skill_root = package.join("skills");
+        if skill_root.is_dir() {
+            let skill_path = skill_root.join(id).join("SKILL.md");
+            if skill_path.is_file() {
+                let metadata = fs::metadata(&skill_path)?;
+                ensure!(
+                    metadata.len() <= MAX_PLUGIN_TEXT as u64,
+                    "Blu skill file is too large"
+                );
+                files.insert(
+                    format!("skills/{id}/SKILL.md"),
+                    fs::read_to_string(skill_path)?,
+                );
+            }
+        }
+        if let Some(workflows) = manifest.get("workflows").and_then(toml::Value::as_table) {
+            for (name, workflow) in workflows {
+                validate_plugin_id(name)?;
+                let entrypoint = workflow
+                    .get("entrypoint")
+                    .and_then(toml::Value::as_str)
+                    .context("Blu workflow is missing an entrypoint")?;
+                validate_relative_path(Path::new(entrypoint), "Blu workflow entrypoint")?;
+                let path = package.join(entrypoint);
+                let canonical_root = package.canonicalize()?;
+                let canonical = path.canonicalize()?;
+                ensure!(
+                    canonical.starts_with(&canonical_root),
+                    "Blu workflow entrypoint escapes its package"
+                );
+                let metadata = fs::metadata(&canonical)?;
+                ensure!(
+                    metadata.len() <= MAX_BLU_WORKFLOW_SOURCE as u64,
+                    "Blu workflow is too large"
+                );
+                files.insert(entrypoint.to_string(), fs::read_to_string(canonical)?);
+            }
+        }
+        Ok(json!({
+            "id": id,
+            "scope": scope,
+            "path": package,
+            "manifest": manifest,
+            "files": files,
+        }))
+    }
+
+    fn create_blu_extension(&self, args: CreateBluExtensionArgs) -> Result<Value> {
+        validate_plugin_id(&args.id)?;
+        let scope = args.scope.as_deref().unwrap_or("project");
+        validate_blu_scope(scope)?;
+        ensure!(
+            !args.description.trim().is_empty(),
+            "extension description must not be empty"
+        );
+        ensure!(
+            !args.instructions.trim().is_empty(),
+            "extension instructions must not be empty"
+        );
+        ensure!(
+            args.description.len() <= 4 * 1024,
+            "extension description is too large"
+        );
+        ensure!(
+            args.instructions.len() <= MAX_PLUGIN_TEXT,
+            "extension instructions are too large"
+        );
+        ensure!(
+            !args.description.contains('\0'),
+            "extension description contains NUL"
+        );
+        ensure!(
+            !args.instructions.contains('\0'),
+            "extension instructions contain NUL"
+        );
+        let workflow = match (&args.workflow_name, &args.workflow_source) {
+            (None, None) => None,
+            (Some(name), Some(source)) => {
+                validate_plugin_id(name)?;
+                ensure!(
+                    !source.trim().is_empty(),
+                    "workflow source must not be empty"
+                );
+                ensure!(
+                    source.len() <= MAX_BLU_WORKFLOW_SOURCE,
+                    "workflow source is too large"
+                );
+                ensure!(!source.contains('\0'), "workflow source contains NUL");
+                Some((name, source))
+            }
+            _ => bail!("workflow_name and workflow_source must be provided together"),
+        };
+        let extensions_root = self.blu_extensions_root(scope)?;
+        fs::create_dir_all(&extensions_root)?;
+        let destination = extensions_root.join(&args.id);
+        ensure!(
+            !destination.exists() || args.overwrite,
+            "Blu extension {} already exists at {}; pass overwrite=true to replace it",
+            args.id,
+            destination.display()
+        );
+        let staging_root = tempfile::tempdir_in(&extensions_root)?;
+        let staging = staging_root.path().join(&args.id);
+        fs::create_dir_all(staging.join("skills").join(&args.id))?;
+
+        let mut manifest = toml::map::Map::new();
+        manifest.insert("manifest_version".into(), toml::Value::Integer(1));
+        manifest.insert("id".into(), toml::Value::String(args.id.clone()));
+        manifest.insert("name".into(), toml::Value::String(args.id.clone()));
+        manifest.insert("version".into(), toml::Value::String("0.1.0".into()));
+        manifest.insert(
+            "description".into(),
+            toml::Value::String(args.description.clone()),
+        );
+        manifest.insert("enabled".into(), toml::Value::Boolean(true));
+        manifest.insert(
+            "skill_roots".into(),
+            toml::Value::Array(vec![toml::Value::String("skills".into())]),
+        );
+        if let Some((name, _)) = workflow.as_ref() {
+            let mut definition = toml::map::Map::new();
+            definition.insert(
+                "entrypoint".into(),
+                toml::Value::String(format!("workflows/{name}.blu")),
+            );
+            definition.insert(
+                "description".into(),
+                toml::Value::String(format!("{name} Blu workflow")),
+            );
+            let mut workflows = toml::map::Map::new();
+            workflows.insert(name.to_string(), toml::Value::Table(definition));
+            manifest.insert("workflows".into(), toml::Value::Table(workflows));
+        }
+        let manifest_text = toml::to_string_pretty(&toml::Value::Table(manifest))?;
+        write_atomic(&staging.join("blu.toml"), manifest_text.as_bytes())?;
+        write_atomic(
+            &staging.join("skills").join(&args.id).join("SKILL.md"),
+            format!(
+                "---\nname: {}\ndescription: {}\n---\n\n# {}\n\n{}\n",
+                args.id,
+                yaml_scalar(&args.description),
+                args.id,
+                args.instructions.trim()
+            )
+            .as_bytes(),
+        )?;
+        if let Some((name, source)) = workflow {
+            let workflow_path = staging.join("workflows").join(format!("{name}.blu"));
+            write_atomic(&workflow_path, source.as_bytes())?;
+        }
+
+        let backup = extensions_root.join(format!(".{}.backup", args.id));
+        if backup.exists() {
+            fs::remove_dir_all(&backup)?;
+        }
+        if destination.exists() {
+            fs::rename(&destination, &backup)?;
+        }
+        if let Err(error) = fs::rename(&staging, &destination) {
+            if backup.exists() {
+                let _ = fs::rename(&backup, &destination);
+            }
+            return Err(error).context("activate staged Blu extension");
+        }
+        if backup.exists() {
+            let _ = fs::remove_dir_all(&backup);
+        }
+        let reload_signal = self.reload_blu_extensions(scope)?;
+        let audit = self.audit_blu(scope, "create", &args.id)?;
+        Ok(json!({
+            "id": args.id,
+            "scope": scope,
+            "path": destination,
+            "workflow": args.workflow_name,
+            "reload_signal": reload_signal,
+            "audit": audit,
+            "hot_reload": "next native turn boundary",
+        }))
+    }
+
+    fn set_blu_extension_enabled(&self, id: &str, scope: &str, enabled: bool) -> Result<Value> {
+        validate_plugin_id(id)?;
+        let _ = self.blu_package_path(scope, id)?;
+        let path = self.blu_state_path(scope)?;
+        let mut root = if path.is_file() {
+            toml::from_str::<toml::Value>(&fs::read_to_string(&path)?)?
+        } else {
+            toml::Value::Table(toml::map::Map::new())
+        };
+        let table = root
+            .as_table_mut()
+            .context("Blu state must be a TOML table")?;
+        table
+            .entry("state_version")
+            .or_insert_with(|| toml::Value::Integer(1));
+        let extensions = table
+            .entry("extensions")
+            .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+            .as_table_mut()
+            .context("Blu state extensions must be a table")?;
+        let state = extensions
+            .entry(id.to_string())
+            .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+            .as_table_mut()
+            .context("Blu extension state must be a table")?;
+        state.insert("enabled".into(), toml::Value::Boolean(enabled));
+        write_atomic(&path, toml::to_string_pretty(&root)?.as_bytes())?;
+        let reload_signal = self.reload_blu_extensions(scope)?;
+        let operation = if enabled { "enable" } else { "disable" };
+        let audit = self.audit_blu(scope, operation, id)?;
+        Ok(json!({
+            "id": id,
+            "scope": scope,
+            "enabled": enabled,
+            "state": path,
+            "reload_signal": reload_signal,
+            "audit": audit,
+            "hot_reload": "next native turn boundary",
+        }))
+    }
+
+    fn remove_blu_extension(&self, id: &str, scope: &str) -> Result<Value> {
+        validate_plugin_id(id)?;
+        let package = self.blu_package_path(scope, id)?;
+        let staging = package.with_extension(format!("remove-{}", Uuid::new_v4()));
+        if staging.exists() {
+            fs::remove_dir_all(&staging)?;
+        }
+        fs::rename(&package, &staging)?;
+        if let Err(error) = self.clear_blu_extension_state(scope, id) {
+            let _ = fs::rename(&staging, &package);
+            return Err(error);
+        }
+        fs::remove_dir_all(&staging)?;
+        let reload_signal = self.reload_blu_extensions(scope)?;
+        let audit = self.audit_blu(scope, "remove", id)?;
+        Ok(json!({
+            "id": id,
+            "scope": scope,
+            "removed": true,
+            "reload_signal": reload_signal,
+            "audit": audit,
+            "hot_reload": "next native turn boundary",
+        }))
+    }
+
+    fn reload_blu_extensions(&self, scope: &str) -> Result<PathBuf> {
+        let path = match scope {
+            "project" => self.cwd.join(".borg/blu.reload"),
+            "user" => self.blu_config_root()?.join("blu.reload"),
+            other => bail!("unknown Blu scope {other}; use project or user"),
+        };
+        write_atomic(
+            &path,
+            format!(
+                "{}\n",
+                SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+            )
+            .as_bytes(),
+        )?;
+        Ok(path)
+    }
+
+    fn blu_extensions_root(&self, scope: &str) -> Result<PathBuf> {
+        validate_blu_scope(scope)?;
+        Ok(match scope {
+            "project" => self.cwd.join(".borg/extensions"),
+            "user" => self.blu_config_root()?.join("extensions"),
+            _ => unreachable!("validated Blu scope"),
+        })
+    }
+
+    fn blu_config_root(&self) -> Result<PathBuf> {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+            .map(|root| root.join("borg"))
+            .context("cannot locate the Blu user config; set HOME or XDG_CONFIG_HOME")
+    }
+
+    fn blu_package_path(&self, scope: &str, id: &str) -> Result<PathBuf> {
+        let root = self.blu_extensions_root(scope)?;
+        let package = root.join(id);
+        let canonical_root = root.canonicalize().unwrap_or(root);
+        let canonical = package
+            .canonicalize()
+            .with_context(|| format!("Blu extension {id} does not exist"))?;
+        ensure!(
+            canonical.starts_with(&canonical_root),
+            "Blu package path escapes its root"
+        );
+        ensure!(
+            canonical.is_dir(),
+            "Blu extension {id} is not a package directory"
+        );
+        ensure!(
+            canonical.join("blu.toml").is_file(),
+            "Blu extension {id} has no blu.toml"
+        );
+        Ok(canonical)
+    }
+
+    fn blu_state_path(&self, scope: &str) -> Result<PathBuf> {
+        validate_blu_scope(scope)?;
+        Ok(match scope {
+            "project" => self.cwd.join(".borg/blu.toml"),
+            "user" => self.blu_config_root()?.join("blu.toml"),
+            _ => unreachable!("validated Blu scope"),
+        })
+    }
+
+    fn blu_extension_state(&self, scope: &str, id: &str) -> Result<Option<toml::Value>> {
+        let path = self.blu_state_path(scope)?;
+        let Some(source) = path
+            .is_file()
+            .then(|| fs::read_to_string(&path))
+            .transpose()?
+        else {
+            return Ok(None);
+        };
+        let root = toml::from_str::<toml::Value>(&source)?;
+        Ok(root
+            .get("extensions")
+            .and_then(toml::Value::as_table)
+            .and_then(|extensions| extensions.get(id))
+            .cloned())
+    }
+
+    fn clear_blu_extension_state(&self, scope: &str, id: &str) -> Result<()> {
+        let path = self.blu_state_path(scope)?;
+        if !path.is_file() {
+            return Ok(());
+        }
+        let mut root = toml::from_str::<toml::Value>(&fs::read_to_string(&path)?)?;
+        if let Some(extensions) = root
+            .get_mut("extensions")
+            .and_then(toml::Value::as_table_mut)
+        {
+            extensions.remove(id);
+        }
+        if let Some(sources) = root.get_mut("sources").and_then(toml::Value::as_table_mut) {
+            sources.remove(id);
+        }
+        write_atomic(&path, toml::to_string_pretty(&root)?.as_bytes())
+    }
+
+    fn audit_blu(&self, scope: &str, operation: &str, id: &str) -> Result<PathBuf> {
+        validate_blu_scope(scope)?;
+        let path = match scope {
+            "project" => self.cwd.join(".borg/blu.audit.jsonl"),
+            "user" => self.blu_config_root()?.join("blu.audit.jsonl"),
+            _ => unreachable!("validated Blu scope"),
+        };
+        let parent = path.parent().context("Blu audit path has no parent")?;
+        fs::create_dir_all(parent)?;
+        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+        writeln!(
+            file,
+            "{}",
+            serde_json::to_string(&json!({
+                "timestamp_unix_ms": SystemTime::now()
+                    .duration_since(UNIX_EPOCH)?
+                    .as_millis(),
+                "operation": operation,
+                "id": id,
+                "scope": scope,
+            }))?
+        )?;
+        file.sync_data()?;
+        Ok(path)
+    }
+
     fn settings_path(&self, scope: &str) -> Result<PathBuf> {
         match scope {
             "user" => default_settings_path()
@@ -280,6 +761,42 @@ struct CreatePluginArgs {
     overwrite: bool,
 }
 
+#[derive(Debug, Deserialize)]
+struct BluScopeArgs {
+    #[serde(default)]
+    scope: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BluExtensionIdArgs {
+    id: String,
+    #[serde(default)]
+    scope: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateBluExtensionArgs {
+    id: String,
+    description: String,
+    instructions: String,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    workflow_name: Option<String>,
+    #[serde(default)]
+    workflow_source: Option<String>,
+    #[serde(default)]
+    overwrite: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct SetBluExtensionEnabledArgs {
+    id: String,
+    #[serde(default)]
+    scope: Option<String>,
+    enabled: bool,
+}
+
 pub(crate) fn is_tool(name: &str) -> bool {
     matches!(
         name,
@@ -288,6 +805,12 @@ pub(crate) fn is_tool(name: &str) -> bool {
             | "get_agent_settings"
             | "update_agent_settings"
             | "create_plugin"
+            | "list_blu_extensions"
+            | "read_blu_extension"
+            | "create_blu_extension"
+            | "set_blu_extension_enabled"
+            | "remove_blu_extension"
+            | "reload_blu_extensions"
     )
 }
 
@@ -349,7 +872,108 @@ pub(crate) fn tool_specs() -> Vec<Value> {
                 "additionalProperties": false
             }
         }),
+        json!({
+            "name": "list_blu_extensions",
+            "description": "List project and user Blu extension packages, including executable workflow entrypoints. This reads live package state; changes apply at the next native turn boundary.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "read_blu_extension",
+            "description": "Read a bounded Blu extension manifest, skill file, and workflow sources from the selected scope.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "pattern": "^[A-Za-z0-9_-]+$", "maxLength": 64 },
+                    "scope": { "type": "string", "enum": ["project", "user"] }
+                },
+                "required": ["id"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "create_blu_extension",
+            "description": "Create or replace a live Blu package with a skill and optional bounded executable .blu workflow. The package is atomically installed and rescanned at the next native turn boundary.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "pattern": "^[A-Za-z0-9_-]+$", "maxLength": 64 },
+                    "description": { "type": "string", "minLength": 1, "maxLength": 4096 },
+                    "instructions": { "type": "string", "minLength": 1, "maxLength": 524288 },
+                    "scope": { "type": "string", "enum": ["project", "user"], "default": "project" },
+                    "workflow_name": { "type": "string", "pattern": "^[A-Za-z0-9_-]+$", "maxLength": 64 },
+                    "workflow_source": { "type": "string", "minLength": 1, "maxLength": 262144 },
+                    "overwrite": { "type": "boolean" }
+                },
+                "required": ["id", "description", "instructions"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "set_blu_extension_enabled",
+            "description": "Enable or disable an installed Blu extension in durable scope state; the running catalog swaps at the next native turn boundary.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "pattern": "^[A-Za-z0-9_-]+$", "maxLength": 64 },
+                    "scope": { "type": "string", "enum": ["project", "user"] },
+                    "enabled": { "type": "boolean" }
+                },
+                "required": ["id", "enabled"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "remove_blu_extension",
+            "description": "Atomically remove an installed Blu package and its durable activation state.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "pattern": "^[A-Za-z0-9_-]+$", "maxLength": 64 },
+                    "scope": { "type": "string", "enum": ["project", "user"] }
+                },
+                "required": ["id"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "reload_blu_extensions",
+            "description": "Write the Blu reload signal for a project or user catalog. Interactive Borg also polls catalogs automatically; native turns always refresh their snapshot.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "scope": { "type": "string", "enum": ["project", "user"] }
+                },
+                "additionalProperties": false
+            }
+        }),
     ]
+}
+
+fn validate_blu_scope(scope: &str) -> Result<()> {
+    ensure!(
+        matches!(scope, "project" | "user"),
+        "unknown Blu scope {scope}; use project or user"
+    );
+    Ok(())
+}
+
+fn validate_relative_path(path: &Path, label: &str) -> Result<()> {
+    ensure!(!path.as_os_str().is_empty(), "{label} must not be empty");
+    ensure!(!path.is_absolute(), "{label} must be relative");
+    ensure!(
+        !path.components().any(|component| matches!(
+            component,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )),
+        "invalid {label}"
+    );
+    Ok(())
 }
 
 fn default_settings_path() -> Option<PathBuf> {
@@ -843,5 +1467,106 @@ mod tests {
                 .unwrap()
                 .contains("Inspect the diff")
         );
+    }
+
+    #[test]
+    fn blu_extension_lifecycle_is_atomic_audited_and_live() {
+        let workspace = tempfile::tempdir().unwrap();
+        let context = SelfServiceContext::new(workspace.path().to_path_buf());
+        let created = context
+            .call(
+                "create_blu_extension",
+                json!({
+                    "id": "review-tools",
+                    "description": "Review changes",
+                    "instructions": "Use the review workflow when asked.",
+                    "workflow_name": "review",
+                    "workflow_source": "borg_emit(\"audit\", \"review\", \"{}\")"
+                }),
+            )
+            .unwrap();
+        assert_eq!(created["hot_reload"], "next native turn boundary");
+        assert!(
+            workspace
+                .path()
+                .join(".borg/extensions/review-tools/workflows/review.blu")
+                .is_file()
+        );
+        assert!(workspace.path().join(".borg/blu.reload").is_file());
+        assert!(workspace.path().join(".borg/blu.audit.jsonl").is_file());
+
+        let listed = context.call("list_blu_extensions", json!({})).unwrap();
+        assert_eq!(listed["extensions"][0]["id"], "review-tools");
+        assert_eq!(listed["extensions"][0]["workflows"][0], "review");
+        let read = context
+            .call(
+                "read_blu_extension",
+                json!({"id": "review-tools", "scope": "project"}),
+            )
+            .unwrap();
+        assert_eq!(
+            read["files"]["workflows/review.blu"],
+            "borg_emit(\"audit\", \"review\", \"{}\")"
+        );
+
+        context
+            .call(
+                "set_blu_extension_enabled",
+                json!({"id": "review-tools", "enabled": false}),
+            )
+            .unwrap();
+        let state = fs::read_to_string(workspace.path().join(".borg/blu.toml")).unwrap();
+        assert!(state.contains("enabled = false"));
+
+        context
+            .call(
+                "remove_blu_extension",
+                json!({"id": "review-tools", "scope": "project"}),
+            )
+            .unwrap();
+        assert!(
+            !workspace
+                .path()
+                .join(".borg/extensions/review-tools")
+                .exists()
+        );
+        let audit = fs::read_to_string(workspace.path().join(".borg/blu.audit.jsonl")).unwrap();
+        assert!(audit.contains("\"operation\":\"create\""));
+        assert!(audit.contains("\"operation\":\"disable\""));
+        assert!(audit.contains("\"operation\":\"remove\""));
+    }
+
+    #[test]
+    fn blu_extension_lifecycle_rejects_incomplete_or_oversized_workflows() {
+        let workspace = tempfile::tempdir().unwrap();
+        let context = SelfServiceContext::new(workspace.path().to_path_buf());
+        assert!(
+            context
+                .call(
+                    "create_blu_extension",
+                    json!({
+                        "id": "broken",
+                        "description": "Broken",
+                        "instructions": "Instructions",
+                        "workflow_name": "review"
+                    }),
+                )
+                .is_err()
+        );
+        assert!(
+            context
+                .call(
+                    "create_blu_extension",
+                    json!({
+                        "id": "large",
+                        "description": "Large",
+                        "instructions": "Instructions",
+                        "workflow_name": "review",
+                        "workflow_source": "x".repeat(MAX_BLU_WORKFLOW_SOURCE + 1)
+                    }),
+                )
+                .is_err()
+        );
+        assert!(!workspace.path().join(".borg/extensions").exists());
     }
 }

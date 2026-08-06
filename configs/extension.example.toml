@@ -3,12 +3,13 @@
 # Install packages under `.borg/extensions/<id>/` (project) or
 # `$XDG_CONFIG_HOME/borg/extensions/<id>/` (user). Legacy flat
 # `extensions/*.toml` manifests remain supported. Project packages are
-# cataloged but inactive until the user enables
-# `[extensions].allow_project_mcp = true` in agent.toml.
+# packages declaring MCP servers are cataloged but inactive until the user
+# enables `[extensions].allow_project_mcp = true` in agent.toml.
 #
-# Blu is declarative: packages may contribute skill roots and stdio MCP
-# servers, but never opaque shell/lifecycle hooks. Borg validates paths,
-# dependencies, versions, settings, and server declarations before activation.
+# Blu packages may contribute skill roots, stdio MCP servers, and bounded
+# embedded Blu workflows, but never opaque shell/lifecycle hooks. Borg validates
+# paths, dependencies, versions, settings, workflow sources, and server
+# declarations before activation.
 manifest_version = 1
 id = "docs"
 name = "Documentation tools"
@@ -46,3 +47,10 @@ args = ["serve", "--index", "${config.index}"]
 # Environment variables can also be referenced without persisting them:
 # env = { DOCS_TOKEN = "${env.DOCS_TOKEN}" }
 allowed_tools = ["search", "read"]
+
+# Executable workflows are loaded from the package and exposed to the native
+# harness as run_blu_extension. Host calls remain Borg permission-checked and
+# durably journaled.
+[workflows.review]
+entrypoint = "workflows/review.blu"
+description = "Review the current change"

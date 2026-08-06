@@ -28,6 +28,8 @@ installation, and every declared skill root must remain inside the package.
 - typed string, integer, float, boolean, and array settings;
 - secret-setting redaction;
 - namespaced stdio MCP servers with per-server tool allowlists; and
+- bounded executable Blu workflows declared with [workflows.<name>] and an
+  in-package relative entrypoint; and
 - `${config.name}`, `${env.NAME}`, and `${extension_dir}` interpolation.
 
 See [`configs/extension.example.toml`](../configs/extension.example.toml).
@@ -43,10 +45,10 @@ discover → parse → validate → resolve dependencies → activate → snapsh
 Borg hashes manifests, package contents, declared skill roots, state, effective
 capabilities, trust, and explicit reload signals. Running local TUI sessions check that revision twice per
 second; enrolled Remote hosts revalidate immediately before every turn. A valid
-change updates skill roots and MCP server definitions for the next turn without
-restarting the session. The current turn is never mutated underneath a
-provider. If validation fails, Borg keeps the previous runtime and points the
-user to `borg extensions doctor`.
+change updates skill roots, MCP server definitions, and executable workflow
+source for the next turn without restarting the session. The current turn is
+never mutated underneath a provider. If validation fails, Borg keeps the
+previous runtime and points the user to `borg extensions doctor`.
 
 For enrolled hosts, the host-side catalog is authoritative: serialized skill
 paths from a controller are discarded at the host boundary and cannot grant
@@ -98,8 +100,8 @@ isolated rather than partially activated.
 
 ## Trust and safety
 
-User packages are eligible to run when enabled. Project packages are untrusted
-by default because both skills and MCP commands influence an agent; opt in with:
+User packages are eligible to run when enabled. Project packages that declare
+MCP commands are untrusted by default; opt in with:
 
 ```toml
 [extensions]
@@ -112,12 +114,14 @@ processes, not shell snippets. Use `allowed_tools` to expose the smallest tool
 surface; the allowlist is enforced by Borg's native runtime and translated to
 each external provider's MCP policy format.
 
-Separately, the native harness can execute an explicit `run_blu_workflow`
-request in Borg's bounded embedded Blu runtime. That workflow surface is not
-an extension lifecycle hook: its source is admitted with a durable workflow id,
-and every call to Borg tools, processes, autonomy jobs, or checkpoints is
-permission-checked and journaled in the canonical SQLite session store. The
-guest receives no raw filesystem, database, provider, or process handles.
+The native harness advertises each active package workflow as
+`run_blu_extension`; it can also execute an explicit `run_blu_workflow`
+request for ad-hoc code. Neither surface is an extension lifecycle hook: source
+is admitted with a durable workflow id, and every call to Borg tools, processes,
+autonomy jobs, or checkpoints is permission-checked and journaled in the
+canonical SQLite session store. The guest receives no raw filesystem,
+database, provider, or process handles. Workflow source is bounded to 256 KiB,
+must remain inside its package, and is frozen for the turn that loaded it.
 
 ## Compatibility
 

@@ -1601,6 +1601,7 @@ async fn run_agent_session_store_kernel(
                                         agent_tools: dispatcher.clone(),
                                         external_mcp_servers: Vec::new(),
                                         extension_skill_roots: Vec::new(),
+                                        extension_workflows: Vec::new(),
                                         system_prompt_appendix: format!(
                                             "{RETAINED_COMPACTION_SYSTEM_PROMPT}\n\n{}",
                                             crate::provider_capabilities_prompt(
@@ -2177,6 +2178,7 @@ async fn run_agent_session_store_kernel(
             agent_tools: dispatcher.clone(),
             external_mcp_servers: Vec::new(),
             extension_skill_roots: launch.extension_skill_roots.clone(),
+            extension_workflows: Vec::new(),
             system_prompt_appendix: crate::provider_capabilities_prompt(
                 &launch.capabilities.provider_capabilities,
             ),
@@ -3715,6 +3717,7 @@ async fn compact_subscription_context_for_budget(
                     agent_tools: dispatcher.clone(),
                     external_mcp_servers: Vec::new(),
                     extension_skill_roots: Vec::new(),
+                    extension_workflows: Vec::new(),
                     system_prompt_appendix: format!(
                         "{RETAINED_COMPACTION_SYSTEM_PROMPT}\n\n{}",
                         crate::provider_capabilities_prompt(

@@ -4759,6 +4759,26 @@ fn provider_compaction_events_become_status_cards() {
 }
 
 #[test]
+fn compaction_without_provider_detail_is_not_tautological() {
+    let session_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::ProviderEvent {
+            provider: CodingProvider::Codex,
+            kind: "context_compaction".to_string(),
+            payload: serde_json::json!({}),
+        },
+    ));
+
+    assert!(matches!(
+        transcript.order.last(),
+        Some(TranscriptEntry::Compaction { summary, .. }) if summary == "Context compacted"
+    ));
+}
+
+#[test]
 fn automatic_compaction_event_reports_work_in_progress() {
     let session_id = Uuid::new_v4();
     let mut transcript = Transcript::default();

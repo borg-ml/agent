@@ -85,8 +85,19 @@ pub struct AgentTurn {
     pub external_mcp_servers: Vec<borg_provider::mcp::ExternalMcpServer>,
     /// Trusted extension-owned skill roots supplied by the launch contract.
     pub extension_skill_roots: Vec<PathBuf>,
+    /// Executable Blu workflows from the same atomic extension snapshot as
+    /// the skill roots and MCP servers.
+    pub extension_workflows: Vec<BluWorkflowDefinition>,
     /// Trusted runtime context appended to the provider system prompt.
     pub system_prompt_appendix: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BluWorkflowDefinition {
+    pub extension_id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub source: String,
 }
 
 /// A one-shot second-opinion request selected by the main model. The session
@@ -218,13 +229,19 @@ pub struct LocalAgentTurnExecutor {
 }
 
 type RuntimeExtensionLoader = Arc<
-    dyn Fn() -> Result<(Vec<borg_provider::mcp::ExternalMcpServer>, Vec<PathBuf>)> + Send + Sync,
+    dyn Fn() -> Result<(
+            Vec<borg_provider::mcp::ExternalMcpServer>,
+            Vec<PathBuf>,
+            Vec<BluWorkflowDefinition>,
+        )> + Send
+        + Sync,
 >;
 
 #[derive(Clone, Default)]
 struct RuntimeExtensions {
     external_mcp_servers: Vec<borg_provider::mcp::ExternalMcpServer>,
     skill_roots: Vec<PathBuf>,
+    workflows: Vec<BluWorkflowDefinition>,
 }
 
 #[derive(Default)]
@@ -416,10 +433,19 @@ impl LocalAgentTurnExecutor {
         self
     }
 
+    pub fn with_extension_workflows(self, workflows: Vec<BluWorkflowDefinition>) -> Self {
+        self.runtime_extensions
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .workflows = workflows;
+        self
+    }
+
     pub fn replace_runtime_extensions(
         &self,
         servers: Vec<borg_provider::mcp::ExternalMcpServer>,
         skill_roots: Vec<PathBuf>,
+        workflows: Vec<BluWorkflowDefinition>,
     ) {
         *self
             .runtime_extensions
@@ -427,13 +453,17 @@ impl LocalAgentTurnExecutor {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = RuntimeExtensions {
             external_mcp_servers: servers,
             skill_roots,
+            workflows,
         };
     }
 
     pub fn with_runtime_extension_loader<F>(mut self, loader: F) -> Self
     where
-        F: Fn() -> Result<(Vec<borg_provider::mcp::ExternalMcpServer>, Vec<PathBuf>)>
-            + Send
+        F: Fn() -> Result<(
+                Vec<borg_provider::mcp::ExternalMcpServer>,
+                Vec<PathBuf>,
+                Vec<BluWorkflowDefinition>,
+            )> + Send
             + Sync
             + 'static,
     {
@@ -446,7 +476,9 @@ impl LocalAgentTurnExecutor {
             return;
         };
         match tokio::task::spawn_blocking(move || loader()).await {
-            Ok(Ok((servers, roots))) => self.replace_runtime_extensions(servers, roots),
+            Ok(Ok((servers, roots, workflows))) => {
+                self.replace_runtime_extensions(servers, roots, workflows)
+            }
             Ok(Err(error)) => {
                 tracing::warn!(%error, "kept last-known-good runtime extension snapshot");
             }
@@ -479,6 +511,8 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
             .extend(runtime_extensions.external_mcp_servers);
         turn.extension_skill_roots
             .extend(runtime_extensions.skill_roots);
+        turn.extension_workflows
+            .extend(runtime_extensions.workflows);
         if !turn.extension_skill_roots.is_empty() {
             turn.system_prompt_appendix.push_str(
                 &crate::native_context::extension_skill_prompt_appendix(
@@ -1515,6 +1549,12 @@ mod tests {
         executor.replace_runtime_extensions(
             vec![test_server("new")],
             vec![PathBuf::from("new-skills")],
+            vec![BluWorkflowDefinition {
+                extension_id: "new".to_string(),
+                name: "workflow".to_string(),
+                description: None,
+                source: "borg_emit(\"call\", \"kind\", \"{}\")".to_string(),
+            }],
         );
 
         assert_eq!(in_flight_snapshot.external_mcp_servers[0].name, "old");
@@ -1525,6 +1565,7 @@ mod tests {
         let next_turn = executor.runtime_extensions.read().unwrap();
         assert_eq!(next_turn.external_mcp_servers[0].name, "new");
         assert_eq!(next_turn.skill_roots, [PathBuf::from("new-skills")]);
+        assert_eq!(next_turn.workflows[0].name, "workflow");
     }
 
     #[tokio::test]
@@ -1536,6 +1577,12 @@ mod tests {
                 Ok((
                     vec![test_server("reloaded")],
                     vec![PathBuf::from("reloaded-skills")],
+                    vec![BluWorkflowDefinition {
+                        extension_id: "reloaded".to_string(),
+                        name: "workflow".to_string(),
+                        description: None,
+                        source: "borg_emit(\"call\", \"kind\", \"{}\")".to_string(),
+                    }],
                 ))
             });
 
@@ -1544,6 +1591,7 @@ mod tests {
         let snapshot = executor.runtime_extensions.read().unwrap();
         assert_eq!(snapshot.external_mcp_servers[0].name, "reloaded");
         assert_eq!(snapshot.skill_roots, [PathBuf::from("reloaded-skills")]);
+        assert_eq!(snapshot.workflows[0].extension_id, "reloaded");
     }
 
     #[tokio::test]

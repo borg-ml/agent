@@ -94,7 +94,7 @@ fn print_extensions(args: ExtensionsArgs) -> Result<()> {
             &config.capabilities,
             config.extensions.allow_project_mcp,
         )
-        .map(|(catalog, _)| catalog)
+        .map(|(catalog, _, _)| catalog)
     };
     match args.command.unwrap_or(ExtensionCommand::List) {
         ExtensionCommand::List => print_extension_catalog(&discover()?, args.json)?,
@@ -118,6 +118,9 @@ fn print_extensions(args: ExtensionsArgs) -> Result<()> {
                         "inactive"
                     })
                 );
+                if !extension.workflow_names.is_empty() {
+                    println!("  workflows: {}", extension.workflow_names.join(", "));
+                }
                 if let Some(description) = &extension.description {
                     println!("  description: {description}");
                 }

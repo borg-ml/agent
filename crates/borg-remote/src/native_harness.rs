@@ -113,6 +113,7 @@ impl NativeHarness {
             turn.agent_tools.clone(),
             turn.external_mcp_servers.clone(),
             turn.extension_skill_roots.clone(),
+            turn.extension_workflows.clone(),
             self.process_manager.clone(),
             session_store,
         )
@@ -695,6 +696,7 @@ struct NativeToolRuntime {
     permission: PermissionMode,
     agent_tools: crate::AgentToolDispatcher,
     mcp: crate::native_mcp::NativeMcpRuntime,
+    extension_workflows: Vec<crate::BluWorkflowDefinition>,
     processes: crate::native_process::ProcessManager,
     session_store: Option<crate::SqliteSessionStore>,
     context: crate::native_context::NativeContext,
@@ -714,6 +716,7 @@ impl NativeToolRuntime {
         agent_tools: crate::AgentToolDispatcher,
         external_mcp_servers: Vec<borg_provider::mcp::ExternalMcpServer>,
         extension_skill_roots: Vec<PathBuf>,
+        extension_workflows: Vec<crate::BluWorkflowDefinition>,
         processes: crate::native_process::ProcessManager,
         session_store: Option<crate::SqliteSessionStore>,
     ) -> Result<Self> {
@@ -728,6 +731,7 @@ impl NativeToolRuntime {
             permission,
             agent_tools,
             mcp: crate::native_mcp::NativeMcpRuntime::start(external_mcp_servers).await?,
+            extension_workflows,
             processes,
             session_store,
             context,
@@ -744,6 +748,47 @@ impl NativeToolRuntime {
             .chain(self.agent_tools.specs())
             .map(|spec| ModelToolDefinition::from_mcp_spec(&spec).map_err(anyhow::Error::msg))
             .collect::<Result<Vec<_>>>()?;
+        if !self.extension_workflows.is_empty() {
+            let available = self
+                .extension_workflows
+                .iter()
+                .map(|workflow| {
+                    format!(
+                        "{}:{}{}",
+                        workflow.extension_id,
+                        workflow.name,
+                        workflow
+                            .description
+                            .as_deref()
+                            .map(|description| format!(" ({description})"))
+                            .unwrap_or_default()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            definitions.push(
+                ModelToolDefinition::from_mcp_spec(&tool(
+                    "run_blu_extension",
+                    &format!(
+                        "Execute one installed Blu extension workflow through Borg's durable, \
+                     capability-gated host APIs. Available workflows: {available}. \
+                     The workflow source is loaded from the atomic extension snapshot; \
+                     workflow_id is an idempotency key.",
+                    ),
+                    json!({
+                        "type": "object",
+                        "properties": {
+                            "workflow_id": { "type": "string", "format": "uuid" },
+                            "extension_id": { "type": "string", "minLength": 1, "maxLength": 64 },
+                            "name": { "type": "string", "minLength": 1, "maxLength": 128 }
+                        },
+                        "required": ["workflow_id", "extension_id", "name"],
+                        "additionalProperties": false
+                    }),
+                ))
+                .map_err(anyhow::Error::msg)?,
+            );
+        }
         definitions.extend_from_slice(self.mcp.definitions());
         let mut names = HashSet::with_capacity(definitions.len());
         for definition in &definitions {
@@ -854,37 +899,38 @@ impl NativeToolRuntime {
             }
             "run_blu_workflow" => {
                 let args: RunBluWorkflowArgs = serde_json::from_value(arguments)?;
-                let store = self
-                    .session_store
-                    .clone()
-                    .context("durable session storage is unavailable to Blu workflows")?;
-                let autonomy = store.autonomy_store().await?;
-                let permission = if workflow_approved {
-                    PermissionMode::FullAccess
-                } else {
-                    self.permission
-                };
-                let runner = crate::blu_workflow::BluWorkflowRunner::new(
-                    self.session_id,
-                    store,
-                    autonomy,
-                    Some(self.agent_tools.clone()),
-                    self.processes.clone(),
-                    self.root.clone(),
-                    permission,
-                );
-                Ok(serde_json::to_value(
-                    runner
-                        .run_with_cancel(
-                            crate::BluWorkflowRequest {
-                                workflow_id: args.workflow_id,
-                                name: args.name,
-                                source: args.source,
-                            },
-                            workflow_cancel.unwrap_or_else(CancellationToken::new),
+                self.run_blu_workflow(
+                    args.workflow_id,
+                    args.name,
+                    args.source,
+                    workflow_approved,
+                    workflow_cancel,
+                )
+                .await
+            }
+            "run_blu_extension" => {
+                let args: RunBluExtensionArgs = serde_json::from_value(arguments)?;
+                let workflow = self
+                    .extension_workflows
+                    .iter()
+                    .find(|workflow| {
+                        workflow.extension_id == args.extension_id && workflow.name == args.name
+                    })
+                    .with_context(|| {
+                        format!(
+                            "Blu workflow {}:{} is not present in the current extension snapshot",
+                            args.extension_id, args.name
                         )
-                        .await?,
-                )?)
+                    })?
+                    .clone();
+                self.run_blu_workflow(
+                    args.workflow_id,
+                    format!("{}:{}", workflow.extension_id, workflow.name),
+                    workflow.source,
+                    workflow_approved,
+                    workflow_cancel,
+                )
+                .await
             }
             "read_skill" => {
                 let args: ReadSkillArgs = serde_json::from_value(arguments)?;
@@ -893,6 +939,47 @@ impl NativeToolRuntime {
             other if self.mcp.contains(other) => self.mcp.call(other, arguments).await,
             other => self.agent_tools.call(other, arguments).await,
         }
+    }
+
+    async fn run_blu_workflow(
+        &self,
+        workflow_id: Uuid,
+        name: String,
+        source: String,
+        workflow_approved: bool,
+        workflow_cancel: Option<CancellationToken>,
+    ) -> Result<Value> {
+        let store = self
+            .session_store
+            .clone()
+            .context("durable session storage is unavailable to Blu workflows")?;
+        let autonomy = store.autonomy_store().await?;
+        let permission = if workflow_approved {
+            PermissionMode::FullAccess
+        } else {
+            self.permission
+        };
+        let runner = crate::blu_workflow::BluWorkflowRunner::new(
+            self.session_id,
+            store,
+            autonomy,
+            Some(self.agent_tools.clone()),
+            self.processes.clone(),
+            self.root.clone(),
+            permission,
+        );
+        Ok(serde_json::to_value(
+            runner
+                .run_with_cancel(
+                    crate::BluWorkflowRequest {
+                        workflow_id,
+                        name,
+                        source,
+                    },
+                    workflow_cancel.unwrap_or_else(CancellationToken::new),
+                )
+                .await?,
+        )?)
     }
 
     async fn filesystem(&self, operation: WorkspaceFilesystemOperation) -> Result<Value> {
@@ -1178,7 +1265,10 @@ async fn execute_tool(
 ) -> Result<(String, bool, Option<NativeSteer>)> {
     let external_mcp = runtime.mcp.contains(&tool_call.function.name);
     if (tool_call.function.name == "exec_command"
-        || tool_call.function.name == "run_blu_workflow"
+        || matches!(
+            tool_call.function.name.as_str(),
+            "run_blu_workflow" | "run_blu_extension"
+        )
         || external_mcp)
         && runtime.permission != PermissionMode::FullAccess
     {
@@ -1265,10 +1355,15 @@ async fn execute_tool(
         }
     }
 
-    let workflow_approved = tool_call.function.name == "run_blu_workflow"
-        && runtime.permission != PermissionMode::FullAccess;
-    let workflow_cancel =
-        (tool_call.function.name == "run_blu_workflow").then(CancellationToken::new);
+    let workflow_approved = matches!(
+        tool_call.function.name.as_str(),
+        "run_blu_workflow" | "run_blu_extension"
+    ) && runtime.permission != PermissionMode::FullAccess;
+    let workflow_cancel = matches!(
+        tool_call.function.name.as_str(),
+        "run_blu_workflow" | "run_blu_extension"
+    )
+    .then(CancellationToken::new);
     let call = runtime.call(
         &tool_call.function.name,
         input,
@@ -1887,6 +1982,14 @@ struct RunBluWorkflowArgs {
     workflow_id: Uuid,
     name: String,
     source: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunBluExtensionArgs {
+    workflow_id: Uuid,
+    extension_id: String,
+    name: String,
 }
 
 #[derive(Deserialize)]
