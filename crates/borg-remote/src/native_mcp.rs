@@ -138,20 +138,21 @@ impl NativeMcpClient {
                 Ok(probe)
             }
             ModernProbe::Unsupported(supported) => {
-                if let Some(version) = select_modern_version(&supported) {
-                    match probe.probe_modern_version(&version).await {
-                        ModernProbe::Ready(version) => {
-                            probe.mode = McpMode::Modern(version);
-                            Ok(probe)
-                        }
-                        ModernProbe::Unsupported(_) | ModernProbe::Fallback => bail!(
-                            "MCP server `{}` rejected the negotiated protocol version `{version}`",
-                            server.name
-                        ),
+                let version = select_modern_version(&supported).with_context(|| {
+                    format!(
+                        "MCP server `{}` supports no mutually compatible modern protocol version",
+                        server.name
+                    )
+                })?;
+                match probe.probe_modern_version(&version).await {
+                    ModernProbe::Ready(version) => {
+                        probe.mode = McpMode::Modern(version);
+                        Ok(probe)
                     }
-                } else {
-                    drop(probe);
-                    Self::start_legacy(server).await
+                    ModernProbe::Unsupported(_) | ModernProbe::Fallback => bail!(
+                        "MCP server `{}` rejected the negotiated protocol version `{version}`",
+                        server.name
+                    ),
                 }
             }
             ModernProbe::Fallback => {
@@ -285,9 +286,10 @@ impl NativeMcpClient {
             .filter_map(Value::as_str)
             .map(str::to_string)
             .collect::<Vec<_>>();
-        select_modern_version(&supported)
-            .map(ModernProbe::Ready)
-            .unwrap_or(ModernProbe::Fallback)
+        match select_modern_version(&supported) {
+            Some(version) => ModernProbe::Ready(version),
+            None => ModernProbe::Unsupported(supported),
+        }
     }
 
     async fn list_tools(&mut self) -> Result<Vec<ListedTool>> {
@@ -565,10 +567,51 @@ esac
         assert_eq!(result["content"][0]["text"], "ok");
     }
 
+    #[tokio::test]
+    async fn recognized_modern_probe_failure_does_not_downgrade_to_legacy() {
+        let script = r#"
+read first
+case "$first" in
+  *server/discover*)
+    printf '%s\n' '{"jsonrpc":"2.0","id":1,"error":{"code":-32022,"message":"unsupported","data":{"supported":["2025-11-25"],"requested":"2026-07-28"}}}'
+    ;;
+  *initialize*)
+    printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"legacy","version":"1"}}}'
+    read _initialized
+    read _list
+    printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[]}}'
+    ;;
+  *)
+    exit 3
+    ;;
+esac
+"#;
+        let error = match NativeMcpRuntime::start(vec![ExternalMcpServer {
+            name: "modern-only-server".to_string(),
+            command: "sh".to_string(),
+            args: vec!["-c".to_string(), script.to_string()],
+            env: BTreeMap::new(),
+            allowed_tools: vec![],
+        }])
+        .await
+        {
+            Ok(_) => panic!("recognized modern negotiation error was downgraded to legacy"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("supports no mutually compatible modern protocol version")
+        );
+    }
+
     #[test]
     fn modern_params_are_inline_and_stateless() {
         let params = modern_params(json!({ "name": "echo" }), CURRENT_PROTOCOL_VERSION);
-        assert_eq!(params["_meta"][PROTOCOL_VERSION_META], CURRENT_PROTOCOL_VERSION);
+        assert_eq!(
+            params["_meta"][PROTOCOL_VERSION_META],
+            CURRENT_PROTOCOL_VERSION
+        );
         assert!(params["_meta"][CLIENT_CAPABILITIES_META].is_object());
         assert!(params["_meta"][CLIENT_INFO_META].is_object());
     }

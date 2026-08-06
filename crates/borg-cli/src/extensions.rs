@@ -121,6 +121,7 @@ pub(crate) struct EffectiveExtension {
     pub skill_roots: Vec<PathBuf>,
     pub servers: Vec<String>,
     pub workflow_names: Vec<String>,
+    pub workflow_runtimes: BTreeMap<String, String>,
     #[serde(skip_serializing)]
     pub workflows: Vec<borg_remote::BluWorkflowDefinition>,
     /// Secret settings are always redacted from catalog output.
@@ -188,6 +189,12 @@ struct Workflow {
     entrypoint: PathBuf,
     #[serde(default)]
     description: Option<String>,
+    #[serde(default)]
+    runtime: borg_remote::WorkflowRuntime,
+    #[serde(default)]
+    command: Option<String>,
+    #[serde(default)]
+    args: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -542,6 +549,18 @@ fn evaluate_candidate(
         });
     }
     candidate.servers = servers;
+    for workflow in &mut candidate.workflows {
+        workflow.command = workflow
+            .command
+            .as_deref()
+            .map(|command| render_template(command, &config, &candidate.package_root))
+            .transpose()?;
+        workflow.args = workflow
+            .args
+            .iter()
+            .map(|argument| render_template(argument, &config, &candidate.package_root))
+            .collect::<Result<Vec<_>>>()?;
+    }
     Ok(())
 }
 
@@ -586,18 +605,27 @@ fn validate_candidate_declarations(candidate: &mut Candidate, manifest: &Manifes
     for (name, workflow) in &manifest.workflows {
         ensure!(
             valid_id(name),
-            "invalid Blu workflow name {name} in extension {}",
+            "invalid workflow name {name} in extension {}",
             manifest.id
         );
-        validate_relative_path(&workflow.entrypoint, "Blu workflow entrypoint")?;
+        validate_relative_path(&workflow.entrypoint, "workflow entrypoint")?;
+        let extension = workflow
+            .entrypoint
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default();
+        let accepted_extensions = workflow
+            .runtime
+            .source_extensions()
+            .iter()
+            .map(|extension| format!(".{extension}"))
+            .collect::<Vec<_>>()
+            .join(", ");
         ensure!(
-            workflow
-                .entrypoint
-                .extension()
-                .and_then(|value| value.to_str())
-                == Some("blu"),
-            "extension {} workflow {name} entrypoint must use the .blu extension",
-            manifest.id
+            workflow.runtime.accepts_source_extension(extension),
+            "extension {} workflow {name} runtime {} requires one of {accepted_extensions} entrypoints",
+            manifest.id,
+            workflow.runtime.label()
         );
         let requested = candidate.package_root.join(&workflow.entrypoint);
         ensure!(
@@ -619,19 +647,36 @@ fn validate_candidate_declarations(candidate: &mut Candidate, manifest: &Manifes
             MAX_WORKFLOW_SOURCE
         );
         let source = fs::read_to_string(&canonical)
-            .with_context(|| format!("read Blu workflow {name} for extension {}", manifest.id))?;
+            .with_context(|| format!("read workflow {name} for extension {}", manifest.id))?;
         ensure!(
             !source.contains('\0'),
             "extension {} workflow {name} contains NUL bytes",
             manifest.id
         );
+        if let Some(command) = &workflow.command {
+            ensure!(
+                !command.trim().is_empty() && !command.contains('\0'),
+                "extension {} workflow {name} has an invalid runtime command",
+                manifest.id
+            );
+            validate_template(command, manifest)?;
+        }
+        for argument in &workflow.args {
+            ensure!(!argument.contains('\0'), "workflow argument contains NUL");
+            validate_template(argument, manifest)?;
+        }
         candidate
             .workflows
             .push(borg_remote::BluWorkflowDefinition {
                 extension_id: manifest.id.clone(),
                 name: name.clone(),
                 description: workflow.description.clone(),
+                runtime: workflow.runtime,
                 source,
+                entrypoint: canonical,
+                working_directory: candidate.package_root.clone(),
+                command: workflow.command.clone(),
+                args: workflow.args.clone(),
             });
     }
     for (name, server) in &manifest.mcp {
@@ -973,6 +1018,12 @@ fn effective(candidate: Candidate) -> EffectiveExtension {
             .map(|name| format!("{}__{name}", candidate.manifest.id))
             .collect(),
         workflow_names: candidate.manifest.workflows.keys().cloned().collect(),
+        workflow_runtimes: candidate
+            .manifest
+            .workflows
+            .iter()
+            .map(|(name, workflow)| (name.clone(), workflow.runtime.label().to_string()))
+            .collect(),
         workflows: candidate.workflows,
         settings,
     }
@@ -1737,6 +1788,105 @@ description = "Review the current change"
             workflows[0].source,
             "borg_emit(\"audit\", \"extension.review\", \"{}\")"
         );
+        assert_eq!(workflows[0].runtime, borg_remote::WorkflowRuntime::Blu);
+    }
+
+    #[test]
+    fn external_runtime_workflows_are_discovered_with_command_and_package_context() {
+        let root = tempfile::tempdir().unwrap();
+        let package = root.path().join("analysis");
+        fs::create_dir_all(package.join("skills")).unwrap();
+        fs::create_dir_all(package.join("workflows")).unwrap();
+        fs::write(
+            package.join("blu.toml"),
+            r#"
+manifest_version = 1
+id = "analysis"
+version = "1.0.0"
+skill_roots = ["skills"]
+
+[workflows.inspect]
+runtime = "ipython"
+entrypoint = "workflows/inspect.py"
+command = "ipython"
+args = ["--no-banner"]
+"#,
+        )
+        .unwrap();
+        fs::write(package.join("workflows/inspect.py"), "print('ok')").unwrap();
+
+        let (catalog, _, workflows) = discover_in_dirs(
+            None,
+            Some(root.path().to_path_buf()),
+            None,
+            None,
+            &CapabilityConfig::default(),
+            false,
+        )
+        .unwrap();
+        assert!(!catalog.has_errors(), "{:#?}", catalog.diagnostics);
+        assert_eq!(workflows[0].runtime, borg_remote::WorkflowRuntime::Ipython);
+        assert_eq!(workflows[0].command.as_deref(), Some("ipython"));
+        assert_eq!(workflows[0].args, ["--no-banner"]);
+        assert_eq!(
+            workflows[0].working_directory,
+            package.canonicalize().unwrap()
+        );
+        assert_eq!(
+            workflows[0].entrypoint,
+            package.join("workflows/inspect.py").canonicalize().unwrap()
+        );
+        assert_eq!(
+            catalog.extensions[0].workflow_runtimes["inspect"],
+            "ipython"
+        );
+    }
+
+    #[test]
+    fn blu_owns_lua_and_luau_workflow_entrypoints() {
+        let root = tempfile::tempdir().unwrap();
+        let package = root.path().join("lua-family");
+        fs::create_dir_all(package.join("skills")).unwrap();
+        fs::create_dir_all(package.join("workflows")).unwrap();
+        fs::write(
+            package.join("blu.toml"),
+            r#"
+manifest_version = 1
+id = "lua-family"
+version = "1.0.0"
+skill_roots = ["skills"]
+
+[workflows.lua]
+runtime = "blu"
+entrypoint = "workflows/lua.lua"
+
+[workflows.luau]
+runtime = "blu"
+entrypoint = "workflows/luau.luau"
+"#,
+        )
+        .unwrap();
+        fs::write(package.join("workflows/lua.lua"), "return 42").unwrap();
+        fs::write(package.join("workflows/luau.luau"), "return 42").unwrap();
+
+        let (catalog, _, workflows) = discover_in_dirs(
+            None,
+            Some(root.path().to_path_buf()),
+            None,
+            None,
+            &CapabilityConfig::default(),
+            false,
+        )
+        .unwrap();
+        assert!(!catalog.has_errors(), "{:#?}", catalog.diagnostics);
+        assert_eq!(workflows.len(), 2);
+        assert!(
+            workflows
+                .iter()
+                .all(|workflow| workflow.runtime == borg_remote::WorkflowRuntime::Blu)
+        );
+        assert_eq!(catalog.extensions[0].workflow_runtimes["lua"], "blu");
+        assert_eq!(catalog.extensions[0].workflow_runtimes["luau"], "blu");
     }
 
     #[test]

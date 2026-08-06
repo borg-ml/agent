@@ -1343,6 +1343,76 @@ pub enum RuntimeProcessStatus {
     Orphaned,
 }
 
+/// The execution engine selected for an extension workflow. `blu` remains the
+/// compatibility default; the other variants are supervised user-provided
+/// runtimes rather than engines linked into Borg.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum WorkflowRuntime {
+    Blu,
+    Python,
+    Ipython,
+    Javascript,
+    Typescript,
+}
+
+impl Default for WorkflowRuntime {
+    fn default() -> Self {
+        Self::Blu
+    }
+}
+
+impl WorkflowRuntime {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Blu => "blu",
+            Self::Python => "python",
+            Self::Ipython => "ipython",
+            Self::Javascript => "javascript",
+            Self::Typescript => "typescript",
+        }
+    }
+
+    pub fn source_extension(self) -> &'static str {
+        self.source_extensions()[0]
+    }
+
+    /// Source suffixes accepted by this runtime. Blu owns the Lua-family
+    /// entrypoints; `.lua` and `.luau` are not separate external runtimes.
+    pub fn source_extensions(self) -> &'static [&'static str] {
+        match self {
+            Self::Blu => &["blu", "lua", "luau"],
+            Self::Python | Self::Ipython => &["py"],
+            Self::Javascript => &["js"],
+            Self::Typescript => &["ts"],
+        }
+    }
+
+    pub fn accepts_source_extension(self, extension: &str) -> bool {
+        self.source_extensions()
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(extension))
+    }
+
+    /// Best-effort executable defaults. A manifest may override the command;
+    /// discovery deliberately does not fail just because an optional runtime
+    /// is not installed on this host.
+    pub fn default_command(self) -> &'static str {
+        match self {
+            Self::Blu => "",
+            Self::Python => "python3",
+            Self::Ipython => "ipython",
+            Self::Javascript => "bun",
+            Self::Typescript => "bun",
+        }
+    }
+
+    pub fn is_embedded(self) -> bool {
+        matches!(self, Self::Blu)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[ts(export)]
@@ -1468,6 +1538,40 @@ pub enum SessionEventKind {
         source_hash: String,
         success: bool,
         result: Option<Value>,
+        error: Option<String>,
+    },
+    /// Durable lifecycle for a user-selected external workflow runtime.
+    /// These events intentionally carry artifact identity so changing a
+    /// script, interpreter selection, or entrypoint cannot silently replay a
+    /// previous result under different semantics.
+    RuntimeWorkflowStarted {
+        workflow_id: Uuid,
+        runtime: WorkflowRuntime,
+        artifact_hash: String,
+        name: String,
+    },
+    RuntimeWorkflowCallRequested {
+        workflow_id: Uuid,
+        call_id: u64,
+        operation: String,
+        request: Value,
+    },
+    RuntimeWorkflowCallCompleted {
+        workflow_id: Uuid,
+        call_id: u64,
+        operation: String,
+        response: Option<Value>,
+        error: Option<String>,
+    },
+    RuntimeWorkflowCompleted {
+        workflow_id: Uuid,
+        runtime: WorkflowRuntime,
+        artifact_hash: String,
+        success: bool,
+        result: Option<Value>,
+        stdout: String,
+        stderr: String,
+        exit_code: Option<i32>,
         error: Option<String>,
     },
     ApprovalRequested {
@@ -1644,6 +1748,29 @@ impl SessionEvent {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+
+    #[test]
+    fn workflow_runtime_profiles_are_stable_and_user_selectable() {
+        let profiles = [
+            (WorkflowRuntime::Blu, "blu", "blu", ""),
+            (WorkflowRuntime::Python, "python", "py", "python3"),
+            (WorkflowRuntime::Ipython, "ipython", "py", "ipython"),
+            (WorkflowRuntime::Javascript, "javascript", "js", "bun"),
+            (WorkflowRuntime::Typescript, "typescript", "ts", "bun"),
+        ];
+
+        for (runtime, label, extension, command) in profiles {
+            assert_eq!(runtime.label(), label);
+            assert_eq!(runtime.source_extension(), extension);
+            assert_eq!(runtime.default_command(), command);
+            assert_eq!(runtime.is_embedded(), runtime == WorkflowRuntime::Blu);
+            assert_eq!(serde_json::to_value(runtime).unwrap(), json!(label));
+        }
+        assert!(WorkflowRuntime::Blu.accepts_source_extension("blu"));
+        assert!(WorkflowRuntime::Blu.accepts_source_extension("lua"));
+        assert!(WorkflowRuntime::Blu.accepts_source_extension("LUAU"));
+        assert!(!WorkflowRuntime::Blu.accepts_source_extension("js"));
+    }
 
     #[test]
     fn models_resolve_back_to_the_provider_that_serves_them() {

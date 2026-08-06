@@ -98,16 +98,19 @@ struct EditResultPresentation {
 }
 
 fn edit_result_presentation(name: &str, output: &str) -> Option<EditResultPresentation> {
-    if !matches!(
+    let value = serde_json::from_str::<Value>(output).ok()?;
+    let is_edit_tool = matches!(
         tool_leaf_name(name).as_str(),
         "edit" | "apply_patch" | "write" | "write_file"
-    ) {
-        return None;
-    }
-    let entries = serde_json::from_str::<Value>(output)
-        .ok()?
-        .as_array()?
-        .clone();
+    );
+    let entries = if is_edit_tool {
+        value
+            .as_array()
+            .cloned()
+            .or_else(|| value.get("changes").and_then(Value::as_array).cloned())?
+    } else {
+        value.get("changes").and_then(Value::as_array).cloned()?
+    };
     let rendered = entries
         .iter()
         .filter_map(render_edit_result_entry)
@@ -2096,6 +2099,30 @@ mod tests {
             output.text,
             "--- /dev/null\n+++ src/new.rs\n@@ -0,0 +1,1 @@\n+fn main() {}"
         );
+    }
+
+    #[test]
+    fn projects_wrapped_file_change_envelope_as_diff() {
+        let edit = project_tool_presentation(
+            "mcp__borg_agent__write_file",
+            &json!({}),
+            Some(
+                r##"{
+                    "changes": [{
+                        "path": "tmp/runtime-modularity-design.md",
+                        "kind": {"type": "add"},
+                        "diff": "# Borg Modular Runtime Design\n\nStatus: design discussion"
+                    }]
+                }"##,
+            ),
+            false,
+        );
+
+        assert_eq!(edit.label, "Create file");
+        assert_eq!(edit.detail, "tmp/runtime-modularity-design.md");
+        let output = edit.output.expect("wrapped file-change diff");
+        assert_eq!(output.language, "diff:md");
+        assert!(output.text.contains("+# Borg Modular Runtime Design"));
     }
 
     #[test]

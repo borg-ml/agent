@@ -9396,6 +9396,10 @@ fn session_event_changes_transcript(kind: &SessionEventKind) -> bool {
         | SessionEventKind::BluWorkflowCallRequested { .. }
         | SessionEventKind::BluWorkflowCallCompleted { .. }
         | SessionEventKind::BluWorkflowCompleted { .. }
+        | SessionEventKind::RuntimeWorkflowStarted { .. }
+        | SessionEventKind::RuntimeWorkflowCallRequested { .. }
+        | SessionEventKind::RuntimeWorkflowCallCompleted { .. }
+        | SessionEventKind::RuntimeWorkflowCompleted { .. }
         | SessionEventKind::TurnStarted { .. } => false,
         SessionEventKind::StatusChanged {
             status:

@@ -20,7 +20,7 @@ use uuid::Uuid;
 
 use crate::{
     CodingProvider, EventActor, MessageStatus, PermissionMode, ResponseLanguage, SessionEventKind,
-    SessionStatus, native_harness::NativeHarness,
+    SessionStatus, WorkflowRuntime, native_harness::NativeHarness,
 };
 
 pub(crate) const CODING_SYSTEM_PROMPT: &str = "\
@@ -85,8 +85,9 @@ pub struct AgentTurn {
     pub external_mcp_servers: Vec<borg_provider::mcp::ExternalMcpServer>,
     /// Trusted extension-owned skill roots supplied by the launch contract.
     pub extension_skill_roots: Vec<PathBuf>,
-    /// Executable Blu workflows from the same atomic extension snapshot as
-    /// the skill roots and MCP servers.
+    /// Executable workflows from the same atomic extension snapshot as the
+    /// skill roots and MCP servers. Blu remains the compatibility default;
+    /// external runtimes are supervised by the host.
     pub extension_workflows: Vec<BluWorkflowDefinition>,
     /// Trusted runtime context appended to the provider system prompt.
     pub system_prompt_appendix: String,
@@ -97,7 +98,12 @@ pub struct BluWorkflowDefinition {
     pub extension_id: String,
     pub name: String,
     pub description: Option<String>,
+    pub runtime: WorkflowRuntime,
     pub source: String,
+    pub entrypoint: PathBuf,
+    pub working_directory: PathBuf,
+    pub command: Option<String>,
+    pub args: Vec<String>,
 }
 
 /// A one-shot second-opinion request selected by the main model. The session
@@ -934,6 +940,7 @@ async fn run_borg_provider_turn(
     let mut first_model_output = true;
     let mut terminal_seen = false;
     let mut reasoning_text = String::new();
+    let mut last_completed_reasoning = None;
     while let Some(event) = stream.recv().await {
         match event {
             ChatStreamEvent::ProviderEvent { kind, payload, .. } => {
@@ -992,7 +999,11 @@ async fn run_borg_provider_turn(
                 }
             }
             ChatStreamEvent::ReasoningDelta(delta) => {
-                let Some(delta) = normalize_reasoning_delta(&mut reasoning_text, &delta) else {
+                let Some(delta) = normalize_reasoning_delta_after_completion(
+                    &mut reasoning_text,
+                    &mut last_completed_reasoning,
+                    &delta,
+                ) else {
                     continue;
                 };
                 if first_model_output {
@@ -1013,6 +1024,7 @@ async fn run_borg_provider_turn(
                 text: narration_text,
             } => {
                 reasoning_text.clear();
+                last_completed_reasoning = None;
                 if first_model_output {
                     first_model_output = false;
                     tracing::debug!(
@@ -1045,6 +1057,8 @@ async fn run_borg_provider_turn(
             }
             ChatStreamEvent::Phase { name, input } => {
                 if name == "reasoning_completed" {
+                    last_completed_reasoning =
+                        (!reasoning_text.is_empty()).then(|| reasoning_text.clone());
                     reasoning_text.clear();
                     send(&events, SessionEventKind::ReasoningCompleted).await;
                     continue;
@@ -1061,6 +1075,7 @@ async fn run_borg_provider_turn(
             }
             ChatStreamEvent::ToolCall { id, name, input } => {
                 reasoning_text.clear();
+                last_completed_reasoning = None;
                 if first_model_output {
                     first_model_output = false;
                     tracing::debug!(
@@ -1331,6 +1346,19 @@ fn normalize_reasoning_delta(accumulated: &mut String, incoming: &str) -> Option
     Some(delta.to_string())
 }
 
+fn normalize_reasoning_delta_after_completion(
+    accumulated: &mut String,
+    last_completed: &mut Option<String>,
+    incoming: &str,
+) -> Option<String> {
+    if accumulated.is_empty() && last_completed.as_deref() == Some(incoming) {
+        last_completed.take();
+        return None;
+    }
+    last_completed.take();
+    normalize_reasoning_delta(accumulated, incoming)
+}
+
 fn longest_suffix_prefix_overlap(left: &str, right: &str) -> usize {
     let maximum = left.len().min(right.len());
     (1..=maximum)
@@ -1575,7 +1603,12 @@ mod tests {
                 extension_id: "new".to_string(),
                 name: "workflow".to_string(),
                 description: None,
+                runtime: WorkflowRuntime::Blu,
                 source: "borg_emit(\"call\", \"kind\", \"{}\")".to_string(),
+                entrypoint: PathBuf::from("new.blu"),
+                working_directory: PathBuf::from("."),
+                command: None,
+                args: Vec::new(),
             }],
         );
 
@@ -1603,7 +1636,12 @@ mod tests {
                         extension_id: "reloaded".to_string(),
                         name: "workflow".to_string(),
                         description: None,
+                        runtime: WorkflowRuntime::Blu,
                         source: "borg_emit(\"call\", \"kind\", \"{}\")".to_string(),
+                        entrypoint: PathBuf::from("reloaded.blu"),
+                        working_directory: PathBuf::from("."),
+                        command: None,
+                        args: Vec::new(),
                     }],
                 ))
             });
@@ -1838,6 +1876,49 @@ mod tests {
         assert_eq!(
             accumulated,
             "Considering code modifications\nI’m checking the repository"
+        );
+    }
+
+    #[test]
+    fn immediate_completed_reasoning_replay_is_dropped() {
+        let mut accumulated = String::new();
+        let mut last_completed = None;
+        let thought = "I’m checking the repository";
+
+        assert_eq!(
+            normalize_reasoning_delta_after_completion(
+                &mut accumulated,
+                &mut last_completed,
+                thought,
+            ),
+            Some(thought.to_string())
+        );
+        last_completed = Some(accumulated.clone());
+        accumulated.clear();
+
+        assert_eq!(
+            normalize_reasoning_delta_after_completion(
+                &mut accumulated,
+                &mut last_completed,
+                thought,
+            ),
+            None
+        );
+        assert!(last_completed.is_none());
+    }
+
+    #[test]
+    fn different_reasoning_after_completion_is_preserved() {
+        let mut accumulated = String::new();
+        let mut last_completed = Some("first thought".to_string());
+
+        assert_eq!(
+            normalize_reasoning_delta_after_completion(
+                &mut accumulated,
+                &mut last_completed,
+                "second thought",
+            ),
+            Some("second thought".to_string())
         );
     }
 

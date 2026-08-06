@@ -120,6 +120,9 @@ fn print_extensions(args: ExtensionsArgs) -> Result<()> {
                 );
                 if !extension.workflow_names.is_empty() {
                     println!("  workflows: {}", extension.workflow_names.join(", "));
+                    for (name, runtime) in &extension.workflow_runtimes {
+                        println!("    {name}: {runtime}");
+                    }
                 }
                 if let Some(description) = &extension.description {
                     println!("  description: {description}");
@@ -330,7 +333,7 @@ fn print_extension_catalog(catalog: &extensions::ExtensionCatalog, json: bool) -
         println!("{}", serde_json::to_string_pretty(catalog)?);
         return Ok(());
     }
-    println!("Blu extensions");
+    println!("Borg extensions");
     if catalog.extensions.is_empty() {
         println!("  No extensions installed. Try `borg extensions new <id> --project`.");
     }
@@ -349,6 +352,9 @@ fn print_extension_catalog(catalog: &extensions::ExtensionCatalog, json: bool) -
                 .as_deref()
                 .unwrap_or(extension.scope.label())
         );
+        for (name, runtime) in &extension.workflow_runtimes {
+            println!("    workflow {name}: {runtime}");
+        }
     }
     for diagnostic in &catalog.diagnostics {
         println!(

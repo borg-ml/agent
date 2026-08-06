@@ -67,6 +67,10 @@ impl SelfServiceContext {
                 let args: CreateBluExtensionArgs = serde_json::from_value(arguments)?;
                 self.create_blu_extension(args)
             }
+            "create_extension" => {
+                let args: CreateBluExtensionArgs = serde_json::from_value(arguments)?;
+                self.create_blu_extension(args)
+            }
             "set_blu_extension_enabled" => {
                 let args: SetBluExtensionEnabledArgs = serde_json::from_value(arguments)?;
                 self.set_blu_extension_enabled(
@@ -330,6 +334,21 @@ impl SelfServiceContext {
                     "manifest": manifest_path,
                     "enabled": enabled,
                     "workflows": workflows,
+                    "runtimes": manifest
+                        .get("workflows")
+                        .and_then(toml::Value::as_table)
+                        .map(|workflows| {
+                            workflows
+                                .iter()
+                                .filter_map(|(name, workflow)| {
+                                    workflow
+                                        .get("runtime")
+                                        .and_then(toml::Value::as_str)
+                                        .map(|runtime| (name, runtime))
+                                })
+                                .collect::<BTreeMap<_, _>>()
+                        })
+                        .unwrap_or_default(),
                     "activation": "next native turn boundary",
                 }));
             }
@@ -401,6 +420,40 @@ impl SelfServiceContext {
         validate_plugin_id(&args.id)?;
         let scope = args.scope.as_deref().unwrap_or("project");
         validate_blu_scope(scope)?;
+        let runtime = parse_workflow_runtime(args.runtime.as_deref().unwrap_or("blu"))?;
+        let source_extension = args
+            .source_extension
+            .as_deref()
+            .unwrap_or(runtime.source_extension())
+            .to_ascii_lowercase();
+        ensure!(
+            runtime.accepts_source_extension(&source_extension),
+            "workflow runtime {} does not accept .{} entrypoints",
+            runtime.label(),
+            source_extension
+        );
+        ensure!(
+            runtime.is_embedded() || source_extension == runtime.source_extension(),
+            "external workflow runtime {} requires a .{} entrypoint",
+            runtime.label(),
+            runtime.source_extension()
+        );
+        if runtime.is_embedded() {
+            ensure!(
+                args.command.is_none() && args.args.is_empty(),
+                "Blu workflows do not accept an external command or arguments"
+            );
+        }
+        if let Some(command) = &args.command {
+            ensure!(
+                !command.trim().is_empty() && !command.contains('\0'),
+                "workflow runtime command must be a nonempty string without NUL bytes"
+            );
+        }
+        ensure!(
+            args.args.iter().all(|argument| !argument.contains('\0')),
+            "workflow runtime arguments must not contain NUL bytes"
+        );
         ensure!(
             !args.description.trim().is_empty(),
             "extension description must not be empty"
@@ -473,12 +526,27 @@ impl SelfServiceContext {
             let mut definition = toml::map::Map::new();
             definition.insert(
                 "entrypoint".into(),
-                toml::Value::String(format!("workflows/{name}.blu")),
+                toml::Value::String(format!("workflows/{name}.{source_extension}")),
             );
             definition.insert(
                 "description".into(),
-                toml::Value::String(format!("{name} Blu workflow")),
+                toml::Value::String(format!("{name} {} workflow", runtime.label())),
             );
+            definition.insert(
+                "runtime".into(),
+                toml::Value::String(runtime.label().to_string()),
+            );
+            if let Some(command) = &args.command {
+                definition.insert("command".into(), toml::Value::String(command.clone()));
+            }
+            if !args.args.is_empty() {
+                definition.insert(
+                    "args".into(),
+                    toml::Value::Array(
+                        args.args.iter().cloned().map(toml::Value::String).collect(),
+                    ),
+                );
+            }
             let mut workflows = toml::map::Map::new();
             workflows.insert(name.to_string(), toml::Value::Table(definition));
             manifest.insert("workflows".into(), toml::Value::Table(workflows));
@@ -497,7 +565,9 @@ impl SelfServiceContext {
             .as_bytes(),
         )?;
         if let Some((name, source)) = workflow {
-            let workflow_path = staging.join("workflows").join(format!("{name}.blu"));
+            let workflow_path = staging
+                .join("workflows")
+                .join(format!("{name}.{source_extension}"));
             write_atomic(&workflow_path, source.as_bytes())?;
         }
 
@@ -526,6 +596,8 @@ impl SelfServiceContext {
             "workflow": args.workflow_name,
             "reload_signal": reload_signal,
             "audit": audit,
+            "runtime": runtime,
+            "source_extension": source_extension,
             "hot_reload": "next native turn boundary",
         }))
     }
@@ -787,6 +859,14 @@ struct CreateBluExtensionArgs {
     workflow_source: Option<String>,
     #[serde(default)]
     overwrite: bool,
+    #[serde(default)]
+    runtime: Option<String>,
+    #[serde(default)]
+    source_extension: Option<String>,
+    #[serde(default)]
+    command: Option<String>,
+    #[serde(default)]
+    args: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -808,6 +888,7 @@ pub(crate) fn is_tool(name: &str) -> bool {
             | "list_blu_extensions"
             | "read_blu_extension"
             | "create_blu_extension"
+            | "create_extension"
             | "set_blu_extension_enabled"
             | "remove_blu_extension"
             | "reload_blu_extensions"
@@ -896,7 +977,7 @@ pub(crate) fn tool_specs() -> Vec<Value> {
         }),
         json!({
             "name": "create_blu_extension",
-            "description": "Create or replace a live Blu package with a skill and optional bounded executable .blu workflow. The package is atomically installed and rescanned at the next native turn boundary.",
+            "description": "Create or replace a live extension package with a skill and optional executable workflow. Select embedded Blu for .blu/.lua/.luau or a supervised Python, IPython, JavaScript, or TypeScript worker; the package is atomically installed and rescanned at the next native turn boundary.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -906,7 +987,33 @@ pub(crate) fn tool_specs() -> Vec<Value> {
                     "scope": { "type": "string", "enum": ["project", "user"], "default": "project" },
                     "workflow_name": { "type": "string", "pattern": "^[A-Za-z0-9_-]+$", "maxLength": 64 },
                     "workflow_source": { "type": "string", "minLength": 1, "maxLength": 262144 },
-                    "overwrite": { "type": "boolean" }
+                    "overwrite": { "type": "boolean" },
+                    "runtime": { "type": "string", "enum": ["blu", "python", "ipython", "javascript", "typescript"], "default": "blu" },
+                    "source_extension": { "type": "string", "enum": ["blu", "lua", "luau", "py", "js", "ts"], "description": "Optional source suffix. Blu accepts .blu, .lua, and .luau; other runtimes use their standard suffix." },
+                    "command": { "type": "string", "description": "Optional executable override for external runtimes." },
+                    "args": { "type": "array", "items": { "type": "string" }, "maxItems": 32 }
+                },
+                "required": ["id", "description", "instructions"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "create_extension",
+            "description": "Generic alias for create_blu_extension: create a live, hot-reloadable Blu/Lua/Luau/Python/IPython/JavaScript/TypeScript extension package for self-extension.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "pattern": "^[A-Za-z0-9_-]+$", "maxLength": 64 },
+                    "description": { "type": "string", "minLength": 1, "maxLength": 4096 },
+                    "instructions": { "type": "string", "minLength": 1, "maxLength": 524288 },
+                    "scope": { "type": "string", "enum": ["project", "user"], "default": "project" },
+                    "workflow_name": { "type": "string", "pattern": "^[A-Za-z0-9_-]+$", "maxLength": 64 },
+                    "workflow_source": { "type": "string", "minLength": 1, "maxLength": 262144 },
+                    "overwrite": { "type": "boolean" },
+                    "runtime": { "type": "string", "enum": ["blu", "python", "ipython", "javascript", "typescript"], "default": "blu" },
+                    "source_extension": { "type": "string", "enum": ["blu", "lua", "luau", "py", "js", "ts"], "description": "Optional source suffix. Blu accepts .blu, .lua, and .luau; other runtimes use their standard suffix." },
+                    "command": { "type": "string" },
+                    "args": { "type": "array", "items": { "type": "string" }, "maxItems": 32 }
                 },
                 "required": ["id", "description", "instructions"],
                 "additionalProperties": false
@@ -959,6 +1066,19 @@ fn validate_blu_scope(scope: &str) -> Result<()> {
         "unknown Blu scope {scope}; use project or user"
     );
     Ok(())
+}
+
+fn parse_workflow_runtime(value: &str) -> Result<crate::WorkflowRuntime> {
+    match value {
+        "blu" => Ok(crate::WorkflowRuntime::Blu),
+        "python" => Ok(crate::WorkflowRuntime::Python),
+        "ipython" => Ok(crate::WorkflowRuntime::Ipython),
+        "javascript" => Ok(crate::WorkflowRuntime::Javascript),
+        "typescript" => Ok(crate::WorkflowRuntime::Typescript),
+        other => bail!(
+            "unknown workflow runtime `{other}`; use blu, python, ipython, javascript, or typescript"
+        ),
+    }
 }
 
 fn validate_relative_path(path: &Path, label: &str) -> Result<()> {
@@ -1534,6 +1654,78 @@ mod tests {
         assert!(audit.contains("\"operation\":\"create\""));
         assert!(audit.contains("\"operation\":\"disable\""));
         assert!(audit.contains("\"operation\":\"remove\""));
+    }
+
+    #[test]
+    fn create_extension_writes_a_selected_external_runtime() {
+        let workspace = tempfile::tempdir().unwrap();
+        let context = SelfServiceContext::new(workspace.path().to_path_buf());
+        let created = context
+            .call(
+                "create_extension",
+                json!({
+                    "id": "analysis-tools",
+                    "description": "Run project analysis",
+                    "instructions": "Use the analysis workflow when asked.",
+                    "workflow_name": "report",
+                    "workflow_source": "console.log('analysis-ok')",
+                    "runtime": "typescript",
+                    "args": ["--smol"]
+                }),
+            )
+            .unwrap();
+        assert_eq!(created["runtime"], "typescript");
+        assert_eq!(created["hot_reload"], "next native turn boundary");
+        let workflow = workspace
+            .path()
+            .join(".borg/extensions/analysis-tools/workflows/report.ts");
+        assert_eq!(
+            fs::read_to_string(workflow).unwrap(),
+            "console.log('analysis-ok')"
+        );
+        let manifest = fs::read_to_string(
+            workspace
+                .path()
+                .join(".borg/extensions/analysis-tools/blu.toml"),
+        )
+        .unwrap();
+        assert!(manifest.contains("runtime = \"typescript\""));
+        assert!(manifest.contains("args = [\"--smol\"]"));
+    }
+
+    #[test]
+    fn create_extension_can_write_a_luau_workflow_under_blu() {
+        let workspace = tempfile::tempdir().unwrap();
+        let context = SelfServiceContext::new(workspace.path().to_path_buf());
+        let created = context
+            .call(
+                "create_extension",
+                json!({
+                    "id": "luau-tools",
+                    "description": "Run Luau analysis",
+                    "instructions": "Use the Luau workflow when asked.",
+                    "workflow_name": "analyze",
+                    "workflow_source": "local answer: number = 42\nreturn answer",
+                    "runtime": "blu",
+                    "source_extension": "luau"
+                }),
+            )
+            .unwrap();
+        assert_eq!(created["runtime"], "blu");
+        assert_eq!(created["source_extension"], "luau");
+        assert!(
+            workspace
+                .path()
+                .join(".borg/extensions/luau-tools/workflows/analyze.luau")
+                .is_file()
+        );
+        let manifest = fs::read_to_string(
+            workspace
+                .path()
+                .join(".borg/extensions/luau-tools/blu.toml"),
+        )
+        .unwrap();
+        assert!(manifest.contains("entrypoint = \"workflows/analyze.luau\""));
     }
 
     #[test]

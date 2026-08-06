@@ -1,7 +1,9 @@
+use std::collections::HashMap;
 #[cfg(all(unix, test))]
 use std::path::Path;
 #[cfg(unix)]
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
@@ -10,6 +12,8 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader
 use tokio::net::TcpStream;
 #[cfg(unix)]
 use tokio::net::UnixStream;
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 const CURRENT_PROTOCOL_VERSION: &str = "2026-07-28";
 const LEGACY_PROTOCOL_VERSION: &str = "2024-11-05";
@@ -18,16 +22,59 @@ const CLIENT_CAPABILITIES_META: &str = "io.modelcontextprotocol/clientCapabiliti
 const SERVER_INFO_META: &str = "io.modelcontextprotocol/serverInfo";
 
 pub(crate) async fn run() -> Result<()> {
-    let endpoint = AgentToolEndpoint::from_env()?;
+    let endpoint = Arc::new(AgentToolEndpoint::from_env()?);
     let stdin = BufReader::new(tokio::io::stdin());
     let mut lines = stdin.lines();
     let mut stdout = tokio::io::stdout();
-    while let Some(line) = lines.next_line().await? {
-        if let Some(response) = handle_line(&endpoint, &line).await {
-            stdout.write_all(response.to_string().as_bytes()).await?;
-            stdout.write_all(b"\n").await?;
-            stdout.flush().await?;
+    let (response_tx, mut response_rx) = mpsc::channel(32);
+    let mut active = HashMap::<String, CancellationToken>::new();
+    loop {
+        tokio::select! {
+            line = lines.next_line() => {
+                let Some(line) = line? else { break };
+                if let Some(request_id) = cancellation_request_id(&line) {
+                    if let Some(cancel) = active.remove(&request_key(&request_id)) {
+                        cancel.cancel();
+                    }
+                    continue;
+                }
+                let request_id = request_id_from_line(&line);
+                let key = request_id.as_ref().map(request_key);
+                let cancel = request_id.map(|id| {
+                    let cancel = CancellationToken::new();
+                    active.insert(request_key(&id), cancel.clone());
+                    cancel
+                });
+                let endpoint = Arc::clone(&endpoint);
+                let response_tx = response_tx.clone();
+                tokio::spawn(async move {
+                    let response_cancel = cancel.clone();
+                    let response = handle_line_with_cancel(&endpoint, &line, cancel).await;
+                    let response = if response_cancel
+                        .is_some_and(|cancel| cancel.is_cancelled())
+                    {
+                        None
+                    } else {
+                        response
+                    };
+                    let _ = response_tx.send((key, response)).await;
+                });
+            }
+            response = response_rx.recv() => {
+                let Some((key, response)) = response else { break };
+                if let Some(key) = key {
+                    active.remove(&key);
+                }
+                if let Some(response) = response {
+                    stdout.write_all(response.to_string().as_bytes()).await?;
+                    stdout.write_all(b"\n").await?;
+                    stdout.flush().await?;
+                }
+            }
         }
+    }
+    for cancel in active.into_values() {
+        cancel.cancel();
     }
     Ok(())
 }
@@ -169,7 +216,16 @@ enum ProtocolError {
     Unsupported { requested: String },
 }
 
+#[cfg(test)]
 async fn handle_line(endpoint: &AgentToolEndpoint, line: &str) -> Option<Value> {
+    handle_line_with_cancel(endpoint, line, None).await
+}
+
+async fn handle_line_with_cancel(
+    endpoint: &AgentToolEndpoint,
+    line: &str,
+    cancel: Option<CancellationToken>,
+) -> Option<Value> {
     let request: Value = match serde_json::from_str(line) {
         Ok(request) => request,
         Err(error) => return Some(rpc_error(Value::Null, -32700, error.to_string())),
@@ -191,6 +247,16 @@ async fn handle_line(endpoint: &AgentToolEndpoint, line: &str) -> Option<Value> 
             ));
         }
     };
+    if !matches!(
+        method,
+        "server/discover" | "initialize" | "ping" | "tools/list" | "tools/call"
+    ) {
+        return Some(rpc_error(
+            id,
+            -32601,
+            format!("unsupported method: {method}"),
+        ));
+    }
     let modern = matches!(protocol, RequestProtocol::Modern);
     let result = match method {
         "server/discover" if modern => Ok(json!({
@@ -207,9 +273,13 @@ async fn handle_line(endpoint: &AgentToolEndpoint, line: &str) -> Option<Value> 
             "serverInfo": server_info(),
             "capabilities": { "tools": {} }
         })),
-        "initialize" => Err(anyhow::anyhow!(
-            "initialize is only available for legacy MCP clients"
-        )),
+        "initialize" => {
+            return Some(rpc_error(
+                id,
+                -32601,
+                "initialize is only available for legacy MCP clients".to_string(),
+            ));
+        }
         "ping" if modern => Ok(json!({
             "resultType": "complete",
             "_meta": server_meta(),
@@ -225,34 +295,32 @@ async fn handle_line(endpoint: &AgentToolEndpoint, line: &str) -> Option<Value> 
                     endpoint.consultation_enabled(),
                 )
             });
-            Ok(if modern { modern_result(result) } else { result })
+            Ok(if modern {
+                modern_result(result)
+            } else {
+                result
+            })
         }
         "tools/call" => {
             let params = request.get("params").cloned().unwrap_or_else(|| json!({}));
-            let name = params
-                .get("name")
-                .and_then(Value::as_str)
-                .ok_or_else(|| anyhow::anyhow!("missing tool name"));
-            match name {
-                Ok(name) => {
-                    let arguments = params
-                        .get("arguments")
-                        .cloned()
-                        .unwrap_or_else(|| json!({}));
-                    match forward(endpoint, name, arguments).await {
-                        Ok(value) => Ok(if modern {
-                            modern_tool_result(value)
-                        } else {
-                            legacy_tool_result(value)
-                        }),
-                        Err(error) if modern => Ok(modern_tool_error(&error)),
-                        Err(error) => Err(error),
-                    }
-                }
+            let Some(name) = params.get("name").and_then(Value::as_str) else {
+                return Some(rpc_error(id, -32602, "missing tool name".to_string()));
+            };
+            let arguments = params
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            match forward(endpoint, name, arguments, cancel).await {
+                Ok(value) => Ok(if modern {
+                    modern_tool_result(value)
+                } else {
+                    legacy_tool_result(value)
+                }),
+                Err(error) if modern => Ok(modern_tool_error(&error)),
                 Err(error) => Err(error),
             }
         }
-        _ => Err(anyhow::anyhow!("unsupported method: {method}")),
+        _ => unreachable!("MCP method was checked above"),
     };
     Some(match result {
         Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
@@ -260,11 +328,11 @@ async fn handle_line(endpoint: &AgentToolEndpoint, line: &str) -> Option<Value> 
     })
 }
 
-fn request_protocol(request: &Value, method: &str) -> std::result::Result<RequestProtocol, ProtocolError> {
-    let params = request
-        .get("params")
-        .cloned()
-        .unwrap_or_else(|| json!({}));
+fn request_protocol(
+    request: &Value,
+    method: &str,
+) -> std::result::Result<RequestProtocol, ProtocolError> {
+    let params = request.get("params").cloned().unwrap_or_else(|| json!({}));
     let Some(params) = params.as_object() else {
         return Err(ProtocolError::Invalid(
             "MCP request params must be an object".to_string(),
@@ -316,7 +384,10 @@ fn modern_result(mut result: Value) -> Value {
     let object = result
         .as_object_mut()
         .expect("MCP result helpers only receive JSON objects");
-    object.insert("resultType".to_string(), Value::String("complete".to_string()));
+    object.insert(
+        "resultType".to_string(),
+        Value::String("complete".to_string()),
+    );
     object.insert("_meta".to_string(), server_meta());
     result
 }
@@ -353,14 +424,19 @@ fn agent_tool_provider() -> Result<borg_remote::CodingProvider> {
         .context("BORG_AGENT_TOOL_PROVIDER is not a supported provider")
 }
 
-async fn forward(endpoint: &AgentToolEndpoint, name: &str, arguments: Value) -> Result<Value> {
+async fn forward(
+    endpoint: &AgentToolEndpoint,
+    name: &str,
+    arguments: Value,
+    cancel: Option<CancellationToken>,
+) -> Result<Value> {
     #[cfg(unix)]
     let response = match endpoint {
         AgentToolEndpoint::Unix { socket, .. } => {
             let stream = UnixStream::connect(socket)
                 .await
                 .with_context(|| format!("failed to connect to {}", socket.display()))?;
-            exchange(stream, name, arguments, None).await?
+            exchange(stream, name, arguments, None, cancel).await?
         }
     };
     #[cfg(not(unix))]
@@ -369,7 +445,7 @@ async fn forward(endpoint: &AgentToolEndpoint, name: &str, arguments: Value) -> 
             let stream = TcpStream::connect(address).await.with_context(|| {
                 format!("failed to connect to local agent tool server {address}")
             })?;
-            exchange(stream, name, arguments, Some(token.as_str())).await?
+            exchange(stream, name, arguments, Some(token.as_str()), cancel).await?
         }
     };
     if let Some(error) = response.get("error").and_then(Value::as_str) {
@@ -381,7 +457,13 @@ async fn forward(endpoint: &AgentToolEndpoint, name: &str, arguments: Value) -> 
         .context("Borg agent tool server returned no result")
 }
 
-async fn exchange<S>(stream: S, name: &str, arguments: Value, token: Option<&str>) -> Result<Value>
+async fn exchange<S>(
+    stream: S,
+    name: &str,
+    arguments: Value,
+    token: Option<&str>,
+    cancel: Option<CancellationToken>,
+) -> Result<Value>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -392,11 +474,34 @@ where
     }
     write.write_all(format!("{request}\n").as_bytes()).await?;
     let mut lines = BufReader::new(read).lines();
-    let response = lines
-        .next_line()
-        .await?
-        .context("Borg agent tool server closed without a response")?;
+    let response = if let Some(cancel) = cancel.as_ref() {
+        tokio::select! {
+            _ = cancel.cancelled() => bail!("Borg agent tool call was cancelled"),
+            response = lines.next_line() => response?,
+        }
+    } else {
+        lines.next_line().await?
+    }
+    .context("Borg agent tool server closed without a response")?;
     serde_json::from_str(&response).context("Borg agent tool server returned invalid JSON")
+}
+
+fn request_id_from_line(line: &str) -> Option<Value> {
+    serde_json::from_str::<Value>(line)
+        .ok()
+        .and_then(|request| request.get("id").cloned())
+}
+
+fn cancellation_request_id(line: &str) -> Option<Value> {
+    let request = serde_json::from_str::<Value>(line).ok()?;
+    if request.get("method").and_then(Value::as_str) != Some("notifications/cancelled") {
+        return None;
+    }
+    request.get("params")?.get("requestId").cloned()
+}
+
+fn request_key(id: &Value) -> String {
+    serde_json::to_string(id).unwrap_or_else(|_| "null".to_string())
 }
 
 fn rpc_error(id: Value, code: i64, message: String) -> Value {

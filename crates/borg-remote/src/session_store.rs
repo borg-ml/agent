@@ -83,6 +83,10 @@ impl SessionEventKind {
                 | Self::BluWorkflowCallRequested { .. }
                 | Self::BluWorkflowCallCompleted { .. }
                 | Self::BluWorkflowCompleted { .. }
+                | Self::RuntimeWorkflowStarted { .. }
+                | Self::RuntimeWorkflowCallRequested { .. }
+                | Self::RuntimeWorkflowCallCompleted { .. }
+                | Self::RuntimeWorkflowCompleted { .. }
                 // A fork cuts immediately before the admission of the prompt it
                 // rewinds to, which would otherwise leave that prompt's earlier
                 // queue entry inside the inherited history: the fork would then
@@ -2385,6 +2389,49 @@ async fn sync_session_action(
                 .await?;
         }
         SessionEventKind::BluWorkflowCompleted {
+            workflow_id,
+            success,
+            error,
+            ..
+        } => {
+            advance_action(
+                transaction,
+                event.session_id,
+                *workflow_id,
+                if *success {
+                    SessionActionState::Completed
+                } else {
+                    SessionActionState::Failed
+                },
+                error.clone(),
+            )
+            .await?;
+        }
+        SessionEventKind::RuntimeWorkflowStarted {
+            workflow_id,
+            runtime,
+            artifact_hash,
+            name,
+        } => {
+            let mut action = SessionAction::new(
+                *workflow_id,
+                event.session_id,
+                crate::SessionActionKind::Workflow,
+                crate::ActionDeliveryPolicy::WhenRunIdle,
+                crate::ActionWakePolicy::Immediate,
+                serde_json::json!({
+                    "workflow_id": workflow_id,
+                    "runtime": runtime,
+                    "artifact_hash": artifact_hash,
+                    "name": name,
+                }),
+            );
+            action.created_at = event.created_at;
+            action.updated_at = event.created_at;
+            create_action_and_advance(transaction, action, SessionActionState::Running, None)
+                .await?;
+        }
+        SessionEventKind::RuntimeWorkflowCompleted {
             workflow_id,
             success,
             error,

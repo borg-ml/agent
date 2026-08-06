@@ -28,7 +28,7 @@ installation, and every declared skill root must remain inside the package.
 - typed string, integer, float, boolean, and array settings;
 - secret-setting redaction;
 - namespaced stdio MCP servers with per-server tool allowlists; and
-- bounded executable Blu workflows declared with [workflows.<name>] and an
+- bounded executable workflows declared with [workflows.<name>] and an
   in-package relative entrypoint; and
 - `${config.name}`, `${env.NAME}`, and `${extension_dir}` interpolation.
 
@@ -80,6 +80,39 @@ snapshot, activation reasons, scope, and revision. Filesystem changes are
 watched automatically; `borg extensions reload` is available when tooling or
 an editor needs an explicit reload signal.
 
+## Selectable workflow runtimes
+
+Blu remains the embedded runtime for the whole Lua family. A workflow may use
+`.blu`, `.lua`, or `.luau`; `.luau` selects Luau semantics inside the same Blu
+engine. Other workflows can select a supervised user runtime without changing
+the package lifecycle:
+
+```toml
+[workflows.analysis]
+runtime = "ipython" # blu | python | ipython | javascript | typescript
+entrypoint = "workflows/analysis.py"
+description = "Use the project's Python environment for analysis"
+command = "ipython" # optional executable override
+args = ["--no-banner"] # optional arguments before the entrypoint
+```
+
+The default executable profiles are `python3` for Python, `ipython` for IPython,
+and `bun` for both JavaScript and TypeScript. Bun is intentional: both source
+types use one consistent Node-compatible, npm-aware worker, while
+`command = "node"` remains an explicit JavaScript override when a project needs
+Node. Set `command` when a project uses
+a virtual environment, Deno, a package-manager shim, or another runtime
+installation. Runtime processes are supervised, output is bounded and durable,
+and the process is killed on workflow cancellation. A worker process is a
+lifecycle boundary, **not a sandbox**: Python and JavaScript code runs with the
+permissions of the selected user process and must be treated as trusted.
+
+Use the provider-neutral `list_workflows` and `run_workflow` tools for all
+runtimes. `list_blu_workflows` and `run_blu_extension` remain compatibility
+aliases for existing Blu packages. The model can create a package on the fly
+with `create_extension`; the atomic package swap is visible at the next native
+turn boundary, just like a Blu edit.
+
 Installs are staged and validated before an atomic directory swap. Git installs
 record their source and exact revision in the scope's `blu.toml`; update clones
 a fresh copy and uses the same transaction. Local packages intentionally do not
@@ -114,14 +147,15 @@ processes, not shell snippets. Use `allowed_tools` to expose the smallest tool
 surface; the allowlist is enforced by Borg's native runtime and translated to
 each external provider's MCP policy format.
 
-The native harness advertises each active package workflow as
-`run_blu_extension`; it can also execute an explicit `run_blu_workflow`
-request for ad-hoc code. Neither surface is an extension lifecycle hook: source
-is admitted with a durable workflow id, and every call to Borg tools, processes,
-autonomy jobs, or checkpoints is permission-checked and journaled in the
-canonical SQLite session store. The guest receives no raw filesystem,
-database, provider, or process handles. Workflow source is bounded to 256 KiB,
-must remain inside its package, and is frozen for the turn that loaded it.
+The native harness advertises each active package workflow through the generic
+`run_workflow` tool. Blu workflows additionally retain `run_blu_extension` and
+the explicit `run_blu_workflow` request for compatibility. Embedded Blu host
+calls are permission-checked and journaled in the canonical SQLite session
+store. External runtimes are supervised as trusted processes and their
+workflow lifecycle/output is journaled; their normal Python/JavaScript library
+calls are intentionally not rewritten into fake Blu handles. Workflow source
+is bounded to 256 KiB, must remain inside its package, and is frozen for the
+turn that loaded it.
 
 ## Compatibility
 

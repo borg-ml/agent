@@ -5,7 +5,7 @@
 //! journaled before and after execution and is replayed by workflow/call id.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -27,7 +27,7 @@ use uuid::Uuid;
 use crate::native_process::ProcessManager;
 use crate::{
     AgentToolDispatcher, EnqueueAutonomyJob, PermissionMode, SessionEvent, SessionEventKind,
-    SessionStore, SqliteAutonomyStore, SqliteSessionStore,
+    SessionStore, SqliteAutonomyStore, SqliteSessionStore, WorkflowRuntime,
 };
 
 const MAX_SOURCE_BYTES: usize = 256 * 1024;
@@ -53,6 +53,31 @@ pub struct BluWorkflowResult {
     pub source_hash: String,
     pub success: bool,
     pub values: Vec<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RuntimeWorkflowRequest {
+    pub workflow_id: Uuid,
+    pub name: String,
+    pub runtime: WorkflowRuntime,
+    pub artifact_hash: String,
+    pub command: String,
+    pub args: Vec<String>,
+    pub entrypoint: PathBuf,
+    pub working_directory: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct RuntimeWorkflowResult {
+    pub workflow_id: Uuid,
+    pub runtime: WorkflowRuntime,
+    pub artifact_hash: String,
+    pub success: bool,
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -100,6 +125,20 @@ impl BluWorkflowRunner {
         request: BluWorkflowRequest,
         cancel: CancellationToken,
     ) -> Result<BluWorkflowResult> {
+        self.run_with_profile(request, SemanticProfile::Blu, cancel)
+            .await
+    }
+
+    pub(crate) async fn run_with_profile(
+        &self,
+        request: BluWorkflowRequest,
+        profile: SemanticProfile,
+        cancel: CancellationToken,
+    ) -> Result<BluWorkflowResult> {
+        ensure!(
+            matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau),
+            "unsupported embedded Lua-family profile {profile}"
+        );
         ensure!(
             !request.name.trim().is_empty(),
             "Blu workflow name is empty"
@@ -117,7 +156,7 @@ impl BluWorkflowRunner {
             "Blu workflow source exceeds {MAX_SOURCE_BYTES} bytes"
         );
         ensure!(!cancel.is_cancelled(), "Blu workflow was cancelled");
-        let source_hash = source_hash(&request.source);
+        let source_hash = source_hash_for_profile(&request.source, profile);
         let events = self.store.read(self.session_id).await?;
 
         if let Some(kind) = find_completed(&events, request.workflow_id) {
@@ -250,6 +289,7 @@ impl BluWorkflowRunner {
             execute_blu_source(
                 &source,
                 &name,
+                profile,
                 bridge,
                 interrupt_for_worker,
                 cancel_for_worker,
@@ -309,6 +349,229 @@ impl BluWorkflowRunner {
             error,
         })
     }
+
+    /// Execute a user-selected external runtime through the same durable
+    /// action/lease boundary as Blu. The process is intentionally a trusted
+    /// worker, not a sandbox; permissions and approval still gate admission.
+    pub(crate) async fn run_runtime_with_cancel(
+        &self,
+        request: RuntimeWorkflowRequest,
+        cancel: CancellationToken,
+    ) -> Result<RuntimeWorkflowResult> {
+        ensure!(!request.name.trim().is_empty(), "workflow name is empty");
+        ensure!(
+            !request.artifact_hash.trim().is_empty(),
+            "workflow artifact hash is empty"
+        );
+        ensure!(
+            !request.command.trim().is_empty(),
+            "workflow runtime command is empty"
+        );
+        ensure!(
+            request.entrypoint.is_file(),
+            "workflow entrypoint does not exist"
+        );
+        ensure!(
+            request.working_directory.is_dir(),
+            "workflow working directory does not exist"
+        );
+        ensure!(!cancel.is_cancelled(), "workflow was cancelled");
+
+        let events = self.store.read(self.session_id).await?;
+        if let Some(kind) = find_runtime_completed(&events, request.workflow_id) {
+            ensure!(
+                runtime_completed_hash(kind) == request.artifact_hash,
+                "workflow artifact changed"
+            );
+            return Ok(runtime_completed_result(kind));
+        }
+        if let Some(kind) = find_runtime_started(&events, request.workflow_id) {
+            ensure!(
+                runtime_started_hash(kind) == request.artifact_hash,
+                "workflow artifact changed"
+            );
+        } else {
+            self.store
+                .append(SessionEvent::new(
+                    self.session_id,
+                    0,
+                    SessionEventKind::RuntimeWorkflowStarted {
+                        workflow_id: request.workflow_id,
+                        runtime: request.runtime,
+                        artifact_hash: request.artifact_hash.clone(),
+                        name: request.name.clone(),
+                    },
+                ))
+                .await
+                .context("journal external workflow admission")?;
+        }
+
+        let action_payload = json!({
+            "workflow_id": request.workflow_id,
+            "runtime": request.runtime,
+            "artifact_hash": request.artifact_hash.clone(),
+            "name": request.name.clone(),
+        });
+        self.store
+            .ensure_workflow_action(self.session_id, request.workflow_id, &action_payload)
+            .await
+            .context("ensure external workflow action")?;
+        let lease_owner = format!(
+            "runtime-workflow/{}/{}/{}",
+            self.session_id,
+            request.workflow_id,
+            Uuid::new_v4()
+        );
+        let action = self
+            .store
+            .claim_action(
+                self.session_id,
+                request.workflow_id,
+                &lease_owner,
+                WORKFLOW_LEASE_DURATION,
+            )
+            .await?
+            .with_context(|| {
+                format!(
+                    "workflow {} already has a live execution lease",
+                    request.workflow_id
+                )
+            })?;
+        let lease_token = action
+            .lease_token
+            .context("external workflow lease did not return a token")?;
+
+        let heartbeat_stop = CancellationToken::new();
+        let heartbeat_cancel = heartbeat_stop.clone();
+        let heartbeat_store = self.store.clone();
+        let heartbeat_owner = lease_owner.clone();
+        let heartbeat_workflow_cancel = cancel.clone();
+        let heartbeat_session_id = self.session_id;
+        let heartbeat_workflow_id = request.workflow_id;
+        let heartbeat = tokio::spawn(async move {
+            let mut tick = tokio::time::interval(WORKFLOW_HEARTBEAT_INTERVAL);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = heartbeat_cancel.cancelled() => break,
+                    _ = tick.tick() => {
+                        if heartbeat_store
+                            .heartbeat_action(
+                                heartbeat_session_id,
+                                heartbeat_workflow_id,
+                                &heartbeat_owner,
+                                lease_token,
+                                WORKFLOW_LEASE_DURATION,
+                            )
+                            .await
+                            .is_err()
+                        {
+                            heartbeat_workflow_cancel.cancel();
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        let relative_workdir = request
+            .working_directory
+            .strip_prefix(&self.root)
+            .map_err(|_| anyhow::anyhow!("workflow working directory escapes the session root"))?
+            .to_string_lossy()
+            .into_owned();
+        let mut command_parts = Vec::with_capacity(request.args.len() + 2);
+        command_parts.push(request.command.clone());
+        command_parts.extend(request.args.iter().cloned());
+        command_parts.push(request.entrypoint.to_string_lossy().into_owned());
+        let command = command_parts
+            .into_iter()
+            .map(|part| shell_quote(&part))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let execution = self
+            .processes
+            .exec_with_cancel(
+                self.session_id,
+                &self.root,
+                command,
+                Some(&relative_workdir),
+                Some(30_000),
+                Some(MAX_PROCESS_OUTPUT_TOKENS),
+                MAX_PROCESS_TIMEOUT_MS,
+                Some(self.store.clone()),
+                cancel.clone(),
+            )
+            .await;
+        heartbeat_stop.cancel();
+        heartbeat.abort();
+
+        let (success, stdout, stderr, exit_code, error) = match execution {
+            Ok(snapshot) => {
+                let success = !snapshot.timed_out && snapshot.exit_code == Some(0);
+                let error = (!success).then(|| {
+                    if snapshot.timed_out {
+                        "workflow runtime timed out".to_string()
+                    } else {
+                        format!(
+                            "workflow runtime exited with status {}",
+                            snapshot
+                                .exit_code
+                                .map_or_else(|| "unknown".to_string(), |code| code.to_string())
+                        )
+                    }
+                });
+                (
+                    success,
+                    snapshot.stdout,
+                    snapshot.stderr,
+                    snapshot.exit_code,
+                    error,
+                )
+            }
+            Err(error) => (
+                false,
+                String::new(),
+                String::new(),
+                None,
+                Some(format!("workflow runtime failed: {error:#}")),
+            ),
+        };
+        ensure_json_size(
+            &json!({
+                "stdout": &stdout,
+                "stderr": &stderr,
+                "error": &error,
+            }),
+            MAX_RESULT_JSON_BYTES,
+            "workflow runtime result",
+        )?;
+        let completed = self
+            .store
+            .append_with_action_lease(
+                SessionEvent::new(
+                    self.session_id,
+                    0,
+                    SessionEventKind::RuntimeWorkflowCompleted {
+                        workflow_id: request.workflow_id,
+                        runtime: request.runtime,
+                        artifact_hash: request.artifact_hash,
+                        success,
+                        result: None,
+                        stdout,
+                        stderr,
+                        exit_code,
+                        error,
+                    },
+                ),
+                request.workflow_id,
+                &lease_owner,
+                lease_token,
+            )
+            .await
+            .context("journal external workflow completion")?;
+        Ok(runtime_completed_result(&completed.kind))
+    }
 }
 
 fn source_hash(source: &str) -> String {
@@ -316,6 +579,129 @@ fn source_hash(source: &str) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+fn source_hash_for_profile(source: &str, profile: SemanticProfile) -> String {
+    if profile == SemanticProfile::Blu {
+        return source_hash(source);
+    }
+    let mut digest = Sha256::new();
+    digest.update(profile.as_str().as_bytes());
+    digest.update([0]);
+    digest.update(source.as_bytes());
+    digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+pub(crate) fn embedded_source_profile(entrypoint: &Path) -> SemanticProfile {
+    if entrypoint
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("luau"))
+    {
+        SemanticProfile::Luau
+    } else {
+        SemanticProfile::Blu
+    }
+}
+
+pub(crate) fn runtime_artifact_hash(workflow: &crate::BluWorkflowDefinition) -> String {
+    let mut digest = Sha256::new();
+    digest.update(workflow.runtime.label().as_bytes());
+    digest.update([0]);
+    digest.update(workflow.source.as_bytes());
+    digest.update([0]);
+    digest.update(workflow.entrypoint.to_string_lossy().as_bytes());
+    digest.update([0]);
+    digest.update(
+        workflow
+            .command
+            .as_deref()
+            .unwrap_or(workflow.runtime.default_command())
+            .as_bytes(),
+    );
+    digest.update([0]);
+    for argument in &workflow.args {
+        digest.update([0]);
+        digest.update(argument.as_bytes());
+    }
+    digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn runtime_started_hash(kind: &SessionEventKind) -> &str {
+    let SessionEventKind::RuntimeWorkflowStarted { artifact_hash, .. } = kind else {
+        unreachable!("wrong runtime workflow started event kind")
+    };
+    artifact_hash
+}
+
+fn runtime_completed_hash(kind: &SessionEventKind) -> &str {
+    let SessionEventKind::RuntimeWorkflowCompleted { artifact_hash, .. } = kind else {
+        unreachable!("wrong runtime workflow completed event kind")
+    };
+    artifact_hash
+}
+
+fn find_runtime_started(events: &[SessionEvent], id: Uuid) -> Option<&SessionEventKind> {
+    events.iter().find_map(|event| match &event.kind {
+        SessionEventKind::RuntimeWorkflowStarted { workflow_id, .. } if *workflow_id == id => {
+            Some(&event.kind)
+        }
+        _ => None,
+    })
+}
+
+fn find_runtime_completed(events: &[SessionEvent], id: Uuid) -> Option<&SessionEventKind> {
+    events.iter().find_map(|event| match &event.kind {
+        SessionEventKind::RuntimeWorkflowCompleted { workflow_id, .. } if *workflow_id == id => {
+            Some(&event.kind)
+        }
+        _ => None,
+    })
+}
+
+fn runtime_completed_result(kind: &SessionEventKind) -> RuntimeWorkflowResult {
+    let SessionEventKind::RuntimeWorkflowCompleted {
+        workflow_id,
+        runtime,
+        artifact_hash,
+        success,
+        result,
+        stdout,
+        stderr,
+        exit_code,
+        error,
+    } = kind
+    else {
+        unreachable!("wrong runtime workflow completed event kind")
+    };
+    result
+        .as_ref()
+        .and_then(|value| serde_json::from_value(value.clone()).ok())
+        .unwrap_or_else(|| RuntimeWorkflowResult {
+            workflow_id: *workflow_id,
+            runtime: *runtime,
+            artifact_hash: artifact_hash.clone(),
+            success: *success,
+            stdout: stdout.clone(),
+            stderr: stderr.clone(),
+            exit_code: *exit_code,
+            error: error.clone(),
+        })
+}
+
+fn shell_quote(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn find_started(events: &[SessionEvent], id: Uuid) -> Option<&SessionEventKind> {
@@ -726,11 +1112,16 @@ impl HostBridge {
 fn execute_blu_source(
     source: &str,
     name: &str,
+    profile: SemanticProfile,
     bridge: HostBridge,
     interrupt: Arc<Mutex<Option<InterruptHandle>>>,
     cancel: CancellationToken,
 ) -> Result<Vec<Value>> {
-    let vm = Vm::new(Dialect::Blu)
+    let dialect = match profile {
+        SemanticProfile::Luau => Dialect::Luau,
+        _ => Dialect::Blu,
+    };
+    let vm = Vm::new(dialect)
         .with_instruction_limit(MAX_INSTRUCTIONS)
         .with_task_limit(64)
         .with_global_limit(64)
@@ -775,13 +1166,7 @@ fn execute_blu_source(
     limits.max_constants = 65_536;
     limits.max_return_values = 64;
     let values = engine
-        .execute_owned_source_named_with_limits(
-            source,
-            name,
-            SemanticProfile::Blu,
-            limits,
-            BluLimits::default(),
-        )
+        .execute_owned_source_named_with_limits(source, name, profile, limits, BluLimits::default())
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     interrupt
         .lock()
@@ -906,6 +1291,30 @@ mod tests {
         )
     }
 
+    async fn external_runner(permission: PermissionMode) -> (BluWorkflowRunner, PathBuf) {
+        let directory = tempdir().expect("tempdir").keep();
+        let store = SqliteSessionStore::open(directory.join("sessions.sqlite3"))
+            .await
+            .expect("store");
+        let session_id = Uuid::new_v4();
+        store.create_session(session_id).await.expect("session");
+        let autonomy = SqliteAutonomyStore::open(store.pool().clone())
+            .await
+            .expect("autonomy");
+        (
+            BluWorkflowRunner::new(
+                session_id,
+                store,
+                autonomy,
+                None,
+                ProcessManager::default(),
+                directory.clone(),
+                permission,
+            ),
+            directory,
+        )
+    }
+
     #[tokio::test]
     async fn pure_workflow_is_durable_and_idempotent() {
         let runner = runner(PermissionMode::FullAccess).await;
@@ -918,6 +1327,143 @@ mod tests {
         assert_eq!(first.values, vec![json!(4)]);
         assert!(first.success);
         assert_eq!(first, runner.run(request).await.expect("replay"));
+    }
+
+    #[tokio::test]
+    async fn lua_and_luau_sources_use_the_embedded_blu_engine() {
+        let runner = runner(PermissionMode::FullAccess).await;
+        for (extension, profile, source) in [
+            ("lua", SemanticProfile::Blu, "return 40 + 2"),
+            (
+                "luau",
+                SemanticProfile::Luau,
+                "local answer: number = 40\nreturn answer + 2",
+            ),
+        ] {
+            let result = runner
+                .run_with_profile(
+                    BluWorkflowRequest {
+                        workflow_id: Uuid::new_v4(),
+                        name: format!("lua-family-{extension}"),
+                        source: source.to_string(),
+                    },
+                    profile,
+                    CancellationToken::new(),
+                )
+                .await
+                .expect("run");
+            assert!(result.success, "{result:?}");
+            assert_eq!(result.values.len(), 1, "{result:?}");
+            assert_eq!(result.values[0].as_f64(), Some(42.0), "{result:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn external_python_workflow_is_supervised_and_idempotent() {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .status()
+            .is_err()
+        {
+            return;
+        }
+        let (runner, root) = external_runner(PermissionMode::FullAccess).await;
+        let entrypoint = root.join("workflow.py");
+        std::fs::write(&entrypoint, "print('python-runtime-ok')\n").expect("workflow");
+        let request = RuntimeWorkflowRequest {
+            workflow_id: Uuid::new_v4(),
+            name: "python-check".to_string(),
+            runtime: WorkflowRuntime::Python,
+            artifact_hash: "python-artifact-v1".to_string(),
+            command: "python3".to_string(),
+            args: vec!["-u".to_string()],
+            entrypoint,
+            working_directory: root,
+        };
+        let first = runner
+            .run_runtime_with_cancel(request.clone(), CancellationToken::new())
+            .await
+            .expect("run");
+        assert!(first.success, "{first:?}");
+        assert!(first.stdout.contains("python-runtime-ok"));
+        assert_eq!(
+            first,
+            runner
+                .run_runtime_with_cancel(request, CancellationToken::new())
+                .await
+                .expect("replay")
+        );
+        let events = runner.store.read(runner.session_id).await.expect("events");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event.kind,
+                    SessionEventKind::RuntimeWorkflowStarted { .. }
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event.kind,
+                    SessionEventKind::RuntimeWorkflowCompleted { .. }
+                ))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn external_javascript_and_typescript_profiles_use_their_default_commands() {
+        let (runner, root) = external_runner(PermissionMode::FullAccess).await;
+        for (runtime, command, extension, source, marker) in [
+            (
+                WorkflowRuntime::Javascript,
+                "bun",
+                "js",
+                "console.log('javascript-runtime-ok')\n",
+                "javascript-runtime-ok",
+            ),
+            (
+                WorkflowRuntime::Typescript,
+                "bun",
+                "ts",
+                "const marker: string = 'typescript-runtime-ok'; console.log(marker);\n",
+                "typescript-runtime-ok",
+            ),
+        ] {
+            if std::process::Command::new(command)
+                .arg("--version")
+                .status()
+                .is_err()
+            {
+                continue;
+            }
+            let entrypoint = root.join(format!("workflow.{extension}"));
+            std::fs::write(&entrypoint, source).expect("workflow");
+            let workflow_id = Uuid::new_v4();
+            let result = runner
+                .run_runtime_with_cancel(
+                    RuntimeWorkflowRequest {
+                        workflow_id,
+                        name: format!("{}-check", runtime.label()),
+                        runtime,
+                        artifact_hash: format!("{}-artifact-v1", runtime.label()),
+                        command: command.to_string(),
+                        args: Vec::new(),
+                        entrypoint,
+                        working_directory: root.clone(),
+                    },
+                    CancellationToken::new(),
+                )
+                .await
+                .expect("run");
+            assert!(result.success, "{result:?}");
+            assert!(result.stdout.contains(marker), "{result:?}");
+        }
     }
 
     #[tokio::test]

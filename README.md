@@ -105,9 +105,9 @@ Project packages that declare MCP servers remain cataloged but inactive unless
 the user explicitly sets [extensions].allow_project_mcp = true; skill-only and
 workflow-only project packages do not need MCP trust. Packages may declare
 semantic-version dependencies, Borg/capability requirements, typed settings,
-skill roots, namespaced stdio MCP servers, and bounded .blu workflows. Invalid
-packages are isolated and reported by borg extensions doctor instead of
-preventing Borg from starting.
+skill roots, namespaced stdio MCP servers, and bounded Blu/Lua/Luau
+workflows. Invalid packages are isolated and reported by borg extensions
+doctor instead of preventing Borg from starting.
 
 Running local sessions watch the effective catalog, and enrolled Remote hosts
 revalidate it at each turn boundary. A validated change swaps skills, MCP

@@ -990,6 +990,7 @@ fn tool_execution_class(name: &str) -> ToolExecutionClass {
         | "read_file"
         | "search_files"
         | "read_skill"
+        | "list_workflows"
         | "list_blu_workflows"
         | "get_goal"
         | "get_plan"
@@ -1208,7 +1209,7 @@ async fn execute_tool(
     if (tool_call.function.name == "exec_command"
         || matches!(
             tool_call.function.name.as_str(),
-            "run_blu_workflow" | "run_blu_extension"
+            "run_workflow" | "run_blu_workflow" | "run_blu_extension"
         )
         || external_mcp)
         && runtime.permission != PermissionMode::FullAccess
@@ -1298,11 +1299,11 @@ async fn execute_tool(
 
     let workflow_approved = matches!(
         tool_call.function.name.as_str(),
-        "run_blu_workflow" | "run_blu_extension"
+        "run_workflow" | "run_blu_workflow" | "run_blu_extension"
     ) && runtime.permission != PermissionMode::FullAccess;
     let workflow_cancel = matches!(
         tool_call.function.name.as_str(),
-        "run_blu_workflow" | "run_blu_extension"
+        "run_workflow" | "run_blu_workflow" | "run_blu_extension"
     )
     .then(CancellationToken::new);
     let call = runtime.call(

@@ -6,8 +6,9 @@
 # packages declaring MCP servers are cataloged but inactive until the user
 # enables `[extensions].allow_project_mcp = true` in agent.toml.
 #
-# Blu packages may contribute skill roots, stdio MCP servers, and bounded
-# embedded Blu workflows, but never opaque shell/lifecycle hooks. Borg validates
+# Packages may contribute skill roots, stdio MCP servers, and bounded workflows
+# in Blu/Lua/Luau, Python, IPython, JavaScript, or TypeScript, but never opaque
+# lifecycle hooks. Borg validates
 # paths, dependencies, versions, settings, workflow sources, and server
 # declarations before activation.
 manifest_version = 1
@@ -48,9 +49,31 @@ args = ["serve", "--index", "${config.index}"]
 # env = { DOCS_TOKEN = "${env.DOCS_TOKEN}" }
 allowed_tools = ["search", "read"]
 
-# Executable workflows are loaded from the package and exposed to the native
-# harness as run_blu_extension. Host calls remain Borg permission-checked and
-# durably journaled.
+# Executable workflows are loaded from the package and exposed through the
+# provider-neutral list_workflows/run_workflow tools. Blu compatibility aliases
+# remain available. External runtimes are trusted supervised processes.
 [workflows.review]
 entrypoint = "workflows/review.blu"
 description = "Review the current change"
+
+# Blu also accepts .lua and .luau entrypoints; .luau selects Luau semantics
+# inside the embedded Blu engine.
+# [workflows.lua_review]
+# runtime = "blu"
+# entrypoint = "workflows/lua_review.lua"
+#
+# [workflows.luau_review]
+# runtime = "blu"
+# entrypoint = "workflows/luau_review.luau"
+
+# Example full-ecosystem alternatives:
+# [workflows.analysis]
+# runtime = "ipython"
+# entrypoint = "workflows/analysis.py"
+# command = "ipython"
+# args = ["--no-banner"]
+#
+# [workflows.typescript_report]
+# runtime = "typescript"
+# entrypoint = "workflows/report.ts"
+# command = "bun"

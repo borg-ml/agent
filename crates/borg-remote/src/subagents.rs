@@ -396,10 +396,31 @@ async fn serve_agent_tool_connection<S>(
             {
                 json!({ "error": "agent tool authentication failed" })
             }
-            Ok(request) => match dispatcher.call(&request.name, request.arguments).await {
-                Ok(result) => json!({ "result": result }),
-                Err(error) => json!({ "error": format!("{error:#}") }),
-            },
+            Ok(request) => {
+                let cancel = CancellationToken::new();
+                let call = dispatcher.call_with_workflow_control(
+                    &request.name,
+                    request.arguments,
+                    false,
+                    Some(cancel.clone()),
+                );
+                tokio::pin!(call);
+                tokio::select! {
+                    result = &mut call => match result {
+                        Ok(result) => json!({ "result": result }),
+                        Err(error) => json!({ "error": format!("{error:#}") }),
+                    },
+                    next = lines.next_line() => {
+                        cancel.cancel();
+                        match next {
+                            Ok(Some(_)) => json!({
+                                "error": "agent tool connection received a second request before the first completed"
+                            }),
+                            Ok(None) | Err(_) => return,
+                        }
+                    }
+                }
+            }
             Err(error) => json!({ "error": error.to_string() }),
         };
         if write
@@ -430,9 +451,7 @@ impl AgentToolDispatcher {
         consultation: Option<SessionConsultationTools>,
         autonomy: Option<crate::SqliteAutonomyStore>,
         provider_capabilities: Vec<crate::ProviderCapability>,
-        workflow_snapshot: Option<
-            Arc<dyn Fn() -> Vec<crate::BluWorkflowDefinition> + Send + Sync>,
-        >,
+        workflow_snapshot: Option<Arc<dyn Fn() -> Vec<crate::BluWorkflowDefinition> + Send + Sync>>,
         workflow_processes: crate::native_process::ProcessManager,
         permission: crate::PermissionMode,
     ) -> Self {
@@ -506,22 +525,51 @@ impl AgentToolDispatcher {
         workflow_cancel: Option<CancellationToken>,
     ) -> Result<Value> {
         match name {
-            "list_blu_workflows" => {
+            "list_workflows" | "list_blu_workflows" => {
                 let _: NoArgs = serde_json::from_value(arguments)?;
                 let context = self
                     .blu_workflows
                     .as_ref()
-                    .context("Blu workflow tools are unavailable for this session")?;
+                    .context("workflow tools are unavailable for this session")?;
+                let blu_only = name == "list_blu_workflows";
                 Ok(json!({
                     "workflows": (context.snapshot)()
                         .into_iter()
+                        .filter(|workflow| !blu_only || workflow.runtime == crate::WorkflowRuntime::Blu)
                         .map(|workflow| json!({
                             "extension_id": workflow.extension_id,
                             "name": workflow.name,
                             "description": workflow.description,
+                            "runtime": workflow.runtime,
                         }))
                         .collect::<Vec<_>>()
                 }))
+            }
+            "run_workflow" => {
+                let args: RunWorkflowArgs = serde_json::from_value(arguments)?;
+                let context = self
+                    .blu_workflows
+                    .as_ref()
+                    .context("workflow tools are unavailable for this session")?;
+                let workflow = (context.snapshot)()
+                    .into_iter()
+                    .find(|workflow| {
+                        workflow.extension_id == args.extension_id && workflow.name == args.name
+                    })
+                    .with_context(|| {
+                        format!(
+                            "workflow {}:{} is not present in the current extension snapshot",
+                            args.extension_id, args.name
+                        )
+                    })?;
+                self.run_workflow_definition(
+                    context,
+                    workflow,
+                    args.workflow_id,
+                    workflow_approved,
+                    workflow_cancel,
+                )
+                .await
             }
             "run_blu_extension" => {
                 let args: RunBluExtensionArgs = serde_json::from_value(arguments)?;
@@ -540,31 +588,19 @@ impl AgentToolDispatcher {
                             args.extension_id, args.name
                         )
                     })?;
-                let permission = if workflow_approved {
-                    crate::PermissionMode::FullAccess
-                } else {
-                    context.permission
-                };
-                let runner = crate::blu_workflow::BluWorkflowRunner::new(
-                    context.session_id,
-                    context.store.clone(),
-                    context.autonomy.clone(),
-                    Some(self.clone()),
-                    context.processes.clone(),
-                    context.root.clone(),
-                    permission,
+                anyhow::ensure!(
+                    workflow.runtime == crate::WorkflowRuntime::Blu,
+                    "run_blu_extension can only invoke Blu workflows; use run_workflow for {}",
+                    workflow.runtime.label()
                 );
-                let result = runner
-                    .run_with_cancel(
-                        crate::BluWorkflowRequest {
-                            workflow_id: args.workflow_id,
-                            name: format!("{}:{}", workflow.extension_id, workflow.name),
-                            source: workflow.source,
-                        },
-                        workflow_cancel.unwrap_or_else(CancellationToken::new),
-                    )
-                    .await?;
-                Ok(serde_json::to_value(result)?)
+                self.run_workflow_definition(
+                    context,
+                    workflow,
+                    args.workflow_id,
+                    workflow_approved,
+                    workflow_cancel,
+                )
+                .await
             }
             "get_goal" => {
                 let _: NoArgs = serde_json::from_value(arguments)?;
@@ -703,6 +739,74 @@ impl AgentToolDispatcher {
                     .await
             }
         }
+    }
+
+    async fn run_workflow_definition(
+        &self,
+        context: &BluWorkflowToolContext,
+        workflow: crate::BluWorkflowDefinition,
+        workflow_id: Uuid,
+        workflow_approved: bool,
+        workflow_cancel: Option<CancellationToken>,
+    ) -> Result<Value> {
+        let permission = if workflow_approved {
+            crate::PermissionMode::FullAccess
+        } else {
+            context.permission
+        };
+        let runner = crate::blu_workflow::BluWorkflowRunner::new(
+            context.session_id,
+            context.store.clone(),
+            context.autonomy.clone(),
+            Some(self.clone()),
+            context.processes.clone(),
+            context.root.clone(),
+            permission,
+        );
+        let cancel = workflow_cancel.unwrap_or_else(CancellationToken::new);
+        if workflow.runtime == crate::WorkflowRuntime::Blu {
+            let profile = crate::blu_workflow::embedded_source_profile(&workflow.entrypoint);
+            return Ok(serde_json::to_value(
+                runner
+                    .run_with_profile(
+                        crate::BluWorkflowRequest {
+                            workflow_id,
+                            name: format!("{}:{}", workflow.extension_id, workflow.name),
+                            source: workflow.source,
+                        },
+                        profile,
+                        cancel,
+                    )
+                    .await?,
+            )?);
+        }
+        anyhow::ensure!(
+            permission == crate::PermissionMode::FullAccess,
+            "external workflow runtime {} requires full access or an explicit approval",
+            workflow.runtime.label()
+        );
+        let command = workflow
+            .command
+            .clone()
+            .unwrap_or_else(|| workflow.runtime.default_command().to_string());
+        let artifact_hash = crate::blu_workflow::runtime_artifact_hash(&workflow);
+        Ok(serde_json::to_value(
+            runner
+                .run_runtime_with_cancel(
+                    crate::blu_workflow::RuntimeWorkflowRequest {
+                        workflow_id,
+                        name: format!("{}:{}", workflow.extension_id, workflow.name),
+                        runtime: workflow.runtime,
+                        artifact_hash,
+                        command,
+                        args: workflow.args,
+                        entrypoint: workflow.entrypoint,
+                        working_directory: workflow.working_directory,
+                    },
+                    cancel,
+                )
+                .await?,
+        )?)
     }
 }
 
@@ -3079,11 +3183,34 @@ pub fn agent_tool_specs_with_capabilities_and_consultation(
     shared_work_enabled: bool,
     team_policy: Option<&crate::TeamPolicy>,
     consultation_enabled: bool,
-    ) -> Vec<Value> {
+) -> Vec<Value> {
     let mut specs = vec![
         tool(
+            "list_workflows",
+            "List active trusted extension workflows across embedded Blu/Lua/Luau, Python, IPython, JavaScript, and TypeScript runtimes. Sources are never exposed; use extension_id and name with run_workflow.",
+            json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+        ),
+        tool(
+            "run_workflow",
+            "Run one active trusted extension workflow through Borg's durable workflow boundary. The selected runtime is declared by the extension and may be embedded Blu/Lua/Luau, Python, IPython, JavaScript, or TypeScript. External runtimes are supervised user processes, not sandboxes; approval and the session permission mode still apply. Use a fresh workflow_id UUID for a new execution; repeated IDs are idempotent.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "workflow_id": { "type": "string", "format": "uuid" },
+                    "extension_id": { "type": "string", "minLength": 1, "maxLength": 64 },
+                    "name": { "type": "string", "minLength": 1, "maxLength": 128 }
+                },
+                "required": ["workflow_id", "extension_id", "name"],
+                "additionalProperties": false
+            }),
+        ),
+        tool(
             "list_blu_workflows",
-            "List active trusted Blu extension workflows that this Borg session can invoke. Sources are never exposed; use the returned extension_id and name with run_blu_extension.",
+            "Compatibility alias: list active trusted Blu extension workflows. Use list_workflows for all selectable runtimes.",
             json!({
                 "type": "object",
                 "properties": {},
@@ -3488,6 +3615,14 @@ struct NoArgs {}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RunBluExtensionArgs {
+    workflow_id: Uuid,
+    extension_id: String,
+    name: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunWorkflowArgs {
     workflow_id: Uuid,
     extension_id: String,
     name: String,
@@ -4959,6 +5094,9 @@ mod tests {
             "get_agent_settings",
             "update_agent_settings",
             "create_plugin",
+            "create_extension",
+            "list_workflows",
+            "run_workflow",
         ];
         for provider in [
             CodingProvider::Codex,
