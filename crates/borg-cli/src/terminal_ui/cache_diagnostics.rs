@@ -138,6 +138,21 @@ impl CacheDiagnostics {
             if !(cache_telemetry_available || previous.cache_telemetry_available) {
                 return None;
             }
+            // A healthy pooled subscription context receives only the new
+            // prompt delta. Its provider cache counters describe that native
+            // context, not a fresh replay of the previous full Borg prompt.
+            // Comparing those counters with the prior full snapshot therefore
+            // turns every ordinary follow-up into another loud miss card.
+            // Keep the measured result for the footer, but only announce a
+            // miss when a real boundary (signature change or cache expiry)
+            // remains possible.
+            let same_signature = previous.signature == signature;
+            let within_cache_window = cache_window(signature.provider)
+                .is_none_or(|window| elapsed(previous.at, at) < window);
+            if usage.provider_context_reused == Some(true) && same_signature && within_cache_window
+            {
+                return None;
+            }
             let reusable_prefix_tokens = previous.prompt_tokens.min(prompt_tokens);
             let missed_tokens = reusable_prefix_tokens.saturating_sub(usage.cached_input_tokens);
             if !material_cache_miss(missed_tokens, reusable_prefix_tokens) {
@@ -465,13 +480,22 @@ mod tests {
         cached: u64,
         cache_creation: u64,
     ) -> CacheUsage<'static> {
+        usage_with_context_reuse(input, cached, cache_creation, None)
+    }
+
+    fn usage_with_context_reuse(
+        input: u64,
+        cached: u64,
+        cache_creation: u64,
+        provider_context_reused: Option<bool>,
+    ) -> CacheUsage<'static> {
         CacheUsage {
             input_tokens: input,
             cached_input_tokens: cached,
             cache_creation_input_tokens: cache_creation,
             cost_microusd: None,
             cost_basis: "unavailable",
-            provider_context_reused: None,
+            provider_context_reused,
         }
     }
 
@@ -732,7 +756,7 @@ mod tests {
                     cache_creation_input_tokens: 0,
                     cost_microusd: Some(1_100_000),
                     cost_basis: "subscription_equivalent",
-                    provider_context_reused: Some(true),
+                    provider_context_reused: Some(false),
                 },
             )
             .expect("observed subscription miss");
@@ -740,5 +764,98 @@ mod tests {
         assert!(!text.contains("$"));
         assert!(!text.contains("turn cost"));
         assert!(!text.contains("API cache-miss premium"));
+    }
+
+    #[test]
+    fn reused_provider_context_does_not_repeat_miss_cards() {
+        let mut diagnostics = CacheDiagnostics::default();
+        let at = Utc::now();
+        let signature = signature("gpt-5.6-sol", "high");
+
+        diagnostics.observe(
+            at,
+            signature.clone(),
+            CacheUsage {
+                input_tokens: 1_000,
+                cached_input_tokens: 99_000,
+                cache_creation_input_tokens: 0,
+                cost_microusd: None,
+                cost_basis: "unavailable",
+                provider_context_reused: Some(true),
+            },
+        );
+
+        let replay = diagnostics
+            .observe(
+                at + TimeDelta::seconds(1),
+                signature.clone(),
+                CacheUsage {
+                    input_tokens: 101_000,
+                    cached_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                    cost_microusd: None,
+                    cost_basis: "unavailable",
+                    provider_context_reused: Some(false),
+                },
+            )
+            .expect("the first post-resume replay is worth reporting");
+        assert_eq!(replay.cause, CacheMissCause::BorgReplayedContext);
+
+        assert!(
+            diagnostics
+                .observe(
+                    at + TimeDelta::seconds(2),
+                    signature.clone(),
+                    usage_with_context_reuse(102_000, 0, 0, Some(true)),
+                )
+                .is_none()
+        );
+        assert!(
+            diagnostics
+                .observe(
+                    at + TimeDelta::seconds(3),
+                    signature.clone(),
+                    usage_with_context_reuse(103_000, 0, 0, Some(true)),
+                )
+                .is_none()
+        );
+
+        let status = diagnostics
+            .status(at + TimeDelta::seconds(3), &signature)
+            .expect("measured cache status");
+        assert_eq!(status.label, "cache 0% hit");
+    }
+
+    #[test]
+    fn reused_context_still_reports_signature_and_idle_boundaries() {
+        let mut diagnostics = CacheDiagnostics::default();
+        let at = Utc::now();
+        let original = signature("gpt-5.6-sol", "high");
+        diagnostics.observe(
+            at,
+            original.clone(),
+            usage_with_context_reuse(1_000, 99_000, 0, Some(true)),
+        );
+
+        let changed = diagnostics
+            .observe(
+                at + TimeDelta::seconds(1),
+                signature("gpt-5.6-sol", "low"),
+                usage_with_context_reuse(100_000, 0, 0, Some(true)),
+            )
+            .expect("effort change is a cache boundary");
+        assert_eq!(changed.cause, CacheMissCause::EffortChanged);
+
+        let idle = diagnostics
+            .observe(
+                at + TimeDelta::minutes(31),
+                signature("gpt-5.6-sol", "low"),
+                usage_with_context_reuse(101_000, 0, 0, Some(true)),
+            )
+            .expect("cache expiry is a cache boundary");
+        assert_eq!(
+            idle.cause,
+            CacheMissCause::Idle(Duration::from_secs(31 * 60 - 1))
+        );
     }
 }

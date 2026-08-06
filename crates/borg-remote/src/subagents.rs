@@ -124,6 +124,17 @@ pub struct SpawnSubagent {
     pub effort: Option<String>,
 }
 
+#[derive(Clone)]
+struct BluWorkflowToolContext {
+    session_id: Uuid,
+    root: PathBuf,
+    permission: crate::PermissionMode,
+    snapshot: Arc<dyn Fn() -> Vec<crate::BluWorkflowDefinition> + Send + Sync>,
+    processes: crate::native_process::ProcessManager,
+    store: crate::SqliteSessionStore,
+    autonomy: crate::SqliteAutonomyStore,
+}
+
 /// One provider-neutral model-tool dispatcher for durable goals and child
 /// sessions. Provider adapters should transport this catalog, not implement
 /// their own goal or collaboration semantics.
@@ -143,6 +154,7 @@ pub struct AgentToolDispatcher {
     self_service: crate::self_service::SelfServiceContext,
     autonomy: Option<crate::SqliteAutonomyStore>,
     provider_capabilities: Vec<crate::ProviderCapability>,
+    blu_workflows: Option<BluWorkflowToolContext>,
 }
 
 #[derive(Debug)]
@@ -418,10 +430,26 @@ impl AgentToolDispatcher {
         consultation: Option<SessionConsultationTools>,
         autonomy: Option<crate::SqliteAutonomyStore>,
         provider_capabilities: Vec<crate::ProviderCapability>,
+        workflow_snapshot: Option<
+            Arc<dyn Fn() -> Vec<crate::BluWorkflowDefinition> + Send + Sync>,
+        >,
+        workflow_processes: crate::native_process::ProcessManager,
+        permission: crate::PermissionMode,
     ) -> Self {
         let consultation_enabled = subagents
             .as_ref()
             .is_none_or(|team| team.is_root_session(actor_session_id));
+        let blu_workflows = workflow_snapshot
+            .zip(autonomy.clone())
+            .map(|(snapshot, autonomy)| BluWorkflowToolContext {
+                session_id: actor_session_id,
+                root: cwd.clone(),
+                permission,
+                snapshot,
+                processes: workflow_processes,
+                store: autonomy.session_store(),
+                autonomy,
+            });
         Self {
             goals,
             todos,
@@ -437,6 +465,7 @@ impl AgentToolDispatcher {
             self_service: crate::self_service::SelfServiceContext::new(cwd),
             autonomy,
             provider_capabilities,
+            blu_workflows,
         }
     }
 
@@ -465,7 +494,78 @@ impl AgentToolDispatcher {
     }
 
     pub async fn call(&self, name: &str, arguments: Value) -> Result<Value> {
+        self.call_with_workflow_control(name, arguments, false, None)
+            .await
+    }
+
+    pub(crate) async fn call_with_workflow_control(
+        &self,
+        name: &str,
+        arguments: Value,
+        workflow_approved: bool,
+        workflow_cancel: Option<CancellationToken>,
+    ) -> Result<Value> {
         match name {
+            "list_blu_workflows" => {
+                let _: NoArgs = serde_json::from_value(arguments)?;
+                let context = self
+                    .blu_workflows
+                    .as_ref()
+                    .context("Blu workflow tools are unavailable for this session")?;
+                Ok(json!({
+                    "workflows": (context.snapshot)()
+                        .into_iter()
+                        .map(|workflow| json!({
+                            "extension_id": workflow.extension_id,
+                            "name": workflow.name,
+                            "description": workflow.description,
+                        }))
+                        .collect::<Vec<_>>()
+                }))
+            }
+            "run_blu_extension" => {
+                let args: RunBluExtensionArgs = serde_json::from_value(arguments)?;
+                let context = self
+                    .blu_workflows
+                    .as_ref()
+                    .context("Blu workflow tools are unavailable for this session")?;
+                let workflow = (context.snapshot)()
+                    .into_iter()
+                    .find(|workflow| {
+                        workflow.extension_id == args.extension_id && workflow.name == args.name
+                    })
+                    .with_context(|| {
+                        format!(
+                            "Blu workflow {}:{} is not present in the current extension snapshot",
+                            args.extension_id, args.name
+                        )
+                    })?;
+                let permission = if workflow_approved {
+                    crate::PermissionMode::FullAccess
+                } else {
+                    context.permission
+                };
+                let runner = crate::blu_workflow::BluWorkflowRunner::new(
+                    context.session_id,
+                    context.store.clone(),
+                    context.autonomy.clone(),
+                    Some(self.clone()),
+                    context.processes.clone(),
+                    context.root.clone(),
+                    permission,
+                );
+                let result = runner
+                    .run_with_cancel(
+                        crate::BluWorkflowRequest {
+                            workflow_id: args.workflow_id,
+                            name: format!("{}:{}", workflow.extension_id, workflow.name),
+                            source: workflow.source,
+                        },
+                        workflow_cancel.unwrap_or_else(CancellationToken::new),
+                    )
+                    .await?;
+                Ok(serde_json::to_value(result)?)
+            }
             "get_goal" => {
                 let _: NoArgs = serde_json::from_value(arguments)?;
                 goal_response(self.goals.call(SessionGoalToolRequest::Get).await)
@@ -2979,8 +3079,35 @@ pub fn agent_tool_specs_with_capabilities_and_consultation(
     shared_work_enabled: bool,
     team_policy: Option<&crate::TeamPolicy>,
     consultation_enabled: bool,
-) -> Vec<Value> {
+    ) -> Vec<Value> {
     let mut specs = vec![
+        tool(
+            "list_blu_workflows",
+            "List active trusted Blu extension workflows that this Borg session can invoke. Sources are never exposed; use the returned extension_id and name with run_blu_extension.",
+            json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+        ),
+        tool(
+            "run_blu_extension",
+            "Run one active trusted Blu extension workflow through Borg's durable, capability-gated host APIs. Use a fresh workflow_id UUID for a new execution; repeated IDs are idempotent. The session's permission mode still applies, and workflows cannot grant themselves access.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "workflow_id": {
+                        "type": "string",
+                        "format": "uuid",
+                        "description": "Stable idempotency key for this workflow execution."
+                    },
+                    "extension_id": { "type": "string", "minLength": 1, "maxLength": 64 },
+                    "name": { "type": "string", "minLength": 1, "maxLength": 128 }
+                },
+                "required": ["workflow_id", "extension_id", "name"],
+                "additionalProperties": false
+            }),
+        ),
         tool(
             "consult_model",
             "Ask another configured model for a second opinion. The caller must choose the complete freeform briefing: include whatever context, excerpts, constraints, and questions the other model needs. The response is returned to the calling model for reconciliation; this does not switch the main session provider.",
@@ -3357,6 +3484,14 @@ fn shared_work_tool_specs() -> Vec<Value> {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NoArgs {}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunBluExtensionArgs {
+    workflow_id: Uuid,
+    extension_id: String,
+    name: String,
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

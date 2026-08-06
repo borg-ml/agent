@@ -113,7 +113,6 @@ impl NativeHarness {
             turn.agent_tools.clone(),
             turn.external_mcp_servers.clone(),
             turn.extension_skill_roots.clone(),
-            turn.extension_workflows.clone(),
             self.process_manager.clone(),
             session_store,
         )
@@ -696,7 +695,6 @@ struct NativeToolRuntime {
     permission: PermissionMode,
     agent_tools: crate::AgentToolDispatcher,
     mcp: crate::native_mcp::NativeMcpRuntime,
-    extension_workflows: Vec<crate::BluWorkflowDefinition>,
     processes: crate::native_process::ProcessManager,
     session_store: Option<crate::SqliteSessionStore>,
     context: crate::native_context::NativeContext,
@@ -716,7 +714,6 @@ impl NativeToolRuntime {
         agent_tools: crate::AgentToolDispatcher,
         external_mcp_servers: Vec<borg_provider::mcp::ExternalMcpServer>,
         extension_skill_roots: Vec<PathBuf>,
-        extension_workflows: Vec<crate::BluWorkflowDefinition>,
         processes: crate::native_process::ProcessManager,
         session_store: Option<crate::SqliteSessionStore>,
     ) -> Result<Self> {
@@ -731,7 +728,6 @@ impl NativeToolRuntime {
             permission,
             agent_tools,
             mcp: crate::native_mcp::NativeMcpRuntime::start(external_mcp_servers).await?,
-            extension_workflows,
             processes,
             session_store,
             context,
@@ -748,47 +744,6 @@ impl NativeToolRuntime {
             .chain(self.agent_tools.specs())
             .map(|spec| ModelToolDefinition::from_mcp_spec(&spec).map_err(anyhow::Error::msg))
             .collect::<Result<Vec<_>>>()?;
-        if !self.extension_workflows.is_empty() {
-            let available = self
-                .extension_workflows
-                .iter()
-                .map(|workflow| {
-                    format!(
-                        "{}:{}{}",
-                        workflow.extension_id,
-                        workflow.name,
-                        workflow
-                            .description
-                            .as_deref()
-                            .map(|description| format!(" ({description})"))
-                            .unwrap_or_default()
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            definitions.push(
-                ModelToolDefinition::from_mcp_spec(&tool(
-                    "run_blu_extension",
-                    &format!(
-                        "Execute one installed Blu extension workflow through Borg's durable, \
-                     capability-gated host APIs. Available workflows: {available}. \
-                     The workflow source is loaded from the atomic extension snapshot; \
-                     workflow_id is an idempotency key.",
-                    ),
-                    json!({
-                        "type": "object",
-                        "properties": {
-                            "workflow_id": { "type": "string", "format": "uuid" },
-                            "extension_id": { "type": "string", "minLength": 1, "maxLength": 64 },
-                            "name": { "type": "string", "minLength": 1, "maxLength": 128 }
-                        },
-                        "required": ["workflow_id", "extension_id", "name"],
-                        "additionalProperties": false
-                    }),
-                ))
-                .map_err(anyhow::Error::msg)?,
-            );
-        }
         definitions.extend_from_slice(self.mcp.definitions());
         let mut names = HashSet::with_capacity(definitions.len());
         for definition in &definitions {
@@ -908,36 +863,21 @@ impl NativeToolRuntime {
                 )
                 .await
             }
-            "run_blu_extension" => {
-                let args: RunBluExtensionArgs = serde_json::from_value(arguments)?;
-                let workflow = self
-                    .extension_workflows
-                    .iter()
-                    .find(|workflow| {
-                        workflow.extension_id == args.extension_id && workflow.name == args.name
-                    })
-                    .with_context(|| {
-                        format!(
-                            "Blu workflow {}:{} is not present in the current extension snapshot",
-                            args.extension_id, args.name
-                        )
-                    })?
-                    .clone();
-                self.run_blu_workflow(
-                    args.workflow_id,
-                    format!("{}:{}", workflow.extension_id, workflow.name),
-                    workflow.source,
-                    workflow_approved,
-                    workflow_cancel,
-                )
-                .await
-            }
             "read_skill" => {
                 let args: ReadSkillArgs = serde_json::from_value(arguments)?;
                 self.context.read_skill(&args.name).await
             }
             other if self.mcp.contains(other) => self.mcp.call(other, arguments).await,
-            other => self.agent_tools.call(other, arguments).await,
+            other => {
+                self.agent_tools
+                    .call_with_workflow_control(
+                        other,
+                        arguments,
+                        workflow_approved,
+                        workflow_cancel,
+                    )
+                    .await
+            }
         }
     }
 
@@ -1050,6 +990,7 @@ fn tool_execution_class(name: &str) -> ToolExecutionClass {
         | "read_file"
         | "search_files"
         | "read_skill"
+        | "list_blu_workflows"
         | "get_goal"
         | "get_plan"
         | "list_agents"
@@ -1982,14 +1923,6 @@ struct RunBluWorkflowArgs {
     workflow_id: Uuid,
     name: String,
     source: String,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RunBluExtensionArgs {
-    workflow_id: Uuid,
-    extension_id: String,
-    name: String,
 }
 
 #[derive(Deserialize)]

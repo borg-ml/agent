@@ -1121,6 +1121,8 @@ async fn run_agent_session_store_kernel(
             })
         })
         .flatten();
+    let workflow_snapshot = executor.extension_workflow_snapshot();
+    let workflow_processes = crate::native_process::ProcessManager::default();
     let dispatcher = crate::AgentToolDispatcher::new(
         goal_tools.clone(),
         todo_tools.clone(),
@@ -1135,9 +1137,11 @@ async fn run_agent_session_store_kernel(
         Some(consultation_tools),
         autonomy_store.clone(),
         launch.capabilities.provider_capabilities.clone(),
+        workflow_snapshot,
+        workflow_processes.clone(),
+        launch.permission_mode,
     );
     let workflow_autonomy_store = autonomy_store.clone();
-    let workflow_processes = crate::native_process::ProcessManager::default();
     let agent_tool_server =
         crate::AgentToolServer::start(session_root, session_id, dispatcher.clone()).await?;
     let agent_mcp_server = agent_tool_server.external_mcp_server();

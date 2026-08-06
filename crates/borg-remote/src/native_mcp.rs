@@ -12,6 +12,12 @@ use tokio::sync::Mutex;
 
 const MAX_MCP_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 const MCP_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+const MCP_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+const CURRENT_PROTOCOL_VERSION: &str = "2026-07-28";
+const LEGACY_PROTOCOL_VERSION: &str = "2024-11-05";
+const PROTOCOL_VERSION_META: &str = "io.modelcontextprotocol/protocolVersion";
+const CLIENT_CAPABILITIES_META: &str = "io.modelcontextprotocol/clientCapabilities";
+const CLIENT_INFO_META: &str = "io.modelcontextprotocol/clientInfo";
 
 pub(crate) struct NativeMcpRuntime {
     clients: Vec<Mutex<NativeMcpClient>>,
@@ -98,9 +104,23 @@ impl NativeMcpRuntime {
 struct NativeMcpClient {
     server_name: String,
     next_id: u64,
+    mode: McpMode,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     _child: Child,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum McpMode {
+    Probing,
+    Modern(String),
+    Legacy,
+}
+
+enum ModernProbe {
+    Ready(String),
+    Unsupported(Vec<String>),
+    Fallback,
 }
 
 struct ListedTool {
@@ -111,6 +131,37 @@ struct ListedTool {
 
 impl NativeMcpClient {
     async fn start(server: &ExternalMcpServer) -> Result<Self> {
+        let mut probe = Self::spawn(server).await?;
+        match probe.probe_modern().await {
+            ModernProbe::Ready(version) => {
+                probe.mode = McpMode::Modern(version);
+                Ok(probe)
+            }
+            ModernProbe::Unsupported(supported) => {
+                if let Some(version) = select_modern_version(&supported) {
+                    match probe.probe_modern_version(&version).await {
+                        ModernProbe::Ready(version) => {
+                            probe.mode = McpMode::Modern(version);
+                            Ok(probe)
+                        }
+                        ModernProbe::Unsupported(_) | ModernProbe::Fallback => bail!(
+                            "MCP server `{}` rejected the negotiated protocol version `{version}`",
+                            server.name
+                        ),
+                    }
+                } else {
+                    drop(probe);
+                    Self::start_legacy(server).await
+                }
+            }
+            ModernProbe::Fallback => {
+                drop(probe);
+                Self::start_legacy(server).await
+            }
+        }
+    }
+
+    async fn spawn(server: &ExternalMcpServer) -> Result<Self> {
         let mut command = Command::new(&server.command);
         command
             .args(&server.args)
@@ -146,18 +197,25 @@ impl NativeMcpClient {
                 }
             });
         }
-        let mut client = Self {
+        let client = Self {
             server_name: server.name.clone(),
             next_id: 1,
+            mode: McpMode::Probing,
             stdin,
             stdout: BufReader::new(stdout),
             _child: child,
         };
+        Ok(client)
+    }
+
+    async fn start_legacy(server: &ExternalMcpServer) -> Result<Self> {
+        let mut client = Self::spawn(server).await?;
+        client.mode = McpMode::Legacy;
         client
             .request(
                 "initialize",
                 json!({
-                    "protocolVersion": "2024-11-05",
+                    "protocolVersion": LEGACY_PROTOCOL_VERSION,
                     "capabilities": {},
                     "clientInfo": {
                         "name": "borg-native-harness",
@@ -171,6 +229,65 @@ impl NativeMcpClient {
             .notify("notifications/initialized", json!({}))
             .await?;
         Ok(client)
+    }
+
+    async fn probe_modern(&mut self) -> ModernProbe {
+        self.probe_modern_version(CURRENT_PROTOCOL_VERSION).await
+    }
+
+    async fn probe_modern_version(&mut self, version: &str) -> ModernProbe {
+        let id = Value::from(self.next_id);
+        self.next_id = self.next_id.saturating_add(1);
+        if self
+            .write(&json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "server/discover",
+                "params": modern_params(json!({}), version),
+            }))
+            .await
+            .is_err()
+        {
+            return ModernProbe::Fallback;
+        }
+        let response = match tokio::time::timeout(MCP_PROBE_TIMEOUT, self.read_response(&id)).await
+        {
+            Ok(Ok(response)) => response,
+            _ => return ModernProbe::Fallback,
+        };
+        if let Some(error) = response.get("error") {
+            if error.get("code").and_then(Value::as_i64) == Some(-32022) {
+                let supported = error
+                    .get("data")
+                    .and_then(|data| data.get("supported"))
+                    .and_then(Value::as_array)
+                    .map(|versions| {
+                        versions
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                return ModernProbe::Unsupported(supported);
+            }
+            return ModernProbe::Fallback;
+        }
+        let Some(versions) = response
+            .get("result")
+            .and_then(|result| result.get("supportedVersions"))
+            .and_then(Value::as_array)
+        else {
+            return ModernProbe::Fallback;
+        };
+        let supported = versions
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        select_modern_version(&supported)
+            .map(ModernProbe::Ready)
+            .unwrap_or(ModernProbe::Fallback)
     }
 
     async fn list_tools(&mut self) -> Result<Vec<ListedTool>> {
@@ -225,8 +342,12 @@ impl NativeMcpClient {
     }
 
     async fn request_inner(&mut self, method: &str, params: Value) -> Result<Value> {
-        let id = self.next_id;
+        let id = Value::from(self.next_id);
         self.next_id = self.next_id.saturating_add(1);
+        let params = match &self.mode {
+            McpMode::Modern(version) => modern_params(params, version),
+            McpMode::Probing | McpMode::Legacy => params,
+        };
         self.write(&json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -234,9 +355,24 @@ impl NativeMcpClient {
             "params": params,
         }))
         .await?;
+        let message = self.read_response(&id).await?;
+        if let Some(error) = message.get("error") {
+            bail!(
+                "MCP server `{}` returned an error for {method}: {}",
+                self.server_name,
+                truncate(&error.to_string(), 4096)
+            );
+        }
+        message
+            .get("result")
+            .cloned()
+            .context("MCP response is missing result")
+    }
+
+    async fn read_response(&mut self, id: &Value) -> Result<Value> {
         loop {
             let message = self.read_message().await?;
-            if message.get("id").and_then(Value::as_u64) != Some(id) {
+            if message.get("id") != Some(id) {
                 if message.get("method").and_then(Value::as_str) == Some("ping")
                     && let Some(server_request_id) = message.get("id").cloned()
                 {
@@ -249,17 +385,7 @@ impl NativeMcpClient {
                 }
                 continue;
             }
-            if let Some(error) = message.get("error") {
-                bail!(
-                    "MCP server `{}` returned an error for {method}: {}",
-                    self.server_name,
-                    truncate(&error.to_string(), 4096)
-                );
-            }
-            return message
-                .get("result")
-                .cloned()
-                .context("MCP response is missing result");
+            return Ok(message);
         }
     }
 
@@ -304,6 +430,29 @@ impl NativeMcpClient {
         serde_json::from_str(&line)
             .with_context(|| format!("MCP server `{}` emitted invalid JSON", self.server_name))
     }
+}
+
+fn modern_params(params: Value, version: &str) -> Value {
+    let mut object = params.as_object().cloned().unwrap_or_default();
+    object.insert(
+        "_meta".to_string(),
+        json!({
+            PROTOCOL_VERSION_META: version,
+            CLIENT_CAPABILITIES_META: {},
+            CLIENT_INFO_META: {
+                "name": "borg-native-harness",
+                "version": env!("CARGO_PKG_VERSION"),
+            },
+        }),
+    );
+    Value::Object(object)
+}
+
+fn select_modern_version(supported: &[String]) -> Option<String> {
+    supported
+        .iter()
+        .find(|version| version.as_str() == CURRENT_PROTOCOL_VERSION)
+        .cloned()
 }
 
 fn external_tool_name(server_name: &str, wire_name: &str) -> String {
@@ -379,5 +528,48 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text
             .await
             .unwrap();
         assert_eq!(result["content"][0]["text"], "ok");
+    }
+
+    #[tokio::test]
+    async fn stdio_client_prefers_stateless_discovery_and_per_request_metadata() {
+        let script = r#"
+read _discover
+case "$_discover" in
+  *server/discover*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{"listChanged":false}}}}' ;;
+esac
+read _list
+case "$_list" in
+  *tools/list*2026-07-28*) printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[{"name":"echo","description":"Echo","inputSchema":{"type":"object"}}]}}' ;;
+  *) exit 3 ;;
+esac
+read _call
+case "$_call" in
+  *tools/call*2026-07-28*) printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","content":[{"type":"text","text":"ok"}]}}' ;;
+  *) exit 4 ;;
+esac
+"#;
+        let runtime = NativeMcpRuntime::start(vec![ExternalMcpServer {
+            name: "modern-server".to_string(),
+            command: "sh".to_string(),
+            args: vec!["-c".to_string(), script.to_string()],
+            env: BTreeMap::new(),
+            allowed_tools: vec![],
+        }])
+        .await
+        .unwrap();
+        assert!(runtime.contains("mcp__modern_server__echo"));
+        let result = runtime
+            .call("mcp__modern_server__echo", json!({ "value": "hello" }))
+            .await
+            .unwrap();
+        assert_eq!(result["content"][0]["text"], "ok");
+    }
+
+    #[test]
+    fn modern_params_are_inline_and_stateless() {
+        let params = modern_params(json!({ "name": "echo" }), CURRENT_PROTOCOL_VERSION);
+        assert_eq!(params["_meta"][PROTOCOL_VERSION_META], CURRENT_PROTOCOL_VERSION);
+        assert!(params["_meta"][CLIENT_CAPABILITIES_META].is_object());
+        assert!(params["_meta"][CLIENT_INFO_META].is_object());
     }
 }

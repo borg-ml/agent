@@ -11,6 +11,12 @@ use tokio::net::TcpStream;
 #[cfg(unix)]
 use tokio::net::UnixStream;
 
+const CURRENT_PROTOCOL_VERSION: &str = "2026-07-28";
+const LEGACY_PROTOCOL_VERSION: &str = "2024-11-05";
+const PROTOCOL_VERSION_META: &str = "io.modelcontextprotocol/protocolVersion";
+const CLIENT_CAPABILITIES_META: &str = "io.modelcontextprotocol/clientCapabilities";
+const SERVER_INFO_META: &str = "io.modelcontextprotocol/serverInfo";
+
 pub(crate) async fn run() -> Result<()> {
     let endpoint = AgentToolEndpoint::from_env()?;
     let stdin = BufReader::new(tokio::io::stdin());
@@ -151,6 +157,18 @@ impl AgentToolEndpoint {
     }
 }
 
+#[derive(Debug)]
+enum RequestProtocol {
+    Modern,
+    Legacy,
+}
+
+#[derive(Debug)]
+enum ProtocolError {
+    Invalid(String),
+    Unsupported { requested: String },
+}
+
 async fn handle_line(endpoint: &AgentToolEndpoint, line: &str) -> Option<Value> {
     let request: Value = match serde_json::from_str(line) {
         Ok(request) => request,
@@ -158,22 +176,57 @@ async fn handle_line(endpoint: &AgentToolEndpoint, line: &str) -> Option<Value> 
     };
     let id = request.get("id").cloned()?;
     let method = request.get("method").and_then(Value::as_str).unwrap_or("");
+    let protocol = match request_protocol(&request, method) {
+        Ok(protocol) => protocol,
+        Err(ProtocolError::Invalid(message)) => return Some(rpc_error(id, -32602, message)),
+        Err(ProtocolError::Unsupported { requested }) => {
+            return Some(rpc_error_with_data(
+                id,
+                -32022,
+                format!("unsupported MCP protocol version `{requested}`"),
+                json!({
+                    "supported": [CURRENT_PROTOCOL_VERSION, LEGACY_PROTOCOL_VERSION],
+                    "requested": requested,
+                }),
+            ));
+        }
+    };
+    let modern = matches!(protocol, RequestProtocol::Modern);
     let result = match method {
-        "initialize" => Ok(json!({
-            "protocolVersion": "2024-11-05",
-            "serverInfo": { "name": "borg-agent", "version": env!("CARGO_PKG_VERSION") },
+        "server/discover" if modern => Ok(json!({
+            "resultType": "complete",
+            "supportedVersions": [CURRENT_PROTOCOL_VERSION, LEGACY_PROTOCOL_VERSION],
+            "capabilities": { "tools": { "listChanged": false } },
+            "_meta": server_meta(),
+        })),
+        "server/discover" => Err(anyhow::anyhow!(
+            "server/discover requires stateless MCP request metadata"
+        )),
+        "initialize" if !modern => Ok(json!({
+            "protocolVersion": LEGACY_PROTOCOL_VERSION,
+            "serverInfo": server_info(),
             "capabilities": { "tools": {} }
         })),
-        "ping" => Ok(json!({})),
-        "tools/list" => Ok(json!({
-            "tools": borg_remote::agent_tool_specs_with_capabilities_and_consultation(
-                endpoint.provider(),
-                true,
-                endpoint.shared_work_enabled(),
-                endpoint.team_policy(),
-                endpoint.consultation_enabled(),
-            )
+        "initialize" => Err(anyhow::anyhow!(
+            "initialize is only available for legacy MCP clients"
+        )),
+        "ping" if modern => Ok(json!({
+            "resultType": "complete",
+            "_meta": server_meta(),
         })),
+        "ping" => Ok(json!({})),
+        "tools/list" => {
+            let result = json!({
+                "tools": borg_remote::agent_tool_specs_with_capabilities_and_consultation(
+                    endpoint.provider(),
+                    true,
+                    endpoint.shared_work_enabled(),
+                    endpoint.team_policy(),
+                    endpoint.consultation_enabled(),
+                )
+            });
+            Ok(if modern { modern_result(result) } else { result })
+        }
         "tools/call" => {
             let params = request.get("params").cloned().unwrap_or_else(|| json!({}));
             let name = params
@@ -186,16 +239,15 @@ async fn handle_line(endpoint: &AgentToolEndpoint, line: &str) -> Option<Value> 
                         .get("arguments")
                         .cloned()
                         .unwrap_or_else(|| json!({}));
-                    forward(endpoint, name, arguments).await.map(|value| {
-                        json!({
-                            "content": [{
-                                "type": "text",
-                                "text": serde_json::to_string(&value).unwrap_or_default()
-                            }],
-                            "structuredContent": value,
-                            "isError": false
-                        })
-                    })
+                    match forward(endpoint, name, arguments).await {
+                        Ok(value) => Ok(if modern {
+                            modern_tool_result(value)
+                        } else {
+                            legacy_tool_result(value)
+                        }),
+                        Err(error) if modern => Ok(modern_tool_error(&error)),
+                        Err(error) => Err(error),
+                    }
                 }
                 Err(error) => Err(error),
             }
@@ -206,6 +258,92 @@ async fn handle_line(endpoint: &AgentToolEndpoint, line: &str) -> Option<Value> 
         Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
         Err(error) => rpc_error(id, -32000, format!("{error:#}")),
     })
+}
+
+fn request_protocol(request: &Value, method: &str) -> std::result::Result<RequestProtocol, ProtocolError> {
+    let params = request
+        .get("params")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let Some(params) = params.as_object() else {
+        return Err(ProtocolError::Invalid(
+            "MCP request params must be an object".to_string(),
+        ));
+    };
+    let Some(meta) = params.get("_meta") else {
+        if method == "server/discover" {
+            return Err(ProtocolError::Invalid(
+                "stateless MCP requests require params._meta".to_string(),
+            ));
+        }
+        return Ok(RequestProtocol::Legacy);
+    };
+    let Some(meta) = meta.as_object() else {
+        return Err(ProtocolError::Invalid(
+            "MCP request params._meta must be an object".to_string(),
+        ));
+    };
+    let Some(version) = meta.get(PROTOCOL_VERSION_META).and_then(Value::as_str) else {
+        return Err(ProtocolError::Invalid(format!(
+            "MCP request metadata is missing `{PROTOCOL_VERSION_META}`"
+        )));
+    };
+    if version != CURRENT_PROTOCOL_VERSION {
+        return Err(ProtocolError::Unsupported {
+            requested: version.to_string(),
+        });
+    }
+    if !meta
+        .get(CLIENT_CAPABILITIES_META)
+        .is_some_and(Value::is_object)
+    {
+        return Err(ProtocolError::Invalid(format!(
+            "MCP request metadata is missing object `{CLIENT_CAPABILITIES_META}`"
+        )));
+    }
+    Ok(RequestProtocol::Modern)
+}
+
+fn server_info() -> Value {
+    json!({ "name": "borg-agent", "version": env!("CARGO_PKG_VERSION") })
+}
+
+fn server_meta() -> Value {
+    json!({ SERVER_INFO_META: server_info() })
+}
+
+fn modern_result(mut result: Value) -> Value {
+    let object = result
+        .as_object_mut()
+        .expect("MCP result helpers only receive JSON objects");
+    object.insert("resultType".to_string(), Value::String("complete".to_string()));
+    object.insert("_meta".to_string(), server_meta());
+    result
+}
+
+fn legacy_tool_result(value: Value) -> Value {
+    json!({
+        "content": [{
+            "type": "text",
+            "text": serde_json::to_string(&value).unwrap_or_default()
+        }],
+        "structuredContent": value,
+        "isError": false
+    })
+}
+
+fn modern_tool_result(value: Value) -> Value {
+    modern_result(legacy_tool_result(value))
+}
+
+fn modern_tool_error(error: &anyhow::Error) -> Value {
+    modern_result(json!({
+        "content": [{
+            "type": "text",
+            "text": format!("{error:#}")
+        }],
+        "isError": true
+    }))
 }
 
 fn agent_tool_provider() -> Result<borg_remote::CodingProvider> {
@@ -269,6 +407,14 @@ fn rpc_error(id: Value, code: i64, message: String) -> Value {
     })
 }
 
+fn rpc_error_with_data(id: Value, code: i64, message: String, data: Value) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": { "code": code, "message": message, "data": data }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,5 +456,96 @@ mod tests {
         assert!(names.contains(&"wait_agent"));
         assert!(names.contains(&"create_shared_work"));
         assert!(names.contains(&"consult_peer"));
+        assert!(names.contains(&"list_blu_workflows"));
+        assert!(names.contains(&"run_blu_extension"));
+    }
+
+    #[tokio::test]
+    async fn stateless_discovery_and_tool_listing_use_current_protocol_metadata() {
+        #[cfg(unix)]
+        let endpoint = AgentToolEndpoint::Unix {
+            socket: Path::new("/unused").to_path_buf(),
+            provider: borg_remote::CodingProvider::Codex,
+            shared_work_enabled: false,
+            consultation_enabled: true,
+            team_policy: None,
+        };
+        #[cfg(not(unix))]
+        let endpoint = AgentToolEndpoint::Loopback {
+            address: "127.0.0.1:1".parse().unwrap(),
+            token: "unused".to_string(),
+            provider: borg_remote::CodingProvider::Codex,
+            shared_work_enabled: false,
+            consultation_enabled: true,
+            team_policy: None,
+        };
+        let meta = json!({
+            PROTOCOL_VERSION_META: CURRENT_PROTOCOL_VERSION,
+            CLIENT_CAPABILITIES_META: {},
+        });
+        let discover = handle_line(
+            &endpoint,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "server/discover",
+                "params": { "_meta": meta },
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(discover["result"]["resultType"], "complete");
+        assert_eq!(
+            discover["result"]["supportedVersions"][0],
+            CURRENT_PROTOCOL_VERSION
+        );
+        assert!(discover["result"]["_meta"][SERVER_INFO_META].is_object());
+
+        let listing = handle_line(
+            &endpoint,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/list",
+                "params": { "_meta": {
+                    PROTOCOL_VERSION_META: CURRENT_PROTOCOL_VERSION,
+                    CLIENT_CAPABILITIES_META: {},
+                }},
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(listing["result"]["resultType"], "complete");
+        assert!(listing["result"]["tools"].is_array());
+    }
+
+    #[tokio::test]
+    async fn stateless_requests_require_protocol_metadata() {
+        #[cfg(unix)]
+        let endpoint = AgentToolEndpoint::Unix {
+            socket: Path::new("/unused").to_path_buf(),
+            provider: borg_remote::CodingProvider::Codex,
+            shared_work_enabled: false,
+            consultation_enabled: true,
+            team_policy: None,
+        };
+        #[cfg(not(unix))]
+        let endpoint = AgentToolEndpoint::Loopback {
+            address: "127.0.0.1:1".parse().unwrap(),
+            token: "unused".to_string(),
+            provider: borg_remote::CodingProvider::Codex,
+            shared_work_enabled: false,
+            consultation_enabled: true,
+            team_policy: None,
+        };
+        let response = handle_line(
+            &endpoint,
+            r#"{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{}}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response["error"]["code"], -32602);
     }
 }

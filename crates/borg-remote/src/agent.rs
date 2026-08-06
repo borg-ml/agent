@@ -183,6 +183,15 @@ pub trait AgentTurnExecutor: Send + Sync {
         false
     }
 
+    /// Return a live view of the trusted executable Blu workflows available to
+    /// the session. The view is intentionally a closure so extension reloads
+    /// become visible to model tools without rebuilding the dispatcher.
+    fn extension_workflow_snapshot(
+        &self,
+    ) -> Option<Arc<dyn Fn() -> Vec<BluWorkflowDefinition> + Send + Sync>> {
+        None
+    }
+
     /// Run an isolated, one-shot consultation without attaching it to the
     /// main session's provider conversation or exposing the main session's
     /// tools. Providers that cannot offer this path report a normal tool error.
@@ -493,6 +502,19 @@ impl LocalAgentTurnExecutor {
 impl AgentTurnExecutor for LocalAgentTurnExecutor {
     fn supports_subscription_context_reuse(&self, provider: CodingProvider) -> bool {
         matches!(provider, CodingProvider::Codex | CodingProvider::Claude)
+    }
+
+    fn extension_workflow_snapshot(
+        &self,
+    ) -> Option<Arc<dyn Fn() -> Vec<BluWorkflowDefinition> + Send + Sync>> {
+        let runtime_extensions = Arc::clone(&self.runtime_extensions);
+        Some(Arc::new(move || {
+            runtime_extensions
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .workflows
+                .clone()
+        }))
     }
 
     async fn execute(
