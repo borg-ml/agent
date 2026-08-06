@@ -584,9 +584,16 @@ mod tests {
     use crate::PromptDelivery;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    fn short_socket_tempdir() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("borg-session-")
+            .tempdir_in("/tmp")
+            .expect("short Unix socket test directory")
+    }
+
     #[tokio::test]
     async fn owner_metadata_prevents_silent_attachment_to_an_obsolete_binary() {
-        let root = tempfile::tempdir().unwrap();
+        let root = short_socket_tempdir();
         let session_id = Uuid::new_v4();
         let journal_path = root.path().join(format!("{session_id}.lock"));
         let socket_path = session_control_socket_path(root.path(), session_id);
@@ -615,7 +622,7 @@ mod tests {
 
     #[tokio::test]
     async fn attached_commands_are_acknowledged_and_session_scoped() {
-        let root = tempfile::tempdir().unwrap();
+        let root = short_socket_tempdir();
         let session_id = Uuid::new_v4();
         let socket_path = session_control_socket_path(root.path(), session_id);
         let journal_path = root.path().join(format!("{session_id}.lock"));
@@ -689,7 +696,7 @@ mod tests {
 
     #[tokio::test]
     async fn presence_channel_tracks_idle_attached_viewers() {
-        let root = tempfile::tempdir().unwrap();
+        let root = short_socket_tempdir();
         let session_id = Uuid::new_v4();
         let journal_path = root.path().join(format!("{session_id}.lock"));
         let socket_path = session_control_socket_path(root.path(), session_id);
@@ -721,7 +728,7 @@ mod tests {
 
     #[tokio::test]
     async fn attachment_ends_cleanly_when_the_writer_disappears() {
-        let root = tempfile::tempdir().unwrap();
+        let root = short_socket_tempdir();
         let session_id = Uuid::new_v4();
         let journal_path = root.path().join(format!("{session_id}.lock"));
         let socket_path = session_control_socket_path(root.path(), session_id);
@@ -759,7 +766,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_new_owner_reclaims_a_refused_socket() {
-        let root = tempfile::tempdir().unwrap();
+        let root = short_socket_tempdir();
         let session_id = Uuid::new_v4();
         let socket_path = session_control_socket_path(root.path(), session_id);
         let lock_path = root.path().join(format!("{session_id}.lock"));
@@ -781,7 +788,7 @@ mod tests {
 
     #[tokio::test]
     async fn attachment_delivers_durable_status_before_live_projection_state() {
-        let root = tempfile::tempdir().unwrap();
+        let root = short_socket_tempdir();
         let session_id = Uuid::new_v4();
         let journal_path = root.path().join(format!("{session_id}.lock"));
         let socket_path = session_control_socket_path(root.path(), session_id);

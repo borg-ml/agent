@@ -22,9 +22,10 @@ claude-native:
         fi
     done
     test -n "$platform_dir"
+    sdk_dir="$install_dir/node_modules/@anthropic-ai/claude-agent-sdk"
     cp "$platform_dir/claude" "$native_dir/claude"
-    cp "$platform_dir/manifest.json" "$native_dir/manifest.json"
-    cp "$install_dir/node_modules/@anthropic-ai/claude-agent-sdk/package.json" "$native_dir/package.json"
+    cp "$sdk_dir/manifest.json" "$native_dir/manifest.json"
+    cp "$sdk_dir/package.json" "$native_dir/package.json"
     chmod 700 "$native_dir/claude"
 
 # Validate a release without changing the repository.

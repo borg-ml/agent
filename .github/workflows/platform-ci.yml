@@ -23,6 +23,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
           toolchain: "1.94.0"
+          components: rustfmt, clippy
       - name: Install quality tools
         run: cargo install --locked just cargo-deny cargo-audit
       - name: Run workspace verification
@@ -93,10 +94,11 @@ jobs:
             fi
           done
           test -n "$native_package"
+          sdk_package="packages/claude-native-runtime/node_modules/@anthropic-ai/claude-agent-sdk"
           mkdir -p "$stage/borg-${{ matrix.target }}/providers/claude"
           cp "$native_package/claude" "$stage/borg-${{ matrix.target }}/providers/claude/claude"
-          cp "$native_package/manifest.json" "$stage/borg-${{ matrix.target }}/providers/claude/manifest.json"
-          cp packages/claude-native-runtime/node_modules/@anthropic-ai/claude-agent-sdk/package.json "$stage/borg-${{ matrix.target }}/providers/claude/package.json"
+          cp "$sdk_package/manifest.json" "$stage/borg-${{ matrix.target }}/providers/claude/manifest.json"
+          cp "$sdk_package/package.json" "$stage/borg-${{ matrix.target }}/providers/claude/package.json"
           chmod 700 "$stage/borg-${{ matrix.target }}/providers/claude/claude"
           mkdir -p "$stage/borg-${{ matrix.target }}/docs" "$stage/borg-${{ matrix.target }}/configs"
           cp docs/blu-extensions.md "$stage/borg-${{ matrix.target }}/docs/"
@@ -122,10 +124,11 @@ jobs:
             Where-Object { $_.Name -like "claude-agent-sdk-*" -and (Test-Path (Join-Path $_.FullName "claude.exe")) } |
             Select-Object -First 1
           if (-not $platformPackage) { throw "Claude native platform package was not installed" }
+          $sdkPackage = "packages/claude-native-runtime/node_modules/@anthropic-ai/claude-agent-sdk"
           New-Item -ItemType Directory -Path "$stage/providers/claude"
           Copy-Item (Join-Path $platformPackage.FullName "claude.exe") "$stage/providers/claude/claude.exe"
-          Copy-Item (Join-Path $platformPackage.FullName "manifest.json") "$stage/providers/claude/manifest.json"
-          Copy-Item "packages/claude-native-runtime/node_modules/@anthropic-ai/claude-agent-sdk/package.json" "$stage/providers/claude/package.json"
+          Copy-Item (Join-Path $sdkPackage "manifest.json") "$stage/providers/claude/manifest.json"
+          Copy-Item (Join-Path $sdkPackage "package.json") "$stage/providers/claude/package.json"
           New-Item -ItemType Directory -Path "$stage/docs", "$stage/configs"
           Copy-Item "docs/blu-extensions.md" "$stage/docs/"
           Copy-Item "configs/extension.example.toml" "$stage/configs/"

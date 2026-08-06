@@ -4,6 +4,17 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to rebuild and publish
+        required: true
+        type: string
+
+run-name: Release ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
 
 permissions:
   contents: read
@@ -13,9 +24,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
           toolchain: "1.94.0"
+          components: rustfmt, clippy
       - name: Install quality tools
         run: cargo install --locked just cargo-deny cargo-audit
       - name: Run workspace verification
@@ -23,7 +37,7 @@ jobs:
       - name: Verify tag and release tooling
         shell: bash
         run: |
-          ./scripts/release.sh --verify-tag "$GITHUB_REF_NAME"
+          ./scripts/release.sh --verify-tag "$RELEASE_TAG"
           ./scripts/release-test.sh
 
   build:
@@ -53,6 +67,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
           toolchain: "1.94.0"
@@ -90,10 +106,11 @@ jobs:
             fi
           done
           test -n "$native_package"
+          sdk_package="packages/claude-native-runtime/node_modules/@anthropic-ai/claude-agent-sdk"
           mkdir -p "$package_dir/providers/claude"
           cp "$native_package/claude" "$package_dir/providers/claude/claude"
-          cp "$native_package/manifest.json" "$package_dir/providers/claude/manifest.json"
-          cp packages/claude-native-runtime/node_modules/@anthropic-ai/claude-agent-sdk/package.json "$package_dir/providers/claude/package.json"
+          cp "$sdk_package/manifest.json" "$package_dir/providers/claude/manifest.json"
+          cp "$sdk_package/package.json" "$package_dir/providers/claude/package.json"
           chmod 700 "$package_dir/providers/claude/claude"
           mkdir -p "$package_dir/docs" "$package_dir/configs"
           cp docs/blu-extensions.md "$package_dir/docs/"
@@ -117,10 +134,11 @@ jobs:
             Where-Object { $_.Name -like "claude-agent-sdk-*" -and (Test-Path (Join-Path $_.FullName "claude.exe")) } |
             Select-Object -First 1
           if (-not $platformPackage) { throw "Claude native platform package was not installed" }
+          $sdkPackage = "packages/claude-native-runtime/node_modules/@anthropic-ai/claude-agent-sdk"
           New-Item -ItemType Directory -Path "$packageDir/providers/claude"
           Copy-Item (Join-Path $platformPackage.FullName "claude.exe") "$packageDir/providers/claude/claude.exe"
-          Copy-Item (Join-Path $platformPackage.FullName "manifest.json") "$packageDir/providers/claude/manifest.json"
-          Copy-Item "packages/claude-native-runtime/node_modules/@anthropic-ai/claude-agent-sdk/package.json" "$packageDir/providers/claude/package.json"
+          Copy-Item (Join-Path $sdkPackage "manifest.json") "$packageDir/providers/claude/manifest.json"
+          Copy-Item (Join-Path $sdkPackage "package.json") "$packageDir/providers/claude/package.json"
           New-Item -ItemType Directory -Path "$packageDir/docs", "$packageDir/configs"
           Copy-Item "docs/blu-extensions.md" "$packageDir/docs/"
           Copy-Item "configs/extension.example.toml" "$packageDir/configs/"
@@ -176,5 +194,6 @@ jobs:
           merge-multiple: true
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
+          tag_name: ${{ env.RELEASE_TAG }}
           files: artifacts/*
           generate_release_notes: true

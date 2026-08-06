@@ -118,7 +118,7 @@ impl LocalServerLease {
 
 impl Drop for LocalServerLease {
     fn drop(&mut self) {
-        let Some(child) = self.child.as_ref() else {
+        let Some(child) = self.child.as_mut() else {
             return;
         };
         if let Some(pid) = self.pid.or_else(|| child.id()) {
@@ -638,6 +638,10 @@ fn isolate_process_group(command: &mut Command) {
     #[cfg(unix)]
     {
         command.process_group(0);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = command;
     }
 }
 

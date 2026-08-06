@@ -1,7 +1,16 @@
 use super::*;
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
+#[cfg(unix)]
 use tokio::io::AsyncReadExt;
+
+#[cfg(unix)]
+fn short_socket_tempdir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("borg-session-")
+        .tempdir_in("/tmp")
+        .expect("short Unix socket test directory")
+}
 
 #[test]
 fn pending_revert_forks_after_stop_or_actor_disconnect() {
@@ -737,8 +746,9 @@ fn session_switch_distinguishes_owner_shutdown_from_viewer_detach() {
 }
 
 #[tokio::test]
+#[cfg(unix)]
 async fn owner_shutdown_hands_active_turn_to_an_attached_viewer() {
-    let root = tempdir().unwrap();
+    let root = short_socket_tempdir();
     let session_id = Uuid::new_v4();
     let journal_path = root.path().join(format!("{session_id}.lock"));
     let socket_path = session_control_socket_path(root.path(), session_id);
@@ -814,8 +824,9 @@ fn owned_resume_presents_stopped_state_as_ready_while_rehydrating() {
 }
 
 #[tokio::test]
+#[cfg(unix)]
 async fn obsolete_owner_handoff_releases_and_reacquires_the_writer_lease() {
-    let root = tempdir().unwrap();
+    let root = short_socket_tempdir();
     let session_id = Uuid::new_v4();
     let journal_path = root.path().join(format!("{session_id}.lock"));
     let socket_path = session_control_socket_path(root.path(), session_id);

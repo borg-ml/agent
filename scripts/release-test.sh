@@ -29,6 +29,20 @@ if [[ -f "$repo_root/.github/workflows/release.yml" ]]; then
   fi
   grep -Fq 'providers/claude' "$release_workflow" ||
     fail "release archive does not package the native Claude payload"
+  grep -Fq 'components: rustfmt, clippy' "$release_workflow" ||
+    fail "release validation does not install rustfmt and clippy"
+  grep -Fq 'workflow_dispatch:' "$release_workflow" ||
+    fail "release workflow cannot recover an existing tag"
+  grep -Fq 'tag_name: ${{ env.RELEASE_TAG }}' "$release_workflow" ||
+    fail "release publication is not pinned to the requested tag"
+  grep -Fq '$sdk_package/manifest.json' "$release_workflow" ||
+    fail "Unix release packaging does not use the SDK manifest"
+  grep -Fq 'Join-Path $sdkPackage "manifest.json"' "$release_workflow" ||
+    fail "Windows release packaging does not use the SDK manifest"
+  if grep -Fq '$native_package/manifest.json' "$release_workflow" ||
+    grep -Fq 'Join-Path $platformPackage.FullName "manifest.json"' "$release_workflow"; then
+    fail "release packaging reads a manifest that is absent from platform packages"
+  fi
   grep -Fq 'docs/blu-extensions.md' "$release_workflow" ||
     fail "release archive does not package the Blu guide"
   grep -Fq 'configs/extension.example.toml' "$release_workflow" ||
@@ -59,12 +73,30 @@ if [[ -f "$repo_root/.github/workflows/platform-ci.yml" ]]; then
     fail "platform workflow is missing the binary-only native test matrix"
   grep -Fq 'providers/claude' "$platform_workflow" ||
     fail "platform archive does not package the native Claude payload"
+  grep -Fq 'components: rustfmt, clippy' "$platform_workflow" ||
+    fail "platform quality job does not install rustfmt and clippy"
+  grep -Fq '$sdk_package/manifest.json' "$platform_workflow" ||
+    fail "Unix platform packaging does not use the SDK manifest"
+  grep -Fq 'Join-Path $sdkPackage "manifest.json"' "$platform_workflow" ||
+    fail "Windows platform packaging does not use the SDK manifest"
+  if grep -Fq '$native_package/manifest.json' "$platform_workflow" ||
+    grep -Fq 'Join-Path $platformPackage.FullName "manifest.json"' "$platform_workflow"; then
+    fail "platform packaging reads a manifest that is absent from platform packages"
+  fi
   grep -Fq 'docs/blu-extensions.md' "$platform_workflow" ||
     fail "platform archive does not package the Blu guide"
   grep -Fq 'configs/extension.example.toml' "$platform_workflow" ||
     fail "platform archive does not package the Blu manifest example"
   if grep -Eq 'providers/claude-sdk|BORG_CLAUDE_NATIVE|borg-claude-sdk' "$platform_workflow"; then
     fail "platform workflow still contains the removed Claude fallback"
+  fi
+fi
+
+if [[ -f "$repo_root/Justfile" ]]; then
+  grep -Fq 'cp "$sdk_dir/manifest.json" "$native_dir/manifest.json"' "$repo_root/Justfile" ||
+    fail "just claude-native does not install the SDK manifest"
+  if grep -Fq 'cp "$platform_dir/manifest.json"' "$repo_root/Justfile"; then
+    fail "just claude-native reads a manifest that is absent from platform packages"
   fi
 fi
 
