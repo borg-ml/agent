@@ -81,9 +81,9 @@ pub use subagents::{
 };
 pub use tool_presentation::{
     ToolPresentation, ToolPresentationBody, ToolPresentationCategory, compact_text,
-    is_diff_language, is_edit_tool, is_subagent_tool, project_tool_presentation, tool_call_summary,
-    tool_code_view, tool_has_rich_ui, tool_output_code_view, tool_output_is_backgrounded,
-    web_search_query,
+    is_diff_language, is_edit_tool, is_mcp_resource_probe, is_subagent_tool,
+    project_tool_presentation, tool_call_summary, tool_code_view, tool_has_rich_ui,
+    tool_output_code_view, tool_output_is_backgrounded, web_search_query,
 };
 pub use workspace::{
     AtomicWorkClaim, Audience, DeliveryAttempt, DeliveryCursor, DeliveryMode, DeliveryState,

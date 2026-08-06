@@ -4784,6 +4784,110 @@ fn compaction_without_provider_detail_is_not_tautological() {
         transcript.order.last(),
         Some(TranscriptEntry::Compaction { summary, .. }) if summary == "Context compacted"
     ));
+    assert!(!transcript.compaction_is_expandable(0));
+    transcript.toggle_compaction_expansion(0);
+    assert!(matches!(
+        transcript.order.last(),
+        Some(TranscriptEntry::Compaction {
+            complete: true,
+            expanded: false,
+            ..
+        })
+    ));
+    let rendered = transcript
+        .lines(100)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!rendered.contains("click to expand"));
+    assert!(!rendered.contains("click to collapse"));
+}
+
+#[test]
+fn compaction_with_only_provider_punctuation_is_not_expandable() {
+    let session_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::ProviderEvent {
+            provider: CodingProvider::Codex,
+            kind: "context_compaction".to_string(),
+            payload: serde_json::json!({"summary": "*"}),
+        },
+    ));
+
+    assert!(!transcript.compaction_is_expandable(0));
+    let rendered = transcript
+        .lines(100)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!rendered.contains("click to expand"));
+}
+
+#[test]
+fn mcp_resource_readiness_failures_are_static_and_compact() {
+    let session_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::ToolStarted {
+            tool_call_id: "mcp-resource-probe".to_string(),
+            name: "mcp__borg_agent__list_mcp_resources".to_string(),
+            input: serde_json::json!({"server": "borg_agent"}),
+            input_ref: None,
+        },
+    ));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::ToolCompleted {
+            tool_call_id: "mcp-resource-probe".to_string(),
+            output: "resources/list failed: MCP server 'borg_agent' was not ready for this step"
+                .to_string(),
+            output_ref: None,
+            is_error: true,
+            input: Some(serde_json::json!({"server": "borg_agent"})),
+            input_ref: None,
+        },
+    ));
+
+    assert!(matches!(
+        transcript.order.first(),
+        Some(TranscriptEntry::Tool {
+            name,
+            detail,
+            code_view: None,
+            output_view: None,
+            error: true,
+            complete: true,
+            expanded: false,
+            ..
+        }) if name == "Borg agent · List MCP resources"
+            && detail == "MCP server not ready"
+    ));
+    assert!(!transcript.tool_is_expandable(0));
+    assert!(transcript.toggle_tool(0).is_empty());
+    assert!(!transcript.tool_is_expanded(0));
+
+    let rendered = transcript
+        .lines(100)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        rendered.contains("Borg agent · List MCP resources"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("MCP server not ready"), "{rendered}");
+    assert!(!rendered.contains("resources/list failed"), "{rendered}");
+    assert!(!rendered.contains("\"server\""), "{rendered}");
+    assert!(!rendered.contains("click to expand"), "{rendered}");
 }
 
 #[test]
@@ -6231,6 +6335,171 @@ fn transcript_text_selection_uses_stable_document_rows() {
 }
 
 #[test]
+fn ordinary_left_drag_starts_application_owned_transcript_selection() {
+    let area = Rect::new(4, 8, 40, 12);
+    let mouse = |kind, modifiers, column, row| MouseEvent {
+        kind,
+        column,
+        row,
+        modifiers,
+    };
+
+    assert!(mouse_starts_text_selection(
+        &mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            KeyModifiers::NONE,
+            10,
+            12,
+        ),
+        Some(area),
+    ));
+    assert!(mouse_starts_text_selection(
+        &mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            KeyModifiers::SHIFT,
+            10,
+            12,
+        ),
+        Some(area),
+    ));
+    assert!(!mouse_starts_text_selection(
+        &mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            KeyModifiers::NONE,
+            10,
+            12,
+        ),
+        Some(area),
+    ));
+    assert!(!mouse_starts_text_selection(
+        &mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            KeyModifiers::NONE,
+            10,
+            30,
+        ),
+        Some(area),
+    ));
+}
+
+#[test]
+fn click_release_runs_the_deferred_action_but_drag_release_keeps_selection() {
+    let point = SelectionPoint {
+        entry: 2,
+        row_in_entry: 3,
+        column: 4,
+        logical_offset: None,
+    };
+    let mut click_selection = Some(TextSelection {
+        anchor: point,
+        focus: point,
+        dragging: true,
+        autoscroll: 1,
+        pointer: Position::new(5, 6),
+    });
+    let mut pending_click = Some(PendingTranscriptClick::Message(2));
+
+    assert!(matches!(
+        finish_text_selection(&mut click_selection, &mut pending_click),
+        Some(PendingTranscriptClick::Message(2))
+    ));
+    assert!(click_selection.is_none());
+    assert!(pending_click.is_none());
+
+    let mut drag_selection = Some(TextSelection {
+        anchor: point,
+        focus: SelectionPoint {
+            row_in_entry: 5,
+            ..point
+        },
+        dragging: true,
+        autoscroll: -1,
+        pointer: Position::new(5, 8),
+    });
+    let mut pending_click = Some(PendingTranscriptClick::Message(2));
+    assert!(finish_text_selection(&mut drag_selection, &mut pending_click).is_none());
+    let selection = drag_selection.expect("non-empty selection remains");
+    assert!(!selection.dragging);
+    assert_eq!(selection.autoscroll, 0);
+    assert!(pending_click.is_none());
+}
+
+#[test]
+fn wheel_scrolling_during_a_drag_extends_selection_at_the_pointer() {
+    let area = Rect::new(5, 10, 30, 6);
+    let pointer = Position::new(9, 12);
+    let ranges = vec![(0, 0, 60, 0)];
+    let scroll_max = 50;
+    let initial_from_bottom = 20;
+    let initial_scroll_start = scroll_max - initial_from_bottom;
+    let initial_focus =
+        selection_point_for_viewport_pointer(area, initial_scroll_start, pointer, &ranges);
+
+    let scrolled_from_bottom = scroll_from_bottom_by_lines(initial_from_bottom, scroll_max, 5);
+    let scrolled_start = scroll_max - scrolled_from_bottom;
+    let wheel_focus = selection_point_for_viewport_pointer(area, scrolled_start, pointer, &ranges);
+
+    assert_eq!(initial_focus.row_in_entry, 32);
+    assert_eq!(wheel_focus.row_in_entry, 27);
+    assert_eq!(wheel_focus.column, 4);
+    let selection = TextSelection {
+        anchor: initial_focus,
+        focus: wheel_focus,
+        dragging: true,
+        autoscroll: 0,
+        pointer,
+    };
+    let (start, end) = resolved_selection(selection, &ranges).expect("wheel selection resolves");
+    assert_eq!((start.row, end.row), (27, 32));
+    let mut viewport = (scrolled_start..scrolled_start + usize::from(area.height))
+        .map(|row| Line::from(format!("row {row}")))
+        .collect::<Vec<_>>();
+    apply_text_selection(&mut viewport, scrolled_start, start, end);
+    assert!(viewport[0].spans.iter().all(|span| span.style.bg.is_none()));
+    assert!(viewport[1].spans.iter().all(|span| span.style.bg.is_none()));
+    assert!(viewport[2].spans.iter().any(|span| span.style.bg.is_some()));
+    assert!(viewport[5].spans.iter().any(|span| span.style.bg.is_some()));
+    assert_eq!(
+        scroll_from_bottom_by_lines(scrolled_from_bottom, scroll_max, -5),
+        initial_from_bottom,
+    );
+}
+
+#[test]
+fn drag_at_each_viewport_edge_autoscrolls_and_clamps() {
+    let area = Rect::new(5, 10, 30, 6);
+    assert_eq!(
+        selection_autoscroll_direction(area, Position::new(8, area.y)),
+        1,
+    );
+    assert_eq!(
+        selection_autoscroll_direction(area, Position::new(8, area.bottom().saturating_sub(1)),),
+        -1,
+    );
+    assert_eq!(
+        selection_autoscroll_direction(area, Position::new(8, area.y + 2)),
+        0,
+    );
+    assert_eq!(advance_selection_autoscroll(4, 20, 1), 6);
+    assert_eq!(advance_selection_autoscroll(19, 20, 1), 20);
+    assert_eq!(advance_selection_autoscroll(4, 20, -1), 2);
+    assert_eq!(advance_selection_autoscroll(1, 20, -1), 0);
+}
+
+#[test]
+fn active_drag_focus_retargets_when_streaming_moves_the_tail() {
+    let area = Rect::new(0, 0, 40, 6);
+    let pointer = Position::new(7, 3);
+    let ranges = vec![(0, 0, 80, 0)];
+    let before = selection_point_for_viewport_pointer(area, 40, pointer, &ranges);
+    let after = selection_point_for_viewport_pointer(area, 44, pointer, &ranges);
+
+    assert_eq!(before.row_in_entry, 43);
+    assert_eq!(after.row_in_entry, 47);
+    assert_eq!(before.column, after.column);
+}
+
+#[test]
 fn selection_highlight_survives_a_changed_viewport_offset() {
     let start = TranscriptPoint { row: 5, column: 1 };
     let end = TranscriptPoint { row: 6, column: 2 };
@@ -6328,12 +6597,16 @@ fn live_message_selection_moves_up_when_the_tail_grows() {
         .expect("selected live row is rendered");
     assert!(selected_row >= before_scroll_start);
     let selection = TextSelection {
-        anchor: selection_point_for_row(&before.6, selected_row, 2),
-        focus: selection_point_for_row(&before.6, selected_row + 2, 4),
+        anchor: selection_point_for_row_in_lines(&before.6, &before.0, selected_row, 2),
+        focus: selection_point_for_row_in_lines(&before.6, &before.0, selected_row + 1, 20),
         dragging: false,
         autoscroll: 0,
         pointer: Position::new(0, 0),
     };
+    let before_selection =
+        resolved_selection_in_lines(selection, &before.6, &before.0).expect("selection resolves");
+    let before_text = selected_transcript_text(&before.0, before_selection.0, before_selection.1)
+        .expect("selection has text");
     let before_viewport_row = selected_row - before_scroll_start;
 
     transcript.apply(&SessionEvent::new(
@@ -6358,7 +6631,15 @@ fn live_message_selection_moves_up_when_the_tail_grows() {
     let after = transcript.render(80, None, None, None);
     let after_height = after.0.len();
     let after_scroll_start = after_height - viewport_height;
-    let (resolved_start, _) = resolved_selection(selection, &after.6).expect("selection resolves");
+    let (resolved_start, _) =
+        resolved_selection_in_lines(selection, &after.6, &after.0).expect("selection resolves");
+    let after_selection =
+        resolved_selection_in_lines(selection, &after.6, &after.0).expect("selection resolves");
+    assert_eq!(
+        selected_transcript_text(&after.0, after_selection.0, after_selection.1).as_deref(),
+        Some(before_text.as_str()),
+        "streaming must not retarget a released selection to different text",
+    );
     let added_rows = after_height - before_height;
     assert_eq!(after_scroll_start, before_scroll_start + added_rows);
     assert_eq!(
@@ -6372,7 +6653,7 @@ fn live_message_selection_moves_up_when_the_tail_grows() {
         &mut viewport,
         after_scroll_start,
         resolved_start,
-        resolved_selection(selection, &after.6)
+        resolved_selection_in_lines(selection, &after.6, &after.0)
             .expect("selection resolves")
             .1,
     );
@@ -6398,6 +6679,7 @@ fn selection_points_resolve_through_accordion_body_offsets() {
             entry: 1,
             row_in_entry: 5,
             column: 4,
+            logical_offset: None,
         }
     );
 
@@ -6412,6 +6694,7 @@ fn selection_points_resolve_through_accordion_body_offsets() {
             entry: 1,
             row_in_entry: 0,
             column: 4,
+            logical_offset: None,
         },
         &shifted,
     );

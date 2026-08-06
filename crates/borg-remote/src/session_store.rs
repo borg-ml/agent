@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::str::FromStr;
@@ -13,6 +14,7 @@ use sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow, SqliteSynchronous,
 };
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::session_action::{SessionAction, SessionActionState, SessionActionTransition};
@@ -28,6 +30,7 @@ const SQLITE_WRITE_TRANSACTION: &str = "BEGIN IMMEDIATE";
 const MAX_HOST_LAUNCH_METADATA_BYTES: usize = 512 * 1024;
 pub const SESSION_PROJECTION_VERSION: i32 = 3;
 const SESSION_SCHEMA_VERSION: i64 = 5;
+const DISPOSABLE_SCHEMA_ERROR: &str = "Borg session database schema is incompatible";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventPersistence {
@@ -750,7 +753,10 @@ impl SqliteSessionStore {
     }
 
     pub async fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
+        Self::open_path(path.as_ref().to_path_buf(), true).await
+    }
+
+    async fn open_path(path: PathBuf, reset_incompatible: bool) -> Result<Self> {
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
@@ -783,17 +789,30 @@ impl SqliteSessionStore {
         };
         let store = Self { pool };
         let schema_deadline = std::time::Instant::now() + SQLITE_BUSY_TIMEOUT;
-        loop {
+        let schema_result = loop {
             match store.ensure_schema().await {
-                Ok(()) => break,
+                Ok(()) => break Ok(()),
                 Err(error)
                     if sqlite_schema_lock(&error)
                         && std::time::Instant::now() < schema_deadline =>
                 {
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
-                Err(error) => return Err(error),
+                Err(error) => break Err(error),
             }
+        };
+        if let Err(error) = schema_result {
+            if reset_incompatible && is_disposable_schema_error(&error) {
+                store.pool.close().await;
+                let archived = archive_incompatible_database(&path)?;
+                warn!(
+                    database = %path.display(),
+                    archived = %archived.display(),
+                    "archived incompatible session database and started a fresh one"
+                );
+                return Box::pin(Self::open_path(path, false)).await;
+            }
+            return Err(error);
         }
         Ok(store)
     }
@@ -979,6 +998,46 @@ impl SqliteSessionStore {
     }
 
     async fn ensure_schema(&self) -> Result<()> {
+        let had_existing_schema = sqlx::query_scalar::<_, i64>(
+            "select exists(select 1 from sqlite_master where type='table' and name in \
+             ('sessions','session_events','session_actions','borg_session_schema'))",
+        )
+        .fetch_one(&self.pool)
+        .await?
+            != 0;
+        let has_schema_marker = sqlx::query_scalar::<_, i64>(
+            "select exists(select 1 from sqlite_master where type='table' and name='borg_session_schema')",
+        )
+        .fetch_one(&self.pool)
+        .await?
+            != 0;
+        let existing_schema_version: Option<i64> = if has_schema_marker {
+            sqlx::query_scalar::<_, i64>("select version from borg_session_schema where id=1")
+                .fetch_optional(&self.pool)
+                .await?
+        } else {
+            None
+        };
+        if had_existing_schema {
+            match existing_schema_version {
+                Some(version) if version == SESSION_SCHEMA_VERSION => {}
+                Some(version) if version > SESSION_SCHEMA_VERSION => {
+                    bail!(
+                        "unsupported future Borg session schema version {version}; current is {SESSION_SCHEMA_VERSION}"
+                    );
+                }
+                Some(version) => {
+                    bail!(
+                        "{DISPOSABLE_SCHEMA_ERROR}: version {version} is older than the current version {SESSION_SCHEMA_VERSION}"
+                    );
+                }
+                None => {
+                    bail!(
+                        "{DISPOSABLE_SCHEMA_ERROR}: legacy database has no current schema marker"
+                    );
+                }
+            }
+        }
         sqlx::raw_sql(
             r#"
             create table if not exists sessions (
@@ -1125,31 +1184,26 @@ impl SqliteSessionStore {
         )
         .execute(&self.pool)
         .await?;
-        // Keep the only supported forward migration at the same SQLite
-        // boundary as its schema marker. The lease fields are nullable and
-        // additive, so this is safe for existing action rows and idempotent if
-        // a previous process was interrupted after ALTER TABLE but before the
-        // marker update.
         let mut schema_transaction = self.begin_write().await?;
         let schema_version: Option<i64> =
             sqlx::query_scalar("select version from borg_session_schema where id=1")
                 .fetch_optional(&mut *schema_transaction)
                 .await?;
-        if let Some(version) = schema_version {
-            ensure!(
-                version <= SESSION_SCHEMA_VERSION,
-                "unsupported future Borg session schema version {version}; current is {SESSION_SCHEMA_VERSION}"
-            );
-        }
-        Self::ensure_session_action_lease_columns(&mut schema_transaction).await?;
         match schema_version {
-            Some(version) if version < SESSION_SCHEMA_VERSION => {
-                sqlx::query("update borg_session_schema set version=? where id=1")
-                    .bind(SESSION_SCHEMA_VERSION)
-                    .execute(&mut *schema_transaction)
-                    .await?;
+            Some(version) if version == SESSION_SCHEMA_VERSION => {}
+            Some(version) if version > SESSION_SCHEMA_VERSION => {
+                bail!(
+                    "unsupported future Borg session schema version {version}; current is {SESSION_SCHEMA_VERSION}"
+                );
             }
-            Some(_) => {}
+            Some(version) => {
+                bail!(
+                    "{DISPOSABLE_SCHEMA_ERROR}: version {version} is older than the current version {SESSION_SCHEMA_VERSION}"
+                );
+            }
+            None if had_existing_schema => {
+                bail!("{DISPOSABLE_SCHEMA_ERROR}: legacy database has no current schema marker");
+            }
             None => {
                 sqlx::query("insert into borg_session_schema(id,version) values(1,?)")
                     .bind(SESSION_SCHEMA_VERSION)
@@ -1186,43 +1240,9 @@ impl SqliteSessionStore {
         Ok(())
     }
 
-    async fn ensure_session_action_lease_columns(
-        transaction: &mut Transaction<'_, Sqlite>,
-    ) -> Result<()> {
-        let existing = sqlx::query("pragma table_info(session_actions)")
-            .fetch_all(&mut **transaction)
-            .await?
-            .into_iter()
-            .map(|row| row.get::<String, _>("name"))
-            .collect::<HashSet<_>>();
-        for (name, statement) in [
-            (
-                "lease_owner",
-                "alter table session_actions add column lease_owner text",
-            ),
-            (
-                "lease_token",
-                "alter table session_actions add column lease_token text",
-            ),
-            (
-                "lease_heartbeat_at",
-                "alter table session_actions add column lease_heartbeat_at text",
-            ),
-            (
-                "lease_expires_at",
-                "alter table session_actions add column lease_expires_at text",
-            ),
-        ] {
-            if !existing.contains(name) {
-                sqlx::query(statement).execute(&mut **transaction).await?;
-            }
-        }
-        Ok(())
-    }
-
-    /// The store rejects unsupported future schemas and schemas missing
-    /// non-additive invariants. The one supported additive repair happens in
-    /// `ensure_schema` before this validation runs.
+    /// The store accepts only the current schema. Incompatible local session
+    /// databases are archived and recreated by `open`; future schemas are
+    /// rejected so a newer Borg cannot be silently destroyed by an older one.
     async fn validate_current_schema(&self) -> Result<()> {
         for (table, required_columns) in [
             (
@@ -1296,7 +1316,7 @@ impl SqliteSessionStore {
                 .collect::<Vec<_>>();
             if !missing.is_empty() {
                 bail!(
-                    "Borg session database schema is stale for {table}; missing columns: {}",
+                    "{DISPOSABLE_SCHEMA_ERROR}: stale {table} table; missing columns: {}",
                     missing.join(", ")
                 );
             }
@@ -2172,6 +2192,66 @@ impl SqliteSessionStore {
         .await?;
         Ok(event)
     }
+}
+
+fn is_disposable_schema_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string().starts_with(DISPOSABLE_SCHEMA_ERROR))
+}
+
+fn archive_incompatible_database(path: &Path) -> Result<PathBuf> {
+    ensure!(
+        path.exists(),
+        "incompatible session database {} disappeared before it could be archived",
+        path.display()
+    );
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("sessions.sqlite3");
+    let stamp = Utc::now().timestamp_nanos_opt().unwrap_or_default();
+    let archived = (0..100)
+        .map(|attempt| {
+            parent.join(format!(
+                "{file_name}.incompatible-{stamp}-{}-{attempt}",
+                std::process::id()
+            ))
+        })
+        .find(|candidate| !candidate.exists())
+        .context("could not choose an archive path for the incompatible session database")?;
+    fs::rename(path, &archived).with_context(|| {
+        format!(
+            "failed to archive incompatible session database {}",
+            path.display()
+        )
+    })?;
+    for suffix in ["-wal", "-shm"] {
+        let sidecar = path_with_suffix(path, suffix);
+        if sidecar.exists() {
+            let archived_sidecar = path_with_suffix(&archived, suffix);
+            if let Err(error) = fs::rename(&sidecar, &archived_sidecar) {
+                warn!(
+                    sidecar = %sidecar.display(),
+                    archived_sidecar = %archived_sidecar.display(),
+                    %error,
+                    "could not archive an old SQLite sidecar"
+                );
+            }
+        }
+    }
+    #[cfg(unix)]
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .with_context(|| format!("failed to sync database directory {}", parent.display()))?;
+    Ok(archived)
+}
+
+fn path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
 }
 
 fn sqlite_schema_lock(error: &anyhow::Error) -> bool {

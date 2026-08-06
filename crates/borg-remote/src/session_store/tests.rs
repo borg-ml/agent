@@ -14,7 +14,7 @@ async fn store() -> (tempfile::TempDir, SqliteSessionStore) {
 }
 
 #[tokio::test]
-async fn opening_schema_v4_repairs_missing_action_lease_columns() {
+async fn opening_schema_v4_archives_and_recreates_the_database() {
     let (directory, store) = store().await;
     let path = directory.path().join("sessions.sqlite3");
     sqlx::query("drop index if exists idx_session_actions_lease_expiry")
@@ -27,7 +27,7 @@ async fn opening_schema_v4_repairs_missing_action_lease_columns() {
         "lease_heartbeat_at",
         "lease_expires_at",
     ] {
-        // These identifiers are fixed by the migration regression fixture;
+        // These identifiers are fixed by the schema-reset regression fixture;
         // SQLx 0.9 requires the dynamic identifier to be explicitly audited.
         sqlx::query(sqlx::AssertSqlSafe(format!(
             "alter table session_actions drop column {column}"
@@ -65,6 +65,52 @@ async fn opening_schema_v4_repairs_missing_action_lease_columns() {
         .await
         .unwrap();
     assert_eq!(version, SESSION_SCHEMA_VERSION);
+    let sessions: i64 = sqlx::query_scalar("select count(*) from sessions")
+        .fetch_one(reopened.pool())
+        .await
+        .unwrap();
+    assert_eq!(sessions, 0, "the incompatible database must not be reused");
+    let archive_count = std::fs::read_dir(directory.path())
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("sessions.sqlite3.incompatible-")
+        })
+        .count();
+    assert_eq!(
+        archive_count, 1,
+        "the old database should remain recoverable"
+    );
+}
+
+#[tokio::test]
+async fn opening_a_legacy_database_without_a_schema_marker_archives_it() {
+    let (directory, store) = store().await;
+    let path = directory.path().join("sessions.sqlite3");
+    sqlx::query("drop table borg_session_schema")
+        .execute(store.pool())
+        .await
+        .unwrap();
+    store.pool().close().await;
+
+    SqliteSessionStore::open(&path).await.unwrap();
+
+    assert_eq!(
+        std::fs::read_dir(directory.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("sessions.sqlite3.incompatible-")
+            })
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]

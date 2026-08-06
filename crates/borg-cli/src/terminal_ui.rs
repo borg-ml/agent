@@ -25,8 +25,9 @@ use borg_remote::{
     PlanItem, PlanItemStatus, PromptDelivery, ResponseLanguage, SessionEvent, SessionEventKind,
     SessionGoal, SessionPayloadKind, SessionPayloadRef, SessionState, SessionStatus,
     SubagentActivityKind, SubagentSnapshot, SubagentStatus, ToolPresentationCategory, compact_text,
-    is_diff_language, is_edit_tool, is_subagent_tool, project_tool_presentation, tool_has_rich_ui,
-    tool_output_code_view, tool_output_is_backgrounded, web_search_query,
+    is_diff_language, is_edit_tool, is_mcp_resource_probe, is_subagent_tool,
+    project_tool_presentation, tool_has_rich_ui, tool_output_code_view,
+    tool_output_is_backgrounded, web_search_query,
 };
 #[cfg(test)]
 use borg_remote::{tool_call_summary, tool_code_view};
@@ -35,7 +36,7 @@ use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseButton,
-    MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -337,6 +338,10 @@ struct SelectionPoint {
     entry: usize,
     row_in_entry: usize,
     column: usize,
+    /// A rendered-body offset used to keep a released selection on the same
+    /// text when a streaming message rewraps.  The row/column coordinates are
+    /// still retained for entries whose body cannot be mapped stably.
+    logical_offset: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -352,6 +357,19 @@ impl TextSelection {
     fn is_empty(self) -> bool {
         self.anchor == self.focus
     }
+}
+
+#[derive(Clone, Debug)]
+enum PendingTranscriptClick {
+    Link(String),
+    ToolRunHeader(usize),
+    Tool {
+        index: usize,
+        run: Option<(usize, usize)>,
+    },
+    Message(usize),
+    Entry(usize),
+    Background,
 }
 
 const SLASH_COMMANDS: &[(&str, &str)] = &[
@@ -644,6 +662,7 @@ pub struct BorgTerminal {
     nested_scroll_capture: Option<NestedScrollCapture>,
     nested_scroll_motion: Option<NestedScrollMotion>,
     text_selection: Option<TextSelection>,
+    pending_transcript_click: Option<PendingTranscriptClick>,
     active_since: Option<DateTime<Utc>>,
     notice: Option<String>,
     copy_notice_expires_at: Option<Instant>,
@@ -1531,6 +1550,7 @@ impl BorgTerminal {
             nested_scroll_capture: None,
             nested_scroll_motion: None,
             text_selection: None,
+            pending_transcript_click: None,
             active_since: None,
             notice: None,
             copy_notice_expires_at: None,
@@ -1640,6 +1660,7 @@ impl BorgTerminal {
             return;
         }
         self.text_selection = None;
+        self.pending_transcript_click = None;
         self.pending_scroll_anchor_height = Some(previous_height);
         self.transcript_render_cache = None;
     }
@@ -2131,6 +2152,7 @@ impl BorgTerminal {
         if self.focused_child == Some(child_id) {
             self.transcript = transcript;
             self.text_selection = None;
+            self.pending_transcript_click = None;
             self.transcript_render_cache = None;
         } else {
             self.child_transcripts.insert(child_id, transcript);
@@ -2196,6 +2218,7 @@ impl BorgTerminal {
         self.transcript.follow_tail = true;
         self.transcript_render_cache = None;
         self.text_selection = None;
+        self.pending_transcript_click = None;
         self.hovered_entry = None;
         self.hovered_message = None;
         self.hovered_tool = None;
@@ -2257,6 +2280,7 @@ impl BorgTerminal {
         };
         if selection.anchor.entry == removed || selection.focus.entry == removed {
             self.text_selection = None;
+            self.pending_transcript_click = None;
             return;
         }
         for point in [&mut selection.anchor, &mut selection.focus] {
@@ -2999,8 +3023,12 @@ impl BorgTerminal {
                     });
                 if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
                     && !mouse.modifiers.contains(KeyModifiers::SHIFT)
+                    && !self
+                        .transcript_viewport_area
+                        .is_some_and(|area| area.contains(pointer))
                 {
                     self.text_selection = None;
+                    self.pending_transcript_click = None;
                 }
                 match mouse.kind {
                     MouseEventKind::Down(MouseButton::Left)
@@ -3030,10 +3058,11 @@ impl BorgTerminal {
                         self.cancel_scroll_motion();
                         self.scroll_from_bottom = 0;
                         self.text_selection = None;
+                        self.pending_transcript_click = None;
                         self.transcript.follow_tail = true;
                     }
                     MouseEventKind::Down(MouseButton::Left)
-                        if mouse.modifiers.contains(KeyModifiers::SHIFT) =>
+                        if mouse_starts_text_selection(&mouse, self.transcript_viewport_area) =>
                     {
                         if let Some(point) = self.selection_point_at(pointer) {
                             self.text_selection = Some(TextSelection {
@@ -3043,63 +3072,11 @@ impl BorgTerminal {
                                 autoscroll: 0,
                                 pointer,
                             });
+                            self.pending_transcript_click =
+                                (!mouse.modifiers.contains(KeyModifiers::SHIFT))
+                                    .then(|| self.pending_transcript_click(hovered_tool_run));
                         }
                         self.pending_scroll_anchor_height = None;
-                    }
-                    MouseEventKind::Down(MouseButton::Left) if self.hovered_link.is_some() => {
-                        if let Err(error) =
-                            open_http_link(self.hovered_link.as_deref().expect("checked above"))
-                        {
-                            self.notice = Some(format!("Could not open link: {error}"));
-                        }
-                    }
-                    MouseEventKind::Down(MouseButton::Left)
-                        if self.hovered_tool_run_header.is_some() =>
-                    {
-                        let start = self.hovered_tool_run_header.expect("checked above");
-                        if self.transcript.tool_run_expanded(start) {
-                            self.capture_transcript_anchor_for_collapse();
-                        }
-                        self.nested_scroll_motion = None;
-                        self.transcript.toggle_tool_run_expansion(start);
-                        self.transcript_render_cache = None;
-                    }
-                    MouseEventKind::Down(MouseButton::Left) if self.hovered_tool.is_some() => {
-                        self.nested_scroll_motion = None;
-                        let tool_index = self.hovered_tool.expect("checked above");
-                        if self.transcript.tool_is_expanded(tool_index) {
-                            self.capture_transcript_anchor_for_collapse();
-                        }
-                        if let Some((start, max_offset)) = hovered_tool_run {
-                            self.transcript.anchor_tool_run(start, max_offset);
-                        }
-                        let payloads = self.transcript.toggle_tool(tool_index);
-                        self.transcript_render_cache = None;
-                        if !payloads.is_empty() {
-                            return Ok(UiAction::LoadPayloads(payloads));
-                        }
-                    }
-                    MouseEventKind::Down(MouseButton::Left) if self.hovered_message.is_some() => {
-                        return Ok(
-                            self.open_entry_actions(self.hovered_message.expect("checked above"))
-                        );
-                    }
-                    MouseEventKind::Down(MouseButton::Left) if self.hovered_entry.is_some() => {
-                        let index = self.hovered_entry.expect("checked above");
-                        if self.transcript.compaction_is_expandable(index) {
-                            self.capture_transcript_anchor_for_collapse();
-                            self.transcript.toggle_compaction_expansion(index);
-                            self.transcript_render_cache = None;
-                        } else if self.transcript.action_is_expandable(index) {
-                            self.capture_transcript_anchor_for_collapse();
-                            self.transcript.toggle_action_expansion(index);
-                            self.transcript_render_cache = None;
-                        } else if self.transcript.plan_is_clippable(index) {
-                            self.transcript.toggle_plan_expansion(index);
-                            self.transcript_render_cache = None;
-                        } else {
-                            return Ok(self.open_entry_actions(index));
-                        }
                     }
                     MouseEventKind::Down(MouseButton::Left) => {
                         self.transcript.selected = None;
@@ -3114,16 +3091,40 @@ impl BorgTerminal {
                             .is_some_and(|selection| selection.dragging) =>
                     {
                         self.pending_scroll_anchor_height = None;
+                        self.pending_transcript_click = None;
                         self.update_text_selection_drag(pointer);
                     }
                     MouseEventKind::Up(MouseButton::Left) => {
                         self.dragging_scrollbar = false;
-                        if let Some(selection) = self.text_selection.as_mut() {
-                            selection.dragging = false;
-                            selection.autoscroll = 0;
+                        if self
+                            .text_selection
+                            .is_some_and(|selection| selection.dragging)
+                        {
+                            self.update_text_selection_drag(pointer);
+                        }
+                        let click = finish_text_selection(
+                            &mut self.text_selection,
+                            &mut self.pending_transcript_click,
+                        );
+                        if let Some(click) = click {
+                            return Ok(self.run_pending_transcript_click(click));
                         }
                     }
                     MouseEventKind::ScrollUp => {
+                        if self
+                            .text_selection
+                            .is_some_and(|selection| selection.dragging)
+                        {
+                            self.update_text_selection_drag(pointer);
+                            self.history_page_requested = true;
+                            let viewport_height =
+                                self.transcript_viewport_area.map_or(1, |area| area.height);
+                            self.scroll_drag_selection(wheel_scroll_distance(
+                                viewport_height,
+                                scroll_repetitions,
+                            ));
+                            return Ok(UiAction::None);
+                        }
                         let consumed = if let Some((start, max_offset)) = hovered_tool_run {
                             let can_move = self.transcript.tool_run_offset(start, max_offset) > 0;
                             if can_move {
@@ -3160,6 +3161,20 @@ impl BorgTerminal {
                         }
                     }
                     MouseEventKind::ScrollDown => {
+                        if self
+                            .text_selection
+                            .is_some_and(|selection| selection.dragging)
+                        {
+                            self.update_text_selection_drag(pointer);
+                            self.history_page_requested = false;
+                            let viewport_height =
+                                self.transcript_viewport_area.map_or(1, |area| area.height);
+                            self.scroll_drag_selection(-wheel_scroll_distance(
+                                viewport_height,
+                                scroll_repetitions,
+                            ));
+                            return Ok(UiAction::None);
+                        }
                         let consumed = if let Some((start, max_offset)) = hovered_tool_run {
                             let can_move =
                                 self.transcript.tool_run_offset(start, max_offset) < max_offset;
@@ -3256,19 +3271,17 @@ impl BorgTerminal {
             .text_selection
             .filter(|selection| selection.dragging)
             .map_or(0, |selection| selection.autoscroll);
+        if selection_autoscroll != 0 {
+            self.scroll_from_bottom = advance_selection_autoscroll(
+                self.scroll_from_bottom,
+                self.transcript_scroll_max,
+                selection_autoscroll,
+            );
+        }
         if selection_autoscroll > 0 {
             self.transcript.follow_tail = false;
-            self.scroll_from_bottom = self
-                .scroll_from_bottom
-                .saturating_add(SELECTION_AUTOSCROLL_LINES_PER_FRAME)
-                .min(self.transcript_scroll_max);
-        } else if selection_autoscroll < 0 {
-            self.scroll_from_bottom = self
-                .scroll_from_bottom
-                .saturating_sub(SELECTION_AUTOSCROLL_LINES_PER_FRAME);
-            if self.scroll_from_bottom == 0 {
-                self.transcript.follow_tail = true;
-            }
+        } else if selection_autoscroll < 0 && self.scroll_from_bottom == 0 {
+            self.transcript.follow_tail = true;
         }
         if selection_autoscroll != 0
             && let Some(pointer) = self.text_selection.map(|selection| selection.pointer)
@@ -3324,6 +3337,94 @@ impl BorgTerminal {
         self.nested_scroll_motion = None;
     }
 
+    fn pending_transcript_click(
+        &self,
+        hovered_tool_run: Option<(usize, usize)>,
+    ) -> PendingTranscriptClick {
+        if let Some(url) = self.hovered_link.clone() {
+            PendingTranscriptClick::Link(url)
+        } else if let Some(start) = self.hovered_tool_run_header {
+            PendingTranscriptClick::ToolRunHeader(start)
+        } else if let Some(index) = self.hovered_tool {
+            PendingTranscriptClick::Tool {
+                index,
+                run: hovered_tool_run,
+            }
+        } else if let Some(index) = self.hovered_message {
+            PendingTranscriptClick::Message(index)
+        } else if let Some(index) = self.hovered_entry {
+            PendingTranscriptClick::Entry(index)
+        } else {
+            PendingTranscriptClick::Background
+        }
+    }
+
+    fn run_pending_transcript_click(&mut self, click: PendingTranscriptClick) -> UiAction {
+        match click {
+            PendingTranscriptClick::Link(url) => {
+                if let Err(error) = open_http_link(&url) {
+                    self.notice = Some(format!("Could not open link: {error}"));
+                }
+            }
+            PendingTranscriptClick::ToolRunHeader(start) => {
+                if self.transcript.tool_run_expanded(start) {
+                    self.capture_transcript_anchor_for_collapse();
+                }
+                self.nested_scroll_motion = None;
+                self.transcript.toggle_tool_run_expansion(start);
+                self.transcript_render_cache = None;
+            }
+            PendingTranscriptClick::Tool { index, run } => {
+                self.nested_scroll_motion = None;
+                if self.transcript.tool_is_expanded(index) {
+                    self.capture_transcript_anchor_for_collapse();
+                }
+                if let Some((start, max_offset)) = run {
+                    self.transcript.anchor_tool_run(start, max_offset);
+                }
+                let payloads = self.transcript.toggle_tool(index);
+                self.transcript_render_cache = None;
+                if !payloads.is_empty() {
+                    return UiAction::LoadPayloads(payloads);
+                }
+            }
+            PendingTranscriptClick::Message(index) => {
+                return self.open_entry_actions(index);
+            }
+            PendingTranscriptClick::Entry(index) => {
+                if self.transcript.compaction_is_expandable(index) {
+                    self.capture_transcript_anchor_for_collapse();
+                    self.transcript.toggle_compaction_expansion(index);
+                    self.transcript_render_cache = None;
+                } else if self.transcript.action_is_expandable(index) {
+                    self.capture_transcript_anchor_for_collapse();
+                    self.transcript.toggle_action_expansion(index);
+                    self.transcript_render_cache = None;
+                } else if self.transcript.plan_is_clippable(index) {
+                    self.transcript.toggle_plan_expansion(index);
+                    self.transcript_render_cache = None;
+                } else {
+                    return self.open_entry_actions(index);
+                }
+            }
+            PendingTranscriptClick::Background => {
+                self.transcript.selected = None;
+            }
+        }
+        UiAction::None
+    }
+
+    fn scroll_drag_selection(&mut self, lines: isize) {
+        self.cancel_scroll_motion();
+        self.pending_transcript_click = None;
+        self.scroll_from_bottom =
+            scroll_from_bottom_by_lines(self.scroll_from_bottom, self.transcript_scroll_max, lines);
+        self.transcript.follow_tail = self.scroll_from_bottom == 0;
+        if let Some(pointer) = self.text_selection.map(|selection| selection.pointer) {
+            self.update_text_selection_focus(pointer);
+        }
+    }
+
     fn transcript_point_at(&self, pointer: Position) -> Option<TranscriptPoint> {
         let area = self.transcript_viewport_area?;
         area.contains(pointer)
@@ -3332,12 +3433,13 @@ impl BorgTerminal {
 
     fn selection_point_at(&self, pointer: Position) -> Option<SelectionPoint> {
         let point = self.transcript_point_at(pointer)?;
-        let ranges = self
-            .transcript_render_cache
-            .as_ref()
-            .map(|(.., render)| render.6.as_slice())
-            .unwrap_or(&[]);
-        Some(selection_point_for_row(ranges, point.row, point.column))
+        let (.., render) = self.transcript_render_cache.as_ref()?;
+        Some(selection_point_for_row_in_lines(
+            &render.6,
+            &render.0,
+            point.row,
+            point.column,
+        ))
     }
 
     fn transcript_point_for_pointer(&self, area: Rect, pointer: Position) -> TranscriptPoint {
@@ -3362,13 +3464,7 @@ impl BorgTerminal {
         let Some(area) = self.transcript_viewport_area else {
             return;
         };
-        let autoscroll = if pointer.y <= area.y {
-            1
-        } else if pointer.y >= area.bottom().saturating_sub(1) {
-            -1
-        } else {
-            0
-        };
+        let autoscroll = selection_autoscroll_direction(area, pointer);
         if let Some(selection) = self.text_selection.as_mut() {
             selection.pointer = pointer;
             selection.autoscroll = autoscroll;
@@ -3380,17 +3476,21 @@ impl BorgTerminal {
         let Some(area) = self.transcript_viewport_area else {
             return;
         };
-        let clamped = Position::new(
-            pointer.x.clamp(area.x, area.right().saturating_sub(1)),
-            pointer.y.clamp(area.y, area.bottom().saturating_sub(1)),
+        let scroll_start = self
+            .transcript_scroll_max
+            .saturating_sub(self.scroll_from_bottom.min(self.transcript_scroll_max));
+        let Some((.., render)) = self.transcript_render_cache.as_ref() else {
+            return;
+        };
+        let ranges = render.6.as_slice();
+        let lines = render.0.as_slice();
+        let point = selection_point_for_viewport_pointer_in_lines(
+            area,
+            scroll_start,
+            pointer,
+            ranges,
+            lines,
         );
-        let point = self.transcript_point_for_pointer(area, clamped);
-        let ranges = self
-            .transcript_render_cache
-            .as_ref()
-            .map(|(.., render)| render.6.as_slice())
-            .unwrap_or(&[]);
-        let point = selection_point_for_row(ranges, point.row, point.column);
         if let Some(selection) = self.text_selection.as_mut() {
             selection.focus = point;
         }
@@ -3403,7 +3503,7 @@ impl BorgTerminal {
         let Some((start, end)) = self
             .text_selection
             .filter(|selection| !selection.is_empty())
-            .and_then(|selection| resolved_selection(selection, &render.6))
+            .and_then(|selection| resolved_selection_in_lines(selection, &render.6, &render.0))
         else {
             return false;
         };
@@ -4258,9 +4358,27 @@ impl BorgTerminal {
                         *index,
                     ));
                 }
-                if let Some((selection_start, selection_end)) = self
+                if let Some(selection) = self
                     .text_selection
-                    .and_then(|selection| resolved_selection(selection, selection_rows))
+                    .as_mut()
+                    .filter(|selection| selection.dragging)
+                {
+                    // The pointer is screen-relative while a drag is held.
+                    // Resolve it again on every draw so streaming content,
+                    // wheel motion, and viewport reflow all extend the focus
+                    // to the text that is actually under the mouse now.
+                    selection.focus = selection_point_for_viewport_pointer_in_lines(
+                        content_area,
+                        scroll_start,
+                        selection.pointer,
+                        selection_rows,
+                        transcript,
+                    );
+                }
+                if let Some((selection_start, selection_end)) =
+                    self.text_selection.and_then(|selection| {
+                        resolved_selection_in_lines(selection, selection_rows, transcript)
+                    })
                 {
                     apply_text_selection(
                         &mut visible_transcript,
@@ -7563,6 +7681,34 @@ fn resolve_selection_point(
     })
 }
 
+fn resolve_selection_point_in_lines(
+    point: SelectionPoint,
+    ranges: &[SelectionRowRange],
+    lines: &[Line<'static>],
+) -> Option<TranscriptPoint> {
+    let (_, start, end, _) = ranges.iter().find(|(entry, ..)| *entry == point.entry)?;
+    let logical_offset = point.logical_offset?;
+    let last = end.saturating_sub(1).max(*start);
+    let mut remaining = logical_offset;
+    for row in *start..*end {
+        let line = lines.get(row)?;
+        let (prefix, width) = selection_line_content_metrics(line);
+        if remaining < width {
+            return Some(TranscriptPoint {
+                row,
+                column: prefix.saturating_add(remaining),
+            });
+        }
+        remaining = remaining.saturating_sub(width);
+    }
+    let (prefix, width) = selection_line_content_metrics(lines.get(last)?);
+    Some(TranscriptPoint {
+        row: last,
+        column: prefix.saturating_add(width),
+    })
+}
+
+#[cfg(test)]
 fn resolved_selection(
     selection: TextSelection,
     ranges: &[SelectionRowRange],
@@ -7579,6 +7725,121 @@ fn resolved_selection(
     })
 }
 
+fn resolved_selection_in_lines(
+    selection: TextSelection,
+    ranges: &[SelectionRowRange],
+    lines: &[Line<'static>],
+) -> Option<(TranscriptPoint, TranscriptPoint)> {
+    let anchor = selection
+        .anchor
+        .logical_offset
+        .and_then(|_| resolve_selection_point_in_lines(selection.anchor, ranges, lines))
+        .or_else(|| resolve_selection_point(selection.anchor, ranges))?;
+    let focus = selection
+        .focus
+        .logical_offset
+        .and_then(|_| resolve_selection_point_in_lines(selection.focus, ranges, lines))
+        .or_else(|| resolve_selection_point(selection.focus, ranges))?;
+    if anchor == focus {
+        return None;
+    }
+    Some(if anchor <= focus {
+        (anchor, focus)
+    } else {
+        (focus, anchor)
+    })
+}
+
+fn mouse_starts_text_selection(mouse: &MouseEvent, area: Option<Rect>) -> bool {
+    matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+        && area.is_some_and(|area| area.contains(Position::new(mouse.column, mouse.row)))
+}
+
+fn finish_text_selection(
+    selection: &mut Option<TextSelection>,
+    pending_click: &mut Option<PendingTranscriptClick>,
+) -> Option<PendingTranscriptClick> {
+    let empty = selection.is_some_and(TextSelection::is_empty);
+    if let Some(selection) = selection.as_mut() {
+        selection.dragging = false;
+        selection.autoscroll = 0;
+    }
+    let click = empty.then(|| pending_click.take()).flatten();
+    if empty {
+        *selection = None;
+    }
+    *pending_click = None;
+    click
+}
+
+fn selection_autoscroll_direction(area: Rect, pointer: Position) -> isize {
+    if pointer.y <= area.y {
+        1
+    } else if pointer.y >= area.bottom().saturating_sub(1) {
+        -1
+    } else {
+        0
+    }
+}
+
+fn advance_selection_autoscroll(
+    scroll_from_bottom: usize,
+    scroll_max: usize,
+    direction: isize,
+) -> usize {
+    scroll_from_bottom_by_lines(
+        scroll_from_bottom,
+        scroll_max,
+        direction.saturating_mul(SELECTION_AUTOSCROLL_LINES_PER_FRAME as isize),
+    )
+}
+
+fn scroll_from_bottom_by_lines(
+    scroll_from_bottom: usize,
+    scroll_max: usize,
+    lines: isize,
+) -> usize {
+    if lines >= 0 {
+        scroll_from_bottom
+            .saturating_add(lines.unsigned_abs())
+            .min(scroll_max)
+    } else {
+        scroll_from_bottom.saturating_sub(lines.unsigned_abs())
+    }
+}
+
+#[cfg(test)]
+fn selection_point_for_viewport_pointer(
+    area: Rect,
+    scroll_start: usize,
+    pointer: Position,
+    ranges: &[SelectionRowRange],
+) -> SelectionPoint {
+    let pointer = Position::new(
+        pointer.x.clamp(area.x, area.right().saturating_sub(1)),
+        pointer.y.clamp(area.y, area.bottom().saturating_sub(1)),
+    );
+    let row = scroll_start.saturating_add(usize::from(pointer.y.saturating_sub(area.y)));
+    let column = usize::from(pointer.x.saturating_sub(area.x));
+    selection_point_for_row(ranges, row, column)
+}
+
+fn selection_point_for_viewport_pointer_in_lines(
+    area: Rect,
+    scroll_start: usize,
+    pointer: Position,
+    ranges: &[SelectionRowRange],
+    lines: &[Line<'static>],
+) -> SelectionPoint {
+    let pointer = Position::new(
+        pointer.x.clamp(area.x, area.right().saturating_sub(1)),
+        pointer.y.clamp(area.y, area.bottom().saturating_sub(1)),
+    );
+    let row = scroll_start.saturating_add(usize::from(pointer.y.saturating_sub(area.y)));
+    let column = usize::from(pointer.x.saturating_sub(area.x));
+    selection_point_for_row_in_lines(ranges, lines, row, column)
+}
+
 fn selection_point_for_row(
     ranges: &[SelectionRowRange],
     row: usize,
@@ -7592,6 +7853,7 @@ fn selection_point_for_row(
             entry: *entry,
             row_in_entry: body_start + (row - start),
             column,
+            logical_offset: None,
         };
     }
     if let Some((entry, ..)) = ranges.iter().find(|(_, start, _, _)| *start > row) {
@@ -7599,6 +7861,7 @@ fn selection_point_for_row(
             entry: *entry,
             row_in_entry: 0,
             column,
+            logical_offset: None,
         };
     }
     if let Some((entry, start, end, body_start)) = ranges.last() {
@@ -7606,13 +7869,60 @@ fn selection_point_for_row(
             entry: *entry,
             row_in_entry: body_start + end.saturating_sub(1).saturating_sub(*start),
             column,
+            logical_offset: None,
         };
     }
     SelectionPoint {
         entry: 0,
         row_in_entry: row,
         column,
+        logical_offset: None,
     }
+}
+
+fn selection_point_for_row_in_lines(
+    ranges: &[SelectionRowRange],
+    lines: &[Line<'static>],
+    row: usize,
+    column: usize,
+) -> SelectionPoint {
+    let point = selection_point_for_row(ranges, row, column);
+    let Some((_, start, _end, _)) = ranges
+        .iter()
+        .find(|(_, start, end, _)| row >= *start && row < *end)
+    else {
+        return point;
+    };
+    let logical_offset = (*start..row)
+        .filter_map(|line| lines.get(line))
+        .map(|line| selection_line_content_metrics(line).1)
+        .sum::<usize>()
+        .saturating_add(
+            lines
+                .get(row)
+                .map(selection_line_content_metrics)
+                .map_or(0, |(prefix, width)| {
+                    column.saturating_sub(prefix).min(width)
+                }),
+        );
+    SelectionPoint {
+        logical_offset: Some(logical_offset),
+        ..point
+    }
+}
+
+fn selection_line_content_metrics(line: &Line<'static>) -> (usize, usize) {
+    let width = line
+        .spans
+        .iter()
+        .map(|span| span.content.width())
+        .sum::<usize>();
+    let prefix = line
+        .spans
+        .first()
+        .filter(|span| span.content.as_ref() == "  ")
+        .map_or(0, |_| 2);
+    (prefix, width.saturating_sub(prefix))
 }
 
 fn tool_run_separator(in_tool_run: bool) -> Line<'static> {

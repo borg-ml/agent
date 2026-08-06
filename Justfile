@@ -54,6 +54,10 @@ verify:
 release version="":
     ./scripts/release.sh {{ quote(version) }}
 
+# Bump the minor component and reset the patch component, e.g. 0.1.44 -> 0.2.0.
+release-minor version="":
+    ./scripts/release.sh --minor {{ quote(version) }}
+
 # Build and install the optimized public Borg CLI from this checkout.
 cli:
     #!/usr/bin/env bash

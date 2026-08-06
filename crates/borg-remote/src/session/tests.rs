@@ -1523,6 +1523,116 @@ async fn provider_setup_stall_has_a_durable_terminal_boundary() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn stopping_an_active_turn_marks_its_prompt_failed() {
+    let root = tempdir().unwrap();
+    let journal_path = root.path().join("session.lock");
+    let session_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    let (command_tx, command_rx) = mpsc::channel(8);
+    let (event_tx, mut event_rx) = mpsc::channel(64);
+    let actor = tokio::spawn({
+        let journal_path = journal_path.clone();
+        let cwd = root.path().to_path_buf();
+        async move {
+            run_agent_session_with_executor(
+                &journal_path,
+                session_id,
+                LaunchSession {
+                    request_id: message_id,
+                    cwd,
+                    provider: CodingProvider::Codex,
+                    model: None,
+                    effort: None,
+                    fast: Some(false),
+                    response_language: crate::ResponseLanguage::Auto,
+                    permission_mode: PermissionMode::Manual,
+                    name: None,
+                    initial_prompt: None,
+                    capabilities: Default::default(),
+                    subagent_concurrency_limit: None,
+                    extension_skill_roots: Vec::new(),
+                    team_policy: None,
+                },
+                command_rx,
+                event_tx,
+                Arc::new(HungProviderExecutor),
+            )
+            .await
+        }
+    });
+
+    command_tx
+        .send(HostCommand::Prompt {
+            session_id,
+            message_id,
+            text: "stop me".to_string(),
+            attachments: Vec::new(),
+            output_schema: None,
+            delivery: PromptDelivery::Queue,
+        })
+        .await
+        .unwrap();
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+            .await
+            .expect("prompt enters the active turn")
+            .expect("session remains open");
+        if matches!(
+            event.kind,
+            SessionEventKind::Message {
+                message_id: event_message_id,
+                status: MessageStatus::InProgress,
+                ..
+            } if event_message_id == message_id
+        ) {
+            break;
+        }
+    }
+
+    command_tx
+        .send(HostCommand::Stop { session_id })
+        .await
+        .unwrap();
+    actor.await.unwrap().unwrap();
+
+    let mut terminal_events = Vec::new();
+    while let Some(event) = event_rx.recv().await {
+        terminal_events.push(event.kind);
+    }
+    assert!(terminal_events.iter().any(|kind| matches!(
+        kind,
+        SessionEventKind::Message {
+            message_id: event_message_id,
+            status: MessageStatus::Failed,
+            ..
+        } if *event_message_id == message_id
+    )));
+    assert!(terminal_events.iter().any(|kind| matches!(
+        kind,
+        SessionEventKind::TurnCompleted {
+            message_id: event_message_id,
+            error: Some(error),
+            ..
+        } if *event_message_id == message_id && error == "session stopped during turn"
+    )));
+
+    let durable = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+        .await
+        .unwrap()
+        .read(session_id)
+        .await
+        .unwrap();
+    assert!(durable.iter().any(|event| matches!(
+        &event.kind,
+        SessionEventKind::Message {
+            message_id: event_message_id,
+            status: MessageStatus::Failed,
+            ..
+        } if *event_message_id == message_id
+    )));
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn detached_live_projection_cannot_block_durable_turn_terminalization() {
     let root = tempdir().unwrap();
     let journal_path = root.path().join("session.lock");
@@ -2632,6 +2742,7 @@ async fn unacknowledged_steer_does_not_block_interrupt_or_fifo_fallback() {
     tokio::time::timeout(Duration::from_secs(1), steer_seen.notified())
         .await
         .expect("provider receives steer");
+    let mut transitions = Vec::new();
 
     command_tx
         .send(HostCommand::Interrupt { session_id })
@@ -2640,6 +2751,25 @@ async fn unacknowledged_steer_does_not_block_interrupt_or_fifo_fallback() {
     tokio::time::timeout(Duration::from_secs(1), turn_started.notified())
         .await
         .expect("unacknowledged steer falls back to the FIFO");
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+            .await
+            .expect("the FIFO turn reaches a terminal boundary")
+            .expect("session remains open");
+        if let SessionEventKind::Message {
+            message_id,
+            status,
+            delivery: Some(delivery),
+            ..
+        } = event.kind
+            && message_id == followup_id
+        {
+            transitions.push((status, delivery));
+            if status == MessageStatus::Complete {
+                break;
+            }
+        }
+    }
     command_tx
         .send(HostCommand::Stop { session_id })
         .await
@@ -2653,7 +2783,6 @@ async fn unacknowledged_steer_does_not_block_interrupt_or_fifo_fallback() {
         assert!(subscription_prompt_ends_with(&turns[1].0, "followup"));
     }
 
-    let mut transitions = Vec::new();
     while let Some(event) = event_rx.recv().await {
         if let SessionEventKind::Message {
             message_id,

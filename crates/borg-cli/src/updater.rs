@@ -352,8 +352,14 @@ fn validate_native_provider(provider: &Path) -> Result<()> {
 #[cfg(unix)]
 fn install_candidate(candidate: &Path, provider: &Path, _version: &Version) -> Result<()> {
     let executable = std::env::current_exe().context("failed to locate installed Borg")?;
-    install_candidate_at(candidate, &executable)?;
-    install_native_provider_at(provider, &executable)
+    let target = native_provider_target(&executable)?;
+    let swap = stage_native_provider(provider, &target)?;
+    if let Err(error) = install_candidate_at(candidate, &executable) {
+        swap.rollback()
+            .context("failed to roll back native provider after binary update failure")?;
+        return Err(error);
+    }
+    swap.commit()
 }
 
 #[cfg(unix)]
@@ -375,8 +381,14 @@ fn install_candidate_at(candidate: &Path, executable: &Path) -> Result<()> {
     fs::rename(&staged, executable).context("failed to atomically replace installed Borg")
 }
 
+#[cfg(windows)]
 fn install_native_provider_at(provider: &Path, executable: &Path) -> Result<()> {
     validate_native_provider(provider)?;
+    let target = native_provider_target(executable)?;
+    stage_native_provider(provider, &target)?.commit()
+}
+
+fn native_provider_target(executable: &Path) -> Result<PathBuf> {
     let target = std::env::var_os("BORG_HOME")
         .map(PathBuf::from)
         .map(|home| home.join("providers/claude"))
@@ -386,10 +398,42 @@ fn install_native_provider_at(provider: &Path, executable: &Path) -> Result<()> 
                 .map(|parent| parent.join("providers/claude"))
         })
         .context("installed Borg has no provider destination")?;
-    install_native_provider_to(provider, &target)
+    Ok(target)
 }
 
+#[cfg(any(test, windows))]
 fn install_native_provider_to(provider: &Path, target: &Path) -> Result<()> {
+    stage_native_provider(provider, target)?.commit()
+}
+
+struct NativeProviderSwap {
+    target: PathBuf,
+    backup: Option<PathBuf>,
+}
+
+impl NativeProviderSwap {
+    fn commit(self) -> Result<()> {
+        if let Some(backup) = self.backup {
+            fs::remove_dir_all(backup).context("failed to remove old native provider")?;
+        }
+        Ok(())
+    }
+
+    fn rollback(self) -> Result<()> {
+        if self.target.exists() {
+            fs::remove_dir_all(&self.target)
+                .context("failed to remove partially installed native provider")?;
+        }
+        if let Some(backup) = self.backup {
+            fs::rename(backup, &self.target)
+                .context("failed to restore the previous native provider")?;
+        }
+        Ok(())
+    }
+}
+
+fn stage_native_provider(provider: &Path, target: &Path) -> Result<NativeProviderSwap> {
+    validate_native_provider(provider)?;
     let providers_parent = target
         .parent()
         .context("native provider destination has no parent")?;
@@ -421,7 +465,8 @@ fn install_native_provider_to(provider: &Path, target: &Path) -> Result<()> {
         )
         .context("failed to make native provider executable")?;
     }
-    if target.exists() {
+    let had_target = target.exists();
+    if had_target {
         fs::rename(target, &backup).context("failed to stage the installed native provider")?;
     }
     if let Err(error) = fs::rename(&staged, target) {
@@ -430,10 +475,10 @@ fn install_native_provider_to(provider: &Path, target: &Path) -> Result<()> {
         }
         return Err(error).context("failed to atomically install native provider");
     }
-    if backup.exists() {
-        fs::remove_dir_all(&backup).context("failed to remove old native provider")?;
-    }
-    Ok(())
+    Ok(NativeProviderSwap {
+        target: target.to_path_buf(),
+        backup: had_target.then_some(backup),
+    })
 }
 
 #[cfg(windows)]
@@ -809,5 +854,26 @@ mod tests {
             fs::read(installed_provider.join("claude")).unwrap(),
             b"new-claude"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_native_provider_swap_can_roll_back_before_commit() {
+        let directory = tempfile::tempdir().unwrap();
+        let provider = directory.path().join("staged-provider");
+        let target = directory.path().join("providers/claude");
+        fs::create_dir_all(&provider).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        fs::write(provider.join("claude"), b"new-claude").unwrap();
+        fs::write(provider.join("manifest.json"), b"{}").unwrap();
+        fs::write(provider.join("package.json"), b"{}").unwrap();
+        fs::write(target.join("claude"), b"old-claude").unwrap();
+        fs::write(target.join("manifest.json"), b"{}").unwrap();
+        fs::write(target.join("package.json"), b"{}").unwrap();
+
+        let swap = stage_native_provider(&provider, &target).unwrap();
+        assert_eq!(fs::read(target.join("claude")).unwrap(), b"new-claude");
+        swap.rollback().unwrap();
+        assert_eq!(fs::read(target.join("claude")).unwrap(), b"old-claude");
     }
 }

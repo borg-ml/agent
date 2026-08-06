@@ -3180,6 +3180,17 @@ async fn run_agent_session_store_kernel(
                                 &mut pending_provider_interaction,
                             )
                             .await?;
+                            if prompt.visible {
+                                record_prompt_status(
+                                    &mut journal,
+                                    &events,
+                                    session_id,
+                                    &prompt,
+                                    MessageStatus::Failed,
+                                    prompt.delivery,
+                                )
+                                .await?;
+                            }
                             record(
                                 &mut journal,
                                 &events,

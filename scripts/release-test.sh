@@ -96,6 +96,7 @@ fixture_version() {
 
 make_fixture() {
   local name="$1"
+  local version="${2:-1.2.3}"
   local fixture="$test_root/$name"
   local origin="$test_root/$name-origin.git"
 
@@ -109,7 +110,7 @@ make_fixture() {
     echo 'members = []'
     echo
     echo '[workspace.package]'
-    echo 'version = "1.2.3"'
+    echo "version = \"$version\""
   } >"$fixture/Cargo.toml"
 
   {
@@ -118,13 +119,13 @@ make_fixture() {
       echo
       echo '[[package]]'
       echo "name = \"$package\""
-      echo 'version = "1.2.3"'
+      echo "version = \"$version\""
     done
   } >"$fixture/Cargo.lock"
 
   git -C "$fixture" add Cargo.toml Cargo.lock
-  git -C "$fixture" commit --quiet -m "Release Borg CLI 1.2.3"
-  git -C "$fixture" tag -a v1.2.3 -m "Borg CLI 1.2.3"
+  git -C "$fixture" commit --quiet -m "Release Borg CLI $version"
+  git -C "$fixture" tag -a "v$version" -m "Borg CLI $version"
 
   cp "$release_script" "$fixture/scripts/release.sh"
   chmod +x "$fixture/scripts/release.sh"
@@ -210,6 +211,8 @@ run_release() {
 
 assert_equal "1.2.4" "$("$release_script" --next-version 1.2.3)" \
   "default patch calculation"
+assert_equal "0.2.0" "$("$release_script" --next-minor 0.1.44)" \
+  "minor version calculation"
 if "$release_script" --next-version 01.2.3 >/dev/null 2>&1; then
   fail "invalid SemVer was accepted"
 fi
@@ -272,6 +275,32 @@ assert_equal "1.2.4" "$(fixture_version "$interrupted_fixture")" \
 assert_equal "$interrupted_head" \
   "$(git -C "$interrupted_fixture" rev-parse 'refs/tags/v1.2.4^{commit}')" \
   "interrupted release tag"
+
+prebumped_fixture="$(make_fixture prebumped 0.1.43)"
+sed -i 's/0\.1\.43/0.1.44/g' \
+  "$prebumped_fixture/Cargo.toml" "$prebumped_fixture/Cargo.lock"
+echo "coalesced release change" >"$prebumped_fixture/status.txt"
+git -C "$prebumped_fixture" add Cargo.toml Cargo.lock status.txt
+git -C "$prebumped_fixture" commit --quiet \
+  -m "Preserve status tracking and bump version to 0.1.44"
+git -C "$prebumped_fixture" push --quiet origin main
+prebumped_head="$(git -C "$prebumped_fixture" rev-parse HEAD)"
+run_release "$prebumped_fixture"
+assert_equal "$prebumped_head" "$(git -C "$prebumped_fixture" rev-parse HEAD)" \
+  "pre-bumped release HEAD"
+assert_equal "$prebumped_head" \
+  "$(git -C "$prebumped_fixture" rev-parse 'refs/tags/v0.1.44^{commit}')" \
+  "pre-bumped release tag"
+
+minor_fixture="$(make_fixture minor 0.1.44)"
+run_release "$minor_fixture" --minor
+assert_equal "0.2.0" "$(fixture_version "$minor_fixture")" \
+  "minor release version"
+assert_equal "Release Borg CLI 0.2.0" \
+  "$(git -C "$minor_fixture" log -1 --format=%s)" \
+  "minor release commit"
+git -C "$minor_fixture" rev-parse --verify 'refs/tags/v0.2.0^{commit}' \
+  >/dev/null || fail "minor release tag is missing"
 
 rollback_fixture="$(make_fixture rollback)"
 rollback_manifest="$(sha256sum "$rollback_fixture/Cargo.toml")"

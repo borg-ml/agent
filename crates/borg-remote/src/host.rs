@@ -1,5 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::fs;
+use std::io::Write;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -13,6 +14,7 @@ use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 use tokio::sync::{Mutex, mpsc, watch};
+use url::{Host, Url};
 use uuid::Uuid;
 
 use crate::receipt::{ReceiptState, SqliteReceiptStore};
@@ -34,6 +36,18 @@ pub struct HostConfig {
     pub host_token: String,
     pub name: String,
     pub roots: Vec<PathBuf>,
+}
+
+impl HostConfig {
+    fn validate(&self) -> Result<()> {
+        validate_server_url(&self.server)?;
+        ensure!(
+            !self.host_token.trim().is_empty(),
+            "remote host token is empty"
+        );
+        ensure!(!self.name.trim().is_empty(), "remote host name is empty");
+        Ok(())
+    }
 }
 
 #[derive(Serialize)]
@@ -551,6 +565,8 @@ pub async fn enroll_host(
     roots: Vec<PathBuf>,
     config_path: &Path,
 ) -> Result<HostConfig> {
+    let server = validate_server_url(server)?;
+    ensure!(!token.trim().is_empty(), "host enrollment token is empty");
     let roots = canonical_roots(roots)?;
     let name = name
         .map(str::trim)
@@ -559,7 +575,7 @@ pub async fn enroll_host(
         .unwrap_or_else(hostname);
     let capabilities = probe_capabilities(roots.clone()).await;
     let response = Client::new()
-        .post(endpoint(server, "/api/remote/hosts/enroll"))
+        .post(endpoint(&server, "/api/remote/hosts/enroll"))
         .json(&EnrollRequest {
             token: token.to_string(),
             name: name.clone(),
@@ -582,12 +598,13 @@ pub async fn enroll_host(
         .await
         .context("Borg returned an invalid host enrollment response")?;
     let config = HostConfig {
-        server: server.trim_end_matches('/').to_string(),
+        server,
         host_id: enrolled.host.id,
         host_token: enrolled.host_token,
         name,
         roots,
     };
+    config.validate()?;
     write_config(config_path, &config)?;
     Ok(config)
 }
@@ -881,6 +898,7 @@ pub async fn run_host_with_executor_factory(
             .with_context(|| format!("failed to read {}", config_path.display()))?,
     )
     .with_context(|| format!("invalid host config {}", config_path.display()))?;
+    config.validate()?;
     let client = Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(35))
@@ -984,6 +1002,7 @@ pub async fn mirror_local_session(
             .with_context(|| format!("failed to read {}", config_path.display()))?,
     )
     .with_context(|| format!("invalid host config {}", config_path.display()))?;
+    config.validate()?;
     let client = Client::builder()
         .connect_timeout(Duration::from_secs(3))
         .timeout(Duration::from_secs(5))
@@ -1888,15 +1907,87 @@ fn canonical_roots(roots: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
 fn write_config(path: &Path, config: &HostConfig) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+        }
     }
     let bytes = serde_json::to_vec_pretty(config)?;
-    fs::write(path, bytes).with_context(|| format!("failed to write {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("host.json");
+    let temporary = parent.join(format!(".{file_name}.tmp-{}", Uuid::new_v4()));
+    let result = (|| -> std::io::Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))?;
+        }
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        replace_config_file(&temporary, path)?;
+        #[cfg(unix)]
+        fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let _ = fs::remove_file(&temporary);
+        return Err(error).with_context(|| format!("failed to write {}", path.display()));
     }
     Ok(())
+}
+
+#[cfg(not(windows))]
+fn replace_config_file(temporary: &Path, destination: &Path) -> std::io::Result<()> {
+    fs::rename(temporary, destination)
+}
+
+#[cfg(windows)]
+fn replace_config_file(temporary: &Path, destination: &Path) -> std::io::Result<()> {
+    match fs::remove_file(destination) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    fs::rename(temporary, destination)
+}
+
+fn validate_server_url(server: &str) -> Result<String> {
+    let server = server.trim().trim_end_matches('/');
+    ensure!(!server.is_empty(), "remote server URL is empty");
+    let parsed = Url::parse(server).with_context(|| "invalid remote server URL")?;
+    ensure!(
+        parsed.username().is_empty() && parsed.password().is_none(),
+        "remote server URL must not contain userinfo"
+    );
+    ensure!(
+        parsed.query().is_none() && parsed.fragment().is_none(),
+        "remote server URL must not contain a query or fragment"
+    );
+    ensure!(
+        parsed.path().is_empty() || parsed.path() == "/",
+        "remote server URL must not contain a path"
+    );
+    let host = parsed.host().context("remote server URL has no host")?;
+    match parsed.scheme() {
+        "https" => {}
+        "http"
+            if matches!(host, Host::Domain("localhost"))
+                || matches!(host, Host::Ipv4(address) if address.is_loopback())
+                || matches!(host, Host::Ipv6(address) if address.is_loopback()) => {}
+        "http" => bail!(
+            "remote server must use HTTPS; plain HTTP is allowed only for loopback development servers"
+        ),
+        scheme => bail!("unsupported remote server URL scheme `{scheme}`; use HTTPS"),
+    }
+    Ok(server.to_string())
 }
 
 fn endpoint(server: &str, path: &str) -> String {
@@ -2834,6 +2925,54 @@ mod tests {
         assert!(codex_auth_status_authenticated("authenticated"));
         assert!(!codex_auth_status_authenticated("Not logged in"));
         assert!(!codex_auth_status_authenticated(""));
+    }
+
+    #[test]
+    fn remote_server_requires_https_except_for_loopback_development() {
+        assert_eq!(
+            validate_server_url("https://borg.ml/").unwrap(),
+            "https://borg.ml"
+        );
+        assert!(validate_server_url("http://127.0.0.1:8080").is_ok());
+        assert!(validate_server_url("http://[::1]:8080").is_ok());
+        assert!(validate_server_url("http://example.com").is_err());
+        assert!(validate_server_url("https://user:secret@example.com").is_err());
+        assert!(validate_server_url("https://example.com/api").is_err());
+    }
+
+    #[test]
+    fn host_config_writes_atomically_with_private_unix_permissions() {
+        let root = tempdir().unwrap();
+        let config_path = root.path().join("remote").join("host.json");
+        let config = test_config(root.path());
+        write_config(&config_path, &config).unwrap();
+        let loaded: HostConfig = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+        assert_eq!(loaded.host_id, config.host_id);
+        assert!(
+            fs::read_dir(config_path.parent().unwrap())
+                .unwrap()
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".host.json.tmp-"))
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&config_path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                fs::metadata(config_path.parent().unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+        }
     }
 
     fn test_config(root: &Path) -> HostConfig {

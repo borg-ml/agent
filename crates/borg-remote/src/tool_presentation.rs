@@ -55,6 +55,12 @@ pub fn project_tool_presentation(
     is_error: bool,
 ) -> ToolPresentation {
     let (mut label, mut detail) = tool_call_summary(name, input);
+    if is_error
+        && is_mcp_resource_probe(name)
+        && let Some(output) = output
+    {
+        detail = mcp_resource_error_detail(output);
+    }
     if matches!(tool_leaf_name(name).as_str(), "read" | "read_file")
         && let Some(output) = output
         && let Some(output_detail) = read_output_detail(input, output)
@@ -89,6 +95,16 @@ pub fn project_tool_presentation(
         label,
         detail,
     }
+}
+
+/// Codex exposes MCP resource discovery as built-in model tools. Borg's MCP
+/// bridge is intentionally a tool server, so these probes are informational
+/// and have no useful expandable request/response body in the transcript.
+pub fn is_mcp_resource_probe(name: &str) -> bool {
+    matches!(
+        tool_leaf_name(name).as_str(),
+        "list_mcp_resources" | "list_mcp_resource_templates"
+    )
 }
 
 struct EditResultPresentation {
@@ -225,6 +241,9 @@ pub fn tool_code_view(name: &str, input: &Value) -> Option<(String, String)> {
     ) {
         return None;
     }
+    if is_mcp_resource_probe(name) {
+        return None;
+    }
     if name.to_ascii_lowercase().contains("edit")
         && let Some((path, source)) = claude_edit_diff(input)
     {
@@ -316,6 +335,17 @@ pub fn is_diff_language(language: &str) -> bool {
 
 pub fn tool_call_summary(name: &str, input: &Value) -> (String, String) {
     let tool = tool_leaf_name(name);
+
+    if is_mcp_resource_probe(name) {
+        let label = if name.starts_with("mcp__") {
+            format_mcp_tool_name(name)
+        } else if tool == "list_mcp_resources" {
+            "List MCP resources".to_string()
+        } else {
+            "List MCP resource templates".to_string()
+        };
+        return (label, String::new());
+    }
 
     if matches!(tool.as_str(), "toolsearch" | "tool_search") {
         return (
@@ -577,6 +607,9 @@ pub fn tool_output_code_view(name: &str, output: &str) -> Option<(String, String
     if trimmed.is_empty() || trimmed == "null" {
         return None;
     }
+    if is_mcp_resource_probe(name) {
+        return None;
+    }
     if matches!(
         tool_leaf_name(name).as_str(),
         "edit" | "apply_patch" | "write" | "write_file"
@@ -682,6 +715,8 @@ fn tool_category(name: &str, label: &str, input: &Value) -> ToolPresentationCate
         ToolPresentationCategory::Plan
     } else if matches!(leaf.as_str(), "get_goal" | "create_goal" | "update_goal") {
         ToolPresentationCategory::Goal
+    } else if is_mcp_resource_probe(name) {
+        ToolPresentationCategory::Read
     } else if leaf == "remote_approval" {
         ToolPresentationCategory::Approval
     } else if matches!(leaf.as_str(), "image_generation" | "view_image") {
@@ -788,6 +823,30 @@ fn summarize_tool_result(
     let trimmed = readable.trim();
     if trimmed.is_empty() || trimmed == "null" {
         return None;
+    }
+    if is_mcp_resource_probe(name) {
+        if is_error {
+            return Some(mcp_resource_error_detail(trimmed));
+        }
+        let key = if tool_leaf_name(name) == "list_mcp_resources" {
+            "resources"
+        } else {
+            "resourceTemplates"
+        };
+        if let Ok(Value::Object(fields)) = serde_json::from_str::<Value>(trimmed)
+            && let Some(items) = fields.get(key).and_then(Value::as_array)
+        {
+            let noun = if key == "resources" {
+                "resource"
+            } else {
+                "resource template"
+            };
+            return Some(format!(
+                "{} {noun}{}",
+                items.len(),
+                if items.len() == 1 { "" } else { "s" }
+            ));
+        }
     }
     if is_error {
         return trimmed
@@ -1384,11 +1443,28 @@ fn format_mcp_tool_name(name: &str) -> String {
     })
     .unwrap_or((server, action));
     let service = service.replace(['_', '-'], " ");
-    format!(
-        "{} · {}",
-        title_case(&service),
-        action.replace(['_', '-'], " ")
-    )
+    let action = match action {
+        "list_mcp_resources" => "List MCP resources".to_string(),
+        "list_mcp_resource_templates" => "List MCP resource templates".to_string(),
+        _ => action.replace(['_', '-'], " "),
+    };
+    format!("{} · {}", title_case(&service), action)
+}
+
+fn mcp_resource_error_detail(output: &str) -> String {
+    let first_line = output
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("MCP resource lookup failed")
+        .trim();
+    let normalized = first_line.to_ascii_lowercase();
+    if normalized.contains("not ready") {
+        return "MCP server not ready".to_string();
+    }
+    if normalized.contains("unsupported method") {
+        return "MCP resources unavailable".to_string();
+    }
+    compact_text(first_line, 100)
 }
 
 fn high_signal_detail(input: &Value) -> Option<String> {
@@ -2188,6 +2264,41 @@ mod tests {
 
         assert_eq!(decision.label, "Borg agent · record workspace decision");
         assert!(!decision.label.contains('_'));
+    }
+
+    #[test]
+    fn resource_probes_are_compact_and_hide_transport_payloads() {
+        let probe = project_tool_presentation(
+            "mcp__borg_agent__list_mcp_resources",
+            &json!({"server": "borg_agent"}),
+            Some("resources/list failed: MCP server 'borg_agent' was not ready for this step"),
+            true,
+        );
+
+        assert_eq!(probe.label, "Borg agent · List MCP resources");
+        assert_eq!(probe.detail, "MCP server not ready");
+        assert_eq!(probe.category, ToolPresentationCategory::Read);
+        assert_eq!(probe.input, None);
+        assert_eq!(probe.output, None);
+        assert_eq!(probe.result.as_deref(), Some("MCP server not ready"));
+        assert_eq!(
+            tool_output_code_view("mcp__borg_agent__list_mcp_resources", r#"{"resources":[]}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn empty_resource_probe_results_have_a_small_summary() {
+        let probe = project_tool_presentation(
+            "mcp__borg_agent__list_mcp_resource_templates",
+            &json!({"server": "borg_agent"}),
+            Some(r#"{"resourceTemplates":[]}"#),
+            false,
+        );
+
+        assert_eq!(probe.label, "Borg agent · List MCP resource templates");
+        assert_eq!(probe.detail, "");
+        assert_eq!(probe.result.as_deref(), Some("0 resource templates"));
     }
 
     #[test]

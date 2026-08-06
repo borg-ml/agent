@@ -249,7 +249,13 @@ async fn handle_line_with_cancel(
     };
     if !matches!(
         method,
-        "server/discover" | "initialize" | "ping" | "tools/list" | "tools/call"
+        "server/discover"
+            | "initialize"
+            | "ping"
+            | "tools/list"
+            | "tools/call"
+            | "resources/list"
+            | "resources/templates/list"
     ) {
         return Some(rpc_error(
             id,
@@ -262,7 +268,10 @@ async fn handle_line_with_cancel(
         "server/discover" if modern => Ok(json!({
             "resultType": "complete",
             "supportedVersions": [CURRENT_PROTOCOL_VERSION, LEGACY_PROTOCOL_VERSION],
-            "capabilities": { "tools": { "listChanged": false } },
+            "capabilities": {
+                "tools": { "listChanged": false },
+                "resources": { "listChanged": false, "subscribe": false }
+            },
             "_meta": server_meta(),
         })),
         "server/discover" => Err(anyhow::anyhow!(
@@ -271,7 +280,7 @@ async fn handle_line_with_cancel(
         "initialize" if !modern => Ok(json!({
             "protocolVersion": LEGACY_PROTOCOL_VERSION,
             "serverInfo": server_info(),
-            "capabilities": { "tools": {} }
+            "capabilities": { "tools": {}, "resources": {} }
         })),
         "initialize" => {
             return Some(rpc_error(
@@ -295,6 +304,22 @@ async fn handle_line_with_cancel(
                     endpoint.consultation_enabled(),
                 )
             });
+            Ok(if modern {
+                modern_result(result)
+            } else {
+                result
+            })
+        }
+        "resources/list" => {
+            let result = json!({"resources": []});
+            Ok(if modern {
+                modern_result(result)
+            } else {
+                result
+            })
+        }
+        "resources/templates/list" => {
+            let result = json!({"resourceTemplates": []});
             Ok(if modern {
                 modern_result(result)
             } else {
@@ -606,6 +631,10 @@ mod tests {
             CURRENT_PROTOCOL_VERSION
         );
         assert!(discover["result"]["_meta"][SERVER_INFO_META].is_object());
+        assert_eq!(
+            discover["result"]["capabilities"]["resources"]["listChanged"],
+            false
+        );
 
         let listing = handle_line(
             &endpoint,
@@ -624,6 +653,40 @@ mod tests {
         .unwrap();
         assert_eq!(listing["result"]["resultType"], "complete");
         assert!(listing["result"]["tools"].is_array());
+
+        let resources = handle_line(
+            &endpoint,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "resources/list",
+                "params": { "_meta": {
+                    PROTOCOL_VERSION_META: CURRENT_PROTOCOL_VERSION,
+                    CLIENT_CAPABILITIES_META: {},
+                }},
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resources["result"]["resources"], json!([]));
+
+        let templates = handle_line(
+            &endpoint,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "resources/templates/list",
+                "params": { "_meta": {
+                    PROTOCOL_VERSION_META: CURRENT_PROTOCOL_VERSION,
+                    CLIENT_CAPABILITIES_META: {},
+                }},
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(templates["result"]["resourceTemplates"], json!([]));
     }
 
     #[tokio::test]

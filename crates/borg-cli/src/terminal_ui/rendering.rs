@@ -55,19 +55,14 @@ pub(super) fn tool_body_lines(
 }
 
 fn reasoning_lines(source: &str, width: usize) -> Vec<Line<'static>> {
-    let source = normalize_reasoning_text(source);
-    let items = source
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>();
+    let items = reasoning_items(source);
     if items.is_empty() {
         return vec![Line::default()];
     }
     items
         .into_iter()
         .flat_map(|item| {
-            super::wrap_display(item, width.saturating_sub(2).max(1))
+            super::wrap_display(&item, width.saturating_sub(2).max(1))
                 .into_iter()
                 .enumerate()
                 .map(|(index, line)| {
@@ -88,15 +83,39 @@ fn reasoning_lines(source: &str, width: usize) -> Vec<Line<'static>> {
         .collect()
 }
 
-fn normalize_reasoning_text(source: &str) -> String {
+fn reasoning_items(source: &str) -> Vec<String> {
     let trimmed = source.trim();
     if trimmed.is_empty() {
-        return String::new();
+        return Vec::new();
     }
     if let Some(thoughts) = bold_reasoning_thoughts(trimmed) {
-        return thoughts.join("\n");
+        return thoughts.into_iter().map(str::to_string).collect();
     }
-    source.replace("**", "")
+    let cleaned = source.replace("**", "");
+    let mut items = Vec::new();
+    let mut current = String::new();
+    for raw_line in cleaned.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            if !current.is_empty() {
+                items.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+        let line = line
+            .strip_prefix("• ")
+            .or_else(|| line.strip_prefix("- "))
+            .or_else(|| line.strip_prefix("* "))
+            .unwrap_or(line);
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(line);
+    }
+    if !current.is_empty() {
+        items.push(current);
+    }
+    items
 }
 
 fn bold_reasoning_thoughts(mut source: &str) -> Option<Vec<&str>> {
@@ -737,6 +756,29 @@ mod tests {
         assert_eq!(lines[0].to_string(), "  │ • Inspecting blank lines");
         assert_eq!(lines[1].to_string(), "  │ • Restoring card padding");
         assert!(lines.iter().all(|line| !line.to_string().contains("**")));
+    }
+
+    #[test]
+    fn reasoning_renderer_wraps_soft_lines_under_one_bullet() {
+        let lines = tool_body_lines(
+            "reasoning",
+            "First sentence\nsecond sentence that continues the same thought.",
+            42,
+            "  │ ",
+        );
+
+        assert!(
+            lines[0]
+                .to_string()
+                .starts_with("  │ • First sentence second sentence")
+        );
+        assert!(lines[1].to_string().starts_with("  │   "));
+        assert!(
+            lines
+                .iter()
+                .skip(1)
+                .all(|line| !line.to_string().contains("• "))
+        );
     }
 
     #[test]

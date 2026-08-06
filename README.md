@@ -79,6 +79,21 @@ Automated CLI/terminal checks should use `borg agent --ephemeral --local-only`.
 That creates a temporary session store and removes it when the process exits,
 so health checks do not pollute the user's resume history or Remote workspace.
 
+### Durable data and trust boundaries
+
+Local session data is intentionally disposable while Borg is pre-1.0. Borg
+accepts only the current SQLite session schema; when an incompatible older
+database is found, it moves the file aside as an `*.incompatible-*` archive and
+starts a fresh store. Future schemas are rejected rather than overwritten.
+There is no historical local-schema migration or downgrade guarantee yet.
+
+**Full Access** is the default permission mode. Native processes, MCP servers,
+and Blu executable workflows run with the user's operating-system authority;
+Blu runtimes are trusted processes, not sandboxes. Project MCP remains disabled
+unless explicitly enabled. Remote host URLs require HTTPS, except for
+loopback HTTP development servers, and host configuration files are written
+with private permissions.
+
 Resume paints a bounded recent conversation synchronously, then fetches older
 pages only when you scroll. Restored subagents remain dormant metadata until an
 explicit child-directed action wakes them, and stopping the owning main thread
@@ -216,6 +231,12 @@ the Blu guide and manifest example under `docs/` and `configs/`, `LICENSE`,
 `NOTICE.md`, and this README. The Rust protocol runtime is provided
 by the standalone MIT-licensed [`claude-agents`](https://github.com/borg-ml/claude-agents)
 crate.
+
+Run `just release` for the next patch release or `just release-minor` for the
+next minor release (`0.1.44` → `0.2.0`). The release script repairs an
+interrupted publish and recognizes a version bump committed alongside its code,
+so rerunning the same command is safe after a transient failure.
+Before tagging a public release, follow [`docs/public-release-checklist.md`](docs/public-release-checklist.md).
 
 ---
 

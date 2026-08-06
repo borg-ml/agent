@@ -1658,6 +1658,14 @@ fn codex_app_server_mcp_config(servers: &[ExternalMcpServer]) -> Value {
             "args": server.args,
             "env": server.env,
         });
+        if server.name == "borg_agent" {
+            // Borg's tools are part of the turn contract. Make Codex wait for
+            // this local bridge before exposing the turn to the model instead
+            // of racing its asynchronous MCP startup and emitting a noisy
+            // "not ready for this step" resource failure.
+            config["required"] = Value::Bool(true);
+            config["startup_timeout_sec"] = Value::from(10);
+        }
         if !server.allowed_tools.is_empty() {
             config["enabled_tools"] = Value::Array(
                 server
@@ -2658,6 +2666,16 @@ mod tests {
         };
 
         let codex_config = codex_thread_start_params(&request, LocalAgentPermission::FullAccess);
+        let borg_agent_config = codex_config
+            .get("config")
+            .and_then(|value| value.get("mcp_servers"))
+            .and_then(|value| value.get("borg_agent"))
+            .expect("Borg agent Codex config");
+        assert_eq!(borg_agent_config.get("required"), Some(&Value::Bool(true)));
+        assert_eq!(
+            borg_agent_config.get("startup_timeout_sec"),
+            Some(&Value::from(10))
+        );
         assert_eq!(
             codex_config
                 .get("config")

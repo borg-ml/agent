@@ -214,6 +214,39 @@ enum TranscriptActionState {
     Failed,
 }
 
+fn compaction_has_expandable_detail(summary: &str) -> bool {
+    let detail = summary
+        .strip_prefix("Compacted context: ")
+        .unwrap_or(summary);
+    let normalized = detail
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+
+    !matches!(
+        normalized.as_str(),
+        ""
+            | "context compacted"
+            | "context was compacted"
+            | "no summary"
+            | "no details"
+    )
+}
+
+fn tool_has_expandable_body(
+    source_name: &str,
+    code_view: Option<&(String, String)>,
+    output_view: Option<&(String, String)>,
+) -> bool {
+    !is_mcp_resource_probe(source_name)
+        && [code_view, output_view]
+            .into_iter()
+            .flatten()
+            .any(|(_, body)| !body.trim().is_empty())
+}
+
 impl Transcript {
     fn upsert_subagent_snapshot(&mut self, agent: &SubagentSnapshot) {
         self.subagents.insert(agent.session_id, agent.status);
@@ -434,9 +467,13 @@ impl Transcript {
 
     fn toggle_compaction_expansion(&mut self, index: usize) {
         if let Some(TranscriptEntry::Compaction {
-            expanded, complete, ..
+            expanded,
+            summary,
+            complete,
+            ..
         }) = self.order.get_mut(index)
             && *complete
+            && compaction_has_expandable_detail(summary)
         {
             *expanded = !*expanded;
         }
@@ -445,7 +482,11 @@ impl Transcript {
     fn compaction_is_expandable(&self, index: usize) -> bool {
         matches!(
             self.order.get(index),
-            Some(TranscriptEntry::Compaction { complete: true, .. })
+            Some(TranscriptEntry::Compaction {
+                summary,
+                complete: true,
+                ..
+            }) if compaction_has_expandable_detail(summary)
         )
     }
 
@@ -485,7 +526,22 @@ impl Transcript {
         )
     }
 
+    fn tool_is_expandable(&self, index: usize) -> bool {
+        matches!(
+            self.order.get(index),
+            Some(TranscriptEntry::Tool {
+                source_name,
+                code_view,
+                output_view,
+                ..
+            }) if tool_has_expandable_body(source_name, code_view.as_ref(), output_view.as_ref())
+        )
+    }
+
     fn toggle_tool(&mut self, index: usize) -> Vec<SessionPayloadRef> {
+        if !self.tool_is_expandable(index) {
+            return Vec::new();
+        }
         if let Some(TranscriptEntry::Tool {
             expanded,
             payload_refs,
@@ -504,7 +560,7 @@ impl Transcript {
         matches!(
             self.order.get(index),
             Some(TranscriptEntry::Tool { expanded: true, .. })
-        )
+        ) && self.tool_is_expandable(index)
     }
 
     fn hydrate_payload(&mut self, payload: &SessionPayloadRef, bytes: Vec<u8>) -> Result<()> {
@@ -541,7 +597,9 @@ impl Transcript {
                 let output =
                     String::from_utf8(bytes).context("stored tool output is not valid UTF-8")?;
                 *backgrounded = !*error && tool_output_is_backgrounded(&output);
-                *output_view = if *error && !output.trim().is_empty() {
+                *output_view = if is_mcp_resource_probe(source_name) {
+                    None
+                } else if *error && !output.trim().is_empty() {
                     Some(("text".to_string(), output.trim_end().to_string()))
                 } else {
                     tool_output_code_view(name, &output)
@@ -1034,14 +1092,18 @@ impl Transcript {
                             *output_view = None;
                             *expanded = auto_expand_edits;
                         } else {
-                            *output_view = if *is_error && !output.trim().is_empty() {
+                            *output_view = if is_mcp_resource_probe(source_name) {
+                                None
+                            } else if *is_error && !output.trim().is_empty() {
                                 Some(("text".to_string(), output.trim_end().to_string()))
                             } else {
                                 tool_output_code_view(name, output)
                             };
                         }
                     } else {
-                        *output_view = if *is_error && !output.trim().is_empty() {
+                        *output_view = if is_mcp_resource_probe(source_name) {
+                            None
+                        } else if *is_error && !output.trim().is_empty() {
                             Some(("text".to_string(), output.trim_end().to_string()))
                         } else {
                             borg_control_tool_output_view(source_name, input.as_ref(), output)
@@ -2203,12 +2265,15 @@ impl Transcript {
                     ..
                 } => {
                     let time = display_local_time(time, today);
-                    let action_hint = if *complete {
+                    let expandable = *complete && compaction_has_expandable_detail(summary);
+                    let action_hint = if expandable {
                         if *expanded {
                             " · click to collapse · right-click for actions"
                         } else {
                             " · click to expand · right-click for actions"
                         }
+                    } else if *complete {
+                        " · right-click for actions"
                     } else {
                         ""
                     };
@@ -2224,7 +2289,7 @@ impl Transcript {
                             Style::default().fg(Color::DarkGray),
                         ),
                     ]));
-                    if *expanded && *complete {
+                    if *expanded && expandable {
                         let detail = summary
                             .strip_prefix("Compacted context: ")
                             .unwrap_or(summary);
@@ -2268,6 +2333,11 @@ impl Transcript {
                     let rich_ui = tool_has_rich_ui(
                         name,
                         code_view.as_ref().map(|(language, _)| language.as_str()),
+                    );
+                    let expandable = tool_has_expandable_body(
+                        source_name,
+                        code_view.as_ref(),
+                        output_view.as_ref(),
                     );
                     if *expanded
                         && rich_ui
@@ -2369,7 +2439,7 @@ impl Transcript {
                             apply_line_background(line, width, MESSAGE_HOVER_BG);
                         }
                     }
-                    if *expanded && let Some((language, source)) = code_view {
+                    if *expanded && expandable && let Some((language, source)) = code_view {
                         let body_prefix = if tool_window.is_some() {
                             "│   │ "
                         } else {
@@ -2413,7 +2483,7 @@ impl Transcript {
                             ));
                         }
                     }
-                    if *expanded && let Some((language, source)) = output_view {
+                    if *expanded && expandable && let Some((language, source)) = output_view {
                         let body_prefix = if tool_window.is_some() {
                             "│   │ "
                         } else {

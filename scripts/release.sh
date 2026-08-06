@@ -54,6 +54,14 @@ next_patch_version() {
   printf '%d.%d.%d\n' "$((10#$major))" "$((10#$minor))" "$((10#$patch + 1))"
 }
 
+next_minor_version() {
+  local version="$1"
+  local major minor patch
+  validate_version "$version" || die "workspace version '$version' is not stable SemVer"
+  IFS=. read -r major minor patch <<<"$version"
+  printf '%d.%d.0\n' "$((10#$major))" "$((10#$minor + 1))"
+}
+
 version_is_greater() {
   local candidate="$1"
   local current="$2"
@@ -113,7 +121,7 @@ replace_workspace_version() {
   mv "$manifest_tmp" Cargo.toml
 }
 
-version_only_change() {
+manifest_version_change() {
   local parent="$1"
   local commit="$2"
   local previous="$3"
@@ -121,7 +129,7 @@ version_only_change() {
   local changed_file
   local -a changed_files
 
-  mapfile -t changed_files < <(git diff --name-only "$parent" "$commit")
+  mapfile -t changed_files < <(git diff --name-only "$parent" "$commit" -- Cargo.toml Cargo.lock)
   [[ " ${changed_files[*]} " == *" Cargo.toml "* ]] || return 1
   for changed_file in "${changed_files[@]}"; do
     case "$changed_file" in
@@ -148,13 +156,12 @@ version_only_change() {
     '
 }
 
-interrupted_release_commit() {
+prebumped_release_commit() {
   local target="$1"
   local commit
   local parent
   local previous
   local previous_tag
-  local subject
 
   while IFS= read -r commit; do
     parent="$(git rev-parse --verify "$commit^" 2>/dev/null)" || continue
@@ -167,13 +174,11 @@ interrupted_release_commit() {
     git rev-parse --quiet --verify "refs/tags/$previous_tag^{commit}" >/dev/null || continue
     git merge-base --is-ancestor "$previous_tag" "$parent" || continue
 
-    subject="$(git log -1 --format=%s "$commit")"
-    case "$subject" in
-      "Bump workspace version to $target" | "Release Borg CLI $target") ;;
-      *) continue ;;
-    esac
-
-    version_only_change "$parent" "$commit" "$previous" "$target" || continue
+    # A release version can be bumped together with the code it releases. The
+    # manifest and lockfile must still contain only the expected version
+    # transition; non-Cargo changes are allowed and are the reason this is
+    # separate from the old version-only release path.
+    manifest_version_change "$parent" "$commit" "$previous" "$target" || continue
     [[ -z "$(git diff --name-only "$commit" HEAD -- Cargo.toml Cargo.lock)" ]] || continue
     printf '%s\n' "$commit"
     return 0
@@ -189,12 +194,20 @@ run_release_checks() {
 }
 
 mode="release"
+release_kind="patch"
 if [[ "${1:-}" == "--next-version" ]]; then
   [[ "$#" -eq 2 ]] || die "usage: $0 --next-version CURRENT"
   next_patch_version "$2"
   exit 0
+elif [[ "${1:-}" == "--next-minor" ]]; then
+  [[ "$#" -eq 2 ]] || die "usage: $0 --next-minor CURRENT"
+  next_minor_version "$2"
+  exit 0
 elif [[ "${1:-}" == "--check" ]]; then
   mode="check"
+  shift
+elif [[ "${1:-}" == "--minor" ]]; then
+  release_kind="minor"
   shift
 elif [[ "${1:-}" == "--verify-tag" ]]; then
   mode="verify-tag"
@@ -252,16 +265,41 @@ local_head="$(git rev-parse HEAD)"
   die "local $branch must exactly match $remote/$branch before release"
 
 recovered=0
+recovery_kind=""
 tag="v$current_version"
 current_tag_commit=""
 if current_tag_commit="$(git rev-parse --verify "refs/tags/$tag^{commit}" 2>/dev/null)"; then
   if ! git ls-remote --quiet --exit-code "$remote" "refs/tags/$tag" >/dev/null 2>&1 &&
     [[ "$current_tag_commit" == "$local_head" ]]; then
     recovered=1
+    recovery_kind="pending tag"
     target_version="$current_version"
   else
     if [[ -n "$requested_version" ]]; then
       target_version="$requested_version"
+    else
+      if [[ "$release_kind" == "minor" ]]; then
+        target_version="$(next_minor_version "$current_version")"
+      else
+        target_version="$(next_patch_version "$current_version")"
+      fi
+    fi
+    version_is_greater "$target_version" "$current_version" ||
+      die "target $target_version must be newer than workspace version $current_version"
+    tag="v$target_version"
+  fi
+else
+  if prebumped_release_commit "$current_version" >/dev/null 2>&1 &&
+    [[ "$release_kind" == "patch" ]] &&
+    [[ -z "$requested_version" || "$requested_version" == "$current_version" ]]; then
+    recovered=1
+    recovery_kind="pre-bumped version"
+    target_version="$current_version"
+  else
+    if [[ -n "$requested_version" ]]; then
+      target_version="$requested_version"
+    elif [[ "$release_kind" == "minor" ]]; then
+      target_version="$(next_minor_version "$current_version")"
     else
       target_version="$(next_patch_version "$current_version")"
     fi
@@ -269,14 +307,12 @@ if current_tag_commit="$(git rev-parse --verify "refs/tags/$tag^{commit}" 2>/dev
       die "target $target_version must be newer than workspace version $current_version"
     tag="v$target_version"
   fi
-else
-  if [[ ( -z "$requested_version" || "$requested_version" == "$current_version" ) ]] &&
-    interrupted_release_commit "$current_version" >/dev/null; then
-    recovered=1
-    target_version="$current_version"
-  else
-    die "current version v$current_version has no local release tag"
-  fi
+fi
+
+if [[ "$release_kind" == "minor" && -n "$requested_version" ]]; then
+  expected_minor="$(next_minor_version "$current_version")"
+  [[ "$requested_version" == "$expected_minor" ]] ||
+    die "minor release target must be $expected_minor (got $requested_version)"
 fi
 
 if [[ "$recovered" -eq 0 ]] && git rev-parse --quiet --verify "refs/tags/$tag^{commit}" >/dev/null; then
@@ -284,7 +320,7 @@ if [[ "$recovered" -eq 0 ]] && git rev-parse --quiet --verify "refs/tags/$tag^{c
 fi
 
 if [[ "$recovered" -eq 1 ]]; then
-  echo "Recovered interrupted release: $target_version (version bump already committed)"
+  echo "Recovered $recovery_kind release: $target_version (version bump already committed)"
 else
   echo "Release plan: $current_version -> $target_version"
 fi
