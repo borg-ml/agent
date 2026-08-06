@@ -377,6 +377,13 @@ fn request_protocol(
         ));
     };
     let Some(version) = meta.get(PROTOCOL_VERSION_META).and_then(Value::as_str) else {
+        // Standard stateful MCP clients may attach unrelated request metadata
+        // (for example a progress token) without opting into Borg's stateless
+        // protocol. The Codex app-server does this during `initialize`; treat
+        // it as legacy unless the stateless-only discovery method was used.
+        if method != "server/discover" {
+            return Ok(RequestProtocol::Legacy);
+        }
         return Err(ProtocolError::Invalid(format!(
             "MCP request metadata is missing `{PROTOCOL_VERSION_META}`"
         )));
@@ -715,5 +722,49 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(response["error"]["code"], -32602);
+    }
+
+    #[tokio::test]
+    async fn legacy_initialize_accepts_standard_request_metadata() {
+        #[cfg(unix)]
+        let endpoint = AgentToolEndpoint::Unix {
+            socket: Path::new("/unused").to_path_buf(),
+            provider: borg_remote::CodingProvider::Codex,
+            shared_work_enabled: false,
+            consultation_enabled: true,
+            team_policy: None,
+        };
+        #[cfg(not(unix))]
+        let endpoint = AgentToolEndpoint::Loopback {
+            address: "127.0.0.1:1".parse().unwrap(),
+            token: "unused".to_string(),
+            provider: borg_remote::CodingProvider::Codex,
+            shared_work_enabled: false,
+            consultation_enabled: true,
+            team_policy: None,
+        };
+        let response = handle_line(
+            &endpoint,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": LEGACY_PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "clientInfo": { "name": "codex-app-server", "version": "test" },
+                    "_meta": { "progressToken": "startup" },
+                },
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+        assert!(response.get("error").is_none(), "{response}");
+        assert_eq!(
+            response["result"]["protocolVersion"],
+            LEGACY_PROTOCOL_VERSION
+        );
     }
 }

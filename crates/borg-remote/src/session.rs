@@ -926,7 +926,9 @@ async fn run_agent_session_store_kernel(
     // A provider process can die after the durable TurnStarted boundary but
     // before its worker lease is installed. Requeue both unleased and expired
     // in-flight actions before rebuilding the actor's prompt queue.
-    let recovered_actions = store.recover_expired_actions(Utc::now(), 256).await?;
+    let recovered_actions = store
+        .recover_expired_actions(session_id, Utc::now(), 256)
+        .await?;
     let workspace_projection = if launch.capabilities.multiplayer {
         let binding = store
             .workspace_binding(session_id)
@@ -4216,7 +4218,12 @@ fn retained_compaction_prompt(context: &str) -> String {
 }
 
 fn recover_queued_prompts(events: &[SessionEvent]) -> VecDeque<QueuedPrompt> {
-    let mut pending = VecDeque::new();
+    let mut pending = VecDeque::<QueuedPrompt>::new();
+    // A crashed actor can leave an older in-progress snapshot after the
+    // message's terminal event. Do not resurrect that snapshot on resume;
+    // only an explicit queued event after a failed action starts a new
+    // attempt. Completed and recalled actions are not retryable.
+    let mut settled = HashMap::<Uuid, bool>::new();
     for event in events {
         match &event.kind {
             SessionEventKind::Message {
@@ -4224,32 +4231,55 @@ fn recover_queued_prompts(events: &[SessionEvent]) -> VecDeque<QueuedPrompt> {
                 actor,
                 text,
                 attachments,
-                status: MessageStatus::Queued | MessageStatus::InProgress,
+                status: status @ (MessageStatus::Queued | MessageStatus::InProgress),
                 delivery,
-            } if matches!(actor, EventActor::User | EventActor::System)
-                && !pending
-                    .iter()
-                    .any(|prompt: &QueuedPrompt| prompt.message_id == *message_id) =>
-            {
-                pending.push_back(QueuedPrompt {
-                    message_id: *message_id,
-                    text: text.clone(),
-                    actor: *actor,
-                    attachments: attachments.clone(),
-                    output_schema: None,
-                    delivery: delivery.unwrap_or(PromptDelivery::Queue),
-                    visible: true,
-                    interrupt_batch: *actor == EventActor::User,
-                    batch: Vec::new(),
-                });
+            } if matches!(actor, EventActor::User | EventActor::System) => {
+                let queued = *status == MessageStatus::Queued;
+                if settled
+                    .get(message_id)
+                    .is_some_and(|retryable| !queued || !*retryable)
+                {
+                    continue;
+                }
+                let delivery = delivery.unwrap_or(PromptDelivery::Queue);
+                if let Some(prompt) = pending
+                    .iter_mut()
+                    .find(|prompt| prompt.message_id == *message_id)
+                {
+                    // Steering is promoted to the FIFO when it is admitted
+                    // at a turn boundary. Keep the latest durable text,
+                    // attachments, and delivery class rather than treating
+                    // that promotion as a duplicate no-op.
+                    prompt.text = text.clone();
+                    prompt.attachments = attachments.clone();
+                    prompt.delivery = delivery;
+                } else {
+                    pending.push_back(QueuedPrompt {
+                        message_id: *message_id,
+                        text: text.clone(),
+                        actor: *actor,
+                        attachments: attachments.clone(),
+                        output_schema: None,
+                        delivery,
+                        visible: true,
+                        interrupt_batch: *actor == EventActor::User,
+                        batch: Vec::new(),
+                    });
+                }
+                if queued {
+                    // A queued event after a failed terminal status is an
+                    // explicit retry of the same durable action id.
+                    settled.remove(message_id);
+                }
             }
             SessionEventKind::Message {
                 message_id,
                 actor: EventActor::User | EventActor::System,
-                status: MessageStatus::Complete | MessageStatus::Failed,
+                status: status @ (MessageStatus::Complete | MessageStatus::Failed),
                 delivery,
                 ..
             } => {
+                settled.insert(*message_id, *status == MessageStatus::Failed);
                 if let Some(admitted) = pending
                     .iter()
                     .position(|prompt| prompt.message_id == *message_id)
@@ -4257,8 +4287,8 @@ fn recover_queued_prompts(events: &[SessionEvent]) -> VecDeque<QueuedPrompt> {
                     if *delivery == Some(PromptDelivery::Queue) {
                         let mut index = 0;
                         pending.retain(|prompt| {
-                            let retain =
-                                index > admitted || prompt.delivery != PromptDelivery::Queue;
+                            let retain = prompt.message_id != *message_id
+                                && (index > admitted || prompt.delivery != PromptDelivery::Queue);
                             index += 1;
                             retain
                         });
@@ -4273,6 +4303,7 @@ fn recover_queued_prompts(events: &[SessionEvent]) -> VecDeque<QueuedPrompt> {
                 }
             }
             SessionEventKind::PromptRecalled { message_id, .. } => {
+                settled.insert(*message_id, false);
                 pending.retain(|prompt| prompt.message_id != *message_id);
             }
             _ => {}

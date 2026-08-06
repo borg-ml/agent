@@ -66,6 +66,44 @@ type RevertForkTask = tokio::task::JoinHandle<Result<Uuid>>;
 /// keeping picker construction and per-keystroke filtering bounded.
 const RESUME_PICKER_SESSION_LIMIT: usize = 1_000;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RevertStartMode {
+    ForkNow,
+    StopThenFork,
+}
+
+fn revert_start_mode(status: SessionStatus) -> RevertStartMode {
+    if status == SessionStatus::Stopped {
+        RevertStartMode::ForkNow
+    } else {
+        RevertStartMode::StopThenFork
+    }
+}
+
+fn spawn_revert_fork(
+    store: Arc<dyn SessionStore>,
+    session_id: Uuid,
+    sequence: u64,
+) -> RevertForkTask {
+    let fork_id = Uuid::new_v4();
+    tokio::spawn(async move {
+        store
+            .fork_before(session_id, fork_id, sequence)
+            .await
+            .map(|_| fork_id)
+    })
+}
+
+fn take_revert_ready_to_fork(
+    pending_sequence: &mut Option<u64>,
+    status: SessionStatus,
+    event_stream_closed: bool,
+) -> Option<u64> {
+    (event_stream_closed || status == SessionStatus::Stopped)
+        .then(|| pending_sequence.take())
+        .flatten()
+}
+
 fn rich_terminal_can_prompt(stdin_is_terminal: bool, stdout_is_terminal: bool, json: bool) -> bool {
     stdin_is_terminal && stdout_is_terminal && !json
 }
@@ -661,6 +699,12 @@ async fn stop_stale_local_owner_and_acquire(
     control_socket_path: &Path,
     session_id: Uuid,
 ) -> Result<SessionWriterLease> {
+    // A crashed owner releases the OS file lock even if its control socket and
+    // owner metadata remain on disk. Prefer the lock as the source of truth so
+    // a stale socket cannot make resume fail before the new actor starts.
+    if let Some(writer) = SessionWriterLease::try_acquire(lock_path)? {
+        return Ok(writer);
+    }
     send_local_session_command(
         control_socket_path,
         session_id,
@@ -1332,6 +1376,7 @@ async fn run_local_agent_session(
     update_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut blu_discovery_task: Option<BluDiscoveryTask> = None;
     let mut shutdown_signal_open = true;
+    let mut session_event_stream_open = true;
     loop {
         tokio::select! {
             composer_history_result = async {
@@ -1434,14 +1479,16 @@ async fn run_local_agent_session(
                     }
                     Ok(Err(error)) => {
                         let message = format!("Revert failed; keeping the original session: {error:#}");
-                        tracing::warn!(%session_id, %error, "compaction checkpoint revert failed");
+                        tracing::warn!(%session_id, %error, "session revert failed");
+                        rewind_prompt = None;
                         resume_session = Some(session_id);
                         exit_notice = Some(message);
                         break;
                     }
                     Err(error) => {
                         let message = format!("Revert failed; keeping the original session: {error}");
-                        tracing::warn!(%session_id, %error, "compaction checkpoint revert task failed");
+                        tracing::warn!(%session_id, %error, "session revert task failed");
+                        rewind_prompt = None;
                         resume_session = Some(session_id);
                         exit_notice = Some(message);
                         break;
@@ -1644,25 +1691,24 @@ async fn run_local_agent_session(
                     }
                 }
             }
-            event = session_events.recv() => {
+            event = session_events.recv(), if session_event_stream_open => {
                 let Some(event) = event else {
-                    if let Some(sequence) = pending_revert_sequence.take() {
-                        if status == SessionStatus::Stopped && revert_fork_task.is_none() {
-                            let fork_id = Uuid::new_v4();
-                            let revert_store = Arc::clone(&store);
-                            revert_fork_task = Some(tokio::spawn(async move {
-                                revert_store
-                                    .fork_before(session_id, fork_id, sequence)
-                                    .await
-                                    .map(|_| fork_id)
-                            }));
-                        } else {
-                            resume_session = Some(session_id);
-                            exit_notice = Some(
-                                "Revert could not reach a stopped session; keeping the original session"
-                                    .to_string(),
-                            );
-                        }
+                    session_event_stream_open = false;
+                    if revert_fork_task.is_none()
+                        && let Some(sequence) = take_revert_ready_to_fork(
+                            &mut pending_revert_sequence,
+                            status,
+                            true,
+                        )
+                    {
+                        // A closed event stream means the actor cannot append
+                        // more events. Fork the immutable historical prefix
+                        // even if its final Stopped projection was not seen.
+                        revert_fork_task = Some(spawn_revert_fork(
+                            Arc::clone(&store),
+                            session_id,
+                            sequence,
+                        ));
                     }
                     if revert_fork_task.is_none() {
                         break;
@@ -1723,22 +1769,20 @@ async fn run_local_agent_session(
                             | SessionStatus::Running
                             | SessionStatus::WaitingForApproval
                     ));
-                    if *next == SessionStatus::Stopped
-                        && let Some(sequence) = pending_revert_sequence.take()
-                        && revert_fork_task.is_none()
+                    if revert_fork_task.is_none()
+                        && let Some(sequence) = take_revert_ready_to_fork(
+                            &mut pending_revert_sequence,
+                            *next,
+                            false,
+                        )
                     {
-                        let fork_id = Uuid::new_v4();
-                        let revert_store = Arc::clone(&store);
-                        revert_fork_task = Some(tokio::spawn(async move {
-                            revert_store
-                                .fork_before(session_id, fork_id, sequence)
-                                .await
-                                .map(|_| fork_id)
-                        }));
+                        revert_fork_task = Some(spawn_revert_fork(
+                            Arc::clone(&store),
+                            session_id,
+                            sequence,
+                        ));
                         if let Some(terminal) = terminal.as_mut() {
-                            terminal.set_notice(
-                                "Compaction checkpoint stopped · creating reverted session…",
-                            );
+                            terminal.set_notice("Session stopped · creating reverted session…");
                             terminal_dirty = true;
                         }
                     }
@@ -2526,24 +2570,50 @@ async fn run_local_agent_session(
                         text,
                         attachments,
                     } => {
-                        if matches!(
-                            status,
-                            SessionStatus::Starting
-                                | SessionStatus::Running
-                                | SessionStatus::WaitingForApproval
-                        ) {
-                            terminal.as_mut().expect("terminal").set_notice(
-                                "Interrupt the current turn before rewinding".to_string(),
-                            );
-                        } else {
-                            let fork_id = Uuid::new_v4();
-                            store
-                                .fork_before(session_id, fork_id, sequence)
-                                .await?;
-                            resume_session = Some(fork_id);
+                        if pending_revert_sequence.is_some() || revert_fork_task.is_some() {
+                            terminal
+                                .as_mut()
+                                .expect("terminal")
+                                .set_notice("A revert is already in progress".to_string());
+                        } else if revert_start_mode(status) == RevertStartMode::ForkNow {
                             rewind_prompt = Some((text, attachments));
-                            stop_sent = true;
-                            session_command_tx.send(HostCommand::Stop { session_id }).await.ok();
+                            revert_fork_task = Some(spawn_revert_fork(
+                                Arc::clone(&store),
+                                session_id,
+                                sequence,
+                            ));
+                            terminal
+                                .as_mut()
+                                .expect("terminal")
+                                .set_notice("Creating reverted session…".to_string());
+                        } else {
+                            rewind_prompt = Some((text, attachments));
+                            pending_revert_sequence = Some(sequence);
+                            terminal
+                                .as_mut()
+                                .expect("terminal")
+                                .set_notice("Stopping session before reverting…".to_string());
+                            if !stop_sent {
+                                stop_sent = true;
+                                if session_command_tx
+                                    .send(HostCommand::Stop { session_id })
+                                    .await
+                                    .is_err()
+                                    && let Some(sequence) = pending_revert_sequence.take()
+                                {
+                                    // The command receiver is gone, so the
+                                    // actor cannot mutate the session further.
+                                    revert_fork_task = Some(spawn_revert_fork(
+                                        Arc::clone(&store),
+                                        session_id,
+                                        sequence,
+                                    ));
+                                    terminal.as_mut().expect("terminal").set_notice(
+                                        "Session already stopped · creating reverted session…"
+                                            .to_string(),
+                                    );
+                                }
+                            }
                         }
                     }
                     UiAction::RevertTo { sequence } => {
@@ -2552,19 +2622,18 @@ async fn run_local_agent_session(
                                 .as_mut()
                                 .expect("terminal")
                                 .set_notice("A revert is already in progress".to_string());
-                        } else if status == SessionStatus::Stopped {
-                            let fork_id = Uuid::new_v4();
-                            let revert_store = Arc::clone(&store);
-                            revert_fork_task = Some(tokio::spawn(async move {
-                                revert_store
-                                    .fork_before(session_id, fork_id, sequence)
-                                    .await
-                                    .map(|_| fork_id)
-                            }));
+                        } else if revert_start_mode(status) == RevertStartMode::ForkNow {
+                            rewind_prompt = None;
+                            revert_fork_task = Some(spawn_revert_fork(
+                                Arc::clone(&store),
+                                session_id,
+                                sequence,
+                            ));
                             terminal.as_mut().expect("terminal").set_notice(
                                 "Creating reverted session…".to_string(),
                             );
                         } else {
+                            rewind_prompt = None;
                             pending_revert_sequence = Some(sequence);
                             terminal.as_mut().expect("terminal").set_notice(
                                 "Stopping session before reverting…".to_string(),
@@ -2575,11 +2644,16 @@ async fn run_local_agent_session(
                                     .send(HostCommand::Stop { session_id })
                                     .await
                                     .is_err()
+                                    && let Some(sequence) = pending_revert_sequence.take()
                                 {
-                                    pending_revert_sequence = None;
-                                    stop_sent = false;
+                                    revert_fork_task = Some(spawn_revert_fork(
+                                        Arc::clone(&store),
+                                        session_id,
+                                        sequence,
+                                    ));
                                     terminal.as_mut().expect("terminal").set_notice(
-                                        "Could not stop the session for revert".to_string(),
+                                        "Session already stopped · creating reverted session…"
+                                            .to_string(),
                                     );
                                 }
                             }

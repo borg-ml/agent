@@ -459,6 +459,67 @@ async fn prompt_event_boundaries_drive_one_atomic_action_lifecycle() {
 }
 
 #[tokio::test]
+async fn stale_in_progress_message_does_not_resurrect_terminal_action() {
+    let (directory, store) = store().await;
+    let session_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+    for kind in [
+        SessionEventKind::SessionStarted,
+        configured(directory.path()),
+        SessionEventKind::Message {
+            message_id,
+            actor: EventActor::User,
+            text: "original prompt".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Queued,
+            delivery: Some(PromptDelivery::Queue),
+        },
+        SessionEventKind::TurnStarted {
+            message_id,
+            provider: CodingProvider::Codex,
+            model: Some("gpt-test".to_string()),
+            effort: Some("high".to_string()),
+            fast: false,
+        },
+        SessionEventKind::TurnCompleted {
+            message_id,
+            provider_session_id: None,
+            final_text: String::new(),
+            error: Some("provider stopped".to_string()),
+        },
+        SessionEventKind::Message {
+            message_id,
+            actor: EventActor::User,
+            text: "coalesced stale snapshot".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::InProgress,
+            delivery: Some(PromptDelivery::Queue),
+        },
+    ] {
+        store
+            .append(SessionEvent::new(session_id, 0, kind))
+            .await
+            .unwrap();
+    }
+
+    let action = store.action(session_id, message_id).await.unwrap().unwrap();
+    assert_eq!(action.state, SessionActionState::Failed);
+    assert_eq!(action.payload["text"], "original prompt");
+    assert!(
+        !store
+            .action_transitions(session_id, message_id)
+            .await
+            .unwrap()
+            .iter()
+            .any(|transition| {
+                transition.from == Some(SessionActionState::Failed)
+                    && transition.to == SessionActionState::Queued
+            })
+    );
+}
+
+#[tokio::test]
 async fn concurrent_claims_have_one_winner_and_same_owner_claim_is_idempotent() {
     let (_directory, store) = store().await;
     let session_id = Uuid::new_v4();
@@ -594,7 +655,10 @@ async fn expired_leases_requeue_once_and_fence_stale_workers() {
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_millis(60)).await;
-    let recovered = store.recover_expired_actions(Utc::now(), 10).await.unwrap();
+    let recovered = store
+        .recover_expired_actions(session_id, Utc::now(), 10)
+        .await
+        .unwrap();
     assert_eq!(recovered.len(), 1);
     assert_eq!(recovered[0].state, SessionActionState::Queued);
     assert!(recovered[0].lease_owner.is_none());
@@ -612,7 +676,7 @@ async fn expired_leases_requeue_once_and_fence_stale_workers() {
     );
     assert!(
         store
-            .recover_expired_actions(Utc::now(), 10)
+            .recover_expired_actions(session_id, Utc::now(), 10)
             .await
             .unwrap()
             .is_empty()
@@ -645,6 +709,76 @@ async fn expired_leases_requeue_once_and_fence_stale_workers() {
         transition.from == Some(SessionActionState::Committing)
             && transition.to == SessionActionState::Queued
     }));
+}
+
+#[tokio::test]
+async fn expired_action_recovery_never_moves_work_between_sessions() {
+    let (_directory, store) = store().await;
+    let resumed_session_id = Uuid::new_v4();
+    let other_session_id = Uuid::new_v4();
+    let other_action_id = Uuid::new_v4();
+    store.create_session(resumed_session_id).await.unwrap();
+    store.create_session(other_session_id).await.unwrap();
+    store
+        .enqueue_action(SessionAction::new(
+            other_action_id,
+            other_session_id,
+            crate::SessionActionKind::Prompt,
+            crate::ActionDeliveryPolicy::NextTurnBoundary,
+            crate::ActionWakePolicy::Immediate,
+            serde_json::json!({
+                "message_id": other_action_id,
+                "text": "belongs to the other session",
+            }),
+        ))
+        .await
+        .unwrap();
+
+    let mut expected = SessionActionState::Queued;
+    for next in [
+        SessionActionState::Admitted,
+        SessionActionState::Delivered,
+        SessionActionState::Preparing,
+        SessionActionState::Committing,
+    ] {
+        store
+            .transition_action(
+                other_session_id,
+                other_action_id,
+                Some(expected),
+                next,
+                None,
+            )
+            .await
+            .unwrap();
+        expected = next;
+    }
+
+    assert!(
+        store
+            .recover_expired_actions(resumed_session_id, Utc::now(), 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "resuming one session must not claim another session's abandoned prompt"
+    );
+    assert_eq!(
+        store
+            .action(other_session_id, other_action_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        SessionActionState::Committing
+    );
+    assert_eq!(
+        store
+            .recover_expired_actions(other_session_id, Utc::now(), 10)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 #[tokio::test]

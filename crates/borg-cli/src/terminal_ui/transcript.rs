@@ -563,6 +563,48 @@ impl Transcript {
         ) && self.tool_is_expandable(index)
     }
 
+    fn tool_payloads(&self, index: usize) -> Vec<SessionPayloadRef> {
+        match self.order.get(index) {
+            Some(TranscriptEntry::Tool { payload_refs, .. }) => payload_refs.clone(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Return the footer affordance for a tool while the pointer is over its
+    /// rendered row. Edit tools expose their diff as the call body, while
+    /// other tools expose their completed response as the output body.
+    fn tool_copy_hint(&self, index: usize) -> Option<&'static str> {
+        let TranscriptEntry::Tool {
+            code_view,
+            output_view,
+            detail,
+            ..
+        } = self.order.get(index)?
+        else {
+            return None;
+        };
+        if code_view
+            .as_ref()
+            .is_some_and(|(language, body)| is_diff_language(language) && !body.trim().is_empty())
+        {
+            Some("left click expand · right click copy diff")
+        } else if output_view
+            .as_ref()
+            .is_some_and(|(_, body)| !body.trim().is_empty())
+        {
+            Some("left click expand · right click copy output")
+        } else if code_view
+            .as_ref()
+            .is_some_and(|(_, body)| !body.trim().is_empty())
+        {
+            Some("left click expand · right click copy tool call")
+        } else if !detail.trim().is_empty() {
+            Some("right click copy tool details")
+        } else {
+            None
+        }
+    }
+
     fn hydrate_payload(&mut self, payload: &SessionPayloadRef, bytes: Vec<u8>) -> Result<()> {
         let Some(TranscriptEntry::Tool {
             source_name,
@@ -597,13 +639,30 @@ impl Transcript {
                 let output =
                     String::from_utf8(bytes).context("stored tool output is not valid UTF-8")?;
                 *backgrounded = !*error && tool_output_is_backgrounded(&output);
-                *output_view = if is_mcp_resource_probe(source_name) {
-                    None
-                } else if *error && !output.trim().is_empty() {
-                    Some(("text".to_string(), output.trim_end().to_string()))
+                let hydrated_presentation = project_tool_presentation(
+                    source_name,
+                    &serde_json::Value::Null,
+                    Some(&output),
+                    *error,
+                );
+                let edit_diff = (!*error)
+                    .then(|| hydrated_presentation.output.clone())
+                    .flatten()
+                    .filter(|body| is_diff_language(&body.language));
+                if let Some(body) = edit_diff {
+                    *name = hydrated_presentation.label;
+                    *detail = hydrated_presentation.detail;
+                    *code_view = Some((body.language, body.text));
+                    *output_view = None;
                 } else {
-                    tool_output_code_view(name, &output)
-                };
+                    *output_view = if is_mcp_resource_probe(source_name) {
+                        None
+                    } else if *error && !output.trim().is_empty() {
+                        Some(("text".to_string(), output.trim_end().to_string()))
+                    } else {
+                        tool_output_code_view(name, &output)
+                    };
+                }
             }
             SessionPayloadKind::ToolResultInput => {
                 let input: serde_json::Value = serde_json::from_slice(&bytes)

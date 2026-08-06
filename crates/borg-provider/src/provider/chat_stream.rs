@@ -1040,20 +1040,14 @@ async fn run_pooled_codex_turn(
                     continue;
                 }
                 emit_provider_event(events, &value).await;
-                emit_codex_events_with_state(events, &value, &mut reasoning_state).await;
-                if let Some(delta) = codex_event_delta(&value) {
-                    if codex_event_is_reasoning_delta(&value) {
-                        if let Some(delta) = reasoning_state.observe_delta(&value, &delta) {
-                            events.send(ChatStreamEvent::ReasoningDelta(delta)).await.ok();
-                        }
-                    } else if codex_event_is_assistant_text_delta(&value) {
-                        text.push_str(&delta);
-                        events.send(ChatStreamEvent::Delta(delta)).await.ok();
-                    }
-                }
-                if let Some(result) = codex_event_result(&value) {
-                    final_text = Some(result);
-                }
+                observe_codex_output_event(
+                    events,
+                    &value,
+                    &mut reasoning_state,
+                    &mut text,
+                    &mut final_text,
+                )
+                .await;
                 if let Some(event_usage) = event_usage_with_billing_mode(&value, billing_mode) {
                     usage = event_usage;
                 }
@@ -1308,20 +1302,14 @@ async fn run_codex_subscription_process(
                     continue;
                 }
                 emit_provider_event(&events, &value).await;
-                emit_codex_events_with_state(&events, &value, &mut reasoning_state).await;
-                if let Some(delta) = codex_event_delta(&value) {
-                    if codex_event_is_reasoning_delta(&value) {
-                        if let Some(delta) = reasoning_state.observe_delta(&value, &delta) {
-                            events.send(ChatStreamEvent::ReasoningDelta(delta)).await.ok();
-                        }
-                    } else if codex_event_is_assistant_text_delta(&value) {
-                        text.push_str(&delta);
-                        events.send(ChatStreamEvent::Delta(delta)).await.ok();
-                    }
-                }
-                if let Some(result) = codex_event_result(&value) {
-                    final_text = Some(result);
-                }
+                observe_codex_output_event(
+                    &events,
+                    &value,
+                    &mut reasoning_state,
+                    &mut text,
+                    &mut final_text,
+                )
+                .await;
                 if let Some(event_usage) = event_usage_with_billing_mode(&value, billing_mode) {
                     usage = event_usage;
                 }
@@ -1585,7 +1573,11 @@ fn codex_thread_start_params(
             LocalAgentPermission::FullAccess => "danger-full-access",
             LocalAgentPermission::Auto | LocalAgentPermission::Manual => "workspace-write",
         },
-        "baseInstructions": request.system_prompt,
+        // Borg's policy augments Codex; it must not replace the model's own
+        // base instructions. In particular, those base instructions govern
+        // visible progress/commentary between tool calls. Replacing them made
+        // long Codex turns collapse to reasoning + tools with no narration.
+        "developerInstructions": request.system_prompt,
     });
     let mut config = serde_json::Map::new();
     if !request.mcp_external_servers.is_empty()
@@ -2022,6 +2014,32 @@ async fn emit_codex_events_with_state(
                 .ok();
         }
         _ => {}
+    }
+}
+
+async fn observe_codex_output_event(
+    events: &mpsc::Sender<ChatStreamEvent>,
+    value: &Value,
+    reasoning_state: &mut CodexReasoningState,
+    text: &mut String,
+    final_text: &mut Option<String>,
+) {
+    emit_codex_events_with_state(events, value, reasoning_state).await;
+    if let Some(delta) = codex_event_delta(value) {
+        if codex_event_is_reasoning_delta(value) {
+            if let Some(delta) = reasoning_state.observe_delta(value, &delta) {
+                events
+                    .send(ChatStreamEvent::ReasoningDelta(delta))
+                    .await
+                    .ok();
+            }
+        } else if codex_event_is_assistant_text_delta(value) {
+            text.push_str(&delta);
+            events.send(ChatStreamEvent::Delta(delta)).await.ok();
+        }
+    }
+    if let Some(result) = codex_event_result(value) {
+        *final_text = Some(result);
     }
 }
 
@@ -2677,6 +2695,11 @@ mod tests {
             Some(&Value::from(10))
         );
         assert_eq!(
+            codex_config.get("developerInstructions"),
+            Some(&Value::String("system".to_string()))
+        );
+        assert!(codex_config.get("baseInstructions").is_none());
+        assert_eq!(
             codex_config
                 .get("config")
                 .and_then(|value| value.get("mcp_servers"))
@@ -3147,6 +3170,99 @@ mod tests {
             receiver.recv().await,
             Some(ChatStreamEvent::Narration { text }) if text == "done"
         ));
+    }
+
+    #[tokio::test]
+    async fn codex_commentary_between_tool_calls_remains_visible_and_ordered() {
+        let (sender, mut receiver) = mpsc::channel(16);
+        let mut reasoning_state = CodexReasoningState::default();
+        let mut text = String::new();
+        let mut final_text = None;
+        let values = [
+            serde_json::json!({
+                "method": "item/agentMessage/delta",
+                "params": {"delta": "Before the tool."}
+            }),
+            serde_json::json!({
+                "method": "item/completed",
+                "params": {"item": {
+                    "id": "message-1",
+                    "type": "agentMessage",
+                    "text": "Before the tool.",
+                    "phase": "commentary"
+                }}
+            }),
+            serde_json::json!({
+                "method": "item/started",
+                "params": {"item": {
+                    "id": "command-1",
+                    "type": "commandExecution",
+                    "command": "/usr/bin/bash -lc pwd"
+                }}
+            }),
+            serde_json::json!({
+                "method": "item/completed",
+                "params": {"item": {
+                    "id": "command-1",
+                    "type": "commandExecution",
+                    "command": "/usr/bin/bash -lc pwd",
+                    "aggregatedOutput": "/workspace\n",
+                    "exitCode": 0,
+                    "status": "completed"
+                }}
+            }),
+            serde_json::json!({
+                "method": "item/agentMessage/delta",
+                "params": {"delta": "After the tool."}
+            }),
+            serde_json::json!({
+                "method": "item/completed",
+                "params": {"item": {
+                    "id": "message-2",
+                    "type": "agentMessage",
+                    "text": "After the tool.",
+                    "phase": "commentary"
+                }}
+            }),
+        ];
+        for value in &values {
+            observe_codex_output_event(
+                &sender,
+                value,
+                &mut reasoning_state,
+                &mut text,
+                &mut final_text,
+            )
+            .await;
+        }
+
+        assert!(matches!(
+            receiver.recv().await,
+            Some(ChatStreamEvent::Delta(text)) if text == "Before the tool."
+        ));
+        assert!(matches!(
+            receiver.recv().await,
+            Some(ChatStreamEvent::Narration { text }) if text == "Before the tool."
+        ));
+        assert!(matches!(
+            receiver.recv().await,
+            Some(ChatStreamEvent::ToolCall { id, .. }) if id == "command-1"
+        ));
+        assert!(matches!(
+            receiver.recv().await,
+            Some(ChatStreamEvent::ToolResult { tool_use_id, .. }) if tool_use_id == "command-1"
+        ));
+        assert!(matches!(
+            receiver.recv().await,
+            Some(ChatStreamEvent::Delta(text)) if text == "After the tool."
+        ));
+        assert!(matches!(
+            receiver.recv().await,
+            Some(ChatStreamEvent::Narration { text }) if text == "After the tool."
+        ));
+        assert_eq!(text, "Before the tool.After the tool.");
+        assert_eq!(final_text.as_deref(), Some("After the tool."));
+        assert!(receiver.try_recv().is_err());
     }
 
     #[test]

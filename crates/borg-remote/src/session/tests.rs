@@ -4915,6 +4915,127 @@ fn in_progress_prompt_recovery_preserves_input_after_a_host_crash() {
 }
 
 #[test]
+fn prompt_recovery_updates_delivery_and_ignores_stale_terminal_snapshots() {
+    let session_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    let events = vec![
+        SessionEvent::new(
+            session_id,
+            1,
+            SessionEventKind::Message {
+                message_id,
+                actor: EventActor::User,
+                text: "retry me".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Queued,
+                delivery: Some(PromptDelivery::Steer),
+            },
+        ),
+        SessionEvent::new(
+            session_id,
+            2,
+            SessionEventKind::Message {
+                message_id,
+                actor: EventActor::User,
+                text: "retry me".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Queued,
+                delivery: Some(PromptDelivery::Queue),
+            },
+        ),
+        SessionEvent::new(
+            session_id,
+            3,
+            SessionEventKind::Message {
+                message_id,
+                actor: EventActor::User,
+                text: "retry me".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: Some(PromptDelivery::Queue),
+            },
+        ),
+        // A completed action cannot be retried by reusing its id.
+        SessionEvent::new(
+            session_id,
+            4,
+            SessionEventKind::Message {
+                message_id,
+                actor: EventActor::User,
+                text: "invalid completed retry".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Queued,
+                delivery: Some(PromptDelivery::Queue),
+            },
+        ),
+        // This is a stale durable snapshot from before the terminal event.
+        SessionEvent::new(
+            session_id,
+            5,
+            SessionEventKind::Message {
+                message_id,
+                actor: EventActor::User,
+                text: "coalesced retry me".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::InProgress,
+                delivery: Some(PromptDelivery::Queue),
+            },
+        ),
+    ];
+
+    assert!(recover_queued_prompts(&events).is_empty());
+}
+
+#[test]
+fn prompt_recovery_allows_an_explicit_retry_after_terminal_status() {
+    let session_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    let events = vec![
+        SessionEvent::new(
+            session_id,
+            1,
+            SessionEventKind::Message {
+                message_id,
+                actor: EventActor::User,
+                text: "try again".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Failed,
+                delivery: Some(PromptDelivery::Queue),
+            },
+        ),
+        SessionEvent::new(
+            session_id,
+            2,
+            SessionEventKind::Message {
+                message_id,
+                actor: EventActor::User,
+                text: "try again".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Queued,
+                delivery: Some(PromptDelivery::Queue),
+            },
+        ),
+        SessionEvent::new(
+            session_id,
+            3,
+            SessionEventKind::Message {
+                message_id,
+                actor: EventActor::User,
+                text: "try again".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::InProgress,
+                delivery: Some(PromptDelivery::Queue),
+            },
+        ),
+    ];
+
+    let recovered = recover_queued_prompts(&events);
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].message_id, message_id);
+    assert_eq!(recovered[0].delivery, PromptDelivery::Queue);
+}
+
+#[test]
 fn only_empty_provider_responses_are_eligible_for_automatic_retry() {
     assert!(is_safe_automatic_retry_error(
         "codex returned an empty response"

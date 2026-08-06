@@ -501,6 +501,7 @@ fn model_picker_openrouter_uses_runtime_entries_and_existing_fuzzy_filter() {
         options,
         selected: 0,
         query: Some("sonnet".to_string()),
+        viewport_offset: Cell::new(0),
     };
     let matches = picker.matches();
     assert!(matches.contains(&1));
@@ -734,6 +735,80 @@ fn completed_tool_keeps_output_in_the_expandable_body_and_summarizes_the_header(
         !collapsed
             .iter()
             .any(|line| line.to_string().contains("src/other.rs"))
+    );
+}
+
+#[test]
+fn tool_copy_uses_output_and_keeps_edit_diffs_copyable() {
+    let tool = |code_view, output_view| TranscriptEntry::Tool {
+        source_name: "functions.exec_command".to_string(),
+        name: "Run command".to_string(),
+        detail: "git status".to_string(),
+        code_view,
+        output_view,
+        payload_refs: Vec::new(),
+        time: "12:00".to_string(),
+        started_at: Utc::now(),
+        completed_at: Some(Utc::now()),
+        complete: true,
+        error: false,
+        user_interrupted: false,
+        backgrounded: false,
+        expanded: false,
+    };
+
+    let command = tool(
+        Some(("command".to_string(), "git status".to_string())),
+        Some(("text".to_string(), " M src/main.rs".to_string())),
+    );
+    assert_eq!(command.copy_text_owned().as_deref(), Some(" M src/main.rs"));
+
+    let edit = tool(
+        Some(("diff:rs".to_string(), "@@ -1 +1 @@\n-old\n+new".to_string())),
+        None,
+    );
+    assert_eq!(
+        edit.copy_text_owned().as_deref(),
+        Some("@@ -1 +1 @@\n-old\n+new")
+    );
+}
+
+#[test]
+fn tool_hover_hint_names_the_copy_target() {
+    let mut transcript = Transcript::default();
+    transcript.order.push(TranscriptEntry::Tool {
+        source_name: "functions.exec_command".to_string(),
+        name: "Run command".to_string(),
+        detail: "git status".to_string(),
+        code_view: Some(("command".to_string(), "git status".to_string())),
+        output_view: Some(("text".to_string(), " M src/main.rs".to_string())),
+        payload_refs: Vec::new(),
+        time: "12:00".to_string(),
+        started_at: Utc::now(),
+        completed_at: Some(Utc::now()),
+        complete: true,
+        error: false,
+        user_interrupted: false,
+        backgrounded: false,
+        expanded: false,
+    });
+    assert_eq!(
+        transcript.tool_copy_hint(0),
+        Some("left click expand · right click copy output")
+    );
+
+    if let Some(TranscriptEntry::Tool {
+        code_view,
+        output_view,
+        ..
+    }) = transcript.order.first_mut()
+    {
+        *code_view = Some(("diff:rs".to_string(), "@@ -1 +1 @@\n-old\n+new".to_string()));
+        *output_view = None;
+    }
+    assert_eq!(
+        transcript.tool_copy_hint(0),
+        Some("left click expand · right click copy diff")
     );
 }
 
@@ -1600,6 +1675,63 @@ fn deferred_tool_input_loads_when_the_card_is_expanded() {
             && source.contains("+new")
             && payload_refs.is_empty()
     ));
+}
+
+#[test]
+fn deferred_edit_output_rehydrates_as_a_copyable_diff() {
+    let session_id = Uuid::new_v4();
+    let payload = SessionPayloadRef {
+        id: Uuid::new_v4(),
+        kind: SessionPayloadKind::ToolOutput,
+        byte_len: 1_000_000,
+    };
+    let mut transcript = Transcript::default();
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::ToolStarted {
+            tool_call_id: "deferred-edit-output".to_string(),
+            name: "Edit".to_string(),
+            input: serde_json::json!({"borg_payload_deferred": true}),
+            input_ref: None,
+        },
+    ));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::ToolCompleted {
+            tool_call_id: "deferred-edit-output".to_string(),
+            output: "[preview omitted]".to_string(),
+            output_ref: Some(payload.clone()),
+            is_error: false,
+            input: Some(serde_json::json!({"borg_payload_deferred": true})),
+            input_ref: None,
+        },
+    ));
+
+    transcript
+        .hydrate_payload(
+            &payload,
+            br#"[{"diff":"@@ -1 +1 @@\n-old\n+new","path":"src/main.rs"}]"#.to_vec(),
+        )
+        .unwrap();
+
+    assert!(matches!(
+        transcript.order.first(),
+        Some(TranscriptEntry::Tool {
+            code_view: Some((language, body)),
+            output_view: None,
+            payload_refs,
+            ..
+        }) if language == "diff:rs"
+            && body.contains("-old")
+            && body.contains("+new")
+            && payload_refs.is_empty()
+    ));
+    assert_eq!(
+        transcript.order[0].copy_text_owned().as_deref(),
+        Some("@@ -1 +1 @@\n-old\n+new")
+    );
 }
 
 #[test]
@@ -3402,6 +3534,7 @@ fn the_command_palette_filters_across_commands_and_keybindings() {
         options: command_palette_options(&keymap),
         selected: 0,
         query: Some(String::new()),
+        viewport_offset: Cell::new(0),
     };
     let rendered = |picker: &Picker| picker.display(72);
 
@@ -3444,6 +3577,7 @@ fn resume_picker_filters_models_and_pages_without_wrapping() {
         options: vec![local, global],
         selected: 0,
         query: None,
+        viewport_offset: Cell::new(0),
     };
 
     picker.set_query("claude-opus".to_string());
@@ -3483,6 +3617,7 @@ fn resume_picker_scroll_keeps_every_loaded_option_reachable() {
         options,
         selected: 0,
         query: Some(String::new()),
+        viewport_offset: Cell::new(0),
     };
 
     assert!(picker.scroll(23));
@@ -3504,6 +3639,62 @@ fn resume_picker_scroll_keeps_every_loaded_option_reachable() {
     assert_eq!(picker.selected, 11);
     picker.page(-12);
     assert_eq!(picker.selected, 0);
+}
+
+#[test]
+fn model_picker_wheel_and_hover_share_one_stable_viewport() {
+    let options = (0..30)
+        .map(|index| {
+            let mut option = PickerOption::new(format!("Model {index:02}"), index.to_string());
+            if index % 10 == 0 {
+                option.section = Some(format!("Provider {}", index / 10));
+            }
+            option
+        })
+        .collect::<Vec<_>>();
+    let mut picker = Picker {
+        kind: PickerKind::Model,
+        title: "Choose model",
+        options,
+        selected: 2,
+        query: None,
+        viewport_offset: Cell::new(0),
+    };
+    let line_count = picker.displayed_option_rows().len().saturating_add(1);
+    let viewport_height = 6;
+    let before_offset = picker.scroll_offset(viewport_height, line_count);
+    let before_line = picker
+        .option_row_offsets()
+        .into_iter()
+        .find_map(|(index, line)| (index == picker.selected).then_some(line))
+        .unwrap();
+
+    assert!(picker.scroll(10));
+    let after_offset = picker.scroll_offset(viewport_height, line_count);
+    let after_line = picker
+        .option_row_offsets()
+        .into_iter()
+        .find_map(|(index, line)| (index == picker.selected).then_some(line))
+        .unwrap();
+    assert_eq!(
+        before_line - before_offset,
+        after_line - after_offset,
+        "wheel motion should keep the active row anchored on screen"
+    );
+
+    let hovered = picker
+        .option_row_offsets()
+        .into_iter()
+        .find_map(|(index, line)| {
+            (line > after_offset && line < after_offset + viewport_height - 1).then_some(index)
+        })
+        .unwrap();
+    assert!(picker.select_hovered(true, Some(hovered)));
+    assert_eq!(
+        picker.scroll_offset(viewport_height, line_count),
+        after_offset,
+        "hovering a visible model must not recenter or snap the list"
+    );
 }
 
 #[test]
@@ -3572,6 +3763,7 @@ fn resume_picker_uses_a_balanced_two_column_layout() {
             ],
             selected: 0,
             query: None,
+            viewport_offset: Cell::new(0),
         };
 
     let rendered = picker.display(112);
@@ -3645,15 +3837,41 @@ fn picker_hover_selects_the_option_without_a_click() {
         None,
     );
 
-    assert!(picker.select_hovered(&MouseEventKind::Moved, Some(2)));
+    assert!(picker.select_hovered(true, Some(2)));
 
     assert_eq!(picker.selected, 2);
-    assert!(!picker.select_hovered(&MouseEventKind::Down(MouseButton::Left), Some(1),));
+    assert!(!picker.select_hovered(false, Some(1)));
     assert_eq!(picker.selected, 2);
-    assert!(!picker.select_hovered(&MouseEventKind::Moved, None));
+    assert!(!picker.select_hovered(true, None));
     assert!(!picker.select_index(3));
     assert_eq!(picker.selected, 2);
     assert_eq!(picker.selected_value(), "Third");
+}
+
+#[test]
+fn redundant_pointer_motion_after_wheel_does_not_retarget_the_picker() {
+    let pointer = Position::new(12, 8);
+    let mut last = None;
+    assert!(update_mouse_position(
+        &mut last,
+        &MouseEventKind::Moved,
+        pointer
+    ));
+    assert!(!update_mouse_position(
+        &mut last,
+        &MouseEventKind::ScrollDown,
+        pointer
+    ));
+    assert!(!update_mouse_position(
+        &mut last,
+        &MouseEventKind::Moved,
+        pointer
+    ));
+    assert!(update_mouse_position(
+        &mut last,
+        &MouseEventKind::Moved,
+        Position::new(12, 9)
+    ));
 }
 
 #[test]
@@ -3667,10 +3885,11 @@ fn picker_hover_uses_actual_option_indices_after_filtering() {
             .collect(),
         selected: 0,
         query: Some("high".to_string()),
+        viewport_offset: Cell::new(0),
     };
 
     assert_eq!(picker.option_row_offsets(), vec![(2, 1)]);
-    assert!(picker.select_hovered(&MouseEventKind::Moved, Some(2)));
+    assert!(picker.select_hovered(true, Some(2)));
     assert_eq!(picker.selected_value(), "high");
 }
 
@@ -3701,6 +3920,7 @@ fn picker_hit_offsets_match_rendered_rows_with_sections() {
         ],
         selected: 2,
         query: None,
+        viewport_offset: Cell::new(0),
     };
     let lines = picker.styled_lines(80, Color::White, Color::White);
     for (index, line) in picker.option_row_offsets() {

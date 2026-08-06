@@ -615,6 +615,7 @@ pub trait SessionStore: Send + Sync {
     /// The update and its audit transition are committed as one transaction.
     async fn recover_expired_actions(
         &self,
+        session_id: Uuid,
         now: DateTime<Utc>,
         limit: usize,
     ) -> Result<Vec<SessionAction>>;
@@ -2661,6 +2662,20 @@ async fn insert_action_row(
             "action {} was reused by a different session",
             action.action_id
         );
+        if allow_in_progress_payload_rewrite && existing.state.is_terminal() {
+            // Recovery replays durable in-progress snapshots. A snapshot can
+            // legitimately arrive after the action's terminal event (for
+            // example when a coalesced queue was interrupted), but it must not
+            // resurrect or rewrite a completed action. A later queued event
+            // is the explicit retry boundary and still follows the immutable
+            // payload checks below.
+            tracing::debug!(
+                action_id = %action.action_id,
+                state = ?existing.state,
+                "ignoring stale in-progress snapshot for terminal action"
+            );
+            return Ok(());
+        }
         if existing.kind == crate::SessionActionKind::Steering
             && action.kind == crate::SessionActionKind::Prompt
             && same_prompt_payload_ignoring_delivery(&existing.payload, &action.payload)
@@ -3246,6 +3261,7 @@ impl SessionStore for SqliteSessionStore {
 
     async fn recover_expired_actions(
         &self,
+        session_id: Uuid,
         now: DateTime<Utc>,
         limit: usize,
     ) -> Result<Vec<SessionAction>> {
@@ -3255,10 +3271,12 @@ impl SessionStore for SqliteSessionStore {
         let mut transaction = self.begin_write().await?;
         let rows = sqlx::query(
             "select * from session_actions \
-             where state in ('running', 'committing') \
+             where session_id = ? \
+               and state in ('running', 'committing') \
                and (lease_expires_at is null or lease_expires_at <= ?) \
              order by lease_expires_at, created_at, action_id limit ?",
         )
+        .bind(session_id.to_string())
         .bind(now.to_rfc3339())
         .bind(i64::try_from(limit).unwrap_or(i64::MAX))
         .fetch_all(&mut *transaction)

@@ -8,7 +8,7 @@ mod terminal_input;
 mod tests;
 
 use std::borrow::Cow;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
@@ -642,6 +642,7 @@ pub struct BorgTerminal {
     hovered_message: Option<usize>,
     hovered_link: Option<String>,
     hovered_picker_option: Option<usize>,
+    last_mouse_position: Option<Position>,
     status_area: Option<Rect>,
     status_hovered: bool,
     goal_status_area: Option<Rect>,
@@ -663,6 +664,7 @@ pub struct BorgTerminal {
     nested_scroll_motion: Option<NestedScrollMotion>,
     text_selection: Option<TextSelection>,
     pending_transcript_click: Option<PendingTranscriptClick>,
+    pending_tool_copy: Option<usize>,
     active_since: Option<DateTime<Utc>>,
     notice: Option<String>,
     copy_notice_expires_at: Option<Instant>,
@@ -748,6 +750,16 @@ fn hover_state_changed(previous: HoverState, current: HoverState) -> bool {
     previous != current
 }
 
+fn update_mouse_position(
+    last: &mut Option<Position>,
+    kind: &MouseEventKind,
+    pointer: Position,
+) -> bool {
+    let moved = matches!(kind, MouseEventKind::Moved) && *last != Some(pointer);
+    *last = Some(pointer);
+    moved
+}
+
 fn session_state_snapshot_is_stale(projected_sequence: u64, state: &SessionState) -> bool {
     state.latest_sequence < projected_sequence
 }
@@ -767,6 +779,10 @@ struct Picker {
     /// Live filter text for pickers the user types into. `None` leaves the
     /// picker on its number-key shortcuts, which typing would otherwise eat.
     query: Option<String>,
+    /// First rendered content line. Keeping this independent from `selected`
+    /// prevents mouse hover from snapping a scrolled list back around the row
+    /// under the pointer.
+    viewport_offset: Cell<usize>,
 }
 
 struct PickerOption {
@@ -842,6 +858,7 @@ impl Picker {
             options,
             selected,
             query: None,
+            viewport_offset: Cell::new(0),
         }
     }
 
@@ -919,6 +936,7 @@ impl Picker {
     /// Retarget the filter, keeping the selection on a row that still matches.
     fn set_query(&mut self, query: String) {
         self.query = Some(query);
+        self.viewport_offset.set(0);
         let matches = self.matches();
         if !matches.contains(&self.selected)
             && let Some(first) = matches.first()
@@ -943,8 +961,8 @@ impl Picker {
         true
     }
 
-    fn select_hovered(&mut self, kind: &MouseEventKind, hovered: Option<usize>) -> bool {
-        if !matches!(kind, MouseEventKind::Moved) {
+    fn select_hovered(&mut self, pointer_moved: bool, hovered: Option<usize>) -> bool {
+        if !pointer_moved {
             return false;
         }
         hovered.is_some_and(|index| self.select_option(index))
@@ -1024,11 +1042,25 @@ impl Picker {
         let Some(position) = self.selected_position() else {
             return false;
         };
-        let next = matches[position
+        let next_position = position
             .saturating_add_signed(delta)
-            .min(matches.len().saturating_sub(1))];
+            .min(matches.len().saturating_sub(1));
+        let next = matches[next_position];
         if next == self.selected {
             return false;
+        }
+        let row_offsets = self.option_row_offsets();
+        let selected_line = row_offsets
+            .iter()
+            .find_map(|(index, line)| (*index == self.selected).then_some(*line));
+        let next_line = row_offsets
+            .iter()
+            .find_map(|(index, line)| (*index == next).then_some(*line));
+        if let (Some(selected_line), Some(next_line)) = (selected_line, next_line) {
+            let line_delta = isize::try_from(next_line).unwrap_or(isize::MAX)
+                - isize::try_from(selected_line).unwrap_or(isize::MAX);
+            self.viewport_offset
+                .set(self.viewport_offset.get().saturating_add_signed(line_delta));
         }
         self.selected = next;
         true
@@ -1038,15 +1070,28 @@ impl Picker {
     /// normal one-column picker and Resume's two-column surface so keyboard,
     /// wheel, and mouse hit-testing all use the same slice.
     fn scroll_offset(&self, content_height: usize, line_count: usize) -> usize {
+        if content_height == 0 {
+            self.viewport_offset.set(0);
+            return 0;
+        }
         let max_scroll = line_count.saturating_sub(content_height);
         let selected_line = self
             .option_row_offsets()
             .iter()
             .find_map(|(index, line)| (*index == self.selected).then_some(*line))
             .unwrap_or(1);
-        selected_line
-            .saturating_sub(content_height.saturating_sub(2))
-            .min(max_scroll)
+        let current = self.viewport_offset.get().min(max_scroll);
+        let last_safe_line = current.saturating_add(content_height.saturating_sub(2));
+        let next = if selected_line < current {
+            selected_line.saturating_sub(1)
+        } else if selected_line > last_safe_line {
+            selected_line.saturating_sub(content_height.saturating_sub(2))
+        } else {
+            current
+        }
+        .min(max_scroll);
+        self.viewport_offset.set(next);
+        next
     }
 
     fn selected_value(self) -> String {
@@ -1530,6 +1575,7 @@ impl BorgTerminal {
             hovered_message: None,
             hovered_link: None,
             hovered_picker_option: None,
+            last_mouse_position: None,
             status_area: None,
             status_hovered: false,
             goal_status_area: None,
@@ -1551,6 +1597,7 @@ impl BorgTerminal {
             nested_scroll_motion: None,
             text_selection: None,
             pending_transcript_click: None,
+            pending_tool_copy: None,
             active_since: None,
             notice: None,
             copy_notice_expires_at: None,
@@ -1930,6 +1977,7 @@ impl BorgTerminal {
                 self.hovered_tool_run_header = None;
                 self.hovered_entry = None;
                 self.hovered_message = None;
+                self.pending_tool_copy = None;
             }
             SessionEventKind::PromptRecalled {
                 text, attachments, ..
@@ -2219,6 +2267,7 @@ impl BorgTerminal {
         self.transcript_render_cache = None;
         self.text_selection = None;
         self.pending_transcript_click = None;
+        self.pending_tool_copy = None;
         self.hovered_entry = None;
         self.hovered_message = None;
         self.hovered_tool = None;
@@ -2255,6 +2304,12 @@ impl BorgTerminal {
         self.transcript.hydrate_payload(payload, bytes)?;
         self.transcript.tool_body_cache.get_mut().lines.clear();
         self.transcript_render_cache = None;
+        if let Some(index) = self.pending_tool_copy
+            && self.transcript.tool_payloads(index).is_empty()
+        {
+            self.pending_tool_copy = None;
+            self.copy_transcript_entry(index);
+        }
         Ok(())
     }
 
@@ -2321,6 +2376,7 @@ impl BorgTerminal {
             options,
             selected,
             query: None,
+            viewport_offset: Cell::new(0),
         });
     }
 
@@ -2354,6 +2410,7 @@ impl BorgTerminal {
             options,
             selected: 0,
             query: None,
+            viewport_offset: Cell::new(0),
         });
     }
 
@@ -2398,6 +2455,7 @@ impl BorgTerminal {
                 .collect(),
             selected: 0,
             query: None,
+            viewport_offset: Cell::new(0),
         });
     }
 
@@ -2431,6 +2489,7 @@ impl BorgTerminal {
             // Resume owns typed characters so session labels, responses, and
             // metadata such as model names can be searched immediately.
             query: Some(String::new()),
+            viewport_offset: Cell::new(0),
         });
     }
 
@@ -2498,6 +2557,7 @@ impl BorgTerminal {
                 })
                 .unwrap_or(0),
             query: None,
+            viewport_offset: Cell::new(0),
         });
     }
 
@@ -2513,6 +2573,7 @@ impl BorgTerminal {
             options: command_palette_options(&self.keymap),
             selected: 0,
             query: Some(String::new()),
+            viewport_offset: Cell::new(0),
         });
     }
 
@@ -2647,6 +2708,7 @@ impl BorgTerminal {
                 .collect(),
             selected: 0,
             query: None,
+            viewport_offset: Cell::new(0),
         });
     }
 
@@ -2702,6 +2764,7 @@ impl BorgTerminal {
             options: goal_picker_options(&goal),
             selected: 0,
             query: None,
+            viewport_offset: Cell::new(0),
         });
     }
 
@@ -2762,6 +2825,8 @@ impl BorgTerminal {
                 let previous_hover = self.hover_state();
                 self.last_ctrl_c = None;
                 let pointer = Position::new(mouse.column, mouse.row);
+                let pointer_moved =
+                    update_mouse_position(&mut self.last_mouse_position, &mouse.kind, pointer);
                 let background_hover_suppressed = overlay_suppresses_background_hover(
                     self.picker.is_some(),
                     self.team_switcher_open,
@@ -2859,6 +2924,19 @@ impl BorgTerminal {
                 {
                     return Ok(self.open_entry_actions(index));
                 }
+                if !background_hover_suppressed
+                    && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right))
+                    && let Some(index) = self.hovered_tool
+                {
+                    let payloads = self.transcript.tool_payloads(index);
+                    if payloads.is_empty() {
+                        self.copy_transcript_entry(index);
+                    } else {
+                        self.pending_tool_copy = Some(index);
+                        return Ok(UiAction::LoadPayloads(payloads));
+                    }
+                    return Ok(UiAction::None);
+                }
                 if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
                     if self.picker.is_none()
                         && !self.keybindings_open
@@ -2954,7 +3032,7 @@ impl BorgTerminal {
                 }
                 if let Some(picker) = self.picker.as_mut() {
                     let selected_before = picker.selected;
-                    picker.select_hovered(&mouse.kind, self.hovered_picker_option);
+                    picker.select_hovered(pointer_moved, self.hovered_picker_option);
                     self.event_redraw_needed |= picker.selected != selected_before;
                     if !matches!(picker.kind, PickerKind::MessageActions | PickerKind::Goal)
                         && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
@@ -3950,6 +4028,11 @@ impl BorgTerminal {
             .map(CacheStatus::cold_cache_guidance);
         let showing_primary_controls =
             !showing_slash_suggestions && notice.is_none() && cold_cache_guidance.is_none();
+        let tool_interaction_hint = self
+            .hovered_tool
+            .and_then(|index| self.transcript.tool_copy_hint(index));
+        let showing_tool_interaction_hint =
+            showing_primary_controls && tool_interaction_hint.is_some();
         let primary_controls = if resume_picker_open {
             format!(
                 "filter type · select ↑↓ · older PgUp/PgDn · resume {} · close {}",
@@ -3969,10 +4052,16 @@ impl BorgTerminal {
             effort_status_hovered: self.effort_status_hovered,
             permission_status_hovered: self.permission_status_hovered,
         });
-        let primary_controls_display = interaction_hint.map_or_else(
-            || primary_controls.clone(),
-            |hint| format!("{hint} · {primary_controls}"),
-        );
+        let primary_controls_display = if showing_tool_interaction_hint {
+            tool_interaction_hint
+                .expect("tool interaction hint is present")
+                .to_string()
+        } else {
+            interaction_hint.map_or_else(
+                || primary_controls.clone(),
+                |hint| format!("{hint} · {primary_controls}"),
+            )
+        };
         let keybindings_hint = format!("keybindings {}", self.keymap.label(KeyAction::Keybindings));
         let copy_notice_active = notice.as_deref().is_some_and(is_copy_notice);
         let notice_style = if copy_notice_active {
@@ -3997,6 +4086,11 @@ impl BorgTerminal {
                     .into_iter()
                     .map(|line| Line::from(Span::styled(line, Style::default().fg(Color::Yellow))))
                     .collect()
+            } else if showing_tool_interaction_hint {
+                vec![Line::from(Span::styled(
+                    tool_interaction_hint.expect("tool interaction hint is present"),
+                    Style::default().fg(Color::Yellow),
+                ))]
             } else {
                 vec![if let Some(hint) = interaction_hint {
                     Line::from(vec![
@@ -5089,7 +5183,7 @@ impl BorgTerminal {
                     );
                 }
             }
-            if showing_primary_controls {
+            if showing_primary_controls && !showing_tool_interaction_hint {
                 let (controls_x, controls_y, controls_width) = if is_launch_screen {
                     let width = primary_controls_display.width() as u16;
                     (
@@ -5177,15 +5271,7 @@ impl BorgTerminal {
                     self.transcript.assistant_message_color,
                 );
                 let content_height = popup.height.saturating_sub(2) as usize;
-                let max_scroll = lines.len().saturating_sub(content_height);
-                let selected_line = picker
-                    .option_row_offsets()
-                    .iter()
-                    .find_map(|(index, line)| (*index == picker.selected).then_some(*line))
-                    .unwrap_or(1);
-                let scroll = selected_line
-                    .saturating_sub(content_height.saturating_sub(2))
-                    .min(max_scroll);
+                let scroll = picker.scroll_offset(content_height, lines.len());
                 frame.render_widget(Clear, popup);
                 frame.render_widget(
                     Paragraph::new(lines)
@@ -7537,13 +7623,35 @@ impl TranscriptEntry {
             ),
             Self::Goal { goal, .. } => Some(goal.objective.clone()),
             Self::Tool {
-                detail, code_view, ..
-            } => Some(
+                detail,
+                code_view,
+                output_view,
+                ..
+            } => {
+                // Diffs are the useful copy target for edit calls. For every
+                // other tool, prefer the completed response over the command
+                // that produced it, then fall back to the call summary while
+                // a deferred payload is still being fetched.
                 code_view
                     .as_ref()
-                    .map(|(_, source)| source.clone())
-                    .unwrap_or_else(|| detail.clone()),
-            ),
+                    .filter(|(language, body)| {
+                        is_diff_language(language) && !body.trim().is_empty()
+                    })
+                    .map(|(_, body)| body.clone())
+                    .or_else(|| {
+                        output_view
+                            .as_ref()
+                            .filter(|(_, body)| !body.trim().is_empty())
+                            .map(|(_, body)| body.clone())
+                    })
+                    .or_else(|| {
+                        code_view
+                            .as_ref()
+                            .filter(|(_, body)| !body.trim().is_empty())
+                            .map(|(_, body)| body.clone())
+                    })
+                    .or_else(|| (!detail.trim().is_empty()).then(|| detail.clone()))
+            }
             Self::Compaction { summary, .. } => Some(summary.clone()),
         }
     }

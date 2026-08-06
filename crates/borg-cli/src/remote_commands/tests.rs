@@ -4,6 +4,47 @@ use tempfile::tempdir;
 use tokio::io::AsyncReadExt;
 
 #[test]
+fn pending_revert_forks_after_stop_or_actor_disconnect() {
+    let mut pending = Some(42);
+    assert_eq!(
+        take_revert_ready_to_fork(&mut pending, SessionStatus::Running, false),
+        None
+    );
+    assert_eq!(pending, Some(42));
+    assert_eq!(
+        take_revert_ready_to_fork(&mut pending, SessionStatus::Stopped, false),
+        Some(42)
+    );
+    assert_eq!(pending, None);
+
+    let mut disconnected = Some(84);
+    assert_eq!(
+        take_revert_ready_to_fork(&mut disconnected, SessionStatus::Running, true),
+        Some(84),
+        "a lost final status event must not strand a requested revert"
+    );
+    assert_eq!(disconnected, None);
+}
+
+#[test]
+fn active_rewind_stops_automatically_instead_of_being_rejected() {
+    for status in [
+        SessionStatus::Starting,
+        SessionStatus::Ready,
+        SessionStatus::Running,
+        SessionStatus::WaitingForApproval,
+        SessionStatus::Completed,
+        SessionStatus::Failed,
+    ] {
+        assert_eq!(revert_start_mode(status), RevertStartMode::StopThenFork);
+    }
+    assert_eq!(
+        revert_start_mode(SessionStatus::Stopped),
+        RevertStartMode::ForkNow
+    );
+}
+
+#[test]
 fn persistent_sidecar_aliases_keep_their_durable_lane_identity() {
     assert!(matches!(
         persistent_sidecar_command("/peer claude review this"),
@@ -797,6 +838,25 @@ async fn obsolete_owner_handoff_releases_and_reacquires_the_writer_lease() {
         .await
         .unwrap();
     release.await.unwrap();
+    drop(replacement);
+}
+
+#[tokio::test]
+async fn obsolete_owner_handoff_uses_a_free_lease_when_its_socket_is_gone() {
+    let root = tempdir().unwrap();
+    let session_id = Uuid::new_v4();
+    let journal_path = root.path().join(format!("{session_id}.lock"));
+    let socket_path = session_control_socket_path(root.path(), session_id);
+    let writer = SessionWriterLease::try_acquire(&journal_path)
+        .unwrap()
+        .unwrap();
+    drop(writer);
+
+    // A crashed owner can leave no usable control endpoint. The released OS
+    // lock is sufficient evidence that the next resume may take ownership.
+    let replacement = stop_stale_local_owner_and_acquire(&journal_path, &socket_path, session_id)
+        .await
+        .unwrap();
     drop(replacement);
 }
 
