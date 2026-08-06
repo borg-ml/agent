@@ -373,7 +373,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/fast", "toggle provider priority/fast mode"),
     ("/followups", "choose steer current turn or queue next turn"),
     ("/refresh", "choose terminal refresh rate"),
-    ("/sleep", "prevent sleep during active turns"),
+    ("/sleep", "keep the machine awake during active turns"),
     ("/expand-edits", "auto-expand edit diffs"),
     ("/expand-tools", "auto-expand other tool details"),
     ("/colors", "view configurable transcript colours"),
@@ -2342,7 +2342,7 @@ impl BorgTerminal {
             "Provider fast mode".to_string(),
             "Active messages".to_string(),
             "Refresh rate".to_string(),
-            "Prevent sleep".to_string(),
+            "Keep machine awake".to_string(),
             "Auto-expand edits".to_string(),
             "Auto-expand tools".to_string(),
             "Transcript colours".to_string(),
@@ -2514,7 +2514,7 @@ impl BorgTerminal {
     pub fn open_prevent_sleep_picker(&mut self, enabled: bool) {
         self.picker = Some(Picker::new(
             PickerKind::PreventSleep,
-            "Prevent sleep during active turns",
+            "Keep machine awake during active turns",
             ["On", "Off"],
             Some(if enabled { "On" } else { "Off" }),
         ));

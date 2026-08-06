@@ -70,7 +70,10 @@ Copy [`configs/editor.example.toml`](configs/editor.example.toml) to
 `$XDG_CONFIG_HOME/borg/editor.toml` to configure transcript presentation and
 active-turn input policy. `active_messages = "steer"` makes Enter inject at the
 next Codex boundary; `"queue"` makes Enter start a later turn. The dedicated
-queue keybinding remains available in either mode.
+queue keybinding remains available in either mode. `prevent_sleep = true` keeps
+the machine awake during active turns by default; on systemd Linux it also
+holds the lid-switch action while a turn is running. Use `/sleep off` or set it
+to `false` when a laptop should suspend on lid close.
 
 Automated CLI/terminal checks should use `borg agent --ephemeral --local-only`.
 That creates a temporary session store and removes it when the process exits,

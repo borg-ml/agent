@@ -7,6 +7,9 @@
 # "queue" to make Enter always start a later turn. The queue keybinding in
 # agent.toml remains an explicit next-turn queue in either mode.
 active_messages = "steer"
+# Keep the machine awake while a turn is active. On systemd Linux this also
+# prevents the desktop from handling a lid close during the turn; use
+# `/sleep off` or set this to false if the laptop should suspend when closed.
 prevent_sleep = true
 
 [presentation]

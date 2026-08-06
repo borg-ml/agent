@@ -1314,6 +1314,10 @@ async fn run_local_agent_session(
     let mut pending_revert_sequence = None;
     let mut revert_fork_task: Option<RevertForkTask> = None;
     let mut sleep_inhibitor = SleepInhibitor::new(prevent_sleep);
+    sleep_inhibitor.set_turn_active(matches!(
+        status,
+        SessionStatus::Starting | SessionStatus::Running | SessionStatus::WaitingForApproval
+    ));
     let mut render_frame_interval = tui_frame_interval(tui_fps);
     let mut render_tick = tui_render_interval(render_frame_interval);
     let mut activity_tick = tokio::time::interval(ACTIVITY_FRAME_INTERVAL);
@@ -1488,6 +1492,7 @@ async fn run_local_agent_session(
                 terminal_dirty = true;
             }
             _ = update_tick.tick() => {
+                sleep_inhibitor.refresh();
                 if let Some(notice) = crate::updater::manual_update_notice()
                     && displayed_update_notice.as_deref() != Some(notice.as_str())
                 {
@@ -2107,7 +2112,7 @@ async fn run_local_agent_session(
                     "/settings" | "/followups" | "/refresh" | "/sleep"
                 ) {
                     println!(
-                        "\n  Settings\n  Model: {}\n  Effort: {}\n  Fast mode: {}\n  Active messages: {}\n  Refresh: {tui_fps} FPS\n  Prevent sleep: {}\n  User label: {}\n  Assistant label: {}\n  Use /model NAME, /effort LEVEL, /fast on|off, /followups steer|queue, /refresh FPS, /sleep on|off, /user-label TEXT, or /assistant-label TEXT.\n",
+                        "\n  Settings\n  Model: {}\n  Effort: {}\n  Fast mode: {}\n  Active messages: {}\n  Refresh: {tui_fps} FPS\n  Keep machine awake: {}\n  User label: {}\n  Assistant label: {}\n  Use /model NAME, /effort LEVEL, /fast on|off, /followups steer|queue, /refresh FPS, /sleep on|off, /user-label TEXT, or /assistant-label TEXT.\n",
                         current_model.as_deref().unwrap_or("provider default"),
                         current_effort.as_deref().unwrap_or("provider default"),
                         if current_fast { "on" } else { "off" },
@@ -2191,7 +2196,7 @@ async fn run_local_agent_session(
                     editor_preferences.interaction.prevent_sleep = prevent_sleep;
                     editor_preferences.save()?;
                     println!(
-                        "\n  Prevent sleep during active turns: {}.\n",
+                        "\n  Keep machine awake during active turns: {}.\n",
                         if prevent_sleep { "on" } else { "off" }
                     );
                     continue;
@@ -2761,7 +2766,7 @@ async fn run_local_agent_session(
                         editor_preferences.interaction.prevent_sleep = enabled;
                         editor_preferences.save()?;
                         terminal.as_mut().expect("terminal").set_notice(format!(
-                            "Prevent sleep during active turns: {}",
+                            "Keep machine awake during active turns: {}",
                             if enabled { "on" } else { "off" }
                         ));
                     }
@@ -3440,7 +3445,7 @@ async fn run_local_agent_session(
                                 editor_preferences.interaction.prevent_sleep = enabled;
                                 editor_preferences.save()?;
                                 terminal.as_mut().expect("terminal").set_notice(format!(
-                                    "Prevent sleep during active turns: {}",
+                                    "Keep machine awake during active turns: {}",
                                     if enabled { "on" } else { "off" }
                                 ));
                             } else {
@@ -5298,7 +5303,7 @@ fn print_agent_help() {
   /effort           choose reasoning effort
   /followups        choose steer current turn or queue next turn
   /refresh          choose terminal refresh rate
-  /sleep            prevent sleep during active turns
+  /sleep            keep the machine awake during active turns
   /colors           show transcript colours
   /color TARGET HEX set a transcript colour
   /usage            show real Codex weekly limit and session tokens

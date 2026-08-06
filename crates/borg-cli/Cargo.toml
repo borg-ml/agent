@@ -55,7 +55,14 @@ uuid.workspace = true
 [target.'cfg(unix)'.dependencies]
 flate2 = "1"
 tar = "0.4"
+libc.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 dirs.workspace = true
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_System_Power",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+] }
 zip = { version = "4", default-features = false, features = ["deflate"] }

@@ -511,6 +511,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.3.4",
  "image",
+ "libc",
  "pulldown-cmark",
  "qrcode",
  "ratatui",
@@ -535,6 +536,7 @@ dependencies = [
  "url",
  "urlencoding",
  "uuid",
+ "windows-sys 0.61.2",
  "zip",
 ]
 
