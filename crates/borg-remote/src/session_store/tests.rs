@@ -636,11 +636,12 @@ async fn expired_leases_requeue_once_and_fence_stale_workers() {
         .await
         .unwrap();
     let claimed = store
-        .claim_action(session_id, action_id, "worker-a", Duration::from_millis(40))
+        .claim_action(session_id, action_id, "worker-a", Duration::from_secs(30))
         .await
         .unwrap()
         .unwrap();
     let token = claimed.lease_token.unwrap();
+    let expired_at = claimed.lease_expires_at.unwrap() + chrono::Duration::milliseconds(1);
     store
         .transition_claimed_action(ClaimedActionTransition {
             session_id,
@@ -689,9 +690,8 @@ async fn expired_leases_requeue_once_and_fence_stale_workers() {
         })
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(60)).await;
     let recovered = store
-        .recover_expired_actions(session_id, Utc::now(), 10)
+        .recover_expired_actions(session_id, expired_at, 10)
         .await
         .unwrap();
     assert_eq!(recovered.len(), 1);
