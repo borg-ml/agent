@@ -134,10 +134,13 @@ fn edit_result_presentation(name: &str, output: &str) -> Option<EditResultPresen
     if rendered.is_empty() {
         return None;
     }
-    let paths = rendered
-        .iter()
-        .map(|entry| entry.path.as_str())
-        .collect::<Vec<_>>();
+    let paths = rendered.iter().fold(Vec::new(), |mut paths, entry| {
+        let path = entry.path.as_str();
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+        paths
+    });
     let all_add = rendered.iter().all(|entry| entry.kind == "add");
     let all_delete = rendered.iter().all(|entry| entry.kind == "delete");
     let label = match (rendered.len(), all_add, all_delete) {
@@ -147,11 +150,7 @@ fn edit_result_presentation(name: &str, output: &str) -> Option<EditResultPresen
         (_, _, true) => "Delete files",
         _ => "Edit",
     };
-    let detail = if paths.len() == 1 {
-        paths[0].to_string()
-    } else {
-        format!("{} files", paths.len())
-    };
+    let detail = summarize_edit_paths(&paths).unwrap_or_else(|| "files".to_string());
     let language = if paths.len() == 1 {
         Path::new(paths[0])
             .extension()
@@ -550,10 +549,7 @@ pub fn tool_call_summary(name: &str, input: &Value) -> (String, String) {
     }
 
     if tool.contains("edit") || tool.contains("patch") || tool.contains("write_file") {
-        let detail = input_path(input)
-            .map(str::to_string)
-            .or_else(|| edit_source(input).and_then(patch_path))
-            .unwrap_or_else(|| "files".to_string());
+        let detail = edit_detail(input).unwrap_or_else(|| "files".to_string());
         return ("Edit".to_string(), detail);
     }
 
@@ -675,10 +671,7 @@ fn product_tool_summary(name: &str, input: &Value) -> Option<(String, String)> {
         leaf.as_str(),
         "edit" | "apply_patch" | "write" | "write_file"
     ) {
-        input_path(input)
-            .map(str::to_string)
-            .or_else(|| edit_source(input).and_then(patch_path))
-            .unwrap_or_else(|| "files".to_string())
+        edit_detail(input).unwrap_or_else(|| "files".to_string())
     } else {
         high_signal_detail(input).unwrap_or_default()
     };
@@ -1661,6 +1654,62 @@ fn input_path(input: &Value) -> Option<&str> {
         .find_map(|key| input.get(key).and_then(Value::as_str))
 }
 
+fn edit_detail(input: &Value) -> Option<String> {
+    input_path(input)
+        .map(str::to_string)
+        .or_else(|| edit_source(input).and_then(patch_path))
+        .or_else(|| {
+            let mut paths = Vec::new();
+            collect_edit_paths(input, &mut paths);
+            summarize_edit_paths(&paths)
+        })
+}
+
+fn collect_edit_paths<'a>(input: &'a Value, paths: &mut Vec<&'a str>) {
+    match input {
+        Value::Array(items) => {
+            for item in items {
+                collect_edit_paths(item, paths);
+            }
+        }
+        Value::Object(fields) => {
+            if let Some(path) = ["path", "file_path", "filepath", "filename"]
+                .iter()
+                .find_map(|key| fields.get(*key).and_then(Value::as_str))
+                && !paths.contains(&path)
+            {
+                paths.push(path);
+            }
+            for key in ["input", "changes"] {
+                if let Some(value) = fields.get(key) {
+                    collect_edit_paths(value, paths);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn summarize_edit_paths(paths: &[&str]) -> Option<String> {
+    let display = |path: &str| {
+        let path = Path::new(path);
+        if path.is_absolute() {
+            path.file_name()
+                .unwrap_or(path.as_os_str())
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            path.to_string_lossy().into_owned()
+        }
+    };
+    match paths {
+        [] => None,
+        [path] => Some(display(path)),
+        [first, second] => Some(format!("{} + {}", display(first), display(second))),
+        [first, rest @ ..] => Some(format!("{} + {} more", display(first), rest.len())),
+    }
+}
+
 fn search_query(command: &str) -> Option<String> {
     let words = shell_words(command);
     if let Some(script) = shell_script(&words) {
@@ -2102,6 +2151,31 @@ mod tests {
             edit.input.as_ref().map(|body| body.text.as_str()),
             Some("--- docs/review.md\n+++ docs/review.md\n-old line\n+new line")
         );
+    }
+
+    #[test]
+    fn names_files_in_native_multi_edit_envelopes() {
+        let edit = project_tool_presentation(
+            "Edit",
+            &json!({
+                "changes": [
+                    {
+                        "path": "/home/user/project/src/packed_oblivious_moe_frontier.rs",
+                        "kind": {"type": "update"},
+                        "diff": "@@ -1 +1 @@\n-old\n+new"
+                    },
+                    {
+                        "path": "/home/user/project/src/tests.rs",
+                        "kind": {"type": "update"},
+                        "diff": "@@ -1 +1 @@\n-old test\n+new test"
+                    }
+                ]
+            }),
+            Some(""),
+            false,
+        );
+
+        assert_eq!(edit.detail, "packed_oblivious_moe_frontier.rs + tests.rs");
     }
 
     #[test]

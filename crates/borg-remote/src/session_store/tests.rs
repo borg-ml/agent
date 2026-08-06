@@ -14,6 +14,41 @@ async fn store() -> (tempfile::TempDir, SqliteSessionStore) {
 }
 
 #[tokio::test]
+async fn durable_append_waits_through_extended_writer_contention() {
+    let (_directory, store) = store().await;
+    let session_id = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+
+    let blocker = store.begin_write().await.unwrap();
+    let append_store = store.clone();
+    let append = tokio::spawn(async move {
+        append_store
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::StatusChanged {
+                    status: SessionStatus::Ready,
+                    detail: None,
+                },
+            ))
+            .await
+    });
+
+    tokio::time::sleep(SQLITE_BUSY_TIMEOUT + Duration::from_millis(250)).await;
+    assert!(
+        !append.is_finished(),
+        "writer contention must wait instead of failing the session actor"
+    );
+
+    blocker.rollback().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), append)
+        .await
+        .expect("append did not resume after the writer lock cleared")
+        .expect("append task panicked")
+        .expect("append failed after the writer lock cleared");
+}
+
+#[tokio::test]
 async fn opening_schema_v4_archives_and_recreates_the_database() {
     let (directory, store) = store().await;
     let path = directory.path().join("sessions.sqlite3");

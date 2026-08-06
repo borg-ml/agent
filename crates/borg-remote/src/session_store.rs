@@ -967,7 +967,29 @@ impl SqliteSessionStore {
     }
 
     async fn begin_write(&self) -> Result<Transaction<'static, Sqlite>, sqlx::Error> {
-        self.pool.begin_with(SQLITE_WRITE_TRANSACTION).await
+        let mut reported_contention = false;
+        loop {
+            match self.pool.begin_with(SQLITE_WRITE_TRANSACTION).await {
+                Ok(transaction) => return Ok(transaction),
+                Err(error) if sqlite_lock_text(&error.to_string()) => {
+                    if !reported_contention {
+                        warn!(
+                            error = %error,
+                            "SQLite session journal is busy; waiting for the current writer"
+                        );
+                        reported_contention = true;
+                    }
+                    // A session event is not safely skippable: SQLite is the
+                    // canonical journal, and returning SQLITE_BUSY here tears
+                    // down an otherwise healthy actor. The connection-level
+                    // busy timeout handles ordinary contention; keep waiting
+                    // in bounded slices when another Borg process holds the
+                    // writer lock longer (for example during a large commit).
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     pub async fn contains_session(&self, session_id: Uuid) -> Result<bool> {
