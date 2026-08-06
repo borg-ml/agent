@@ -154,6 +154,14 @@ struct SubscriptionContextToolCall<'a> {
 }
 
 #[derive(Clone)]
+struct PromptBatchEntry {
+    message_id: Uuid,
+    text: String,
+    actor: EventActor,
+    attachments: Vec<PathBuf>,
+}
+
+#[derive(Clone)]
 struct QueuedPrompt {
     message_id: Uuid,
     text: String,
@@ -166,6 +174,21 @@ struct QueuedPrompt {
     /// interrupts a turn. Internal team messages remain separate so they can
     /// never replace or be folded into that user-visible batch.
     interrupt_batch: bool,
+    /// Prompts absorbed into this one by queue batching. Keeping their durable
+    /// identities here lets the eventual turn status settle every original
+    /// message instead of leaving the absorbed entries recoverable forever.
+    batch: Vec<PromptBatchEntry>,
+}
+
+impl QueuedPrompt {
+    fn batch_entry(&self) -> PromptBatchEntry {
+        PromptBatchEntry {
+            message_id: self.message_id,
+            text: self.text.clone(),
+            actor: self.actor,
+            attachments: self.attachments.clone(),
+        }
+    }
 }
 
 struct PendingSteer {
@@ -1190,6 +1213,7 @@ async fn run_agent_session_store_kernel(
             delivery: PromptDelivery::Steer,
             visible: true,
             interrupt_batch: true,
+            batch: Vec::new(),
         });
     }
     loop {
@@ -1243,6 +1267,7 @@ async fn run_agent_session_store_kernel(
                 delivery: PromptDelivery::Queue,
                 visible: false,
                 interrupt_batch: false,
+                batch: Vec::new(),
             })
         } else {
             record(
@@ -1429,6 +1454,7 @@ async fn run_agent_session_store_kernel(
                                     delivery,
                                     visible: true,
                                     interrupt_batch: false,
+                                    batch: Vec::new(),
                                 },
                             )
                             .await?;
@@ -1443,6 +1469,7 @@ async fn run_agent_session_store_kernel(
                             delivery,
                             visible: !is_autonomy,
                             interrupt_batch: actor == EventActor::User,
+                            batch: Vec::new(),
                         });
                     }
                     Some(HostCommand::RecallQueuedPrompt { .. }) => {}
@@ -1511,6 +1538,7 @@ async fn run_agent_session_store_kernel(
                                 delivery: PromptDelivery::Queue,
                                 visible: false,
                                 interrupt_batch: false,
+                                batch: Vec::new(),
                             });
                         }
                     }
@@ -2793,6 +2821,7 @@ async fn run_agent_session_store_kernel(
                                 delivery: PromptDelivery::Steer,
                                 visible: true,
                                 interrupt_batch: actor == EventActor::User,
+                                batch: Vec::new(),
                             };
                             record_prompt_status(
                                 &mut journal,
@@ -2860,6 +2889,7 @@ async fn run_agent_session_store_kernel(
                                 visible: true,
                                 actor,
                                 interrupt_batch: actor == EventActor::User,
+                                batch: Vec::new(),
                             });
                         }
                         HostCommand::RecallQueuedPrompt { message_id, .. } => {
@@ -2870,15 +2900,11 @@ async fn run_agent_session_store_kernel(
                                     message_id,
                                 ));
                             for recalled in recalled.collect::<Vec<_>>() {
-                                record(
+                                record_recalled_prompt(
                                     &mut journal,
                                     &events,
                                     session_id,
-                                    SessionEventKind::PromptRecalled {
-                                        message_id: recalled.message_id,
-                                        text: recalled.text,
-                                        attachments: recalled.attachments,
-                                    },
+                                    &recalled,
                                 )
                                 .await?;
                             }
@@ -3553,11 +3579,8 @@ fn native_conversation(
             SessionEventKind::ProviderEvent { kind, payload, .. }
                 if kind == "context_compaction" =>
             {
-                let mut unresolved_prompts = pending_generic
-                    .drain(..)
-                    .filter(is_context_prompt)
-                    .collect::<Vec<_>>();
-                unresolved_prompts.append(&mut failed_prompts);
+                let mut unresolved_prompts = std::mem::take(&mut failed_prompts);
+                unresolved_prompts.extend(pending_generic.drain(..).filter(is_context_prompt));
                 pending_native.clear();
                 conversation.clear();
                 if let Some(summary) = payload.get("summary").and_then(Value::as_str) {
@@ -4206,6 +4229,7 @@ fn recover_queued_prompts(events: &[SessionEvent]) -> VecDeque<QueuedPrompt> {
                     delivery: delivery.unwrap_or(PromptDelivery::Queue),
                     visible: true,
                     interrupt_batch: *actor == EventActor::User,
+                    batch: Vec::new(),
                 });
             }
             SessionEventKind::Message {
@@ -4289,6 +4313,7 @@ fn queued_prompt_from_action(action: &crate::SessionAction) -> Option<QueuedProm
         delivery: PromptDelivery::Queue,
         visible: false,
         interrupt_batch: false,
+        batch: Vec::new(),
     })
 }
 
@@ -4302,7 +4327,11 @@ fn recall_visible_queued_prompts(
             .rposition(|prompt| {
                 prompt.visible
                     && prompt.delivery == PromptDelivery::Queue
-                    && prompt.message_id == message_id
+                    && (prompt.message_id == message_id
+                        || prompt
+                            .batch
+                            .iter()
+                            .any(|entry| entry.message_id == message_id))
             })
             .and_then(|index| pending.remove(index))
             .into_iter()
@@ -4320,6 +4349,30 @@ fn recall_visible_queued_prompts(
     }
     *pending = retained;
     recalled
+}
+
+async fn record_recalled_prompt(
+    journal: &mut RuntimeSessionStore,
+    events: &mpsc::Sender<SessionEvent>,
+    session_id: Uuid,
+    prompt: &QueuedPrompt,
+) -> Result<()> {
+    let mut entries = prompt.batch.clone();
+    entries.push(prompt.batch_entry());
+    for entry in entries {
+        record(
+            journal,
+            events,
+            session_id,
+            SessionEventKind::PromptRecalled {
+                message_id: entry.message_id,
+                text: entry.text,
+                attachments: entry.attachments,
+            },
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 /// Withdraw steers that have not crossed the provider's user-message commit
@@ -4429,6 +4482,7 @@ fn coalesce_queued_prompts(pending: &mut VecDeque<QueuedPrompt>) {
         *pending = retained;
         return;
     };
+    let mut batch = Vec::new();
     let mut text = String::new();
     let mut attachments = Vec::new();
     let mut visible = combined.visible;
@@ -4441,6 +4495,8 @@ fn coalesce_queued_prompts(pending: &mut VecDeque<QueuedPrompt>) {
         }
         attachments.extend(prompt.attachments.iter().cloned());
         visible |= prompt.visible;
+        batch.extend(prompt.batch.iter().cloned());
+        batch.push(prompt.batch_entry());
     }
     if !combined.text.is_empty() {
         if !text.is_empty() {
@@ -4449,11 +4505,13 @@ fn coalesce_queued_prompts(pending: &mut VecDeque<QueuedPrompt>) {
         text.push_str(&combined.text);
     }
     attachments.append(&mut combined.attachments);
+    batch.append(&mut combined.batch);
     combined.text = text;
     combined.attachments = attachments;
     combined.delivery = PromptDelivery::Queue;
     combined.visible = visible;
     combined.interrupt_batch = true;
+    combined.batch = batch;
     pending.push_back(combined);
     pending.append(&mut retained);
 }
@@ -4539,6 +4597,7 @@ async fn collect_input_at_turn_boundary(
                     delivery: PromptDelivery::Queue,
                     visible: true,
                     interrupt_batch: actor == EventActor::User,
+                    batch: Vec::new(),
                 };
                 record_prompt_status(
                     journal,
@@ -4698,20 +4757,25 @@ async fn record_prompt_status(
     status: MessageStatus,
     delivery: PromptDelivery,
 ) -> Result<()> {
-    record(
-        journal,
-        events,
-        session_id,
-        SessionEventKind::Message {
-            message_id: prompt.message_id,
-            actor: prompt.actor,
-            text: prompt.text.clone(),
-            attachments: prompt.attachments.clone(),
-            status,
-            delivery: Some(delivery),
-        },
-    )
-    .await
+    let mut entries = prompt.batch.clone();
+    entries.push(prompt.batch_entry());
+    for entry in entries {
+        record(
+            journal,
+            events,
+            session_id,
+            SessionEventKind::Message {
+                message_id: entry.message_id,
+                actor: entry.actor,
+                text: entry.text,
+                attachments: entry.attachments,
+                status,
+                delivery: Some(delivery),
+            },
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 fn committed_codex_user_message_id(kind: &SessionEventKind) -> Option<Uuid> {

@@ -4066,6 +4066,7 @@ fn recalling_prompts_targets_the_exact_queue_entry_and_skips_steers() {
             delivery: PromptDelivery::Queue,
             visible: true,
             interrupt_batch: true,
+            batch: Vec::new(),
         },
         QueuedPrompt {
             message_id: internal_id,
@@ -4076,6 +4077,7 @@ fn recalling_prompts_targets_the_exact_queue_entry_and_skips_steers() {
             delivery: PromptDelivery::Queue,
             visible: false,
             interrupt_batch: false,
+            batch: Vec::new(),
         },
         QueuedPrompt {
             message_id: second_visible_id,
@@ -4086,6 +4088,7 @@ fn recalling_prompts_targets_the_exact_queue_entry_and_skips_steers() {
             delivery: PromptDelivery::Queue,
             visible: true,
             interrupt_batch: true,
+            batch: Vec::new(),
         },
         QueuedPrompt {
             message_id: Uuid::new_v4(),
@@ -4096,6 +4099,7 @@ fn recalling_prompts_targets_the_exact_queue_entry_and_skips_steers() {
             delivery: PromptDelivery::Steer,
             visible: true,
             interrupt_batch: true,
+            batch: Vec::new(),
         },
     ]);
 
@@ -4147,6 +4151,7 @@ fn only_an_uncommitted_steer_is_withdrawable_from_the_active_turn() {
             delivery: PromptDelivery::Steer,
             visible: true,
             interrupt_batch: true,
+            batch: Vec::new(),
         },
         state,
     };
@@ -4186,10 +4191,12 @@ fn only_an_uncommitted_steer_is_withdrawable_from_the_active_turn() {
 fn escape_batch_coalesces_queued_prompts_in_fifo_order() {
     let first_image = PathBuf::from("/tmp/first.png");
     let last_image = PathBuf::from("/tmp/last.png");
+    let first_id = Uuid::new_v4();
+    let second_id = Uuid::new_v4();
     let last_id = Uuid::new_v4();
     let mut pending = VecDeque::from([
         QueuedPrompt {
-            message_id: Uuid::new_v4(),
+            message_id: first_id,
             text: "first [Image 1]".to_string(),
             actor: EventActor::User,
             attachments: vec![first_image.clone()],
@@ -4197,9 +4204,10 @@ fn escape_batch_coalesces_queued_prompts_in_fifo_order() {
             delivery: PromptDelivery::Queue,
             visible: true,
             interrupt_batch: true,
+            batch: Vec::new(),
         },
         QueuedPrompt {
-            message_id: Uuid::new_v4(),
+            message_id: second_id,
             text: "second".to_string(),
             actor: EventActor::User,
             attachments: Vec::new(),
@@ -4207,6 +4215,7 @@ fn escape_batch_coalesces_queued_prompts_in_fifo_order() {
             delivery: PromptDelivery::Queue,
             visible: true,
             interrupt_batch: true,
+            batch: Vec::new(),
         },
         QueuedPrompt {
             message_id: last_id,
@@ -4217,6 +4226,7 @@ fn escape_batch_coalesces_queued_prompts_in_fifo_order() {
             delivery: PromptDelivery::Queue,
             visible: true,
             interrupt_batch: true,
+            batch: Vec::new(),
         },
     ]);
 
@@ -4230,6 +4240,67 @@ fn escape_batch_coalesces_queued_prompts_in_fifo_order() {
     );
     assert_eq!(pending[0].attachments, [first_image, last_image]);
     assert_eq!(pending[0].delivery, PromptDelivery::Queue);
+    assert_eq!(
+        pending[0]
+            .batch
+            .iter()
+            .map(|entry| entry.message_id)
+            .collect::<Vec<_>>(),
+        [first_id, second_id]
+    );
+}
+
+#[tokio::test]
+async fn batched_prompt_status_settles_every_durable_message() {
+    let root = tempdir().unwrap();
+    let session_id = Uuid::new_v4();
+    let (_store, mut runtime) = sqlite_runtime_store(&root, session_id).await;
+    let (events, mut received) = mpsc::channel(16);
+    let first_id = Uuid::new_v4();
+    let second_id = Uuid::new_v4();
+    let last_id = Uuid::new_v4();
+    let prompt = |message_id: Uuid, text: &str| QueuedPrompt {
+        message_id,
+        text: text.to_string(),
+        actor: EventActor::User,
+        attachments: Vec::new(),
+        output_schema: None,
+        delivery: PromptDelivery::Queue,
+        visible: true,
+        interrupt_batch: true,
+        batch: Vec::new(),
+    };
+    let mut pending = VecDeque::from([
+        prompt(first_id, "first"),
+        prompt(second_id, "second"),
+        prompt(last_id, "last"),
+    ]);
+    coalesce_queued_prompts(&mut pending);
+    let combined = pending.pop_front().unwrap();
+
+    record_prompt_status(
+        &mut runtime,
+        &events,
+        session_id,
+        &combined,
+        MessageStatus::Complete,
+        PromptDelivery::Queue,
+    )
+    .await
+    .unwrap();
+
+    let mut settled = Vec::new();
+    while let Ok(event) = received.try_recv() {
+        if let SessionEventKind::Message {
+            message_id,
+            status: MessageStatus::Complete,
+            ..
+        } = event.kind
+        {
+            settled.push(message_id);
+        }
+    }
+    assert_eq!(settled, [first_id, second_id, last_id]);
 }
 
 #[test]
@@ -4247,6 +4318,7 @@ fn escape_batch_runs_user_prompts_before_separate_team_messages() {
         delivery: PromptDelivery::Queue,
         visible: true,
         interrupt_batch,
+        batch: Vec::new(),
     };
     let mut pending = VecDeque::from([
         prompt("Team message from /root/worker:\n\ninternal report", false),
@@ -4280,6 +4352,7 @@ fn pending_user_input_always_owns_the_next_turn_boundary() {
         delivery: PromptDelivery::Queue,
         visible: true,
         interrupt_batch: actor == EventActor::User,
+        batch: Vec::new(),
     };
     let mut pending = VecDeque::from([
         prompt(EventActor::System, "internal report"),
@@ -4364,6 +4437,7 @@ async fn inactive_team_reports_settle_without_starting_a_provider_turn() {
         delivery: PromptDelivery::Queue,
         visible: true,
         interrupt_batch: false,
+        batch: Vec::new(),
     }]);
 
     settle_inactive_team_notifications(&mut runtime, &event_tx, session_id, &mut pending)
@@ -4406,6 +4480,7 @@ async fn inactive_wake_report_is_retained_for_the_root_provider_turn() {
         delivery: PromptDelivery::Steer,
         visible: true,
         interrupt_batch: false,
+        batch: Vec::new(),
     }]);
 
     settle_inactive_team_notifications(&mut runtime, &event_tx, session_id, &mut pending)
