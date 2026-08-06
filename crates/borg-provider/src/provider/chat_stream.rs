@@ -21,6 +21,11 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{Mutex, mpsc};
 
+// app-server rejects a single text input larger than 1 MiB. Keep this guard at
+// the resume fallback boundary so an unavailable native thread returns control
+// to Borg for durable compaction instead of issuing a request known to fail.
+const CODEX_APP_SERVER_TEXT_INPUT_LIMIT_CHARS: usize = 1 << 20;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SubscriptionProvider {
     Codex,
@@ -214,10 +219,10 @@ struct ClaudeSubscriptionPoolState {
     _mcp_setup: Option<(TempDir, ProviderMcpSetup)>,
 }
 
-/// A volatile, per-Borg-session Codex app-server lane. The app-server thread
-/// is retained only while the lifecycle key is unchanged and the prior turn
-/// reached a terminal frame. A failed or interrupted turn is discarded so the
-/// next call is forced to replay Borg's complete durable context.
+/// A per-Borg-session Codex app-server lane. The live process is volatile, but
+/// acknowledged threads may also be persisted and resumed after an idle
+/// process restart. Borg's journal remains authoritative; an uncertain turn
+/// invalidates the checkpoint and forces a canonical replay.
 #[derive(Clone, Default)]
 pub struct CodexSubscriptionPool {
     inner: Arc<Mutex<CodexSubscriptionPoolState>>,
@@ -237,6 +242,27 @@ struct PooledCodexProcess {
     stderr: Arc<Mutex<Vec<u8>>>,
     thread_id: String,
     next_request_id: u64,
+}
+
+struct StartedCodexProcess {
+    process: PooledCodexProcess,
+    resumed: bool,
+}
+
+impl CodexSubscriptionPool {
+    /// Close an idle app-server cleanly so its persisted rollout is available
+    /// to the next Borg process. A bounded hard kill remains the final fallback
+    /// for a provider that does not react to stdin shutdown.
+    pub async fn shutdown(&self) {
+        let process = {
+            let mut state = self.inner.lock().await;
+            state.lifecycle_key = None;
+            state.process.take()
+        };
+        if let Some(process) = process {
+            shutdown_pooled_codex_process(process).await;
+        }
+    }
 }
 
 pub fn run_claude_chat_stream(request: ChatStreamRequest) -> mpsc::Receiver<ChatStreamEvent> {
@@ -846,7 +872,7 @@ fn map_claude_usage(
 }
 
 async fn run_codex_subscription_process_pooled(
-    request: ChatStreamRequest,
+    mut request: ChatStreamRequest,
     controls: Option<mpsc::Receiver<ChatStreamControl>>,
     permission: LocalAgentPermission,
     events: mpsc::Sender<ChatStreamEvent>,
@@ -858,9 +884,8 @@ async fn run_codex_subscription_process_pooled(
         .unwrap_or_else(|| "borg-codex-subscription".to_string());
     let mut state = pool.inner.lock().await;
     if state.lifecycle_key.as_deref() != Some(lifecycle_key.as_str()) {
-        if let Some(mut process) = state.process.take() {
-            let _ = process.child.kill().await;
-            let _ = process.child.wait().await;
+        if let Some(process) = state.process.take() {
+            shutdown_pooled_codex_process(process).await;
         }
         state.lifecycle_key = Some(lifecycle_key);
         state._auth_home = restore_auth_home(request.provider_auth.as_ref())?;
@@ -871,9 +896,16 @@ async fn run_codex_subscription_process_pooled(
         state._auth_home.as_ref(),
     );
     if state.process.is_none() {
-        state.process = Some(
-            start_pooled_codex_process(&request, permission, state._auth_home.as_ref()).await?,
-        );
+        let started =
+            start_pooled_codex_process(&request, permission, state._auth_home.as_ref()).await?;
+        if request.session_id.is_some() && !started.resumed {
+            request.prompt = request
+                .resume_unavailable_prompt
+                .take()
+                .context("Codex resume failed without a durable replay prompt")?;
+            request.session_id = None;
+        }
+        state.process = Some(started.process);
     }
     let mut process = state
         .process
@@ -898,11 +930,22 @@ async fn run_codex_subscription_process_pooled(
     }
 }
 
+async fn shutdown_pooled_codex_process(mut process: PooledCodexProcess) {
+    let _ = process.stdin.shutdown().await;
+    if tokio::time::timeout(Duration::from_secs(2), process.child.wait())
+        .await
+        .is_err()
+    {
+        let _ = process.child.kill().await;
+        let _ = process.child.wait().await;
+    }
+}
+
 async fn start_pooled_codex_process(
     request: &ChatStreamRequest,
     permission: LocalAgentPermission,
     auth_home: Option<&TempDir>,
-) -> Result<PooledCodexProcess> {
+) -> Result<StartedCodexProcess> {
     let mut command = codex_app_server_command(request, auth_home)?;
     let mut child = command.spawn().with_context(|| {
         format!(
@@ -953,14 +996,59 @@ async fn start_pooled_codex_process(
     read_codex_response(&mut lines, 1).await?;
     write_codex_notification(&mut stdin, "initialized", Value::Object(Default::default())).await?;
 
-    write_codex_request(
-        &mut stdin,
-        2,
-        "thread/start",
-        codex_thread_start_params(request, permission),
-    )
-    .await?;
-    let thread_response = read_codex_response(&mut lines, 2).await?;
+    let mut next_request_id = 3;
+    let (thread_response, resumed) = if let Some(thread_id) = request
+        .session_id
+        .as_deref()
+        .filter(|thread_id| !thread_id.trim().is_empty())
+    {
+        write_codex_request(
+            &mut stdin,
+            2,
+            "thread/resume",
+            codex_thread_resume_params(request, permission, thread_id),
+        )
+        .await?;
+        match read_codex_response(&mut lines, 2).await {
+            Ok(response) => (response, true),
+            Err(resume_error) => {
+                let replay = request
+                    .resume_unavailable_prompt
+                    .as_deref()
+                    .with_context(|| {
+                        format!("failed to resume Codex thread {thread_id}: {resume_error:#}")
+                    })?;
+                anyhow::ensure!(
+                    replay.chars().count() <= CODEX_APP_SERVER_TEXT_INPUT_LIMIT_CHARS,
+                    "Codex durable thread resume unavailable; retry from Borg's durable journal after context compaction: {resume_error:#}"
+                );
+                tracing::warn!(
+                    thread_id,
+                    error = %resume_error,
+                    "Codex durable thread was unavailable; starting from Borg's canonical replay"
+                );
+                write_codex_request(
+                    &mut stdin,
+                    next_request_id,
+                    "thread/start",
+                    codex_thread_start_params(request, permission),
+                )
+                .await?;
+                let response = read_codex_response(&mut lines, next_request_id).await?;
+                next_request_id = next_request_id.saturating_add(1);
+                (response, false)
+            }
+        }
+    } else {
+        write_codex_request(
+            &mut stdin,
+            2,
+            "thread/start",
+            codex_thread_start_params(request, permission),
+        )
+        .await?;
+        (read_codex_response(&mut lines, 2).await?, false)
+    };
     let thread_id = thread_response
         .pointer("/result/thread/id")
         .or_else(|| thread_response.pointer("/thread/id"))
@@ -968,13 +1056,16 @@ async fn start_pooled_codex_process(
         .context("Codex app server did not return a thread id")?
         .to_string();
 
-    Ok(PooledCodexProcess {
-        child,
-        stdin,
-        lines,
-        stderr: stderr_buffer,
-        thread_id,
-        next_request_id: 3,
+    Ok(StartedCodexProcess {
+        process: PooledCodexProcess {
+            child,
+            stdin,
+            lines,
+            stderr: stderr_buffer,
+            thread_id,
+            next_request_id,
+        },
+        resumed,
     })
 }
 
@@ -1014,6 +1105,7 @@ async fn run_pooled_codex_turn(
     > = HashMap::new();
     let mut pending_approvals = HashMap::new();
     let mut turn_completed = false;
+    let mut turn_status = None;
     let mut reasoning_state = CodexReasoningState::default();
 
     loop {
@@ -1052,6 +1144,7 @@ async fn run_pooled_codex_turn(
                     usage = event_usage;
                 }
                 if codex_event_kind(&value).is_some_and(|method| method == "turn/completed") {
+                    turn_status = codex_turn_status(&value).map(str::to_string);
                     turn_completed = true;
                     break;
                 }
@@ -1144,12 +1237,7 @@ async fn run_pooled_codex_turn(
     if !turn_completed {
         return Ok(false);
     }
-    let final_text = final_text.unwrap_or(text);
-    anyhow::ensure!(
-        !final_text.trim().is_empty(),
-        "{} returned an empty response",
-        SubscriptionProvider::Codex.executable()
-    );
+    let final_text = codex_terminal_text(final_text, text, turn_status.as_deref())?;
     usage.duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
     if events
         .send(ChatStreamEvent::Done {
@@ -1272,6 +1360,7 @@ async fn run_codex_subscription_process(
     > = HashMap::new();
     let mut pending_approvals = HashMap::new();
     let mut turn_completed = false;
+    let mut turn_status = None;
     let mut reasoning_state = CodexReasoningState::default();
 
     loop {
@@ -1316,6 +1405,7 @@ async fn run_codex_subscription_process(
                 if let Some(method) = codex_event_kind(&value)
                     && method == "turn/completed"
                 {
+                    turn_status = codex_turn_status(&value).map(str::to_string);
                     turn_completed = true;
                     break;
                 }
@@ -1435,12 +1525,7 @@ async fn run_codex_subscription_process(
         );
     }
 
-    let final_text = final_text.unwrap_or(text);
-    anyhow::ensure!(
-        !final_text.trim().is_empty(),
-        "{} returned an empty response",
-        SubscriptionProvider::Codex.executable()
-    );
+    let final_text = codex_terminal_text(final_text, text, turn_status.as_deref())?;
 
     usage.duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
     events
@@ -1595,6 +1680,23 @@ fn codex_thread_start_params(
     if !config.is_empty() {
         params["config"] = Value::Object(config);
     }
+    params
+}
+
+fn codex_thread_resume_params(
+    request: &ChatStreamRequest,
+    permission: LocalAgentPermission,
+    thread_id: &str,
+) -> Value {
+    let mut params = codex_thread_start_params(request, permission);
+    let object = params
+        .as_object_mut()
+        .expect("Codex thread parameters are always an object");
+    object.remove("ephemeral");
+    object.insert("threadId".to_string(), Value::String(thread_id.to_string()));
+    // Borg already owns and renders the durable transcript. Avoid returning a
+    // potentially enormous duplicate turn array just to reopen the thread.
+    object.insert("excludeTurns".to_string(), Value::Bool(true));
     params
 }
 
@@ -2366,6 +2468,27 @@ fn codex_event_result(value: &Value) -> Option<String> {
         .and_then(codex_agent_message_text)
 }
 
+fn codex_turn_status(value: &Value) -> Option<&str> {
+    value
+        .pointer("/params/turn/status")
+        .or_else(|| value.pointer("/turn/status"))
+        .and_then(Value::as_str)
+}
+
+fn codex_terminal_text(
+    final_text: Option<String>,
+    streamed_text: String,
+    turn_status: Option<&str>,
+) -> Result<String> {
+    let text = final_text.unwrap_or(streamed_text);
+    anyhow::ensure!(
+        !text.trim().is_empty() || turn_status == Some("interrupted"),
+        "{} returned an empty response",
+        SubscriptionProvider::Codex.executable()
+    );
+    Ok(text)
+}
+
 fn codex_event_kind(value: &Value) -> Option<&str> {
     value
         .get("type")
@@ -3090,6 +3213,74 @@ mod tests {
         assert_eq!(
             event_session_id(&serde_json::json!({"thread_id":"thread-1"})),
             Some("thread-1".to_string())
+        );
+    }
+
+    #[test]
+    fn interrupted_codex_turn_accepts_an_empty_terminal_message() {
+        let completed = serde_json::json!({
+            "method": "turn/completed",
+            "params": {"turn": {"status": "interrupted"}}
+        });
+
+        assert_eq!(codex_turn_status(&completed), Some("interrupted"));
+        assert_eq!(
+            codex_terminal_text(None, String::new(), codex_turn_status(&completed)).unwrap(),
+            ""
+        );
+        assert!(codex_terminal_text(None, String::new(), Some("completed")).is_err());
+    }
+
+    #[test]
+    fn codex_resume_reopens_persisted_thread_without_returning_its_history() {
+        let request = ChatStreamRequest {
+            prompt: "next".to_string(),
+            lifecycle_key: None,
+            owner_session_id: None,
+            client_user_message_id: None,
+            attachments: Vec::new(),
+            model: Some("gpt-5.6-luna".to_string()),
+            effort: Some("max".to_string()),
+            fast: false,
+            system_prompt: "Borg policy".to_string(),
+            output_schema: None,
+            mcp_owner_id: None,
+            mcp_allowed_scopes: Vec::new(),
+            mcp_user_id: None,
+            mcp_external_servers: vec![ExternalMcpServer {
+                name: "borg_agent".to_string(),
+                command: "/opt/borg/replacement-borg".to_string(),
+                args: vec!["__agent-mcp".to_string()],
+                env: Default::default(),
+                allowed_tools: vec!["mcp__borg_agent__get_goal".to_string()],
+            }],
+            mcp_api_token: None,
+            provider_auth: None,
+            git_credentials: Vec::new(),
+            working_directory: Some(PathBuf::from("/tmp/workspace")),
+            session_id: Some("thread-1".to_string()),
+            provider_channel: ProviderChannel::Direct,
+            persist_session: Some(true),
+            web_search_allowed: true,
+            resume_unavailable_prompt: Some("full replay + next".to_string()),
+        };
+
+        let params =
+            codex_thread_resume_params(&request, LocalAgentPermission::FullAccess, "thread-1");
+        assert_eq!(params.get("threadId"), Some(&Value::from("thread-1")));
+        assert_eq!(params.get("excludeTurns"), Some(&Value::Bool(true)));
+        assert!(params.get("ephemeral").is_none());
+        assert_eq!(
+            params.get("developerInstructions"),
+            Some(&Value::from("Borg policy"))
+        );
+        assert_eq!(
+            params.pointer("/config/mcp_servers/borg_agent/command"),
+            Some(&Value::from("/opt/borg/replacement-borg"))
+        );
+        assert_eq!(
+            params.pointer("/config/mcp_servers/borg_agent/args/0"),
+            Some(&Value::from("__agent-mcp"))
         );
     }
 

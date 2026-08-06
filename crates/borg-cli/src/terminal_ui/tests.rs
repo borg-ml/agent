@@ -6664,7 +6664,7 @@ fn click_release_runs_the_deferred_action_but_drag_release_keeps_selection() {
 fn wheel_scrolling_during_a_drag_extends_selection_at_the_pointer() {
     let area = Rect::new(5, 10, 30, 6);
     let pointer = Position::new(9, 12);
-    let ranges = vec![(0, 0, 60, 0)];
+    let ranges = vec![SelectionRowRange::nested_entry(0, 0, 60, 0)];
     let scroll_max = 50;
     let initial_from_bottom = 20;
     let initial_scroll_start = scroll_max - initial_from_bottom;
@@ -6726,7 +6726,7 @@ fn drag_at_each_viewport_edge_autoscrolls_and_clamps() {
 fn active_drag_focus_retargets_when_streaming_moves_the_tail() {
     let area = Rect::new(0, 0, 40, 6);
     let pointer = Position::new(7, 3);
-    let ranges = vec![(0, 0, 80, 0)];
+    let ranges = vec![SelectionRowRange::nested_entry(0, 0, 80, 0)];
     let before = selection_point_for_viewport_pointer(area, 40, pointer, &ranges);
     let after = selection_point_for_viewport_pointer(area, 44, pointer, &ranges);
 
@@ -6905,7 +6905,10 @@ fn live_message_selection_moves_up_when_the_tail_grows() {
 #[test]
 fn selection_points_resolve_through_accordion_body_offsets() {
     // Entry 1 is a boxed tool whose visible slice starts at body row 3.
-    let ranges = vec![(0, 2, 10, 0), (1, 10, 18, 3)];
+    let ranges = vec![
+        SelectionRowRange::nested_entry(0, 2, 10, 0),
+        SelectionRowRange::nested_entry(1, 10, 18, 3),
+    ];
 
     // Absolute row 12 inside the slice anchors to body row 5 of entry 1.
     let anchor = selection_point_for_row(&ranges, 12, 4);
@@ -6920,7 +6923,10 @@ fn selection_points_resolve_through_accordion_body_offsets() {
     );
 
     // The window shifts down by one: the slice now starts at body row 4.
-    let shifted = vec![(0, 2, 10, 0), (1, 10, 18, 4)];
+    let shifted = vec![
+        SelectionRowRange::nested_entry(0, 2, 10, 0),
+        SelectionRowRange::nested_entry(1, 10, 18, 4),
+    ];
     let resolved = resolve_selection_point(anchor, &shifted);
     assert_eq!(resolved, Some(TranscriptPoint { row: 11, column: 4 }));
 
@@ -6935,6 +6941,35 @@ fn selection_points_resolve_through_accordion_body_offsets() {
         &shifted,
     );
     assert_eq!(clamped, Some(TranscriptPoint { row: 10, column: 4 }));
+
+    // An action that is fully outside the nested viewport clamps to the
+    // appropriate edge instead of making the whole selection disappear.
+    let before_slice = resolve_selection_point(
+        SelectionPoint {
+            entry: 0,
+            row_in_entry: 0,
+            column: 4,
+            logical_offset: None,
+        },
+        &shifted[1..],
+    );
+    assert_eq!(before_slice, Some(TranscriptPoint { row: 10, column: 0 }));
+    let after_slice = resolve_selection_point(
+        SelectionPoint {
+            entry: 2,
+            row_in_entry: 0,
+            column: 4,
+            logical_offset: None,
+        },
+        &shifted[..1],
+    );
+    assert_eq!(
+        after_slice,
+        Some(TranscriptPoint {
+            row: 9,
+            column: usize::MAX,
+        })
+    );
 }
 
 #[test]
@@ -6985,4 +7020,234 @@ fn selection_anchors_follow_content_when_the_actions_window_shifts() {
         resolved.row,
     );
     assert_eq!(resolved.row, target_row - 1);
+}
+
+#[test]
+fn mixed_actions_window_selection_ranges_match_the_visible_rows() {
+    let tool = |index: usize| TranscriptEntry::Tool {
+        source_name: "Run".to_string(),
+        name: "Run".to_string(),
+        detail: format!("call-{index}"),
+        code_view: None,
+        output_view: None,
+        payload_refs: Vec::new(),
+        time: "12:00".to_string(),
+        started_at: Utc::now(),
+        completed_at: Some(Utc::now()),
+        complete: true,
+        error: false,
+        user_interrupted: false,
+        backgrounded: false,
+        expanded: false,
+    };
+    let mut transcript = Transcript::default();
+    for index in 0..4 {
+        transcript.order.push(tool(index));
+    }
+    transcript.order.push(TranscriptEntry::Activity {
+        text: "agent · /root/reviewer · started".to_string(),
+        time: "12:00".to_string(),
+    });
+    for index in 4..10 {
+        transcript.order.push(tool(index));
+    }
+
+    let render = transcript.render_with_tool_run_viewport(100, 8, None, None, None);
+    let activity_row = render
+        .0
+        .iter()
+        .position(|line| line.to_string().contains("/root/reviewer"))
+        .expect("agent activity is visible");
+    let activity_anchor = selection_point_for_row_in_lines(&render.6, &render.0, activity_row, 16);
+    for (row, line) in render.0.iter().enumerate() {
+        if line.to_string().starts_with('┌') || line.to_string().starts_with('└') {
+            continue;
+        }
+        let point = selection_point_for_row_in_lines(&render.6, &render.0, row, 8);
+        let resolved = resolve_selection_point_in_lines(point, &render.6, &render.0)
+            .or_else(|| resolve_selection_point(point, &render.6))
+            .expect("every visible action row resolves");
+        assert_eq!(
+            resolved.row,
+            row,
+            "selection for visible row {row} drifted to row {}:\n{}",
+            resolved.row,
+            render
+                .0
+                .iter()
+                .map(Line::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    let max_offset = render.2[0].3;
+    assert!(transcript.scroll_tool_run(0, max_offset, -2));
+    let shifted = transcript.render_with_tool_run_viewport(100, 8, None, None, None);
+    let shifted_activity =
+        resolve_selection_point_in_lines(activity_anchor, &shifted.6, &shifted.0)
+            .or_else(|| resolve_selection_point(activity_anchor, &shifted.6))
+            .expect("agent activity remains selectable after nested scrolling");
+    assert!(
+        shifted.0[shifted_activity.row]
+            .to_string()
+            .contains("/root/reviewer"),
+        "released selection must follow the same mixed action after scrolling"
+    );
+    assert_eq!(shifted_activity.row, activity_row + 2);
+}
+
+#[test]
+fn drag_selection_stays_live_when_wheel_scroll_hides_its_action_anchor() {
+    let mut transcript = Transcript::default();
+    for index in 0..20 {
+        transcript.order.push(TranscriptEntry::Tool {
+            source_name: "Run".to_string(),
+            name: "Run".to_string(),
+            detail: format!("call-{index}"),
+            code_view: None,
+            output_view: None,
+            payload_refs: Vec::new(),
+            time: "12:00".to_string(),
+            started_at: Utc::now(),
+            completed_at: Some(Utc::now()),
+            complete: true,
+            error: false,
+            user_interrupted: false,
+            backgrounded: false,
+            expanded: false,
+        });
+    }
+
+    let before = transcript.render_with_tool_run_viewport(100, 8, None, None, None);
+    let anchor_row = before
+        .0
+        .iter()
+        .position(|line| line.to_string().contains("call-18"))
+        .expect("anchor action is initially visible");
+    let pointer_row = before
+        .0
+        .iter()
+        .position(|line| line.to_string().contains("call-15"))
+        .expect("drag pointer action is initially visible");
+    let anchor = selection_point_for_row_in_lines(&before.6, &before.0, anchor_row, 8);
+    let max_offset = before.2[0].3;
+
+    assert!(transcript.scroll_tool_run(0, max_offset, -8));
+    let after = transcript.render_with_tool_run_viewport(100, 8, None, None, None);
+    assert!(
+        after.6.iter().all(|range| range.entry != anchor.entry),
+        "the regression requires the held anchor to scroll fully out of view"
+    );
+    let focus = selection_point_for_row_in_lines(&after.6, &after.0, pointer_row, 8);
+    assert!(focus.entry < anchor.entry);
+    let selection = TextSelection {
+        anchor,
+        focus,
+        dragging: true,
+        autoscroll: 0,
+        pointer: Position::new(8, pointer_row as u16),
+    };
+    let (start, end) = resolved_selection_in_lines(selection, &after.6, &after.0)
+        .expect("wheel scrolling must not break an active action selection");
+    assert_eq!(start.row, pointer_row);
+    assert_eq!(
+        end.row,
+        after
+            .6
+            .last()
+            .expect("visible actions have a selection range")
+            .end
+            - 1
+    );
+
+    let mut highlighted = after.0.clone();
+    apply_text_selection(&mut highlighted, 0, start, end);
+    for (row, line) in highlighted
+        .iter()
+        .enumerate()
+        .take(end.row + 1)
+        .skip(start.row)
+    {
+        assert!(
+            line.spans.iter().any(|span| span.style.bg.is_some()),
+            "visible action row {row} was not extended into the drag selection"
+        );
+    }
+}
+
+#[test]
+fn released_selection_follows_expanded_tool_text_during_nested_scroll() {
+    let mut transcript = Transcript::default();
+    for index in 0..9 {
+        transcript.order.push(TranscriptEntry::Tool {
+            source_name: "Edit".to_string(),
+            name: "Edit".to_string(),
+            detail: format!("file-{index}.rs"),
+            code_view: Some((
+                "diff:rs".to_string(),
+                (0..24)
+                    .map(|line| format!("+changed-{line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )),
+            output_view: None,
+            payload_refs: Vec::new(),
+            time: "12:00".to_string(),
+            started_at: Utc::now(),
+            completed_at: Some(Utc::now()),
+            complete: true,
+            error: false,
+            user_interrupted: false,
+            backgrounded: false,
+            expanded: index == 8,
+        });
+    }
+
+    let before = transcript.render_with_tool_run_viewport(100, 8, None, None, None);
+    let selected_row = before
+        .0
+        .iter()
+        .position(|line| line.to_string().contains("changed-21"))
+        .expect("expanded tool tail is visible");
+    let anchor = selection_point_for_row_in_lines(&before.6, &before.0, selected_row, 12);
+    assert_eq!(
+        anchor.logical_offset, None,
+        "nested selection must use the tool's stable body row"
+    );
+    let sticky_row = before
+        .0
+        .iter()
+        .position(|line| line.to_string().contains("file-8.rs"))
+        .expect("the clipped tool has a pinned header");
+    let sticky_anchor = selection_point_for_row_in_lines(&before.6, &before.0, sticky_row, 12);
+    assert_eq!(sticky_anchor.row_in_entry, 0);
+    assert_eq!(sticky_anchor.logical_offset, None);
+    let max_offset = before.2[0].3;
+
+    assert!(transcript.scroll_tool_run(0, max_offset, -2));
+    let after = transcript.render_with_tool_run_viewport(100, 8, None, None, None);
+    let resolved = resolve_selection_point_in_lines(anchor, &after.6, &after.0)
+        .or_else(|| resolve_selection_point(anchor, &after.6))
+        .expect("expanded tool selection resolves after nested scrolling");
+    assert!(
+        after.0[resolved.row].to_string().contains("changed-21"),
+        "released selection moved to different tool text:\n{}",
+        after
+            .0
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    assert_eq!(resolved.row, selected_row + 2);
+    let resolved_sticky = resolve_selection_point(sticky_anchor, &after.6)
+        .expect("pinned tool header selection resolves after nested scrolling");
+    assert_eq!(resolved_sticky.row, sticky_row);
+    assert!(
+        after.0[resolved_sticky.row]
+            .to_string()
+            .contains("file-8.rs"),
+        "the synthetic pinned row must keep selecting the tool header"
+    );
 }

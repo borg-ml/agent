@@ -1040,15 +1040,20 @@ async fn run_agent_session_store_kernel(
     // Set when a provider switch lands mid-turn; drained at the next turn
     // boundary once the in-flight turn has reported its own session id.
     let mut provider_switch_pending = false;
-    // A healthy local subscription pool appends only `prompt_delta` on the
-    // next turn. Keep this separate from the provider session id: a failed or
-    // interrupted executor must force a full durable replay even if it left a
-    // stale provider id behind.
-    let mut subscription_context_reusable = false;
-    // Subscription providers are deliberately fed from Borg's durable
-    // conversation branch. Their own session files are an optimization at
-    // best and can diverge from the journal after a crash, provider switch,
-    // or an interrupted tool round.
+    // A live pool appends only `prompt_delta`. Codex can also reopen the last
+    // acknowledged provider checkpoint after an idle Borg/app-server restart,
+    // preserving provider-side cache without replaying the whole transcript.
+    // Failed/uncertain turns durably clear this id before recovery.
+    let mut subscription_context_reusable = launch.provider == CodingProvider::Codex
+        && provider_session_id
+            .as_deref()
+            .is_some_and(|provider_session_id| {
+                codex_checkpoint_is_acknowledged(journal.context_events(), provider_session_id)
+            })
+        && executor.supports_subscription_context_reuse(launch.provider);
+    // Borg's journal remains authoritative. Native subscription sessions are
+    // cache-preserving checkpoints only; whenever one cannot be proven usable,
+    // the exact durable branch below is replayed.
     let mut retained_context = (!launch.provider.uses_native_harness())
         .then(|| retained_conversation_context(journal.context_events()))
         .flatten();
@@ -1174,7 +1179,7 @@ async fn run_agent_session_store_kernel(
     let workflow_autonomy_store = autonomy_store.clone();
     let agent_tool_server =
         crate::AgentToolServer::start(session_root, session_id, dispatcher.clone()).await?;
-    let agent_mcp_server = agent_tool_server.external_mcp_server();
+    let agent_mcp_server = agent_tool_server.external_mcp_server()?;
     let (autonomy_dispatch_tx, mut autonomy_dispatch_rx) = mpsc::channel(16);
     let autonomy_cancel = CancellationToken::new();
     let _autonomy_shutdown = SessionAutonomyShutdown(autonomy_cancel.clone());
@@ -1723,6 +1728,10 @@ async fn run_agent_session_store_kernel(
                                     )
                                     .await?;
                                     provider_session_id = Some(new_provider_session_id);
+                                    subscription_context_reusable = launch.provider
+                                        == CodingProvider::Codex
+                                        && executor
+                                            .supports_subscription_context_reuse(launch.provider);
                                 }
                                 if !launch.provider.uses_native_harness() {
                                     // The summary is already durable in the
@@ -2204,7 +2213,10 @@ async fn run_agent_session_store_kernel(
             message_id: prompt.message_id,
             context_generation: journal.state(session_id).await?.context_generation,
             provider: launch.provider,
-            provider_session_id: provider_session_id.clone(),
+            provider_session_id: (launch.provider.uses_native_harness()
+                || subscription_context_reusable)
+                .then(|| provider_session_id.clone())
+                .flatten(),
             cwd: launch.cwd.clone(),
             prompt_delta: if launch.provider.uses_native_harness() {
                 prompt.text.clone()
@@ -2335,9 +2347,13 @@ async fn run_agent_session_store_kernel(
                         match result {
                         Ok(outcome) => {
                             goal_turn_failures.reset();
-                            subscription_context_reusable = !interrupted
-                                && !launch.provider.uses_native_harness()
-                                && executor.supports_subscription_context_reuse(launch.provider);
+                            subscription_context_reusable =
+                                subscription_context_reusable_after_turn(
+                                    launch.provider,
+                                    interrupted,
+                                    executor
+                                        .supports_subscription_context_reuse(launch.provider),
+                                );
                             provider_session_id = outcome.provider_session_id.clone();
                             let final_text = outcome.final_text;
                             if autonomy_result_sender.is_some() {
@@ -2390,8 +2406,15 @@ async fn run_agent_session_store_kernel(
                                 autonomy_result = Some(Err(anyhow::anyhow!(error.clone())));
                             }
                             let ready_detail = if retry {
-                                "The provider returned no response; your message was preserved and is being retried automatically."
-                                    .to_string()
+                                if error.to_ascii_lowercase().contains(
+                                    "durable thread resume unavailable",
+                                ) {
+                                    "The provider thread could not be resumed; your message was preserved and Borg is retrying from its durable journal."
+                                        .to_string()
+                                } else {
+                                    "The provider returned no response; your message was preserved and is being retried automatically."
+                                        .to_string()
+                                }
                             } else {
                                 format!("Turn failed; the session remains available: {error}")
                             };
@@ -2488,7 +2511,6 @@ async fn run_agent_session_store_kernel(
                         context_compaction_in_progress = true;
                     } else if compaction_status == Some("completed") {
                         context_compaction_in_progress = false;
-                        subscription_context_reusable = false;
                     }
                     let retry_steers = provider_event_is_steer_boundary(&kind)
                         || compaction_status == Some("completed");
@@ -2574,6 +2596,7 @@ async fn run_agent_session_store_kernel(
                     }
                 }, if interrupt_deadline.is_some() => {
                     subscription_context_reusable = false;
+                    provider_session_id = None;
                     running.abort();
                     let _ = (&mut running).await;
                     executor.stop_session(session_id).await?;
@@ -2611,7 +2634,7 @@ async fn run_agent_session_store_kernel(
                         session_id,
                         SessionEventKind::TurnCompleted {
                             message_id: prompt.message_id,
-                            provider_session_id: provider_session_id.clone(),
+                            provider_session_id: None,
                             final_text: String::new(),
                             error: Some("turn interrupted".to_string()),
                         },
@@ -2926,7 +2949,6 @@ async fn run_agent_session_store_kernel(
                                 // finishes, so the switch is applied at the
                                 // turn boundary instead of here.
                                 Ok(provider_switched) => {
-                                    subscription_context_reusable = false;
                                     provider_switch_pending |= provider_switched;
                                 }
                                 Err(error) => {
@@ -3089,6 +3111,8 @@ async fn run_agent_session_store_kernel(
                             running.abort();
                             let _ = (&mut running).await;
                             executor.stop_session(session_id).await?;
+                            subscription_context_reusable = false;
+                            provider_session_id = None;
                             deny_pending_approval(
                                 &mut journal,
                                 &events,
@@ -3121,7 +3145,7 @@ async fn run_agent_session_store_kernel(
                                 session_id,
                                 SessionEventKind::TurnCompleted {
                                     message_id: prompt.message_id,
-                                    provider_session_id: provider_session_id.clone(),
+                                    provider_session_id: None,
                                     final_text: String::new(),
                                     error: Some("turn interrupted".to_string()),
                                 },
@@ -3348,10 +3372,13 @@ async fn run_agent_session_store_kernel(
             };
         }
         if interrupted {
-            subscription_context_reusable = false;
-            // Codex and Claude interruption is scoped to the active turn and
-            // preserves the provider thread/session. Discarding that id here
-            // silently forks the conversation and loses provider-side cache.
+            if launch.provider != CodingProvider::Codex {
+                subscription_context_reusable = false;
+            }
+            // Codex explicitly completes turn/interrupt with an interruption
+            // marker that is valid context for the next turn, so a clean
+            // terminal result can keep both its thread and append-only pool.
+            // Claude keeps its session id but still forces a durable replay.
             if !matches!(
                 launch.provider,
                 CodingProvider::Codex | CodingProvider::Claude
@@ -3822,6 +3849,36 @@ fn subscription_context_needs_compaction(
     !provider_context_reusable
         && subscription_prompt_chars(Some(retained_context), actor, text)
             > SUBSCRIPTION_INPUT_BUDGET_CHARS
+}
+
+fn subscription_context_reusable_after_turn(
+    provider: CodingProvider,
+    interrupted: bool,
+    executor_supports_reuse: bool,
+) -> bool {
+    !provider.uses_native_harness()
+        && executor_supports_reuse
+        && (!interrupted || provider == CodingProvider::Codex)
+}
+
+fn codex_checkpoint_is_acknowledged(events: &[SessionEvent], provider_session_id: &str) -> bool {
+    // ProviderSessionLinked can reach the journal just before the actor writes
+    // TurnCompleted. If the actor dies in that narrow gap, the native thread
+    // may already contain a prompt that Borg will recover and retry. Resume is
+    // safe only when the latest turn boundary is the matching terminal event;
+    // an unmatched TurnStarted always forces canonical replay.
+    events.iter().rev().find_map(|event| match &event.kind {
+        SessionEventKind::TurnStarted { .. } => Some(false),
+        SessionEventKind::TurnCompleted {
+            provider_session_id: checkpoint,
+            error,
+            ..
+        } => Some(
+            checkpoint.as_deref() == Some(provider_session_id)
+                && (error.is_none() || error.as_deref() == Some("turn interrupted")),
+        ),
+        _ => None,
+    }) == Some(true)
 }
 
 /// Split retained provider-context bytes without dropping them. An unusually
@@ -5644,9 +5701,9 @@ fn provider_error_is_usage_limited(error: &str) -> bool {
 }
 
 fn is_safe_automatic_retry_error(error: &str) -> bool {
-    error
-        .to_ascii_lowercase()
-        .contains("returned an empty response")
+    let error = error.to_ascii_lowercase();
+    error.contains("returned an empty response")
+        || error.contains("durable thread resume unavailable")
 }
 
 fn provider_event_has_side_effect(kind: &SessionEventKind) -> bool {

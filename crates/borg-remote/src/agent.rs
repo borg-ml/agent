@@ -278,6 +278,17 @@ struct PreparedSubscriptionTurn {
     lifecycle_key: String,
     pool: SubscriptionPool,
     reused: bool,
+    resume_session_id: Option<String>,
+    resume_unavailable_prompt: Option<String>,
+}
+
+struct SubscriptionTurnInput {
+    context_generation: u64,
+    provider: CodingProvider,
+    provider_session_id: Option<String>,
+    prompt: String,
+    prompt_delta: String,
+    lifecycle_key: String,
 }
 
 #[derive(Clone)]
@@ -290,12 +301,16 @@ impl SubscriptionPoolRegistry {
     async fn prepare(
         &self,
         session_id: Uuid,
-        context_generation: u64,
-        provider: CodingProvider,
-        prompt: String,
-        prompt_delta: String,
-        lifecycle_key: String,
+        input: SubscriptionTurnInput,
     ) -> PreparedSubscriptionTurn {
+        let SubscriptionTurnInput {
+            context_generation,
+            provider,
+            provider_session_id,
+            prompt,
+            prompt_delta,
+            lifecycle_key,
+        } = input;
         let mut slots = self.slots.lock().await;
         let slot = slots
             .entry(session_id)
@@ -311,10 +326,10 @@ impl SubscriptionPoolRegistry {
             && slot.healthy
             && slot.context_generation == context_generation
             && slot.lifecycle_key == lifecycle_key;
-        // Reserve the slot pessimistically. If the executor task is aborted,
-        // the success callback below cannot run; the next turn must therefore
-        // replay the durable journal instead of assuming the native process
-        // still contains the complete context.
+        // Reserve the volatile process pessimistically. If the executor task
+        // is aborted, the success callback below cannot run. Codex may still
+        // resume a separately persisted, acknowledged thread checkpoint;
+        // otherwise the next turn replays Borg's durable journal.
         slot.healthy = false;
         if !append {
             if slot.provider != provider {
@@ -336,12 +351,22 @@ impl SubscriptionPoolRegistry {
             slot.context_generation = context_generation;
             slot.healthy = false;
         }
+        let resume_session_id = (!append && provider == CodingProvider::Codex)
+            .then_some(provider_session_id)
+            .flatten();
+        let reusing_native_context = append || resume_session_id.is_some();
         let effective_key = format!("{lifecycle_key}#epoch={}", slot.epoch);
         PreparedSubscriptionTurn {
-            prompt: if append { prompt_delta } else { prompt },
+            prompt: if reusing_native_context {
+                prompt_delta
+            } else {
+                prompt.clone()
+            },
             lifecycle_key: effective_key,
             pool: slot.pool.clone(),
-            reused: append,
+            reused: reusing_native_context,
+            resume_session_id,
+            resume_unavailable_prompt: reusing_native_context.then_some(prompt),
         }
     }
 
@@ -698,14 +723,22 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
     }
 
     async fn stop_session(&self, session_id: Uuid) -> Result<()> {
-        // Dropping the slot closes the volatile native subscription process;
-        // the durable journal remains available for a later resume, which
-        // will deliberately begin with a full replay.
-        self.subscription_pools
+        // The Borg journal is always durable. Let an idle Codex app-server
+        // flush its own acknowledged rollout too, so a later actor can resume
+        // that cache-preserving checkpoint rather than replaying the journal.
+        let slot = self
+            .subscription_pools
             .slots
             .lock()
             .await
             .remove(&session_id);
+        if let Some(SubscriptionPoolSlot {
+            pool: SubscriptionPool::Codex(pool),
+            ..
+        }) = slot
+        {
+            pool.shutdown().await;
+        }
         self.native_harness.stop_session(session_id).await;
         Ok(())
     }
@@ -864,15 +897,28 @@ async fn run_borg_provider_turn(
         let prepared = registry
             .prepare(
                 turn.session_id,
-                turn.context_generation,
-                turn.provider,
-                turn.prompt.clone(),
-                turn.prompt_delta.clone(),
-                lifecycle_key,
+                SubscriptionTurnInput {
+                    context_generation: turn.context_generation,
+                    provider: turn.provider,
+                    provider_session_id: turn.provider_session_id.clone(),
+                    prompt: turn.prompt.clone(),
+                    prompt_delta: turn.prompt_delta.clone(),
+                    lifecycle_key,
+                },
             )
             .await;
         request.prompt = prepared.prompt.clone();
         request.lifecycle_key = Some(prepared.lifecycle_key.clone());
+        request.session_id = prepared.resume_session_id.clone();
+        request.resume_unavailable_prompt = prepared.resume_unavailable_prompt.clone();
+        // Codex app-server threads are the cache-preserving continuation of
+        // Borg's durable journal. Persist them so an idle process restart can
+        // resume the acknowledged checkpoint instead of replaying a possibly
+        // over-limit transcript. Borg remains the source of truth and sends a
+        // full replay whenever the checkpoint is absent or invalidated.
+        if turn.provider == CodingProvider::Codex {
+            request.persist_session = Some(true);
+        }
         Some((Arc::clone(registry), prepared))
     } else {
         None
@@ -1297,7 +1343,10 @@ async fn run_borg_provider_turn(
             .mark(
                 turn.session_id,
                 turn.provider,
-                !interrupted.load(Ordering::Acquire),
+                subscription_pool_turn_is_healthy(
+                    turn.provider,
+                    interrupted.load(Ordering::Acquire),
+                ),
             )
             .await;
     }
@@ -1317,6 +1366,10 @@ fn require_provider_stream_terminal(terminal_seen: bool) -> Result<()> {
         "provider stream closed without a terminal Done or Failed event"
     );
     Ok(())
+}
+
+fn subscription_pool_turn_is_healthy(provider: CodingProvider, interrupted: bool) -> bool {
+    !interrupted || provider == CodingProvider::Codex
 }
 
 fn normalize_reasoning_delta(accumulated: &mut String, incoming: &str) -> Option<String> {
@@ -1661,11 +1714,14 @@ mod tests {
         let first = registry
             .prepare(
                 session_id,
-                0,
-                CodingProvider::Claude,
-                "canonical history + first".to_string(),
-                "<borg-message>first</borg-message>".to_string(),
-                "stable-config".to_string(),
+                SubscriptionTurnInput {
+                    context_generation: 0,
+                    provider: CodingProvider::Claude,
+                    provider_session_id: None,
+                    prompt: "canonical history + first".to_string(),
+                    prompt_delta: "<borg-message>first</borg-message>".to_string(),
+                    lifecycle_key: "stable-config".to_string(),
+                },
             )
             .await;
         assert_eq!(first.prompt, "canonical history + first");
@@ -1676,11 +1732,14 @@ mod tests {
         let appended = registry
             .prepare(
                 session_id,
-                0,
-                CodingProvider::Claude,
-                "canonical history + first + second".to_string(),
-                "<borg-message>second</borg-message>".to_string(),
-                "stable-config".to_string(),
+                SubscriptionTurnInput {
+                    context_generation: 0,
+                    provider: CodingProvider::Claude,
+                    provider_session_id: None,
+                    prompt: "canonical history + first + second".to_string(),
+                    prompt_delta: "<borg-message>second</borg-message>".to_string(),
+                    lifecycle_key: "stable-config".to_string(),
+                },
             )
             .await;
         assert_eq!(appended.prompt, "<borg-message>second</borg-message>");
@@ -1691,15 +1750,48 @@ mod tests {
         let replay = registry
             .prepare(
                 session_id,
-                0,
-                CodingProvider::Claude,
-                "canonical history + first + second + third".to_string(),
-                "<borg-message>third</borg-message>".to_string(),
-                "stable-config".to_string(),
+                SubscriptionTurnInput {
+                    context_generation: 0,
+                    provider: CodingProvider::Claude,
+                    provider_session_id: None,
+                    prompt: "canonical history + first + second + third".to_string(),
+                    prompt_delta: "<borg-message>third</borg-message>".to_string(),
+                    lifecycle_key: "stable-config".to_string(),
+                },
             )
             .await;
         assert_eq!(replay.prompt, "canonical history + first + second + third");
         assert_ne!(appended.lifecycle_key, replay.lifecycle_key);
+    }
+
+    #[tokio::test]
+    async fn codex_pool_resumes_a_durable_thread_with_only_the_new_delta() {
+        let registry = SubscriptionPoolRegistry::default();
+        let session_id = Uuid::new_v4();
+        let prepared = registry
+            .prepare(
+                session_id,
+                SubscriptionTurnInput {
+                    context_generation: 4,
+                    provider: CodingProvider::Codex,
+                    provider_session_id: Some("durable-codex-thread".to_string()),
+                    prompt: "large canonical replay + next".to_string(),
+                    prompt_delta: "<borg-message>next</borg-message>".to_string(),
+                    lifecycle_key: "stable-config".to_string(),
+                },
+            )
+            .await;
+
+        assert_eq!(prepared.prompt, "<borg-message>next</borg-message>");
+        assert_eq!(
+            prepared.resume_session_id.as_deref(),
+            Some("durable-codex-thread")
+        );
+        assert_eq!(
+            prepared.resume_unavailable_prompt.as_deref(),
+            Some("large canonical replay + next")
+        );
+        assert!(prepared.reused);
     }
 
     #[tokio::test]
@@ -1850,6 +1942,22 @@ mod tests {
                 .to_string(),
             "provider stream closed without a terminal Done or Failed event"
         );
+    }
+
+    #[test]
+    fn acknowledged_codex_interrupt_keeps_the_native_thread_reusable() {
+        assert!(subscription_pool_turn_is_healthy(
+            CodingProvider::Codex,
+            true
+        ));
+        assert!(!subscription_pool_turn_is_healthy(
+            CodingProvider::Claude,
+            true
+        ));
+        assert!(subscription_pool_turn_is_healthy(
+            CodingProvider::Claude,
+            false
+        ));
     }
 
     #[test]

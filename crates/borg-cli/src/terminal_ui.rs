@@ -112,11 +112,51 @@ const LARGE_PASTE_CHAR_THRESHOLD: usize = 1000;
 const SELECTION_AUTOSCROLL_LINES_PER_FRAME: usize = 2;
 type RowRange = (usize, usize, usize);
 type ToolRunRowRange = (usize, usize, usize, usize);
-/// (entry index, absolute start row, absolute end row, body row of `start`).
-/// `body row of start` is zero unless the entry is a tool clipped inside an
-/// actions accordion, in which case it is the body row currently shown at the
-/// top of the tool's visible slice.
-type SelectionRowRange = (usize, usize, usize, usize);
+/// The visible slice of one selectable transcript entry.
+///
+/// `body_start` is the entry-relative row shown at `start`. Nested action
+/// accordions track that row directly because clipping and sticky headers can
+/// expose several disjoint slices of one entry. Ordinary transcript entries
+/// additionally use text offsets so selections survive wrapping and streaming.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SelectionRowRange {
+    entry: usize,
+    start: usize,
+    end: usize,
+    body_start: usize,
+    uses_logical_offsets: bool,
+}
+
+impl SelectionRowRange {
+    const fn new(
+        entry: usize,
+        start: usize,
+        end: usize,
+        body_start: usize,
+        uses_logical_offsets: bool,
+    ) -> Self {
+        Self {
+            entry,
+            start,
+            end,
+            body_start,
+            uses_logical_offsets,
+        }
+    }
+
+    const fn transcript_entry(entry: usize, start: usize, end: usize) -> Self {
+        Self::new(entry, start, end, 0, true)
+    }
+
+    const fn nested_entry(entry: usize, start: usize, end: usize, body_start: usize) -> Self {
+        Self::new(entry, start, end, body_start, false)
+    }
+
+    fn body_end(self) -> usize {
+        self.body_start
+            .saturating_add(self.end.saturating_sub(self.start))
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct LinkRowRange {
     row: usize,
@@ -3202,13 +3242,25 @@ impl BorgTerminal {
                             .is_some_and(|selection| selection.dragging)
                         {
                             self.update_text_selection_drag(pointer);
-                            self.history_page_requested = true;
                             let viewport_height =
                                 self.transcript_viewport_area.map_or(1, |area| area.height);
-                            self.scroll_drag_selection(wheel_scroll_distance(
-                                viewport_height,
-                                scroll_repetitions,
-                            ));
+                            let terminal_height =
+                                self.terminal.size().map(|size| size.height).unwrap_or(1);
+                            let nested = hovered_tool_run.map(|(start, max_offset)| {
+                                (
+                                    start,
+                                    max_offset,
+                                    -nested_wheel_scroll_distance(
+                                        terminal_height,
+                                        scroll_repetitions,
+                                    ),
+                                )
+                            });
+                            let nested_scrolled = self.scroll_drag_selection(
+                                wheel_scroll_distance(viewport_height, scroll_repetitions),
+                                nested,
+                            );
+                            self.history_page_requested = !nested_scrolled;
                             return Ok(UiAction::None);
                         }
                         let consumed = if let Some((start, max_offset)) = hovered_tool_run {
@@ -3252,13 +3304,25 @@ impl BorgTerminal {
                             .is_some_and(|selection| selection.dragging)
                         {
                             self.update_text_selection_drag(pointer);
-                            self.history_page_requested = false;
                             let viewport_height =
                                 self.transcript_viewport_area.map_or(1, |area| area.height);
-                            self.scroll_drag_selection(-wheel_scroll_distance(
-                                viewport_height,
-                                scroll_repetitions,
-                            ));
+                            let terminal_height =
+                                self.terminal.size().map(|size| size.height).unwrap_or(1);
+                            let nested = hovered_tool_run.map(|(start, max_offset)| {
+                                (
+                                    start,
+                                    max_offset,
+                                    nested_wheel_scroll_distance(
+                                        terminal_height,
+                                        scroll_repetitions,
+                                    ),
+                                )
+                            });
+                            self.scroll_drag_selection(
+                                -wheel_scroll_distance(viewport_height, scroll_repetitions),
+                                nested,
+                            );
+                            self.history_page_requested = false;
                             return Ok(UiAction::None);
                         }
                         let consumed = if let Some((start, max_offset)) = hovered_tool_run {
@@ -3506,15 +3570,33 @@ impl BorgTerminal {
         UiAction::None
     }
 
-    fn scroll_drag_selection(&mut self, lines: isize) {
+    fn scroll_drag_selection(
+        &mut self,
+        lines: isize,
+        nested: Option<(usize, usize, isize)>,
+    ) -> bool {
         self.cancel_scroll_motion();
         self.pending_transcript_click = None;
+        if let Some((start, max_offset, delta)) = nested
+            && self.transcript.scroll_tool_run(start, max_offset, delta)
+        {
+            self.transcript_render_cache = None;
+            if let Some(selection) = self.text_selection.as_mut() {
+                selection.autoscroll = 0;
+            }
+            // The next draw rebuilds the clipped action rows and retargets the
+            // held pointer against them. Updating against the invalidated
+            // cache here would briefly select the row that used to be under
+            // the pointer before the nested viewport moved.
+            return true;
+        }
         self.scroll_from_bottom =
             scroll_from_bottom_by_lines(self.scroll_from_bottom, self.transcript_scroll_max, lines);
         self.transcript.follow_tail = self.scroll_from_bottom == 0;
         if let Some(pointer) = self.text_selection.map(|selection| selection.pointer) {
             self.update_text_selection_focus(pointer);
         }
+        false
     }
 
     fn transcript_point_at(&self, pointer: Position) -> Option<TranscriptPoint> {
@@ -7797,14 +7879,50 @@ fn resolve_selection_point(
     point: SelectionPoint,
     ranges: &[SelectionRowRange],
 ) -> Option<TranscriptPoint> {
-    let (_, start, end, body_start) = ranges.iter().find(|(entry, ..)| *entry == point.entry)?;
-    let last = end.saturating_sub(1).max(*start);
-    let row = (*start as isize + point.row_in_entry as isize - *body_start as isize)
-        .clamp(*start as isize, last as isize) as usize;
+    let Some(range) = selection_range_for_point(point, ranges) else {
+        if let Some(next) = ranges.iter().find(|range| range.entry > point.entry) {
+            return Some(TranscriptPoint {
+                row: next.start,
+                column: 0,
+            });
+        }
+        let previous = ranges
+            .iter()
+            .rev()
+            .find(|range| range.entry < point.entry)?;
+        return Some(TranscriptPoint {
+            row: previous.end.saturating_sub(1).max(previous.start),
+            column: usize::MAX,
+        });
+    };
+    let last = range.end.saturating_sub(1).max(range.start);
+    let row = (range.start as isize + point.row_in_entry as isize - range.body_start as isize)
+        .clamp(range.start as isize, last as isize) as usize;
     Some(TranscriptPoint {
         row,
         column: point.column,
     })
+}
+
+fn selection_range_for_point(
+    point: SelectionPoint,
+    ranges: &[SelectionRowRange],
+) -> Option<&SelectionRowRange> {
+    let entry_ranges = ranges.iter().filter(|range| range.entry == point.entry);
+    entry_ranges
+        .clone()
+        .find(|range| {
+            point.row_in_entry >= range.body_start && point.row_in_entry < range.body_end()
+        })
+        .or_else(|| {
+            entry_ranges.min_by_key(|range| {
+                if point.row_in_entry < range.body_start {
+                    range.body_start - point.row_in_entry
+                } else {
+                    point.row_in_entry.saturating_sub(range.body_end())
+                }
+            })
+        })
 }
 
 fn resolve_selection_point_in_lines(
@@ -7812,11 +7930,13 @@ fn resolve_selection_point_in_lines(
     ranges: &[SelectionRowRange],
     lines: &[Line<'static>],
 ) -> Option<TranscriptPoint> {
-    let (_, start, end, _) = ranges.iter().find(|(entry, ..)| *entry == point.entry)?;
+    let range = ranges
+        .iter()
+        .find(|range| range.entry == point.entry && range.uses_logical_offsets)?;
     let logical_offset = point.logical_offset?;
-    let last = end.saturating_sub(1).max(*start);
+    let last = range.end.saturating_sub(1).max(range.start);
     let mut remaining = logical_offset;
-    for row in *start..*end {
+    for row in range.start..range.end {
         let line = lines.get(row)?;
         let (prefix, width) = selection_line_content_metrics(line);
         if remaining < width {
@@ -7971,29 +8091,31 @@ fn selection_point_for_row(
     row: usize,
     column: usize,
 ) -> SelectionPoint {
-    if let Some((entry, start, _, body_start)) = ranges
+    if let Some(range) = ranges
         .iter()
-        .find(|(_, start, end, _)| row >= *start && row < *end)
+        .find(|range| row >= range.start && row < range.end)
     {
         return SelectionPoint {
-            entry: *entry,
-            row_in_entry: body_start + (row - start),
+            entry: range.entry,
+            row_in_entry: range.body_start + (row - range.start),
             column,
             logical_offset: None,
         };
     }
-    if let Some((entry, ..)) = ranges.iter().find(|(_, start, _, _)| *start > row) {
+    if let Some(range) = ranges.iter().find(|range| range.start > row) {
         return SelectionPoint {
-            entry: *entry,
-            row_in_entry: 0,
+            entry: range.entry,
+            row_in_entry: range.body_start,
             column,
             logical_offset: None,
         };
     }
-    if let Some((entry, start, end, body_start)) = ranges.last() {
+    if let Some(range) = ranges.last() {
         return SelectionPoint {
-            entry: *entry,
-            row_in_entry: body_start + end.saturating_sub(1).saturating_sub(*start),
+            entry: range.entry,
+            row_in_entry: range
+                .body_start
+                .saturating_add(range.end.saturating_sub(1).saturating_sub(range.start)),
             column,
             logical_offset: None,
         };
@@ -8013,13 +8135,14 @@ fn selection_point_for_row_in_lines(
     column: usize,
 ) -> SelectionPoint {
     let point = selection_point_for_row(ranges, row, column);
-    let Some((_, start, _end, _)) = ranges
+    let Some(range) = ranges
         .iter()
-        .find(|(_, start, end, _)| row >= *start && row < *end)
+        .find(|range| row >= range.start && row < range.end)
+        .filter(|range| range.uses_logical_offsets)
     else {
         return point;
     };
-    let logical_offset = (*start..row)
+    let logical_offset = (range.start..row)
         .filter_map(|line| lines.get(line))
         .map(|line| selection_line_content_metrics(line).1)
         .sum::<usize>()

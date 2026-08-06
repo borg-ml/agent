@@ -1903,7 +1903,7 @@ impl Transcript {
         let mut message_rows = Vec::new();
         let mut entry_rows = Vec::new();
         let mut link_rows = Vec::new();
-        let mut selection_rows = Vec::new();
+        let mut selection_rows: Vec<SelectionRowRange> = Vec::new();
         let mut tool_run_starts = HashMap::new();
         let tool_run_windows = self.tool_run_windows();
         let running_tool = self.has_running_tool();
@@ -1915,7 +1915,15 @@ impl Transcript {
                     format!("┌─ actions · {}", window.total),
                     Style::default().fg(Color::DarkGray),
                 )));
-                tool_run_starts.insert(window.start, (row, tool_rows.len()));
+                tool_run_starts.insert(
+                    window.start,
+                    (
+                        row,
+                        tool_rows.len(),
+                        entry_rows.len(),
+                        selection_rows.len(),
+                    ),
+                );
             }
             let visible_message = matches!(
                 entry,
@@ -2070,7 +2078,11 @@ impl Transcript {
                     if matches!(actor, EventActor::User | EventActor::Assistant) && *complete {
                         message_rows.push((index, entry_start, lines.len()));
                     }
-                    selection_rows.push((index, entry_start, lines.len(), 0));
+                    selection_rows.push(SelectionRowRange::transcript_entry(
+                        index,
+                        entry_start,
+                        lines.len(),
+                    ));
                     lines.push(Line::default());
                 }
                 TranscriptEntry::Activity { text, time } => {
@@ -2090,7 +2102,11 @@ impl Transcript {
                             Span::styled(line, Style::default().fg(activity_color)),
                         ]));
                     }
-                    selection_rows.push((index, entry_start, lines.len(), 0));
+                    selection_rows.push(if tool_window.is_some() {
+                        SelectionRowRange::nested_entry(index, entry_start, lines.len(), 0)
+                    } else {
+                        SelectionRowRange::transcript_entry(index, entry_start, lines.len())
+                    });
                 }
                 TranscriptEntry::Action {
                     kind,
@@ -2147,7 +2163,11 @@ impl Transcript {
                         }
                     }
                     entry_rows.push((index, entry_start, lines.len()));
-                    selection_rows.push((index, entry_start, lines.len(), 0));
+                    selection_rows.push(if tool_window.is_some() {
+                        SelectionRowRange::nested_entry(index, entry_start, lines.len(), 0)
+                    } else {
+                        SelectionRowRange::transcript_entry(index, entry_start, lines.len())
+                    });
                 }
                 TranscriptEntry::Plan {
                     items,
@@ -2238,7 +2258,11 @@ impl Transcript {
                         }
                     }
                     entry_rows.push((index, entry_start, lines.len()));
-                    selection_rows.push((index, entry_start, lines.len(), 0));
+                    selection_rows.push(SelectionRowRange::transcript_entry(
+                        index,
+                        entry_start,
+                        lines.len(),
+                    ));
                     lines.push(Line::default());
                 }
                 TranscriptEntry::Goal { goal, time } => {
@@ -2287,7 +2311,11 @@ impl Transcript {
                         }
                     }
                     entry_rows.push((index, entry_start, lines.len()));
-                    selection_rows.push((index, entry_start, lines.len(), 0));
+                    selection_rows.push(SelectionRowRange::transcript_entry(
+                        index,
+                        entry_start,
+                        lines.len(),
+                    ));
                     lines.push(Line::default());
                 }
                 TranscriptEntry::Info { title, text, time } => {
@@ -2313,7 +2341,11 @@ impl Transcript {
                         }
                     }
                     entry_rows.push((index, entry_start, lines.len()));
-                    selection_rows.push((index, entry_start, lines.len(), 0));
+                    selection_rows.push(SelectionRowRange::transcript_entry(
+                        index,
+                        entry_start,
+                        lines.len(),
+                    ));
                     lines.push(Line::default());
                 }
                 TranscriptEntry::Compaction {
@@ -2365,7 +2397,11 @@ impl Transcript {
                         }
                     }
                     entry_rows.push((index, entry_start, lines.len()));
-                    selection_rows.push((index, entry_start, lines.len(), 0));
+                    selection_rows.push(SelectionRowRange::transcript_entry(
+                        index,
+                        entry_start,
+                        lines.len(),
+                    ));
                     lines.push(Line::default());
                 }
                 TranscriptEntry::Tool {
@@ -2595,13 +2631,20 @@ impl Transcript {
                         lines.push(tool_run_separator(tool_window.is_some()));
                     }
                     tool_rows.push((index, summary_start, lines.len()));
-                    if tool_window.is_none() {
-                        selection_rows.push((index, summary_start, lines.len(), 0));
-                    }
+                    selection_rows.push(if tool_window.is_some() {
+                        SelectionRowRange::nested_entry(index, summary_start, lines.len(), 0)
+                    } else {
+                        SelectionRowRange::transcript_entry(index, summary_start, lines.len())
+                    });
                     if let Some(window) = tool_window
                         && index + 1 == window.end
                     {
-                        let (header_row, first_tool_row) = tool_run_starts
+                        let (
+                            header_row,
+                            first_tool_row,
+                            first_entry_row,
+                            first_selection_row,
+                        ) = tool_run_starts
                             .get(&window.start)
                             .copied()
                             .expect("tool run header was recorded");
@@ -2627,13 +2670,13 @@ impl Transcript {
                             .find(|(_, start, end)| {
                                 *start < viewport_start && *end > viewport_start
                             })
-                            .map(|(_, start, _)| lines[*start].clone());
+                            .map(|(entry, start, _)| (*entry, lines[*start].clone()));
                         let mut visible_lines =
                             lines[content_start + offset..content_start + visible_end].to_vec();
-                        if let Some(header) = sticky_tool_header
+                        if let Some((_, header)) = sticky_tool_header.as_ref()
                             && let Some(first) = visible_lines.first_mut()
                         {
-                            *first = header;
+                            *first = header.clone();
                         }
 
                         lines.truncate(content_start);
@@ -2674,12 +2717,63 @@ impl Transcript {
                                     content_start + visible_start - offset,
                                     content_start + visible_tool_end - offset,
                                 ));
-                                selection_rows.push((
-                                    tool_index,
+                            }
+                        }
+                        let run_entry_rows = entry_rows.split_off(first_entry_row);
+                        for (entry_index, start, end) in run_entry_rows {
+                            let start = start.saturating_sub(content_start);
+                            let end = end.saturating_sub(content_start);
+                            let visible_start = start.max(offset);
+                            let visible_entry_end = end.min(visible_end);
+                            if visible_start < visible_entry_end {
+                                entry_rows.push((
+                                    entry_index,
                                     content_start + visible_start - offset,
-                                    content_start + visible_tool_end - offset,
-                                    visible_start - start,
+                                    content_start + visible_entry_end - offset,
                                 ));
+                            }
+                        }
+                        let run_selection_rows =
+                            selection_rows.split_off(first_selection_row);
+                        for range in run_selection_rows {
+                            let start = range.start.saturating_sub(content_start);
+                            let end = range.end.saturating_sub(content_start);
+                            let visible_start = start.max(offset);
+                            let visible_selection_end = end.min(visible_end);
+                            if visible_start < visible_selection_end {
+                                let screen_start = content_start + visible_start - offset;
+                                let screen_end =
+                                    content_start + visible_selection_end - offset;
+                                let body_start = range
+                                    .body_start
+                                    .saturating_add(visible_start.saturating_sub(start));
+                                let has_sticky_header = sticky_tool_header
+                                    .as_ref()
+                                    .is_some_and(|(entry, _)| *entry == range.entry)
+                                    && visible_start == offset;
+                                if has_sticky_header {
+                                    selection_rows.push(SelectionRowRange::nested_entry(
+                                        range.entry,
+                                        screen_start,
+                                        screen_start + 1,
+                                        0,
+                                    ));
+                                    if screen_start + 1 < screen_end {
+                                        selection_rows.push(SelectionRowRange::nested_entry(
+                                            range.entry,
+                                            screen_start + 1,
+                                            screen_end,
+                                            body_start.saturating_add(1),
+                                        ));
+                                    }
+                                } else {
+                                    selection_rows.push(SelectionRowRange::nested_entry(
+                                        range.entry,
+                                        screen_start,
+                                        screen_end,
+                                        body_start,
+                                    ));
+                                }
                             }
                         }
                         tool_run_rows.push((window.start, header_row, lines.len(), max_offset));

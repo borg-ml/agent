@@ -3,6 +3,32 @@ use crate::{PermissionMode, SessionEventKind};
 use std::sync::Mutex as StdMutex;
 use tempfile::tempdir;
 
+#[test]
+fn agent_mcp_executable_uses_existing_current_binary() {
+    let directory = tempdir().unwrap();
+    let executable = directory.path().join("borg");
+    std::fs::write(&executable, b"borg").unwrap();
+
+    assert_eq!(
+        resolve_agent_mcp_executable(&executable).unwrap(),
+        executable
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn agent_mcp_executable_recovers_path_after_atomic_upgrade() {
+    let directory = tempdir().unwrap();
+    let executable = directory.path().join("borg");
+    std::fs::write(&executable, b"replacement").unwrap();
+    let deleted_identity = PathBuf::from(format!("{} (deleted)", executable.display()));
+
+    assert_eq!(
+        resolve_agent_mcp_executable(&deleted_identity).unwrap(),
+        executable
+    );
+}
+
 #[derive(Clone, Default)]
 struct RecordingPeerExecutor {
     prompts: Arc<StdMutex<Vec<String>>>,

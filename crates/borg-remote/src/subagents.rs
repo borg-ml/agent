@@ -308,7 +308,7 @@ impl AgentToolServer {
         })
     }
 
-    pub fn external_mcp_server(&self) -> borg_provider::mcp::ExternalMcpServer {
+    pub fn external_mcp_server(&self) -> Result<borg_provider::mcp::ExternalMcpServer> {
         let mut env = BTreeMap::new();
         env.insert(
             "BORG_AGENT_TOOL_PROVIDER".to_string(),
@@ -337,12 +337,9 @@ impl AgentToolServer {
             env.insert("BORG_AGENT_TOOL_TCP".to_string(), self.tcp_addr.to_string());
             env.insert("BORG_AGENT_TOOL_TOKEN".to_string(), self.token.clone());
         }
-        borg_provider::mcp::ExternalMcpServer {
+        Ok(borg_provider::mcp::ExternalMcpServer {
             name: "borg_agent".to_string(),
-            command: std::env::current_exe()
-                .expect("Borg cannot expose session tools without its executable path")
-                .to_string_lossy()
-                .into_owned(),
+            command: agent_mcp_executable()?.to_string_lossy().into_owned(),
             args: vec!["__agent-mcp".to_string()],
             env,
             allowed_tools: agent_tool_specs_with_capabilities_and_consultation(
@@ -359,8 +356,62 @@ impl AgentToolServer {
                     .map(|name| format!("mcp__borg_agent__{name}"))
             })
             .collect(),
+        })
+    }
+}
+
+fn agent_mcp_executable() -> Result<PathBuf> {
+    let current = std::env::current_exe().context("failed to locate the Borg executable")?;
+    resolve_agent_mcp_executable(&current)
+}
+
+fn resolve_agent_mcp_executable(current: &Path) -> Result<PathBuf> {
+    if current.is_file() {
+        return Ok(current.to_path_buf());
+    }
+
+    // Linux decorates /proc/self/exe with a literal ` (deleted)` suffix after
+    // an atomic in-place upgrade. std::env::current_exe() preserves that
+    // decoration, so passing it directly to Codex or Claude makes their MCP
+    // launcher look for a filename that cannot exist. Prefer the replacement
+    // now installed at the original path. This also keeps provider-persisted
+    // MCP configuration valid after the old Borg host exits.
+    #[cfg(target_os = "linux")]
+    if let Some(replacement) = current
+        .to_string_lossy()
+        .strip_suffix(" (deleted)")
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+    {
+        tracing::warn!(
+            running_executable = %current.display(),
+            replacement = %replacement.display(),
+            "Borg was upgraded while this host remained active; using the installed replacement for agent MCP"
+        );
+        return Ok(replacement);
+    }
+
+    // A process may also have been launched from a temporary executable that
+    // was removed without replacement. The live inode remains executable via
+    // procfs for this host's lifetime, which is safer than emitting a broken
+    // MCP command and failing the user's turn at provider startup.
+    #[cfg(target_os = "linux")]
+    {
+        let live_executable = PathBuf::from(format!("/proc/{}/exe", std::process::id()));
+        if live_executable.is_file() {
+            tracing::warn!(
+                running_executable = %current.display(),
+                live_executable = %live_executable.display(),
+                "Borg's launch path is unavailable; using the live executable for agent MCP"
+            );
+            return Ok(live_executable);
         }
     }
+
+    bail!(
+        "Borg cannot expose session tools because its executable is unavailable at {}",
+        current.display()
+    )
 }
 
 impl Drop for AgentToolServer {

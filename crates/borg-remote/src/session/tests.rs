@@ -489,6 +489,19 @@ struct ReusableContextExecutor {
     called: Arc<Notify>,
 }
 
+struct InterruptibleReusableContextExecutor {
+    prompt_lengths: Arc<Mutex<Vec<usize>>>,
+    called: Arc<Notify>,
+    calls: AtomicUsize,
+    compaction_calls: Arc<AtomicUsize>,
+}
+
+struct DurableResumeExecutor {
+    seen: RecordedContextTurns,
+    called: Arc<Notify>,
+    compaction_calls: Arc<AtomicUsize>,
+}
+
 struct ProviderRecordingExecutor {
     seen: RecordedProviderTurns,
     called: Arc<Notify>,
@@ -609,6 +622,96 @@ impl AgentTurnExecutor for ReusableContextExecutor {
 }
 
 #[async_trait::async_trait]
+impl AgentTurnExecutor for InterruptibleReusableContextExecutor {
+    fn supports_subscription_context_reuse(&self, provider: CodingProvider) -> bool {
+        provider == CodingProvider::Codex
+    }
+
+    async fn execute(
+        &self,
+        turn: AgentTurn,
+        events: mpsc::Sender<SessionEventKind>,
+        controls: Option<mpsc::Receiver<AgentTurnControl>>,
+    ) -> Result<AgentTurnResult> {
+        self.prompt_lengths.lock().unwrap().push(turn.prompt.len());
+        let call = self.calls.fetch_add(1, Ordering::AcqRel);
+        self.called.notify_one();
+        let final_text = match call {
+            0 => {
+                let text = "r".repeat(650_000);
+                events
+                    .send(SessionEventKind::Message {
+                        message_id: Uuid::new_v4(),
+                        actor: EventActor::Assistant,
+                        text: text.clone(),
+                        attachments: Vec::new(),
+                        status: MessageStatus::Complete,
+                        delivery: None,
+                    })
+                    .await
+                    .unwrap();
+                text
+            }
+            1 => {
+                let mut controls = controls.expect("active turn has controls");
+                while !matches!(
+                    controls.recv().await,
+                    Some(AgentTurnControl::Interrupt) | None
+                ) {}
+                String::new()
+            }
+            _ => "done".to_string(),
+        };
+        Ok(AgentTurnResult {
+            provider_session_id: Some("reusable-provider-session".to_string()),
+            final_text,
+        })
+    }
+
+    async fn compact_retained_context(&self, _turn: AgentTurn) -> Result<AgentCompaction> {
+        self.compaction_calls.fetch_add(1, Ordering::AcqRel);
+        Ok(AgentCompaction {
+            summary: "unexpected compaction".to_string(),
+            usage: ProviderCallUsage::default(),
+            provider_session_id: None,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentTurnExecutor for DurableResumeExecutor {
+    fn supports_subscription_context_reuse(&self, provider: CodingProvider) -> bool {
+        provider == CodingProvider::Codex
+    }
+
+    async fn execute(
+        &self,
+        turn: AgentTurn,
+        _events: mpsc::Sender<SessionEventKind>,
+        _controls: Option<mpsc::Receiver<AgentTurnControl>>,
+    ) -> Result<AgentTurnResult> {
+        self.seen
+            .lock()
+            .unwrap()
+            .push((turn.prompt, turn.provider_session_id));
+        self.called.notify_one();
+        Ok(AgentTurnResult {
+            provider_session_id: Some("resumed-codex-thread".to_string()),
+            final_text: "resumed".to_string(),
+        })
+    }
+
+    async fn compact_retained_context(&self, _turn: AgentTurn) -> Result<AgentCompaction> {
+        self.compaction_calls.fetch_add(1, Ordering::AcqRel);
+        Ok(AgentCompaction {
+            summary: "unexpected compaction".to_string(),
+            usage: ProviderCallUsage::default(),
+            provider_session_id: None,
+        })
+    }
+}
+
+#[async_trait::async_trait]
 impl AgentTurnExecutor for ProviderRecordingExecutor {
     async fn execute(
         &self,
@@ -690,6 +793,10 @@ impl AgentTurnExecutor for ConsultingExecutor {
 
 #[async_trait::async_trait]
 impl AgentTurnExecutor for CrossProviderCompactionExecutor {
+    fn supports_subscription_context_reuse(&self, provider: CodingProvider) -> bool {
+        provider == CodingProvider::Codex
+    }
+
     async fn execute(
         &self,
         turn: AgentTurn,
@@ -830,6 +937,10 @@ impl AgentTurnExecutor for CleanupBarrierExecutor {
 
 #[async_trait::async_trait]
 impl AgentTurnExecutor for InterruptibleQueueExecutor {
+    fn supports_subscription_context_reuse(&self, provider: CodingProvider) -> bool {
+        provider == CodingProvider::Codex
+    }
+
     async fn execute(
         &self,
         turn: AgentTurn,
@@ -5036,9 +5147,12 @@ fn prompt_recovery_allows_an_explicit_retry_after_terminal_status() {
 }
 
 #[test]
-fn only_empty_provider_responses_are_eligible_for_automatic_retry() {
+fn only_side_effect_free_transport_recovery_is_eligible_for_automatic_retry() {
     assert!(is_safe_automatic_retry_error(
         "codex returned an empty response"
+    ));
+    assert!(is_safe_automatic_retry_error(
+        "Codex durable thread resume unavailable; retry from Borg's durable journal"
     ));
     assert!(!is_safe_automatic_retry_error("turn interrupted"));
     assert!(!is_safe_automatic_retry_error("tool execution failed"));
@@ -6025,6 +6139,76 @@ fn reusable_subscription_context_does_not_compact_the_full_replay() {
 }
 
 #[test]
+fn acknowledged_codex_interrupt_keeps_subscription_context_reusable() {
+    assert!(subscription_context_reusable_after_turn(
+        CodingProvider::Codex,
+        true,
+        true
+    ));
+    assert!(!subscription_context_reusable_after_turn(
+        CodingProvider::Claude,
+        true,
+        true
+    ));
+    assert!(!subscription_context_reusable_after_turn(
+        CodingProvider::Codex,
+        true,
+        false
+    ));
+}
+
+#[test]
+fn codex_resume_requires_a_terminal_checkpoint_after_the_latest_turn_start() {
+    let session_id = Uuid::new_v4();
+    let completed_id = Uuid::new_v4();
+    let crashed_id = Uuid::new_v4();
+    let mut events = vec![
+        SessionEvent::new(
+            session_id,
+            1,
+            SessionEventKind::TurnStarted {
+                message_id: completed_id,
+                provider: CodingProvider::Codex,
+                model: None,
+                effort: None,
+                fast: false,
+            },
+        ),
+        SessionEvent::new(
+            session_id,
+            2,
+            SessionEventKind::TurnCompleted {
+                message_id: completed_id,
+                provider_session_id: Some("thread-1".to_string()),
+                final_text: "done".to_string(),
+                error: None,
+            },
+        ),
+    ];
+    assert!(codex_checkpoint_is_acknowledged(&events, "thread-1"));
+
+    events.push(SessionEvent::new(
+        session_id,
+        3,
+        SessionEventKind::TurnStarted {
+            message_id: crashed_id,
+            provider: CodingProvider::Codex,
+            model: None,
+            effort: None,
+            fast: false,
+        },
+    ));
+    events.push(SessionEvent::new(
+        session_id,
+        4,
+        SessionEventKind::ProviderSessionLinked {
+            provider_session_id: "thread-1".to_string(),
+        },
+    ));
+    assert!(!codex_checkpoint_is_acknowledged(&events, "thread-1"));
+}
+
+#[test]
 fn subscription_input_budget_counts_characters_not_utf8_bytes() {
     let text = "🛠️".repeat(SUBSCRIPTION_INPUT_BUDGET_CHARS / 4);
     let prompt = format_subscription_provider_prompt(None, EventActor::User, &text);
@@ -6136,6 +6320,262 @@ async fn reusable_subscription_pool_does_not_compact_large_durable_replay() {
         .await
         .unwrap();
     actor.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn resumed_codex_checkpoint_avoids_large_replay_compaction_after_actor_restart() {
+    let root = tempdir().unwrap();
+    let journal_path = root.path().join("session.lock");
+    let session_id = Uuid::new_v4();
+    let previous_id = Uuid::new_v4();
+    let next_id = Uuid::new_v4();
+    let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+        .await
+        .unwrap();
+    store.create_session(session_id).await.unwrap();
+    for kind in [
+        SessionEventKind::SessionStarted,
+        SessionEventKind::SessionConfigured {
+            cwd: root.path().to_path_buf(),
+            provider: CodingProvider::Codex,
+            model: Some("gpt-5.6-luna".to_string()),
+            effort: Some("max".to_string()),
+            fast: false,
+            response_language: crate::ResponseLanguage::Auto,
+            permission_mode: PermissionMode::Manual,
+        },
+        SessionEventKind::Message {
+            message_id: previous_id,
+            actor: EventActor::User,
+            text: "u".repeat(450_000),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: Some(PromptDelivery::Queue),
+        },
+        SessionEventKind::TurnStarted {
+            message_id: previous_id,
+            provider: CodingProvider::Codex,
+            model: Some("gpt-5.6-luna".to_string()),
+            effort: Some("max".to_string()),
+            fast: false,
+        },
+        SessionEventKind::Message {
+            message_id: Uuid::new_v4(),
+            actor: EventActor::Assistant,
+            text: "r".repeat(650_000),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: None,
+        },
+        SessionEventKind::ProviderSessionLinked {
+            provider_session_id: "resumed-codex-thread".to_string(),
+        },
+        SessionEventKind::TurnCompleted {
+            message_id: previous_id,
+            provider_session_id: Some("resumed-codex-thread".to_string()),
+            final_text: "done".to_string(),
+            error: None,
+        },
+        SessionEventKind::StatusChanged {
+            status: SessionStatus::Ready,
+            detail: None,
+        },
+    ] {
+        store
+            .append(SessionEvent::new(session_id, 0, kind))
+            .await
+            .unwrap();
+    }
+
+    let (command_tx, command_rx) = mpsc::channel(8);
+    let (event_tx, _event_rx) = mpsc::channel(64);
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let called = Arc::new(Notify::new());
+    let compaction_calls = Arc::new(AtomicUsize::new(0));
+    let executor = Arc::new(DurableResumeExecutor {
+        seen: Arc::clone(&seen),
+        called: Arc::clone(&called),
+        compaction_calls: Arc::clone(&compaction_calls),
+    });
+    let actor = tokio::spawn(async move {
+        run_agent_session_with_executor(
+            &journal_path,
+            session_id,
+            LaunchSession {
+                request_id: Uuid::new_v4(),
+                cwd: root.path().to_path_buf(),
+                provider: CodingProvider::Codex,
+                model: Some("gpt-5.6-luna".to_string()),
+                effort: Some("max".to_string()),
+                fast: Some(false),
+                response_language: crate::ResponseLanguage::Auto,
+                permission_mode: PermissionMode::Manual,
+                name: None,
+                initial_prompt: None,
+                capabilities: Default::default(),
+                subagent_concurrency_limit: None,
+                extension_skill_roots: Vec::new(),
+                team_policy: None,
+            },
+            command_rx,
+            event_tx,
+            executor,
+        )
+        .await
+    });
+
+    command_tx
+        .send(HostCommand::Prompt {
+            session_id,
+            message_id: next_id,
+            text: "continue after restart".to_string(),
+            attachments: Vec::new(),
+            output_schema: None,
+            delivery: PromptDelivery::Queue,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), called.notified())
+        .await
+        .expect("resumed turn starts without compaction");
+    command_tx
+        .send(HostCommand::Stop { session_id })
+        .await
+        .unwrap();
+    actor.await.unwrap().unwrap();
+
+    assert_eq!(compaction_calls.load(Ordering::Acquire), 0);
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert!(seen[0].0.len() > SUBSCRIPTION_INPUT_BUDGET_CHARS);
+    assert_eq!(seen[0].1.as_deref(), Some("resumed-codex-thread"));
+}
+
+#[tokio::test]
+async fn acknowledged_codex_escape_does_not_compact_a_reusable_large_context() {
+    let root = tempdir().unwrap();
+    let journal_path = root.path().join("session.lock");
+    let session_id = Uuid::new_v4();
+    let first_id = Uuid::new_v4();
+    let interrupted_id = Uuid::new_v4();
+    let corrected_id = Uuid::new_v4();
+    let (command_tx, command_rx) = mpsc::channel(8);
+    let (event_tx, mut event_rx) = mpsc::channel(256);
+    let called = Arc::new(Notify::new());
+    let prompt_lengths = Arc::new(Mutex::new(Vec::new()));
+    let compaction_calls = Arc::new(AtomicUsize::new(0));
+    let executor = Arc::new(InterruptibleReusableContextExecutor {
+        prompt_lengths: Arc::clone(&prompt_lengths),
+        called: Arc::clone(&called),
+        calls: AtomicUsize::new(0),
+        compaction_calls: Arc::clone(&compaction_calls),
+    });
+    let actor = tokio::spawn(async move {
+        run_agent_session_with_executor(
+            &journal_path,
+            session_id,
+            LaunchSession {
+                request_id: Uuid::new_v4(),
+                cwd: root.path().to_path_buf(),
+                provider: CodingProvider::Codex,
+                model: Some("gpt-5.6-luna".to_string()),
+                effort: Some("max".to_string()),
+                fast: Some(false),
+                response_language: crate::ResponseLanguage::Auto,
+                permission_mode: PermissionMode::Manual,
+                name: None,
+                initial_prompt: None,
+                capabilities: Default::default(),
+                subagent_concurrency_limit: None,
+                extension_skill_roots: Vec::new(),
+                team_policy: None,
+            },
+            command_rx,
+            event_tx,
+            executor,
+        )
+        .await
+    });
+
+    command_tx
+        .send(HostCommand::Prompt {
+            session_id,
+            message_id: first_id,
+            text: "u".repeat(450_000),
+            attachments: Vec::new(),
+            output_schema: None,
+            delivery: PromptDelivery::Queue,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), called.notified())
+        .await
+        .expect("large first turn starts");
+
+    command_tx
+        .send(HostCommand::Prompt {
+            session_id,
+            message_id: interrupted_id,
+            text: "cancel this turn".to_string(),
+            attachments: Vec::new(),
+            output_schema: None,
+            delivery: PromptDelivery::Queue,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), called.notified())
+        .await
+        .expect("interruptible turn starts");
+    command_tx
+        .send(HostCommand::Interrupt { session_id })
+        .await
+        .unwrap();
+
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+            .await
+            .expect("interrupted turn reaches its durable boundary")
+            .expect("session remains attached");
+        if matches!(
+            event.kind,
+            SessionEventKind::TurnCompleted { message_id, .. }
+                if message_id == interrupted_id
+        ) {
+            break;
+        }
+    }
+
+    command_tx
+        .send(HostCommand::Prompt {
+            session_id,
+            message_id: corrected_id,
+            text: "corrected request".to_string(),
+            attachments: Vec::new(),
+            output_schema: None,
+            delivery: PromptDelivery::Queue,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), called.notified())
+        .await
+        .expect("corrected turn starts without compaction");
+
+    command_tx
+        .send(HostCommand::Stop { session_id })
+        .await
+        .unwrap();
+    actor.await.unwrap().unwrap();
+
+    let remaining_events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+    assert_eq!(compaction_calls.load(Ordering::Acquire), 0);
+    assert!(!remaining_events.iter().any(|event| matches!(
+        &event.kind,
+        SessionEventKind::ProviderEvent { kind, payload, .. }
+            if kind == "context_compaction"
+                && payload.get("trigger").and_then(Value::as_str)
+                    == Some("provider_input_size")
+    )));
+    assert_eq!(prompt_lengths.lock().unwrap().len(), 3);
 }
 
 #[test]

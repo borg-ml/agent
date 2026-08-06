@@ -997,6 +997,61 @@ async fn context_clear_resets_provider_projection_and_recovery_prefix() {
 }
 
 #[tokio::test]
+async fn only_acknowledged_terminal_turns_remain_provider_resume_checkpoints() {
+    let (directory, store) = store().await;
+    let session_id = Uuid::new_v4();
+    let completed_id = Uuid::new_v4();
+    let failed_id = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+    for kind in [
+        SessionEventKind::SessionStarted,
+        configured(directory.path()),
+        SessionEventKind::TurnCompleted {
+            message_id: completed_id,
+            provider_session_id: Some("acknowledged-thread".to_string()),
+            final_text: "done".to_string(),
+            error: None,
+        },
+    ] {
+        store
+            .append(SessionEvent::new(session_id, 0, kind))
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        store
+            .state(session_id)
+            .await
+            .unwrap()
+            .provider_session_id
+            .as_deref(),
+        Some("acknowledged-thread")
+    );
+
+    store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::TurnCompleted {
+                message_id: failed_id,
+                provider_session_id: Some("stale-thread".to_string()),
+                final_text: String::new(),
+                error: Some("transport closed before a terminal frame".to_string()),
+            },
+        ))
+        .await
+        .unwrap();
+    assert!(
+        store
+            .state(session_id)
+            .await
+            .unwrap()
+            .provider_session_id
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn state_projects_pending_approval_and_cumulative_usage() {
     let (directory, store) = store().await;
     let session_id = Uuid::new_v4();

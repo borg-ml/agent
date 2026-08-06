@@ -361,6 +361,22 @@ impl SessionState {
             SessionEventKind::ProviderSessionLinked {
                 provider_session_id,
             } => self.provider_session_id = Some(provider_session_id.clone()),
+            SessionEventKind::TurnCompleted {
+                provider_session_id,
+                error,
+                ..
+            } => {
+                // A provider id is resumable only at a durable terminal
+                // boundary. Successful turns and acknowledged interrupts are
+                // valid checkpoints; uncertain failures explicitly unlink the
+                // native thread so recovery replays Borg's journal instead.
+                self.provider_session_id =
+                    if error.is_none() || error.as_deref() == Some("turn interrupted") {
+                        provider_session_id.clone()
+                    } else {
+                        None
+                    };
+            }
             SessionEventKind::ApprovalRequested { approval_id, .. } => {
                 self.pending_approval_id = Some(approval_id.clone());
             }
