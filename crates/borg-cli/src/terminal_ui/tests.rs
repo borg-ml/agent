@@ -5214,6 +5214,22 @@ fn compaction_completion_updates_the_live_card_and_can_expand() {
 }
 
 #[test]
+fn completed_compaction_copy_action_stays_in_the_context_menu() {
+    let entry = TranscriptEntry::Compaction {
+        summary: "Context compacted".to_string(),
+        time: "20:23".to_string(),
+        sequence: 0,
+        expanded: false,
+        complete: true,
+    };
+
+    // The first compaction has no valid revert target, but right-click must
+    // still leave its one copy action visible in the menu instead of running
+    // it silently.
+    assert!(!entry_action_runs_directly(&entry, 1));
+}
+
+#[test]
 fn adjacent_provider_notifications_render_one_compaction_card() {
     let session_id = Uuid::new_v4();
     let mut transcript = Transcript::default();

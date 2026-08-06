@@ -2740,7 +2740,15 @@ impl BorgTerminal {
             _ => return UiAction::None,
         };
         self.transcript.selected = Some(index);
-        let run_directly = options.len() == 1;
+        // A completed compaction advertises an action menu because its
+        // checkpoint may be revertable, and the first checkpoint still needs
+        // a visible way to choose its copy action.  Do not silently execute
+        // the one-option case as we do for ordinary message cards.
+        let run_directly = self
+            .transcript
+            .order
+            .get(index)
+            .is_some_and(|entry| entry_action_runs_directly(entry, options.len()));
         self.picker = Some(Picker::new(
             PickerKind::MessageActions,
             title,
@@ -3481,6 +3489,12 @@ impl BorgTerminal {
                 } else if self.transcript.plan_is_clippable(index) {
                     self.transcript.toggle_plan_expansion(index);
                     self.transcript_render_cache = None;
+                } else if matches!(
+                    self.transcript.order.get(index),
+                    Some(TranscriptEntry::Compaction { .. })
+                ) {
+                    // Compaction actions are deliberately a right-click menu;
+                    // a left click only expands a compaction that has detail.
                 } else {
                     return self.open_entry_actions(index);
                 }
@@ -5912,6 +5926,10 @@ impl BorgTerminal {
             Some(slash_help(&matches))
         };
     }
+}
+
+fn entry_action_runs_directly(entry: &TranscriptEntry, option_count: usize) -> bool {
+    option_count == 1 && !matches!(entry, TranscriptEntry::Compaction { complete: true, .. })
 }
 
 fn is_composer_newline(keymap: &KeyMap, key: &KeyEvent) -> bool {
