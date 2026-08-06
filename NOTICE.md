@@ -2,7 +2,7 @@
 
 Borg-authored code in this distribution is available under:
 
-**GPL-3.0-or-later.**
+**MIT.**
 
 The complete licence is in [`LICENSE`](LICENSE).
 

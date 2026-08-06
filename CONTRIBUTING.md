@@ -7,7 +7,7 @@ Thank you for improving Borg CLI.
 Borg requires an executed Contributor Licence Agreement (CLA) before accepting
 a contribution. The CLA must:
 
-- preserve availability of the contributed code under GPL-3.0-or-later; and
+- preserve availability of the contributed code under the MIT licence; and
 - grant Borg the rights needed to distribute the contribution as part of Borg.
 
 This checked-in document is policy, **not a signing mechanism**, and opening a

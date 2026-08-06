@@ -163,6 +163,15 @@ pub trait AgentTurnExecutor: Send + Sync {
         controls: Option<mpsc::Receiver<AgentTurnControl>>,
     ) -> Result<AgentTurnResult>;
 
+    /// Whether a successful subscription turn can append only its new input
+    /// to a provider-owned process on the next turn. The session actor uses
+    /// this to avoid measuring the whole durable replay when the executor will
+    /// send only the delta; executors without a pool must keep using the full
+    /// replay budget.
+    fn supports_subscription_context_reuse(&self, _provider: CodingProvider) -> bool {
+        false
+    }
+
     /// Run an isolated, one-shot consultation without attaching it to the
     /// main session's provider conversation or exposing the main session's
     /// tools. Providers that cannot offer this path report a normal tool error.
@@ -450,6 +459,10 @@ impl LocalAgentTurnExecutor {
 
 #[async_trait::async_trait]
 impl AgentTurnExecutor for LocalAgentTurnExecutor {
+    fn supports_subscription_context_reuse(&self, provider: CodingProvider) -> bool {
+        matches!(provider, CodingProvider::Codex | CodingProvider::Claude)
+    }
+
     async fn execute(
         &self,
         mut turn: AgentTurn,

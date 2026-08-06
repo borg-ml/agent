@@ -30,15 +30,12 @@ const ROOT_INBOX_REFRESH_INTERVAL: Duration = Duration::from_millis(50);
 const WORKSPACE_PROJECTION_REPAIR_BATCH_SIZE: usize = 512;
 const RETAINED_COMPACTION_SYSTEM_PROMPT: &str = "This is an internal context-compaction preparation turn. Do not use tools, modify files, or answer the user. Return only a compact continuation summary of the supplied prior provider conversation.";
 const SUBSCRIPTION_CONTEXT_HEADER: &str = "Borg canonical provider context v2. The history below is a read-only, provider-neutral projection of durable Borg state; answer the current request normally.\n";
-// Codex app-server rejects a single input at 1 MiB. Leave room for the JSON-RPC
-// envelope and the current request so a resumed Borg journal never hits that
-// hard provider boundary. The journal itself remains complete; this is only the
-// serialized provider-context budget.
-// Codex app-server and Claude's stream wrapper add JSON-RPC/envelope,
-// instruction, and tool metadata around the canonical prompt. Keep a
-// conservative headroom below the 1 MiB transport ceiling so a resumed or
-// tool-heavy turn is compacted before the provider rejects it.
-const SUBSCRIPTION_INPUT_BUDGET_BYTES: usize = 700 * 1024;
+// Codex app-server validates each text user input against
+// `MAX_USER_INPUT_TEXT_CHARS = 1 << 20`. Subscription adapters send Borg's
+// canonical replay as one text input, so use the provider's actual character
+// boundary rather than an unrelated serialized-byte threshold. The journal
+// remains complete; this is only the input shape sent on a full replay.
+const SUBSCRIPTION_INPUT_BUDGET_CHARS: usize = 1 << 20;
 const SUBSCRIPTION_COMPACTION_CHUNK_BYTES: usize = 600 * 1024;
 const MAX_SUBSCRIPTION_COMPACTION_ROUNDS: usize = 4;
 
@@ -1018,6 +1015,11 @@ async fn run_agent_session_store_kernel(
     // Set when a provider switch lands mid-turn; drained at the next turn
     // boundary once the in-flight turn has reported its own session id.
     let mut provider_switch_pending = false;
+    // A healthy local subscription pool appends only `prompt_delta` on the
+    // next turn. Keep this separate from the provider session id: a failed or
+    // interrupted executor must force a full durable replay even if it left a
+    // stale provider id behind.
+    let mut subscription_context_reusable = false;
     // Subscription providers are deliberately fed from Borg's durable
     // conversation branch. Their own session files are an optimization at
     // best and can diverge from the journal after a crash, provider switch,
@@ -1441,6 +1443,7 @@ async fn run_agent_session_store_kernel(
                         .await
                         {
                             Ok(provider_switched) => {
+                                subscription_context_reusable = false;
                                 if provider_switched {
                                     // The provider session id belongs to the
                                     // provider we just left, so the next turn
@@ -1546,6 +1549,7 @@ async fn run_agent_session_store_kernel(
                             },
                         )
                         .await?;
+                        subscription_context_reusable = false;
                         let result: Result<Option<crate::AgentCompaction>> = async {
                             if launch.provider.uses_native_harness() {
                                 let model = launch
@@ -1611,6 +1615,7 @@ async fn run_agent_session_store_kernel(
                         .await;
                         match result {
                             Ok(native) => {
+                                subscription_context_reusable = false;
                                 if let Some(native) = native.as_ref() {
                                     record(
                                         &mut journal,
@@ -1714,6 +1719,7 @@ async fn run_agent_session_store_kernel(
                     Some(HostCommand::ClearContext {
                         session_id: command_session_id,
                     }) if command_session_id == session_id => {
+                        subscription_context_reusable = false;
                         provider_session_id = None;
                         retained_context = None;
                         record(
@@ -1901,14 +1907,20 @@ async fn run_agent_session_store_kernel(
 
         if !launch.provider.uses_native_harness()
             && retained_context.as_deref().is_some_and(|context| {
-                subscription_prompt_bytes(Some(context), prompt.actor, &prompt.text)
-                    > SUBSCRIPTION_INPUT_BUDGET_BYTES
+                subscription_context_needs_compaction(
+                    context,
+                    prompt.actor,
+                    &prompt.text,
+                    subscription_context_reusable
+                        && executor.supports_subscription_context_reuse(launch.provider),
+                )
             })
         {
             let context = retained_context
                 .take()
                 .expect("oversized subscription context was present");
-            let context_bytes = context.len();
+            let context_chars = context.chars().count();
+            subscription_context_reusable = false;
             record(
                 &mut journal,
                 &events,
@@ -1968,8 +1980,8 @@ async fn run_agent_session_store_kernel(
                                 "native": false,
                                 "automatic": true,
                                 "trigger": "provider_input_size",
-                                "context_bytes_before": context_bytes,
-                                "input_budget_bytes": SUBSCRIPTION_INPUT_BUDGET_BYTES,
+                                "context_chars_before": context_chars,
+                                "input_budget_chars": SUBSCRIPTION_INPUT_BUDGET_CHARS,
                             }),
                         },
                     )
@@ -1982,7 +1994,7 @@ async fn run_agent_session_store_kernel(
                     );
                     tracing::warn!(
                         session_id = %session_id,
-                        context_bytes,
+                        context_chars,
                         error = %error,
                         "automatic subscription context compaction failed"
                     );
@@ -1997,8 +2009,8 @@ async fn run_agent_session_store_kernel(
                             payload: serde_json::json!({
                                 "automatic": true,
                                 "trigger": "provider_input_size",
-                                "context_bytes_before": context_bytes,
-                                "input_budget_bytes": SUBSCRIPTION_INPUT_BUDGET_BYTES,
+                                "context_chars_before": context_chars,
+                                "input_budget_chars": SUBSCRIPTION_INPUT_BUDGET_CHARS,
                                 "error": message,
                             }),
                         },
@@ -2020,13 +2032,23 @@ async fn run_agent_session_store_kernel(
                 &prompt.text,
             )
         };
+        let subscription_input_chars = if !launch.provider.uses_native_harness()
+            && subscription_context_reusable
+            && executor.supports_subscription_context_reuse(launch.provider)
+        {
+            // A healthy pooled process receives only this delta. Measuring the
+            // complete canonical replay here was the source of premature
+            // compaction while the provider still had ample context space.
+            subscription_prompt_chars(None, prompt.actor, &prompt.text)
+        } else {
+            provider_prompt.chars().count()
+        };
         if !launch.provider.uses_native_harness()
-            && provider_prompt.len() > SUBSCRIPTION_INPUT_BUDGET_BYTES
+            && subscription_input_chars > SUBSCRIPTION_INPUT_BUDGET_CHARS
         {
             let message = format!(
-                "provider context remains {} bytes after compaction; refusing an over-limit subscription request (budget {} bytes)",
-                provider_prompt.len(),
-                SUBSCRIPTION_INPUT_BUDGET_BYTES
+                "provider input remains {} characters after compaction; refusing an over-limit subscription request (budget {} characters)",
+                subscription_input_chars, SUBSCRIPTION_INPUT_BUDGET_CHARS
             );
             tracing::error!(session_id = %session_id, %message, "subscription request exceeds safe input budget");
             record(
@@ -2060,6 +2082,7 @@ async fn run_agent_session_store_kernel(
                 },
             )
             .await?;
+            subscription_context_reusable = false;
             continue;
         }
         record(
@@ -2212,6 +2235,14 @@ async fn run_agent_session_store_kernel(
                             &kind,
                         )
                         .await?;
+                        commit_claude_steer(
+                            &mut journal,
+                            &events,
+                            session_id,
+                            &mut pending_steers,
+                            &kind,
+                        )
+                        .await?;
                         record(&mut journal, &events, session_id, kind).await?;
                         if let Some(tokens) = usage {
                             account_goal_tokens(
@@ -2251,6 +2282,9 @@ async fn run_agent_session_store_kernel(
                         match result {
                         Ok(outcome) => {
                             goal_turn_failures.reset();
+                            subscription_context_reusable = !interrupted
+                                && !launch.provider.uses_native_harness()
+                                && executor.supports_subscription_context_reuse(launch.provider);
                             provider_session_id = outcome.provider_session_id.clone();
                             let final_text = outcome.final_text;
                             if autonomy_result_sender.is_some() {
@@ -2276,6 +2310,7 @@ async fn run_agent_session_store_kernel(
                             .await?;
                         }
                         Err(error) => {
+                            subscription_context_reusable = false;
                             let error = format!("{error:#}");
                             if autonomy_result_sender.is_some() {
                                 autonomy_result = Some(Err(anyhow::anyhow!(error.clone())));
@@ -2350,6 +2385,7 @@ async fn run_agent_session_store_kernel(
                         context_compaction_in_progress = true;
                     } else if compaction_status == Some("completed") {
                         context_compaction_in_progress = false;
+                        subscription_context_reusable = false;
                     }
                     let retry_steers = provider_event_is_steer_boundary(&kind)
                         || compaction_status == Some("completed");
@@ -2357,6 +2393,14 @@ async fn run_agent_session_store_kernel(
                     track_provider_interaction(&kind, &mut pending_provider_interaction);
                     let usage = goal_token_usage(&kind);
                     commit_codex_steer(
+                        &mut journal,
+                        &events,
+                        session_id,
+                        &mut pending_steers,
+                        &kind,
+                    )
+                    .await?;
+                    commit_claude_steer(
                         &mut journal,
                         &events,
                         session_id,
@@ -2426,6 +2470,7 @@ async fn run_agent_session_store_kernel(
                         deadline.as_mut().await;
                     }
                 }, if interrupt_deadline.is_some() => {
+                    subscription_context_reusable = false;
                     running.abort();
                     let _ = (&mut running).await;
                     executor.stop_session(session_id).await?;
@@ -2471,6 +2516,7 @@ async fn run_agent_session_store_kernel(
                 }
                 _ = &mut liveness_deadline => {
                     let timed_out_phase = turn_phase;
+                    subscription_context_reusable = false;
                     running.abort();
                     let _ = (&mut running).await;
                     executor.stop_session(session_id).await?;
@@ -2536,7 +2582,12 @@ async fn run_agent_session_store_kernel(
                         continue;
                     };
                     match acknowledgement {
-                        Ok(()) if launch.provider != CodingProvider::Codex => {
+                        Ok(())
+                            if !matches!(
+                                launch.provider,
+                                CodingProvider::Codex | CodingProvider::Claude
+                            ) =>
+                        {
                             let steer = pending_steers
                                 .remove(index)
                                 .expect("matching pending steer index exists");
@@ -2551,6 +2602,11 @@ async fn run_agent_session_store_kernel(
                             .await?;
                         }
                         Ok(()) => {
+                            // A transport acknowledgement only says the
+                            // provider accepted the control message. Codex
+                            // and Claude both expose a later user-message
+                            // boundary; keep the steer in the pending-input
+                            // projection until that boundary is observed.
                             pending_steers[index].state = PendingSteerState::Accepted;
                         }
                         Err(error) => {
@@ -2736,6 +2792,7 @@ async fn run_agent_session_store_kernel(
                                 // finishes, so the switch is applied at the
                                 // turn boundary instead of here.
                                 Ok(provider_switched) => {
+                                    subscription_context_reusable = false;
                                     provider_switch_pending |= provider_switched;
                                 }
                                 Err(error) => {
@@ -3126,6 +3183,7 @@ async fn run_agent_session_store_kernel(
         }
         at_turn_boundary = true;
         if std::mem::take(&mut provider_switch_pending) {
+            subscription_context_reusable = false;
             provider_session_id = None;
             retained_context = if launch.provider.uses_native_harness() {
                 None
@@ -3134,6 +3192,7 @@ async fn run_agent_session_store_kernel(
             };
         }
         if interrupted {
+            subscription_context_reusable = false;
             // Codex and Claude interruption is scoped to the active turn and
             // preserves the provider thread/session. Discarding that id here
             // silently forks the conversation and loses provider-side cache.
@@ -3529,12 +3588,25 @@ fn native_usage_event(
     }
 }
 
-fn subscription_prompt_bytes(
+fn subscription_prompt_chars(
     retained_context: Option<&str>,
     actor: EventActor,
     text: &str,
 ) -> usize {
-    format_subscription_provider_prompt(retained_context, actor, text).len()
+    format_subscription_provider_prompt(retained_context, actor, text)
+        .chars()
+        .count()
+}
+
+fn subscription_context_needs_compaction(
+    retained_context: &str,
+    actor: EventActor,
+    text: &str,
+    provider_context_reusable: bool,
+) -> bool {
+    !provider_context_reusable
+        && subscription_prompt_chars(Some(retained_context), actor, text)
+            > SUBSCRIPTION_INPUT_BUDGET_CHARS
 }
 
 /// Split retained provider-context bytes without dropping them. An unusually
@@ -3660,8 +3732,8 @@ async fn compact_subscription_context_for_budget(
         }
 
         let combined = summaries.join("\n\n--- retained context segment ---\n\n");
-        if subscription_prompt_bytes(Some(&combined), actor, current_prompt)
-            <= SUBSCRIPTION_INPUT_BUDGET_BYTES
+        if subscription_prompt_chars(Some(&combined), actor, current_prompt)
+            <= SUBSCRIPTION_INPUT_BUDGET_CHARS
         {
             return Ok(AgentCompaction {
                 summary: combined,
@@ -3673,8 +3745,8 @@ async fn compact_subscription_context_for_budget(
     }
 
     anyhow::bail!(
-        "compacted subscription context still exceeds the {}-byte provider input budget after {} passes",
-        SUBSCRIPTION_INPUT_BUDGET_BYTES,
+        "compacted subscription context still exceeds the {}-character provider input budget after {} passes",
+        SUBSCRIPTION_INPUT_BUDGET_CHARS,
         MAX_SUBSCRIPTION_COMPACTION_ROUNDS
     )
 }
@@ -4498,6 +4570,78 @@ async fn commit_codex_steer(
         PromptDelivery::Steer,
     )
     .await
+}
+
+/// Claude echoes each user input as a `claude.user` provider event. That
+/// event is the native runtime's user-message boundary: unlike the control
+/// acknowledgement, it proves the steer reached Claude's conversation. The
+/// current runtime summary does not expose the echoed UUID, so use FIFO for
+/// older summaries and prefer an explicit UUID when one is available.
+async fn commit_claude_steer(
+    journal: &mut RuntimeSessionStore,
+    events: &mpsc::Sender<SessionEvent>,
+    session_id: Uuid,
+    pending_steers: &mut VecDeque<PendingSteer>,
+    kind: &SessionEventKind,
+) -> Result<()> {
+    if !is_committed_claude_user_message(kind) {
+        return Ok(());
+    }
+    let explicit_message_id = claude_user_message_id(kind);
+    let Some(index) = pending_steers.iter().position(|steer| {
+        steer.prompt.delivery == PromptDelivery::Steer
+            && matches!(steer.state, PendingSteerState::Accepted)
+            && explicit_message_id.is_none_or(|id| steer.prompt.message_id == id)
+    }) else {
+        return Ok(());
+    };
+    let steer = pending_steers
+        .remove(index)
+        .expect("matching pending Claude steer index exists");
+    record_prompt_status(
+        journal,
+        events,
+        session_id,
+        &steer.prompt,
+        MessageStatus::Complete,
+        PromptDelivery::Steer,
+    )
+    .await
+}
+
+fn is_committed_claude_user_message(kind: &SessionEventKind) -> bool {
+    let SessionEventKind::ProviderEvent {
+        provider: CodingProvider::Claude,
+        kind,
+        payload,
+    } = kind
+    else {
+        return false;
+    };
+    if kind != "claude.user" || payload.get("type").and_then(Value::as_str) != Some("user") {
+        return false;
+    }
+    let Some(content_types) = payload.get("content_block_types").and_then(Value::as_array) else {
+        return true;
+    };
+    content_types.iter().any(|content_type| {
+        content_type.as_str() == Some("text")
+            && content_types
+                .iter()
+                .all(|content_type| content_type.as_str() != Some("tool_result"))
+    })
+}
+
+fn claude_user_message_id(kind: &SessionEventKind) -> Option<Uuid> {
+    let SessionEventKind::ProviderEvent { payload, .. } = kind else {
+        return None;
+    };
+    payload
+        .get("uuid")
+        .or_else(|| payload.get("message_id"))
+        .or_else(|| payload.get("client_id"))
+        .and_then(Value::as_str)
+        .and_then(|id| Uuid::parse_str(id).ok())
 }
 
 async fn promote_uncommitted_steers(
@@ -5956,6 +6100,11 @@ mod tests {
         seen: RecordedContextTurns,
     }
 
+    struct ReusableContextExecutor {
+        prompt_lengths: Arc<Mutex<Vec<usize>>>,
+        called: Arc<Notify>,
+    }
+
     struct ProviderRecordingExecutor {
         seen: RecordedProviderTurns,
         called: Arc<Notify>,
@@ -6038,6 +6187,39 @@ mod tests {
             Ok(AgentTurnResult {
                 provider_session_id: Some("provider-session".to_string()),
                 final_text: "done".to_string(),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentTurnExecutor for ReusableContextExecutor {
+        fn supports_subscription_context_reuse(&self, provider: CodingProvider) -> bool {
+            matches!(provider, CodingProvider::Codex | CodingProvider::Claude)
+        }
+
+        async fn execute(
+            &self,
+            turn: AgentTurn,
+            events: mpsc::Sender<SessionEventKind>,
+            _controls: Option<mpsc::Receiver<AgentTurnControl>>,
+        ) -> Result<AgentTurnResult> {
+            self.prompt_lengths.lock().unwrap().push(turn.prompt.len());
+            let final_text = "r".repeat(650_000);
+            events
+                .send(SessionEventKind::Message {
+                    message_id: Uuid::new_v4(),
+                    actor: EventActor::Assistant,
+                    text: final_text.clone(),
+                    attachments: Vec::new(),
+                    status: MessageStatus::Complete,
+                    delivery: None,
+                })
+                .await
+                .unwrap();
+            self.called.notify_one();
+            Ok(AgentTurnResult {
+                provider_session_id: Some("reusable-provider-session".to_string()),
+                final_text,
             })
         }
     }
@@ -6186,6 +6368,7 @@ mod tests {
     }
 
     struct CommittingSteerExecutor {
+        provider: CodingProvider,
         turn_started: Arc<Notify>,
         steer_accepted: Arc<Notify>,
         release_commit: Arc<Notify>,
@@ -6375,14 +6558,28 @@ mod tests {
                 let _ = ack.send(Ok(()));
                 self.steer_accepted.notify_one();
                 self.release_commit.notified().await;
-                events
-                    .send(SessionEventKind::ProviderEvent {
-                        provider: CodingProvider::Codex,
-                        kind: "item/completed:userMessage".to_string(),
-                        payload: json!({
+                let (kind, payload) = match self.provider {
+                    CodingProvider::Codex => (
+                        "item/completed:userMessage".to_string(),
+                        json!({
                             "item_type": "userMessage",
                             "client_id": message_id.to_string(),
                         }),
+                    ),
+                    CodingProvider::Claude => (
+                        "claude.user".to_string(),
+                        json!({
+                            "type": "user",
+                            "content_block_types": ["text"],
+                        }),
+                    ),
+                    provider => panic!("unsupported committing steer provider: {provider:?}"),
+                };
+                events
+                    .send(SessionEventKind::ProviderEvent {
+                        provider: self.provider,
+                        kind,
+                        payload,
                     })
                     .await
                     .unwrap();
@@ -7487,6 +7684,7 @@ mod tests {
         let steer_accepted = Arc::new(Notify::new());
         let release_commit = Arc::new(Notify::new());
         let executor = Arc::new(CommittingSteerExecutor {
+            provider: CodingProvider::Codex,
             turn_started: Arc::clone(&turn_started),
             steer_accepted: Arc::clone(&steer_accepted),
             release_commit: Arc::clone(&release_commit),
@@ -7571,6 +7769,128 @@ mod tests {
             let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
                 .await
                 .expect("committed steer event arrives")
+                .expect("session remains open");
+            if matches!(
+                event.kind,
+                SessionEventKind::Message {
+                    message_id,
+                    status: MessageStatus::Complete,
+                    delivery: Some(PromptDelivery::Steer),
+                    ..
+                } if message_id == followup_id
+            ) {
+                break;
+            }
+        }
+
+        command_tx
+            .send(HostCommand::Interrupt { session_id })
+            .await
+            .unwrap();
+        command_tx
+            .send(HostCommand::Stop { session_id })
+            .await
+            .unwrap();
+        actor.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn accepted_claude_steer_stays_pending_until_the_user_message_commits() {
+        let root = tempdir().unwrap();
+        let journal_path = root.path().join("session.lock");
+        let session_id = Uuid::new_v4();
+        let followup_id = Uuid::new_v4();
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let turn_started = Arc::new(Notify::new());
+        let steer_accepted = Arc::new(Notify::new());
+        let release_commit = Arc::new(Notify::new());
+        let executor = Arc::new(CommittingSteerExecutor {
+            provider: CodingProvider::Claude,
+            turn_started: Arc::clone(&turn_started),
+            steer_accepted: Arc::clone(&steer_accepted),
+            release_commit: Arc::clone(&release_commit),
+        });
+        let actor = tokio::spawn(async move {
+            run_agent_session_with_executor(
+                &journal_path,
+                session_id,
+                LaunchSession {
+                    request_id: Uuid::new_v4(),
+                    cwd: root.path().to_path_buf(),
+                    provider: CodingProvider::Claude,
+                    model: None,
+                    effort: None,
+                    fast: Some(false),
+                    response_language: crate::ResponseLanguage::Auto,
+                    permission_mode: PermissionMode::Manual,
+                    name: None,
+                    initial_prompt: None,
+                    capabilities: Default::default(),
+                    subagent_concurrency_limit: None,
+                    extension_skill_roots: Vec::new(),
+                    team_policy: None,
+                },
+                command_rx,
+                event_tx,
+                executor,
+            )
+            .await
+        });
+
+        command_tx
+            .send(HostCommand::Prompt {
+                session_id,
+                message_id: Uuid::new_v4(),
+                text: "first".to_string(),
+                attachments: Vec::new(),
+                output_schema: None,
+                delivery: PromptDelivery::Steer,
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), turn_started.notified())
+            .await
+            .expect("first turn starts");
+        command_tx
+            .send(HostCommand::Prompt {
+                session_id,
+                message_id: followup_id,
+                text: "steer at the next boundary".to_string(),
+                attachments: Vec::new(),
+                output_schema: None,
+                delivery: PromptDelivery::Steer,
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), steer_accepted.notified())
+            .await
+            .expect("Claude accepts steer transport");
+
+        let mut transitions = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            if let SessionEventKind::Message {
+                message_id,
+                status,
+                delivery: Some(delivery),
+                ..
+            } = event.kind
+                && message_id == followup_id
+            {
+                transitions.push((status, delivery));
+            }
+        }
+        assert_eq!(
+            transitions,
+            [(MessageStatus::Queued, PromptDelivery::Steer)],
+            "Claude transport acknowledgement must not hide an uncommitted steer"
+        );
+
+        release_commit.notify_one();
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+                .await
+                .expect("Claude committed steer event arrives")
                 .expect("session remains open");
             if matches!(
                 event.kind,
@@ -10507,12 +10827,155 @@ mod tests {
     fn subscription_context_budget_detects_oversized_resumed_transcripts() {
         let context = format!(
             "{{\"role\":\"tool\",\"content\":\"{}\"}}",
-            "x".repeat(SUBSCRIPTION_INPUT_BUDGET_BYTES)
+            "x".repeat(SUBSCRIPTION_INPUT_BUDGET_CHARS)
         );
         assert!(
-            subscription_prompt_bytes(Some(&context), EventActor::User, "continue")
-                > SUBSCRIPTION_INPUT_BUDGET_BYTES
+            subscription_prompt_chars(Some(&context), EventActor::User, "continue")
+                > SUBSCRIPTION_INPUT_BUDGET_CHARS
         );
+    }
+
+    #[test]
+    fn reusable_subscription_context_does_not_compact_the_full_replay() {
+        let context = format!(
+            "{{\"role\":\"tool\",\"content\":\"{}\"}}",
+            "x".repeat(SUBSCRIPTION_INPUT_BUDGET_CHARS)
+        );
+
+        assert!(subscription_context_needs_compaction(
+            &context,
+            EventActor::User,
+            "continue",
+            false
+        ));
+        assert!(!subscription_context_needs_compaction(
+            &context,
+            EventActor::User,
+            "continue",
+            true
+        ));
+        assert!(
+            subscription_prompt_chars(Some(&context), EventActor::User, "continue")
+                > SUBSCRIPTION_INPUT_BUDGET_CHARS
+        );
+        assert!(
+            subscription_prompt_chars(None, EventActor::User, "continue")
+                <= SUBSCRIPTION_INPUT_BUDGET_CHARS
+        );
+    }
+
+    #[test]
+    fn subscription_input_budget_counts_characters_not_utf8_bytes() {
+        let text = "🛠️".repeat(SUBSCRIPTION_INPUT_BUDGET_CHARS / 4);
+        let prompt = format_subscription_provider_prompt(None, EventActor::User, &text);
+
+        assert!(prompt.len() > SUBSCRIPTION_INPUT_BUDGET_CHARS);
+        assert!(prompt.chars().count() <= SUBSCRIPTION_INPUT_BUDGET_CHARS);
+    }
+
+    #[tokio::test]
+    async fn reusable_subscription_pool_does_not_compact_large_durable_replay() {
+        let root = tempdir().unwrap();
+        let journal_path = root.path().join("session.lock");
+        let session_id = Uuid::new_v4();
+        let first_id = Uuid::new_v4();
+        let second_id = Uuid::new_v4();
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(256);
+        let called = Arc::new(Notify::new());
+        let prompt_lengths = Arc::new(Mutex::new(Vec::new()));
+        let executor = Arc::new(ReusableContextExecutor {
+            prompt_lengths: Arc::clone(&prompt_lengths),
+            called: Arc::clone(&called),
+        });
+        let actor = tokio::spawn(async move {
+            run_agent_session_with_executor(
+                &journal_path,
+                session_id,
+                LaunchSession {
+                    request_id: Uuid::new_v4(),
+                    cwd: root.path().to_path_buf(),
+                    provider: CodingProvider::Codex,
+                    model: None,
+                    effort: None,
+                    fast: Some(false),
+                    response_language: crate::ResponseLanguage::Auto,
+                    permission_mode: PermissionMode::Manual,
+                    name: None,
+                    initial_prompt: None,
+                    capabilities: Default::default(),
+                    subagent_concurrency_limit: None,
+                    extension_skill_roots: Vec::new(),
+                    team_policy: None,
+                },
+                command_rx,
+                event_tx,
+                executor,
+            )
+            .await
+        });
+
+        command_tx
+            .send(HostCommand::Prompt {
+                session_id,
+                message_id: first_id,
+                text: "u".repeat(450_000),
+                attachments: Vec::new(),
+                output_schema: None,
+                delivery: PromptDelivery::Queue,
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), called.notified())
+            .await
+            .expect("first pooled turn completes");
+
+        command_tx
+            .send(HostCommand::Prompt {
+                session_id,
+                message_id: second_id,
+                text: "continue".to_string(),
+                attachments: Vec::new(),
+                output_schema: None,
+                delivery: PromptDelivery::Queue,
+            })
+            .await
+            .unwrap();
+
+        let mut provider_input_compacted = false;
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+                .await
+                .expect("second pooled turn remains live")
+                .expect("session remains open");
+            match &event.kind {
+                SessionEventKind::ProviderEvent { kind, payload, .. }
+                    if kind == "context_compaction"
+                        && payload.get("trigger").and_then(Value::as_str)
+                            == Some("provider_input_size") =>
+                {
+                    provider_input_compacted = true;
+                }
+                SessionEventKind::TurnCompleted { message_id, .. } if *message_id == second_id => {
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        let prompt_lengths = prompt_lengths.lock().unwrap().clone();
+        assert_eq!(prompt_lengths.len(), 2);
+        assert!(prompt_lengths[1] > SUBSCRIPTION_INPUT_BUDGET_CHARS);
+        assert!(
+            !provider_input_compacted,
+            "a healthy pooled subscription must not compact the full durable replay"
+        );
+
+        command_tx
+            .send(HostCommand::Stop { session_id })
+            .await
+            .unwrap();
+        actor.await.unwrap().unwrap();
     }
 
     #[test]
