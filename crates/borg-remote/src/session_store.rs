@@ -189,6 +189,15 @@ impl SessionEventKind {
                 status: SessionStatus::Ready | SessionStatus::Stopped,
                 ..
             } => vec!["reasoning".to_string()],
+            Self::ReasoningCompleted
+            | Self::ToolStarted { .. }
+            | Self::ToolCompleted { .. }
+            | Self::ApprovalRequested { .. }
+            | Self::ProviderInteractionRequested { .. }
+            | Self::StatusChanged {
+                status: SessionStatus::WaitingForApproval,
+                ..
+            } => vec!["reasoning".to_string()],
             Self::ContextCleared => vec!["reasoning".to_string(), "context_window".to_string()],
             _ => Vec::new(),
         }
@@ -380,6 +389,7 @@ impl SessionState {
                 cost_usd,
                 context_tokens,
                 context_window_tokens,
+                ..
             } => {
                 self.usage.calls = self.usage.calls.saturating_add(1);
                 self.usage.provider_duration_ms = self
@@ -1549,10 +1559,17 @@ impl SqliteSessionStore {
                 (session.parent_session_id, session.parent_cut_sequence)
             {
                 if inherited_limit < session.inherited_event_count {
-                    let mut inherited = self.composed_events(parent, Some(cut)).await?;
+                    // The parent cut already identifies the exact inherited
+                    // prefix. Replaying `composed_events` here materialized
+                    // every tool/subagent payload in that prefix just to
+                    // discard the non-recovery rows below. On large forked
+                    // sessions that turns resume into a multi-gigabyte scan.
+                    // Recurse through the recovery-only path instead; it
+                    // preserves the same cut while letting each generation
+                    // apply its indexed recovery filter.
+                    let mut inherited = self.composed_recovery_events(parent, Some(cut)).await?;
                     inherited.retain(|event| event.fork_inheritable);
                     inherited.truncate(usize::try_from(inherited_limit).unwrap_or(usize::MAX));
-                    inherited.retain(|event| event.event.kind.is_recovery_relevant());
                     inherited
                 } else {
                     let mut inherited = self.composed_recovery_events(parent, Some(cut)).await?;
@@ -4313,6 +4330,8 @@ mod tests {
             },
             SessionEventKind::UsageUpdated {
                 provider_duration_ms: 10,
+                turn_id: None,
+                provider_context_reused: None,
                 input_tokens: 100,
                 output_tokens: 20,
                 cached_input_tokens: 40,
@@ -4326,6 +4345,8 @@ mod tests {
             },
             SessionEventKind::UsageUpdated {
                 provider_duration_ms: 20,
+                turn_id: None,
+                provider_context_reused: None,
                 input_tokens: 200,
                 output_tokens: 30,
                 cached_input_tokens: 80,
@@ -4681,6 +4702,87 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn reasoning_boundaries_clear_the_snapshot_before_the_next_thought() {
+        let (directory, store) = store().await;
+        let session_id = Uuid::new_v4();
+        store.create_session(session_id).await.unwrap();
+        for kind in [
+            SessionEventKind::SessionStarted,
+            configured(directory.path()),
+            SessionEventKind::StatusChanged {
+                status: SessionStatus::Running,
+                detail: None,
+            },
+        ] {
+            store
+                .append(SessionEvent::new(session_id, 0, kind))
+                .await
+                .unwrap();
+        }
+
+        store
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::ReasoningDelta {
+                    text: "previous thought".to_string(),
+                },
+            ))
+            .await
+            .unwrap();
+        store
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::ReasoningCompleted,
+            ))
+            .await
+            .unwrap();
+        let next = store
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::ReasoningDelta {
+                    text: "next thought".to_string(),
+                },
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(
+            next.kind,
+            SessionEventKind::ReasoningDelta { ref text } if text == "next thought"
+        ));
+
+        store
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::ToolStarted {
+                    tool_call_id: "tool-1".to_string(),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "src/lib.rs"}),
+                    input_ref: None,
+                },
+            ))
+            .await
+            .unwrap();
+        let after_tool = store
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::ReasoningDelta {
+                    text: "thought after tool".to_string(),
+                },
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(
+            after_tool.kind,
+            SessionEventKind::ReasoningDelta { ref text } if text == "thought after tool"
+        ));
     }
 
     #[tokio::test]

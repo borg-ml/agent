@@ -5,7 +5,7 @@
 //! thin wire adapters and do not own Borg's tool/runtime loop; the
 //! provider-neutral NativeHarness owns API-key/OpenAI-compatible model routes.
 
-use crate::mcp::{ExternalMcpServer, prepare_external_provider_mcp};
+use crate::mcp::{ExternalMcpServer, ProviderMcpSetup, prepare_external_provider_mcp};
 use crate::runtime::ProviderCallUsage;
 use crate::{ProviderAuthBundle, ProviderAuthProvider, ProviderChannel};
 use anyhow::{Context, Result, bail};
@@ -14,16 +14,30 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{ChildStdin, Command};
-use tokio::sync::mpsc;
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::sync::{Mutex, mpsc};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SubscriptionProvider {
     Codex,
     Claude,
+}
+
+/// Billing/authentication lane for the native CLI adapter. The provider name
+/// alone is insufficient: both Codex and Claude CLIs can run with either an
+/// OAuth subscription session or an API key. Keeping this distinction beside
+/// the usage parser prevents subscription-equivalent counters from being
+/// rendered as API charges while preserving real API-key billing telemetry.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum ProviderBillingMode {
+    Subscription,
+    ApiKey,
+    #[default]
+    Unknown,
 }
 
 #[derive(Debug, Clone)]
@@ -142,6 +156,10 @@ impl fmt::Debug for ChatGitCredential {
 #[derive(Debug, Clone)]
 pub struct ChatStreamRequest {
     pub prompt: String,
+    /// Stable identity for the provider-native conversation configuration.
+    /// The prompt is deliberately excluded: a healthy pooled process receives
+    /// only the new user delta after its first full replay.
+    pub lifecycle_key: Option<String>,
     pub owner_session_id: Option<String>,
     pub client_user_message_id: Option<String>,
     pub attachments: Vec<PathBuf>,
@@ -163,6 +181,52 @@ pub struct ChatStreamRequest {
     pub persist_session: Option<bool>,
     pub web_search_allowed: bool,
     pub resume_unavailable_prompt: Option<String>,
+}
+
+/// A volatile, per-Borg-session Claude subscription lane.
+///
+/// Borg's SQLite journal remains authoritative. This pool only keeps the
+/// provider process and its already-authenticated native conversation alive so
+/// that ordinary turns follow the same append-only path as the first-party CLI.
+/// A lifecycle-key change causes the next call to start a fresh native process;
+/// callers must then send the complete durable prompt again.
+#[derive(Clone, Default)]
+pub struct ClaudeSubscriptionPool {
+    inner: Arc<Mutex<ClaudeSubscriptionPoolState>>,
+}
+
+#[derive(Default)]
+struct ClaudeSubscriptionPoolState {
+    native: claude_agents::ClaudePool,
+    lifecycle_key: Option<String>,
+    command: Option<claude_agents::CommandSpec>,
+    _auth_home: Option<TempDir>,
+    _mcp_setup: Option<(TempDir, ProviderMcpSetup)>,
+}
+
+/// A volatile, per-Borg-session Codex app-server lane. The app-server thread
+/// is retained only while the lifecycle key is unchanged and the prior turn
+/// reached a terminal frame. A failed or interrupted turn is discarded so the
+/// next call is forced to replay Borg's complete durable context.
+#[derive(Clone, Default)]
+pub struct CodexSubscriptionPool {
+    inner: Arc<Mutex<CodexSubscriptionPoolState>>,
+}
+
+#[derive(Default)]
+struct CodexSubscriptionPoolState {
+    lifecycle_key: Option<String>,
+    process: Option<PooledCodexProcess>,
+    _auth_home: Option<TempDir>,
+}
+
+struct PooledCodexProcess {
+    child: Child,
+    stdin: ChildStdin,
+    lines: tokio::io::Lines<BufReader<ChildStdout>>,
+    stderr: Arc<Mutex<Vec<u8>>>,
+    thread_id: String,
+    next_request_id: u64,
 }
 
 pub fn run_claude_chat_stream(request: ChatStreamRequest) -> mpsc::Receiver<ChatStreamEvent> {
@@ -194,6 +258,34 @@ pub fn run_claude_local_chat_stream(
     run_subscription_stream(request, controls, SubscriptionProvider::Claude, permission)
 }
 
+/// Run Claude Code on the shared native process for this Borg session.
+pub fn run_claude_local_chat_stream_pooled(
+    request: ChatStreamRequest,
+    controls: Option<mpsc::Receiver<ChatStreamControl>>,
+    permission: LocalAgentPermission,
+    pool: ClaudeSubscriptionPool,
+) -> mpsc::Receiver<ChatStreamEvent> {
+    let (events, receiver) = mpsc::channel(64);
+    tokio::spawn(async move {
+        if let Err(error) = run_claude_subscription_process_pooled(
+            request,
+            controls,
+            permission,
+            events.clone(),
+            pool,
+        )
+        .await
+        {
+            let _ = events
+                .send(ChatStreamEvent::Failed {
+                    error: format!("{error:#}"),
+                })
+                .await;
+        }
+    });
+    receiver
+}
+
 pub fn run_codex_chat_stream(request: ChatStreamRequest) -> mpsc::Receiver<ChatStreamEvent> {
     run_subscription_stream(
         request,
@@ -221,6 +313,34 @@ pub fn run_codex_local_chat_stream(
     permission: LocalAgentPermission,
 ) -> mpsc::Receiver<ChatStreamEvent> {
     run_subscription_stream(request, controls, SubscriptionProvider::Codex, permission)
+}
+
+/// Run Codex app-server on the shared native thread for this Borg session.
+pub fn run_codex_local_chat_stream_pooled(
+    request: ChatStreamRequest,
+    controls: Option<mpsc::Receiver<ChatStreamControl>>,
+    permission: LocalAgentPermission,
+    pool: CodexSubscriptionPool,
+) -> mpsc::Receiver<ChatStreamEvent> {
+    let (events, receiver) = mpsc::channel(64);
+    tokio::spawn(async move {
+        if let Err(error) = run_codex_subscription_process_pooled(
+            request,
+            controls,
+            permission,
+            events.clone(),
+            pool,
+        )
+        .await
+        {
+            let _ = events
+                .send(ChatStreamEvent::Failed {
+                    error: format!("{error:#}"),
+                })
+                .await;
+        }
+    });
+    receiver
 }
 
 pub fn run_codex_freeform_chat_stream(
@@ -274,6 +394,8 @@ async fn run_claude_subscription_process(
     events: mpsc::Sender<ChatStreamEvent>,
 ) -> Result<()> {
     let auth_home = restore_auth_home(request.provider_auth.as_ref())?;
+    let billing_mode =
+        provider_billing_mode(SubscriptionProvider::Claude, &request, auth_home.as_ref());
     let mcp_setup = if request.mcp_external_servers.is_empty() {
         None
     } else {
@@ -293,9 +415,84 @@ async fn run_claude_subscription_process(
         system_prompt: request.system_prompt,
         command,
         runtime_directory: None,
-        lifecycle_key: "borg-claude-subscription".to_string(),
+        lifecycle_key: request
+            .lifecycle_key
+            .unwrap_or_else(|| "borg-claude-subscription".to_string()),
     };
 
+    relay_claude_runtime(claude_request, controls, events, None, billing_mode).await
+}
+
+async fn run_claude_subscription_process_pooled(
+    request: ChatStreamRequest,
+    controls: Option<mpsc::Receiver<ChatStreamControl>>,
+    permission: LocalAgentPermission,
+    events: mpsc::Sender<ChatStreamEvent>,
+    pool: ClaudeSubscriptionPool,
+) -> Result<()> {
+    let lifecycle_key = request
+        .lifecycle_key
+        .clone()
+        .unwrap_or_else(|| "borg-claude-subscription".to_string());
+    let mut state = pool.inner.lock().await;
+    if state.lifecycle_key.as_deref() != Some(lifecycle_key.as_str()) {
+        let auth_home = restore_auth_home(request.provider_auth.as_ref())?;
+        let mcp_setup = if request.mcp_external_servers.is_empty() {
+            None
+        } else {
+            let directory = tempfile::tempdir().context("failed to create Claude MCP directory")?;
+            let setup =
+                prepare_external_provider_mcp(directory.path(), &request.mcp_external_servers)
+                    .context("failed to prepare Claude MCP config")?;
+            Some((directory, setup))
+        };
+        let mcp_config_path = mcp_setup
+            .as_ref()
+            .and_then(|(_, setup)| setup.claude_config_path.as_deref());
+        let command =
+            build_claude_command_spec(&request, permission, auth_home.as_ref(), mcp_config_path)?;
+        state.lifecycle_key = Some(lifecycle_key.clone());
+        state.command = Some(command);
+        state._auth_home = auth_home;
+        state._mcp_setup = mcp_setup;
+    }
+    let command = state
+        .command
+        .clone()
+        .context("pooled Claude command was not initialized")?;
+    let native_pool = state.native.clone();
+    let billing_mode = provider_billing_mode(
+        SubscriptionProvider::Claude,
+        &request,
+        state._auth_home.as_ref(),
+    );
+    drop(state);
+
+    let claude_request = claude_agents::ChatStreamRequest {
+        prompt: request.prompt,
+        attachments: request.attachments,
+        system_prompt: request.system_prompt,
+        command,
+        runtime_directory: None,
+        lifecycle_key,
+    };
+    relay_claude_runtime(
+        claude_request,
+        controls,
+        events,
+        Some(native_pool),
+        billing_mode,
+    )
+    .await
+}
+
+async fn relay_claude_runtime(
+    claude_request: claude_agents::ChatStreamRequest,
+    controls: Option<mpsc::Receiver<ChatStreamControl>>,
+    events: mpsc::Sender<ChatStreamEvent>,
+    pool: Option<claude_agents::ClaudePool>,
+    billing_mode: ProviderBillingMode,
+) -> Result<()> {
     let (native_events, mut native_events_receiver) = mpsc::channel(64);
     let (native_controls, mut control_forwarder) = match controls {
         Some(mut controls) => {
@@ -311,23 +508,54 @@ async fn run_claude_subscription_process(
         }
         None => (None, None),
     };
-    let mut runner = Some(tokio::spawn(claude_agents::run(
-        claude_request,
-        native_events,
-        native_controls,
-    )));
+    let mut runner = Some(tokio::spawn(async move {
+        match pool {
+            Some(pool) => {
+                claude_agents::run_pooled(claude_request, native_events, native_controls, pool)
+                    .await
+            }
+            None => claude_agents::run(claude_request, native_events, native_controls).await,
+        }
+    }));
 
-    while let Some(event) = native_events_receiver.recv().await {
-        if events.send(map_claude_event(event)).await.is_err() {
-            if let Some(runner) = runner.take() {
-                runner.abort();
-                let _ = runner.await;
+    loop {
+        tokio::select! {
+            // The session actor may abort its consumer on timeout, interrupt,
+            // or provider switch. The provider task is separate from that
+            // actor future, so watching the output channel here is what makes
+            // cancellation reach the Claude child instead of leaving an idle
+            // subscription process behind.
+            _ = events.closed() => {
+                if let Some(runner) = runner.take() {
+                    runner.abort();
+                    let _ = runner.await;
+                }
+                if let Some(forwarder) = control_forwarder.take() {
+                    forwarder.abort();
+                    let _ = forwarder.await;
+                }
+                return Ok(());
             }
-            if let Some(forwarder) = control_forwarder.take() {
-                forwarder.abort();
-                let _ = forwarder.await;
+            event = native_events_receiver.recv() => {
+                let Some(event) = event else {
+                    break;
+                };
+                if events
+                    .send(map_claude_event(event, billing_mode))
+                    .await
+                    .is_err()
+                {
+                    if let Some(runner) = runner.take() {
+                        runner.abort();
+                        let _ = runner.await;
+                    }
+                    if let Some(forwarder) = control_forwarder.take() {
+                        forwarder.abort();
+                        let _ = forwarder.await;
+                    }
+                    return Ok(());
+                }
             }
-            return Ok(());
         }
     }
 
@@ -380,7 +608,10 @@ fn map_claude_control(control: ChatStreamControl) -> claude_agents::ChatStreamCo
     }
 }
 
-fn map_claude_event(event: claude_agents::ChatStreamEvent) -> ChatStreamEvent {
+fn map_claude_event(
+    event: claude_agents::ChatStreamEvent,
+    billing_mode: ProviderBillingMode,
+) -> ChatStreamEvent {
     match event {
         claude_agents::ChatStreamEvent::ProviderEvent {
             kind,
@@ -453,14 +684,18 @@ fn map_claude_event(event: claude_agents::ChatStreamEvent) -> ChatStreamEvent {
             session_id,
         } => ChatStreamEvent::Done {
             final_text,
-            usage: usage.map(map_claude_usage),
+            usage: usage.map(|usage| map_claude_usage(usage, billing_mode)),
             session_id,
         },
         claude_agents::ChatStreamEvent::Failed { error } => ChatStreamEvent::Failed { error },
     }
 }
 
-fn map_claude_usage(usage: claude_agents::ProviderCallUsage) -> ProviderCallUsage {
+fn map_claude_usage(
+    usage: claude_agents::ProviderCallUsage,
+    billing_mode: ProviderBillingMode,
+) -> ProviderCallUsage {
+    let cost_basis = usage_cost_basis(usage.cost_microusd, billing_mode);
     ProviderCallUsage {
         duration_ms: usage.duration_ms,
         input_tokens: usage.input_tokens,
@@ -471,8 +706,334 @@ fn map_claude_usage(usage: claude_agents::ProviderCallUsage) -> ProviderCallUsag
         context_tokens: usage.context_tokens,
         context_window_tokens: usage.context_window_tokens,
         cost_microusd: usage.cost_microusd,
-        ..ProviderCallUsage::default()
+        cost_basis,
     }
+}
+
+async fn run_codex_subscription_process_pooled(
+    request: ChatStreamRequest,
+    controls: Option<mpsc::Receiver<ChatStreamControl>>,
+    permission: LocalAgentPermission,
+    events: mpsc::Sender<ChatStreamEvent>,
+    pool: CodexSubscriptionPool,
+) -> Result<()> {
+    let lifecycle_key = request
+        .lifecycle_key
+        .clone()
+        .unwrap_or_else(|| "borg-codex-subscription".to_string());
+    let mut state = pool.inner.lock().await;
+    if state.lifecycle_key.as_deref() != Some(lifecycle_key.as_str()) {
+        if let Some(mut process) = state.process.take() {
+            let _ = process.child.kill().await;
+            let _ = process.child.wait().await;
+        }
+        state.lifecycle_key = Some(lifecycle_key);
+        state._auth_home = restore_auth_home(request.provider_auth.as_ref())?;
+    }
+    let billing_mode = provider_billing_mode(
+        SubscriptionProvider::Codex,
+        &request,
+        state._auth_home.as_ref(),
+    );
+    if state.process.is_none() {
+        state.process = Some(
+            start_pooled_codex_process(&request, permission, state._auth_home.as_ref()).await?,
+        );
+    }
+    let mut process = state
+        .process
+        .take()
+        .context("pooled Codex process was not initialized")?;
+    let reusable = run_pooled_codex_turn(
+        &mut process,
+        &request,
+        controls,
+        permission,
+        &events,
+        billing_mode,
+    )
+    .await;
+    match reusable {
+        Ok(true) => {
+            state.process = Some(process);
+            Ok(())
+        }
+        Ok(false) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+async fn start_pooled_codex_process(
+    request: &ChatStreamRequest,
+    permission: LocalAgentPermission,
+    auth_home: Option<&TempDir>,
+) -> Result<PooledCodexProcess> {
+    let mut command = codex_app_server_command(request, auth_home)?;
+    let mut child = command.spawn().with_context(|| {
+        format!(
+            "failed to start {}",
+            SubscriptionProvider::Codex.executable()
+        )
+    })?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .context("pooled Codex stdin pipe missing")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("pooled Codex stdout pipe missing")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("pooled Codex stderr pipe missing")?;
+    let stderr_buffer = Arc::new(Mutex::new(Vec::new()));
+    let stderr_buffer_task = Arc::clone(&stderr_buffer);
+    tokio::spawn(async move {
+        let mut stderr = stderr;
+        let mut output = Vec::new();
+        let _ = tokio::io::AsyncReadExt::read_to_end(&mut stderr, &mut output).await;
+        stderr_buffer_task.lock().await.extend(output);
+    });
+
+    write_codex_request(
+        &mut stdin,
+        1,
+        "initialize",
+        serde_json::json!({
+            "clientInfo": {
+                "name": "borg",
+                "title": "Borg",
+                "version": env!("CARGO_PKG_VERSION")
+            },
+            "capabilities": {
+                "experimentalApi": true,
+                "optOutNotificationMethods": []
+            }
+        }),
+    )
+    .await
+    .context("failed to initialize Codex app server")?;
+    let mut lines = BufReader::new(stdout).lines();
+    read_codex_response(&mut lines, 1).await?;
+    write_codex_notification(&mut stdin, "initialized", Value::Object(Default::default())).await?;
+
+    write_codex_request(
+        &mut stdin,
+        2,
+        "thread/start",
+        codex_thread_start_params(request, permission),
+    )
+    .await?;
+    let thread_response = read_codex_response(&mut lines, 2).await?;
+    let thread_id = thread_response
+        .pointer("/result/thread/id")
+        .or_else(|| thread_response.pointer("/thread/id"))
+        .and_then(Value::as_str)
+        .context("Codex app server did not return a thread id")?
+        .to_string();
+
+    Ok(PooledCodexProcess {
+        child,
+        stdin,
+        lines,
+        stderr: stderr_buffer,
+        thread_id,
+        next_request_id: 3,
+    })
+}
+
+async fn run_pooled_codex_turn(
+    process: &mut PooledCodexProcess,
+    request: &ChatStreamRequest,
+    mut controls: Option<mpsc::Receiver<ChatStreamControl>>,
+    permission: LocalAgentPermission,
+    events: &mpsc::Sender<ChatStreamEvent>,
+    billing_mode: ProviderBillingMode,
+) -> Result<bool> {
+    let started_at = Instant::now();
+    let turn_request_id = process.next_request_id;
+    process.next_request_id = process.next_request_id.saturating_add(1);
+    write_codex_request(
+        &mut process.stdin,
+        turn_request_id,
+        "turn/start",
+        codex_turn_start_params(request, permission, &process.thread_id),
+    )
+    .await?;
+    let turn_response = read_codex_response(&mut process.lines, turn_request_id).await?;
+    let turn_id = turn_response
+        .pointer("/result/turn/id")
+        .or_else(|| turn_response.pointer("/turn/id"))
+        .and_then(Value::as_str)
+        .context("Codex app server did not return a turn id")?
+        .to_string();
+
+    let mut text = String::new();
+    let mut final_text = None;
+    let session_id = Some(process.thread_id.clone());
+    let mut usage = ProviderCallUsage::default();
+    let mut pending_steers: HashMap<
+        u64,
+        tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+    > = HashMap::new();
+    let mut pending_approvals = HashMap::new();
+    let mut turn_completed = false;
+    let mut reasoning_state = CodexReasoningState::default();
+
+    loop {
+        tokio::select! {
+            _ = events.closed() => {
+                break;
+            }
+            line = process.lines.next_line() => {
+                let Some(line) = line.context("failed to read pooled Codex output")? else {
+                    let stderr = String::from_utf8_lossy(&process.stderr.lock().await).trim().to_string();
+                    bail!("Codex app server closed unexpectedly{}", if stderr.is_empty() { String::new() } else { format!(": {stderr}") });
+                };
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let value = serde_json::from_str::<Value>(&line).unwrap_or_else(|_| Value::String(line.clone()));
+                if let Some(response_id) = codex_response_id(&value) {
+                    if let Some(ack) = pending_steers.remove(&response_id) {
+                        let result = value.get("error")
+                            .map(codex_rpc_error)
+                            .map_or(Ok(()), Err);
+                        let _ = ack.send(result);
+                    }
+                    continue;
+                }
+                emit_provider_event(events, &value).await;
+                emit_codex_events_with_state(events, &value, &mut reasoning_state).await;
+                if let Some(delta) = codex_event_delta(&value) {
+                    if codex_event_is_reasoning_delta(&value) {
+                        if let Some(delta) = reasoning_state.observe_delta(&value, &delta) {
+                            events.send(ChatStreamEvent::ReasoningDelta(delta)).await.ok();
+                        }
+                    } else if codex_event_is_assistant_text_delta(&value) {
+                        text.push_str(&delta);
+                        events.send(ChatStreamEvent::Delta(delta)).await.ok();
+                    }
+                }
+                if let Some(result) = codex_event_result(&value) {
+                    final_text = Some(result);
+                }
+                if let Some(event_usage) = event_usage_with_billing_mode(&value, billing_mode) {
+                    usage = event_usage;
+                }
+                if codex_event_kind(&value).is_some_and(|method| method == "turn/completed") {
+                    turn_completed = true;
+                    break;
+                }
+                if let Some(method) = codex_event_kind(&value)
+                    && method.ends_with("/requestApproval")
+                    && let Some(rpc_id) = value.get("id")
+                {
+                    let params = value.get("params").cloned().unwrap_or(Value::Null);
+                    let approval_id = params
+                        .get("approvalId")
+                        .or_else(|| params.get("itemId"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| rpc_id.to_string());
+                    pending_approvals.insert(approval_id.clone(), rpc_id.clone());
+                    events.send(ChatStreamEvent::ApprovalRequested {
+                        approval_id,
+                        title: method.to_string(),
+                        detail: params.get("reason")
+                            .and_then(Value::as_str)
+                            .unwrap_or("Codex requested approval")
+                            .to_string(),
+                        command: params.get("command").and_then(Value::as_str).map(str::to_string),
+                    }).await.ok();
+                }
+            }
+            control = receive_control(&mut controls), if controls.is_some() => {
+                let Some(control) = control else {
+                    controls = None;
+                    continue;
+                };
+                match control {
+                    ChatStreamControl::Interrupt => {
+                        let request_id = process.next_request_id;
+                        process.next_request_id = process.next_request_id.saturating_add(1);
+                        write_codex_request(
+                            &mut process.stdin,
+                            request_id,
+                            "turn/interrupt",
+                            serde_json::json!({"threadId": process.thread_id, "turnId": turn_id}),
+                        ).await?;
+                    }
+                    ChatStreamControl::Steer {
+                        client_user_message_id,
+                        text: steer_text,
+                        attachments,
+                        ack,
+                    } => {
+                        let request_id = process.next_request_id;
+                        process.next_request_id = process.next_request_id.saturating_add(1);
+                        write_codex_request(
+                            &mut process.stdin,
+                            request_id,
+                            "turn/steer",
+                            codex_turn_steer_params(
+                                &process.thread_id,
+                                &turn_id,
+                                &steer_text,
+                                &attachments,
+                                client_user_message_id.as_deref(),
+                            ),
+                        ).await?;
+                        pending_steers.insert(request_id, ack);
+                    }
+                    ChatStreamControl::Approval { approval_id, decision } => {
+                        if let Some(rpc_id) = pending_approvals.remove(&approval_id) {
+                            let decision = match decision {
+                                ChatApprovalDecision::ApproveOnce => "accept",
+                                ChatApprovalDecision::ApproveSession => "acceptForSession",
+                                ChatApprovalDecision::Reject => "decline",
+                            };
+                            write_codex_response(
+                                &mut process.stdin,
+                                rpc_id,
+                                serde_json::json!({"decision": decision}),
+                            ).await?;
+                        }
+                    }
+                    ChatStreamControl::ProviderInteractionResponse { .. } => {}
+                }
+            }
+        }
+    }
+
+    for (_, ack) in pending_steers {
+        let _ = ack.send(Err(
+            "Codex turn completed before the steer was delivered".to_string()
+        ));
+    }
+    if !turn_completed {
+        return Ok(false);
+    }
+    let final_text = final_text.unwrap_or(text);
+    anyhow::ensure!(
+        !final_text.trim().is_empty(),
+        "{} returned an empty response",
+        SubscriptionProvider::Codex.executable()
+    );
+    usage.duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+    if events
+        .send(ChatStreamEvent::Done {
+            final_text,
+            usage: Some(usage),
+            session_id,
+        })
+        .await
+        .is_err()
+    {
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 async fn run_codex_subscription_process(
@@ -483,6 +1044,8 @@ async fn run_codex_subscription_process(
 ) -> Result<()> {
     let started_at = Instant::now();
     let auth_home = restore_auth_home(request.provider_auth.as_ref())?;
+    let billing_mode =
+        provider_billing_mode(SubscriptionProvider::Codex, &request, auth_home.as_ref());
     let mut command = codex_app_server_command(&request, auth_home.as_ref())?;
     let mut child = command.spawn().with_context(|| {
         format!(
@@ -584,6 +1147,14 @@ async fn run_codex_subscription_process(
 
     loop {
         tokio::select! {
+            // Dropping the consumer is how the session actor cancels a
+            // subscription turn after a timeout or interrupt. Do not leave
+            // the app-server child waiting on its pipe in that case; fall
+            // through the normal bounded child cleanup below.
+            _ = events.closed() => {
+                turn_completed = true;
+                break;
+            }
             line = lines.next_line() => {
                 let Some(line) = line.context("failed to read subscription output")? else {
                     break;
@@ -616,7 +1187,7 @@ async fn run_codex_subscription_process(
                 if let Some(result) = codex_event_result(&value) {
                     final_text = Some(result);
                 }
-                if let Some(event_usage) = event_usage(&value) {
+                if let Some(event_usage) = event_usage_with_billing_mode(&value, billing_mode) {
                     usage = event_usage;
                 }
                 if let Some(method) = codex_event_kind(&value)
@@ -859,7 +1430,8 @@ fn codex_app_server_command(
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
     Ok(command)
 }
 
@@ -978,6 +1550,12 @@ fn claude_command_args(
 ) -> Vec<String> {
     let mut args = vec![
         "--print".to_string(),
+        // The adapter speaks Claude Code's realtime JSON input protocol. The
+        // CLI defaults to plain-text stdin; without this flag it waits for a
+        // complete text prompt/EOF and never consumes the initialize and user
+        // frames that claude-agents writes.
+        "--input-format".to_string(),
+        "stream-json".to_string(),
         "--output-format".to_string(),
         "stream-json".to_string(),
         "--verbose".to_string(),
@@ -1136,7 +1714,7 @@ impl CodexReasoningState {
         } else if previous.starts_with(incoming) {
             // A reconnect or lifecycle boundary replayed an older snapshot.
         } else {
-            previous.push_str(incoming);
+            previous.push_str(&emitted);
         }
         if emitted.is_empty() {
             return None;
@@ -1166,7 +1744,7 @@ impl CodexReasoningState {
         } else if previous.starts_with(aggregate) {
             // The completed item carried a shorter snapshot than the stream.
         } else {
-            previous.push_str(aggregate);
+            previous.push_str(&emitted);
         }
         if emitted.is_empty() {
             return None;
@@ -1179,9 +1757,23 @@ fn normalize_provider_delta(previous: &str, incoming: &str) -> String {
     if incoming.is_empty() || incoming == previous || previous.starts_with(incoming) {
         return String::new();
     }
-    incoming
-        .strip_prefix(previous)
-        .map_or_else(|| incoming.to_string(), str::to_string)
+    if let Some(delta) = incoming.strip_prefix(previous) {
+        return delta.to_string();
+    }
+    let overlap = longest_suffix_prefix_overlap(previous, incoming);
+    incoming[overlap..].to_string()
+}
+
+fn longest_suffix_prefix_overlap(left: &str, right: &str) -> usize {
+    let maximum = left.len().min(right.len());
+    (1..=maximum)
+        .rev()
+        .find(|overlap| {
+            left.is_char_boundary(left.len() - overlap)
+                && right.is_char_boundary(*overlap)
+                && left.as_bytes()[left.len() - overlap..] == right.as_bytes()[..*overlap]
+        })
+        .unwrap_or(0)
 }
 
 fn codex_reasoning_stream_key(value: &Value) -> String {
@@ -1647,7 +2239,10 @@ fn event_session_id(value: &Value) -> Option<String> {
     .map(str::to_string)
 }
 
-fn event_usage(value: &Value) -> Option<ProviderCallUsage> {
+fn event_usage_with_billing_mode(
+    value: &Value,
+    billing_mode: ProviderBillingMode,
+) -> Option<ProviderCallUsage> {
     let container = value
         .get("usage")
         .or_else(|| value.pointer("/event/usage"))
@@ -1724,6 +2319,19 @@ fn event_usage(value: &Value) -> Option<ProviderCallUsage> {
         .or_else(|| value.pointer("/params/modelContextWindow"))
         .or_else(|| value.pointer("/params/model_context_window"))
         .and_then(Value::as_u64);
+    let cost_microusd = usage
+        .get("cost_microusd")
+        .or_else(|| usage.get("costMicrousd"))
+        .or_else(|| usage.get("cost_usd"))
+        .or_else(|| usage.get("costUsd"))
+        .and_then(|value| {
+            value.as_u64().or_else(|| {
+                value
+                    .as_f64()
+                    .filter(|cost| cost.is_finite() && *cost >= 0.0)
+                    .map(|cost| (cost * 1_000_000.0).round() as u64)
+            })
+        });
     Some(ProviderCallUsage {
         input_tokens,
         cached_input_tokens,
@@ -1732,8 +2340,94 @@ fn event_usage(value: &Value) -> Option<ProviderCallUsage> {
         total_tokens,
         context_tokens: (total_tokens > 0).then_some(total_tokens),
         context_window_tokens,
+        cost_microusd,
+        cost_basis: usage_cost_basis(cost_microusd, billing_mode),
         ..ProviderCallUsage::default()
     })
+}
+
+fn usage_cost_basis(
+    cost_microusd: Option<u64>,
+    billing_mode: ProviderBillingMode,
+) -> crate::runtime::CostBasis {
+    match (cost_microusd, billing_mode) {
+        (Some(_), ProviderBillingMode::Subscription) => {
+            crate::runtime::CostBasis::SubscriptionEquivalent
+        }
+        (Some(_), ProviderBillingMode::ApiKey | ProviderBillingMode::Unknown) => {
+            crate::runtime::CostBasis::ProviderReported
+        }
+        (None, _) => crate::runtime::CostBasis::Unavailable,
+    }
+}
+
+fn provider_billing_mode(
+    provider: SubscriptionProvider,
+    request: &ChatStreamRequest,
+    auth_home: Option<&TempDir>,
+) -> ProviderBillingMode {
+    match provider {
+        SubscriptionProvider::Claude => {
+            // Claude Code gives explicit API-key environment variables
+            // precedence over its OAuth credential file. Mirror that choice
+            // for billing attribution without ever logging the key.
+            if has_nonempty_env("ANTHROPIC_API_KEY") || has_nonempty_env("ANTHROPIC_AUTH_TOKEN") {
+                return ProviderBillingMode::ApiKey;
+            }
+            let credentials_path = auth_home
+                .map(|home| home.path().join(".claude/.credentials.json"))
+                .or_else(|| {
+                    std::env::var_os("HOME")
+                        .map(PathBuf::from)
+                        .map(|home| home.join(".claude/.credentials.json"))
+                });
+            if request
+                .provider_auth
+                .as_ref()
+                .is_some_and(|auth| auth.provider == ProviderAuthProvider::Claude)
+                || credentials_path.is_some_and(|path| path.is_file())
+            {
+                ProviderBillingMode::Subscription
+            } else {
+                ProviderBillingMode::Unknown
+            }
+        }
+        SubscriptionProvider::Codex => {
+            if has_nonempty_env("OPENAI_API_KEY") {
+                return ProviderBillingMode::ApiKey;
+            }
+            let auth_path = auth_home
+                .map(|home| home.path().join(".codex/auth.json"))
+                .or_else(|| {
+                    std::env::var_os("CODEX_HOME")
+                        .map(PathBuf::from)
+                        .map(|home| home.join("auth.json"))
+                })
+                .or_else(|| {
+                    std::env::var_os("HOME")
+                        .map(PathBuf::from)
+                        .map(|home| home.join(".codex/auth.json"))
+                });
+            let Some(auth_path) = auth_path else {
+                return ProviderBillingMode::Unknown;
+            };
+            let Ok(contents) = std::fs::read_to_string(auth_path) else {
+                return ProviderBillingMode::Unknown;
+            };
+            let Ok(auth_json) = serde_json::from_str::<Value>(&contents) else {
+                return ProviderBillingMode::Unknown;
+            };
+            if crate::provider_auth::auth_json_holds_chatgpt_session(&auth_json) {
+                ProviderBillingMode::Subscription
+            } else {
+                ProviderBillingMode::ApiKey
+            }
+        }
+    }
+}
+
+fn has_nonempty_env(name: &str) -> bool {
+    std::env::var_os(name).is_some_and(|value| !value.is_empty())
 }
 
 impl SubscriptionProvider {
@@ -1753,6 +2447,7 @@ mod tests {
     fn claude_command_preserves_subscription_flags() {
         let request = ChatStreamRequest {
             prompt: "hello".to_string(),
+            lifecycle_key: None,
             owner_session_id: None,
             client_user_message_id: None,
             attachments: Vec::new(),
@@ -1779,6 +2474,8 @@ mod tests {
             claude_command_args(&request, LocalAgentPermission::Manual, None),
             vec![
                 "--print",
+                "--input-format",
+                "stream-json",
                 "--output-format",
                 "stream-json",
                 "--verbose",
@@ -1810,6 +2507,7 @@ mod tests {
         };
         let request = ChatStreamRequest {
             prompt: "hello".to_string(),
+            lifecycle_key: None,
             owner_session_id: None,
             client_user_message_id: None,
             attachments: Vec::new(),
@@ -1905,7 +2603,7 @@ mod tests {
             session_id: Some("session-1".to_string()),
         };
         assert!(matches!(
-            map_claude_event(event),
+            map_claude_event(event, ProviderBillingMode::Unknown),
             ChatStreamEvent::Done {
                 final_text,
                 usage: Some(ProviderCallUsage {
@@ -1922,7 +2620,8 @@ mod tests {
 
     #[test]
     fn codex_usage_preserves_cached_input_counters() {
-        let usage = event_usage(&serde_json::json!({
+        let usage = event_usage_with_billing_mode(
+            &serde_json::json!({
             "usage": {
                 "input_tokens": 222_000,
                 "cached_input_tokens": 210_000,
@@ -1930,7 +2629,9 @@ mod tests {
                 "output_tokens": 800,
                 "total_tokens": 222_800
             }
-        }))
+            }),
+            ProviderBillingMode::Unknown,
+        )
         .expect("Codex usage");
         assert_eq!(usage.input_tokens, 10_976);
         assert_eq!(usage.cached_input_tokens, 210_000);
@@ -1940,15 +2641,34 @@ mod tests {
     }
 
     #[test]
+    fn subscription_and_api_key_usage_have_distinct_billing_bases() {
+        assert_eq!(
+            usage_cost_basis(Some(1_000), ProviderBillingMode::Subscription),
+            crate::runtime::CostBasis::SubscriptionEquivalent
+        );
+        assert_eq!(
+            usage_cost_basis(Some(1_000), ProviderBillingMode::ApiKey),
+            crate::runtime::CostBasis::ProviderReported
+        );
+        assert_eq!(
+            usage_cost_basis(Some(1_000), ProviderBillingMode::Unknown),
+            crate::runtime::CostBasis::ProviderReported
+        );
+    }
+
+    #[test]
     fn codex_usage_derives_context_when_exec_omits_total_tokens() {
-        let usage = event_usage(&serde_json::json!({
+        let usage = event_usage_with_billing_mode(
+            &serde_json::json!({
             "usage": {
                 "input_tokens": 222_000,
                 "cached_input_tokens": 210_000,
                 "cache_write_input_tokens": 1_024,
                 "output_tokens": 800
             }
-        }))
+            }),
+            ProviderBillingMode::Unknown,
+        )
         .expect("Codex usage");
         assert_eq!(usage.total_tokens, 222_800);
         assert_eq!(usage.context_tokens, Some(222_800));
@@ -1957,7 +2677,8 @@ mod tests {
 
     #[test]
     fn codex_app_server_usage_keeps_breakdown_buckets_and_context_window() {
-        let usage = event_usage(&serde_json::json!({
+        let usage = event_usage_with_billing_mode(
+            &serde_json::json!({
             "method": "thread/tokenUsage/updated",
             "params": {
                 "tokenUsage": {
@@ -1971,7 +2692,9 @@ mod tests {
                     "modelContextWindow": 258_400
                 }
             }
-        }))
+            }),
+            ProviderBillingMode::Unknown,
+        )
         .expect("Codex app-server usage");
         assert_eq!(usage.input_tokens, 6_741);
         assert_eq!(usage.cache_creation_input_tokens, 6_738);
@@ -2065,6 +2788,27 @@ mod tests {
                     .unwrap()
             ),
             None
+        );
+    }
+
+    #[test]
+    fn overlapping_reasoning_chunks_do_not_replay_the_previous_suffix() {
+        let mut state = CodexReasoningState::default();
+        let first = serde_json::json!({
+            "method": "item/reasoning/summaryTextDelta",
+            "params": {"delta": "checking the repository", "itemId": "reasoning-1", "summaryIndex": 0}
+        });
+        let second = serde_json::json!({
+            "method": "item/reasoning/summaryTextDelta",
+            "params": {"delta": "repository for duplicate output", "itemId": "reasoning-1", "summaryIndex": 0}
+        });
+        assert_eq!(
+            state.observe_delta(&first, "checking the repository"),
+            Some("checking the repository".to_string())
+        );
+        assert_eq!(
+            state.observe_delta(&second, "repository for duplicate output"),
+            Some(" for duplicate output".to_string())
         );
     }
 

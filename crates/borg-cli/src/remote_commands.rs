@@ -736,6 +736,21 @@ async fn run_local_agent_session(
     }
     let store: Arc<dyn SessionStore> = sqlite_store.clone();
     let mut session_state = store.state(session_id).await?;
+    // Context usage is intentionally coalesced live state rather than a
+    // durable transcript event. Resume must seed the footer from that latest
+    // snapshot too; otherwise every long session briefly (or permanently,
+    // until the next provider event) advertises the misleading 100% headroom.
+    let live_state_events = store.live_events_after(session_id, 0).await?;
+    for live in &live_state_events {
+        if let SessionEventKind::ContextWindowUpdated {
+            context_tokens,
+            context_window_tokens,
+        } = &live.event.kind
+        {
+            session_state.usage.context_tokens = Some(*context_tokens);
+            session_state.usage.context_window_tokens = Some(*context_window_tokens);
+        }
+    }
     let mut stale_local_owner = session_access.is_attached()
         && !remote_launch_present
         && !local_session_owner_uses_current_binary(&sessions_dir, session_id)?;
@@ -889,6 +904,7 @@ async fn run_local_agent_session(
         .with_extension_skill_roots(extension_skill_roots);
     let live_extension_executor = local_executor.clone();
     let executor: Arc<dyn AgentTurnExecutor> = Arc::new(local_executor);
+    let lifecycle_executor = Arc::clone(&executor);
     let mut rendered = HashMap::new();
     let stdin_is_terminal = io::stdin().is_terminal();
     let can_prompt = stdin_is_terminal && !args.json;
@@ -947,6 +963,23 @@ async fn run_local_agent_session(
     } else {
         store.read(session_id).await?
     };
+    if can_prompt && !fallback_terminal {
+        // Durable history is the transcript source of truth, while the latest
+        // coalesced message/reasoning rows are the live tail of an in-flight
+        // turn. Seed both in order so resume shows thinking immediately and
+        // never treats the ephemeral snapshot as a second durable message.
+        history.extend(
+            live_state_events
+                .into_iter()
+                .map(|live| live.event)
+                .filter(|event| {
+                    matches!(
+                        event.kind,
+                        SessionEventKind::Message { .. } | SessionEventKind::ReasoningDelta { .. }
+                    )
+                }),
+        );
+    }
     let mut history_start_reached = session_state.latest_sequence == 0
         || history.first().is_some_and(|event| event.sequence <= 1);
     let (team_history, mut team_snapshots) = if can_prompt && !fallback_terminal {
@@ -2303,6 +2336,7 @@ async fn run_local_agent_session(
                     }
                     "/login" => {
                         login_provider(provider).await?;
+                        lifecycle_executor.stop_session(session_id).await?;
                         println!("  Signed in. Retry your message.");
                     }
                     "/quit" | "/exit" => {
@@ -2586,6 +2620,14 @@ async fn run_local_agent_session(
                                     })
                                 }
                             };
+                            if outcome.is_ok() {
+                                // Authentication changes are part of the
+                                // provider lifecycle. Drop any retained
+                                // native subscription process so the next
+                                // turn cannot accidentally use the old
+                                // credential context.
+                                lifecycle_executor.stop_session(session_id).await?;
+                            }
                             let latest_state = store.state(session_id).await?;
                             let latest = recent_tui_history(
                                 store.as_ref(),
@@ -6045,6 +6087,8 @@ mod tests {
                     sequence,
                     SessionEventKind::UsageUpdated {
                         provider_duration_ms: 0,
+                        turn_id: None,
+                        provider_context_reused: None,
                         input_tokens: 1,
                         output_tokens: 0,
                         total_tokens: 1,

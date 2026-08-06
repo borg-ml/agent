@@ -1497,6 +1497,14 @@ pub enum SessionEventKind {
     UsageUpdated {
         #[serde(default)]
         provider_duration_ms: u64,
+        /// The durable user-turn message this usage belongs to. Older events
+        /// omit it; clients must treat those as legacy telemetry only.
+        #[serde(default)]
+        turn_id: Option<Uuid>,
+        /// Whether the subscription adapter reused its native context for
+        /// this turn. `None` means the route did not expose this distinction.
+        #[serde(default)]
+        provider_context_reused: Option<bool>,
         input_tokens: u64,
         output_tokens: u64,
         cached_input_tokens: u64,

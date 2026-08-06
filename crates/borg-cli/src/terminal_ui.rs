@@ -2639,6 +2639,7 @@ impl BorgTerminal {
             Some(TranscriptEntry::Goal { .. }) => ("Goal actions", vec!["Copy goal"]),
             Some(TranscriptEntry::Plan { .. }) => ("Plan actions", vec!["Copy todo list"]),
             Some(TranscriptEntry::Info { .. }) => ("Card actions", vec!["Copy details"]),
+            Some(TranscriptEntry::Action { .. }) => ("Action details", vec!["Copy action"]),
             Some(TranscriptEntry::Compaction {
                 complete: true,
                 sequence,
@@ -3088,6 +3089,10 @@ impl BorgTerminal {
                         if self.transcript.compaction_is_expandable(index) {
                             self.capture_transcript_anchor_for_collapse();
                             self.transcript.toggle_compaction_expansion(index);
+                            self.transcript_render_cache = None;
+                        } else if self.transcript.action_is_expandable(index) {
+                            self.capture_transcript_anchor_for_collapse();
+                            self.transcript.toggle_action_expansion(index);
                             self.transcript_render_cache = None;
                         } else if self.transcript.plan_is_clippable(index) {
                             self.transcript.toggle_plan_expansion(index);
@@ -6614,6 +6619,20 @@ enum TranscriptEntry {
         text: String,
         time: String,
     },
+    /// A durable, typed lifecycle row.  Agent/approval/provider-interaction
+    /// rows used to be flattened into strings and later reparsed to decide
+    /// colour, grouping, and state.  Keep the semantic fields together so a
+    /// reconnect/update can replace one row without manufacturing duplicate
+    /// transcript text.
+    Action {
+        kind: TranscriptActionKind,
+        label: String,
+        detail: String,
+        body: Option<String>,
+        time: String,
+        state: TranscriptActionState,
+        expanded: bool,
+    },
     Plan {
         items: Vec<PlanItem>,
         time: String,
@@ -6653,27 +6672,72 @@ enum TranscriptEntry {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TranscriptActionKind {
+    Agent,
+    Approval,
+    ProviderInteraction,
+    Error,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TranscriptActionState {
+    Running,
+    Waiting,
+    Complete,
+    Stopped,
+    Failed,
+}
+
 impl Transcript {
     fn upsert_subagent_snapshot(&mut self, agent: &SubagentSnapshot) {
         self.subagents.insert(agent.session_id, agent.status);
         self.subagent_snapshots
             .insert(agent.session_id, agent.clone());
-        if let Some(summary) = hydrated_subagent_activity_summary(agent) {
+        if let Some((label, detail, body, state)) = hydrated_subagent_action(agent) {
             let time = canonical_local_time(agent.updated_at.with_timezone(&Local));
-            if let Some(index) = self.subagent_entries.get(&agent.session_id).copied()
-                && let Some(TranscriptEntry::Activity {
-                    text: existing,
-                    time: existing_time,
-                }) = self.order.get_mut(index)
-            {
-                *existing = summary;
-                *existing_time = time;
+            if let Some(index) = self.subagent_entries.get(&agent.session_id).copied() {
+                match self.order.get_mut(index) {
+                    Some(TranscriptEntry::Action {
+                        label: existing_label,
+                        detail: existing_detail,
+                        body: existing_body,
+                        time: existing_time,
+                        state: existing_state,
+                        expanded,
+                        ..
+                    }) => {
+                        *existing_label = label;
+                        *existing_detail = detail;
+                        *existing_body = body;
+                        *existing_time = time;
+                        *existing_state = state;
+                        if existing_body.is_none() {
+                            *expanded = false;
+                        }
+                    }
+                    // Keep old in-memory fixtures and sessions readable if a
+                    // reconnect updates a row created by an older binary.
+                    Some(TranscriptEntry::Activity {
+                        text: existing,
+                        time: existing_time,
+                    }) => {
+                        *existing = format_action_text(&label, &detail, body.as_deref());
+                        *existing_time = time;
+                    }
+                    _ => {}
+                }
             } else {
                 self.subagent_entries
                     .insert(agent.session_id, self.order.len());
-                self.order.push(TranscriptEntry::Activity {
-                    text: summary,
+                self.order.push(TranscriptEntry::Action {
+                    kind: TranscriptActionKind::Agent,
+                    label,
+                    detail,
+                    body,
                     time,
+                    state,
+                    expanded: false,
                 });
             }
         }
@@ -6858,6 +6922,23 @@ impl Transcript {
             self.order.get(index),
             Some(TranscriptEntry::Compaction { complete: true, .. })
         )
+    }
+
+    fn action_is_expandable(&self, index: usize) -> bool {
+        matches!(
+            self.order.get(index),
+            Some(TranscriptEntry::Action {
+                body: Some(body), ..
+            }) if !body.trim().is_empty()
+        )
+    }
+
+    fn toggle_action_expansion(&mut self, index: usize) {
+        if let Some(TranscriptEntry::Action { expanded, body, .. }) = self.order.get_mut(index)
+            && body.as_deref().is_some_and(|body| !body.trim().is_empty())
+        {
+            *expanded = !*expanded;
+        }
     }
 
     fn compaction_revert_sequence(&self, index: usize) -> Option<u64> {
@@ -7086,6 +7167,8 @@ impl Transcript {
                 });
             }
             SessionEventKind::UsageUpdated {
+                turn_id,
+                provider_context_reused,
                 input_tokens,
                 cached_input_tokens,
                 cache_creation_input_tokens,
@@ -7102,15 +7185,21 @@ impl Transcript {
                     self.context_remaining_percent =
                         context_remaining_percent(*context_tokens, *context_window_tokens);
                 }
-                if let Some(signature) = self
-                    .active_turn
-                    .as_ref()
-                    .map(ActiveTurnDisplayConfig::cache_signature)
-                    .or_else(|| {
-                        self.config
-                            .as_ref()
-                            .map(SessionDisplayConfig::cache_signature)
-                    })
+                let usage_belongs_to_active_turn = turn_id.is_none_or(|turn_id| {
+                    self.active_turn
+                        .as_ref()
+                        .is_some_and(|active| active.message_id == turn_id)
+                });
+                if usage_belongs_to_active_turn
+                    && let Some(signature) = self
+                        .active_turn
+                        .as_ref()
+                        .map(ActiveTurnDisplayConfig::cache_signature)
+                        .or_else(|| {
+                            self.config
+                                .as_ref()
+                                .map(SessionDisplayConfig::cache_signature)
+                        })
                     && let Some(notice) = self.cache_diagnostics.observe(
                         event.created_at,
                         signature,
@@ -7120,6 +7209,7 @@ impl Transcript {
                             cache_creation_input_tokens: *cache_creation_input_tokens,
                             cost_microusd: *cost_microusd,
                             cost_basis,
+                            provider_context_reused: *provider_context_reused,
                         },
                     )
                 {
@@ -7361,7 +7451,12 @@ impl Transcript {
                     }
                     if *is_error && !output.trim().is_empty() {
                         let message = output.lines().next().unwrap_or_default();
-                        *detail = format!("{detail} · {}", compact_text(message, 120));
+                        let message = compact_text(message, 120);
+                        if detail.trim().is_empty() {
+                            *detail = message;
+                        } else {
+                            *detail = format!("{detail} · {message}");
+                        }
                     }
                     *complete = true;
                     *completed_at = Some(event.created_at);
@@ -7377,6 +7472,17 @@ impl Transcript {
                         && !completion_presentation.detail.is_empty()
                     {
                         *detail = completion_presentation.detail.clone();
+                    }
+                    // Keep the result summary on the tool header when the
+                    // input had no useful detail (for example `git status`),
+                    // while leaving the full output in the expandable tool
+                    // body. This keeps command output out of assistant
+                    // message bubbles without making completed tools
+                    // anonymous.
+                    if detail.trim().is_empty()
+                        && let Some(result) = completion_presentation.result.as_deref()
+                    {
+                        *detail = compact_text(result, 120);
                     }
                     let input_is_diff = code_view
                         .as_ref()
@@ -7451,9 +7557,14 @@ impl Transcript {
             }
             SessionEventKind::ApprovalRequested { title, detail, .. } => {
                 self.finish_reasoning(event.created_at);
-                self.order.push(TranscriptEntry::Activity {
-                    text: format!("approval · {title} · {detail}"),
+                self.order.push(TranscriptEntry::Action {
+                    kind: TranscriptActionKind::Approval,
+                    label: "Approval".to_string(),
+                    detail: format_action_detail(title, detail),
+                    body: (!detail.trim().is_empty()).then(|| detail.clone()),
                     time: local_event_time(event),
+                    state: TranscriptActionState::Waiting,
+                    expanded: false,
                 })
             }
             SessionEventKind::ProviderInteractionRequested {
@@ -7464,13 +7575,18 @@ impl Transcript {
             } => {
                 self.finish_reasoning(event.created_at);
                 let options = provider_interaction_options(payload);
-                self.order.push(TranscriptEntry::Activity {
-                    text: if options.is_empty() {
-                        format!("input needed · {title} · {detail}")
+                self.order.push(TranscriptEntry::Action {
+                    kind: TranscriptActionKind::ProviderInteraction,
+                    label: "Input needed".to_string(),
+                    detail: if options.is_empty() {
+                        format_action_detail(title, detail)
                     } else {
-                        format!("input needed · {title} · {detail} · {options}")
+                        format!("{} · {options}", format_action_detail(title, detail))
                     },
+                    body: (!detail.trim().is_empty()).then(|| detail.clone()),
                     time: local_event_time(event),
+                    state: TranscriptActionState::Waiting,
+                    expanded: false,
                 })
             }
             SessionEventKind::GoalUpdated { goal } => {
@@ -7562,32 +7678,64 @@ impl Transcript {
                 self.subagents.insert(agent.session_id, agent.status);
                 self.subagent_snapshots
                     .insert(agent.session_id, agent.clone());
-                if let Some(text) =
-                    subagent_activity_summary(*activity, agent, child_event.as_deref())
+                if let Some((label, detail, body, state)) =
+                    subagent_action_projection(*activity, agent, child_event.as_deref())
                 {
-                    if let Some(index) = self.subagent_entries.get(&agent.session_id).copied()
-                        && let Some(TranscriptEntry::Activity {
-                            text: existing,
-                            time,
-                        }) = self.order.get_mut(index)
-                    {
-                        *existing = text;
-                        *time = local_event_time(event);
+                    let time = local_event_time(event);
+                    if let Some(index) = self.subagent_entries.get(&agent.session_id).copied() {
+                        match self.order.get_mut(index) {
+                            Some(TranscriptEntry::Action {
+                                label: existing_label,
+                                detail: existing_detail,
+                                body: existing_body,
+                                time: existing_time,
+                                state: existing_state,
+                                expanded,
+                                ..
+                            }) => {
+                                *existing_label = label;
+                                *existing_detail = detail;
+                                *existing_body = body;
+                                *existing_time = time;
+                                *existing_state = state;
+                                if existing_body.is_none() {
+                                    *expanded = false;
+                                }
+                            }
+                            Some(TranscriptEntry::Activity {
+                                text: existing,
+                                time: existing_time,
+                            }) => {
+                                *existing = format_action_text(&label, &detail, body.as_deref());
+                                *existing_time = time;
+                            }
+                            _ => {}
+                        }
                     } else {
                         self.subagent_entries
                             .insert(agent.session_id, self.order.len());
-                        self.order.push(TranscriptEntry::Activity {
-                            text,
-                            time: local_event_time(event),
+                        self.order.push(TranscriptEntry::Action {
+                            kind: TranscriptActionKind::Agent,
+                            label,
+                            detail,
+                            body,
+                            time,
+                            state,
+                            expanded: false,
                         });
                     }
                 }
             }
             SessionEventKind::Error { message } => {
                 self.finish_reasoning(event.created_at);
-                self.order.push(TranscriptEntry::Activity {
-                    text: format!("error · {message}"),
+                self.order.push(TranscriptEntry::Action {
+                    kind: TranscriptActionKind::Error,
+                    label: "Error".to_string(),
+                    detail: compact_text(message, 180),
+                    body: Some(message.clone()),
                     time: local_event_time(event),
+                    state: TranscriptActionState::Failed,
+                    expanded: false,
                 })
             }
             _ => {}
@@ -7699,7 +7847,8 @@ impl Transcript {
         } else if source.starts_with(incoming) {
             // An older snapshot arrived after a newer one during reconnect.
         } else {
-            source.push_str(incoming);
+            let overlap = longest_suffix_prefix_overlap(source, incoming);
+            source.push_str(&incoming[overlap..]);
         }
     }
 
@@ -8131,6 +8280,7 @@ impl Transcript {
                     TranscriptEntry::Plan { .. }
                         | TranscriptEntry::Goal { .. }
                         | TranscriptEntry::Info { .. }
+                        | TranscriptEntry::Action { .. }
                         | TranscriptEntry::Compaction { .. }
                 );
             if starts_labeled_group
@@ -8293,6 +8443,63 @@ impl Transcript {
                             Span::styled(line, Style::default().fg(activity_color)),
                         ]));
                     }
+                    selection_rows.push((index, entry_start, lines.len(), 0));
+                }
+                TranscriptEntry::Action {
+                    kind,
+                    label,
+                    detail,
+                    body,
+                    time,
+                    state,
+                    expanded,
+                } => {
+                    let time = display_local_time(time, today);
+                    let prefix = if tool_window.is_some() { "│ " } else { "  " };
+                    let glyph = transcript_action_glyph(*state);
+                    let color = transcript_action_color(*kind, *state);
+                    let mut summary = if detail.is_empty() {
+                        format!("{time}  {glyph} {label}")
+                    } else {
+                        format!("{time}  {glyph} {label}  {detail}")
+                    };
+                    if body.as_deref().is_some_and(|body| !body.trim().is_empty()) {
+                        summary.push_str(if *expanded {
+                            " · click to collapse"
+                        } else {
+                            " · click to expand"
+                        });
+                    }
+                    let action_start = lines.len();
+                    for line in wrap_display(&summary, width.saturating_sub(prefix.len() + 2)) {
+                        lines.push(Line::from(vec![
+                            Span::styled(prefix, Style::default().fg(Color::DarkGray)),
+                            Span::styled(line, Style::default().fg(color)),
+                        ]));
+                    }
+                    if *expanded
+                        && let Some(body) = body.as_deref().filter(|body| !body.trim().is_empty())
+                    {
+                        for line in wrap_display(body, width.saturating_sub(prefix.len() + 6)) {
+                            lines.push(Line::from(vec![
+                                Span::styled(
+                                    if tool_window.is_some() {
+                                        "│   │ "
+                                    } else {
+                                        "  │ "
+                                    },
+                                    Style::default().fg(Color::DarkGray),
+                                ),
+                                Span::styled(line, Style::default().fg(Color::Gray)),
+                            ]));
+                        }
+                    }
+                    if hovered_entry == Some(index) {
+                        for line in &mut lines[action_start..] {
+                            apply_line_background(line, width, MESSAGE_HOVER_BG);
+                        }
+                    }
+                    entry_rows.push((index, entry_start, lines.len()));
                     selection_rows.push((index, entry_start, lines.len(), 0));
                 }
                 TranscriptEntry::Plan {
@@ -9146,6 +9353,30 @@ fn focused_subagent_status_color(status: SessionStatus, focused_subagent: bool) 
     }
 }
 
+fn transcript_action_glyph(state: TranscriptActionState) -> &'static str {
+    match state {
+        TranscriptActionState::Running => "◇",
+        TranscriptActionState::Waiting => "?",
+        TranscriptActionState::Complete => "✓",
+        TranscriptActionState::Stopped => "■",
+        TranscriptActionState::Failed => "!",
+    }
+}
+
+fn transcript_action_color(kind: TranscriptActionKind, state: TranscriptActionState) -> Color {
+    if matches!(state, TranscriptActionState::Failed) {
+        return Color::LightRed;
+    }
+    if matches!(state, TranscriptActionState::Waiting) {
+        return Color::Yellow;
+    }
+    match kind {
+        TranscriptActionKind::Agent => SUBAGENT_PINK,
+        TranscriptActionKind::Approval | TranscriptActionKind::ProviderInteraction => Color::Yellow,
+        TranscriptActionKind::Error => Color::LightRed,
+    }
+}
+
 /// Whether applying an event can change the cached transcript layout.
 ///
 /// Footer/projection and provider-lifecycle updates still trigger a frame when
@@ -9296,29 +9527,199 @@ pub(crate) fn subagent_activity_summary(
     }
 }
 
-fn hydrated_subagent_activity_summary(agent: &SubagentSnapshot) -> Option<String> {
-    let task = &agent.task_name;
-    match agent.status {
-        SubagentStatus::Failed => Some(format!(
-            "agent · {task} · failed{}",
-            agent
-                .detail
-                .as_deref()
-                .filter(|detail| !detail.trim().is_empty())
-                .map(|detail| format!(" · {}", compact_text(detail, 120)))
-                .unwrap_or_default()
-        )),
-        SubagentStatus::Stopped => Some(terminal_agent_summary(
-            task,
-            "stopped",
-            agent.final_text.as_deref(),
-        )),
-        _ => agent
-            .final_text
-            .as_deref()
-            .filter(|text| !text.trim().is_empty())
-            .map(|_| format!("agent · {task} · report ready")),
+type SubagentActionProjection = (String, String, Option<String>, TranscriptActionState);
+
+/// Project every subagent lifecycle update into the same typed action shape.
+/// The transcript keeps the report as an optional body instead of embedding
+/// it in a status string; this makes updates idempotent and gives the renderer
+/// one place to decide whether the body is collapsed or expanded.
+fn subagent_action_projection(
+    activity: SubagentActivityKind,
+    agent: &SubagentSnapshot,
+    child_event: Option<&SessionEvent>,
+) -> Option<SubagentActionProjection> {
+    let task = agent.task_name.clone();
+    let project = |detail: String, body: Option<String>, state| {
+        Some((
+            "Agent".to_string(),
+            format!("{task} · {detail}"),
+            body,
+            state,
+        ))
+    };
+    match activity {
+        SubagentActivityKind::Started => {
+            project("started".to_string(), None, TranscriptActionState::Running)
+        }
+        SubagentActivityKind::Completed => project(
+            "completed".to_string(),
+            agent.final_text.clone(),
+            TranscriptActionState::Complete,
+        ),
+        SubagentActivityKind::Stopped => project(
+            "stopped".to_string(),
+            agent.final_text.clone(),
+            TranscriptActionState::Stopped,
+        ),
+        SubagentActivityKind::Failed => project(
+            format!(
+                "failed{}",
+                agent
+                    .detail
+                    .as_deref()
+                    .filter(|detail| !detail.trim().is_empty())
+                    .map(|detail| format!(" · {}", compact_text(detail, 120)))
+                    .unwrap_or_default()
+            ),
+            agent.detail.clone(),
+            TranscriptActionState::Failed,
+        ),
+        SubagentActivityKind::Updated => match child_event.map(|event| &event.kind) {
+            Some(SessionEventKind::Message {
+                actor: EventActor::Assistant,
+                text,
+                status: MessageStatus::Complete,
+                ..
+            }) if !text.trim().is_empty() => project(
+                "report ready".to_string(),
+                Some(text.clone()),
+                TranscriptActionState::Complete,
+            ),
+            Some(SessionEventKind::ApprovalRequested { title, detail, .. }) => project(
+                format!(
+                    "needs approval · {}",
+                    compact_text(
+                        if title.trim().is_empty() {
+                            detail
+                        } else {
+                            title
+                        },
+                        120
+                    )
+                ),
+                (!detail.trim().is_empty()).then(|| detail.clone()),
+                TranscriptActionState::Waiting,
+            ),
+            Some(SessionEventKind::Error { message }) => project(
+                format!("error · {}", compact_text(message, 120)),
+                Some(message.clone()),
+                TranscriptActionState::Failed,
+            ),
+            _ => match agent.status {
+                SubagentStatus::Starting => {
+                    project("starting".to_string(), None, TranscriptActionState::Running)
+                }
+                SubagentStatus::Running => {
+                    project("working".to_string(), None, TranscriptActionState::Running)
+                }
+                SubagentStatus::WaitingForApproval => project(
+                    "waiting for approval".to_string(),
+                    None,
+                    TranscriptActionState::Waiting,
+                ),
+                SubagentStatus::Ready => agent
+                    .final_text
+                    .as_ref()
+                    .filter(|text| !text.trim().is_empty())
+                    .map(|text| {
+                        (
+                            "Agent".to_string(),
+                            format!("{task} · report ready"),
+                            Some(text.clone()),
+                            TranscriptActionState::Complete,
+                        )
+                    }),
+                SubagentStatus::Stopped => project(
+                    "stopped".to_string(),
+                    agent.final_text.clone(),
+                    TranscriptActionState::Stopped,
+                ),
+                SubagentStatus::Failed => project(
+                    "failed".to_string(),
+                    agent.detail.clone(),
+                    TranscriptActionState::Failed,
+                ),
+            },
+        },
     }
+}
+
+fn hydrated_subagent_action(agent: &SubagentSnapshot) -> Option<SubagentActionProjection> {
+    match agent.status {
+        SubagentStatus::Failed => Some((
+            "Agent".to_string(),
+            format!(
+                "{} · failed{}",
+                agent.task_name,
+                agent
+                    .detail
+                    .as_deref()
+                    .filter(|detail| !detail.trim().is_empty())
+                    .map(|detail| format!(" · {}", compact_text(detail, 120)))
+                    .unwrap_or_default()
+            ),
+            agent.detail.clone(),
+            TranscriptActionState::Failed,
+        )),
+        SubagentStatus::Stopped => Some((
+            "Agent".to_string(),
+            format!("{} · stopped", agent.task_name),
+            agent.final_text.clone(),
+            TranscriptActionState::Stopped,
+        )),
+        SubagentStatus::Ready => agent
+            .final_text
+            .as_ref()
+            .filter(|text| !text.trim().is_empty())
+            .map(|text| {
+                (
+                    "Agent".to_string(),
+                    format!("{} · report ready", agent.task_name),
+                    Some(text.clone()),
+                    TranscriptActionState::Complete,
+                )
+            }),
+        SubagentStatus::Starting | SubagentStatus::Running | SubagentStatus::WaitingForApproval => {
+            None
+        }
+    }
+}
+
+fn format_action_detail(label: &str, detail: &str) -> String {
+    if label.trim().is_empty() {
+        compact_text(detail, 180)
+    } else if detail.trim().is_empty() {
+        label.to_string()
+    } else {
+        format!("{label} · {}", compact_text(detail, 180))
+    }
+}
+
+fn format_action_text(label: &str, detail: &str, body: Option<&str>) -> String {
+    let mut text = if detail.is_empty() {
+        label.to_string()
+    } else {
+        format!("{label} · {detail}")
+    };
+    if let Some(body) = body.filter(|body| !body.trim().is_empty()) {
+        if let Some(first) = body.lines().find(|line| !line.trim().is_empty()) {
+            text.push_str(" · ");
+            text.push_str(&compact_text(first, 120));
+        }
+    }
+    text
+}
+
+fn longest_suffix_prefix_overlap(left: &str, right: &str) -> usize {
+    let maximum = left.len().min(right.len());
+    (1..=maximum)
+        .rev()
+        .find(|overlap| {
+            left.is_char_boundary(left.len() - overlap)
+                && right.is_char_boundary(*overlap)
+                && left.as_bytes()[left.len() - overlap..] == right.as_bytes()[..*overlap]
+        })
+        .unwrap_or(0)
 }
 
 fn terminal_agent_summary(task: &str, outcome: &str, final_text: Option<&str>) -> String {
@@ -9634,6 +10035,23 @@ impl TranscriptEntry {
             Self::Message { text, .. } | Self::Activity { text, .. } | Self::Info { text, .. } => {
                 Some(markdown_plain_text(text))
             }
+            Self::Action {
+                label,
+                detail,
+                body,
+                ..
+            } => Some(
+                [
+                    (!label.trim().is_empty()).then_some(label.as_str()),
+                    (!detail.trim().is_empty()).then_some(detail.as_str()),
+                    body.as_deref().filter(|body| !body.trim().is_empty()),
+                ]
+                .into_iter()
+                .flatten()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+            ),
             Self::Plan { items, .. } => Some(
                 items
                     .iter()
@@ -9707,8 +10125,11 @@ fn apply_text_selection(
 fn action_run_bridge(entry: &TranscriptEntry) -> bool {
     matches!(
         entry,
-        TranscriptEntry::Activity { text, .. } if is_subagent_activity_text(text)
-    )
+        TranscriptEntry::Action {
+            kind: TranscriptActionKind::Agent,
+            ..
+        }
+    ) || matches!(entry, TranscriptEntry::Activity { text, .. } if is_subagent_activity_text(text))
 }
 
 fn is_subagent_activity_text(text: &str) -> bool {

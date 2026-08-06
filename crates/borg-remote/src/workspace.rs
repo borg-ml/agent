@@ -309,6 +309,10 @@ pub trait WorkspaceStore: Send + Sync {
     async fn add_member(&self, membership: WorkspaceMembership) -> Result<()>;
     async fn create_thread(&self, thread: Thread) -> Result<()>;
     async fn append(&self, event: WorkspaceEvent) -> Result<WorkspaceEvent>;
+    async fn append_session_event_batch(&self, events: &[WorkspaceEvent]) -> Result<()> {
+        let _ = events;
+        bail!("batch session-event projection is unavailable for this workspace store")
+    }
     async fn replay(
         &self,
         workspace_id: Uuid,
@@ -1094,6 +1098,106 @@ impl WorkspaceStore for SqliteWorkspaceStore {
         tx.commit().await?;
         Ok(e)
     }
+
+    /// Append session-event projections in one durable transaction.
+    ///
+    /// Session events are already validated by the canonical session journal;
+    /// this path only materializes the workspace reference rows. Keeping the
+    /// idempotency check and all inserts in one transaction makes repair fast
+    /// without weakening the workspace journal's atomicity.
+    async fn append_session_event_batch(&self, events: &[WorkspaceEvent]) -> Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let workspace_id = events[0].workspace_id;
+        anyhow::ensure!(
+            events.iter().all(|event| {
+                event.workspace_id == workspace_id
+                    && matches!(&event.kind, WorkspaceEventKind::SessionEvent { .. })
+            }),
+            "session projection batch contains an incompatible workspace event"
+        );
+        let mut tx = self.write().await?;
+        let members = self.members(&mut tx, workspace_id).await?;
+        let member_ids = members.into_iter().map(|(id, _)| id).collect::<Vec<_>>();
+
+        for source in events {
+            let WorkspaceEventKind::SessionEvent { mode, .. } = &source.kind else {
+                unreachable!("session projection batch was validated above")
+            };
+            anyhow::ensure!(
+                member_ids.contains(&source.author_id),
+                "author is not a workspace member"
+            );
+            let canonical = Self::canonical_event(source.clone())?;
+            if let Some(row) = sqlx::query(
+                "select canonical_json from workspace_events \
+                 where workspace_id=? and author_id=? and idempotency_key=?",
+            )
+            .bind(workspace_id.to_string())
+            .bind(source.author_id.to_string())
+            .bind(&source.idempotency_key)
+            .fetch_optional(&mut *tx)
+            .await?
+            {
+                anyhow::ensure!(
+                    row.get::<String, _>("canonical_json") == canonical,
+                    "idempotency conflict: key was used with a different payload"
+                );
+                continue;
+            }
+
+            let sequence: i64 = sqlx::query_scalar(
+                "update workspaces set next_sequence=next_sequence+1 \
+                 where id=? returning next_sequence-1",
+            )
+            .bind(workspace_id.to_string())
+            .fetch_one(&mut *tx)
+            .await?;
+            let mut event = source.clone();
+            event.sequence = u64::try_from(sequence)?;
+            let event_json = serde_json::to_string(&event)?;
+            sqlx::query(
+                "insert into workspace_events \
+                 (workspace_id,sequence,id,author_id,idempotency_key,canonical_json,event_json,created_at) \
+                 values(?,?,?,?,?,?,?,?)",
+            )
+            .bind(workspace_id.to_string())
+            .bind(sequence)
+            .bind(event.id.to_string())
+            .bind(event.author_id.to_string())
+            .bind(&event.idempotency_key)
+            .bind(canonical)
+            .bind(event_json)
+            .bind(event.created_at.to_rfc3339())
+            .execute(&mut *tx)
+            .await?;
+
+            let mode_json = serde_json::to_string(mode)?;
+            let pending_json = serde_json::to_string(&DeliveryState::Pending)?;
+            for recipient in member_ids
+                .iter()
+                .copied()
+                .filter(|id| *id != event.author_id)
+            {
+                sqlx::query(
+                    "insert into workspace_deliveries \
+                     (workspace_id,sequence,recipient_id,mode,state,is_message) \
+                     values(?,?,?,?,?,0)",
+                )
+                .bind(workspace_id.to_string())
+                .bind(sequence)
+                .bind(recipient.to_string())
+                .bind(&mode_json)
+                .bind(&pending_json)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     async fn replay(
         &self,
         w: Uuid,
@@ -1409,6 +1513,44 @@ mod tests {
                 .to_string()
                 .contains("idempotency conflict")
         );
+    }
+
+    #[tokio::test]
+    async fn session_event_projection_batch_is_idempotent_and_visible() {
+        let (store, workspace, human, agent, _) = fixture().await;
+        let session_id = Uuid::new_v4();
+        let events = (1..=1024)
+            .map(|session_sequence| WorkspaceEvent {
+                id: Uuid::new_v4(),
+                workspace_id: workspace.id,
+                sequence: 0,
+                author_id: agent.id,
+                idempotency_key: format!("session-projection-{session_sequence}"),
+                created_at: Utc::now(),
+                kind: WorkspaceEventKind::SessionEvent {
+                    session_id,
+                    session_event_id: Uuid::new_v4(),
+                    session_sequence,
+                    mode: DeliveryMode::Notify,
+                },
+            })
+            .collect::<Vec<_>>();
+
+        store.append_session_event_batch(&events).await.unwrap();
+        // A retried repair batch must be a no-op, including its deliveries.
+        store.append_session_event_batch(&events).await.unwrap();
+
+        let visible_to_agent = store.replay(workspace.id, agent.id, 0, 2048).await.unwrap();
+        assert_eq!(visible_to_agent.len(), events.len());
+        assert!(
+            visible_to_agent
+                .iter()
+                .enumerate()
+                .all(|(index, event)| { event.sequence == u64::try_from(index + 1).unwrap() })
+        );
+
+        let visible_to_human = store.replay(workspace.id, human.id, 0, 2048).await.unwrap();
+        assert_eq!(visible_to_human.len(), events.len());
     }
 
     #[tokio::test]

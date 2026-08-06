@@ -232,7 +232,7 @@ impl NativeHarness {
                     },
                 )
                 .await;
-                send_usage(&events, &usage).await;
+                send_usage(&events, &usage, Some(turn.message_id)).await;
                 send(
                     &events,
                     SessionEventKind::StatusChanged {
@@ -1502,11 +1502,17 @@ async fn send(events: &mpsc::Sender<SessionEventKind>, event: SessionEventKind) 
     let _ = events.send(event).await;
 }
 
-async fn send_usage(events: &mpsc::Sender<SessionEventKind>, usage: &ProviderCallUsage) {
+async fn send_usage(
+    events: &mpsc::Sender<SessionEventKind>,
+    usage: &ProviderCallUsage,
+    turn_id: Option<Uuid>,
+) {
     send(
         events,
         SessionEventKind::UsageUpdated {
             provider_duration_ms: usage.duration_ms,
+            turn_id,
+            provider_context_reused: None,
             input_tokens: usage.input_tokens,
             output_tokens: usage.output_tokens,
             cached_input_tokens: usage.cached_input_tokens,

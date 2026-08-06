@@ -4,10 +4,11 @@ mod openai_compatible;
 
 pub use chat_stream::{
     ChatApprovalDecision, ChatGitCredential, ChatProviderAuth, ChatStreamControl, ChatStreamEvent,
-    ChatStreamRequest, LocalAgentPermission, run_claude_chat_stream,
-    run_claude_chat_stream_with_control, run_claude_local_chat_stream, run_codex_chat_stream,
-    run_codex_chat_stream_with_control, run_codex_freeform_chat_stream,
-    run_codex_local_chat_stream,
+    ChatStreamRequest, ClaudeSubscriptionPool, CodexSubscriptionPool, LocalAgentPermission,
+    run_claude_chat_stream, run_claude_chat_stream_with_control, run_claude_local_chat_stream,
+    run_claude_local_chat_stream_pooled, run_codex_chat_stream, run_codex_chat_stream_with_control,
+    run_codex_freeform_chat_stream, run_codex_local_chat_stream,
+    run_codex_local_chat_stream_pooled,
 };
 pub use model_turn::{
     ModelFunctionCall, ModelInputAttachment, ModelMessage, ModelToolCall, ModelToolDefinition,

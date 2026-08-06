@@ -694,6 +694,50 @@ fn completed_file_creation_replaces_null_diff_placeholder() {
 }
 
 #[test]
+fn completed_tool_keeps_output_in_the_expandable_body_and_summarizes_the_header() {
+    let session_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::ToolStarted {
+            tool_call_id: "status-1".to_string(),
+            name: "functions.exec_command".to_string(),
+            input: serde_json::json!({"cmd": "git status --short"}),
+            input_ref: None,
+        },
+    ));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::ToolCompleted {
+            tool_call_id: "status-1".to_string(),
+            output: " M src/main.rs\n?? src/other.rs\n".to_string(),
+            output_ref: None,
+            is_error: false,
+            input: Some(serde_json::json!({"cmd": "git status --short"})),
+            input_ref: None,
+        },
+    ));
+
+    assert!(matches!(
+        transcript.order.last(),
+        Some(TranscriptEntry::Tool {
+            detail,
+            output_view: Some((language, body)),
+            expanded: false,
+            ..
+        }) if detail == "2 lines" && language == "text" && body.contains("src/other.rs")
+    ));
+    let collapsed = transcript.lines(100);
+    assert!(
+        !collapsed
+            .iter()
+            .any(|line| line.to_string().contains("src/other.rs"))
+    );
+}
+
+#[test]
 fn native_edit_file_keeps_the_replacement_diff_after_its_mutation_receipt() {
     let session_id = Uuid::new_v4();
     let input = serde_json::json!({
@@ -1275,6 +1319,8 @@ fn projection_only_events_keep_the_transcript_layout_cache() {
     assert!(!session_event_changes_transcript(
         &SessionEventKind::UsageUpdated {
             provider_duration_ms: 10,
+            turn_id: None,
+            provider_context_reused: None,
             input_tokens: 1,
             output_tokens: 2,
             cached_input_tokens: 0,
@@ -1387,6 +1433,8 @@ fn effort_changes_do_not_relabel_usage_from_the_active_turn() {
     };
     let usage = |cached_input_tokens| SessionEventKind::UsageUpdated {
         provider_duration_ms: 10,
+        turn_id: None,
+        provider_context_reused: None,
         input_tokens: 1_000,
         output_tokens: 100,
         cached_input_tokens,
@@ -1436,6 +1484,70 @@ fn effort_changes_do_not_relabel_usage_from_the_active_turn() {
 
     apply(&mut transcript, started(new_turn, "high"));
     apply(&mut transcript, usage(9_000));
+    assert_eq!(transcript.cache_status(Utc::now()), None);
+}
+
+#[test]
+fn correlated_usage_from_another_turn_cannot_poison_cache_diagnostics() {
+    let session_id = Uuid::new_v4();
+    let active_turn = Uuid::new_v4();
+    let unrelated_turn = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    let configured = SessionEventKind::SessionConfigured {
+        cwd: PathBuf::from("/workspace"),
+        provider: CodingProvider::Codex,
+        model: Some("gpt-5.6-sol".to_string()),
+        effort: Some("high".to_string()),
+        fast: false,
+        response_language: ResponseLanguage::English,
+        permission_mode: PermissionMode::FullAccess,
+    };
+    let started = SessionEventKind::TurnStarted {
+        message_id: active_turn,
+        provider: CodingProvider::Codex,
+        model: Some("gpt-5.6-sol".to_string()),
+        effort: Some("high".to_string()),
+        fast: false,
+    };
+    let first_usage = SessionEventKind::UsageUpdated {
+        provider_duration_ms: 1,
+        turn_id: Some(active_turn),
+        provider_context_reused: Some(false),
+        input_tokens: 1_000,
+        output_tokens: 100,
+        cached_input_tokens: 49_000,
+        cache_creation_input_tokens: 50_000,
+        total_tokens: 50_100,
+        cost_microusd: None,
+        cost_basis: String::new(),
+        cost_usd: None,
+        context_tokens: Some(50_100),
+        context_window_tokens: Some(100_000),
+    };
+    let unrelated_usage = SessionEventKind::UsageUpdated {
+        provider_duration_ms: 1,
+        turn_id: Some(unrelated_turn),
+        provider_context_reused: Some(true),
+        input_tokens: 100_000,
+        output_tokens: 100,
+        cached_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+        total_tokens: 100_100,
+        cost_microusd: None,
+        cost_basis: String::new(),
+        cost_usd: None,
+        context_tokens: Some(100_100),
+        context_window_tokens: Some(100_000),
+    };
+    for (sequence, kind) in [
+        (1, configured),
+        (2, started),
+        (3, first_usage),
+        (4, unrelated_usage),
+    ] {
+        transcript.apply(&SessionEvent::new(session_id, sequence, kind));
+    }
+
     assert_eq!(transcript.cache_status(Utc::now()), None);
 }
 
@@ -3046,8 +3158,16 @@ fn subagent_activity_collapses_chatter_and_keeps_terminal_result() {
     ));
     assert!(matches!(
         &transcript.order[0],
-        TranscriptEntry::Activity { text, .. }
-            if text == "agent · inspect_ui · report ready"
+        TranscriptEntry::Action {
+            kind: TranscriptActionKind::Agent,
+            label,
+            detail,
+            body: Some(body),
+            state: TranscriptActionState::Complete,
+            ..
+        } if label == "Agent"
+            && detail == "inspect_ui · report ready"
+            && body.starts_with("Found the renderer issue")
     ));
     agent.status = SubagentStatus::WaitingForApproval;
     transcript.apply(&activity(
@@ -3068,8 +3188,14 @@ fn subagent_activity_collapses_chatter_and_keeps_terminal_result() {
     assert_eq!(transcript.order.len(), 1);
     assert!(matches!(
         &transcript.order[0],
-        TranscriptEntry::Activity { text, .. }
-            if text == "agent · inspect_ui · needs approval · Run focused tests?"
+        TranscriptEntry::Action {
+            kind: TranscriptActionKind::Agent,
+            label,
+            detail,
+            state: TranscriptActionState::Waiting,
+            ..
+        } if label == "Agent"
+            && detail == "inspect_ui · needs approval · Run focused tests?"
     ));
     agent.status = SubagentStatus::Stopped;
     agent.final_text = Some("Found the renderer issue.\nExtra detail".to_string());
@@ -3078,9 +3204,67 @@ fn subagent_activity_collapses_chatter_and_keeps_terminal_result() {
     assert_eq!(transcript.order.len(), 1);
     assert!(matches!(
         &transcript.order[0],
-        TranscriptEntry::Activity { text, .. }
-            if text == "agent · inspect_ui · completed · Found the renderer issue."
+        TranscriptEntry::Action {
+            kind: TranscriptActionKind::Agent,
+            label,
+            detail,
+            body: Some(body),
+            state: TranscriptActionState::Complete,
+            ..
+        } if label == "Agent"
+            && detail == "inspect_ui · completed"
+            && body == "Found the renderer issue.\nExtra detail"
     ));
+}
+
+#[test]
+fn typed_agent_action_has_an_expandable_report_and_structured_copy() {
+    let mut transcript = Transcript::default();
+    transcript.order.push(TranscriptEntry::Action {
+        kind: TranscriptActionKind::Agent,
+        label: "Agent".to_string(),
+        detail: "/root/review · report ready".to_string(),
+        body: Some("First line\nSecond line".to_string()),
+        time: "12:00".to_string(),
+        state: TranscriptActionState::Complete,
+        expanded: false,
+    });
+
+    let collapsed = transcript
+        .lines(100)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(collapsed.contains("Agent"));
+    assert!(!collapsed.contains("Second line"));
+    assert!(transcript.action_is_expandable(0));
+    transcript.toggle_action_expansion(0);
+    let expanded = transcript
+        .lines(100)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(expanded.contains("First line"));
+    assert!(expanded.contains("Second line"));
+    assert_eq!(
+        transcript.order[0].copy_text_owned().as_deref(),
+        Some("Agent\n/root/review · report ready\nFirst line\nSecond line")
+    );
+}
+
+#[test]
+fn reasoning_snapshot_overlap_is_appended_once() {
+    let mut source = "Considering code modifications\nI’m checking".to_string();
+    Transcript::merge_reasoning_snapshot(
+        &mut source,
+        "I’m checking the repository\nfor duplicate output",
+    );
+    assert_eq!(
+        source,
+        "Considering code modifications\nI’m checking the repository\nfor duplicate output"
+    );
 }
 
 #[test]
@@ -3661,6 +3845,7 @@ fn optimistic_idle_submission_immediately_hides_cold_cache_guidance() {
             cache_creation_input_tokens: 0,
             cost_microusd: None,
             cost_basis: "unavailable",
+            provider_context_reused: None,
         },
     );
     assert!(

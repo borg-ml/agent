@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
@@ -6,12 +7,15 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use borg_provider::provider::{
     ChatApprovalDecision, ChatStreamControl, ChatStreamEvent, ChatStreamRequest,
-    LocalAgentPermission, run_claude_chat_stream_with_control, run_claude_local_chat_stream,
-    run_codex_chat_stream_with_control, run_codex_local_chat_stream,
+    ClaudeSubscriptionPool, CodexSubscriptionPool, LocalAgentPermission,
+    run_claude_chat_stream_with_control, run_claude_local_chat_stream,
+    run_claude_local_chat_stream_pooled, run_codex_chat_stream_with_control,
+    run_codex_local_chat_stream, run_codex_local_chat_stream_pooled,
 };
 use borg_provider::{ProviderCallUsage, ProviderChannel};
 use serde_json::Value;
-use tokio::sync::mpsc;
+use sha2::{Digest, Sha256};
+use tokio::sync::{Mutex, mpsc};
 use uuid::Uuid;
 
 use crate::{
@@ -58,6 +62,10 @@ pub struct AgentTurn {
     pub provider: CodingProvider,
     pub provider_session_id: Option<String>,
     pub cwd: PathBuf,
+    /// The new durable user input represented by this turn. `prompt` remains
+    /// the complete canonical replay prompt; the subscription pool uses this
+    /// delta only when its native process is proven to be the same context.
+    pub prompt_delta: String,
     pub prompt: String,
     pub attachments: Vec<PathBuf>,
     pub output_schema: Option<Value>,
@@ -197,6 +205,7 @@ pub struct LocalAgentTurnExecutor {
     native_harness: NativeHarness,
     runtime_extensions: Arc<RwLock<RuntimeExtensions>>,
     runtime_extension_loader: Option<RuntimeExtensionLoader>,
+    subscription_pools: Arc<SubscriptionPoolRegistry>,
 }
 
 type RuntimeExtensionLoader = Arc<
@@ -207,6 +216,148 @@ type RuntimeExtensionLoader = Arc<
 struct RuntimeExtensions {
     external_mcp_servers: Vec<borg_provider::mcp::ExternalMcpServer>,
     skill_roots: Vec<PathBuf>,
+}
+
+#[derive(Default)]
+struct SubscriptionPoolRegistry {
+    slots: Mutex<HashMap<Uuid, SubscriptionPoolSlot>>,
+}
+
+struct SubscriptionPoolSlot {
+    provider: CodingProvider,
+    lifecycle_key: String,
+    context_generation: u64,
+    epoch: u64,
+    healthy: bool,
+    pool: SubscriptionPool,
+}
+
+struct PreparedSubscriptionTurn {
+    prompt: String,
+    lifecycle_key: String,
+    pool: SubscriptionPool,
+    reused: bool,
+}
+
+#[derive(Clone)]
+enum SubscriptionPool {
+    Claude(ClaudeSubscriptionPool),
+    Codex(CodexSubscriptionPool),
+}
+
+impl SubscriptionPoolRegistry {
+    async fn prepare(
+        &self,
+        session_id: Uuid,
+        context_generation: u64,
+        provider: CodingProvider,
+        prompt: String,
+        prompt_delta: String,
+        lifecycle_key: String,
+    ) -> PreparedSubscriptionTurn {
+        let mut slots = self.slots.lock().await;
+        let slot = slots
+            .entry(session_id)
+            .or_insert_with(|| SubscriptionPoolSlot {
+                provider: CodingProvider::Claude,
+                lifecycle_key: String::new(),
+                context_generation,
+                epoch: 0,
+                healthy: false,
+                pool: SubscriptionPool::Claude(ClaudeSubscriptionPool::default()),
+            });
+        let append = slot.provider == provider
+            && slot.healthy
+            && slot.context_generation == context_generation
+            && slot.lifecycle_key == lifecycle_key;
+        // Reserve the slot pessimistically. If the executor task is aborted,
+        // the success callback below cannot run; the next turn must therefore
+        // replay the durable journal instead of assuming the native process
+        // still contains the complete context.
+        slot.healthy = false;
+        if !append {
+            if slot.provider != provider {
+                slot.pool = match provider {
+                    CodingProvider::Claude => {
+                        SubscriptionPool::Claude(ClaudeSubscriptionPool::default())
+                    }
+                    CodingProvider::Codex => {
+                        SubscriptionPool::Codex(CodexSubscriptionPool::default())
+                    }
+                    CodingProvider::OpenRouter | CodingProvider::OpenAiCompatible => {
+                        unreachable!("native providers do not use subscription pools")
+                    }
+                };
+            }
+            slot.epoch = slot.epoch.saturating_add(1);
+            slot.provider = provider;
+            slot.lifecycle_key = lifecycle_key.clone();
+            slot.context_generation = context_generation;
+            slot.healthy = false;
+        }
+        let effective_key = format!("{lifecycle_key}#epoch={}", slot.epoch);
+        PreparedSubscriptionTurn {
+            prompt: if append { prompt_delta } else { prompt },
+            lifecycle_key: effective_key,
+            pool: slot.pool.clone(),
+            reused: append,
+        }
+    }
+
+    async fn mark(&self, session_id: Uuid, provider: CodingProvider, healthy: bool) {
+        if let Some(slot) = self.slots.lock().await.get_mut(&session_id)
+            && slot.provider == provider
+        {
+            slot.healthy = healthy;
+            if !healthy {
+                slot.epoch = slot.epoch.saturating_add(1);
+            }
+        }
+    }
+}
+
+fn subscription_lifecycle_key(
+    turn: &AgentTurn,
+    request: &ChatStreamRequest,
+    permission: PermissionMode,
+) -> String {
+    let mcp_servers = request
+        .mcp_external_servers
+        .iter()
+        .map(|server| {
+            serde_json::json!({
+                "name": server.name,
+                "command": server.command,
+                "args": server.args,
+                "env": server.env,
+                "allowed_tools": server.allowed_tools,
+            })
+        })
+        .collect::<Vec<_>>();
+    let material = serde_json::json!({
+        "version": 2,
+        "session_id": turn.session_id,
+        "context_generation": turn.context_generation,
+        "provider": turn.provider.catalog_backend(),
+        "model": request.model,
+        "effort": request.effort,
+        "fast": request.fast,
+        "permission": format!("{permission:?}"),
+        "cwd": request.working_directory.as_ref().map(|path| path.to_string_lossy()),
+        "system_prompt": request.system_prompt,
+        "output_schema": request.output_schema,
+        "mcp_servers": mcp_servers,
+        "provider_channel": request.provider_channel.as_str(),
+        "web_search_allowed": request.web_search_allowed,
+    });
+    let digest = Sha256::digest(
+        serde_json::to_vec(&material).expect("subscription lifecycle material is serializable"),
+    );
+    let digest = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("borg-{}-{digest}", turn.provider.catalog_backend())
 }
 
 #[derive(Debug, Clone, Default)]
@@ -335,6 +486,7 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
                     BorgProviderTurnRuntime {
                         request_template: None,
                         local: true,
+                        subscription_pools: Some(Arc::clone(&self.subscription_pools)),
                     },
                     true,
                 )
@@ -423,6 +575,7 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
             BorgProviderTurnRuntime {
                 request_template: None,
                 local: true,
+                subscription_pools: None,
             },
             false,
         ));
@@ -470,6 +623,14 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
     }
 
     async fn stop_session(&self, session_id: Uuid) -> Result<()> {
+        // Dropping the slot closes the volatile native subscription process;
+        // the durable journal remains available for a later resume, which
+        // will deliberately begin with a full replay.
+        self.subscription_pools
+            .slots
+            .lock()
+            .await
+            .remove(&session_id);
         self.native_harness.stop_session(session_id).await;
         Ok(())
     }
@@ -506,6 +667,7 @@ pub async fn run_agent_turn_controlled(
                 BorgProviderTurnRuntime {
                     request_template: None,
                     local: true,
+                    subscription_pools: None,
                 },
                 true,
             )
@@ -517,6 +679,7 @@ pub async fn run_agent_turn_controlled(
 struct BorgProviderTurnRuntime {
     request_template: Option<ChatStreamRequest>,
     local: bool,
+    subscription_pools: Option<Arc<SubscriptionPoolRegistry>>,
 }
 
 async fn run_borg_provider_turn(
@@ -529,12 +692,14 @@ async fn run_borg_provider_turn(
     let BorgProviderTurnRuntime {
         request_template,
         local,
+        subscription_pools,
     } = runtime;
     let provider_turn_started = Instant::now();
     let ttft_session_id = turn.session_id;
     let ttft_message_id = turn.message_id;
+    let pool_turn = turn.clone();
     let response_language_instruction = turn.response_language.instruction();
-    let request = match request_template {
+    let mut request = match request_template {
         Some(mut request) => {
             request.prompt = turn.prompt.clone();
             request.owner_session_id = Some(turn.session_id.to_string());
@@ -580,6 +745,7 @@ async fn run_borg_provider_turn(
             };
             ChatStreamRequest {
                 prompt: turn.prompt.clone(),
+                lifecycle_key: None,
                 owner_session_id: Some(turn.session_id.to_string()),
                 client_user_message_id: Some(turn.message_id.to_string()),
                 attachments: turn.attachments,
@@ -612,21 +778,70 @@ async fn run_borg_provider_turn(
         }
     };
     let permission = local_permission(turn.permission_mode);
+    let pool_invocation = if local
+        && matches!(
+            turn.provider,
+            CodingProvider::Claude | CodingProvider::Codex
+        )
+        && let Some(registry) = subscription_pools.as_ref()
+    {
+        let lifecycle_key = subscription_lifecycle_key(&pool_turn, &request, turn.permission_mode);
+        let prepared = registry
+            .prepare(
+                turn.session_id,
+                turn.context_generation,
+                turn.provider,
+                turn.prompt.clone(),
+                turn.prompt_delta.clone(),
+                lifecycle_key,
+            )
+            .await;
+        request.prompt = prepared.prompt.clone();
+        request.lifecycle_key = Some(prepared.lifecycle_key.clone());
+        Some((Arc::clone(registry), prepared))
+    } else {
+        None
+    };
+    let pooled_claude = pool_invocation
+        .as_ref()
+        .and_then(|(_, prepared)| match &prepared.pool {
+            SubscriptionPool::Claude(pool) => Some(pool.clone()),
+            SubscriptionPool::Codex(_) => None,
+        });
+    let pooled_codex = pool_invocation
+        .as_ref()
+        .and_then(|(_, prepared)| match &prepared.pool {
+            SubscriptionPool::Claude(_) => None,
+            SubscriptionPool::Codex(pool) => Some(pool.clone()),
+        });
     let interrupted = Arc::new(AtomicBool::new(false));
     let mut stream = match turn.provider {
         CodingProvider::Codex => {
             let control_rx = map_controls(controls, Arc::clone(&interrupted));
-            if local {
+            if let Some(pool) = pooled_codex {
+                run_codex_local_chat_stream_pooled(request, control_rx, permission, pool)
+            } else if local {
                 run_codex_local_chat_stream(request, control_rx, permission)
             } else {
                 run_codex_chat_stream_with_control(request, control_rx)
             }
         }
-        CodingProvider::Claude if local => run_claude_local_chat_stream(
-            request,
-            map_controls(controls, Arc::clone(&interrupted)),
-            permission,
-        ),
+        CodingProvider::Claude if local => {
+            if let Some(pool) = pooled_claude {
+                run_claude_local_chat_stream_pooled(
+                    request,
+                    map_controls(controls, Arc::clone(&interrupted)),
+                    permission,
+                    pool,
+                )
+            } else {
+                run_claude_local_chat_stream(
+                    request,
+                    map_controls(controls, Arc::clone(&interrupted)),
+                    permission,
+                )
+            }
+        }
         CodingProvider::Claude => run_claude_chat_stream_with_control(
             request,
             map_controls(controls, Arc::clone(&interrupted)),
@@ -897,6 +1112,10 @@ async fn run_borg_provider_turn(
                         &events,
                         SessionEventKind::UsageUpdated {
                             provider_duration_ms: usage.duration_ms,
+                            turn_id: Some(turn.message_id),
+                            provider_context_reused: pool_invocation
+                                .as_ref()
+                                .map(|(_, prepared)| prepared.reused),
                             input_tokens: usage.input_tokens,
                             output_tokens: usage.output_tokens,
                             cached_input_tokens: usage.cached_input_tokens,
@@ -923,6 +1142,9 @@ async fn run_borg_provider_turn(
                 ) {
                     Ok(text) => text,
                     Err(error) => {
+                        if let Some((registry, _)) = pool_invocation.as_ref() {
+                            registry.mark(turn.session_id, turn.provider, false).await;
+                        }
                         send(
                             &events,
                             SessionEventKind::Error {
@@ -950,6 +1172,9 @@ async fn run_borg_provider_turn(
                 }
             }
             ChatStreamEvent::Failed { error } => {
+                if let Some((registry, _)) = pool_invocation.as_ref() {
+                    registry.mark(turn.session_id, turn.provider, false).await;
+                }
                 let error = user_facing_provider_error(turn.provider, &error);
                 send(
                     &events,
@@ -963,6 +1188,9 @@ async fn run_borg_provider_turn(
         }
     }
     if let Err(error) = require_provider_stream_terminal(terminal_seen) {
+        if let Some((registry, _)) = pool_invocation.as_ref() {
+            registry.mark(turn.session_id, turn.provider, false).await;
+        }
         send(
             &events,
             SessionEventKind::Error {
@@ -980,6 +1208,15 @@ async fn run_borg_provider_turn(
         },
     )
     .await;
+    if let Some((registry, _)) = pool_invocation.as_ref() {
+        registry
+            .mark(
+                turn.session_id,
+                turn.provider,
+                !interrupted.load(Ordering::Acquire),
+            )
+            .await;
+    }
     Ok(AgentTurnResult {
         provider_session_id,
         final_text: if final_output.is_empty() {
@@ -1011,8 +1248,30 @@ fn normalize_reasoning_delta(accumulated: &mut String, incoming: &str) -> Option
     if accumulated.starts_with(incoming) {
         return None;
     }
-    accumulated.push_str(incoming);
-    Some(incoming.to_string())
+    // Some subscription/CLI versions switch between incremental chunks and
+    // cumulative snapshots without preserving the exact byte prefix (for
+    // example, a chunk may repeat the last line after a reconnect). Append
+    // only the non-overlapping suffix so the durable live row cannot grow a
+    // second copy of the previous thought.
+    let overlap = longest_suffix_prefix_overlap(accumulated, incoming);
+    let delta = &incoming[overlap..];
+    if delta.is_empty() {
+        return None;
+    }
+    accumulated.push_str(delta);
+    Some(delta.to_string())
+}
+
+fn longest_suffix_prefix_overlap(left: &str, right: &str) -> usize {
+    let maximum = left.len().min(right.len());
+    (1..=maximum)
+        .rev()
+        .find(|overlap| {
+            left.is_char_boundary(left.len() - overlap)
+                && right.is_char_boundary(*overlap)
+                && left.as_bytes()[left.len() - overlap..] == right.as_bytes()[..*overlap]
+        })
+        .unwrap_or(0)
 }
 
 fn terminal_assistant_text(
@@ -1272,6 +1531,54 @@ mod tests {
         let snapshot = executor.runtime_extensions.read().unwrap();
         assert_eq!(snapshot.external_mcp_servers[0].name, "reloaded");
         assert_eq!(snapshot.skill_roots, [PathBuf::from("reloaded-skills")]);
+    }
+
+    #[tokio::test]
+    async fn subscription_pool_replays_after_failure_and_appends_only_when_healthy() {
+        let registry = SubscriptionPoolRegistry::default();
+        let session_id = Uuid::new_v4();
+        let first = registry
+            .prepare(
+                session_id,
+                0,
+                CodingProvider::Claude,
+                "canonical history + first".to_string(),
+                "<borg-message>first</borg-message>".to_string(),
+                "stable-config".to_string(),
+            )
+            .await;
+        assert_eq!(first.prompt, "canonical history + first");
+        registry
+            .mark(session_id, CodingProvider::Claude, true)
+            .await;
+
+        let appended = registry
+            .prepare(
+                session_id,
+                0,
+                CodingProvider::Claude,
+                "canonical history + first + second".to_string(),
+                "<borg-message>second</borg-message>".to_string(),
+                "stable-config".to_string(),
+            )
+            .await;
+        assert_eq!(appended.prompt, "<borg-message>second</borg-message>");
+
+        registry
+            .mark(session_id, CodingProvider::Claude, false)
+            .await;
+        let replay = registry
+            .prepare(
+                session_id,
+                0,
+                CodingProvider::Claude,
+                "canonical history + first + second + third".to_string(),
+                "<borg-message>third</borg-message>".to_string(),
+                "stable-config".to_string(),
+            )
+            .await;
+        assert_eq!(replay.prompt, "canonical history + first + second + third");
+        assert_ne!(appended.lifecycle_key, replay.lifecycle_key);
     }
 
     #[tokio::test]

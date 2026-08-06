@@ -969,7 +969,8 @@ struct GitInvocation {
 }
 
 fn git_summary(command: &str) -> Option<GitCall> {
-    let words = shell_words(command);
+    let normalized_command = unwrapped_shell_command(command);
+    let words = shell_words(&normalized_command);
     let invocations = git_invocations(command);
     let first = invocations.first()?;
     if words
@@ -986,7 +987,10 @@ fn git_summary(command: &str) -> Option<GitCall> {
     let same_action = invocations
         .iter()
         .all(|invocation| invocation.action == first.action);
-    let label = if invocations.len() == 1 {
+    let mut auxiliary_detail = git_auxiliary_detail(&words)?;
+    let label = if !auxiliary_detail.is_empty() {
+        "Inspect repository".to_string()
+    } else if invocations.len() == 1 {
         first.action.label().to_string()
     } else if same_action {
         repeated_git_label(first.action)
@@ -999,14 +1003,15 @@ fn git_summary(command: &str) -> Option<GitCall> {
         "Run Git operations".to_string()
     };
     let detail = if same_action {
-        invocations
+        let mut detail = invocations
             .iter()
             .map(|invocation| git_invocation_detail(invocation.action, &invocation.arguments))
             .filter(|detail| !detail.is_empty())
-            .collect::<Vec<_>>()
-            .join(", ")
+            .collect::<Vec<_>>();
+        detail.append(&mut auxiliary_detail);
+        detail.join(", ")
     } else {
-        invocations
+        let mut detail = invocations
             .iter()
             .map(|invocation| {
                 let detail = git_invocation_detail(invocation.action, &invocation.arguments);
@@ -1016,10 +1021,67 @@ fn git_summary(command: &str) -> Option<GitCall> {
                     format!("{}: {detail}", git_action_name(invocation.action))
                 }
             })
-            .collect::<Vec<_>>()
-            .join(", ")
+            .collect::<Vec<_>>();
+        detail.append(&mut auxiliary_detail);
+        detail.join(", ")
     };
     Some(GitCall { label, detail })
+}
+
+/// Return read-only commands composed after a Git invocation. A shell
+/// pipeline is treated as presentation plumbing (`git show … | sed …`), but
+/// a command joined with `&&` or `;` is part of the user's actual operation
+/// and should be visible in the summary. Any unknown or mutating command
+/// makes the Git-specific projection unsafe, so the caller falls back to the
+/// generic execution summary instead of hiding it.
+fn git_auxiliary_detail(words: &[String]) -> Option<Vec<String>> {
+    let mut details = Vec::new();
+    for (operator, segment) in shell_command_segments(words) {
+        if segment.is_empty() || git_invocation(&segment).is_some() {
+            continue;
+        }
+        if operator == Some("|") || is_shell_setup_segment(&segment) {
+            continue;
+        }
+        let command = segment.join(" ");
+        if !command_is_read_only(&command) {
+            return None;
+        }
+        let detail = if let Some(query) = search_query(&command) {
+            format!("search: {}", compact_text(&query, 120))
+        } else {
+            format!("read: {}", compact_text(&command, 120))
+        };
+        details.push(detail);
+    }
+    Some(details)
+}
+
+fn shell_command_segments(words: &[String]) -> Vec<(Option<&str>, Vec<String>)> {
+    let mut segments = Vec::new();
+    let mut segment = Vec::new();
+    let mut operator = None;
+    for word in words {
+        if is_shell_operator(word) {
+            if !segment.is_empty() {
+                segments.push((operator, std::mem::take(&mut segment)));
+            }
+            operator = Some(word.as_str());
+        } else {
+            segment.push(word.clone());
+        }
+    }
+    if !segment.is_empty() {
+        segments.push((operator, segment));
+    }
+    segments
+}
+
+fn is_shell_setup_segment(segment: &[String]) -> bool {
+    let Some(command) = segment.first().and_then(|word| word.rsplit('/').next()) else {
+        return true;
+    };
+    matches!(command, "cd" | "true" | "false" | ":")
 }
 
 fn git_invocations(command: &str) -> Vec<GitInvocation> {
@@ -2214,8 +2276,8 @@ mod tests {
             ),
             (
                 "git status && rg '!*target*' . | sed -n '1,160p'",
-                "Git status",
-                "",
+                "Inspect repository",
+                "search: !*target*",
             ),
             (
                 "git status && git diff --stat HEAD",

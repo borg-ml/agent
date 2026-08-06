@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use serde_json::Value;
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 use tokio::time::Sleep;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -27,6 +27,7 @@ use crate::{
 use borg_provider::ProviderCallUsage;
 
 const ROOT_INBOX_REFRESH_INTERVAL: Duration = Duration::from_millis(50);
+const WORKSPACE_PROJECTION_REPAIR_BATCH_SIZE: usize = 512;
 const RETAINED_COMPACTION_SYSTEM_PROMPT: &str = "This is an internal context-compaction preparation turn. Do not use tools, modify files, or answer the user. Return only a compact continuation summary of the supplied prior provider conversation.";
 const SUBSCRIPTION_CONTEXT_HEADER: &str = "Borg canonical provider context v2. The history below is a read-only, provider-neutral projection of durable Borg state; answer the current request normally.\n";
 // Codex app-server rejects a single input at 1 MiB. Leave room for the JSON-RPC
@@ -194,13 +195,30 @@ struct WorkspaceProjection {
     workspace_id: Uuid,
     agent_participant_id: Uuid,
     human_participant_id: Uuid,
+    inherited_sequence: u64,
+    projected_sequence: Arc<Mutex<u64>>,
 }
 
 impl WorkspaceProjection {
-    async fn project(&self, event: &SessionEvent) -> Result<()> {
-        if event.sequence == 0 {
-            return Ok(());
+    fn new(
+        store: SqliteWorkspaceStore,
+        workspace_id: Uuid,
+        agent_participant_id: Uuid,
+        human_participant_id: Uuid,
+        inherited_sequence: u64,
+        projected_sequence: u64,
+    ) -> Self {
+        Self {
+            store,
+            workspace_id,
+            agent_participant_id,
+            human_participant_id,
+            inherited_sequence,
+            projected_sequence: Arc::new(Mutex::new(projected_sequence.max(inherited_sequence))),
         }
+    }
+
+    fn workspace_event(&self, event: &SessionEvent) -> WorkspaceEvent {
         let projection_id = Uuid::new_v5(&event.id, b"borg-workspace-session-event");
         let author_id = match &event.kind {
             SessionEventKind::Message {
@@ -209,10 +227,76 @@ impl WorkspaceProjection {
             } => self.human_participant_id,
             _ => self.agent_participant_id,
         };
-        let idempotency_key = format!("session-event:{}", event.id);
+        WorkspaceEvent {
+            id: projection_id,
+            workspace_id: self.workspace_id,
+            sequence: 0,
+            author_id,
+            idempotency_key: format!("session-event:{}", event.id),
+            created_at: event.created_at,
+            kind: WorkspaceEventKind::SessionEvent {
+                session_id: event.session_id,
+                session_event_id: event.id,
+                session_sequence: event.sequence,
+                mode: crate::DeliveryMode::Notify,
+            },
+        }
+    }
+
+    fn needs_delivery_transition(event: &SessionEvent) -> bool {
+        matches!(
+            &event.kind,
+            SessionEventKind::Message {
+                actor: EventActor::User,
+                status: MessageStatus::Complete,
+                ..
+            } | SessionEventKind::PromptRecalled { .. }
+                | SessionEventKind::TurnCompleted { .. }
+        )
+    }
+
+    /// Project a newly appended event when it is the next contiguous event.
+    ///
+    /// A repair task may be catching up older events. Never append a newer
+    /// event ahead of that repair: doing so would make a max(sequence) query
+    /// falsely declare the projection complete and would scramble workspace
+    /// ordering. The source session remains authoritative while the lagging
+    /// event is picked up by `repair`.
+    async fn project(&self, event: &SessionEvent) -> Result<()> {
+        if event.sequence == 0 {
+            return Ok(());
+        }
+        if event.sequence <= self.inherited_sequence {
+            return Ok(());
+        }
+        let mut projected = self.projected_sequence.lock().await;
+        if event.sequence <= *projected {
+            return Ok(());
+        }
+        if event.sequence != projected.saturating_add(1) {
+            tracing::debug!(
+                workspace_id = %self.workspace_id,
+                session_id = %event.session_id,
+                session_sequence = event.sequence,
+                projected_sequence = *projected,
+                "deferring out-of-order workspace projection until repair catches up"
+            );
+            return Ok(());
+        }
+        self.project_one(event).await?;
+        *projected = event.sequence;
+        Ok(())
+    }
+
+    async fn project_one(&self, event: &SessionEvent) -> Result<()> {
+        let workspace_event = self.workspace_event(event);
         if self
             .store
-            .contains_idempotent_event(self.workspace_id, author_id, &idempotency_key)
+            .contains_idempotent_event(
+                workspace_event.workspace_id,
+                workspace_event.author_id,
+                &workspace_event.idempotency_key,
+            )
             .await?
         {
             return Ok(());
@@ -265,24 +349,114 @@ impl WorkspaceProjection {
             }
             _ => {}
         }
-        self.store
-            .append(WorkspaceEvent {
-                id: projection_id,
-                workspace_id: self.workspace_id,
-                sequence: 0,
-                author_id,
-                idempotency_key,
-                created_at: event.created_at,
-                kind: WorkspaceEventKind::SessionEvent {
-                    session_id: event.session_id,
-                    session_event_id: event.id,
-                    session_sequence: event.sequence,
-                    mode: crate::DeliveryMode::Notify,
-                },
-            })
-            .await?;
+        self.store.append(workspace_event).await?;
         Ok(())
     }
+
+    async fn flush_repair_batch(
+        &self,
+        batch: &mut Vec<SessionEvent>,
+        projected: &mut u64,
+    ) -> Result<()> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let workspace_events = batch
+            .iter()
+            .map(|event| self.workspace_event(event))
+            .collect::<Vec<_>>();
+        self.store
+            .append_session_event_batch(&workspace_events)
+            .await?;
+        *projected = batch.last().map_or(*projected, |event| event.sequence);
+        batch.clear();
+        Ok(())
+    }
+
+    /// Repair the workspace suffix without delaying provider startup.
+    ///
+    /// The repair cursor is shared with foreground projection so a live event
+    /// can never be inserted ahead of an older suffix. Ordinary session-event
+    /// references are inserted in 512-row transactions; delivery-boundary
+    /// events still use the single-event path because they can transition an
+    /// existing workspace delivery.
+    async fn repair(&self, store: Arc<dyn SessionStore>, session_id: Uuid) -> Result<()> {
+        loop {
+            let after = *self.projected_sequence.lock().await;
+            let events = store
+                .events_after(
+                    session_id,
+                    after.max(self.inherited_sequence),
+                    WORKSPACE_PROJECTION_REPAIR_BATCH_SIZE,
+                )
+                .await?;
+            if events.is_empty() {
+                return Ok(());
+            }
+
+            let mut projected = self.projected_sequence.lock().await;
+            // `projected` is the last sequence committed to the workspace.
+            // Ordinary rows are buffered for one transaction, so the durable
+            // cursor does not move until the batch flushes. Validate against a
+            // separate in-memory cursor while walking that batch; comparing
+            // every row with `projected` made the second row look like a gap
+            // (`expected N, received N+1`) and stopped repair immediately.
+            let mut contiguous = *projected;
+            let mut batch = Vec::with_capacity(WORKSPACE_PROJECTION_REPAIR_BATCH_SIZE);
+            for event in events {
+                if event.sequence <= self.inherited_sequence || event.sequence <= contiguous {
+                    continue;
+                }
+                anyhow::ensure!(
+                    event.sequence == contiguous.saturating_add(1),
+                    "workspace projection repair encountered a sequence gap: expected {}, received {}",
+                    contiguous.saturating_add(1),
+                    event.sequence
+                );
+                contiguous = event.sequence;
+                if Self::needs_delivery_transition(&event) {
+                    self.flush_repair_batch(&mut batch, &mut projected).await?;
+                    self.project_one(&event).await?;
+                    *projected = event.sequence;
+                    contiguous = *projected;
+                } else {
+                    batch.push(event);
+                    if batch.len() >= WORKSPACE_PROJECTION_REPAIR_BATCH_SIZE {
+                        self.flush_repair_batch(&mut batch, &mut projected).await?;
+                        contiguous = *projected;
+                    }
+                }
+            }
+            self.flush_repair_batch(&mut batch, &mut projected).await?;
+            drop(projected);
+            tokio::task::yield_now().await;
+        }
+    }
+}
+
+fn start_workspace_projection_repair(
+    started: &mut bool,
+    projection: Option<&WorkspaceProjection>,
+    store: &Arc<dyn SessionStore>,
+    session_id: Uuid,
+) {
+    if *started {
+        return;
+    }
+    *started = true;
+    let Some(projection) = projection.cloned() else {
+        return;
+    };
+    let store = Arc::clone(store);
+    tokio::spawn(async move {
+        if let Err(error) = projection.repair(store, session_id).await {
+            tracing::warn!(
+                %session_id,
+                %error,
+                "workspace projection repair stopped; the source session remains authoritative"
+            );
+        }
+    });
 }
 
 impl RuntimeSessionStore {
@@ -761,27 +935,22 @@ async fn run_agent_session_store_kernel(
                 agent_display_name,
             )
             .await?;
-        let projection = WorkspaceProjection {
-            store: workspace_store,
-            workspace_id: binding.workspace_id,
-            agent_participant_id: binding.participant_id,
-            human_participant_id,
-        };
         // Inherited events were already projected by the fork parent, and reads
         // renumber them into this session's sequence space under fresh event
         // ids, so replaying them would re-append the whole ancestry to the
         // workspace under a participant that was never in its audiences.
         let inherited = store.inherited_event_count(session_id).await?;
-        let projected = projection
-            .store
+        let projected = workspace_store
             .latest_projected_session_sequence(binding.workspace_id, session_id)
             .await?;
-        for event in store
-            .events_after(session_id, inherited.max(projected), usize::MAX)
-            .await?
-        {
-            projection.project(&event).await?;
-        }
+        let projection = WorkspaceProjection::new(
+            workspace_store,
+            binding.workspace_id,
+            binding.participant_id,
+            human_participant_id,
+            inherited,
+            projected,
+        );
         Some(projection)
     } else {
         None
@@ -876,6 +1045,7 @@ async fn run_agent_session_store_kernel(
     let mut deferred_commands = VecDeque::new();
     let mut team_message_ids = HashSet::new();
     let mut at_turn_boundary = !pending.is_empty();
+    let mut projection_repair_started = false;
     let mut next_ready_detail = (!fresh).then(|| "Resumed".to_string());
     let (goal_tool_tx, mut goal_tool_rx) = mpsc::channel(8);
     let goal_tools = SessionGoalTools {
@@ -1069,6 +1239,12 @@ async fn run_agent_session_store_kernel(
                 },
             )
             .await?;
+            start_workspace_projection_repair(
+                &mut projection_repair_started,
+                workspace_projection.as_ref(),
+                &store,
+                session_id,
+            );
             loop {
                 let command = tokio::select! {
                     biased;
@@ -1407,6 +1583,7 @@ async fn run_agent_session_store_kernel(
                                         provider: launch.provider,
                                         provider_session_id: None,
                                         cwd: launch.cwd.clone(),
+                                        prompt_delta: retained_compaction_prompt(&context),
                                         prompt: retained_compaction_prompt(&context),
                                         attachments: Vec::new(),
                                         output_schema: None,
@@ -1439,7 +1616,7 @@ async fn run_agent_session_store_kernel(
                                         &mut journal,
                                         &events,
                                         session_id,
-                                        native_usage_event(&native.usage),
+                                        native_usage_event(&native.usage, None),
                                     )
                                     .await?;
                                 }
@@ -1651,7 +1828,7 @@ async fn run_agent_session_store_kernel(
                             &mut journal,
                             &events,
                             session_id,
-                            native_usage_event(&compaction.usage),
+                            native_usage_event(&compaction.usage, Some(prompt.message_id)),
                         )
                         .await?;
                         record(
@@ -1775,7 +1952,7 @@ async fn run_agent_session_store_kernel(
                         &mut journal,
                         &events,
                         session_id,
-                        native_usage_event(&compaction.usage),
+                        native_usage_event(&compaction.usage, Some(prompt.message_id)),
                     )
                     .await?;
                     record(
@@ -1908,6 +2085,12 @@ async fn run_agent_session_store_kernel(
             },
         )
         .await?;
+        start_workspace_projection_repair(
+            &mut projection_repair_started,
+            workspace_projection.as_ref(),
+            &store,
+            session_id,
+        );
         if let Some(action) = store
             .claim_action(
                 session_id,
@@ -1950,6 +2133,14 @@ async fn run_agent_session_store_kernel(
             provider: launch.provider,
             provider_session_id: provider_session_id.clone(),
             cwd: launch.cwd.clone(),
+            prompt_delta: if launch.provider.uses_native_harness() {
+                prompt.text.clone()
+            } else {
+                format_subscription_frame(&format_subscription_actor_value(
+                    prompt.actor,
+                    &prompt.text,
+                ))
+            },
             prompt: provider_prompt,
             attachments: prompt.attachments,
             output_schema: prompt.output_schema,
@@ -2901,7 +3092,7 @@ async fn run_agent_session_store_kernel(
                             &mut journal,
                             &events,
                             session_id,
-                            native_usage_event(&consultation.usage),
+                        native_usage_event(&consultation.usage, Some(prompt.message_id)),
                         )
                         .await?;
                     }
@@ -3317,9 +3508,14 @@ fn native_auto_compaction_needed(state: &SessionState) -> bool {
                 .saturating_mul(100 - u128::from(NATIVE_AUTO_COMPACT_REMAINING_PERCENT))
 }
 
-fn native_usage_event(usage: &borg_provider::ProviderCallUsage) -> SessionEventKind {
+fn native_usage_event(
+    usage: &borg_provider::ProviderCallUsage,
+    turn_id: Option<Uuid>,
+) -> SessionEventKind {
     SessionEventKind::UsageUpdated {
         provider_duration_ms: usage.duration_ms,
+        turn_id,
+        provider_context_reused: None,
         input_tokens: usage.input_tokens,
         output_tokens: usage.output_tokens,
         cached_input_tokens: usage.cached_input_tokens,
@@ -3433,6 +3629,7 @@ async fn compact_subscription_context_for_budget(
                     provider: launch.provider,
                     provider_session_id: None,
                     cwd: launch.cwd.clone(),
+                    prompt_delta: retained_compaction_prompt(&chunk),
                     prompt: retained_compaction_prompt(&chunk),
                     attachments: Vec::new(),
                     output_schema: None,
@@ -5340,12 +5537,14 @@ mod tests {
             )
             .await
             .unwrap();
-        let projection = WorkspaceProjection {
-            store: workspace_store.clone(),
-            workspace_id: binding.workspace_id,
-            agent_participant_id: binding.participant_id,
-            human_participant_id: human_id,
-        };
+        let projection = WorkspaceProjection::new(
+            workspace_store.clone(),
+            binding.workspace_id,
+            binding.participant_id,
+            human_id,
+            0,
+            0,
+        );
         let store: Arc<dyn SessionStore> = session_store.clone();
         let mut runtime = RuntimeSessionStore::new(store.clone(), Vec::new())
             .with_workspace_projection(projection.clone());
@@ -5518,12 +5717,14 @@ mod tests {
                 .unwrap(),
         );
         session_store.create_session(session_id).await.unwrap();
-        let projection = WorkspaceProjection {
-            store: session_store.workspace_store().await.unwrap().unwrap(),
-            workspace_id: Uuid::new_v4(),
-            agent_participant_id: Uuid::new_v4(),
-            human_participant_id: Uuid::new_v4(),
-        };
+        let projection = WorkspaceProjection::new(
+            session_store.workspace_store().await.unwrap().unwrap(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            0,
+            0,
+        );
         let store: Arc<dyn SessionStore> = session_store.clone();
         let mut runtime =
             RuntimeSessionStore::new(store, Vec::new()).with_workspace_projection(projection);
@@ -5592,12 +5793,14 @@ mod tests {
             )
             .await
             .unwrap();
-        let projection = WorkspaceProjection {
-            store: workspace_store.clone(),
-            workspace_id: binding.workspace_id,
-            agent_participant_id: binding.participant_id,
-            human_participant_id: human_id,
-        };
+        let projection = WorkspaceProjection::new(
+            workspace_store.clone(),
+            binding.workspace_id,
+            binding.participant_id,
+            human_id,
+            0,
+            0,
+        );
         let store: Arc<dyn SessionStore> = session_store.clone();
         let mut runtime = RuntimeSessionStore::new(store.clone(), Vec::new())
             .with_workspace_projection(projection.clone());
@@ -5691,12 +5894,14 @@ mod tests {
             )
             .await
             .unwrap();
-        let fork_projection = WorkspaceProjection {
-            store: workspace_store.clone(),
-            workspace_id: fork_binding.workspace_id,
-            agent_participant_id: fork_binding.participant_id,
-            human_participant_id: human_id,
-        };
+        let fork_projection = WorkspaceProjection::new(
+            workspace_store.clone(),
+            fork_binding.workspace_id,
+            fork_binding.participant_id,
+            human_id,
+            fork.inherited_event_count,
+            0,
+        );
 
         // The hazard: a plain read renumbers the ancestry into the fork's own
         // identity, so filtering on session_id cannot separate the two.

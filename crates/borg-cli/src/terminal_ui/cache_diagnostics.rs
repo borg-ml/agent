@@ -43,6 +43,7 @@ pub(super) struct CacheUsage<'a> {
     pub cache_creation_input_tokens: u64,
     pub cost_microusd: Option<u64>,
     pub cost_basis: &'a str,
+    pub provider_context_reused: Option<bool>,
 }
 
 #[derive(Default)]
@@ -69,6 +70,7 @@ enum CacheMissCause {
     ModelChanged,
     EffortChanged,
     ModelAndEffortChanged,
+    BorgReplayedContext,
     Idle(Duration),
     Unknown,
 }
@@ -97,9 +99,10 @@ impl CacheDiagnostics {
     }
 
     pub(super) fn needs_idle_timer(&self) -> bool {
-        self.previous
-            .as_ref()
-            .is_some_and(|previous| cache_window(previous.signature.provider).is_some())
+        self.previous.as_ref().is_some_and(|previous| {
+            previous.cache_telemetry_available
+                && cache_window(previous.signature.provider).is_some()
+        })
     }
 
     pub(super) fn observe(
@@ -119,11 +122,17 @@ impl CacheDiagnostics {
             return None;
         }
 
-        let cache_telemetry_available = matches!(
-            signature.provider,
-            CodingProvider::Codex | CodingProvider::Claude
-        ) || usage.cached_input_tokens > 0
-            || usage.cache_creation_input_tokens > 0;
+        // A zero counter is ambiguous: some subscription/runtime versions
+        // omit cache fields entirely, while a real cold request also reports
+        // zero. Start warning only after this lane has actually exposed a
+        // positive cache-read/write counter, then carry that knowledge across
+        // later zero-hit turns.
+        let cache_telemetry_available = (usage.cached_input_tokens > 0
+            || usage.cache_creation_input_tokens > 0)
+            || self
+                .previous
+                .as_ref()
+                .is_some_and(|previous| previous.cache_telemetry_available);
         let had_prior_prompt = self.previous.is_some();
         let notice = self.previous.as_ref().and_then(|previous| {
             if !(cache_telemetry_available || previous.cache_telemetry_available) {
@@ -139,7 +148,7 @@ impl CacheDiagnostics {
                 prompt_tokens,
                 reusable_prefix_tokens,
                 cached_input_tokens: usage.cached_input_tokens,
-                cause: cache_miss_cause(previous, &signature, at),
+                cause: cache_miss_cause(previous, &signature, at, usage.provider_context_reused),
                 model: signature.model.clone(),
                 turn_cost_microusd: usage.cost_microusd,
                 cost_basis: usage.cost_basis.to_string(),
@@ -179,6 +188,9 @@ impl CacheDiagnostics {
         signature: &CacheSignature,
     ) -> Option<CacheStatus> {
         let previous = self.previous.as_ref()?;
+        if !previous.cache_telemetry_available {
+            return None;
+        }
         if previous.signature.provider != signature.provider {
             return Some(warning_status(
                 "cache cold · provider changed",
@@ -273,7 +285,16 @@ impl CacheMissNotice {
             ),
             format!("{hit_percent}% cache hit"),
         ];
-        if let Some(model) = self.model.as_deref()
+        // Only explicit API billing bases justify a dollar projection. Native
+        // subscription adapters report token counters for observability, and
+        // legacy/unknown telemetry must remain cost-free rather than being
+        // guessed into an API bill.
+        let api_billing_basis = matches!(
+            self.cost_basis.as_str(),
+            "provider_reported" | "estimated_from_pricing"
+        );
+        if api_billing_basis
+            && let Some(model) = self.model.as_deref()
             && let Some(cost) =
                 estimate_openai_cache_miss_microusd(model, self.missed_tokens, self.prompt_tokens)
         {
@@ -282,15 +303,19 @@ impl CacheMissNotice {
                 format_microusd(cost)
             ));
         }
-        if let Some(cost) = self.turn_cost_microusd {
+        if api_billing_basis && let Some(cost) = self.turn_cost_microusd {
             let label = match self.cost_basis.as_str() {
                 "provider_reported" => "provider-reported turn cost",
                 "estimated_from_pricing" => "estimated API-equivalent turn cost",
-                _ => "turn cost",
+                _ => return self.text_without_cost(facts),
             };
             facts.push(format!("{label} {}", format_microusd(cost)));
         }
 
+        self.text_without_cost(facts)
+    }
+
+    fn text_without_cost(&self, facts: Vec<String>) -> String {
         format!(
             "{}.\nLikely cause: {}.\nIf the earlier conversation is no longer useful, \
              /clear starts a fresh context. /compact keeps a lossy summary and also starts a new \
@@ -308,6 +333,9 @@ impl CacheMissCause {
             Self::ModelChanged => "the model changed".to_string(),
             Self::EffortChanged => "reasoning effort changed".to_string(),
             Self::ModelAndEffortChanged => "the model and reasoning effort changed".to_string(),
+            Self::BorgReplayedContext => {
+                "Borg had to replay the durable journal into a new provider context".to_string()
+            }
             Self::Idle(duration) => format!(
                 "{} idle exceeded the provider's usual cache window",
                 format_duration(*duration)
@@ -324,6 +352,7 @@ fn cache_miss_cause(
     previous: &PromptSnapshot,
     current: &CacheSignature,
     at: DateTime<Utc>,
+    provider_context_reused: Option<bool>,
 ) -> CacheMissCause {
     if previous.signature.provider != current.provider {
         return CacheMissCause::ProviderChanged;
@@ -336,6 +365,9 @@ fn cache_miss_cause(
         (true, false) => return CacheMissCause::ModelChanged,
         (false, true) => return CacheMissCause::EffortChanged,
         (false, false) => {}
+    }
+    if provider_context_reused == Some(false) {
+        return CacheMissCause::BorgReplayedContext;
     }
     let idle = elapsed(previous.at, at);
     if cache_window(current.provider).is_some_and(|window| idle >= window) {
@@ -439,6 +471,7 @@ mod tests {
             cache_creation_input_tokens: cache_creation,
             cost_microusd: None,
             cost_basis: "unavailable",
+            provider_context_reused: None,
         }
     }
 
@@ -640,6 +673,15 @@ mod tests {
                 )
                 .is_none()
         );
+
+        let mut diagnostics = CacheDiagnostics::default();
+        let codex = signature("gpt-5.6-sol", "high");
+        diagnostics.observe(at, codex.clone(), usage(50_000, 0));
+        assert!(
+            diagnostics
+                .observe(at + TimeDelta::minutes(1), codex, usage(50_500, 0))
+                .is_none()
+        );
     }
 
     #[test]
@@ -658,5 +700,45 @@ mod tests {
                 )
                 .is_none()
         );
+    }
+
+    #[test]
+    fn a_short_interval_is_not_reported_as_idle_expiry() {
+        let mut diagnostics = CacheDiagnostics::default();
+        let at = Utc::now();
+        let signature = claude_signature("claude-opus-5");
+        diagnostics.observe(at, signature.clone(), usage(1_000, 99_000));
+
+        let notice = diagnostics
+            .observe(at + TimeDelta::seconds(2), signature, usage(100_000, 0))
+            .expect("observed short-interval miss");
+        assert_eq!(notice.cause, CacheMissCause::Unknown);
+        assert!(!notice.text().contains("idle exceeded"));
+    }
+
+    #[test]
+    fn subscription_usage_never_looks_like_an_api_bill() {
+        let mut diagnostics = CacheDiagnostics::default();
+        let at = Utc::now();
+        let signature = claude_signature("claude-opus-5");
+        diagnostics.observe(at, signature.clone(), usage(1_000, 99_000));
+        let notice = diagnostics
+            .observe(
+                at + TimeDelta::seconds(2),
+                signature,
+                CacheUsage {
+                    input_tokens: 100_000,
+                    cached_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                    cost_microusd: Some(1_100_000),
+                    cost_basis: "subscription_equivalent",
+                    provider_context_reused: Some(true),
+                },
+            )
+            .expect("observed subscription miss");
+        let text = notice.text();
+        assert!(!text.contains("$"));
+        assert!(!text.contains("turn cost"));
+        assert!(!text.contains("API cache-miss premium"));
     }
 }

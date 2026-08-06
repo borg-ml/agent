@@ -64,6 +64,10 @@ pub fn model_catalog_for_backend(backend: &str) -> Option<ProviderModelCatalog> 
 pub enum CostBasis {
     ProviderReported,
     EstimatedFromPricing,
+    /// A provider exposed token counters for a subscription-backed session,
+    /// but the account is not billed at the public API rate. This value is
+    /// useful for observability only and must never be rendered as a charge.
+    SubscriptionEquivalent,
     #[default]
     Unavailable,
 }
@@ -73,6 +77,7 @@ impl CostBasis {
         match self {
             Self::ProviderReported => "provider_reported",
             Self::EstimatedFromPricing => "estimated_from_pricing",
+            Self::SubscriptionEquivalent => "subscription_equivalent",
             Self::Unavailable => "unavailable",
         }
     }
