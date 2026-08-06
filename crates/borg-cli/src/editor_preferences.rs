@@ -178,12 +178,12 @@ fn default_path() -> Result<PathBuf> {
     Ok(root.join("borg").join("editor.toml"))
 }
 
-#[cfg(windows)]
+#[cfg(any(unix, windows))]
 fn platform_config_dir() -> Option<PathBuf> {
     dirs::config_dir()
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(unix, windows)))]
 fn platform_config_dir() -> Option<PathBuf> {
     None
 }
