@@ -1220,8 +1220,13 @@ async fn run_agent_session_store_kernel(
                     &mut goal_active_since,
                 )
                 .await?;
-                coalesce_queued_prompts(&mut pending);
             }
+            // Queue-mode user prompts can arrive while the previous turn is
+            // running or in the small hand-off window immediately before the
+            // next turn starts. Batch them at every natural boundary, not
+            // only after an explicit interrupt, so one provider turn sees all
+            // queued input that was submitted together.
+            coalesce_queued_prompts(&mut pending);
         }
         let next = if let Some(prompt) = pop_next_pending_prompt(&mut pending, goal_is_active) {
             Some(prompt)
@@ -3525,6 +3530,11 @@ fn native_conversation(
     let mut conversation = Vec::new();
     let mut pending_native = Vec::new();
     let mut pending_generic = Vec::new();
+    // Failed user/system prompts are not safe to ask the summarizer to
+    // remember implicitly. Keep them as an exact durable tail and append that
+    // tail after every compaction summary so an empty/interrupted provider
+    // turn cannot erase the user's request from the next context.
+    let mut failed_prompts = Vec::new();
     let mut active_provider = None;
     let mut native_structured_in_turn = false;
     let non_interrupted_failed_turns = events
@@ -3543,10 +3553,11 @@ fn native_conversation(
             SessionEventKind::ProviderEvent { kind, payload, .. }
                 if kind == "context_compaction" =>
             {
-                let unresolved_prompts = pending_generic
+                let mut unresolved_prompts = pending_generic
                     .drain(..)
                     .filter(is_context_prompt)
                     .collect::<Vec<_>>();
+                unresolved_prompts.append(&mut failed_prompts);
                 pending_native.clear();
                 conversation.clear();
                 if let Some(summary) = payload.get("summary").and_then(Value::as_str) {
@@ -3565,6 +3576,10 @@ fn native_conversation(
                 native_structured_in_turn = false;
             }
             SessionEventKind::TurnStarted { provider, .. } => {
+                // If a failed prompt was followed by another turn without a
+                // compaction boundary, it is already part of `conversation`;
+                // it no longer needs the exact-tail escape hatch.
+                failed_prompts.clear();
                 active_provider = Some(*provider);
                 native_structured_in_turn = false;
             }
@@ -3672,15 +3687,24 @@ fn native_conversation(
             SessionEventKind::TurnCompleted {
                 error: Some(error), ..
             } if !is_interrupted_turn_error(error) => {
-                let unresolved_prompts = pending_generic.drain(..).filter(is_context_prompt);
+                let unresolved_prompts = pending_generic
+                    .drain(..)
+                    .filter(is_context_prompt)
+                    .collect::<Vec<_>>();
+                conversation.extend(unresolved_prompts.iter().cloned());
+                failed_prompts.extend(unresolved_prompts);
                 pending_native.clear();
-                conversation.extend(unresolved_prompts);
                 active_provider = None;
                 native_structured_in_turn = false;
             }
             SessionEventKind::TurnCompleted { error: Some(_), .. } => {
+                let unresolved_prompts = pending_generic
+                    .drain(..)
+                    .filter(is_context_prompt)
+                    .collect::<Vec<_>>();
+                conversation.extend(unresolved_prompts.iter().cloned());
+                failed_prompts.extend(unresolved_prompts);
                 pending_native.clear();
-                pending_generic.clear();
                 active_provider = None;
                 native_structured_in_turn = false;
             }
@@ -3689,7 +3713,8 @@ fn native_conversation(
     }
     // A failed turn emits its terminal boundary before the durable Failed
     // message projection. Keep that unresolved user/system input in the next
-    // replay even though there is no assistant result to append.
+    // replay even though there is no assistant result to append. This exact
+    // tail is also appended after a later compaction summary above.
     conversation.extend(pending_generic.into_iter().filter(is_context_prompt));
     Ok(conversation)
 }
@@ -4740,11 +4765,11 @@ async fn commit_codex_steer(
     .await
 }
 
-/// Claude echoes each user input as a `claude.user` provider event. That
-/// event is the native runtime's user-message boundary: unlike the control
-/// acknowledgement, it proves the steer reached Claude's conversation. The
-/// current runtime summary does not expose the echoed UUID, so use FIFO for
-/// older summaries and prefer an explicit UUID when one is available.
+/// Claude reports each submitted command through a lifecycle event. A
+/// transport acknowledgement only means that Borg wrote the steer to the
+/// native runtime; `state=started` is the first provider boundary that proves
+/// Claude accepted it for execution. The provider adapter correlates that
+/// lifecycle event with the original Borg message id.
 async fn commit_claude_steer(
     journal: &mut RuntimeSessionStore,
     events: &mpsc::Sender<SessionEvent>,
@@ -4752,14 +4777,16 @@ async fn commit_claude_steer(
     pending_steers: &mut VecDeque<PendingSteer>,
     kind: &SessionEventKind,
 ) -> Result<()> {
-    if !is_committed_claude_user_message(kind) {
+    let Some(message_id) = committed_claude_user_message_id(kind) else {
         return Ok(());
-    }
-    let explicit_message_id = claude_user_message_id(kind);
+    };
     let Some(index) = pending_steers.iter().position(|steer| {
         steer.prompt.delivery == PromptDelivery::Steer
-            && matches!(steer.state, PendingSteerState::Accepted)
-            && explicit_message_id.is_none_or(|id| steer.prompt.message_id == id)
+            && steer.prompt.message_id == message_id
+            && matches!(
+                steer.state,
+                PendingSteerState::AwaitingAcknowledgement | PendingSteerState::Accepted
+            )
     }) else {
         return Ok(());
     };
@@ -4777,37 +4804,22 @@ async fn commit_claude_steer(
     .await
 }
 
-fn is_committed_claude_user_message(kind: &SessionEventKind) -> bool {
+fn committed_claude_user_message_id(kind: &SessionEventKind) -> Option<Uuid> {
     let SessionEventKind::ProviderEvent {
         provider: CodingProvider::Claude,
         kind,
         payload,
     } = kind
     else {
-        return false;
-    };
-    if kind != "claude.user" || payload.get("type").and_then(Value::as_str) != Some("user") {
-        return false;
-    }
-    let Some(content_types) = payload.get("content_block_types").and_then(Value::as_array) else {
-        return true;
-    };
-    content_types.iter().any(|content_type| {
-        content_type.as_str() == Some("text")
-            && content_types
-                .iter()
-                .all(|content_type| content_type.as_str() != Some("tool_result"))
-    })
-}
-
-fn claude_user_message_id(kind: &SessionEventKind) -> Option<Uuid> {
-    let SessionEventKind::ProviderEvent { payload, .. } = kind else {
         return None;
     };
+    if kind != "claude.command_lifecycle"
+        || payload.get("state").and_then(Value::as_str) != Some("started")
+    {
+        return None;
+    }
     payload
-        .get("uuid")
-        .or_else(|| payload.get("message_id"))
-        .or_else(|| payload.get("client_id"))
+        .get("client_user_message_id")
         .and_then(Value::as_str)
         .and_then(|id| Uuid::parse_str(id).ok())
 }

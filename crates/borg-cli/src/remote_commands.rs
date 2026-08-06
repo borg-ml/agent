@@ -1697,12 +1697,6 @@ async fn run_local_agent_session(
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .remove(message_id);
-                } else if matches!(event.kind, SessionEventKind::Error { .. }) {
-                    pending_prompt_ids.clear();
-                    local_prompt_admissions
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .clear();
                 }
                 if let SessionEventKind::StatusChanged { status: next, detail } = &event.kind {
                     status = *next;
@@ -4270,7 +4264,7 @@ fn committed_prompt_id(kind: &SessionEventKind) -> Option<Uuid> {
         SessionEventKind::Message {
             message_id,
             actor: EventActor::User,
-            status: MessageStatus::Complete,
+            status: MessageStatus::Complete | MessageStatus::Failed,
             ..
         } => Some(*message_id),
         _ => None,

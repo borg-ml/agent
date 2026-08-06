@@ -76,6 +76,22 @@ fn director_command_extracts_text_without_matching_longer_commands() {
 }
 
 #[test]
+fn terminal_admission_is_released_by_a_terminal_failed_prompt() {
+    let message_id = Uuid::new_v4();
+    assert_eq!(
+        committed_prompt_id(&SessionEventKind::Message {
+            message_id,
+            actor: EventActor::User,
+            text: "preserve this request".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Failed,
+            delivery: Some(PromptDelivery::Queue),
+        }),
+        Some(message_id)
+    );
+}
+
+#[test]
 fn consultation_aliases_route_through_the_primary_model() {
     assert_eq!(
         normalize_consultation_command("/claude review this"),

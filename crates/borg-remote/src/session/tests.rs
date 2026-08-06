@@ -955,10 +955,12 @@ impl AgentTurnExecutor for CommittingSteerExecutor {
                     }),
                 ),
                 CodingProvider::Claude => (
-                    "claude.user".to_string(),
+                    "claude.command_lifecycle".to_string(),
                     json!({
-                        "type": "user",
-                        "content_block_types": ["text"],
+                        "type": "command_lifecycle",
+                        "command_uuid": Uuid::new_v4().to_string(),
+                        "state": "started",
+                        "client_user_message_id": message_id.to_string(),
                     }),
                 ),
                 provider => panic!("unsupported committing steer provider: {provider:?}"),
@@ -1825,12 +1827,12 @@ async fn multiple_queue_mode_prompts_drain_fifo_after_a_natural_turn_boundary() 
         }
     }
 
-    // Releasing the first turn must let the natural boundary loop run every
-    // queued prompt in FIFO order; no interrupt/coalescing path is involved.
+    // Releasing the first turn must batch all queue-mode prompts at the
+    // natural boundary. They are one provider input, in FIFO text order.
     release_first.notify_one();
     tokio::time::timeout(Duration::from_secs(1), async {
         loop {
-            if turns.lock().unwrap().len() == 3 {
+            if turns.lock().unwrap().len() == 2 {
                 break;
             }
             tokio::task::yield_now().await;
@@ -1847,8 +1849,7 @@ async fn multiple_queue_mode_prompts_drain_fifo_after_a_natural_turn_boundary() 
             .collect::<Vec<_>>(),
         [
             "Borg canonical provider context v2. The history below is a read-only, provider-neutral projection of durable Borg state; answer the current request normally.\n<borg-message>{\"content\":\"first\",\"role\":\"user\"}</borg-message>",
-            "Borg canonical provider context v2. The history below is a read-only, provider-neutral projection of durable Borg state; answer the current request normally.\n<borg-message>{\"content\":\"first\",\"role\":\"user\"}</borg-message>\n<borg-message>{\"content\":\"second\",\"role\":\"user\"}</borg-message>",
-            "Borg canonical provider context v2. The history below is a read-only, provider-neutral projection of durable Borg state; answer the current request normally.\n<borg-message>{\"content\":\"first\",\"role\":\"user\"}</borg-message>\n<borg-message>{\"content\":\"second\",\"role\":\"user\"}</borg-message>\n<borg-message>{\"content\":\"third\",\"role\":\"user\"}</borg-message>",
+            "Borg canonical provider context v2. The history below is a read-only, provider-neutral projection of durable Borg state; answer the current request normally.\n<borg-message>{\"content\":\"first\",\"role\":\"user\"}</borg-message>\n<borg-message>{\"content\":\"second\\n\\nthird\",\"role\":\"user\"}</borg-message>",
         ]
     );
 
@@ -4582,6 +4583,42 @@ fn active_provider_steer_uses_turn_control_across_provider_lanes() {
 }
 
 #[test]
+fn claude_steer_commits_only_on_correlated_command_start() {
+    let message_id = Uuid::new_v4();
+    let provider_event = |payload| SessionEventKind::ProviderEvent {
+        provider: CodingProvider::Claude,
+        kind: "claude.command_lifecycle".to_string(),
+        payload,
+    };
+
+    assert_eq!(
+        committed_claude_user_message_id(&provider_event(json!({
+            "state": "queued",
+            "client_user_message_id": message_id,
+        }))),
+        None
+    );
+    assert_eq!(
+        committed_claude_user_message_id(&SessionEventKind::ProviderEvent {
+            provider: CodingProvider::Claude,
+            kind: "claude.user".to_string(),
+            payload: json!({
+                "type": "user",
+                "content_block_types": ["text"],
+            }),
+        }),
+        None
+    );
+    assert_eq!(
+        committed_claude_user_message_id(&provider_event(json!({
+            "state": "started",
+            "client_user_message_id": message_id.to_string(),
+        }))),
+        Some(message_id)
+    );
+}
+
+#[test]
 fn queued_prompt_recovery_preserves_fifo_and_excludes_settled_messages() {
     let session_id = Uuid::new_v4();
     let settled_id = Uuid::new_v4();
@@ -5558,6 +5595,66 @@ fn provider_neutral_replay_resets_subscription_history_at_compaction() {
         Some(
             "<borg-message>{\"content\":\"Previous conversation summary:\\n\\npreserved decisions\",\"role\":\"user\"}</borg-message>\n<borg-message>{\"content\":\"continue\",\"role\":\"user\"}</borg-message>"
         )
+    );
+}
+
+#[test]
+fn interrupted_user_prompt_is_preserved_after_context_compaction() {
+    use borg_provider::provider::ModelMessage;
+
+    let session_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    let events = vec![
+        SessionEvent::new(
+            session_id,
+            1,
+            SessionEventKind::Message {
+                message_id,
+                actor: EventActor::User,
+                text: "do not lose this interrupted request".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: Some(PromptDelivery::Steer),
+            },
+        ),
+        SessionEvent::new(
+            session_id,
+            2,
+            SessionEventKind::TurnStarted {
+                message_id,
+                provider: CodingProvider::Codex,
+                model: Some("gpt-5.6-luna".to_string()),
+                effort: Some("max".to_string()),
+                fast: false,
+            },
+        ),
+        SessionEvent::new(
+            session_id,
+            3,
+            SessionEventKind::TurnCompleted {
+                message_id,
+                provider_session_id: None,
+                final_text: String::new(),
+                error: Some("turn interrupted".to_string()),
+            },
+        ),
+        SessionEvent::new(
+            session_id,
+            4,
+            SessionEventKind::ProviderEvent {
+                provider: CodingProvider::Codex,
+                kind: "context_compaction".to_string(),
+                payload: json!({"summary": "preserved earlier decisions"}),
+            },
+        ),
+    ];
+
+    assert_eq!(
+        native_conversation(&events, CodingProvider::Claude).unwrap(),
+        vec![
+            ModelMessage::user("Previous conversation summary:\n\npreserved earlier decisions"),
+            ModelMessage::user("do not lose this interrupted request"),
+        ]
     );
 }
 

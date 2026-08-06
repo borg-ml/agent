@@ -10,11 +10,11 @@ use crate::runtime::ProviderCallUsage;
 use crate::{ProviderAuthBundle, ProviderAuthProvider, ProviderChannel};
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -38,6 +38,16 @@ enum ProviderBillingMode {
     ApiKey,
     #[default]
     Unknown,
+}
+
+/// The Claude native runtime does not currently carry Borg's client message
+/// id through its steer control enum. Keep the correlation at this adapter
+/// boundary instead: controls are serialized into the runtime, and Claude's
+/// command lifecycle events are serialized back out on the same stream.
+#[derive(Default)]
+struct ClaudeSteerCorrelation {
+    pending: VecDeque<String>,
+    commands: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -494,12 +504,25 @@ async fn relay_claude_runtime(
     billing_mode: ProviderBillingMode,
 ) -> Result<()> {
     let (native_events, mut native_events_receiver) = mpsc::channel(64);
+    let steer_correlation = Arc::new(StdMutex::new(ClaudeSteerCorrelation::default()));
     let (native_controls, mut control_forwarder) = match controls {
         Some(mut controls) => {
             let (sender, receiver) = mpsc::channel(64);
+            let steer_correlation = Arc::clone(&steer_correlation);
             let forwarder = tokio::spawn(async move {
                 while let Some(control) = controls.recv().await {
+                    let client_user_message_id =
+                        claude_steer_client_message_id(&control).map(str::to_owned);
+                    if let Some(client_user_message_id) = client_user_message_id.as_deref() {
+                        register_claude_steer(
+                            &steer_correlation,
+                            client_user_message_id.to_string(),
+                        );
+                    }
                     if sender.send(map_claude_control(control)).await.is_err() {
+                        if let Some(client_user_message_id) = client_user_message_id.as_deref() {
+                            unregister_claude_steer(&steer_correlation, client_user_message_id);
+                        }
                         break;
                     }
                 }
@@ -541,7 +564,11 @@ async fn relay_claude_runtime(
                     break;
                 };
                 if events
-                    .send(map_claude_event(event, billing_mode))
+                    .send(map_claude_event_with_correlation(
+                        event,
+                        billing_mode,
+                        Some(&steer_correlation),
+                    ))
                     .await
                     .is_err()
                 {
@@ -568,6 +595,36 @@ async fn relay_claude_runtime(
     }
     runner_result.context("Claude subscription runtime task failed")??;
     Ok(())
+}
+
+fn claude_steer_client_message_id(control: &ChatStreamControl) -> Option<&str> {
+    match control {
+        ChatStreamControl::Steer {
+            client_user_message_id,
+            ..
+        } => client_user_message_id.as_deref(),
+        _ => None,
+    }
+}
+
+fn register_claude_steer(correlation: &StdMutex<ClaudeSteerCorrelation>, message_id: String) {
+    let mut correlation = correlation
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    correlation.pending.push_back(message_id);
+}
+
+fn unregister_claude_steer(correlation: &StdMutex<ClaudeSteerCorrelation>, message_id: &str) {
+    let mut correlation = correlation
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(index) = correlation
+        .pending
+        .iter()
+        .rposition(|pending| pending == message_id)
+    {
+        correlation.pending.remove(index);
+    }
 }
 
 fn map_claude_control(control: ChatStreamControl) -> claude_agents::ChatStreamControl {
@@ -608,30 +665,47 @@ fn map_claude_control(control: ChatStreamControl) -> claude_agents::ChatStreamCo
     }
 }
 
+#[cfg(test)]
 fn map_claude_event(
     event: claude_agents::ChatStreamEvent,
     billing_mode: ProviderBillingMode,
 ) -> ChatStreamEvent {
+    map_claude_event_with_correlation(event, billing_mode, None)
+}
+
+fn map_claude_event_with_correlation(
+    event: claude_agents::ChatStreamEvent,
+    billing_mode: ProviderBillingMode,
+    steer_correlation: Option<&StdMutex<ClaudeSteerCorrelation>>,
+) -> ChatStreamEvent {
     match event {
         claude_agents::ChatStreamEvent::ProviderEvent {
             kind,
-            payload,
+            mut payload,
             raw_payload,
             stream_channel,
             content_text,
             provider_item_id,
             tool_use_id,
             tool_name,
-        } => ChatStreamEvent::ProviderEvent {
-            kind,
-            payload,
-            raw_payload,
-            stream_channel,
-            content_text,
-            provider_item_id,
-            tool_use_id,
-            tool_name,
-        },
+        } => {
+            enrich_claude_lifecycle_payload(
+                &kind,
+                &mut payload,
+                raw_payload.as_ref(),
+                steer_correlation,
+            );
+            ChatStreamEvent::ProviderEvent {
+                kind,
+                payload,
+                raw_payload,
+                stream_channel,
+                content_text,
+                provider_item_id,
+                tool_use_id,
+                tool_name,
+            }
+        }
         claude_agents::ChatStreamEvent::Delta(text) => ChatStreamEvent::Delta(text),
         claude_agents::ChatStreamEvent::ReasoningDelta(text) => {
             ChatStreamEvent::ReasoningDelta(text)
@@ -688,6 +762,67 @@ fn map_claude_event(
             session_id,
         },
         claude_agents::ChatStreamEvent::Failed { error } => ChatStreamEvent::Failed { error },
+    }
+}
+
+fn enrich_claude_lifecycle_payload(
+    kind: &str,
+    payload: &mut Value,
+    raw_payload: Option<&Value>,
+    steer_correlation: Option<&StdMutex<ClaudeSteerCorrelation>>,
+) {
+    if kind != "claude.command_lifecycle" {
+        return;
+    }
+    let Some(raw_payload) = raw_payload else {
+        return;
+    };
+    let Some(payload) = payload.as_object_mut() else {
+        return;
+    };
+    for key in ["command_uuid", "state", "uuid"] {
+        if let Some(value) = raw_payload.get(key) {
+            payload.insert(key.to_string(), value.clone());
+        }
+    }
+    let (Some(command_uuid), Some(state)) = (
+        raw_payload.get("command_uuid").and_then(Value::as_str),
+        raw_payload.get("state").and_then(Value::as_str),
+    ) else {
+        return;
+    };
+    let Some(steer_correlation) = steer_correlation else {
+        return;
+    };
+    let mut steer_correlation = steer_correlation
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match state {
+        "queued" => {
+            if !steer_correlation.commands.contains_key(command_uuid)
+                && let Some(message_id) = steer_correlation.pending.pop_front()
+            {
+                payload.insert(
+                    "client_user_message_id".to_string(),
+                    Value::String(message_id.clone()),
+                );
+                steer_correlation
+                    .commands
+                    .insert(command_uuid.to_string(), message_id);
+            }
+        }
+        "started" | "completed" | "failed" | "cancelled" | "error" => {
+            if let Some(message_id) = steer_correlation.commands.get(command_uuid).cloned() {
+                payload.insert(
+                    "client_user_message_id".to_string(),
+                    Value::String(message_id),
+                );
+                if matches!(state, "completed" | "failed" | "cancelled" | "error") {
+                    steer_correlation.commands.remove(command_uuid);
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -2607,6 +2742,75 @@ mod tests {
                 session_id: Some(session_id),
             } if final_text == "done" && session_id == "session-1"
         ));
+    }
+
+    #[test]
+    fn claude_command_lifecycle_correlates_steers_at_the_provider_boundary() {
+        let correlation = StdMutex::new(ClaudeSteerCorrelation {
+            pending: VecDeque::from(["borg-message-1".to_string()]),
+            commands: HashMap::new(),
+        });
+        let command_uuid = "claude-command-1";
+        let queued = map_claude_event_with_correlation(
+            claude_agents::ChatStreamEvent::ProviderEvent {
+                kind: "claude.command_lifecycle".to_string(),
+                payload: serde_json::json!({"type": "command_lifecycle"}),
+                raw_payload: Some(serde_json::json!({
+                    "type": "command_lifecycle",
+                    "command_uuid": command_uuid,
+                    "state": "queued",
+                    "uuid": "event-queued",
+                })),
+                stream_channel: None,
+                content_text: None,
+                provider_item_id: None,
+                tool_use_id: None,
+                tool_name: None,
+            },
+            ProviderBillingMode::Unknown,
+            Some(&correlation),
+        );
+        assert!(matches!(
+            queued,
+            ChatStreamEvent::ProviderEvent { ref payload, .. }
+                if payload.get("command_uuid").and_then(Value::as_str) == Some(command_uuid)
+                    && payload.get("state").and_then(Value::as_str) == Some("queued")
+                    && payload.get("client_user_message_id").and_then(Value::as_str)
+                        == Some("borg-message-1")
+        ));
+
+        let started = map_claude_event_with_correlation(
+            claude_agents::ChatStreamEvent::ProviderEvent {
+                kind: "claude.command_lifecycle".to_string(),
+                payload: serde_json::json!({"type": "command_lifecycle"}),
+                raw_payload: Some(serde_json::json!({
+                    "type": "command_lifecycle",
+                    "command_uuid": command_uuid,
+                    "state": "started",
+                    "uuid": "event-started",
+                })),
+                stream_channel: None,
+                content_text: None,
+                provider_item_id: None,
+                tool_use_id: None,
+                tool_name: None,
+            },
+            ProviderBillingMode::Unknown,
+            Some(&correlation),
+        );
+        assert!(matches!(
+            started,
+            ChatStreamEvent::ProviderEvent { ref payload, .. }
+                if payload.get("client_user_message_id").and_then(Value::as_str)
+                    == Some("borg-message-1")
+        ));
+        assert!(
+            correlation
+                .lock()
+                .unwrap()
+                .commands
+                .contains_key(command_uuid)
+        );
     }
 
     #[test]
