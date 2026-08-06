@@ -663,10 +663,10 @@ fn tool_category(name: &str, label: &str, input: &Value) -> ToolPresentationCate
                 | "subagent_activity"
                 | "collab_tool_call"
                 | "collabagenttoolcall"
+                | "consult_model"
+                | "consult_peer"
         )
     {
-        ToolPresentationCategory::Agent
-    } else if matches!(leaf.as_str(), "consult_model" | "consult_peer") {
         ToolPresentationCategory::Agent
     } else if matches!(
         leaf.as_str(),
@@ -1195,12 +1195,11 @@ fn git_invocation_detail(action: GitAction, arguments: &[String]) -> String {
             continue;
         }
         if !after_separator && argument.starts_with('-') {
-            if git_option_takes_value(action, argument) {
-                if let Some(value) = arguments.next()
-                    && git_option_value_is_detail(action, argument)
-                {
-                    details.push(value.clone());
-                }
+            if git_option_takes_value(action, argument)
+                && let Some(value) = arguments.next()
+                && git_option_value_is_detail(action, argument)
+            {
+                details.push(value.clone());
             }
             continue;
         }

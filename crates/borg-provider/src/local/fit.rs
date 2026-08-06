@@ -68,7 +68,7 @@ pub fn available_vram_bytes() -> Option<u64> {
             total = total.saturating_add(device_total);
             used = used.saturating_add(device_used);
         }
-        return found.then_some(total.saturating_sub(used));
+        found.then_some(total.saturating_sub(used))
     }
 
     #[cfg(not(target_os = "linux"))]

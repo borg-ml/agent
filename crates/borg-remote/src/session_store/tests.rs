@@ -1,0 +1,1749 @@
+use std::time::{Duration, Instant};
+
+use tempfile::tempdir;
+
+use super::*;
+use crate::{EventActor, PromptDelivery};
+
+async fn store() -> (tempfile::TempDir, SqliteSessionStore) {
+    let directory = tempdir().unwrap();
+    let store = SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
+        .await
+        .unwrap();
+    (directory, store)
+}
+
+#[tokio::test]
+async fn opening_schema_v4_repairs_missing_action_lease_columns() {
+    let (directory, store) = store().await;
+    let path = directory.path().join("sessions.sqlite3");
+    sqlx::query("drop index if exists idx_session_actions_lease_expiry")
+        .execute(store.pool())
+        .await
+        .unwrap();
+    for column in [
+        "lease_owner",
+        "lease_token",
+        "lease_heartbeat_at",
+        "lease_expires_at",
+    ] {
+        // These identifiers are fixed by the migration regression fixture;
+        // SQLx 0.9 requires the dynamic identifier to be explicitly audited.
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "alter table session_actions drop column {column}"
+        )))
+        .execute(store.pool())
+        .await
+        .unwrap();
+    }
+    sqlx::query("update borg_session_schema set version=4 where id=1")
+        .execute(store.pool())
+        .await
+        .unwrap();
+    store.pool().close().await;
+
+    let reopened = SqliteSessionStore::open(path).await.unwrap();
+    let columns = sqlx::query("pragma table_info(session_actions)")
+        .fetch_all(reopened.pool())
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.get::<String, _>("name"))
+        .collect::<HashSet<_>>();
+    assert!(
+        [
+            "lease_owner",
+            "lease_token",
+            "lease_heartbeat_at",
+            "lease_expires_at",
+        ]
+        .into_iter()
+        .all(|column| columns.contains(column))
+    );
+    let version: i64 = sqlx::query_scalar("select version from borg_session_schema where id=1")
+        .fetch_one(reopened.pool())
+        .await
+        .unwrap();
+    assert_eq!(version, SESSION_SCHEMA_VERSION);
+}
+
+#[tokio::test]
+async fn list_sessions_skips_state_for_removed_providers() {
+    let (_directory, store) = store().await;
+    let valid = Uuid::new_v4();
+    let incompatible = Uuid::new_v4();
+    store.create_session(valid).await.unwrap();
+    store.create_session(incompatible).await.unwrap();
+    sqlx::query("update sessions set state_json = ? where id = ?")
+        .bind(r#"{"configuration":{"provider":"open_code"}}"#)
+        .bind(incompatible.to_string())
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+    let sessions = store.list_sessions(10).await.unwrap();
+    assert_eq!(
+        sessions
+            .into_iter()
+            .map(|session| session.session_id)
+            .collect::<Vec<_>>(),
+        vec![valid]
+    );
+    assert!(store.contains_session(incompatible).await.unwrap());
+}
+
+#[tokio::test]
+async fn provider_capability_snapshot_is_durable_metadata_not_context() {
+    let (_directory, store) = store().await;
+    let session_id = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+    let providers = vec![crate::ProviderCapability {
+        provider: CodingProvider::Codex,
+        installed: true,
+        version: Some("test".to_string()),
+        authenticated: true,
+        auth_detail: Some("Codex subscription authenticated".to_string()),
+        auth_methods: vec![crate::ProviderAuthMethod::Subscription],
+        can_spawn: true,
+    }];
+    store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::ProviderCapabilitiesUpdated {
+                providers: providers.clone(),
+            },
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store.state(session_id).await.unwrap().provider_capabilities,
+        providers
+    );
+    assert!(
+        store
+            .recovery(session_id)
+            .await
+            .unwrap()
+            .context_events
+            .is_empty()
+    );
+    assert_eq!(store.read(session_id).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn sessions_have_stable_workspace_bindings_and_children_inherit_the_team_workspace() {
+    let (directory, store) = store().await;
+    let root = Uuid::new_v4();
+    store.create_session(root).await.unwrap();
+    let root_binding = store.workspace_binding(root).await.unwrap().unwrap();
+    assert_eq!(root_binding.workspace_id, root);
+    assert_eq!(root_binding.participant_id, root);
+
+    let host_id = Uuid::new_v4();
+    let reattached = store
+        .attach_workspace(SessionWorkspaceBinding {
+            host_id: Some(host_id),
+            attached_at: Utc::now(),
+            ..root_binding.clone()
+        })
+        .await
+        .unwrap();
+    assert_eq!(reattached.host_id, Some(host_id));
+    assert_eq!(
+        store
+            .workspace_binding(root)
+            .await
+            .unwrap()
+            .unwrap()
+            .host_id,
+        Some(host_id)
+    );
+    assert!(
+        store
+            .attach_workspace(SessionWorkspaceBinding {
+                workspace_id: Uuid::new_v4(),
+                ..reattached
+            })
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("already attached")
+    );
+
+    let child = Uuid::new_v4();
+    let child_journal = directory
+        .path()
+        .join("subagents")
+        .join(format!("{child}.lock"));
+    let _writer = crate::SessionWriterLease::acquire(&child_journal).unwrap();
+    store.register_child_session(root, child).await.unwrap();
+    let child_binding = store.workspace_binding(child).await.unwrap().unwrap();
+    assert_eq!(child_binding.workspace_id, root);
+    assert_eq!(child_binding.participant_id, child);
+}
+
+#[tokio::test]
+async fn new_session_can_start_in_a_selected_workspace_without_becoming_rebindable() {
+    let (_directory, store) = store().await;
+    let session_id = Uuid::new_v4();
+    let workspace_id = Uuid::new_v4();
+    let binding = store
+        .create_session_in_workspace(session_id, workspace_id)
+        .await
+        .unwrap();
+    assert_eq!(binding.workspace_id, workspace_id);
+    assert_eq!(binding.participant_id, session_id);
+    assert_eq!(
+        store.workspace_binding(session_id).await.unwrap().unwrap(),
+        binding
+    );
+    assert!(
+        store
+            .attach_workspace(SessionWorkspaceBinding {
+                workspace_id: Uuid::new_v4(),
+                ..binding
+            })
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("already attached")
+    );
+}
+
+#[tokio::test]
+async fn session_writes_wait_for_short_cross_connection_contention() {
+    let (_directory, store) = store().await;
+    let session_id = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+    let blocker = store.begin_write().await.unwrap();
+    let contender = store.clone();
+    let append = tokio::spawn(async move {
+        contender
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::SessionStarted,
+            ))
+            .await
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!append.is_finished());
+    blocker.commit().await.unwrap();
+
+    let event = tokio::time::timeout(Duration::from_secs(1), append)
+        .await
+        .expect("contending append should resume")
+        .expect("append task should not panic")
+        .expect("append should succeed after lock release");
+    assert_eq!(event.sequence, 1);
+}
+
+fn configured(directory: &Path) -> SessionEventKind {
+    SessionEventKind::SessionConfigured {
+        cwd: directory.to_path_buf(),
+        provider: CodingProvider::Codex,
+        model: Some("gpt-test".to_string()),
+        effort: Some("high".to_string()),
+        fast: false,
+        response_language: ResponseLanguage::Auto,
+        permission_mode: PermissionMode::FullAccess,
+    }
+}
+
+fn message(message_id: Uuid, text: &str) -> SessionEventKind {
+    SessionEventKind::Message {
+        message_id,
+        actor: EventActor::User,
+        text: text.to_string(),
+        attachments: Vec::new(),
+        status: MessageStatus::Complete,
+        delivery: Some(PromptDelivery::Steer),
+    }
+}
+
+#[tokio::test]
+async fn prompt_event_boundaries_drive_one_atomic_action_lifecycle() {
+    let (directory, store) = store().await;
+    let session_id = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+    store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::SessionStarted,
+        ))
+        .await
+        .unwrap();
+    store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            configured(directory.path()),
+        ))
+        .await
+        .unwrap();
+    let message_id = Uuid::new_v4();
+    store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::Message {
+                message_id,
+                actor: EventActor::User,
+                text: "do the work".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Queued,
+                delivery: Some(PromptDelivery::Queue),
+            },
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .action(session_id, message_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        SessionActionState::Admitted
+    );
+    store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::TurnStarted {
+                message_id,
+                provider: CodingProvider::Codex,
+                model: Some("gpt-test".to_string()),
+                effort: Some("high".to_string()),
+                fast: false,
+            },
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .action(session_id, message_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        SessionActionState::Running
+    );
+    store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::TurnCompleted {
+                message_id,
+                provider_session_id: Some("provider-session".to_string()),
+                final_text: "done".to_string(),
+                error: None,
+            },
+        ))
+        .await
+        .unwrap();
+    let completed = store.action(session_id, message_id).await.unwrap().unwrap();
+    assert_eq!(completed.state, SessionActionState::Completed);
+    assert!(completed.accepted_at.is_some());
+    assert!(completed.delivered_at.is_some());
+    assert!(completed.completed_at.is_some());
+    let transitions = store
+        .action_transitions(session_id, message_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        transitions
+            .iter()
+            .map(|transition| (transition.from, transition.to))
+            .collect::<Vec<_>>(),
+        [
+            (None, SessionActionState::Queued),
+            (
+                Some(SessionActionState::Queued),
+                SessionActionState::Admitted
+            ),
+            (
+                Some(SessionActionState::Admitted),
+                SessionActionState::Delivered
+            ),
+            (
+                Some(SessionActionState::Delivered),
+                SessionActionState::Preparing
+            ),
+            (
+                Some(SessionActionState::Preparing),
+                SessionActionState::Committing
+            ),
+            (
+                Some(SessionActionState::Committing),
+                SessionActionState::Running
+            ),
+            (
+                Some(SessionActionState::Running),
+                SessionActionState::Completed
+            ),
+        ]
+    );
+    assert!(
+        store
+            .pending_actions(session_id, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // Re-admission with the same id/payload is an idempotent read of the
+    // durable terminal action, not a duplicate action.
+    let replay = SessionAction::new(
+        message_id,
+        session_id,
+        completed.kind,
+        completed.delivery,
+        completed.wake,
+        completed.payload.clone(),
+    );
+    assert_eq!(
+        store.enqueue_action(replay).await.unwrap().state,
+        completed.state
+    );
+}
+
+#[tokio::test]
+async fn concurrent_claims_have_one_winner_and_same_owner_claim_is_idempotent() {
+    let (_directory, store) = store().await;
+    let session_id = Uuid::new_v4();
+    let action_id = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+    store
+        .enqueue_action(SessionAction::new(
+            action_id,
+            session_id,
+            crate::SessionActionKind::Prompt,
+            crate::ActionDeliveryPolicy::NextTurnBoundary,
+            crate::ActionWakePolicy::Immediate,
+            serde_json::json!({"text": "claim once"}),
+        ))
+        .await
+        .unwrap();
+
+    let mut tasks = Vec::new();
+    for worker_number in 0..8 {
+        let contender = store.clone();
+        tasks.push(tokio::spawn(async move {
+            contender
+                .claim_action(
+                    session_id,
+                    action_id,
+                    &format!("worker-{worker_number}"),
+                    Duration::from_secs(30),
+                )
+                .await
+                .unwrap()
+        }));
+    }
+    let mut winner = None;
+    for task in tasks {
+        if let Some(action) = task.await.unwrap() {
+            assert!(winner.is_none(), "two workers claimed the action");
+            winner = Some(action);
+        }
+    }
+    let winner = winner.expect("one worker should claim the queued action");
+    let replay = store
+        .claim_action(
+            session_id,
+            action_id,
+            winner.lease_owner.as_deref().unwrap(),
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(replay.lease_token, winner.lease_token);
+    assert_eq!(replay.lease_heartbeat_at, winner.lease_heartbeat_at);
+    assert_eq!(
+        store
+            .action_transitions(session_id, action_id)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "claiming must not create duplicate lifecycle transitions"
+    );
+}
+
+#[tokio::test]
+async fn expired_leases_requeue_once_and_fence_stale_workers() {
+    let (_directory, store) = store().await;
+    let session_id = Uuid::new_v4();
+    let action_id = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+    store
+        .enqueue_action(SessionAction::new(
+            action_id,
+            session_id,
+            crate::SessionActionKind::Prompt,
+            crate::ActionDeliveryPolicy::NextTurnBoundary,
+            crate::ActionWakePolicy::Immediate,
+            serde_json::json!({"text": "recover me"}),
+        ))
+        .await
+        .unwrap();
+    let claimed = store
+        .claim_action(session_id, action_id, "worker-a", Duration::from_millis(40))
+        .await
+        .unwrap()
+        .unwrap();
+    let token = claimed.lease_token.unwrap();
+    store
+        .transition_claimed_action(ClaimedActionTransition {
+            session_id,
+            action_id,
+            lease_owner: "worker-a".to_string(),
+            lease_token: token,
+            expected: Some(SessionActionState::Queued),
+            next: SessionActionState::Admitted,
+            error: None,
+        })
+        .await
+        .unwrap();
+    store
+        .transition_claimed_action(ClaimedActionTransition {
+            session_id,
+            action_id,
+            lease_owner: "worker-a".to_string(),
+            lease_token: token,
+            expected: Some(SessionActionState::Admitted),
+            next: SessionActionState::Delivered,
+            error: None,
+        })
+        .await
+        .unwrap();
+    store
+        .transition_claimed_action(ClaimedActionTransition {
+            session_id,
+            action_id,
+            lease_owner: "worker-a".to_string(),
+            lease_token: token,
+            expected: Some(SessionActionState::Delivered),
+            next: SessionActionState::Preparing,
+            error: None,
+        })
+        .await
+        .unwrap();
+    store
+        .transition_claimed_action(ClaimedActionTransition {
+            session_id,
+            action_id,
+            lease_owner: "worker-a".to_string(),
+            lease_token: token,
+            expected: Some(SessionActionState::Preparing),
+            next: SessionActionState::Committing,
+            error: None,
+        })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    let recovered = store.recover_expired_actions(Utc::now(), 10).await.unwrap();
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].state, SessionActionState::Queued);
+    assert!(recovered[0].lease_owner.is_none());
+    assert!(
+        store
+            .heartbeat_action(
+                session_id,
+                action_id,
+                "worker-a",
+                token,
+                Duration::from_secs(30),
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .recover_expired_actions(Utc::now(), 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let reclaimed = store
+        .claim_action(session_id, action_id, "worker-b", Duration::from_secs(30))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(reclaimed.lease_token, Some(token));
+    assert!(
+        store
+            .transition_claimed_action(ClaimedActionTransition {
+                session_id,
+                action_id,
+                lease_owner: "worker-a".to_string(),
+                lease_token: token,
+                expected: Some(SessionActionState::Queued),
+                next: SessionActionState::Admitted,
+                error: None,
+            },)
+            .await
+            .is_err()
+    );
+    let transitions = store
+        .action_transitions(session_id, action_id)
+        .await
+        .unwrap();
+    assert!(transitions.iter().any(|transition| {
+        transition.from == Some(SessionActionState::Committing)
+            && transition.to == SessionActionState::Queued
+    }));
+}
+
+#[tokio::test]
+async fn compaction_events_drive_one_replayable_action_lifecycle() {
+    let (directory, store) = store().await;
+    let session_id = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+    for kind in [
+        SessionEventKind::SessionStarted,
+        configured(directory.path()),
+    ] {
+        store
+            .append(SessionEvent::new(session_id, 0, kind))
+            .await
+            .unwrap();
+    }
+    let mut started = SessionEvent::new(
+        session_id,
+        0,
+        SessionEventKind::ProviderEvent {
+            provider: CodingProvider::OpenRouter,
+            kind: "context_compaction".to_string(),
+            payload: serde_json::json!({"status": "started"}),
+        },
+    );
+    started = store.append(started).await.unwrap();
+    assert_eq!(
+        store
+            .action(session_id, started.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        SessionActionState::Running
+    );
+    store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::ProviderEvent {
+                provider: CodingProvider::OpenRouter,
+                kind: "context_compaction".to_string(),
+                payload: serde_json::json!({
+                    "status": "completed",
+                    "summary": "keep the durable decisions"
+                }),
+            },
+        ))
+        .await
+        .unwrap();
+    let action = store.action(session_id, started.id).await.unwrap().unwrap();
+    assert_eq!(action.state, SessionActionState::Completed);
+    assert_eq!(
+        store
+            .action_transitions(session_id, started.id)
+            .await
+            .unwrap()
+            .last()
+            .unwrap()
+            .to,
+        SessionActionState::Completed
+    );
+}
+
+#[tokio::test]
+async fn sqlite_store_appends_projects_and_reads_indexed_suffixes() {
+    let (directory, store) = store().await;
+    let session_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+    for kind in [
+        SessionEventKind::SessionStarted,
+        configured(directory.path()),
+        message(message_id, "hello"),
+    ] {
+        store
+            .append(SessionEvent::new(session_id, 0, kind))
+            .await
+            .unwrap();
+    }
+
+    let state = store.state(session_id).await.unwrap();
+    assert_eq!(state.latest_sequence, 3);
+    assert_eq!(
+        state.configuration.as_ref().unwrap().model.as_deref(),
+        Some("gpt-test")
+    );
+    assert!(
+        store
+            .contains_message(session_id, message_id)
+            .await
+            .unwrap()
+    );
+    let suffix = store.events_after(session_id, 1, 10).await.unwrap();
+    assert_eq!(
+        suffix
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>(),
+        [2, 3]
+    );
+    let recovery = store.recovery(session_id).await.unwrap();
+    assert_eq!(recovery.context_events.len(), 1);
+    assert_eq!(recovery.queue_events.len(), 1);
+    assert!(recovery.subagent_events.is_empty());
+    assert_eq!(store.list_sessions(10).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn recent_user_messages_are_bounded_ordered_and_ignore_non_recallable_prompts() {
+    let (_directory, store) = store().await;
+    let session_id = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+    for kind in [
+        message(Uuid::new_v4(), "first"),
+        SessionEventKind::Message {
+            message_id: Uuid::new_v4(),
+            actor: EventActor::Assistant,
+            text: "assistant".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: None,
+        },
+        SessionEventKind::Message {
+            message_id: Uuid::new_v4(),
+            actor: EventActor::User,
+            text: "still queued".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Queued,
+            delivery: Some(PromptDelivery::Queue),
+        },
+        message(Uuid::new_v4(), "second"),
+        message(Uuid::new_v4(), "third"),
+        SessionEventKind::Message {
+            message_id: Uuid::new_v4(),
+            actor: EventActor::User,
+            text: "failed but recallable".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Failed,
+            delivery: Some(PromptDelivery::Queue),
+        },
+    ] {
+        store
+            .append(SessionEvent::new(session_id, 0, kind))
+            .await
+            .unwrap();
+    }
+
+    let prompts = store.recent_user_messages(session_id, 2).await.unwrap();
+    let texts = prompts
+        .iter()
+        .filter_map(|event| match &event.kind {
+            SessionEventKind::Message { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(texts, vec!["third", "failed but recallable"]);
+    assert!(
+        store
+            .recent_user_messages(session_id, 0)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn durable_store_health_requires_full_sync_wal_and_foreign_keys() {
+    let (_directory, store) = store().await;
+    let health = store.health().await.unwrap();
+    assert_eq!(health.integrity, "ok");
+    assert_eq!(health.journal_mode.to_ascii_lowercase(), "wal");
+    assert!(health.synchronous >= 2);
+    assert!(health.foreign_keys);
+    assert!(health.is_ready());
+}
+
+#[tokio::test]
+async fn context_clear_resets_provider_projection_and_recovery_prefix() {
+    let (directory, store) = store().await;
+    let session_id = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+    for kind in [
+        SessionEventKind::SessionStarted,
+        configured(directory.path()),
+        SessionEventKind::ProviderSessionLinked {
+            provider_session_id: "old-provider-thread".to_string(),
+        },
+        message(Uuid::new_v4(), "old context"),
+        SessionEventKind::ContextWindowUpdated {
+            context_tokens: 40_000,
+            context_window_tokens: 100_000,
+        },
+        SessionEventKind::ContextCleared,
+        message(Uuid::new_v4(), "new context"),
+    ] {
+        store
+            .append(SessionEvent::new(session_id, 0, kind))
+            .await
+            .unwrap();
+    }
+
+    let state = store.state(session_id).await.unwrap();
+    assert!(state.provider_session_id.is_none());
+    assert_eq!(state.usage.context_tokens, Some(0));
+    let recovery = store.recovery(session_id).await.unwrap();
+    assert_eq!(recovery.context_events.len(), 2);
+    assert!(matches!(
+        recovery.context_events[0].kind,
+        SessionEventKind::ContextCleared
+    ));
+    assert!(matches!(
+        &recovery.context_events[1].kind,
+        SessionEventKind::Message { text, .. } if text == "new context"
+    ));
+}
+
+#[tokio::test]
+async fn state_projects_pending_approval_and_cumulative_usage() {
+    let (directory, store) = store().await;
+    let session_id = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+    for kind in [
+        SessionEventKind::SessionStarted,
+        configured(directory.path()),
+        SessionEventKind::ApprovalRequested {
+            approval_id: "approval-1".to_string(),
+            title: "Run command".to_string(),
+            detail: "Needs permission".to_string(),
+            command: Some("cargo test".to_string()),
+        },
+    ] {
+        store
+            .append(SessionEvent::new(session_id, 0, kind))
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        store.state(session_id).await.unwrap().pending_approval_id,
+        Some("approval-1".to_string())
+    );
+    for kind in [
+        SessionEventKind::ApprovalResolved {
+            approval_id: "approval-1".to_string(),
+            decision: crate::ApprovalDecision::AllowOnce,
+        },
+        SessionEventKind::UsageUpdated {
+            provider_duration_ms: 10,
+            turn_id: None,
+            provider_context_reused: None,
+            input_tokens: 100,
+            output_tokens: 20,
+            cached_input_tokens: 40,
+            cache_creation_input_tokens: 5,
+            total_tokens: 120,
+            cost_microusd: Some(100),
+            cost_basis: "provider".to_string(),
+            cost_usd: Some(0.0001),
+            context_tokens: Some(100),
+            context_window_tokens: Some(1_000),
+        },
+        SessionEventKind::UsageUpdated {
+            provider_duration_ms: 20,
+            turn_id: None,
+            provider_context_reused: None,
+            input_tokens: 200,
+            output_tokens: 30,
+            cached_input_tokens: 80,
+            cache_creation_input_tokens: 7,
+            total_tokens: 230,
+            cost_microusd: Some(200),
+            cost_basis: "provider".to_string(),
+            cost_usd: Some(0.0002),
+            context_tokens: Some(200),
+            context_window_tokens: Some(1_000),
+        },
+    ] {
+        store
+            .append(SessionEvent::new(session_id, 0, kind))
+            .await
+            .unwrap();
+    }
+
+    let state = store.state(session_id).await.unwrap();
+    assert_eq!(state.pending_approval_id, None);
+    assert_eq!(state.usage.calls, 2);
+    assert_eq!(state.usage.provider_duration_ms, 30);
+    assert_eq!(state.usage.input_tokens, 300);
+    assert_eq!(state.usage.output_tokens, 50);
+    assert_eq!(state.usage.cached_input_tokens, 120);
+    assert_eq!(state.usage.cache_creation_input_tokens, 12);
+    assert_eq!(state.usage.total_tokens, 350);
+    assert_eq!(state.usage.cost_microusd, Some(300));
+    assert!((state.usage.cost_usd.unwrap() - 0.0003).abs() < f64::EPSILON);
+    assert_eq!(state.usage.context_tokens, Some(200));
+}
+
+#[tokio::test]
+async fn fork_records_lineage_without_copying_events() {
+    let (directory, store) = store().await;
+    let parent_id = Uuid::new_v4();
+    let fork_id = Uuid::new_v4();
+    let retained_message_id = Uuid::new_v4();
+    let discarded_message_id = Uuid::new_v4();
+    store.create_session(parent_id).await.unwrap();
+    for kind in [
+        SessionEventKind::SessionStarted,
+        configured(directory.path()),
+        SessionEventKind::ProviderSessionLinked {
+            provider_session_id: "provider-thread".to_string(),
+        },
+        message(retained_message_id, "keep"),
+        message(discarded_message_id, "discard"),
+    ] {
+        store
+            .append(SessionEvent::new(parent_id, 0, kind))
+            .await
+            .unwrap();
+    }
+
+    let fork = store.fork_before(parent_id, fork_id, 5).await.unwrap();
+    assert_eq!(fork.inherited_event_count, 3);
+    let copied_rows: i64 =
+        sqlx::query_scalar("select count(*) from session_events where session_id = ?")
+            .bind(fork_id.to_string())
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+    assert_eq!(copied_rows, 0);
+
+    let events = store.read(fork_id).await.unwrap();
+    assert_eq!(events.len(), 3);
+    assert!(events.iter().all(|event| event.session_id == fork_id));
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>(),
+        [1, 2, 3]
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| !matches!(event.kind, SessionEventKind::ProviderSessionLinked { .. }))
+    );
+    assert!(
+        store
+            .contains_message(fork_id, retained_message_id)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .contains_message(fork_id, discarded_message_id)
+            .await
+            .unwrap()
+    );
+    let state = store.state(fork_id).await.unwrap();
+    assert_eq!(state.latest_sequence, 3);
+    assert!(state.provider_session_id.is_none());
+    let recovery = store.recovery(fork_id).await.unwrap();
+    assert_eq!(recovery.context_events.len(), 1);
+    assert_eq!(recovery.queue_events.len(), 1);
+}
+
+#[tokio::test]
+async fn inherited_event_pages_match_the_full_projection_across_lineage_boundaries() {
+    let (directory, store) = store().await;
+    let parent_id = Uuid::new_v4();
+    let child_id = Uuid::new_v4();
+    let grandchild_id = Uuid::new_v4();
+    store.create_session(parent_id).await.unwrap();
+    for kind in [
+        SessionEventKind::SessionStarted,
+        configured(directory.path()),
+        SessionEventKind::ProviderSessionLinked {
+            provider_session_id: "must-not-fork".to_string(),
+        },
+        message(Uuid::new_v4(), "parent-a"),
+        message(Uuid::new_v4(), "parent-b"),
+    ] {
+        store
+            .append(SessionEvent::new(parent_id, 0, kind))
+            .await
+            .unwrap();
+    }
+    store.fork_before(parent_id, child_id, 6).await.unwrap();
+    for text in ["child-a", "child-b", "child-c", "child-d"] {
+        store
+            .append(SessionEvent::new(
+                child_id,
+                0,
+                message(Uuid::new_v4(), text),
+            ))
+            .await
+            .unwrap();
+    }
+    store.fork_before(child_id, grandchild_id, 8).await.unwrap();
+    for text in ["grandchild-a", "grandchild-b"] {
+        store
+            .append(SessionEvent::new(
+                grandchild_id,
+                0,
+                message(Uuid::new_v4(), text),
+            ))
+            .await
+            .unwrap();
+    }
+
+    let full = store.read(grandchild_id).await.unwrap();
+    for sequence in 0..=u64::try_from(full.len() + 1).unwrap() {
+        for limit in [1, 2, 4, 100] {
+            let expected = full
+                .iter()
+                .skip(usize::try_from(sequence).unwrap())
+                .take(limit)
+                .map(|event| serde_json::to_value(event).unwrap())
+                .collect::<Vec<_>>();
+            let actual = store
+                .events_after(grandchild_id, sequence, limit)
+                .await
+                .unwrap()
+                .iter()
+                .map(|event| serde_json::to_value(event).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected, "sequence={sequence}, limit={limit}");
+        }
+    }
+}
+
+/// A rewind cuts immediately before the admission of the prompt it targets.
+/// That prompt's earlier queue entry sits below the cut, so inheriting it
+/// would hand the fork a pending prompt and re-run exactly what the user
+/// just discarded.
+#[tokio::test]
+async fn a_rewind_does_not_inherit_the_queue_entry_of_the_discarded_prompt() {
+    let (directory, store) = store().await;
+    let parent_id = Uuid::new_v4();
+    let fork_id = Uuid::new_v4();
+    let discarded_message_id = Uuid::new_v4();
+    store.create_session(parent_id).await.unwrap();
+    for kind in [
+        SessionEventKind::SessionStarted,
+        configured(directory.path()),
+        SessionEventKind::Message {
+            message_id: discarded_message_id,
+            actor: EventActor::User,
+            text: "discard".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Queued,
+            delivery: Some(PromptDelivery::Queue),
+        },
+        SessionEventKind::Message {
+            message_id: discarded_message_id,
+            actor: EventActor::User,
+            text: "discard".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: Some(PromptDelivery::Queue),
+        },
+    ] {
+        store
+            .append(SessionEvent::new(parent_id, 0, kind))
+            .await
+            .unwrap();
+    }
+
+    // The UI rewinds to the admission at sequence 4; the queue entry it was
+    // admitted from is at sequence 3, below the cut.
+    store.fork_before(parent_id, fork_id, 4).await.unwrap();
+    assert!(
+        !store
+            .contains_message(fork_id, discarded_message_id)
+            .await
+            .unwrap()
+    );
+    let recovery = store.recovery(fork_id).await.unwrap();
+    assert!(
+        recovery.queue_events.is_empty(),
+        "the discarded prompt must not come back as pending work"
+    );
+    assert!(
+        store
+            .read(fork_id)
+            .await
+            .unwrap()
+            .iter()
+            .all(|event| !matches!(
+                event.kind,
+                SessionEventKind::Message {
+                    status: MessageStatus::Queued,
+                    ..
+                }
+            ))
+    );
+}
+
+#[tokio::test]
+async fn live_state_coalesces_without_consuming_durable_sequences() {
+    let (directory, store) = store().await;
+    let session_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+    for kind in [
+        SessionEventKind::SessionStarted,
+        configured(directory.path()),
+        SessionEventKind::StatusChanged {
+            status: SessionStatus::Running,
+            detail: None,
+        },
+    ] {
+        store
+            .append(SessionEvent::new(session_id, 0, kind))
+            .await
+            .unwrap();
+    }
+    for text in ["a", "a much longer snapshot"] {
+        let event = store
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::Message {
+                    message_id,
+                    actor: EventActor::Assistant,
+                    text: text.to_string(),
+                    attachments: Vec::new(),
+                    status: MessageStatus::InProgress,
+                    delivery: None,
+                },
+            ))
+            .await
+            .unwrap();
+        assert_eq!(event.sequence, 0);
+    }
+    let first_reasoning = store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::ReasoningDelta {
+                text: "thinking ".to_string(),
+            },
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(
+        first_reasoning.kind,
+        SessionEventKind::ReasoningDelta { ref text } if text == "thinking "
+    ));
+    let second_reasoning = store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::ReasoningDelta {
+                text: "carefully".to_string(),
+            },
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(
+        second_reasoning.kind,
+        SessionEventKind::ReasoningDelta { ref text } if text == "thinking carefully"
+    ));
+    store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::ReasoningDelta {
+                text: "thinking carefully".to_string(),
+            },
+        ))
+        .await
+        .unwrap();
+    store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::ProviderEvent {
+                provider: CodingProvider::Codex,
+                kind: "telemetry".to_string(),
+                payload: serde_json::json!({"large": "discarded"}),
+            },
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(store.read(session_id).await.unwrap().len(), 3);
+    let live = store.live_events_after(session_id, 0).await.unwrap();
+    assert_eq!(live.len(), 2);
+    assert!(live.iter().any(|live| matches!(
+        &live.event.kind,
+        SessionEventKind::Message { text, .. } if text == "a much longer snapshot"
+    )));
+    assert!(live.iter().any(|live| matches!(
+        &live.event.kind,
+        SessionEventKind::ReasoningDelta { text } if text == "thinking carefully"
+    )));
+
+    let completed = store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::Message {
+                message_id,
+                actor: EventActor::Assistant,
+                text: "done".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            },
+        ))
+        .await
+        .unwrap();
+    assert_eq!(completed.sequence, 4);
+    assert!(
+        store
+            .live_events_after(session_id, 0)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn reasoning_boundaries_clear_the_snapshot_before_the_next_thought() {
+    let (directory, store) = store().await;
+    let session_id = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+    for kind in [
+        SessionEventKind::SessionStarted,
+        configured(directory.path()),
+        SessionEventKind::StatusChanged {
+            status: SessionStatus::Running,
+            detail: None,
+        },
+    ] {
+        store
+            .append(SessionEvent::new(session_id, 0, kind))
+            .await
+            .unwrap();
+    }
+
+    store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::ReasoningDelta {
+                text: "previous thought".to_string(),
+            },
+        ))
+        .await
+        .unwrap();
+    store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::ReasoningCompleted,
+        ))
+        .await
+        .unwrap();
+    let next = store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::ReasoningDelta {
+                text: "next thought".to_string(),
+            },
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(
+        next.kind,
+        SessionEventKind::ReasoningDelta { ref text } if text == "next thought"
+    ));
+
+    store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::ToolStarted {
+                tool_call_id: "tool-1".to_string(),
+                name: "read_file".to_string(),
+                input: serde_json::json!({"path": "src/lib.rs"}),
+                input_ref: None,
+            },
+        ))
+        .await
+        .unwrap();
+    let after_tool = store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::ReasoningDelta {
+                text: "thought after tool".to_string(),
+            },
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(
+        after_tool.kind,
+        SessionEventKind::ReasoningDelta { ref text } if text == "thought after tool"
+    ));
+}
+
+#[tokio::test]
+async fn terminal_boundaries_clear_all_turn_live_state_but_keep_context_window() {
+    let (directory, store) = store().await;
+    let session_id = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+    for kind in [
+        SessionEventKind::SessionStarted,
+        configured(directory.path()),
+    ] {
+        store
+            .append(SessionEvent::new(session_id, 0, kind))
+            .await
+            .unwrap();
+    }
+
+    let live_message = |message_id| SessionEventKind::Message {
+        message_id,
+        actor: EventActor::Assistant,
+        text: "partial".to_string(),
+        attachments: Vec::new(),
+        status: MessageStatus::InProgress,
+        delivery: None,
+    };
+    store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            live_message(Uuid::new_v4()),
+        ))
+        .await
+        .unwrap();
+    store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::ReasoningDelta {
+                text: "thinking".to_string(),
+            },
+        ))
+        .await
+        .unwrap();
+    store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::ContextWindowUpdated {
+                context_tokens: 80,
+                context_window_tokens: 100,
+            },
+        ))
+        .await
+        .unwrap();
+
+    store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::TurnCompleted {
+                message_id: Uuid::new_v4(),
+                provider_session_id: None,
+                final_text: String::new(),
+                error: Some("turn interrupted".to_string()),
+            },
+        ))
+        .await
+        .unwrap();
+    let live = store.live_events_after(session_id, 0).await.unwrap();
+    assert_eq!(live.len(), 1);
+    assert!(matches!(
+        live[0].event.kind,
+        SessionEventKind::ContextWindowUpdated {
+            context_tokens: 80,
+            context_window_tokens: 100,
+        }
+    ));
+
+    store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            live_message(Uuid::new_v4()),
+        ))
+        .await
+        .unwrap();
+    store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::StatusChanged {
+                status: SessionStatus::Ready,
+                detail: None,
+            },
+        ))
+        .await
+        .unwrap();
+    let live = store.live_events_after(session_id, 0).await.unwrap();
+    assert_eq!(live.len(), 1);
+    assert!(matches!(
+        live[0].event.kind,
+        SessionEventKind::ContextWindowUpdated { .. }
+    ));
+
+    // A delayed coalesced event must not recreate turn state after the
+    // session has become idle.
+    store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            live_message(Uuid::new_v4()),
+        ))
+        .await
+        .unwrap();
+    let live = store.live_events_after(session_id, 0).await.unwrap();
+    assert_eq!(live.len(), 1);
+    assert!(matches!(
+        live[0].event.kind,
+        SessionEventKind::ContextWindowUpdated { .. }
+    ));
+}
+
+#[tokio::test]
+async fn reopening_repairs_turn_live_state_left_on_a_terminal_session() {
+    let (directory, store) = store().await;
+    let path = directory.path().join("sessions.sqlite3");
+    let session_id = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+    store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::SessionStarted,
+        ))
+        .await
+        .unwrap();
+    store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::StatusChanged {
+                status: SessionStatus::Ready,
+                detail: None,
+            },
+        ))
+        .await
+        .unwrap();
+
+    let message_id = Uuid::new_v4();
+    let event = SessionEvent::new(
+        session_id,
+        0,
+        SessionEventKind::Message {
+            message_id,
+            actor: EventActor::Assistant,
+            text: "stale response".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::InProgress,
+            delivery: None,
+        },
+    );
+    sqlx::query(
+        "insert into session_live_state \
+             (session_id, live_key, revision, event_json, updated_at) values (?, ?, ?, ?, ?)",
+    )
+    .bind(session_id.to_string())
+    .bind(format!("message:{message_id}"))
+    .bind(99_i64)
+    .bind(serde_json::to_string(&event).unwrap())
+    .bind(event.created_at.to_rfc3339())
+    .execute(store.pool())
+    .await
+    .unwrap();
+    drop(store);
+
+    let reopened = SqliteSessionStore::open(&path).await.unwrap();
+    assert!(
+        reopened
+            .live_events_after(session_id, 0)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn large_tool_payloads_are_loaded_only_by_reference() {
+    let (directory, store) = store().await;
+    let session_id = Uuid::new_v4();
+    let input = serde_json::json!({"text": "x".repeat(INLINE_SESSION_PAYLOAD_BYTES)});
+    store.create_session(session_id).await.unwrap();
+    for kind in [
+        SessionEventKind::SessionStarted,
+        configured(directory.path()),
+    ] {
+        store
+            .append(SessionEvent::new(session_id, 0, kind))
+            .await
+            .unwrap();
+    }
+    let appended = store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::ToolStarted {
+                tool_call_id: "large-tool".to_string(),
+                name: "large".to_string(),
+                input: input.clone(),
+                input_ref: None,
+            },
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(
+        appended.kind,
+        SessionEventKind::ToolStarted {
+            input_ref: None,
+            ..
+        }
+    ));
+
+    let persisted = store.events_after(session_id, 2, 1).await.unwrap();
+    let SessionEventKind::ToolStarted {
+        input: preview,
+        input_ref: Some(payload),
+        ..
+    } = &persisted[0].kind
+    else {
+        panic!("large tool input should be stored by reference");
+    };
+    assert_ne!(preview, &input);
+    assert_eq!(
+        store.load_payload(payload).await.unwrap(),
+        serde_json::to_vec(&input).unwrap()
+    );
+}
+
+#[test]
+fn persistence_and_fork_rules_are_typed_rust_contracts() {
+    assert_eq!(
+        SessionEventKind::ReasoningDelta {
+            text: "working".to_string()
+        }
+        .persistence(),
+        EventPersistence::Coalesced
+    );
+    assert_eq!(
+        SessionEventKind::ProviderEvent {
+            provider: CodingProvider::Codex,
+            kind: "noise".to_string(),
+            payload: serde_json::Value::Null,
+        }
+        .persistence(),
+        EventPersistence::Ephemeral
+    );
+    let user_in_progress = SessionEventKind::Message {
+        message_id: Uuid::new_v4(),
+        actor: crate::EventActor::User,
+        text: "must survive a host crash".to_string(),
+        attachments: Vec::new(),
+        status: MessageStatus::InProgress,
+        delivery: Some(crate::PromptDelivery::Queue),
+    };
+    assert_eq!(user_in_progress.persistence(), EventPersistence::Durable);
+    assert!(!user_in_progress.is_fork_inheritable());
+    assert_eq!(
+        SessionEventKind::Message {
+            message_id: Uuid::new_v4(),
+            actor: crate::EventActor::Assistant,
+            text: "streaming".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::InProgress,
+            delivery: None,
+        }
+        .persistence(),
+        EventPersistence::Coalesced
+    );
+    let compaction_started = SessionEventKind::ProviderEvent {
+        provider: CodingProvider::Codex,
+        kind: "context_compaction".to_string(),
+        payload: serde_json::json!({"status": "started"}),
+    };
+    assert_eq!(compaction_started.persistence(), EventPersistence::Durable);
+    assert!(!compaction_started.is_context_relevant());
+    let compaction_completed = SessionEventKind::ProviderEvent {
+        provider: CodingProvider::Codex,
+        kind: "context_compaction".to_string(),
+        payload: serde_json::json!({"status": "completed", "summary": "done"}),
+    };
+    assert_eq!(
+        compaction_completed.persistence(),
+        EventPersistence::Durable
+    );
+    assert!(compaction_completed.is_context_relevant());
+    assert!(
+        !SessionEventKind::ProviderSessionLinked {
+            provider_session_id: "provider".to_string()
+        }
+        .is_fork_inheritable()
+    );
+}
+
+#[test]
+fn context_generation_changes_only_at_explicit_prefix_boundaries() {
+    let session_id = Uuid::new_v4();
+    let mut state = SessionState::default();
+    state
+        .apply(&SessionEvent::new(
+            session_id,
+            1,
+            SessionEventKind::SessionStarted,
+        ))
+        .unwrap();
+    state
+        .apply(&SessionEvent::new(
+            session_id,
+            2,
+            configured(Path::new("/tmp")),
+        ))
+        .unwrap();
+    assert_eq!(state.context_generation, 0);
+    state
+        .apply(&SessionEvent::new(
+            session_id,
+            3,
+            SessionEventKind::ProviderEvent {
+                provider: CodingProvider::Codex,
+                kind: "context_compaction".to_string(),
+                payload: serde_json::json!({"status": "completed"}),
+            },
+        ))
+        .unwrap();
+    assert_eq!(state.context_generation, 1);
+    state
+        .apply(&SessionEvent::new(
+            session_id,
+            4,
+            SessionEventKind::ContextCleared,
+        ))
+        .unwrap();
+    assert_eq!(state.context_generation, 2);
+    state
+        .apply(&SessionEvent::new(
+            session_id,
+            5,
+            SessionEventKind::SessionConfigured {
+                cwd: PathBuf::from("/tmp"),
+                provider: CodingProvider::Claude,
+                model: Some("claude-test".to_string()),
+                effort: Some("high".to_string()),
+                fast: false,
+                response_language: ResponseLanguage::Auto,
+                permission_mode: PermissionMode::FullAccess,
+            },
+        ))
+        .unwrap();
+    assert_eq!(state.context_generation, 3);
+}
+
+#[tokio::test]
+#[ignore = "explicit large-session p95 performance gate"]
+async fn large_session_lineage_and_tail_p95_gates() {
+    const EVENT_COUNT: u64 = 38_272;
+    const SAMPLES: usize = 100;
+
+    let (directory, store) = store().await;
+    let parent_id = Uuid::new_v4();
+    store.create_session(parent_id).await.unwrap();
+    let mut state = SessionState::default();
+    let mut transaction = store.pool().begin().await.unwrap();
+    for sequence in 1..=EVENT_COUNT {
+        let kind = match sequence {
+            1 => SessionEventKind::SessionStarted,
+            2 => configured(directory.path()),
+            _ => SessionEventKind::Error {
+                message: "bounded performance fixture".to_string(),
+            },
+        };
+        let event = SessionEvent::new(parent_id, sequence, kind);
+        state.apply(&event).unwrap();
+        sqlx::query(
+            "insert into session_events \
+                 (session_id, sequence, event_id, event_kind, event_json, projection_json, \
+                  fork_inheritable, recovery_relevant, message_id, created_at) \
+                 values (?, ?, ?, ?, ?, ?, ?, ?, null, ?)",
+        )
+        .bind(parent_id.to_string())
+        .bind(i64::try_from(sequence).unwrap())
+        .bind(event.id.to_string())
+        .bind(event_kind(&event.kind).unwrap())
+        .bind(serde_json::to_string(&event).unwrap())
+        .bind(serde_json::to_string(&state).unwrap())
+        .bind(i64::from(event.kind.is_fork_inheritable()))
+        .bind(i64::from(event.kind.is_recovery_relevant()))
+        .bind(event.created_at.to_rfc3339())
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    }
+    sqlx::query(
+        "update sessions set next_sequence = ?, state_json = ?, updated_at = ? where id = ?",
+    )
+    .bind(i64::try_from(EVENT_COUNT + 1).unwrap())
+    .bind(serde_json::to_string(&state).unwrap())
+    .bind(Utc::now().to_rfc3339())
+    .bind(parent_id.to_string())
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    transaction.commit().await.unwrap();
+
+    let mut fork_samples = Vec::with_capacity(SAMPLES);
+    for _ in 0..SAMPLES {
+        let started = Instant::now();
+        store
+            .fork_before(parent_id, Uuid::new_v4(), EVENT_COUNT + 1)
+            .await
+            .unwrap();
+        fork_samples.push(started.elapsed());
+    }
+    let mut tail_samples = Vec::with_capacity(SAMPLES);
+    for _ in 0..SAMPLES {
+        let started = Instant::now();
+        let tail = store
+            .events_after(parent_id, EVENT_COUNT - 100, 100)
+            .await
+            .unwrap();
+        assert_eq!(tail.len(), 100);
+        tail_samples.push(started.elapsed());
+    }
+    let fork_p95 = duration_p95(&mut fork_samples);
+    let tail_p95 = duration_p95(&mut tail_samples);
+    eprintln!("lineage fork p95: {fork_p95:?}; indexed tail p95: {tail_p95:?}");
+    assert!(
+        fork_p95 < Duration::from_millis(200),
+        "lineage fork p95 exceeded 200 ms: {fork_p95:?}"
+    );
+    assert!(
+        tail_p95 < Duration::from_millis(50),
+        "indexed tail p95 exceeded 50 ms: {tail_p95:?}"
+    );
+}
+
+fn duration_p95(samples: &mut [Duration]) -> Duration {
+    samples.sort_unstable();
+    samples[(samples.len() * 95).div_ceil(100).saturating_sub(1)]
+}

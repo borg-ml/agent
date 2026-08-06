@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
 const MAX_MCP_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 const MCP_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
@@ -21,6 +22,7 @@ const CLIENT_INFO_META: &str = "io.modelcontextprotocol/clientInfo";
 
 pub(crate) struct NativeMcpRuntime {
     clients: Vec<Mutex<NativeMcpClient>>,
+    servers: Vec<ExternalMcpServer>,
     tools: HashMap<String, NativeMcpTool>,
     definitions: Vec<ModelToolDefinition>,
 }
@@ -34,6 +36,7 @@ struct NativeMcpTool {
 impl NativeMcpRuntime {
     pub(crate) async fn start(servers: Vec<ExternalMcpServer>) -> Result<Self> {
         let mut clients = Vec::with_capacity(servers.len());
+        let mut configured_servers = Vec::with_capacity(servers.len());
         let mut tools = HashMap::new();
         let mut definitions = Vec::new();
         for server in servers {
@@ -72,9 +75,11 @@ impl NativeMcpRuntime {
                 );
             }
             clients.push(Mutex::new(client));
+            configured_servers.push(server);
         }
         Ok(Self {
             clients,
+            servers: configured_servers,
             tools,
             definitions,
         })
@@ -88,16 +93,26 @@ impl NativeMcpRuntime {
         self.tools.contains_key(name)
     }
 
-    pub(crate) async fn call(&self, name: &str, arguments: Value) -> Result<Value> {
+    pub(crate) async fn call(
+        &self,
+        name: &str,
+        arguments: Value,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<Value> {
         let tool = self
             .tools
             .get(name)
             .with_context(|| format!("unknown native MCP tool `{name}`"))?;
-        self.clients[tool.client_index]
-            .lock()
-            .await
-            .call_tool(&tool.wire_name, arguments)
-            .await
+        let mut client = self.clients[tool.client_index].lock().await;
+        let result = client.call_tool(&tool.wire_name, arguments, cancel).await;
+        if cancel.is_some_and(CancellationToken::is_cancelled) {
+            let server = &self.servers[tool.client_index];
+            tracing::debug!(server = %server.name, "restarting cancelled native MCP client");
+            *client = NativeMcpClient::start(server)
+                .await
+                .with_context(|| format!("restart native MCP server `{}`", server.name))?;
+        }
+        result
     }
 }
 
@@ -223,6 +238,7 @@ impl NativeMcpClient {
                         "version": env!("CARGO_PKG_VERSION"),
                     }
                 }),
+                None,
             )
             .await
             .with_context(|| format!("failed to initialize MCP server `{}`", server.name))?;
@@ -293,7 +309,7 @@ impl NativeMcpClient {
     }
 
     async fn list_tools(&mut self) -> Result<Vec<ListedTool>> {
-        let result = self.request("tools/list", json!({})).await?;
+        let result = self.request("tools/list", json!({}), None).await?;
         result
             .get("tools")
             .and_then(Value::as_array)
@@ -321,31 +337,71 @@ impl NativeMcpClient {
             .collect()
     }
 
-    async fn call_tool(&mut self, name: &str, arguments: Value) -> Result<Value> {
+    async fn call_tool(
+        &mut self,
+        name: &str,
+        arguments: Value,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<Value> {
         self.request(
             "tools/call",
             json!({
                 "name": name,
                 "arguments": arguments,
             }),
+            cancel,
         )
         .await
     }
 
-    async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
-        tokio::time::timeout(MCP_REQUEST_TIMEOUT, self.request_inner(method, params))
-            .await
-            .with_context(|| {
-                format!(
-                    "MCP server `{}` timed out handling `{method}`",
-                    self.server_name
-                )
-            })?
-    }
-
-    async fn request_inner(&mut self, method: &str, params: Value) -> Result<Value> {
+    async fn request(
+        &mut self,
+        method: &str,
+        params: Value,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<Value> {
         let id = Value::from(self.next_id);
         self.next_id = self.next_id.saturating_add(1);
+        let request = self.request_inner(id.clone(), method, params);
+        if let Some(cancel) = cancel {
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(1),
+                        self.notify(
+                            "notifications/cancelled",
+                            json!({
+                                "requestId": id,
+                                "reason": "cancelled by Borg",
+                            }),
+                        ),
+                    )
+                    .await;
+                    self.terminate().await;
+                    bail!("native MCP request cancelled");
+                }
+                result = tokio::time::timeout(MCP_REQUEST_TIMEOUT, request) => {
+                    result.with_context(|| {
+                        format!(
+                            "MCP server `{}` timed out handling `{method}`",
+                            self.server_name
+                        )
+                    })?
+                }
+            }
+        } else {
+            tokio::time::timeout(MCP_REQUEST_TIMEOUT, request)
+                .await
+                .with_context(|| {
+                    format!(
+                        "MCP server `{}` timed out handling `{method}`",
+                        self.server_name
+                    )
+                })?
+        }
+    }
+
+    async fn request_inner(&mut self, id: Value, method: &str, params: Value) -> Result<Value> {
         let params = match &self.mode {
             McpMode::Modern(version) => modern_params(params, version),
             McpMode::Probing | McpMode::Legacy => params,
@@ -369,6 +425,11 @@ impl NativeMcpClient {
             .get("result")
             .cloned()
             .context("MCP response is missing result")
+    }
+
+    async fn terminate(&mut self) {
+        let _ = self._child.start_kill();
+        let _ = tokio::time::timeout(Duration::from_secs(1), self._child.wait()).await;
     }
 
     async fn read_response(&mut self, id: &Value) -> Result<Value> {
@@ -526,7 +587,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text
         assert!(!runtime.contains("mcp__fake_server__hidden"));
         assert_eq!(runtime.definitions().len(), 1);
         let result = runtime
-            .call("mcp__fake_server__echo", json!({ "value": "hello" }))
+            .call("mcp__fake_server__echo", json!({ "value": "hello" }), None)
             .await
             .unwrap();
         assert_eq!(result["content"][0]["text"], "ok");
@@ -561,10 +622,90 @@ esac
         .unwrap();
         assert!(runtime.contains("mcp__modern_server__echo"));
         let result = runtime
-            .call("mcp__modern_server__echo", json!({ "value": "hello" }))
+            .call(
+                "mcp__modern_server__echo",
+                json!({ "value": "hello" }),
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(result["content"][0]["text"], "ok");
+    }
+
+    #[tokio::test]
+    async fn cancelled_tool_call_restarts_client_before_the_next_call() {
+        let marker_root = tempfile::tempdir().unwrap();
+        let marker = marker_root.path().join("first-call");
+        let script = format!(
+            r#"
+read request
+case "$request" in
+  *server/discover*)
+    id=$(printf '%s' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+    printf '%s\n' '{{"jsonrpc":"2.0","id":'$id',"result":{{"resultType":"complete","supportedVersions":["2026-07-28"]}}}}'
+    ;;
+  *) exit 2 ;;
+esac
+read request
+if printf '%s' "$request" | grep -q 'tools/list'; then
+  id=$(printf '%s' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  printf '%s\n' '{{"jsonrpc":"2.0","id":'$id',"result":{{"tools":[{{"name":"wait","inputSchema":{{"type":"object"}}}}]}}}}'
+  read request
+fi
+case "$request" in
+  *tools/call*)
+    id=$(printf '%s' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+    if [ ! -e "{}" ]; then
+      touch "{}"
+      sleep 30
+    else
+      printf '%s\n' '{{"jsonrpc":"2.0","id":'$id',"result":{{"content":[{{"type":"text","text":"restarted"}}]}}}}'
+    fi
+    ;;
+  *) exit 3 ;;
+esac
+"#,
+            marker.display(),
+            marker.display()
+        );
+        let runtime = NativeMcpRuntime::start(vec![ExternalMcpServer {
+            name: "restart-server".to_string(),
+            command: "sh".to_string(),
+            args: vec!["-c".to_string(), script],
+            env: BTreeMap::new(),
+            allowed_tools: Vec::new(),
+        }])
+        .await
+        .unwrap();
+        let cancel = CancellationToken::new();
+        let call = runtime.call("mcp__restart_server__wait", json!({}), Some(&cancel));
+        tokio::pin!(call);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !marker.exists() {
+                tokio::select! {
+                    result = &mut call => panic!("MCP call ended before it could be cancelled: {result:?}"),
+                    _ = tokio::time::sleep(Duration::from_millis(5)) => {}
+                }
+            }
+        })
+        .await
+        .expect("MCP server should receive the cancellable call");
+        cancel.cancel();
+        let error = tokio::time::timeout(Duration::from_secs(2), call)
+            .await
+            .expect("cancelled MCP call should finish promptly")
+            .unwrap_err();
+        assert!(error.to_string().contains("cancelled"));
+        assert!(
+            marker.exists(),
+            "first MCP request should have been entered"
+        );
+
+        let result = runtime
+            .call("mcp__restart_server__wait", json!({}), None)
+            .await
+            .unwrap();
+        assert_eq!(result["content"][0]["text"], "restarted");
     }
 
     #[tokio::test]

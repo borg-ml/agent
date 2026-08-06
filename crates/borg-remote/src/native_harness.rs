@@ -106,16 +106,16 @@ impl NativeHarness {
             .clone()
             .context("native provider sessions require an explicit model")?;
         let session_store = turn.agent_tools.session_store();
-        let runtime = NativeToolRuntime::start(
-            turn.session_id,
-            turn.cwd.clone(),
-            turn.permission_mode,
-            turn.agent_tools.clone(),
-            turn.external_mcp_servers.clone(),
-            turn.extension_skill_roots.clone(),
-            self.process_manager.clone(),
+        let runtime = NativeToolRuntime::start(NativeToolRuntimeConfig {
+            session_id: turn.session_id,
+            root: turn.cwd.clone(),
+            permission: turn.permission_mode,
+            agent_tools: turn.agent_tools.clone(),
+            external_mcp_servers: turn.external_mcp_servers.clone(),
+            extension_skill_roots: turn.extension_skill_roots.clone(),
+            processes: self.process_manager.clone(),
             session_store,
-        )
+        })
         .await?;
         let tools = runtime.tool_definitions()?;
         let mut messages = Vec::with_capacity(turn.conversation.len().saturating_add(3));
@@ -689,6 +689,17 @@ impl NativeModelClient for CompatibleModelClient {
     }
 }
 
+struct NativeToolRuntimeConfig {
+    session_id: Uuid,
+    root: PathBuf,
+    permission: PermissionMode,
+    agent_tools: crate::AgentToolDispatcher,
+    external_mcp_servers: Vec<borg_provider::mcp::ExternalMcpServer>,
+    extension_skill_roots: Vec<PathBuf>,
+    processes: crate::native_process::ProcessManager,
+    session_store: Option<crate::SqliteSessionStore>,
+}
+
 struct NativeToolRuntime {
     session_id: Uuid,
     root: PathBuf,
@@ -707,29 +718,26 @@ enum ToolExecutionClass {
 }
 
 impl NativeToolRuntime {
-    async fn start(
-        session_id: Uuid,
-        root: PathBuf,
-        permission: PermissionMode,
-        agent_tools: crate::AgentToolDispatcher,
-        external_mcp_servers: Vec<borg_provider::mcp::ExternalMcpServer>,
-        extension_skill_roots: Vec<PathBuf>,
-        processes: crate::native_process::ProcessManager,
-        session_store: Option<crate::SqliteSessionStore>,
-    ) -> Result<Self> {
-        if let Some(store) = session_store.as_ref() {
-            processes.recover_session(session_id, store.clone()).await?;
+    async fn start(config: NativeToolRuntimeConfig) -> Result<Self> {
+        if let Some(store) = config.session_store.as_ref() {
+            config
+                .processes
+                .recover_session(config.session_id, store.clone())
+                .await?;
         }
-        let context =
-            crate::native_context::NativeContext::load(root.clone(), extension_skill_roots).await?;
+        let context = crate::native_context::NativeContext::load(
+            config.root.clone(),
+            config.extension_skill_roots,
+        )
+        .await?;
         Ok(Self {
-            session_id,
-            root,
-            permission,
-            agent_tools,
-            mcp: crate::native_mcp::NativeMcpRuntime::start(external_mcp_servers).await?,
-            processes,
-            session_store,
+            session_id: config.session_id,
+            root: config.root,
+            permission: config.permission,
+            agent_tools: config.agent_tools,
+            mcp: crate::native_mcp::NativeMcpRuntime::start(config.external_mcp_servers).await?,
+            processes: config.processes,
+            session_store: config.session_store,
             context,
         })
     }
@@ -763,7 +771,7 @@ impl NativeToolRuntime {
         name: &str,
         arguments: Value,
         workflow_approved: bool,
-        workflow_cancel: Option<CancellationToken>,
+        cancellation: Option<CancellationToken>,
     ) -> Result<Value> {
         match name {
             "list_files" => {
@@ -859,7 +867,7 @@ impl NativeToolRuntime {
                     args.name,
                     args.source,
                     workflow_approved,
-                    workflow_cancel,
+                    cancellation,
                 )
                 .await
             }
@@ -867,15 +875,12 @@ impl NativeToolRuntime {
                 let args: ReadSkillArgs = serde_json::from_value(arguments)?;
                 self.context.read_skill(&args.name).await
             }
-            other if self.mcp.contains(other) => self.mcp.call(other, arguments).await,
+            other if self.mcp.contains(other) => {
+                self.mcp.call(other, arguments, cancellation.as_ref()).await
+            }
             other => {
                 self.agent_tools
-                    .call_with_workflow_control(
-                        other,
-                        arguments,
-                        workflow_approved,
-                        workflow_cancel,
-                    )
+                    .call_with_workflow_control(other, arguments, workflow_approved, cancellation)
                     .await
             }
         }
@@ -916,7 +921,7 @@ impl NativeToolRuntime {
                         name,
                         source,
                     },
-                    workflow_cancel.unwrap_or_else(CancellationToken::new),
+                    workflow_cancel.unwrap_or_default(),
                 )
                 .await?,
         )?)
@@ -1301,16 +1306,17 @@ async fn execute_tool(
         tool_call.function.name.as_str(),
         "run_workflow" | "run_blu_workflow" | "run_blu_extension"
     ) && runtime.permission != PermissionMode::FullAccess;
-    let workflow_cancel = matches!(
-        tool_call.function.name.as_str(),
-        "run_workflow" | "run_blu_workflow" | "run_blu_extension"
-    )
+    let call_cancel = (external_mcp
+        || matches!(
+            tool_call.function.name.as_str(),
+            "run_workflow" | "run_blu_workflow" | "run_blu_extension"
+        ))
     .then(CancellationToken::new);
     let call = runtime.call(
         &tool_call.function.name,
         input,
         workflow_approved,
-        workflow_cancel.clone(),
+        call_cancel.clone(),
     );
     tokio::pin!(call);
     loop {
@@ -1325,9 +1331,10 @@ async fn execute_tool(
             }),
             control = next_control(controls) => match control {
                 Some(AgentTurnControl::Interrupt) => {
-                    if let Some(cancel) = &workflow_cancel {
+                    if let Some(cancel) = &call_cancel {
                         cancel.cancel();
                     }
+                    let _ = tokio::time::timeout(Duration::from_secs(2), &mut call).await;
                     bail!("native provider turn interrupted")
                 }
                 Some(AgentTurnControl::Steer {
@@ -1336,7 +1343,7 @@ async fn execute_tool(
                     ack,
                     ..
                 }) => {
-                    if let Some(cancel) = &workflow_cancel {
+                    if let Some(cancel) = &call_cancel {
                         cancel.cancel();
                     }
                     let _ = ack.send(Ok(()));
@@ -1958,7 +1965,7 @@ mod tests {
                 .send(ProviderProgress::ProviderEvent {
                     kind: "background_task_live".to_string(),
                     payload: json!({ "task_id": "task-1" }),
-                    raw_payload: None,
+                    raw_payload: Box::new(None),
                     stream_channel: Some("background".to_string()),
                     content_text: None,
                     provider_item_id: Some("task-1".to_string()),

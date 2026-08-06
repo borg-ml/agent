@@ -1,3 +1,13 @@
+//! Workspace filesystem operations are bounded by canonical enrolled roots.
+//!
+//! The checks and the subsequent async mutations are separate filesystem
+//! syscalls. This is intentional, documented local-trust behavior: the
+//! enrolled workspace is trusted not to be concurrently rewritten by a
+//! privileged local actor while a request is executing. These checks defend
+//! against remote path traversal and symlink escapes, but are not a complete
+//! defense against a local TOCTOU attacker. Descriptor-relative, no-follow
+//! operations remain platform-specific follow-up hardening.
+
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 

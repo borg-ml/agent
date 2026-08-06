@@ -169,11 +169,33 @@ pub(crate) fn parse_hex_color(value: &str) -> Result<(u8, u8, u8)> {
 }
 
 fn default_path() -> Result<PathBuf> {
-    let root = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-        .context("HOME or XDG_CONFIG_HOME is required for editor preferences")?;
+    let root = config_root(
+        std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
+        std::env::var_os("HOME").map(PathBuf::from),
+        platform_config_dir(),
+    )
+    .context("unable to determine a config directory for editor preferences")?;
     Ok(root.join("borg").join("editor.toml"))
+}
+
+#[cfg(windows)]
+fn platform_config_dir() -> Option<PathBuf> {
+    dirs::config_dir()
+}
+
+#[cfg(not(windows))]
+fn platform_config_dir() -> Option<PathBuf> {
+    None
+}
+
+fn config_root(
+    xdg_config_home: Option<PathBuf>,
+    home: Option<PathBuf>,
+    platform_config_dir: Option<PathBuf>,
+) -> Option<PathBuf> {
+    xdg_config_home
+        .or_else(|| home.map(|home| home.join(".config")))
+        .or(platform_config_dir)
 }
 
 fn validate_label(kind: &str, value: &str) -> Result<()> {
@@ -236,6 +258,32 @@ mod tests {
         assert_eq!(
             EditorPreferences::load_from(&temp.path().join("missing.toml")).unwrap(),
             EditorPreferences::default()
+        );
+    }
+
+    #[test]
+    fn config_root_falls_back_to_the_platform_config_directory() {
+        let platform_config_dir = PathBuf::from("native-config");
+
+        assert_eq!(
+            config_root(None, None, Some(platform_config_dir.clone())),
+            Some(platform_config_dir)
+        );
+        assert_eq!(
+            config_root(
+                Some(PathBuf::from("xdg-config")),
+                Some(PathBuf::from("home")),
+                Some(PathBuf::from("native-config")),
+            ),
+            Some(PathBuf::from("xdg-config"))
+        );
+        assert_eq!(
+            config_root(
+                None,
+                Some(PathBuf::from("home")),
+                Some(PathBuf::from("native-config")),
+            ),
+            Some(PathBuf::from("home").join(".config"))
         );
     }
 

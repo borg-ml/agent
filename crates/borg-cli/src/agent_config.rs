@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -26,7 +27,9 @@ pub(crate) struct AgentConfig {
 ///
 /// Applied by [`AgentConfig::apply_local_provider_env`]. The process
 /// environment always wins, so an explicit export or `--model` still
-/// overrides the file.
+/// overrides the file. Values injected for one session are restored when that
+/// session ends; this prevents a later session from inheriting an old local
+/// endpoint or model after its config is reloaded.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct LocalProviderConfig {
@@ -89,6 +92,37 @@ impl Default for LocalProviderConfig {
             ctx_size: None,
             jinja: true,
             reasoning_format: Some("deepseek".to_string()),
+        }
+    }
+}
+
+const LOCAL_PROVIDER_ENV_KEYS: [&str; 4] = [
+    "BORG_OPENAI_COMPATIBLE_BASE_URL",
+    "BORG_OPENAI_COMPATIBLE_MODEL",
+    "BORG_OPENAI_COMPATIBLE_API_KEY",
+    "BORG_OPENAI_COMPATIBLE_CONTEXT_WINDOW_TOKENS",
+];
+
+/// Restores the provider environment snapshot taken before a local session.
+/// The guard also covers values written by the optional local-server launcher,
+/// which uses the same environment variables to communicate its bound
+/// endpoint to the provider adapter.
+pub(crate) struct LocalProviderEnvGuard {
+    previous: Vec<(&'static str, Option<OsString>)>,
+}
+
+impl Drop for LocalProviderEnvGuard {
+    fn drop(&mut self) {
+        for (key, value) in &self.previous {
+            // SAFETY: local sessions are run serially by the CLI. The guard is
+            // held for the entire session and restores exactly the snapshot it
+            // took before any provider worker was started.
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
         }
     }
 }
@@ -452,7 +486,11 @@ impl AgentConfig {
     /// Export `[local]` settings into the process environment so the
     /// `OpenAiCompatible` provider picks them up. Existing environment values
     /// are never overwritten: an explicit export or `--model` still wins.
-    pub(crate) fn apply_local_provider_env(&self) {
+    pub(crate) fn apply_local_provider_env(&self) -> LocalProviderEnvGuard {
+        let previous = LOCAL_PROVIDER_ENV_KEYS
+            .into_iter()
+            .map(|key| (key, std::env::var_os(key)))
+            .collect();
         let entries = [
             (
                 "BORG_OPENAI_COMPATIBLE_BASE_URL",
@@ -489,6 +527,7 @@ impl AgentConfig {
             // read provider environment are spawned.
             unsafe { std::env::set_var(key, value) };
         }
+        LocalProviderEnvGuard { previous }
     }
 
     pub(crate) fn autonomous_team_policy(
@@ -645,6 +684,41 @@ fn valid_allowed_tool(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    static LOCAL_ENV_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    struct LocalEnvReset {
+        previous: Vec<(&'static str, Option<OsString>)>,
+    }
+
+    impl LocalEnvReset {
+        fn new() -> Self {
+            let previous = LOCAL_PROVIDER_ENV_KEYS
+                .into_iter()
+                .map(|key| (key, std::env::var_os(key)))
+                .collect::<Vec<_>>();
+            for key in LOCAL_PROVIDER_ENV_KEYS {
+                // SAFETY: this test holds the process-local environment lock.
+                unsafe { std::env::remove_var(key) };
+            }
+            Self { previous }
+        }
+    }
+
+    impl Drop for LocalEnvReset {
+        fn drop(&mut self) {
+            for (key, value) in &self.previous {
+                // SAFETY: this test holds the process-local environment lock.
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn local_block_configures_an_openai_compatible_endpoint() {
@@ -672,6 +746,49 @@ context_window_tokens = 32768
         config.validate().expect("empty config is valid");
         assert_eq!(config.local, LocalProviderConfig::default());
         assert!(config.local.model.is_none());
+    }
+
+    #[test]
+    fn local_provider_environment_is_scoped_across_config_switches() {
+        let _lock = LOCAL_ENV_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap();
+        let _reset = LocalEnvReset::new();
+        let first: AgentConfig = toml::from_str(
+            "[local]\nbase_url='http://127.0.0.1:8000/v1'\nmodel='first'\napi_key='first-key'\ncontext_window_tokens=8192\n",
+        )
+        .unwrap();
+        let second: AgentConfig = toml::from_str(
+            "[local]\nbase_url='http://127.0.0.1:9000/v1'\nmodel='second'\napi_key='second-key'\ncontext_window_tokens=16384\n",
+        )
+        .unwrap();
+
+        {
+            let _guard = first.apply_local_provider_env();
+            assert_eq!(
+                std::env::var("BORG_OPENAI_COMPATIBLE_BASE_URL").unwrap(),
+                "http://127.0.0.1:8000/v1"
+            );
+            assert_eq!(
+                std::env::var("BORG_OPENAI_COMPATIBLE_MODEL").unwrap(),
+                "first"
+            );
+        }
+        assert!(std::env::var_os("BORG_OPENAI_COMPATIBLE_BASE_URL").is_none());
+
+        {
+            let _guard = second.apply_local_provider_env();
+            assert_eq!(
+                std::env::var("BORG_OPENAI_COMPATIBLE_BASE_URL").unwrap(),
+                "http://127.0.0.1:9000/v1"
+            );
+            assert_eq!(
+                std::env::var("BORG_OPENAI_COMPATIBLE_MODEL").unwrap(),
+                "second"
+            );
+        }
+        assert!(std::env::var_os("BORG_OPENAI_COMPATIBLE_MODEL").is_none());
     }
 
     #[test]

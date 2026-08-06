@@ -92,7 +92,8 @@ deny = ["n", "esc"]
 # reviewer_effort = "low"
 
 # Stable releases are verified and installed in the background for the next
-# launch. Active sessions are never restarted.
+# launch. Active sessions are never restarted. If this fails, Borg keeps a
+# durable notice and prompts for `borg update`.
 [updates]
 auto_install = true
 check_interval_hours = 24

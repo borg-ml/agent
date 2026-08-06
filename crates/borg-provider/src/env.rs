@@ -6,7 +6,8 @@ pub(crate) fn nonempty_var(name: &str) -> Option<String> {
         }
         Err(std::env::VarError::NotPresent) => None,
         Err(std::env::VarError::NotUnicode(_)) => {
-            panic!("{name} contains invalid unicode");
+            tracing::warn!(variable = name, "environment value is not valid UTF-8");
+            None
         }
     }
 }

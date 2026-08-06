@@ -1346,21 +1346,16 @@ pub enum RuntimeProcessStatus {
 /// The execution engine selected for an extension workflow. `blu` remains the
 /// compatibility default; the other variants are supervised user-provided
 /// runtimes rather than engines linked into Borg.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(export)]
 pub enum WorkflowRuntime {
+    #[default]
     Blu,
     Python,
     Ipython,
     Javascript,
     Typescript,
-}
-
-impl Default for WorkflowRuntime {
-    fn default() -> Self {
-        Self::Blu
-    }
 }
 
 impl WorkflowRuntime {

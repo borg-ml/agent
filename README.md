@@ -19,10 +19,11 @@ checksum, installs to a user-local binary directory, and checks the installed
 binary with `borg --version`.
 
 Borg CLI checks for verified stable releases in the background and installs them
-for the next launch without interrupting active work. Run `borg update`
-(`borg install` is an alias) to update immediately, or `borg update --check`
-to check without installing. Automatic updates and their check interval are
-configurable.
+for the next launch without interrupting active work. If an unattended check or
+installation fails, Borg keeps a durable notice and prompts you to run the
+manual `borg update` command. Run `borg update` (`borg install` is an alias) to
+update immediately, or `borg update --check` to check without installing.
+Automatic updates and their check interval are configurable.
 
 ## What Borg CLI provides
 

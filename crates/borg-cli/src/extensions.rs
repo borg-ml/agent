@@ -291,32 +291,44 @@ fn discover_in_dirs(
 
     for (dir, scope, state) in roots {
         let Some(dir) = dir else { continue };
-        let reload_signal = dir
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join("blu.reload");
-        if let Err(error) = hash_directory_signature(&mut digest, &dir) {
-            diagnostics.push(ExtensionDiagnostic {
-                level: ExtensionDiagnosticLevel::Error,
-                path: dir.clone(),
-                message: format!("could not inspect extension directory: {error:#}"),
-            });
-        }
-        if reload_signal.is_file() {
-            if let Err(error) = hash_file(&mut digest, &reload_signal) {
-                diagnostics.push(ExtensionDiagnostic {
-                    level: ExtensionDiagnosticLevel::Warning,
-                    path: reload_signal.clone(),
-                    message: format!("could not inspect Blu reload signal: {error:#}"),
-                });
-            }
-        }
-        let paths = match manifest_paths(&dir) {
-            Ok(paths) => paths,
+        let extension_base = match dir.canonicalize() {
+            Ok(path) => path,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => {
                 diagnostics.push(ExtensionDiagnostic {
                     level: ExtensionDiagnosticLevel::Error,
                     path: dir.clone(),
+                    message: format!("could not resolve extension directory: {error:#}"),
+                });
+                continue;
+            }
+        };
+        let reload_signal = dir
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("blu.reload");
+        if let Err(error) = hash_directory_signature(&mut digest, &extension_base) {
+            diagnostics.push(ExtensionDiagnostic {
+                level: ExtensionDiagnosticLevel::Error,
+                path: extension_base.clone(),
+                message: format!("could not inspect extension directory: {error:#}"),
+            });
+        }
+        if reload_signal.is_file()
+            && let Err(error) = hash_file(&mut digest, &reload_signal)
+        {
+            diagnostics.push(ExtensionDiagnostic {
+                level: ExtensionDiagnosticLevel::Warning,
+                path: reload_signal.clone(),
+                message: format!("could not inspect Blu reload signal: {error:#}"),
+            });
+        }
+        let paths = match manifest_paths(&extension_base) {
+            Ok(paths) => paths,
+            Err(error) => {
+                diagnostics.push(ExtensionDiagnostic {
+                    level: ExtensionDiagnosticLevel::Error,
+                    path: extension_base.clone(),
                     message: format!("could not enumerate extensions: {error:#}"),
                 });
                 Vec::new()
@@ -330,7 +342,7 @@ fn discover_in_dirs(
                     message: format!("could not fingerprint extension: {error:#}"),
                 });
             }
-            match load_candidate(&path, scope) {
+            match load_candidate(&path, scope, Some(&extension_base)) {
                 Ok(mut candidate) => {
                     if let Err(error) = hash_package_tree(&mut digest, &candidate.package_root) {
                         diagnostics.push(ExtensionDiagnostic {
@@ -409,7 +421,11 @@ fn discover_in_dirs(
     Ok((catalog, external_servers, workflows))
 }
 
-fn load_candidate(path: &Path, scope: ExtensionScope) -> Result<Candidate> {
+fn load_candidate(
+    path: &Path,
+    scope: ExtensionScope,
+    extension_base: Option<&Path>,
+) -> Result<Candidate> {
     let text = fs::read_to_string(path)
         .with_context(|| format!("read extension manifest {}", path.display()))?;
     let manifest: Manifest =
@@ -436,6 +452,19 @@ fn load_candidate(path: &Path, scope: ExtensionScope) -> Result<Candidate> {
         .context("extension manifest has no parent directory")?
         .canonicalize()
         .with_context(|| format!("canonicalize package containing {}", path.display()))?;
+    if let Some(extension_base) = extension_base {
+        ensure!(
+            package_root.starts_with(extension_base),
+            "extension package escapes its configured extension directory"
+        );
+    }
+    let canonical_manifest = path
+        .canonicalize()
+        .with_context(|| format!("canonicalize extension manifest {}", path.display()))?;
+    ensure!(
+        canonical_manifest.starts_with(&package_root),
+        "extension manifest escapes its package"
+    );
     let candidate = Candidate {
         manifest,
         manifest_path: path.to_path_buf(),
@@ -1045,9 +1074,12 @@ fn manifest_paths(dir: &Path) -> Result<Vec<PathBuf>> {
     entries.sort_by_key(|entry| entry.file_name());
     for entry in entries {
         let path = entry.path();
-        if path.is_file() && path.extension().and_then(|value| value.to_str()) == Some("toml") {
+        let file_type = entry.file_type()?;
+        if (file_type.is_file() || (file_type.is_symlink() && path.is_file()))
+            && path.extension().and_then(|value| value.to_str()) == Some("toml")
+        {
             paths.push(path);
-        } else if path.is_dir() {
+        } else if file_type.is_dir() || (file_type.is_symlink() && path.is_dir()) {
             for name in PACKAGE_MANIFEST_NAMES {
                 let manifest = path.join(name);
                 if manifest.is_file() {
@@ -1266,7 +1298,7 @@ fn install_expected(
     } else {
         ExtensionScope::User
     };
-    let mut source_candidate = load_candidate(&manifest_path, scope)?;
+    let mut source_candidate = load_candidate(&manifest_path, scope, None)?;
     let source_manifest = source_candidate.manifest.clone();
     validate_candidate_declarations(&mut source_candidate, &source_manifest)?;
     if let Some(expected_id) = expected_id {
@@ -1293,7 +1325,7 @@ fn install_expected(
     // Validate the staged package before replacing the live directory.
     let staged_validation = (|| -> Result<()> {
         let staged_manifest = package_manifest(&staging)?;
-        let mut staged_candidate = load_candidate(&staged_manifest, scope)?;
+        let mut staged_candidate = load_candidate(&staged_manifest, scope, None)?;
         let staged_manifest = staged_candidate.manifest.clone();
         validate_candidate_declarations(&mut staged_candidate, &staged_manifest)?;
         ensure!(
@@ -2042,6 +2074,30 @@ entrypoint = "workflows/luau.luau"
         let (catalog, _) = discover_test(None, Some(root.path().to_path_buf()), false);
         assert!(catalog.extensions.is_empty());
         assert_eq!(catalog.diagnostics.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_package_root_cannot_escape_extension_directory() {
+        use std::os::unix::fs::symlink;
+
+        let extension_dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        package(outside.path(), "outside", "");
+        symlink(
+            outside.path().join("outside"),
+            extension_dir.path().join("linked"),
+        )
+        .unwrap();
+
+        let (catalog, _) = discover_test(None, Some(extension_dir.path().to_path_buf()), false);
+
+        assert!(catalog.extensions.is_empty());
+        assert!(catalog.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("configured extension directory")
+        }));
     }
 
     #[test]

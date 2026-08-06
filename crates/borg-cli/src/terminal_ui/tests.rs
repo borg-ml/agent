@@ -1772,39 +1772,41 @@ fn actionable_inactive_goals_remain_in_the_status_line() {
 
 #[test]
 fn todo_status_counts_open_items_and_tooltip_matches_plan_order_and_clipping() {
-    let mut transcript = Transcript::default();
-    transcript.todos = vec![
-        PlanItem {
-            id: Uuid::new_v4(),
-            content: "Ship the hover affordance".to_string(),
-            status: PlanItemStatus::InProgress,
-        },
-        PlanItem {
-            id: Uuid::new_v4(),
-            content: "Keep the completed item visible".to_string(),
-            status: PlanItemStatus::Completed,
-        },
-        PlanItem {
-            id: Uuid::new_v4(),
-            content: "Run the regression tests".to_string(),
-            status: PlanItemStatus::Pending,
-        },
-        PlanItem {
-            id: Uuid::new_v4(),
-            content: "Document the reload boundary".to_string(),
-            status: PlanItemStatus::Pending,
-        },
-        PlanItem {
-            id: Uuid::new_v4(),
-            content: "Archive the old screenshot".to_string(),
-            status: PlanItemStatus::Completed,
-        },
-        PlanItem {
-            id: Uuid::new_v4(),
-            content: "Publish the release notes".to_string(),
-            status: PlanItemStatus::Pending,
-        },
-    ];
+    let transcript = Transcript {
+        todos: vec![
+            PlanItem {
+                id: Uuid::new_v4(),
+                content: "Ship the hover affordance".to_string(),
+                status: PlanItemStatus::InProgress,
+            },
+            PlanItem {
+                id: Uuid::new_v4(),
+                content: "Keep the completed item visible".to_string(),
+                status: PlanItemStatus::Completed,
+            },
+            PlanItem {
+                id: Uuid::new_v4(),
+                content: "Run the regression tests".to_string(),
+                status: PlanItemStatus::Pending,
+            },
+            PlanItem {
+                id: Uuid::new_v4(),
+                content: "Document the reload boundary".to_string(),
+                status: PlanItemStatus::Pending,
+            },
+            PlanItem {
+                id: Uuid::new_v4(),
+                content: "Archive the old screenshot".to_string(),
+                status: PlanItemStatus::Completed,
+            },
+            PlanItem {
+                id: Uuid::new_v4(),
+                content: "Publish the release notes".to_string(),
+                status: PlanItemStatus::Pending,
+            },
+        ],
+        ..Transcript::default()
+    };
 
     assert_eq!(transcript.todo_status().as_deref(), Some("4 open to-dos"));
     let rows = transcript.todo_tooltip_rows(false);
@@ -2129,10 +2131,14 @@ fn focused_transcript_configuration_switches_cwd_metadata() {
         permission_mode: PermissionMode::FullAccess,
     };
     let child_id = Uuid::new_v4();
-    let mut displayed = Transcript::default();
-    displayed.config = Some(config("/workspace/director"));
-    let mut child = Transcript::default();
-    child.config = Some(config("/workspace/child"));
+    let mut displayed = Transcript {
+        config: Some(config("/workspace/director")),
+        ..Transcript::default()
+    };
+    let child = Transcript {
+        config: Some(config("/workspace/child")),
+        ..Transcript::default()
+    };
     let mut director = None;
     let mut children = HashMap::from([(child_id, child)]);
 
@@ -3824,16 +3830,18 @@ fn optimistic_idle_submission_is_visible_before_session_persistence() {
 fn optimistic_idle_submission_immediately_hides_cold_cache_guidance() {
     let session_id = Uuid::new_v4();
     let message_id = Uuid::new_v4();
-    let mut transcript = Transcript::default();
-    transcript.config = Some(SessionDisplayConfig {
-        cwd: PathBuf::from("/workspace"),
-        provider: CodingProvider::Codex,
-        model: Some("gpt-5.6-sol".to_string()),
-        effort: Some("high".to_string()),
-        response_language: ResponseLanguage::English,
-        fast: false,
-        permission_mode: PermissionMode::FullAccess,
-    });
+    let mut transcript = Transcript {
+        config: Some(SessionDisplayConfig {
+            cwd: PathBuf::from("/workspace"),
+            provider: CodingProvider::Codex,
+            model: Some("gpt-5.6-sol".to_string()),
+            effort: Some("high".to_string()),
+            response_language: ResponseLanguage::English,
+            fast: false,
+            permission_mode: PermissionMode::FullAccess,
+        }),
+        ..Transcript::default()
+    };
     transcript.live_turn_closed = true;
     let at = Utc::now() - chrono::Duration::minutes(31);
     transcript.cache_diagnostics.observe(

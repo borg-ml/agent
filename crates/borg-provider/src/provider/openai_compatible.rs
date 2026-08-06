@@ -391,7 +391,7 @@ impl OpenAiCompatibleProvider {
             usage.context_tokens =
                 Some(usage.input_tokens.saturating_add(usage.cached_input_tokens));
             if let Some(limits) =
-                openrouter_model_limits(&client, &endpoint, api_key.as_deref(), &self.model).await
+                openrouter_model_limits(client, &endpoint, api_key.as_deref(), &self.model).await
             {
                 usage.context_window_tokens = Some(
                     limits
@@ -772,7 +772,7 @@ async fn read_compatible_model_stream(
                     let _ = sender.send(ProviderProgress::ProviderEvent {
                         kind: "reasoning_delta".to_string(),
                         payload: json!({ "text": delta }),
-                        raw_payload: None,
+                        raw_payload: Box::new(None),
                         stream_channel: Some("reasoning".to_string()),
                         content_text: Some(delta.to_string()),
                         provider_item_id: None,
@@ -914,7 +914,7 @@ fn emit_compatible_retry_event(
             "max_attempts": retry.max_attempts,
             "delay_ms": retry.delay.as_millis().min(u128::from(u64::MAX)) as u64,
         }),
-        raw_payload: None,
+        raw_payload: Box::new(None),
         stream_channel: None,
         content_text: None,
         provider_item_id: None,
@@ -1032,8 +1032,6 @@ fn merge_object(target: &mut Value, extra: Map<String, Value>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
     #[test]
     fn native_images_use_chat_completions_multimodal_blocks() {
         let message = ModelMessage::user_with_attachments(
@@ -1054,7 +1052,7 @@ mod tests {
     }
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    static OPENROUTER_ENV_LOCK: Mutex<()> = Mutex::new(());
+    static OPENROUTER_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     struct TestEnvGuard {
         key: &'static str,
@@ -1216,9 +1214,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn openrouter_arbitrary_model_runs_the_complete_native_wire_contract() {
-        let _lock = OPENROUTER_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let _lock = OPENROUTER_ENV_LOCK.lock().await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind OpenRouter test server");

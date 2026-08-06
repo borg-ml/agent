@@ -315,7 +315,6 @@ impl SqliteReceiptStore {
         .await?
         .map(|row| decode_receipt_record(&row))
         .transpose()
-        .map_err(Into::into)
     }
 }
 

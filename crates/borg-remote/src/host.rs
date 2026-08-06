@@ -945,13 +945,15 @@ pub async fn run_host_with_executor_factory(
             .context("Borg returned invalid remote commands")?;
         for envelope in commands.commands {
             let handled = dispatch(
-                client.clone(),
-                config.clone(),
-                session_root.clone(),
-                sessions.clone(),
-                Arc::clone(&session_store),
-                Arc::clone(&receipts),
-                Arc::clone(&executor_factory),
+                DispatchContext {
+                    client: client.clone(),
+                    config: config.clone(),
+                    session_root: session_root.clone(),
+                    sessions: sessions.clone(),
+                    session_store: Arc::clone(&session_store),
+                    receipts: Arc::clone(&receipts),
+                    executor_factory: Arc::clone(&executor_factory),
+                },
                 envelope.command,
             )
             .await;
@@ -1253,7 +1255,7 @@ async fn load_session_sync(
         .context("Borg returned an invalid session sync cursor")
 }
 
-async fn dispatch(
+struct DispatchContext {
     client: Client,
     config: HostConfig,
     session_root: PathBuf,
@@ -1261,8 +1263,18 @@ async fn dispatch(
     session_store: Arc<SqliteSessionStore>,
     receipts: Arc<SqliteReceiptStore>,
     executor_factory: HostExecutorFactory,
-    command: HostCommand,
-) -> bool {
+}
+
+async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
+    let DispatchContext {
+        client,
+        config,
+        session_root,
+        sessions,
+        session_store,
+        receipts,
+        executor_factory,
+    } = context;
     if let HostCommand::WorkspaceFilesystem { request } = &command {
         let Some(response) = filesystem_response(&receipts, &config, request).await else {
             return false;
@@ -2379,7 +2391,7 @@ mod tests {
                 &Client::new(),
                 &config,
                 &store,
-                &[root_event.clone()],
+                std::slice::from_ref(&root_event),
                 &mut uploaded_sequence,
                 Duration::from_secs(3),
             )
@@ -2635,13 +2647,15 @@ mod tests {
 
         assert!(
             dispatch(
-                Client::new(),
-                config,
-                root.path().to_path_buf(),
-                Arc::clone(&sessions),
-                session_store,
-                receipts,
-                default_host_executor_factory(),
+                DispatchContext {
+                    client: Client::new(),
+                    config,
+                    session_root: root.path().to_path_buf(),
+                    sessions: Arc::clone(&sessions),
+                    session_store,
+                    receipts,
+                    executor_factory: default_host_executor_factory(),
+                },
                 HostCommand::Stop { session_id },
             )
             .await,

@@ -16,6 +16,7 @@ use crate::cli::UpdateArgs;
 
 const REPOSITORY: &str = "borg-ml/cli";
 const MAX_DOWNLOAD_BYTES: usize = 128 * 1024 * 1024;
+const MAX_UPDATE_ERROR_CHARS: usize = 512;
 static BACKGROUND_STARTED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Deserialize)]
@@ -33,6 +34,10 @@ struct GithubAsset {
 #[derive(Debug, Default, Deserialize, Serialize)]
 struct UpdateState {
     last_checked_unix: u64,
+    #[serde(default)]
+    manual_update_required: bool,
+    #[serde(default)]
+    last_error: Option<String>,
 }
 
 pub(crate) async fn run(args: UpdateArgs) -> Result<()> {
@@ -61,9 +66,19 @@ pub(crate) fn spawn_background(config: UpdateConfig) {
     }
     tokio::spawn(async {
         if let Err(error) = update(false, true).await {
-            tracing::debug!(%error, "background Borg update skipped");
+            record_background_failure(&error.to_string());
+            tracing::warn!(%error, "background Borg update failed; manual update is required");
         }
     });
+}
+
+/// Read the durable failure notice without consuming it. It remains visible
+/// across launches until a later update check or installation succeeds.
+pub(crate) fn manual_update_notice() -> Option<String> {
+    let state = read_update_state()?;
+    state
+        .manual_update_required
+        .then(|| format_manual_update_notice(state.last_error.as_deref()))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -91,6 +106,7 @@ async fn update(check_only: bool, quiet: bool) -> Result<UpdateOutcome> {
     let latest = parse_version(&release.tag_name)?;
     let current = Version::parse(env!("CARGO_PKG_VERSION")).context("invalid installed version")?;
     if latest <= current {
+        clear_background_failure();
         return Ok(UpdateOutcome::Current(current));
     }
     if check_only {
@@ -129,6 +145,7 @@ async fn update(check_only: bool, quiet: bool) -> Result<UpdateOutcome> {
     validate_candidate(&candidate, &latest)?;
     validate_native_provider(&provider_candidate)?;
     install_candidate(&candidate, &provider_candidate, &latest)?;
+    clear_background_failure();
     Ok(UpdateOutcome::Installed(latest))
 }
 
@@ -376,7 +393,7 @@ fn install_native_provider_to(provider: &Path, target: &Path) -> Result<()> {
     let providers_parent = target
         .parent()
         .context("native provider destination has no parent")?;
-    fs::create_dir_all(&providers_parent)
+    fs::create_dir_all(providers_parent)
         .context("failed to create installed provider directory")?;
     let staged = providers_parent.join(format!(".claude-update-{}", std::process::id()));
     let backup = providers_parent.join(format!(".claude-backup-{}", std::process::id()));
@@ -405,11 +422,11 @@ fn install_native_provider_to(provider: &Path, target: &Path) -> Result<()> {
         .context("failed to make native provider executable")?;
     }
     if target.exists() {
-        fs::rename(&target, &backup).context("failed to stage the installed native provider")?;
+        fs::rename(target, &backup).context("failed to stage the installed native provider")?;
     }
-    if let Err(error) = fs::rename(&staged, &target) {
+    if let Err(error) = fs::rename(&staged, target) {
         if backup.exists() {
-            let _ = fs::rename(&backup, &target);
+            let _ = fs::rename(&backup, target);
         }
         return Err(error).context("failed to atomically install native provider");
     }
@@ -507,17 +524,29 @@ fn state_path() -> Option<PathBuf> {
 }
 
 fn check_is_due(interval_hours: u64) -> bool {
-    let Some(path) = state_path() else {
+    let Some(state) = read_update_state() else {
         return false;
     };
-    let state = fs::read(&path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<UpdateState>(&bytes).ok())
-        .unwrap_or_default();
     unix_now().saturating_sub(state.last_checked_unix) >= interval_hours.saturating_mul(3600)
 }
 
 fn record_check() {
+    let mut state = read_update_state().unwrap_or_default();
+    state.last_checked_unix = unix_now();
+    write_update_state(&state);
+}
+
+fn read_update_state() -> Option<UpdateState> {
+    let path = state_path()?;
+    Some(
+        fs::read(path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<UpdateState>(&bytes).ok())
+            .unwrap_or_default(),
+    )
+}
+
+fn write_update_state(state: &UpdateState) {
     let Some(path) = state_path() else {
         return;
     };
@@ -527,20 +556,88 @@ fn record_check() {
     if fs::create_dir_all(parent).is_err() {
         return;
     }
-    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
-    let state = UpdateState {
-        last_checked_unix: unix_now(),
+    let temporary = path.with_extension(format!(
+        "tmp-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let Ok(bytes) = serde_json::to_vec(state) else {
+        return;
     };
-    if serde_json::to_vec(&state)
-        .ok()
-        .and_then(|bytes| {
-            fs::File::create(&temporary)
-                .ok()
-                .and_then(|mut file| file.write_all(&bytes).ok())
-        })
-        .is_some()
-    {
-        let _ = fs::rename(temporary, path);
+    let result = (|| -> std::io::Result<()> {
+        let mut file = fs::File::create(&temporary)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        replace_file(&temporary, &path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+}
+
+#[cfg(not(windows))]
+fn replace_file(temporary: &Path, destination: &Path) -> std::io::Result<()> {
+    fs::rename(temporary, destination)
+}
+
+#[cfg(windows)]
+fn replace_file(temporary: &Path, destination: &Path) -> std::io::Result<()> {
+    // Windows does not let rename replace an existing file. Removing the old
+    // state first keeps repeated background checks writable; the temporary
+    // file is still fully flushed before this small platform-specific window.
+    match fs::remove_file(destination) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    fs::rename(temporary, destination)
+}
+
+fn record_background_failure(error: &str) {
+    let mut state = read_update_state().unwrap_or_default();
+    state.manual_update_required = true;
+    state.last_error = Some(bounded_update_error(error));
+    write_update_state(&state);
+}
+
+fn clear_background_failure() {
+    let Some(mut state) = read_update_state() else {
+        return;
+    };
+    if !state.manual_update_required && state.last_error.is_none() {
+        return;
+    }
+    state.manual_update_required = false;
+    state.last_error = None;
+    write_update_state(&state);
+}
+
+fn bounded_update_error(error: &str) -> String {
+    let compact = error.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut bounded = compact
+        .chars()
+        .take(MAX_UPDATE_ERROR_CHARS)
+        .collect::<String>();
+    if compact.chars().count() > MAX_UPDATE_ERROR_CHARS {
+        bounded.push('…');
+    }
+    if bounded.is_empty() {
+        "the update did not complete".to_string()
+    } else {
+        bounded
+    }
+}
+
+fn format_manual_update_notice(error: Option<&str>) -> String {
+    match error.filter(|error| !error.trim().is_empty()) {
+        Some(error) => {
+            format!("Automatic Borg update failed: {error}. Run `borg update` manually.")
+        }
+        None => "Automatic Borg update failed. Run `borg update` manually.".to_string(),
     }
 }
 
@@ -554,6 +651,46 @@ fn unix_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_update_state_deserializes_with_failure_defaults() {
+        let state: UpdateState = serde_json::from_str(r#"{"last_checked_unix":7}"#).unwrap();
+
+        assert_eq!(state.last_checked_unix, 7);
+        assert!(!state.manual_update_required);
+        assert!(state.last_error.is_none());
+    }
+
+    #[test]
+    fn background_failure_notice_requires_manual_update() {
+        let error = bounded_update_error("network unavailable\ntry again");
+        let notice = format_manual_update_notice(Some(&error));
+
+        assert!(notice.contains("network unavailable try again"));
+        assert!(notice.contains("borg update"));
+    }
+
+    #[test]
+    fn background_failure_reason_is_bounded() {
+        let reason = bounded_update_error(&"x".repeat(MAX_UPDATE_ERROR_CHARS + 20));
+
+        assert_eq!(reason.chars().count(), MAX_UPDATE_ERROR_CHARS + 1);
+        assert!(reason.ends_with('…'));
+    }
+
+    #[test]
+    fn replacing_update_state_overwrites_an_existing_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let temporary = directory.path().join("update.tmp");
+        let destination = directory.path().join("update.json");
+        fs::write(&temporary, b"new").unwrap();
+        fs::write(&destination, b"old").unwrap();
+
+        replace_file(&temporary, &destination).unwrap();
+
+        assert_eq!(fs::read(&destination).unwrap(), b"new");
+        assert!(!temporary.exists());
+    }
 
     #[test]
     fn checksum_binds_hash_and_asset_name() {

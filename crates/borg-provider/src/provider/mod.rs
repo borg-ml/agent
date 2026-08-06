@@ -206,7 +206,7 @@ pub enum ProviderProgress {
     ProviderEvent {
         kind: String,
         payload: Value,
-        raw_payload: Option<Value>,
+        raw_payload: Box<Option<Value>>,
         stream_channel: Option<String>,
         content_text: Option<String>,
         provider_item_id: Option<String>,

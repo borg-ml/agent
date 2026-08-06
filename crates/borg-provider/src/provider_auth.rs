@@ -391,7 +391,7 @@ async fn run_provider_auth_status_command(command: &mut Command, label: &str) ->
     run_provider_auth_status_command_with_timeout(
         command,
         label,
-        provider_auth_validation_timeout(),
+        provider_auth_validation_timeout()?,
     )
     .await
 }
@@ -408,28 +408,34 @@ async fn run_provider_auth_status_command_with_timeout(
         .with_context(|| format!("run {label}"))
 }
 
-fn provider_auth_validation_timeout() -> Duration {
+fn provider_auth_validation_timeout() -> Result<Duration> {
     let raw = match std::env::var(PROVIDER_AUTH_VALIDATION_TIMEOUT_ENV) {
         Ok(raw) => raw,
         Err(std::env::VarError::NotPresent) => {
-            return Duration::from_secs(DEFAULT_PROVIDER_AUTH_VALIDATION_TIMEOUT_SECS);
+            return Ok(Duration::from_secs(
+                DEFAULT_PROVIDER_AUTH_VALIDATION_TIMEOUT_SECS,
+            ));
         }
         Err(std::env::VarError::NotUnicode(_)) => {
-            panic!("{PROVIDER_AUTH_VALIDATION_TIMEOUT_ENV} contains invalid unicode");
+            return Err(anyhow!(
+                "{PROVIDER_AUTH_VALIDATION_TIMEOUT_ENV} contains invalid unicode"
+            ));
         }
     };
     let raw = raw.trim();
     if raw.is_empty() {
-        return Duration::from_secs(DEFAULT_PROVIDER_AUTH_VALIDATION_TIMEOUT_SECS);
+        return Ok(Duration::from_secs(
+            DEFAULT_PROVIDER_AUTH_VALIDATION_TIMEOUT_SECS,
+        ));
     }
     match raw.parse::<u64>() {
-        Ok(secs) if secs > 0 => Duration::from_secs(secs),
-        Ok(_) => {
-            panic!("{PROVIDER_AUTH_VALIDATION_TIMEOUT_ENV} must be positive");
-        }
-        Err(error) => {
-            panic!("invalid {PROVIDER_AUTH_VALIDATION_TIMEOUT_ENV}: {error}");
-        }
+        Ok(secs) if secs > 0 => Ok(Duration::from_secs(secs)),
+        Ok(_) => Err(anyhow!(
+            "{PROVIDER_AUTH_VALIDATION_TIMEOUT_ENV} must be positive"
+        )),
+        Err(error) => Err(anyhow!(
+            "invalid {PROVIDER_AUTH_VALIDATION_TIMEOUT_ENV}: {error}"
+        )),
     }
 }
 
@@ -704,24 +710,27 @@ mod tests {
     fn provider_auth_validation_timeout_rejects_invalid_config() {
         let _guard = EnvGuard::unset(PROVIDER_AUTH_VALIDATION_TIMEOUT_ENV);
         assert_eq!(
-            provider_auth_validation_timeout(),
+            provider_auth_validation_timeout().unwrap(),
             Duration::from_secs(DEFAULT_PROVIDER_AUTH_VALIDATION_TIMEOUT_SECS)
         );
 
         let _guard = EnvGuard::set(PROVIDER_AUTH_VALIDATION_TIMEOUT_ENV, " 45 ");
-        assert_eq!(provider_auth_validation_timeout(), Duration::from_secs(45));
+        assert_eq!(
+            provider_auth_validation_timeout().unwrap(),
+            Duration::from_secs(45)
+        );
 
         let _guard = EnvGuard::set(PROVIDER_AUTH_VALIDATION_TIMEOUT_ENV, " ");
         assert_eq!(
-            provider_auth_validation_timeout(),
+            provider_auth_validation_timeout().unwrap(),
             Duration::from_secs(DEFAULT_PROVIDER_AUTH_VALIDATION_TIMEOUT_SECS)
         );
 
         let _guard = EnvGuard::set(PROVIDER_AUTH_VALIDATION_TIMEOUT_ENV, "0");
-        assert!(std::panic::catch_unwind(provider_auth_validation_timeout).is_err());
+        assert!(provider_auth_validation_timeout().is_err());
 
         let _guard = EnvGuard::set(PROVIDER_AUTH_VALIDATION_TIMEOUT_ENV, "soon");
-        assert!(std::panic::catch_unwind(provider_auth_validation_timeout).is_err());
+        assert!(provider_auth_validation_timeout().is_err());
     }
 
     #[test]

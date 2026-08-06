@@ -15,7 +15,16 @@ allow = [
     "CDLA-Permissive-2.0",
     "ISC",
     "MIT",
+    "MPL-2.0",
     "Unicode-3.0",
     "Unlicense",
     "Zlib",
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-git = [
+    "https://github.com/borg-ml/blu.git",
+    "https://github.com/borg-ml/claude-agents.git",
 ]

@@ -405,10 +405,10 @@ async fn wait_for_health(
 ) -> Result<HealthProbe> {
     let deadline = Instant::now() + budget;
     loop {
-        if let Some(child) = child.as_deref_mut() {
-            if let Some(status) = child.try_wait()? {
-                bail!("local llama-server exited before /v1/health became ready (status {status})");
-            }
+        if let Some(child) = child.as_deref_mut()
+            && let Some(status) = child.try_wait()?
+        {
+            bail!("local llama-server exited before /v1/health became ready (status {status})");
         }
         match probe_health(client, health_url).await {
             HealthProbe::Healthy => return Ok(HealthProbe::Healthy),

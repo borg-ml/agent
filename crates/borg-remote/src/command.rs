@@ -1,3 +1,10 @@
+//! Workspace commands use the same canonical-root boundary as filesystem
+//! operations. Root and cwd validation happens before process creation and is
+//! a remote traversal defense, not a descriptor-relative sandbox: the local
+//! workspace is trusted not to be concurrently renamed or replaced by a
+//! privileged actor during the command. Platform-specific no-follow process
+//! spawning is a future hardening option.
+
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;

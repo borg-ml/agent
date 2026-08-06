@@ -35,6 +35,21 @@ release-check version="":
 release-test:
     ./scripts/release-test.sh
 
+# Run the repository quality gates used by local development and CI.
+verify:
+    cargo fmt --all -- --check
+    cargo check --workspace --locked
+    cargo test --workspace --locked --no-fail-fast
+    cargo clippy --workspace --all-targets --locked -- -D warnings
+    cargo deny check advisories bans licenses sources
+    # Keep the RSA dependency check explicit so a future database feature
+    # cannot reintroduce the Marvin-attack edge into the active graph.
+    if cargo tree --workspace --target all -e features -i rsa 2>/dev/null | grep -q 'rsa'; then echo 'active rsa dependency detected' >&2; exit 1; fi
+    # syntect currently brings bincode 1.x, which is covered by deny.toml's
+    # documented unmaintained-dependency exception.
+    cargo audit --ignore RUSTSEC-2025-0141
+    git diff --check
+
 # Bump, verify, commit, tag, and publish a release. Defaults to the next patch.
 release version="":
     ./scripts/release.sh {{ quote(version) }}

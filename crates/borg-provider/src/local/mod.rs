@@ -136,15 +136,15 @@ pub fn discover_models(
     if !config.model_dirs.is_empty() {
         sources.push(Box::new(NativeGgufSource::new(config.model_dirs.clone())));
     }
-    if config.include_ollama_store {
-        if let Some(models_dir) = config.ollama_models_dir.clone() {
-            sources.push(Box::new(OllamaBlobSource::new(models_dir)));
-        }
+    if config.include_ollama_store
+        && let Some(models_dir) = config.ollama_models_dir.clone()
+    {
+        sources.push(Box::new(OllamaBlobSource::new(models_dir)));
     }
-    if config.include_hf_cache {
-        if let Some(cache_dir) = config.hf_cache_dir.clone() {
-            sources.push(Box::new(HuggingFaceCacheSource::new(cache_dir)));
-        }
+    if config.include_hf_cache
+        && let Some(cache_dir) = config.hf_cache_dir.clone()
+    {
+        sources.push(Box::new(HuggingFaceCacheSource::new(cache_dir)));
     }
 
     let mut models = Vec::new();

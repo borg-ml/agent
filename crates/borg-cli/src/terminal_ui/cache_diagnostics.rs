@@ -268,11 +268,11 @@ impl CacheStatus {
                 )
             },
         );
-        let qualification = self
-            .label
-            .starts_with("cache may be cold · ")
-            .then_some(" Review before sending; provider retention is not a guarantee.")
-            .unwrap_or_default();
+        let qualification = if self.label.starts_with("cache may be cold · ") {
+            " Review before sending; provider retention is not a guarantee."
+        } else {
+            ""
+        };
         format!(
             "Cold cache: {reason}; the next turn may {resend}.{qualification} Run /clear first if that \
              context is no longer useful."

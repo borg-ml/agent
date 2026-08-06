@@ -1198,8 +1198,8 @@ async fn run_codex_subscription_process(
                 }
                 if let Some(method) = codex_event_kind(&value)
                     && method.ends_with("/requestApproval")
+                    && let Some(rpc_id) = value.get("id")
                 {
-                    if let Some(rpc_id) = value.get("id") {
                         let params = value.get("params").cloned().unwrap_or(Value::Null);
                         let approval_id = params
                             .get("approvalId")
@@ -1217,7 +1217,6 @@ async fn run_codex_subscription_process(
                                 .to_string(),
                             command: params.get("command").and_then(Value::as_str).map(str::to_string),
                         }).await.ok();
-                    }
                 }
             }
             control = receive_control(&mut controls), if controls.is_some() => {
@@ -1454,12 +1453,11 @@ fn codex_thread_start_params(
         "baseInstructions": request.system_prompt,
     });
     let mut config = serde_json::Map::new();
-    if !request.mcp_external_servers.is_empty() {
-        if let Some(mcp_config) =
+    if !request.mcp_external_servers.is_empty()
+        && let Some(mcp_config) =
             codex_app_server_mcp_config(&request.mcp_external_servers).as_object()
-        {
-            config.extend(mcp_config.clone());
-        }
+    {
+        config.extend(mcp_config.clone());
     }
     if request.web_search_allowed {
         config.insert(
@@ -1726,15 +1724,13 @@ impl CodexReasoningState {
         let mut key = codex_reasoning_stream_key(value);
         if !self.streams.contains_key(&key)
             && let Some(prefix) = key.strip_suffix(":-")
-        {
-            if let Some(existing) = self
+            && let Some(existing) = self
                 .streams
                 .keys()
                 .find(|candidate| candidate.starts_with(&format!("{prefix}:")))
                 .cloned()
-            {
-                key = existing;
-            }
+        {
+            key = existing;
         }
         let previous = self.streams.entry(key).or_default();
         let emitted = normalize_provider_delta(previous, aggregate);
@@ -1846,15 +1842,14 @@ async fn emit_codex_events_with_state(
                 return;
             }
             if codex_item_is_reasoning(item_type) {
-                if let Some(reasoning) = codex_reasoning_text(item) {
-                    if let Some(reasoning) = reasoning_state.completion_suffix(value, &reasoning) {
-                        if !reasoning.is_empty() {
-                            events
-                                .send(ChatStreamEvent::ReasoningDelta(reasoning))
-                                .await
-                                .ok();
-                        }
-                    }
+                if let Some(reasoning) = codex_reasoning_text(item)
+                    && let Some(reasoning) = reasoning_state.completion_suffix(value, &reasoning)
+                    && !reasoning.is_empty()
+                {
+                    events
+                        .send(ChatStreamEvent::ReasoningDelta(reasoning))
+                        .await
+                        .ok();
                 }
                 events
                     .send(ChatStreamEvent::Phase {
@@ -2174,11 +2169,7 @@ fn codex_event_is_assistant_text_delta(value: &Value) -> bool {
     if codex_event_is_tool_output_delta(value) {
         return false;
     }
-    let kind = kind
-        .replace('.', "")
-        .replace('_', "")
-        .replace('-', "")
-        .to_ascii_lowercase();
+    let kind = kind.replace(['.', '_', '-'], "").to_ascii_lowercase();
     if !kind.contains("delta")
         || kind.contains("reasoning")
         || kind.contains("commandexecution")

@@ -435,13 +435,15 @@ impl SqliteAutonomyStore {
 
         append_transition(
             &mut tx,
-            job_id,
-            None,
-            AutonomyJobState::Queued,
-            0,
-            None,
-            None,
-            now,
+            AutonomyTransition {
+                job_id,
+                from: None,
+                to: AutonomyJobState::Queued,
+                attempt: 0,
+                reason: None,
+                lease_owner: None,
+                occurred_at: now,
+            },
         )
         .await?;
 
@@ -538,13 +540,15 @@ impl SqliteAutonomyStore {
             let job = load_job(&mut tx, job_id).await?;
             append_transition(
                 &mut tx,
-                job_id,
-                Some(AutonomyJobState::Queued),
-                AutonomyJobState::Claimed,
-                job.attempt,
-                None,
-                Some(lease_owner.to_owned()),
-                now,
+                AutonomyTransition {
+                    job_id,
+                    from: Some(AutonomyJobState::Queued),
+                    to: AutonomyJobState::Claimed,
+                    attempt: job.attempt,
+                    reason: None,
+                    lease_owner: Some(lease_owner.to_owned()),
+                    occurred_at: now,
+                },
             )
             .await?;
             claimed.push(job);
@@ -685,13 +689,15 @@ impl SqliteAutonomyStore {
         let updated = load_job(&mut tx, job_id).await?;
         append_transition(
             &mut tx,
-            job_id,
-            Some(expected),
-            next,
-            updated.attempt,
-            reason,
-            lease_owner,
-            now,
+            AutonomyTransition {
+                job_id,
+                from: Some(expected),
+                to: next,
+                attempt: updated.attempt,
+                reason,
+                lease_owner,
+                occurred_at: now,
+            },
         )
         .await?;
         tx.commit().await?;
@@ -736,13 +742,15 @@ impl SqliteAutonomyStore {
         let updated = load_job(&mut tx, job_id).await?;
         append_transition(
             &mut tx,
-            job_id,
-            Some(AutonomyJobState::Running),
-            AutonomyJobState::Completed,
-            updated.attempt,
-            None,
-            Some(lease.owner.clone()),
-            now,
+            AutonomyTransition {
+                job_id,
+                from: Some(AutonomyJobState::Running),
+                to: AutonomyJobState::Completed,
+                attempt: updated.attempt,
+                reason: None,
+                lease_owner: Some(lease.owner.clone()),
+                occurred_at: now,
+            },
         )
         .await?;
         tx.commit().await?;
@@ -833,13 +841,15 @@ impl SqliteAutonomyStore {
             .context("expired autonomy job changed while recovering")?;
             append_transition(
                 &mut tx,
-                job_id,
-                Some(current.state),
-                next,
-                current.attempt,
-                Some(reason.to_owned()),
-                current.lease_owner,
-                now,
+                AutonomyTransition {
+                    job_id,
+                    from: Some(current.state),
+                    to: next,
+                    attempt: current.attempt,
+                    reason: Some(reason.to_owned()),
+                    lease_owner: current.lease_owner,
+                    occurred_at: now,
+                },
             )
             .await?;
             recovered.push(load_job(&mut tx, job_id).await?);
@@ -1039,8 +1049,7 @@ impl SqliteAutonomyStore {
     }
 }
 
-async fn append_transition(
-    tx: &mut Transaction<'_, Sqlite>,
+struct AutonomyTransition {
     job_id: Uuid,
     from: Option<AutonomyJobState>,
     to: AutonomyJobState,
@@ -1048,7 +1057,21 @@ async fn append_transition(
     reason: Option<String>,
     lease_owner: Option<String>,
     occurred_at: DateTime<Utc>,
+}
+
+async fn append_transition(
+    tx: &mut Transaction<'_, Sqlite>,
+    transition: AutonomyTransition,
 ) -> Result<()> {
+    let AutonomyTransition {
+        job_id,
+        from,
+        to,
+        attempt,
+        reason,
+        lease_owner,
+        occurred_at,
+    } = transition;
     let sequence: i64 = sqlx::query_scalar(
         "select coalesce(max(sequence) + 1, 0) from autonomy_job_transitions where job_id=?",
     )

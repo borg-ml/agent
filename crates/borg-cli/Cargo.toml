@@ -57,4 +57,5 @@ flate2 = "1"
 tar = "0.4"
 
 [target.'cfg(windows)'.dependencies]
+dirs.workspace = true
 zip = { version = "4", default-features = false, features = ["deflate"] }

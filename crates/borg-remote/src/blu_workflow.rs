@@ -166,25 +166,37 @@ impl BluWorkflowRunner {
             );
             return Ok(completed_result(kind));
         }
-        if let Some(kind) = find_started(&events, request.workflow_id) {
-            ensure!(
-                started_hash(kind) == source_hash,
-                "Blu workflow source changed"
-            );
-        } else {
+        if find_started(&events, request.workflow_id).is_none() {
             self.store
-                .append(SessionEvent::new(
-                    self.session_id,
-                    0,
-                    SessionEventKind::BluWorkflowStarted {
-                        workflow_id: request.workflow_id,
-                        source_hash: source_hash.clone(),
-                        name: request.name.clone(),
-                    },
-                ))
+                .ensure_workflow_started(
+                    SessionEvent::new(
+                        self.session_id,
+                        0,
+                        SessionEventKind::BluWorkflowStarted {
+                            workflow_id: request.workflow_id,
+                            source_hash: source_hash.clone(),
+                            name: request.name.clone(),
+                        },
+                    ),
+                    request.workflow_id,
+                )
                 .await
                 .context("journal Blu workflow admission")?;
         }
+        let events = self.store.read(self.session_id).await?;
+        if let Some(kind) = find_completed(&events, request.workflow_id) {
+            ensure!(
+                completed_hash(kind) == source_hash,
+                "Blu workflow source changed"
+            );
+            return Ok(completed_result(kind));
+        }
+        let kind = find_started(&events, request.workflow_id)
+            .context("Blu workflow admission did not produce a Started event")?;
+        ensure!(
+            started_hash(kind) == source_hash,
+            "Blu workflow source changed"
+        );
 
         let action_payload = json!({
             "workflow_id": request.workflow_id,
@@ -385,26 +397,39 @@ impl BluWorkflowRunner {
             );
             return Ok(runtime_completed_result(kind));
         }
-        if let Some(kind) = find_runtime_started(&events, request.workflow_id) {
-            ensure!(
-                runtime_started_hash(kind) == request.artifact_hash,
-                "workflow artifact changed"
-            );
-        } else {
+        if find_runtime_started(&events, request.workflow_id).is_none() {
             self.store
-                .append(SessionEvent::new(
-                    self.session_id,
-                    0,
-                    SessionEventKind::RuntimeWorkflowStarted {
-                        workflow_id: request.workflow_id,
-                        runtime: request.runtime,
-                        artifact_hash: request.artifact_hash.clone(),
-                        name: request.name.clone(),
-                    },
-                ))
+                .ensure_workflow_started(
+                    SessionEvent::new(
+                        self.session_id,
+                        0,
+                        SessionEventKind::RuntimeWorkflowStarted {
+                            workflow_id: request.workflow_id,
+                            runtime: request.runtime,
+                            artifact_hash: request.artifact_hash.clone(),
+                            name: request.name.clone(),
+                        },
+                    ),
+                    request.workflow_id,
+                )
                 .await
                 .context("journal external workflow admission")?;
         }
+
+        let events = self.store.read(self.session_id).await?;
+        if let Some(kind) = find_runtime_completed(&events, request.workflow_id) {
+            ensure!(
+                runtime_completed_hash(kind) == request.artifact_hash,
+                "workflow artifact changed"
+            );
+            return Ok(runtime_completed_result(kind));
+        }
+        let kind = find_runtime_started(&events, request.workflow_id)
+            .context("workflow admission did not produce a Started event")?;
+        ensure!(
+            runtime_started_hash(kind) == request.artifact_hash,
+            "workflow artifact changed"
+        );
 
         let action_payload = json!({
             "workflow_id": request.workflow_id,
@@ -1160,11 +1185,13 @@ fn execute_blu_source(
             )
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     }
-    let mut limits = OwnedCompileLimits::default();
-    limits.max_instructions = MAX_INSTRUCTIONS as usize;
-    limits.max_bindings = 16_384;
-    limits.max_constants = 65_536;
-    limits.max_return_values = 64;
+    let limits = OwnedCompileLimits {
+        max_instructions: MAX_INSTRUCTIONS as usize,
+        max_bindings: 16_384,
+        max_constants: 65_536,
+        max_return_values: 64,
+        ..OwnedCompileLimits::default()
+    };
     let values = engine
         .execute_owned_source_named_with_limits(source, name, profile, limits, BluLimits::default())
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
@@ -1327,6 +1354,49 @@ mod tests {
         assert_eq!(first.values, vec![json!(4)]);
         assert!(first.success);
         assert_eq!(first, runner.run(request).await.expect("replay"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_workflow_admission_publishes_one_started_event() {
+        let runner = runner(PermissionMode::FullAccess).await;
+        let request = BluWorkflowRequest {
+            workflow_id: Uuid::new_v4(),
+            name: "concurrent".to_string(),
+            source: "return 7".to_string(),
+        };
+        let first_runner = runner.clone();
+        let second_runner = runner.clone();
+        let first_request = request.clone();
+        let second_request = request.clone();
+        let (first, second) = tokio::join!(
+            first_runner.run(first_request),
+            second_runner.run(second_request)
+        );
+        assert!(first.is_ok() || second.is_ok(), "one admission should run");
+
+        let events = runner.store.read(runner.session_id).await.expect("events");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event.kind,
+                    SessionEventKind::BluWorkflowStarted { workflow_id, .. }
+                        if workflow_id == request.workflow_id
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event.kind,
+                    SessionEventKind::BluWorkflowCompleted { workflow_id, .. }
+                        if workflow_id == request.workflow_id
+                ))
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
