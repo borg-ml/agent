@@ -39,7 +39,9 @@ results, not an unbounded copy of every tick.
 For autonomous map work, use `map.generate` with a seed and bounded candidate
 budget. It returns the winning versioned `MapSpec`, compiled patch/bounds
 summary, measured route certificate, and conservative surfability/difficulty/
-fun-proxy metrics. Use `map.inspect` to validate a supplied `MapSpec` without
+fun-proxy/robustness metrics. Robustness is the fraction of nominal and small
+deterministic yaw-biased replays that retain the route's checkpoint progress.
+Use `map.inspect` to validate a supplied `MapSpec` without
 running a route, and `map.preview` for bounded sampled surface strips. Use
 `map.route` to search a supplied spec in the compact fast
 simulator. Use `map.export` to persist a validated spec, then pass its path to
