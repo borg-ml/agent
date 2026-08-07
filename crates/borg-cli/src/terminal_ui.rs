@@ -1396,7 +1396,15 @@ fn model_picker_options_with_discovered(
                 options.push(option);
             }
         }
-        provider @ (Some(CodingProvider::OpenAiCompatible) | None) => {
+        Some(CodingProvider::Kimi) => {
+            options.push(PickerOption::new(
+                borg_provider::kimi_product_model(),
+                borg_provider::kimi_product_model(),
+            ));
+        }
+        provider @ (Some(CodingProvider::OpenAiCompatible)
+        | Some(CodingProvider::OpenCode)
+        | None) => {
             let backend = provider
                 .map(CodingProvider::catalog_backend)
                 .unwrap_or("openai-compatible");
@@ -6024,6 +6032,12 @@ fn is_composer_newline(keymap: &KeyMap, key: &KeyEvent) -> bool {
             && key
                 .modifiers
                 .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT))
+        // A terminal key binding can emit a literal LF for Shift+Enter. In
+        // raw mode crossterm decodes that byte as Ctrl+J, so accept both
+        // representations as the composer's newline action.
+        || matches!(key.code, KeyCode::Char('\n'))
+        || (matches!(key.code, KeyCode::Char('j' | 'J'))
+            && key.modifiers == KeyModifiers::CONTROL)
 }
 
 impl Drop for BorgTerminal {
@@ -7096,6 +7110,7 @@ fn session_event_changes_transcript(kind: &SessionEventKind) -> bool {
         SessionEventKind::SessionStarted
         | SessionEventKind::SessionConfigured { .. }
         | SessionEventKind::ProviderCapabilitiesUpdated { .. }
+        | SessionEventKind::EffectiveCapabilitiesUpdated { .. }
         | SessionEventKind::ApprovalResolved { .. }
         | SessionEventKind::ProviderInteractionResolved { .. }
         | SessionEventKind::UsageUpdated { .. }

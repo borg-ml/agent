@@ -166,6 +166,7 @@ impl ProcessManager {
 
         let process_id = Uuid::new_v4();
         let mut process = shell_command(&command);
+        crate::process_environment::configure_host_child_environment(&mut process);
         process
             .current_dir(&cwd)
             .stdin(Stdio::piped())

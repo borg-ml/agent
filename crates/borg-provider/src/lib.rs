@@ -16,8 +16,8 @@ pub use runtime::{
     CODEX_MODEL_CATALOG, CODEX_SELECTABLE_MODELS, CostBasis, DynamicModelEntry, MODEL_CATALOGS,
     ProviderCallUsage, ProviderChannel, ProviderModelCatalog, codex_default_effort,
     codex_effort_levels, codex_effort_supported, codex_product_model, dynamic_models_for_backend,
-    model_catalog_for_backend, openrouter_model_entries, openrouter_product_model,
-    refresh_openrouter_model_catalog, set_openrouter_model_entries,
+    kimi_default_effort, kimi_product_model, model_catalog_for_backend, openrouter_model_entries,
+    openrouter_product_model, refresh_openrouter_model_catalog, set_openrouter_model_entries,
 };
 
 pub use local::{

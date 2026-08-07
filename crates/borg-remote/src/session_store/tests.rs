@@ -14,6 +14,86 @@ async fn store() -> (tempfile::TempDir, SqliteSessionStore) {
 }
 
 #[tokio::test]
+async fn runtime_manifest_and_checkpoint_survive_store_reopen_and_detect_worker_restart() {
+    let (directory, store) = store().await;
+    let path = directory.path().join("sessions.sqlite3");
+    let session_id = Uuid::new_v4();
+    let first_worker = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+
+    let first = store
+        .activate_runtime_manifest(session_id, "python", "/workspace", "python3", first_worker)
+        .await
+        .unwrap();
+    assert!(!first.recovered_from_previous_worker);
+    assert_eq!(first.manifest.status, RuntimeManifestStatus::Running);
+
+    store
+        .record_runtime_execution(session_id, first_worker, "sha256:code", false, None)
+        .await
+        .unwrap();
+    let checkpoint = store
+        .save_runtime_checkpoint(
+            session_id,
+            first_worker,
+            "calibration-v1",
+            &serde_json::json!({"angle": 12.5, "ticks": 240}),
+        )
+        .await
+        .unwrap();
+    assert!(checkpoint.content_hash.starts_with("sha256:"));
+
+    store.pool().close().await;
+    let reopened = SqliteSessionStore::open(&path).await.unwrap();
+    let persisted = reopened
+        .runtime_manifest(session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(persisted.execution_count, 1);
+    assert_eq!(persisted.last_code_hash.as_deref(), Some("sha256:code"));
+    assert_eq!(
+        reopened
+            .runtime_checkpoint(session_id, Some("calibration-v1"))
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        serde_json::json!({"angle": 12.5, "ticks": 240})
+    );
+
+    let second_worker = Uuid::new_v4();
+    let recovered = reopened
+        .activate_runtime_manifest(session_id, "python", "/workspace", "python3", second_worker)
+        .await
+        .unwrap();
+    assert!(recovered.recovered_from_previous_worker);
+    assert_eq!(recovered.manifest.worker_id, second_worker);
+
+    let idempotent = reopened
+        .save_runtime_checkpoint(
+            session_id,
+            second_worker,
+            "calibration-v1",
+            &serde_json::json!({"angle": 12.5, "ticks": 240}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(idempotent.revision, checkpoint.revision);
+    assert!(
+        reopened
+            .save_runtime_checkpoint(
+                session_id,
+                second_worker,
+                "calibration-v1",
+                &serde_json::json!({"angle": 13.0}),
+            )
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
 async fn durable_append_waits_through_extended_writer_contention() {
     let (_directory, store) = store().await;
     let session_id = Uuid::new_v4();
@@ -46,6 +126,29 @@ async fn durable_append_waits_through_extended_writer_contention() {
         .expect("append did not resume after the writer lock cleared")
         .expect("append task panicked")
         .expect("append failed after the writer lock cleared");
+}
+
+#[tokio::test]
+async fn session_creation_waits_through_extended_writer_contention() {
+    let (_directory, store) = store().await;
+    let blocker = store.begin_write().await.unwrap();
+    let session_id = Uuid::new_v4();
+    let create_store = store.clone();
+    let create = tokio::spawn(async move { create_store.create_session(session_id).await });
+
+    tokio::time::sleep(SQLITE_BUSY_TIMEOUT + Duration::from_millis(250)).await;
+    assert!(
+        !create.is_finished(),
+        "session creation must wait instead of failing on the busy timeout"
+    );
+
+    blocker.rollback().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), create)
+        .await
+        .expect("session creation did not resume after the writer lock cleared")
+        .expect("session creation task panicked")
+        .expect("session creation failed after the writer lock cleared");
+    assert!(store.contains_session(session_id).await.unwrap());
 }
 
 #[tokio::test]
@@ -1862,6 +1965,254 @@ async fn large_tool_payloads_are_loaded_only_by_reference() {
     );
 }
 
+#[tokio::test]
+async fn history_query_resolves_fts_regex_exact_and_full_payload_hits_to_canonical_events() {
+    let (_directory, store) = store().await;
+    let session_id = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+    let message_event = store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::Message {
+                message_id: Uuid::new_v4(),
+                actor: EventActor::User,
+                text: "compare the contractual remedy matrix".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            },
+        ))
+        .await
+        .unwrap();
+    let payload_needle = "uniquepayload8675309";
+    store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::ToolCompleted {
+                tool_call_id: "large-history-result".to_string(),
+                output: format!(
+                    "{} {}",
+                    "x".repeat(INLINE_SESSION_PAYLOAD_BYTES + 1024),
+                    payload_needle
+                ),
+                output_ref: None,
+                is_error: false,
+                input: None,
+                input_ref: None,
+            },
+        ))
+        .await
+        .unwrap();
+    let other_session = Uuid::new_v4();
+    store.create_session(other_session).await.unwrap();
+    store
+        .append(SessionEvent::new(
+            other_session,
+            0,
+            message(
+                Uuid::new_v4(),
+                "contractual remedy from another tenant scope",
+            ),
+        ))
+        .await
+        .unwrap();
+
+    let lexical = store
+        .query_history(
+            session_id,
+            SessionHistoryQuery {
+                text: Some("contractual remedy".to_string()),
+                actors: vec![EventActor::User],
+                ..SessionHistoryQuery::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(lexical.backend, "sqlite_fts5");
+    assert_eq!(lexical.hits.len(), 1);
+    assert_eq!(lexical.hits[0].event.id, message_event.id);
+
+    let payload_hit = store
+        .query_history(
+            session_id,
+            SessionHistoryQuery {
+                text: Some(payload_needle.to_string()),
+                expand_payloads: true,
+                max_payload_bytes: Some(INLINE_SESSION_PAYLOAD_BYTES * 2),
+                ..SessionHistoryQuery::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(payload_hit.hits.len(), 1);
+    assert!(matches!(
+        payload_hit.hits[0].event.kind,
+        SessionEventKind::ToolCompleted {
+            output_ref: Some(_),
+            ..
+        }
+    ));
+    assert!(
+        payload_hit.hits[0].payloads[0]
+            .text
+            .ends_with(payload_needle)
+    );
+    assert!(!payload_hit.hits[0].payloads[0].truncated);
+
+    let index_documents = store
+        .history_index_documents_after(session_id, message_event.sequence, 10)
+        .await
+        .unwrap();
+    assert_eq!(index_documents.len(), 1);
+    assert!(index_documents[0].content.contains(payload_needle));
+    assert_eq!(index_documents[0].event_id, payload_hit.hits[0].event.id);
+    assert!(
+        index_documents[0]
+            .document_id
+            .starts_with("borg-session-event:v1:")
+    );
+
+    let regex = store
+        .query_history(
+            session_id,
+            SessionHistoryQuery {
+                text: Some("PAYLOAD[0-9]{7}".to_string()),
+                mode: SessionHistorySearchMode::Regex,
+                case_sensitive: false,
+                ..SessionHistoryQuery::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(regex.backend, "sqlite_regex");
+    assert_eq!(regex.hits.len(), 1);
+
+    let exact = store
+        .query_history(
+            session_id,
+            SessionHistoryQuery {
+                event_id: Some(message_event.id),
+                ..SessionHistoryQuery::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(exact.backend, "sqlite_exact");
+    assert_eq!(exact.hits.len(), 1);
+    assert_eq!(exact.hits[0].event.sequence, message_event.sequence);
+}
+
+#[tokio::test]
+async fn history_query_preserves_projected_ids_and_sequences_across_forks() {
+    let (directory, store) = store().await;
+    let parent_id = Uuid::new_v4();
+    let fork_id = Uuid::new_v4();
+    store.create_session(parent_id).await.unwrap();
+    for kind in [
+        SessionEventKind::SessionStarted,
+        configured(directory.path()),
+        message(Uuid::new_v4(), "inherit this distinctive finding"),
+        message(Uuid::new_v4(), "discard this later finding"),
+    ] {
+        store
+            .append(SessionEvent::new(parent_id, 0, kind))
+            .await
+            .unwrap();
+    }
+    store.fork_before(parent_id, fork_id, 4).await.unwrap();
+    store
+        .append(SessionEvent::new(
+            fork_id,
+            0,
+            message(Uuid::new_v4(), "local fork conclusion"),
+        ))
+        .await
+        .unwrap();
+
+    let inherited = store
+        .query_history(
+            fork_id,
+            SessionHistoryQuery {
+                text: Some("distinctive finding".to_string()),
+                ..SessionHistoryQuery::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(inherited.backend, "lineage_scan");
+    assert_eq!(inherited.hits.len(), 1);
+    assert_eq!(inherited.hits[0].event.session_id, fork_id);
+    assert_eq!(inherited.hits[0].event.sequence, 3);
+    assert_ne!(
+        inherited.hits[0].event.id,
+        store.read(parent_id).await.unwrap()[2].id
+    );
+
+    let all_messages = store
+        .query_history(
+            fork_id,
+            SessionHistoryQuery {
+                event_kinds: vec!["message".to_string()],
+                ..SessionHistoryQuery::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(all_messages.hits.len(), 2);
+    assert_eq!(all_messages.hits[1].event.sequence, 4);
+
+    let index_documents = store
+        .history_index_documents_after(fork_id, 0, 10)
+        .await
+        .unwrap();
+    assert_eq!(index_documents.len(), 4);
+    assert_eq!(index_documents[2].event_id, inherited.hits[0].event.id);
+    assert!(index_documents[2].content.contains("distinctive finding"));
+    assert!(
+        index_documents
+            .iter()
+            .all(|document| document.session_id == fork_id)
+    );
+}
+
+#[tokio::test]
+async fn opening_rebuilds_missing_history_projection_from_the_lossless_journal() {
+    let (directory, store) = store().await;
+    let path = directory.path().join("sessions.sqlite3");
+    let session_id = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+    store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            message(Uuid::new_v4(), "rebuildable projection evidence"),
+        ))
+        .await
+        .unwrap();
+    sqlx::query("delete from session_event_search where session_id=?")
+        .bind(session_id.to_string())
+        .execute(store.pool())
+        .await
+        .unwrap();
+    drop(store);
+
+    let reopened = SqliteSessionStore::open(path).await.unwrap();
+    let result = reopened
+        .query_history(
+            session_id,
+            SessionHistoryQuery {
+                text: Some("projection evidence".to_string()),
+                ..SessionHistoryQuery::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.hits.len(), 1);
+    assert_eq!(result.backend, "sqlite_fts5");
+}
+
 #[test]
 fn persistence_and_fork_rules_are_typed_rust_contracts() {
     assert_eq!(
@@ -1984,6 +2335,65 @@ fn context_generation_changes_only_at_explicit_prefix_boundaries() {
     assert_eq!(state.context_generation, 3);
 }
 
+#[test]
+fn same_provider_codex_model_change_preserves_resume_checkpoint() {
+    let session_id = Uuid::new_v4();
+    let mut state = SessionState::default();
+    state
+        .apply(&SessionEvent::new(
+            session_id,
+            1,
+            SessionEventKind::SessionStarted,
+        ))
+        .unwrap();
+    state
+        .apply(&SessionEvent::new(
+            session_id,
+            2,
+            SessionEventKind::SessionConfigured {
+                cwd: PathBuf::from("/tmp"),
+                provider: CodingProvider::Codex,
+                model: Some("gpt-5.6-sol".to_string()),
+                effort: Some("xhigh".to_string()),
+                fast: false,
+                response_language: ResponseLanguage::Auto,
+                permission_mode: PermissionMode::FullAccess,
+            },
+        ))
+        .unwrap();
+    state
+        .apply(&SessionEvent::new(
+            session_id,
+            3,
+            SessionEventKind::TurnCompleted {
+                message_id: Uuid::new_v4(),
+                provider_session_id: Some("codex-thread".to_string()),
+                final_text: "done".to_string(),
+                error: None,
+            },
+        ))
+        .unwrap();
+    state
+        .apply(&SessionEvent::new(
+            session_id,
+            4,
+            SessionEventKind::SessionConfigured {
+                cwd: PathBuf::from("/tmp"),
+                provider: CodingProvider::Codex,
+                model: Some("gpt-5.6-luna".to_string()),
+                effort: Some("ultra".to_string()),
+                fast: false,
+                response_language: ResponseLanguage::Auto,
+                permission_mode: PermissionMode::FullAccess,
+            },
+        ))
+        .unwrap();
+
+    assert_eq!(state.context_generation, 1);
+    assert_eq!(state.provider_session_id.as_deref(), Some("codex-thread"));
+    assert_eq!(state.usage.context_tokens, Some(0));
+}
+
 #[tokio::test]
 #[ignore = "explicit large-session p95 performance gate"]
 async fn large_session_lineage_and_tail_p95_gates() {
@@ -2065,6 +2475,118 @@ async fn large_session_lineage_and_tail_p95_gates() {
     assert!(
         tail_p95 < Duration::from_millis(50),
         "indexed tail p95 exceeded 50 ms: {tail_p95:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "explicit lossless-history retrieval p95 performance gate"]
+async fn large_session_history_query_p95_gate() {
+    const EVENT_COUNT: u64 = 25_000;
+    const SAMPLES: usize = 100;
+    const NEEDLE: &str = "rare-history-needle-8675309";
+
+    let (_directory, store) = store().await;
+    let session_id = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+    let mut state = SessionState::default();
+    let mut transaction = store.pool().begin().await.unwrap();
+    for sequence in 1..=EVENT_COUNT {
+        let kind = SessionEventKind::Error {
+            message: if sequence == EVENT_COUNT - 17 {
+                NEEDLE.to_string()
+            } else {
+                format!("ordinary bounded history fixture {sequence}")
+            },
+        };
+        let event = SessionEvent::new(session_id, sequence, kind);
+        state.apply(&event).unwrap();
+        let event_json = serde_json::to_string(&event).unwrap();
+        let stored_kind = event_kind(&event.kind).unwrap();
+        sqlx::query(
+            "insert into session_events \
+             (session_id, sequence, event_id, event_kind, event_json, projection_json, \
+              fork_inheritable, recovery_relevant, message_id, created_at) \
+             values (?, ?, ?, ?, ?, ?, ?, ?, null, ?)",
+        )
+        .bind(session_id.to_string())
+        .bind(i64::try_from(sequence).unwrap())
+        .bind(event.id.to_string())
+        .bind(&stored_kind)
+        .bind(&event_json)
+        .bind(serde_json::to_string(&state).unwrap())
+        .bind(i64::from(event.kind.is_fork_inheritable()))
+        .bind(i64::from(event.kind.is_recovery_relevant()))
+        .bind(event.created_at.to_rfc3339())
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+        sqlx::query(
+            "insert into session_event_search \
+             (session_id, sequence, event_id, event_kind, actor, body) \
+             values (?, ?, ?, ?, null, ?)",
+        )
+        .bind(session_id.to_string())
+        .bind(i64::try_from(sequence).unwrap())
+        .bind(event.id.to_string())
+        .bind(stored_kind)
+        .bind(event_json)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    }
+    sqlx::query("update sessions set next_sequence=?, state_json=?, updated_at=? where id=?")
+        .bind(i64::try_from(EVENT_COUNT + 1).unwrap())
+        .bind(serde_json::to_string(&state).unwrap())
+        .bind(Utc::now().to_rfc3339())
+        .bind(session_id.to_string())
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
+
+    let query = SessionHistoryQuery {
+        text: Some(NEEDLE.to_string()),
+        ..SessionHistoryQuery::default()
+    };
+    let mut samples = Vec::with_capacity(SAMPLES);
+    for _ in 0..SAMPLES {
+        let started = Instant::now();
+        let page = store
+            .query_history(session_id, query.clone())
+            .await
+            .unwrap();
+        assert_eq!(page.hits.len(), 1);
+        samples.push(started.elapsed());
+    }
+    let p95 = duration_p95(&mut samples);
+    eprintln!("25k-event canonical FTS query p95: {p95:?}");
+    assert!(
+        p95 < Duration::from_millis(50),
+        "history FTS query p95 exceeded 50 ms: {p95:?}"
+    );
+
+    let regex_query = SessionHistoryQuery {
+        text: Some("rare-history-needle-[0-9]+".to_string()),
+        mode: SessionHistorySearchMode::Regex,
+        prefilter: Some("rare history needle".to_string()),
+        scan_limit: Some(EVENT_COUNT as usize),
+        ..SessionHistoryQuery::default()
+    };
+    let mut regex_samples = Vec::with_capacity(10);
+    for _ in 0..10 {
+        let started = Instant::now();
+        let page = store
+            .query_history(session_id, regex_query.clone())
+            .await
+            .unwrap();
+        assert_eq!(page.hits.len(), 1);
+        regex_samples.push(started.elapsed());
+    }
+    let regex_p95 = duration_p95(&mut regex_samples);
+    eprintln!("25k-event bounded regex query p95: {regex_p95:?}");
+    assert!(
+        regex_p95 < Duration::from_millis(250),
+        "history regex query p95 exceeded 250 ms: {regex_p95:?}"
     );
 }
 

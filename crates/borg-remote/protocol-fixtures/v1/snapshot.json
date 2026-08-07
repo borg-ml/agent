@@ -1,0 +1,40 @@
+{
+  "protocol": "borg.agent_runtime",
+  "version": 1,
+  "session_id": "00000000-0000-0000-0000-000000001000",
+  "cursor": 1,
+  "state": {
+    "latest_sequence": 1,
+    "context_generation": 0,
+    "started_at": "2026-08-07T00:00:00Z",
+    "activity_at": "2026-08-07T00:00:00Z",
+    "configuration": null,
+    "provider_capabilities": [],
+    "status": "ready",
+    "status_detail": null,
+    "provider_session_id": null,
+    "pending_approval_id": null,
+    "pending_provider_interaction_id": null,
+    "pending_provider_interaction_kind": null,
+    "pending_provider_interaction_payload": null,
+    "goal": null,
+    "todos": [],
+    "usage": {
+      "calls": 0,
+      "provider_duration_ms": 0,
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "cached_input_tokens": 0,
+      "cache_creation_input_tokens": 0,
+      "total_tokens": 0,
+      "cost_microusd": null,
+      "cost_basis": "",
+      "cost_usd": null,
+      "context_tokens": null,
+      "context_window_tokens": null
+    },
+    "first_prompt": "Begin the runtime conformance check.",
+    "latest_prompt": "Begin the runtime conformance check.",
+    "latest_response": null
+  }
+}

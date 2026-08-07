@@ -17,7 +17,7 @@ use tokio::fs;
 use uuid::Uuid;
 
 use crate::{
-    WorkspaceFileEntry, WorkspaceFileKind, WorkspaceFilesystemErrorCode,
+    HostResourceLimits, WorkspaceFileEntry, WorkspaceFileKind, WorkspaceFilesystemErrorCode,
     WorkspaceFilesystemOperation, WorkspaceFilesystemOutcome, WorkspaceFilesystemOutput,
     WorkspaceFilesystemRequest, WorkspaceFilesystemResponse,
 };
@@ -28,12 +28,37 @@ pub async fn execute_workspace_filesystem(
     enrolled_roots: &[PathBuf],
     request: WorkspaceFilesystemRequest,
 ) -> WorkspaceFilesystemResponse {
+    execute_workspace_filesystem_with_limits(
+        enrolled_roots,
+        request,
+        &HostResourceLimits::default(),
+    )
+    .await
+}
+
+pub async fn execute_workspace_filesystem_with_limits(
+    enrolled_roots: &[PathBuf],
+    request: WorkspaceFilesystemRequest,
+    limits: &HostResourceLimits,
+) -> WorkspaceFilesystemResponse {
     let request_id = request.request_id;
     let workspace_id = request.workspace_id;
     let operation = request.operation.clone();
+    let timeout_ms = request
+        .timeout_ms
+        .min(limits.max_workspace_command_timeout_ms)
+        .clamp(1, 30 * 60 * 1000);
+    let transfer_limit = limits
+        .max_file_transfer_bytes
+        .min(MAX_TRANSFER_BYTES as u64) as usize;
     let outcome = match tokio::time::timeout(
-        std::time::Duration::from_millis(request.timeout_ms.clamp(1, 30 * 60 * 1000)),
-        execute(enrolled_roots, &request.root_path, operation),
+        std::time::Duration::from_millis(timeout_ms),
+        execute(
+            enrolled_roots,
+            &request.root_path,
+            operation,
+            transfer_limit,
+        ),
     )
     .await
     {
@@ -58,6 +83,7 @@ async fn execute(
     enrolled_roots: &[PathBuf],
     requested_root: &Path,
     operation: WorkspaceFilesystemOperation,
+    transfer_limit: usize,
 ) -> FsResult<WorkspaceFilesystemOutput> {
     let root = canonical_workspace_root(enrolled_roots, requested_root)?;
     match operation {
@@ -105,7 +131,8 @@ async fn execute(
             })
         }
         WorkspaceFilesystemOperation::ReadText { path, max_bytes } => {
-            let (bytes, metadata) = read_regular_file(&root, &path, max_bytes).await?;
+            let (bytes, metadata) =
+                read_regular_file(&root, &path, max_bytes, transfer_limit).await?;
             let text = String::from_utf8(bytes).map_err(|_| {
                 failure(
                     WorkspaceFilesystemErrorCode::InvalidEncoding,
@@ -122,7 +149,8 @@ async fn execute(
             })
         }
         WorkspaceFilesystemOperation::ReadBytes { path, max_bytes } => {
-            let (bytes, metadata) = read_regular_file(&root, &path, max_bytes).await?;
+            let (bytes, metadata) =
+                read_regular_file(&root, &path, max_bytes, transfer_limit).await?;
             Ok(WorkspaceFilesystemOutput::Bytes {
                 path,
                 content_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
@@ -137,7 +165,7 @@ async fn execute(
             overwrite,
             create_parent_dirs,
         } => {
-            if text.len() > MAX_TRANSFER_BYTES {
+            if text.len() > transfer_limit {
                 return Err(payload_too_large());
             }
             write_file(
@@ -156,7 +184,7 @@ async fn execute(
             overwrite,
             create_parent_dirs,
         } => {
-            if content_base64.len() > MAX_TRANSFER_BYTES.div_ceil(3) * 4 {
+            if content_base64.len() > transfer_limit.div_ceil(3) * 4 {
                 return Err(payload_too_large());
             }
             let bytes = base64::engine::general_purpose::STANDARD
@@ -168,7 +196,7 @@ async fn execute(
                         false,
                     )
                 })?;
-            if bytes.len() > MAX_TRANSFER_BYTES {
+            if bytes.len() > transfer_limit {
                 return Err(payload_too_large());
             }
             write_file(
@@ -261,7 +289,7 @@ async fn execute(
                     ));
                 }
                 remove_overwrite_target(&target).await?;
-                let stats = copy_tree(&source, &target, max_entries).await?;
+                let stats = copy_tree(&source, &target, max_entries, transfer_limit).await?;
                 let mut output = mutated(
                     "copy",
                     None,
@@ -285,6 +313,9 @@ async fn execute(
                 }
                 Ok(output)
             } else if metadata.is_file() {
+                if metadata.len() > transfer_limit as u64 {
+                    return Err(payload_too_large());
+                }
                 remove_overwrite_target(&target).await?;
                 let bytes = fs::copy(source, target).await.map_err(io_failure)?;
                 Ok(mutated(
@@ -524,6 +555,7 @@ async fn read_regular_file(
     root: &Path,
     path: &Path,
     max_bytes: u64,
+    transfer_limit: usize,
 ) -> FsResult<(Vec<u8>, std::fs::Metadata)> {
     let target = existing_path(root, path)?;
     let metadata = fs::metadata(&target).await.map_err(io_failure)?;
@@ -534,7 +566,7 @@ async fn read_regular_file(
             false,
         ));
     }
-    let limit = max_bytes.min(MAX_TRANSFER_BYTES as u64);
+    let limit = max_bytes.min(transfer_limit as u64);
     if metadata.len() > limit {
         return Err(payload_too_large());
     }
@@ -561,7 +593,12 @@ struct CopyStats {
     bytes: u64,
 }
 
-async fn copy_tree(source: &Path, target: &Path, max_entries: usize) -> FsResult<CopyStats> {
+async fn copy_tree(
+    source: &Path,
+    target: &Path,
+    max_entries: usize,
+    transfer_limit: usize,
+) -> FsResult<CopyStats> {
     fs::create_dir(target).await.map_err(io_failure)?;
     let mut stats = CopyStats {
         directories: 1,
@@ -588,6 +625,9 @@ async fn copy_tree(source: &Path, target: &Path, max_entries: usize) -> FsResult
                 stats.directories += 1;
                 pending.push((entry.path(), destination));
             } else if metadata.is_file() {
+                if stats.bytes.saturating_add(metadata.len()) > transfer_limit as u64 {
+                    return Err(payload_too_large());
+                }
                 stats.bytes += fs::copy(entry.path(), destination)
                     .await
                     .map_err(io_failure)?;
@@ -796,5 +836,37 @@ mod tests {
                 output: WorkspaceFilesystemOutput::Text { ref text, .. }
             } if text == "pub fn borg() {}"
         ));
+    }
+
+    #[tokio::test]
+    async fn host_resource_limit_caps_file_transfer_payloads() {
+        let enrolled = tempfile::tempdir().unwrap();
+        let root = enrolled.path().join("workspace");
+        fs::create_dir(&root).await.unwrap();
+        let response = execute_workspace_filesystem_with_limits(
+            &[enrolled.path().to_path_buf()],
+            request(
+                &root,
+                WorkspaceFilesystemOperation::WriteText {
+                    path: PathBuf::from("too-large.txt"),
+                    text: "12345".to_string(),
+                    overwrite: true,
+                    create_parent_dirs: false,
+                },
+            ),
+            &HostResourceLimits {
+                max_file_transfer_bytes: 4,
+                ..HostResourceLimits::default()
+            },
+        )
+        .await;
+        assert!(matches!(
+            response.outcome,
+            WorkspaceFilesystemOutcome::Failure {
+                code: WorkspaceFilesystemErrorCode::PayloadTooLarge,
+                ..
+            }
+        ));
+        assert!(!root.join("too-large.txt").exists());
     }
 }

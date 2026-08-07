@@ -22,7 +22,9 @@ mod native_mcp;
 mod native_process;
 mod orchestration;
 mod persistent_runtime;
+mod process_environment;
 mod receipt;
+mod runtime_protocol;
 mod self_service;
 mod session;
 mod session_action;
@@ -43,9 +45,9 @@ pub use autonomy::{
     SqliteAutonomySupervisor,
 };
 pub use blu_workflow::{BluWorkflowRequest, BluWorkflowResult};
-pub use command::execute_workspace_command;
+pub use command::{execute_workspace_command, execute_workspace_command_with_limits};
 pub use contract::*;
-pub use filesystem::execute_workspace_filesystem;
+pub use filesystem::{execute_workspace_filesystem, execute_workspace_filesystem_with_limits};
 pub use host::{
     HostConfig, HostExecutorFactory, default_host_config_path, enroll_host, login_provider,
     mirror_local_session, probe_capabilities, probe_provider_capabilities,
@@ -57,6 +59,10 @@ pub use local_control::{
 };
 pub use lsp::LspService;
 pub use orchestration::*;
+pub use runtime_protocol::{
+    AGENT_RUNTIME_PROTOCOL, AGENT_RUNTIME_PROTOCOL_VERSION, AgentRuntimeCommandEnvelope,
+    AgentRuntimeEventEnvelope, AgentRuntimeSnapshot,
+};
 pub use session::{
     SessionConsultationTools, SessionGoalTools, SessionTodoTools, run_agent_session,
     run_agent_session_with_executor, run_agent_session_with_executor_and_writer,
@@ -70,8 +76,10 @@ pub use session_action::{
 pub use session_lock::SessionWriterLease;
 pub use session_store::{
     ClaimedActionTransition, EventPersistence, SESSION_PROJECTION_VERSION, SessionConfiguration,
-    SessionLiveEvent, SessionRecovery, SessionState, SessionStore, SessionStoreFork,
-    SessionStoreHealth, SessionSummary, SessionUsage, SessionWorkspaceBinding, SqliteSessionStore,
+    SessionHistoryHit, SessionHistoryIndexDocument, SessionHistoryPage, SessionHistoryPayload,
+    SessionHistoryQuery, SessionHistorySearchMode, SessionLiveEvent, SessionRecovery, SessionState,
+    SessionStore, SessionStoreFork, SessionStoreHealth, SessionSummary, SessionUsage,
+    SessionWorkspaceBinding, SqliteSessionStore,
 };
 pub use subagents::{
     AgentToolDispatcher, AgentToolServer, DEFAULT_MAX_SUBAGENTS, SpawnSubagent, SubagentActivity,

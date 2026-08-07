@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, BufRead, IsTerminal, Write};
+use std::net::IpAddr;
 use std::panic::{self, AssertUnwindSafe, PanicHookInfo};
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -8,19 +9,20 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use borg_remote::{
     AgentTurnExecutor, ApprovalDecision, CodingProvider, EventActor, GoalAction, GoalStatus,
-    HostCommand, HostExecutorFactory, LaunchSession, LocalAgentSettings, LocalAgentTurnExecutor,
-    LocalSessionControlServer, MessageStatus, PermissionMode, PlanItem, PlanItemStatus,
-    PromptDelivery, ResponseLanguage, SessionConfigAction, SessionEvent, SessionEventKind,
-    SessionGoal, SessionState, SessionStatus, SessionStore, SessionWriterLease, SpawnSubagent,
-    SqliteSessionStore, SubagentAction, SubagentSnapshot, SubagentStatus, TodoAction,
-    default_host_config_path, enroll_host, local_session_owner_uses_current_binary, login_provider,
-    mirror_local_session, probe_capabilities, probe_provider_capabilities,
-    provider_credentials_present, run_agent_session_with_store_and_writer,
-    run_agent_session_with_store_writer_and_peers, run_attached_session,
-    run_host_with_executor_factory, send_local_session_command, session_control_socket_path,
+    HostCommand, HostConfig, HostExecutionProfile, HostExecutorFactory, LaunchSession,
+    LocalAgentSettings, LocalAgentTurnExecutor, LocalSessionControlServer, MessageStatus,
+    PermissionMode, PlanItem, PlanItemStatus, PromptDelivery, ResponseLanguage,
+    SessionConfigAction, SessionEvent, SessionEventKind, SessionGoal, SessionState, SessionStatus,
+    SessionStore, SessionWriterLease, SpawnSubagent, SqliteSessionStore, SubagentAction,
+    SubagentSnapshot, SubagentStatus, TodoAction, default_host_config_path, enroll_host,
+    local_session_owner_uses_current_binary, login_provider, mirror_local_session,
+    probe_capabilities, probe_provider_capabilities, provider_credentials_present,
+    run_agent_session_with_store_and_writer, run_agent_session_with_store_writer_and_peers,
+    run_attached_session, run_host_with_executor_factory, send_local_session_command,
+    session_control_socket_path,
 };
 use chrono::{Local, Utc};
 use futures_util::FutureExt;
@@ -190,11 +192,19 @@ pub(crate) async fn run_remote_command(command: RemoteCommand) -> Result<()> {
         RemoteCommand::Enroll {
             server,
             token,
+            token_stdin,
             name,
             roots,
             config,
         } => {
             let config_path = config.unwrap_or_else(default_host_config_path);
+            let token = match token {
+                Some(token) => token,
+                None => {
+                    anyhow::ensure!(token_stdin, "an enrollment token is required");
+                    read_enrollment_token_from_stdin()?
+                }
+            };
             let enrolled =
                 enroll_host(&server, &token, name.as_deref(), roots, &config_path).await?;
             println!(
@@ -229,6 +239,20 @@ pub(crate) async fn run_remote_command(command: RemoteCommand) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn read_enrollment_token_from_stdin() -> Result<String> {
+    if io::stdin().is_terminal() {
+        eprint!("Paste the one-time enrollment token, then press Enter: ");
+        io::stderr().flush().ok();
+    }
+    let mut token = String::new();
+    io::stdin()
+        .read_line(&mut token)
+        .context("failed to read the enrollment token from stdin")?;
+    let token = token.trim().to_string();
+    anyhow::ensure!(!token.is_empty(), "enrollment token from stdin is empty");
+    Ok(token)
 }
 
 #[derive(Deserialize)]
@@ -356,16 +380,20 @@ fn blu_host_executor_factory() -> HostExecutorFactory {
                 catalog.active_workflows(),
             ))
         };
-        let executor = LocalAgentTurnExecutor::with_model_gateway_and_settings(
-            borg_provider::provider::ModelGateway {
-                endpoint: format!(
-                    "{}/api/remote/host/chat/completions",
-                    host.server.trim_end_matches('/')
-                ),
-                bearer_token: host.host_token.clone(),
-            },
-            local_settings,
-        )
+        let executor = if launch.provider == CodingProvider::Kimi {
+            LocalAgentTurnExecutor::with_model_gateway_and_settings(
+                borg_provider::provider::ModelGateway {
+                    endpoint: format!(
+                        "{}/api/remote/host/kimi/chat/completions",
+                        host.server.trim_end_matches('/')
+                    ),
+                    bearer_token: host.host_token.clone(),
+                },
+                local_settings,
+            )
+        } else {
+            LocalAgentTurnExecutor::with_settings(local_settings)
+        }
         .with_external_mcp_servers(servers)
         .with_extension_skill_roots(roots)
         .with_extension_workflows(extension_workflows)
@@ -392,15 +420,28 @@ async fn open_browser(url: &str) -> Result<()> {
 }
 
 async fn install_host_service(config_path: &Path) -> Result<()> {
-    anyhow::ensure!(
+    ensure!(
         cfg!(target_os = "linux"),
         "`borg remote install` currently supports Linux systemd user services; run `borg remote host` from your platform's login service"
     );
-    anyhow::ensure!(
+    ensure!(
         config_path.is_file(),
         "host config does not exist at {}; run `borg remote enroll` first",
         config_path.display()
     );
+    let config: HostConfig = serde_json::from_slice(
+        &fs::read(config_path)
+            .with_context(|| format!("failed to read {}", config_path.display()))?,
+    )
+    .with_context(|| format!("invalid host config {}", config_path.display()))?;
+    let config_path = config_path
+        .canonicalize()
+        .with_context(|| format!("failed to resolve {}", config_path.display()))?;
+    let allowed_networks = if config.execution_profile == HostExecutionProfile::IsolatedHosted {
+        isolated_allowed_networks()?
+    } else {
+        Vec::new()
+    };
     let executable = std::env::current_exe().context("failed to locate the borg executable")?;
     let service_dir = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
@@ -411,14 +452,20 @@ async fn install_host_service(config_path: &Path) -> Result<()> {
     fs::create_dir_all(&service_dir)?;
     let service_path = service_dir.join("borg-remote.service");
     let path = std::env::var("PATH").unwrap_or_default();
-    let service = format!(
-        "[Unit]\nDescription=Borg Remote host\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStart={} remote host --config {}\nEnvironment={}\nRestart=always\nRestartSec=2\n\n[Install]\nWantedBy=default.target\n",
-        systemd_quote(&executable.to_string_lossy()),
-        systemd_quote(&config_path.to_string_lossy()),
-        systemd_quote(&format!("PATH={path}")),
-    );
+    let service = host_service_unit(&executable, &config_path, &config, &path, &allowed_networks)?;
     fs::write(&service_path, service)
         .with_context(|| format!("failed to write {}", service_path.display()))?;
+    if config.execution_profile == HostExecutionProfile::IsolatedHosted {
+        let status = tokio::process::Command::new("systemd-analyze")
+            .args(["verify", service_path.to_string_lossy().as_ref()])
+            .status()
+            .await
+            .context("failed to run systemd-analyze verify for isolated hosted service")?;
+        ensure!(
+            status.success(),
+            "systemd-analyze rejected the isolated hosted service unit"
+        );
+    }
     for args in host_service_systemctl_commands() {
         let mut command = tokio::process::Command::new("systemctl");
         command.args(args);
@@ -434,6 +481,138 @@ async fn install_host_service(config_path: &Path) -> Result<()> {
         service_path.display()
     );
     Ok(())
+}
+
+fn host_service_unit(
+    executable: &Path,
+    config_path: &Path,
+    config: &HostConfig,
+    path: &str,
+    allowed_networks: &[String],
+) -> Result<String> {
+    let mut service = format!(
+        "[Unit]\nDescription=Borg Remote host\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStart={} remote host --config {}\nEnvironment={}\nRestart=always\nRestartSec=2\n",
+        systemd_quote(&validated_systemd_value(&executable.to_string_lossy())?),
+        systemd_quote(&validated_systemd_value(&config_path.to_string_lossy())?),
+        systemd_quote(&validated_systemd_value(&format!("PATH={path}"))?),
+    );
+
+    if config.execution_profile == HostExecutionProfile::IsolatedHosted {
+        ensure!(
+            !allowed_networks.is_empty(),
+            "isolated hosted systemd service requires BORG_HOST_ALLOWED_NETWORKS"
+        );
+        service.push_str(&format!(
+            "NoNewPrivileges=true\n\
+PrivateTmp=true\n\
+PrivateDevices=true\n\
+ProtectSystem=strict\n\
+ProtectKernelTunables=true\n\
+ProtectKernelModules=true\n\
+ProtectControlGroups=true\n\
+LockPersonality=true\n\
+RestrictSUIDSGID=true\n\
+RestrictRealtime=true\n\
+CapabilityBoundingSet=\n\
+AmbientCapabilities=\n\
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\n\
+CPUAccounting=true\n\
+CPUQuota={}%\n\
+MemoryAccounting=true\n\
+MemoryMax={}\n\
+TasksAccounting=true\n\
+TasksMax={}\n\
+IPAddressDeny=any\n",
+            config.resource_limits.max_cpu_percent,
+            config.resource_limits.max_memory_bytes,
+            config.resource_limits.max_processes,
+        ));
+        for network in allowed_networks {
+            service.push_str("IPAddressAllow=");
+            service.push_str(&validated_systemd_value(network)?);
+            service.push('\n');
+        }
+        let mut write_paths = vec![
+            config_path
+                .parent()
+                .context("host config has no parent directory")?
+                .to_path_buf(),
+        ];
+        write_paths.extend(config.roots.iter().cloned());
+        for path in write_paths {
+            ensure!(
+                path.is_absolute() && path != Path::new("/"),
+                "isolated hosted service refuses a missing, relative, or root filesystem write path: {}",
+                path.display()
+            );
+            service.push_str("ReadWritePaths=");
+            service.push_str(&systemd_quote(&validated_systemd_value(
+                &path.to_string_lossy(),
+            )?));
+            service.push('\n');
+        }
+        service.push_str(
+            "Environment=\"BORG_HOST_EXECUTION_PROFILE=isolated_hosted\"\n\
+Environment=\"BORG_HOST_ISOLATION_ATTESTATION=systemd-user-sandbox-v1\"\n",
+        );
+    }
+    service.push_str("\n[Install]\nWantedBy=default.target\n");
+    Ok(service)
+}
+
+fn isolated_allowed_networks() -> Result<Vec<String>> {
+    let raw = std::env::var("BORG_HOST_ALLOWED_NETWORKS").map_err(|_| {
+        anyhow::anyhow!(
+            "isolated hosted service requires BORG_HOST_ALLOWED_NETWORKS with Borg/provider/DNS IPs or CIDRs"
+        )
+    })?;
+    parse_isolated_allowed_networks(&raw)
+}
+
+fn parse_isolated_allowed_networks(raw: &str) -> Result<Vec<String>> {
+    let mut networks = Vec::new();
+    for item in raw
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+    {
+        let (address, prefix) = item
+            .split_once('/')
+            .map_or((item, None), |(address, prefix)| (address, Some(prefix)));
+        let parsed: IpAddr = address
+            .parse()
+            .with_context(|| format!("invalid isolated host network address `{item}`"))?;
+        if let Some(prefix) = prefix {
+            let prefix = prefix
+                .parse::<u8>()
+                .with_context(|| format!("invalid isolated host network prefix `{item}`"))?;
+            let maximum = if parsed.is_ipv4() { 32 } else { 128 };
+            ensure!(
+                prefix <= maximum,
+                "isolated host network prefix is outside the address family: {item}"
+            );
+            ensure!(
+                prefix > 0,
+                "isolated host network allowlist must not contain a default route: {item}"
+            );
+            networks.push(format!("{parsed}/{prefix}"));
+        } else {
+            networks.push(parsed.to_string());
+        }
+    }
+    ensure!(
+        !networks.is_empty(),
+        "BORG_HOST_ALLOWED_NETWORKS must contain at least one IP address or CIDR"
+    );
+    Ok(networks)
+}
+
+fn validated_systemd_value(value: &str) -> Result<&str> {
+    ensure!(
+        !value.chars().any(char::is_control),
+        "systemd service value contains control characters"
+    );
+    Ok(value)
 }
 
 #[cfg(target_os = "linux")]
@@ -852,6 +1031,8 @@ async fn run_local_agent_session(
     let requested_provider = args.provider.into();
     let requested_model = args.model.clone().or_else(|| match requested_provider {
         CodingProvider::Codex => Some(borg_provider::codex_product_model().to_string()),
+        CodingProvider::Kimi => Some(borg_provider::kimi_product_model().to_string()),
+        CodingProvider::OpenCode => None,
         CodingProvider::OpenRouter => Some(borg_provider::openrouter_product_model().to_string()),
         CodingProvider::OpenAiCompatible => std::env::var("BORG_OPENAI_COMPATIBLE_MODEL")
             .ok()
@@ -864,7 +1045,8 @@ async fn run_local_agent_session(
         // optional reasoning parameter after an explicit user selection.
         CodingProvider::OpenRouter => None,
         CodingProvider::OpenAiCompatible => None,
-        CodingProvider::Claude => None,
+        CodingProvider::Claude | CodingProvider::OpenCode => None,
+        CodingProvider::Kimi => Some(borg_provider::kimi_default_effort().to_string()),
     });
     let (
         recorded_cwd,
@@ -5616,6 +5798,8 @@ fn provider_name(provider: CodingProvider) -> &'static str {
     match provider {
         CodingProvider::Codex => "codex",
         CodingProvider::Claude => "claude",
+        CodingProvider::OpenCode => "open-code",
+        CodingProvider::Kimi => "kimi",
         CodingProvider::OpenRouter => "openrouter",
         CodingProvider::OpenAiCompatible => "openai-compatible",
     }

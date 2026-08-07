@@ -88,6 +88,17 @@ pub fn openrouter_product_model() -> &'static str {
     "openrouter/auto"
 }
 
+/// Borg's directly managed Kimi route uses one product model profile. The
+/// provider adapter still accepts an explicit model so deployments can test a
+/// compatible model without changing the default CLI/Web contract.
+pub fn kimi_product_model() -> &'static str {
+    "kimi-k3"
+}
+
+pub fn kimi_default_effort() -> &'static str {
+    "high"
+}
+
 /// A runtime-discovered model entry for the /model picker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DynamicModelEntry {

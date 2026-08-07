@@ -7,11 +7,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 const MAX_PLUGIN_TEXT: usize = 512 * 1024;
 const MAX_BLU_WORKFLOW_SOURCE: usize = 256 * 1024;
+const MAX_RETRIEVAL_ADAPTER_SOURCE: usize = 256 * 1024;
+const MAX_RETRIEVAL_ADAPTERS: usize = 128;
 const MAX_BLU_EXTENSIONS: usize = 128;
+const MAX_EXTENSION_HISTORY_VERSIONS: usize = 32;
 const SETTINGS_SECTIONS: &[&str] = &[
     "capabilities",
     "extensions",
@@ -55,6 +59,26 @@ impl SelfServiceContext {
                 let args: CreatePluginArgs = serde_json::from_value(arguments)?;
                 self.create_plugin(args)
             }
+            "rollback_plugin" => {
+                let args: RollbackPluginArgs = serde_json::from_value(arguments)?;
+                self.rollback_plugin(&args.id, &args.revision)
+            }
+            "list_retrieval_adapters" => {
+                let _: NoArgs = serde_json::from_value(arguments)?;
+                self.list_retrieval_adapters()
+            }
+            "read_retrieval_adapter" => {
+                let args: RetrievalAdapterIdArgs = serde_json::from_value(arguments)?;
+                self.read_retrieval_adapter(&args.id)
+            }
+            "create_retrieval_adapter" => {
+                let args: CreateRetrievalAdapterArgs = serde_json::from_value(arguments)?;
+                self.create_retrieval_adapter(args)
+            }
+            "rollback_retrieval_adapter" => {
+                let args: RollbackRetrievalAdapterArgs = serde_json::from_value(arguments)?;
+                self.rollback_retrieval_adapter(&args.id, &args.revision)
+            }
             "list_blu_extensions" => {
                 let _: NoArgs = serde_json::from_value(arguments)?;
                 self.list_blu_extensions()
@@ -82,6 +106,14 @@ impl SelfServiceContext {
             "remove_blu_extension" => {
                 let args: BluExtensionIdArgs = serde_json::from_value(arguments)?;
                 self.remove_blu_extension(&args.id, args.scope.as_deref().unwrap_or("project"))
+            }
+            "rollback_blu_extension" => {
+                let args: RollbackBluExtensionArgs = serde_json::from_value(arguments)?;
+                self.rollback_blu_extension(
+                    &args.id,
+                    args.scope.as_deref().unwrap_or("project"),
+                    &args.revision,
+                )
             }
             "reload_blu_extensions" => {
                 let args: BluScopeArgs = serde_json::from_value(arguments)?;
@@ -150,11 +182,15 @@ impl SelfServiceContext {
                     continue;
                 }
                 let content = fs::read_to_string(&path)?;
+                let (version, revision) = plugin_version_and_revision(&content);
                 plugins.push(json!({
                     "id": id,
                     "path": path,
                     "size_bytes": size_bytes,
                     "description": plugin_description(&content),
+                    "version": version,
+                    "revision": revision,
+                    "versions": self.plugin_versions(&id)?,
                 }));
             }
         }
@@ -178,10 +214,14 @@ impl SelfServiceContext {
             metadata.len() <= MAX_PLUGIN_TEXT as u64,
             "plugin `{id}` is too large"
         );
+        let content = fs::read_to_string(&canonical)?;
+        let (version, revision) = plugin_version_and_revision(&content);
         Ok(json!({
             "id": id,
             "path": canonical,
-            "content": fs::read_to_string(&canonical)?
+            "version": version,
+            "revision": revision,
+            "content": content
         }))
     }
 
@@ -242,6 +282,8 @@ impl SelfServiceContext {
 
     fn create_plugin(&self, args: CreatePluginArgs) -> Result<Value> {
         validate_plugin_id(&args.id)?;
+        let version = args.version.as_deref().unwrap_or("0.1.0");
+        validate_extension_version(version)?;
         ensure!(
             args.description.len() <= MAX_PLUGIN_TEXT,
             "plugin description is too large"
@@ -258,7 +300,8 @@ impl SelfServiceContext {
             !args.instructions.contains('\0'),
             "plugin instructions contain NUL"
         );
-        let skill_dir = self.cwd.join(".borg").join("skills").join(&args.id);
+        let skills_root = self.cwd.join(".borg").join("skills");
+        let skill_dir = skills_root.join(&args.id);
         let skill_path = skill_dir.join("SKILL.md");
         if skill_path.exists() && !args.overwrite {
             bail!(
@@ -267,23 +310,444 @@ impl SelfServiceContext {
                 skill_path.display()
             );
         }
-        fs::create_dir_all(&skill_dir)
-            .with_context(|| format!("create plugin directory {}", skill_dir.display()))?;
+        let revision = plugin_revision(&args, version);
         let content = format!(
-            "---\nname: {}\ndescription: {}\n---\n\n# {}\n\n{}\n",
+            "---\nname: {}\ndescription: {}\nversion: {}\nrevision: {}\n---\n\n# {}\n\n{}\n",
             args.id,
             yaml_scalar(&args.description),
+            version,
+            revision,
             args.id,
             args.instructions.trim()
         );
-        write_atomic(&skill_path, content.as_bytes())?;
+        fs::create_dir_all(&skills_root)?;
+        let staging_root = tempfile::tempdir_in(&skills_root)?;
+        let staging = staging_root.path().join(&args.id);
+        fs::create_dir_all(&staging)?;
+        write_atomic(&staging.join("SKILL.md"), content.as_bytes())?;
+        let backup = skills_root.join(format!(".{}.backup-{}", args.id, Uuid::new_v4()));
+        if skill_dir.exists() {
+            fs::rename(&skill_dir, &backup)?;
+        }
+        if let Err(error) = fs::rename(&staging, &skill_dir) {
+            if backup.exists() {
+                let _ = fs::rename(&backup, &skill_dir);
+            }
+            return Err(error).context("activate staged Borg plugin");
+        }
+        if backup.exists()
+            && let Err(error) = self.archive_plugin_package(&args.id, &backup)
+        {
+            let _ = fs::remove_dir_all(&skill_dir);
+            let _ = fs::rename(&backup, &skill_dir);
+            return Err(error).context("archive previous Borg plugin revision");
+        }
         Ok(json!({
             "id": args.id,
             "path": skill_path,
+            "version": version,
+            "revision": revision,
             "hot_reload": "next native turn",
             "restart_required": false,
             "note": "Project skills are rescanned at the start of every native turn. Blu MCP manifests also reload at the next turn boundary."
         }))
+    }
+
+    fn plugin_history_root(&self, id: &str) -> PathBuf {
+        self.cwd
+            .join(".borg")
+            .join("skills")
+            .join(".versions")
+            .join(id)
+    }
+
+    fn archive_plugin_package(&self, id: &str, package: &Path) -> Result<String> {
+        let history_root = self.plugin_history_root(id);
+        fs::create_dir_all(&history_root)?;
+        let revision = plugin_package_revision(package)?;
+        let mut archive_key = revision.clone();
+        let mut archive = history_root.join(&archive_key);
+        if archive.exists() {
+            archive_key = format!("{revision}-{}", Uuid::new_v4());
+            archive = history_root.join(&archive_key);
+        }
+        fs::rename(package, &archive)?;
+        self.prune_plugin_history(&history_root)?;
+        Ok(archive_key)
+    }
+
+    fn prune_plugin_history(&self, history_root: &Path) -> Result<()> {
+        let mut entries = fs::read_dir(history_root)?
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| entry.path().is_dir())
+            .map(|entry| {
+                let modified = entry
+                    .metadata()
+                    .and_then(|metadata| metadata.modified())
+                    .unwrap_or(UNIX_EPOCH);
+                (modified, entry.path())
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|(modified, path)| (*modified, path.clone()));
+        while entries.len() > MAX_EXTENSION_HISTORY_VERSIONS {
+            let (_, path) = entries.remove(0);
+            fs::remove_dir_all(path)?;
+        }
+        Ok(())
+    }
+
+    fn plugin_versions(&self, id: &str) -> Result<Vec<Value>> {
+        let history_root = self.plugin_history_root(id);
+        if !history_root.is_dir() {
+            return Ok(Vec::new());
+        }
+        let mut versions = fs::read_dir(history_root)?
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| entry.path().is_dir())
+            .filter_map(|entry| {
+                let path = entry.path().join("SKILL.md");
+                let content = fs::read_to_string(path).ok()?;
+                let (version, revision) = plugin_version_and_revision(&content);
+                Some(json!({
+                    "revision": entry.file_name().to_string_lossy(),
+                    "version": version,
+                    "path": entry.path(),
+                    "content_revision": revision,
+                }))
+            })
+            .collect::<Vec<_>>();
+        versions.sort_by_key(|value| value["revision"].as_str().unwrap_or_default().to_string());
+        Ok(versions)
+    }
+
+    fn rollback_plugin(&self, id: &str, revision: &str) -> Result<Value> {
+        validate_plugin_id(id)?;
+        validate_extension_revision(revision)?;
+        let root = self.cwd.join(".borg").join("skills");
+        let destination = root.join(id);
+        let history_root = self.plugin_history_root(id);
+        let canonical_root = history_root.canonicalize().unwrap_or(history_root.clone());
+        let selected = history_root.join(revision);
+        let canonical_selected = selected
+            .canonicalize()
+            .with_context(|| format!("plugin revision `{revision}` does not exist"))?;
+        ensure!(
+            canonical_selected.starts_with(&canonical_root)
+                && canonical_selected.join("SKILL.md").is_file(),
+            "invalid plugin revision `{revision}`"
+        );
+        let current = plugin_package_revision(&destination)?;
+        ensure!(
+            current != revision,
+            "plugin revision `{revision}` is already active"
+        );
+        let current_staging = root.join(format!(".{}.rollback-{}", id, Uuid::new_v4()));
+        fs::rename(&destination, &current_staging)?;
+        if let Err(error) = fs::rename(&selected, &destination) {
+            let _ = fs::rename(&current_staging, &destination);
+            return Err(error).context("activate rolled-back plugin revision");
+        }
+        if let Err(error) = self.archive_plugin_package(id, &current_staging) {
+            let _ = fs::remove_dir_all(&destination);
+            let _ = fs::rename(&current_staging, &destination);
+            return Err(error).context("archive current plugin during rollback");
+        }
+        Ok(json!({
+            "id": id,
+            "revision": revision,
+            "hot_reload": "next native turn",
+        }))
+    }
+
+    fn list_retrieval_adapters(&self) -> Result<Value> {
+        let root = self.retrieval_adapters_root();
+        let mut adapters = Vec::new();
+        if root.is_dir() {
+            let mut entries = fs::read_dir(&root)?.collect::<std::io::Result<Vec<_>>>()?;
+            entries.sort_by_key(|entry| entry.file_name());
+            for entry in entries.into_iter().take(MAX_RETRIEVAL_ADAPTERS) {
+                let package = entry.path();
+                if !package.is_dir() {
+                    continue;
+                }
+                let id = entry.file_name().to_string_lossy().to_string();
+                if validate_plugin_id(&id).is_err() {
+                    continue;
+                }
+                let manifest_path = package.join("manifest.json");
+                let manifest = match fs::read_to_string(&manifest_path)
+                    .ok()
+                    .and_then(|source| serde_json::from_str::<Value>(&source).ok())
+                {
+                    Some(manifest) => manifest,
+                    None => continue,
+                };
+                adapters.push(json!({
+                    "id": id,
+                    "path": package,
+                    "manifest": manifest,
+                    "source_bytes": fs::metadata(package.join("adapter.source"))?.len(),
+                    "tests_present": package.join("tests.source").is_file(),
+                    "versions": self.retrieval_adapter_versions(&id)?,
+                }));
+            }
+        }
+        Ok(json!({ "root": root, "adapters": adapters }))
+    }
+
+    fn read_retrieval_adapter(&self, id: &str) -> Result<Value> {
+        validate_plugin_id(id)?;
+        let package = self.retrieval_adapters_root().join(id);
+        let canonical_root = self
+            .retrieval_adapters_root()
+            .canonicalize()
+            .unwrap_or_else(|_| self.retrieval_adapters_root());
+        let canonical = package
+            .canonicalize()
+            .with_context(|| format!("retrieval adapter `{id}` does not exist"))?;
+        ensure!(
+            canonical.starts_with(&canonical_root),
+            "retrieval adapter path escapes the project retriever root"
+        );
+        let manifest = read_retrieval_adapter_file(&canonical, "manifest.json")?;
+        let source = read_bounded_retrieval_source(&canonical.join("adapter.source"))?;
+        let tests = if canonical.join("tests.source").is_file() {
+            Some(read_bounded_retrieval_source(
+                &canonical.join("tests.source"),
+            )?)
+        } else {
+            None
+        };
+        Ok(json!({
+            "id": id,
+            "path": canonical,
+            "manifest": manifest,
+            "source": source,
+            "tests": tests,
+            "versions": self.retrieval_adapter_versions(id)?,
+        }))
+    }
+
+    fn create_retrieval_adapter(&self, args: CreateRetrievalAdapterArgs) -> Result<Value> {
+        validate_plugin_id(&args.id)?;
+        let version = args.version.as_deref().unwrap_or("0.1.0");
+        validate_extension_version(version)?;
+        let language = args.language.as_deref().unwrap_or("python");
+        ensure!(
+            matches!(language, "python" | "javascript"),
+            "retrieval adapter language must be python or javascript"
+        );
+        ensure!(
+            !args.description.trim().is_empty(),
+            "retrieval adapter description must not be empty"
+        );
+        ensure!(
+            args.description.len() <= 4_096,
+            "retrieval adapter description is too large"
+        );
+        ensure!(
+            !args.source.trim().is_empty(),
+            "retrieval adapter source must not be empty"
+        );
+        ensure!(
+            args.source.len() <= MAX_RETRIEVAL_ADAPTER_SOURCE,
+            "retrieval adapter source is too large"
+        );
+        ensure!(
+            args.source.contains("retrieve"),
+            "retrieval adapter source must define a retrieve function"
+        );
+        ensure!(
+            !args.description.contains('\0') && !args.source.contains('\0'),
+            "retrieval adapter contains NUL"
+        );
+        if let Some(tests) = args.tests.as_deref() {
+            ensure!(
+                tests.len() <= MAX_RETRIEVAL_ADAPTER_SOURCE,
+                "retrieval adapter tests are too large"
+            );
+            ensure!(
+                tests.contains("test"),
+                "retrieval adapter tests must define a test function"
+            );
+            ensure!(!tests.contains('\0'), "retrieval adapter tests contain NUL");
+        }
+        let root = self.retrieval_adapters_root();
+        let package = root.join(&args.id);
+        if package.exists() && !args.overwrite {
+            bail!(
+                "retrieval adapter `{}` already exists at {}; pass overwrite=true to replace it",
+                args.id,
+                package.display()
+            );
+        }
+        let revision = retrieval_adapter_revision(
+            &args.id,
+            &args.description,
+            language,
+            version,
+            &args.source,
+            args.tests.as_deref(),
+        );
+        let manifest = json!({
+            "schema": "borg.retrieval-adapter.v1",
+            "id": args.id,
+            "description": args.description,
+            "language": language,
+            "version": version,
+            "revision": revision,
+            "entrypoint": "retrieve",
+            "test_entrypoint": args.tests.as_ref().map(|_| "test"),
+            "authority": "canonical_history",
+            "created_by": "agent",
+        });
+        fs::create_dir_all(&root)?;
+        let staging_root = tempfile::tempdir_in(&root)?;
+        let staging = staging_root.path().join(&args.id);
+        fs::create_dir_all(&staging)?;
+        write_atomic(
+            &staging.join("manifest.json"),
+            serde_json::to_vec_pretty(&manifest)?.as_slice(),
+        )?;
+        write_atomic(&staging.join("adapter.source"), args.source.as_bytes())?;
+        if let Some(tests) = args.tests.as_deref() {
+            write_atomic(&staging.join("tests.source"), tests.as_bytes())?;
+        }
+        let backup = root.join(format!(".{}.backup-{}", args.id, Uuid::new_v4()));
+        if package.exists() {
+            fs::rename(&package, &backup)?;
+        }
+        if let Err(error) = fs::rename(&staging, &package) {
+            if backup.exists() {
+                let _ = fs::rename(&backup, &package);
+            }
+            return Err(error).context("activate staged retrieval adapter");
+        }
+        if backup.exists()
+            && let Err(error) = self.archive_retrieval_adapter_package(&args.id, &backup)
+        {
+            let _ = fs::remove_dir_all(&package);
+            let _ = fs::rename(&backup, &package);
+            return Err(error).context("archive previous retrieval adapter revision");
+        }
+        Ok(json!({
+            "id": args.id,
+            "path": package,
+            "version": version,
+            "revision": revision,
+            "language": language,
+            "tests_present": args.tests.is_some(),
+            "authority": "canonical_history",
+            "reload": "next runtime call",
+            "note": "The adapter may rank or transform history-index documents, but every result must be resolved through query_history before it is treated as evidence."
+        }))
+    }
+
+    fn rollback_retrieval_adapter(&self, id: &str, revision: &str) -> Result<Value> {
+        validate_plugin_id(id)?;
+        validate_extension_revision(revision)?;
+        let root = self.retrieval_adapters_root();
+        let history_root = self.retrieval_adapter_history_root(id);
+        let canonical_root = history_root
+            .canonicalize()
+            .unwrap_or_else(|_| history_root.clone());
+        let selected = history_root.join(revision);
+        let canonical_selected = selected
+            .canonicalize()
+            .with_context(|| format!("retrieval adapter revision `{revision}` does not exist"))?;
+        ensure!(
+            canonical_selected.starts_with(&canonical_root)
+                && canonical_selected.join("manifest.json").is_file()
+                && canonical_selected.join("adapter.source").is_file(),
+            "invalid retrieval adapter revision `{revision}`"
+        );
+        let package = root.join(id);
+        let current = retrieval_adapter_package_revision(&package)?;
+        ensure!(
+            current != revision,
+            "retrieval adapter revision `{revision}` is already active"
+        );
+        let current_staging = root.join(format!(".{}.rollback-{}", id, Uuid::new_v4()));
+        fs::rename(&package, &current_staging)?;
+        if let Err(error) = fs::rename(&selected, &package) {
+            let _ = fs::rename(&current_staging, &package);
+            return Err(error).context("activate rolled-back retrieval adapter revision");
+        }
+        if let Err(error) = self.archive_retrieval_adapter_package(id, &current_staging) {
+            let _ = fs::remove_dir_all(&package);
+            let _ = fs::rename(&current_staging, &package);
+            return Err(error).context("archive current retrieval adapter during rollback");
+        }
+        Ok(json!({
+            "id": id,
+            "revision": revision,
+            "reload": "next runtime call",
+            "authority": "canonical_history",
+        }))
+    }
+
+    fn retrieval_adapters_root(&self) -> PathBuf {
+        self.cwd.join(".borg").join("retrievers")
+    }
+
+    fn retrieval_adapter_history_root(&self, id: &str) -> PathBuf {
+        self.retrieval_adapters_root().join(".versions").join(id)
+    }
+
+    fn archive_retrieval_adapter_package(&self, id: &str, package: &Path) -> Result<String> {
+        let history_root = self.retrieval_adapter_history_root(id);
+        fs::create_dir_all(&history_root)?;
+        let revision = retrieval_adapter_package_revision(package)?;
+        let mut archive_key = revision.clone();
+        let mut archive = history_root.join(&archive_key);
+        if archive.exists() {
+            archive_key = format!("{revision}-{}", Uuid::new_v4());
+            archive = history_root.join(&archive_key);
+        }
+        fs::rename(package, &archive)?;
+        self.prune_retrieval_adapter_history(&history_root)?;
+        Ok(archive_key)
+    }
+
+    fn prune_retrieval_adapter_history(&self, history_root: &Path) -> Result<()> {
+        let mut entries = fs::read_dir(history_root)?
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| entry.path().is_dir())
+            .map(|entry| {
+                let modified = entry
+                    .metadata()
+                    .and_then(|metadata| metadata.modified())
+                    .unwrap_or(UNIX_EPOCH);
+                (modified, entry.path())
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|(modified, path)| (*modified, path.clone()));
+        while entries.len() > MAX_EXTENSION_HISTORY_VERSIONS {
+            let (_, path) = entries.remove(0);
+            fs::remove_dir_all(path)?;
+        }
+        Ok(())
+    }
+
+    fn retrieval_adapter_versions(&self, id: &str) -> Result<Vec<Value>> {
+        let history_root = self.retrieval_adapter_history_root(id);
+        if !history_root.is_dir() {
+            return Ok(Vec::new());
+        }
+        let mut versions = fs::read_dir(&history_root)?
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| entry.path().is_dir())
+            .filter_map(|entry| {
+                let manifest = read_retrieval_adapter_file(&entry.path(), "manifest.json").ok()?;
+                Some(json!({
+                    "revision": entry.file_name().to_string_lossy(),
+                    "manifest": manifest,
+                    "path": entry.path(),
+                }))
+            })
+            .collect::<Vec<_>>();
+        versions.sort_by_key(|value| value["revision"].as_str().unwrap_or_default().to_string());
+        Ok(versions)
     }
 
     fn list_blu_extensions(&self) -> Result<Value> {
@@ -332,6 +796,9 @@ impl SelfServiceContext {
                     "scope": scope,
                     "path": package,
                     "manifest": manifest_path,
+                    "version": manifest.get("version"),
+                    "revision": manifest.get("revision"),
+                    "versions": self.extension_versions(scope, &id)?,
                     "enabled": enabled,
                     "workflows": workflows,
                     "runtimes": manifest
@@ -411,6 +878,8 @@ impl SelfServiceContext {
             "id": id,
             "scope": scope,
             "path": package,
+            "version": manifest.get("version"),
+            "revision": manifest.get("revision"),
             "manifest": manifest,
             "files": files,
         }))
@@ -420,6 +889,8 @@ impl SelfServiceContext {
         validate_plugin_id(&args.id)?;
         let scope = args.scope.as_deref().unwrap_or("project");
         validate_blu_scope(scope)?;
+        let version = args.version.as_deref().unwrap_or("0.1.0");
+        validate_extension_version(version)?;
         let runtime = parse_workflow_runtime(args.runtime.as_deref().unwrap_or("blu"))?;
         let source_extension = args
             .source_extension
@@ -495,6 +966,7 @@ impl SelfServiceContext {
             }
             _ => bail!("workflow_name and workflow_source must be provided together"),
         };
+        let revision = extension_revision(&args, version, runtime, workflow.as_ref());
         let extensions_root = self.blu_extensions_root(scope)?;
         fs::create_dir_all(&extensions_root)?;
         let destination = extensions_root.join(&args.id);
@@ -512,7 +984,8 @@ impl SelfServiceContext {
         manifest.insert("manifest_version".into(), toml::Value::Integer(1));
         manifest.insert("id".into(), toml::Value::String(args.id.clone()));
         manifest.insert("name".into(), toml::Value::String(args.id.clone()));
-        manifest.insert("version".into(), toml::Value::String("0.1.0".into()));
+        manifest.insert("version".into(), toml::Value::String(version.into()));
+        manifest.insert("revision".into(), toml::Value::String(revision.clone()));
         manifest.insert(
             "description".into(),
             toml::Value::String(args.description.clone()),
@@ -571,10 +1044,7 @@ impl SelfServiceContext {
             write_atomic(&workflow_path, source.as_bytes())?;
         }
 
-        let backup = extensions_root.join(format!(".{}.backup", args.id));
-        if backup.exists() {
-            fs::remove_dir_all(&backup)?;
-        }
+        let backup = extensions_root.join(format!(".{}.backup-{}", args.id, Uuid::new_v4()));
         if destination.exists() {
             fs::rename(&destination, &backup)?;
         }
@@ -585,7 +1055,11 @@ impl SelfServiceContext {
             return Err(error).context("activate staged Blu extension");
         }
         if backup.exists() {
-            let _ = fs::remove_dir_all(&backup);
+            if let Err(error) = self.archive_extension_package(scope, &args.id, &backup) {
+                let _ = fs::remove_dir_all(&destination);
+                let _ = fs::rename(&backup, &destination);
+                return Err(error).context("archive previous Blu extension revision");
+            }
         }
         let reload_signal = self.reload_blu_extensions(scope)?;
         let audit = self.audit_blu(scope, "create", &args.id)?;
@@ -598,6 +1072,8 @@ impl SelfServiceContext {
             "audit": audit,
             "runtime": runtime,
             "source_extension": source_extension,
+            "version": version,
+            "revision": revision,
             "hot_reload": "next native turn boundary",
         }))
     }
@@ -647,15 +1123,15 @@ impl SelfServiceContext {
         validate_plugin_id(id)?;
         let package = self.blu_package_path(scope, id)?;
         let staging = package.with_extension(format!("remove-{}", Uuid::new_v4()));
-        if staging.exists() {
-            fs::remove_dir_all(&staging)?;
-        }
         fs::rename(&package, &staging)?;
         if let Err(error) = self.clear_blu_extension_state(scope, id) {
             let _ = fs::rename(&staging, &package);
             return Err(error);
         }
-        fs::remove_dir_all(&staging)?;
+        if let Err(error) = self.archive_extension_package(scope, id, &staging) {
+            let _ = fs::rename(&staging, &package);
+            return Err(error).context("archive removed Blu extension revision");
+        }
         let reload_signal = self.reload_blu_extensions(scope)?;
         let audit = self.audit_blu(scope, "remove", id)?;
         Ok(json!({
@@ -666,6 +1142,114 @@ impl SelfServiceContext {
             "audit": audit,
             "hot_reload": "next native turn boundary",
         }))
+    }
+
+    fn rollback_blu_extension(&self, id: &str, scope: &str, revision: &str) -> Result<Value> {
+        validate_plugin_id(id)?;
+        validate_extension_revision(revision)?;
+        let package = self.blu_package_path(scope, id)?;
+        let history_root = self.extension_history_root(scope, id)?;
+        let selected = history_root.join(revision);
+        let canonical_root = history_root.canonicalize().unwrap_or(history_root.clone());
+        let canonical_selected = selected
+            .canonicalize()
+            .with_context(|| format!("Blu extension revision `{revision}` does not exist"))?;
+        ensure!(
+            canonical_selected.starts_with(&canonical_root)
+                && canonical_selected.is_dir()
+                && canonical_selected.join("blu.toml").is_file(),
+            "invalid Blu extension revision `{revision}`"
+        );
+        let current = package_revision(&package)?;
+        ensure!(
+            current != revision,
+            "Blu extension revision `{revision}` is already active"
+        );
+        let current_staging = package.with_extension(format!("rollback-{}", Uuid::new_v4()));
+        fs::rename(&package, &current_staging)?;
+        if let Err(error) = fs::rename(&selected, &package) {
+            let _ = fs::rename(&current_staging, &package);
+            return Err(error).context("activate rolled-back Blu extension revision");
+        }
+        if let Err(error) = self.archive_extension_package(scope, id, &current_staging) {
+            let _ = fs::remove_dir_all(&package);
+            let _ = fs::rename(&current_staging, &package);
+            return Err(error).context("archive current Blu extension during rollback");
+        }
+        let reload_signal = self.reload_blu_extensions(scope)?;
+        let audit = self.audit_blu(scope, "rollback", id)?;
+        Ok(json!({
+            "id": id,
+            "scope": scope,
+            "revision": revision,
+            "reload_signal": reload_signal,
+            "audit": audit,
+            "hot_reload": "next native turn boundary",
+        }))
+    }
+
+    fn extension_history_root(&self, scope: &str, id: &str) -> Result<PathBuf> {
+        Ok(self.blu_extensions_root(scope)?.join(".versions").join(id))
+    }
+
+    fn archive_extension_package(&self, scope: &str, id: &str, package: &Path) -> Result<String> {
+        let history_root = self.extension_history_root(scope, id)?;
+        fs::create_dir_all(&history_root)?;
+        let revision = package_revision(package)?;
+        let mut archive_key = revision.clone();
+        let mut archive = history_root.join(&archive_key);
+        if archive.exists() {
+            archive_key = format!("{revision}-{}", Uuid::new_v4());
+            archive = history_root.join(&archive_key);
+        }
+        fs::rename(package, &archive)?;
+        self.prune_extension_history(&history_root)?;
+        Ok(archive_key)
+    }
+
+    fn prune_extension_history(&self, history_root: &Path) -> Result<()> {
+        let mut entries = fs::read_dir(history_root)?
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| entry.path().is_dir())
+            .map(|entry| {
+                let modified = entry
+                    .metadata()
+                    .and_then(|metadata| metadata.modified())
+                    .unwrap_or(UNIX_EPOCH);
+                (modified, entry.path())
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|(modified, path)| (*modified, path.clone()));
+        while entries.len() > MAX_EXTENSION_HISTORY_VERSIONS {
+            let (_, path) = entries.remove(0);
+            fs::remove_dir_all(path)?;
+        }
+        Ok(())
+    }
+
+    fn extension_versions(&self, scope: &str, id: &str) -> Result<Vec<Value>> {
+        let history_root = self.extension_history_root(scope, id)?;
+        if !history_root.is_dir() {
+            return Ok(Vec::new());
+        }
+        let mut versions = fs::read_dir(&history_root)?
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| entry.path().is_dir())
+            .filter_map(|entry| {
+                let revision = entry.file_name().to_string_lossy().to_string();
+                let manifest_path = entry.path().join("blu.toml");
+                let manifest = fs::read_to_string(manifest_path)
+                    .ok()
+                    .and_then(|source| toml::from_str::<toml::Value>(&source).ok())?;
+                Some(json!({
+                    "revision": revision,
+                    "version": manifest.get("version"),
+                    "path": entry.path(),
+                }))
+            })
+            .collect::<Vec<_>>();
+        versions.sort_by_key(|value| value["revision"].as_str().unwrap_or_default().to_string());
+        Ok(versions)
     }
 
     fn reload_blu_extensions(&self, scope: &str) -> Result<PathBuf> {
@@ -830,7 +1414,41 @@ struct CreatePluginArgs {
     description: String,
     instructions: String,
     #[serde(default)]
+    version: Option<String>,
+    #[serde(default)]
     overwrite: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct RollbackPluginArgs {
+    id: String,
+    revision: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RetrievalAdapterIdArgs {
+    id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateRetrievalAdapterArgs {
+    id: String,
+    description: String,
+    source: String,
+    #[serde(default)]
+    tests: Option<String>,
+    #[serde(default)]
+    language: Option<String>,
+    #[serde(default)]
+    version: Option<String>,
+    #[serde(default)]
+    overwrite: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct RollbackRetrievalAdapterArgs {
+    id: String,
+    revision: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -852,6 +1470,8 @@ struct CreateBluExtensionArgs {
     description: String,
     instructions: String,
     #[serde(default)]
+    version: Option<String>,
+    #[serde(default)]
     scope: Option<String>,
     #[serde(default)]
     workflow_name: Option<String>,
@@ -870,6 +1490,14 @@ struct CreateBluExtensionArgs {
 }
 
 #[derive(Debug, Deserialize)]
+struct RollbackBluExtensionArgs {
+    id: String,
+    revision: String,
+    #[serde(default)]
+    scope: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct SetBluExtensionEnabledArgs {
     id: String,
     #[serde(default)]
@@ -885,12 +1513,18 @@ pub(crate) fn is_tool(name: &str) -> bool {
             | "get_agent_settings"
             | "update_agent_settings"
             | "create_plugin"
+            | "rollback_plugin"
+            | "list_retrieval_adapters"
+            | "read_retrieval_adapter"
+            | "create_retrieval_adapter"
+            | "rollback_retrieval_adapter"
             | "list_blu_extensions"
             | "read_blu_extension"
             | "create_blu_extension"
             | "create_extension"
             | "set_blu_extension_enabled"
             | "remove_blu_extension"
+            | "rollback_blu_extension"
             | "reload_blu_extensions"
     )
 }
@@ -947,9 +1581,73 @@ pub(crate) fn tool_specs() -> Vec<Value> {
                     "id": { "type": "string", "pattern": "^[A-Za-z0-9_-]+$", "maxLength": 64 },
                     "description": { "type": "string", "minLength": 1, "maxLength": 512 },
                     "instructions": { "type": "string", "minLength": 1, "maxLength": 524288 },
+                    "version": { "type": "string", "pattern": "^[A-Za-z0-9._+-]+$", "maxLength": 128, "default": "0.1.0" },
                     "overwrite": { "type": "boolean" }
                 },
                 "required": ["id", "description", "instructions"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "rollback_plugin",
+            "description": "Restore one bounded, previously persisted project skill revision while keeping the current revision in history.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "pattern": "^[A-Za-z0-9_-]+$", "maxLength": 64 },
+                    "revision": { "type": "string", "pattern": "^[A-Za-z0-9._-]+$", "maxLength": 160 }
+                },
+                "required": ["id", "revision"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "list_retrieval_adapters",
+            "description": "List bounded, project-local retrieval adapters in .borg/retrievers. Adapters are versioned code over canonical history-index documents; they are not an evidence authority.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "read_retrieval_adapter",
+            "description": "Read one retrieval adapter manifest, source, optional tests, and prior revisions. Runtime helpers execute only its declared retrieve entrypoint against the Borg host boundary.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "id": { "type": "string", "pattern": "^[A-Za-z0-9_-]+$", "maxLength": 64 } },
+                "required": ["id"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "create_retrieval_adapter",
+            "description": "Create or replace a versioned Python or JavaScript retrieval adapter at .borg/retrievers/<id>. Define retrieve(query) and optionally test(retrieve, borg). The adapter can rank or transform history_index results, but authoritative evidence must be re-read with query_history.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "pattern": "^[A-Za-z0-9_-]+$", "maxLength": 64 },
+                    "description": { "type": "string", "minLength": 1, "maxLength": 4096 },
+                    "source": { "type": "string", "minLength": 1, "maxLength": 262144 },
+                    "tests": { "type": "string", "maxLength": 262144, "description": "Optional source defining test(retrieve, borg)." },
+                    "language": { "type": "string", "enum": ["python", "javascript"], "default": "python" },
+                    "version": { "type": "string", "pattern": "^[A-Za-z0-9._+-]+$", "maxLength": 128, "default": "0.1.0" },
+                    "overwrite": { "type": "boolean" }
+                },
+                "required": ["id", "description", "source"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "rollback_retrieval_adapter",
+            "description": "Restore one bounded, previously persisted retrieval adapter revision while keeping the current revision in history.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "pattern": "^[A-Za-z0-9_-]+$", "maxLength": 64 },
+                    "revision": { "type": "string", "pattern": "^[A-Za-z0-9._-]+$", "maxLength": 160 }
+                },
+                "required": ["id", "revision"],
                 "additionalProperties": false
             }
         }),
@@ -984,6 +1682,7 @@ pub(crate) fn tool_specs() -> Vec<Value> {
                     "id": { "type": "string", "pattern": "^[A-Za-z0-9_-]+$", "maxLength": 64 },
                     "description": { "type": "string", "minLength": 1, "maxLength": 4096 },
                     "instructions": { "type": "string", "minLength": 1, "maxLength": 524288 },
+                    "version": { "type": "string", "pattern": "^[A-Za-z0-9._+-]+$", "maxLength": 128, "default": "0.1.0" },
                     "scope": { "type": "string", "enum": ["project", "user"], "default": "project" },
                     "workflow_name": { "type": "string", "pattern": "^[A-Za-z0-9_-]+$", "maxLength": 64 },
                     "workflow_source": { "type": "string", "minLength": 1, "maxLength": 262144 },
@@ -1006,6 +1705,7 @@ pub(crate) fn tool_specs() -> Vec<Value> {
                     "id": { "type": "string", "pattern": "^[A-Za-z0-9_-]+$", "maxLength": 64 },
                     "description": { "type": "string", "minLength": 1, "maxLength": 4096 },
                     "instructions": { "type": "string", "minLength": 1, "maxLength": 524288 },
+                    "version": { "type": "string", "pattern": "^[A-Za-z0-9._+-]+$", "maxLength": 128, "default": "0.1.0" },
                     "scope": { "type": "string", "enum": ["project", "user"], "default": "project" },
                     "workflow_name": { "type": "string", "pattern": "^[A-Za-z0-9_-]+$", "maxLength": 64 },
                     "workflow_source": { "type": "string", "minLength": 1, "maxLength": 262144 },
@@ -1047,6 +1747,20 @@ pub(crate) fn tool_specs() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "rollback_blu_extension",
+            "description": "Restore one bounded, previously persisted Blu extension revision and keep the current revision in history.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "pattern": "^[A-Za-z0-9_-]+$", "maxLength": 64 },
+                    "revision": { "type": "string", "pattern": "^[A-Za-z0-9._-]+$", "maxLength": 160 },
+                    "scope": { "type": "string", "enum": ["project", "user"] }
+                },
+                "required": ["id", "revision"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
             "name": "reload_blu_extensions",
             "description": "Write the Blu reload signal for a project or user catalog. Interactive Borg also polls catalogs automatically; native turns always refresh their snapshot.",
             "inputSchema": {
@@ -1066,6 +1780,58 @@ fn validate_blu_scope(scope: &str) -> Result<()> {
         "unknown Blu scope {scope}; use project or user"
     );
     Ok(())
+}
+
+fn read_retrieval_adapter_file(package: &Path, name: &str) -> Result<Value> {
+    let path = package.join(name);
+    let source = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read retrieval adapter file {}", path.display()))?;
+    serde_json::from_str(&source)
+        .with_context(|| format!("invalid retrieval adapter manifest {}", path.display()))
+}
+
+fn read_bounded_retrieval_source(path: &Path) -> Result<String> {
+    let metadata = fs::metadata(path).with_context(|| {
+        format!(
+            "failed to inspect retrieval adapter source {}",
+            path.display()
+        )
+    })?;
+    ensure!(
+        metadata.len() <= MAX_RETRIEVAL_ADAPTER_SOURCE as u64,
+        "retrieval adapter source is too large"
+    );
+    fs::read_to_string(path)
+        .with_context(|| format!("failed to read retrieval adapter source {}", path.display()))
+}
+
+fn retrieval_adapter_revision(
+    id: &str,
+    description: &str,
+    language: &str,
+    version: &str,
+    source: &str,
+    tests: Option<&str>,
+) -> String {
+    let mut digest = Sha256::new();
+    for value in [id, description, language, version, source] {
+        digest.update(value.as_bytes());
+        digest.update([0]);
+    }
+    if let Some(tests) = tests {
+        digest.update(tests.as_bytes());
+    }
+    format!("{:x}", digest.finalize())
+}
+
+fn retrieval_adapter_package_revision(package: &Path) -> Result<String> {
+    let manifest = read_retrieval_adapter_file(package, "manifest.json")?;
+    let revision = manifest
+        .get("revision")
+        .and_then(Value::as_str)
+        .context("retrieval adapter manifest has no revision")?;
+    validate_extension_revision(revision)?;
+    Ok(revision.to_string())
 }
 
 fn parse_workflow_runtime(value: &str) -> Result<crate::WorkflowRuntime> {
@@ -1114,6 +1880,110 @@ fn validate_plugin_id(id: &str) -> Result<()> {
         "plugin id may contain only ASCII letters, digits, `_`, or `-`"
     );
     Ok(())
+}
+
+fn validate_extension_version(version: &str) -> Result<()> {
+    ensure!(
+        !version.is_empty() && version.len() <= 128,
+        "extension version must be 1-128 characters"
+    );
+    ensure!(
+        version.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'+' | b'-' | b'_')
+        }),
+        "extension version contains unsupported characters"
+    );
+    Ok(())
+}
+
+fn validate_extension_revision(revision: &str) -> Result<()> {
+    ensure!(
+        !revision.is_empty()
+            && revision.len() <= 160
+            && revision != "."
+            && revision != ".."
+            && !revision.contains(".."),
+        "invalid extension revision"
+    );
+    ensure!(
+        revision
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_')),
+        "extension revision contains unsupported characters"
+    );
+    Ok(())
+}
+
+fn extension_revision(
+    args: &CreateBluExtensionArgs,
+    version: &str,
+    runtime: crate::WorkflowRuntime,
+    workflow: Option<&(&String, &String)>,
+) -> String {
+    let workflow_name = workflow.map(|(name, _)| name.as_str());
+    let workflow_source = workflow.map(|(_, source)| source.as_str());
+    let input = json!({
+        "id": args.id,
+        "version": version,
+        "description": args.description,
+        "instructions": args.instructions,
+        "runtime": runtime.label(),
+        "source_extension": args.source_extension,
+        "command": args.command,
+        "args": args.args,
+        "workflow_name": workflow_name,
+        "workflow_source": workflow_source,
+    });
+    format!("{:x}", Sha256::digest(input.to_string().as_bytes()))
+}
+
+fn plugin_revision(args: &CreatePluginArgs, version: &str) -> String {
+    let input = json!({
+        "id": args.id,
+        "version": version,
+        "description": args.description,
+        "instructions": args.instructions,
+    });
+    format!("{:x}", Sha256::digest(input.to_string().as_bytes()))
+}
+
+fn plugin_version_and_revision(content: &str) -> (Option<String>, Option<String>) {
+    let mut version = None;
+    let mut revision = None;
+    if content.starts_with("---") {
+        for line in content.lines().skip(1).take_while(|line| *line != "---") {
+            if let Some(value) = line.strip_prefix("version:") {
+                version = Some(value.trim().trim_matches('"').to_string());
+            } else if let Some(value) = line.strip_prefix("revision:") {
+                revision = Some(value.trim().trim_matches('"').to_string());
+            }
+        }
+    }
+    (version, revision)
+}
+
+fn plugin_package_revision(package: &Path) -> Result<String> {
+    let path = package.join("SKILL.md");
+    let content = fs::read_to_string(&path)
+        .with_context(|| format!("read plugin skill {}", path.display()))?;
+    if let (_, Some(revision)) = plugin_version_and_revision(&content) {
+        validate_extension_revision(&revision)?;
+        return Ok(revision);
+    }
+    Ok(format!("legacy-{:x}", Sha256::digest(content.as_bytes())))
+}
+
+fn package_revision(package: &Path) -> Result<String> {
+    let manifest_path = package.join("blu.toml");
+    let source = fs::read_to_string(&manifest_path)
+        .with_context(|| format!("read extension manifest {}", manifest_path.display()))?;
+    let manifest = toml::from_str::<toml::Value>(&source)
+        .with_context(|| format!("parse extension manifest {}", manifest_path.display()))?;
+    if let Some(revision) = manifest.get("revision").and_then(toml::Value::as_str) {
+        validate_extension_revision(revision)?;
+        return Ok(revision.to_string());
+    }
+    Ok(format!("legacy-{:x}", Sha256::digest(source.as_bytes())))
 }
 
 fn yaml_scalar(value: &str) -> String {
@@ -1590,6 +2460,128 @@ mod tests {
     }
 
     #[test]
+    fn plugin_revisions_are_persisted_and_can_be_rolled_back() {
+        let workspace = tempfile::tempdir().unwrap();
+        let context = SelfServiceContext::new(workspace.path().to_path_buf());
+        let first = context
+            .call(
+                "create_plugin",
+                json!({
+                    "id": "versioned-skill",
+                    "description": "Version one",
+                    "instructions": "Use version one.",
+                    "version": "1.0.0"
+                }),
+            )
+            .unwrap();
+        let first_revision = first["revision"].as_str().unwrap().to_string();
+        context
+            .call(
+                "create_plugin",
+                json!({
+                    "id": "versioned-skill",
+                    "description": "Version two",
+                    "instructions": "Use version two.",
+                    "version": "2.0.0",
+                    "overwrite": true
+                }),
+            )
+            .unwrap();
+        let listed = context.call("list_plugins", json!({})).unwrap();
+        assert_eq!(listed["plugins"][0]["version"], "2.0.0");
+        assert_eq!(
+            listed["plugins"][0]["versions"][0]["content_revision"],
+            first_revision
+        );
+
+        context
+            .call(
+                "rollback_plugin",
+                json!({"id": "versioned-skill", "revision": first_revision}),
+            )
+            .unwrap();
+        let read = context
+            .call("read_plugin", json!({"id": "versioned-skill"}))
+            .unwrap();
+        assert_eq!(read["version"], "1.0.0");
+        assert!(
+            read["content"]
+                .as_str()
+                .unwrap()
+                .contains("Use version one.")
+        );
+    }
+
+    #[test]
+    fn retrieval_adapter_revisions_are_persisted_and_can_be_rolled_back() {
+        let workspace = tempfile::tempdir().unwrap();
+        let context = SelfServiceContext::new(workspace.path().to_path_buf());
+        let first = context
+            .call(
+                "create_retrieval_adapter",
+                json!({
+                    "id": "history-ranker",
+                    "description": "Rank history evidence",
+                    "version": "1.0.0",
+                    "source": "def retrieve(query):\n    return {'query': query, 'version': 1}\n",
+                    "tests": "def test(retrieve, borg):\n    assert retrieve('x')['version'] == 1\n    return {'ok': True}\n"
+                }),
+            )
+            .unwrap();
+        let first_revision = first["revision"].as_str().unwrap().to_string();
+        context
+            .call(
+                "create_retrieval_adapter",
+                json!({
+                    "id": "history-ranker",
+                    "description": "Rank newer history evidence",
+                    "version": "2.0.0",
+                    "source": "def retrieve(query):\n    return {'query': query, 'version': 2}\n",
+                    "overwrite": true
+                }),
+            )
+            .unwrap();
+
+        let listed = context.call("list_retrieval_adapters", json!({})).unwrap();
+        assert_eq!(listed["adapters"][0]["manifest"]["version"], "2.0.0");
+        assert_eq!(
+            listed["adapters"][0]["versions"][0]["revision"],
+            first_revision
+        );
+
+        context
+            .call(
+                "rollback_retrieval_adapter",
+                json!({"id": "history-ranker", "revision": first_revision}),
+            )
+            .unwrap();
+        let read = context
+            .call("read_retrieval_adapter", json!({"id": "history-ranker"}))
+            .unwrap();
+        assert_eq!(read["manifest"]["version"], "1.0.0");
+        assert!(read["source"].as_str().unwrap().contains("version': 1"));
+        assert!(read["tests"].as_str().unwrap().contains("assert retrieve"));
+    }
+
+    #[test]
+    fn retrieval_adapter_requires_a_retrieve_entrypoint() {
+        let workspace = tempfile::tempdir().unwrap();
+        let context = SelfServiceContext::new(workspace.path().to_path_buf());
+        assert!(
+            context
+                .call(
+                    "create_retrieval_adapter",
+                    json!({
+                        "id": "invalid",
+                        "description": "No entrypoint",
+                        "source": "def rank(query): return query"
+                    }),
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
     fn blu_extension_lifecycle_is_atomic_audited_and_live() {
         let workspace = tempfile::tempdir().unwrap();
         let context = SelfServiceContext::new(workspace.path().to_path_buf());
@@ -1691,6 +2683,60 @@ mod tests {
         .unwrap();
         assert!(manifest.contains("runtime = \"typescript\""));
         assert!(manifest.contains("args = [\"--smol\"]"));
+    }
+
+    #[test]
+    fn extension_revisions_are_persisted_and_can_be_rolled_back() {
+        let workspace = tempfile::tempdir().unwrap();
+        let context = SelfServiceContext::new(workspace.path().to_path_buf());
+        let first = context
+            .call(
+                "create_extension",
+                json!({
+                    "id": "versioned-tools",
+                    "description": "Version one",
+                    "instructions": "Use version one.",
+                    "version": "1.0.0"
+                }),
+            )
+            .unwrap();
+        let first_revision = first["revision"].as_str().unwrap().to_string();
+        context
+            .call(
+                "create_extension",
+                json!({
+                    "id": "versioned-tools",
+                    "description": "Version two",
+                    "instructions": "Use version two.",
+                    "version": "2.0.0",
+                    "overwrite": true
+                }),
+            )
+            .unwrap();
+        let listed = context.call("list_blu_extensions", json!({})).unwrap();
+        assert_eq!(listed["extensions"][0]["version"], "2.0.0");
+        assert_eq!(
+            listed["extensions"][0]["versions"][0]["revision"],
+            first_revision
+        );
+
+        context
+            .call(
+                "rollback_blu_extension",
+                json!({"id": "versioned-tools", "revision": first_revision}),
+            )
+            .unwrap();
+        let read = context
+            .call(
+                "read_blu_extension",
+                json!({"id": "versioned-tools", "scope": "project"}),
+            )
+            .unwrap();
+        assert_eq!(read["version"], "1.0.0");
+        assert_eq!(
+            read["files"]["skills/versioned-tools/SKILL.md"],
+            "---\nname: versioned-tools\ndescription: \"Version one\"\n---\n\n# versioned-tools\n\nUse version one.\n"
+        );
     }
 
     #[test]

@@ -934,6 +934,13 @@ async fn run_agent_session_store_kernel(
     initial_peers: Vec<crate::SpawnSubagent>,
 ) -> Result<()> {
     validate_launch_session(&mut launch)?;
+    let effective_capabilities = launch.capabilities.apply_dependency_intersection();
+    let runtime_mcp_context = launch
+        .capabilities
+        .runtime_mcp_context
+        .clone()
+        .unwrap_or_default();
+    let runtime_mcp_servers = runtime_mcp_context.provider_external_servers();
     store.create_session(session_id).await?;
     // A provider process can die after the durable TurnStarted boundary but
     // before its worker lease is installed. Requeue both unleased and expired
@@ -1041,6 +1048,17 @@ async fn run_agent_session_store_kernel(
             session_id,
             SessionEventKind::ProviderCapabilitiesUpdated {
                 providers: launch.capabilities.provider_capabilities.clone(),
+            },
+        )
+        .await?;
+    }
+    if initial_state.effective_capabilities.as_ref() != Some(&effective_capabilities) {
+        record(
+            &mut journal,
+            &events,
+            session_id,
+            SessionEventKind::EffectiveCapabilitiesUpdated {
+                capabilities: effective_capabilities,
             },
         )
         .await?;
@@ -1189,7 +1207,11 @@ async fn run_agent_session_store_kernel(
         workflow_processes.clone(),
         launch.permission_mode,
         web_search,
-    );
+    )
+    .with_resource_limits(launch.capabilities.resource_limits.clone());
+    dispatcher
+        .configure_runtime_mcp(runtime_mcp_servers.clone())
+        .await?;
     let workflow_autonomy_store = autonomy_store.clone();
     let agent_tool_server =
         crate::AgentToolServer::start(session_root, session_id, dispatcher.clone()).await?;
@@ -1505,8 +1527,8 @@ async fn run_agent_session_store_kernel(
                         .await
                         {
                             Ok(provider_switched) => {
-                                subscription_context_reusable = false;
                                 if provider_switched {
+                                    subscription_context_reusable = false;
                                     // The provider session id belongs to the
                                     // provider we just left, so the next turn
                                     // replays retained context instead.
@@ -1662,7 +1684,8 @@ async fn run_agent_session_store_kernel(
                                         conversation: Vec::new(),
                                         agent_mcp_server: agent_mcp_server.clone(),
                                         agent_tools: dispatcher.clone(),
-                                        external_mcp_servers: Vec::new(),
+                                        external_mcp_servers: runtime_mcp_servers.clone(),
+                                        runtime_mcp_context: runtime_mcp_context.clone(),
                                         extension_skill_roots: Vec::new(),
                                         extension_workflows: Vec::new(),
                                         system_prompt_appendix: format!(
@@ -2251,7 +2274,8 @@ async fn run_agent_session_store_kernel(
             conversation: native_conversation(journal.context_events(), launch.provider)?,
             agent_mcp_server: agent_mcp_server.clone(),
             agent_tools: dispatcher.clone(),
-            external_mcp_servers: Vec::new(),
+            external_mcp_servers: runtime_mcp_servers.clone(),
+            runtime_mcp_context: runtime_mcp_context.clone(),
             extension_skill_roots: launch.extension_skill_roots.clone(),
             extension_workflows: Vec::new(),
             system_prompt_appendix: crate::provider_capabilities_prompt(
@@ -3484,8 +3508,9 @@ fn resolve_consultation_profile(
 fn default_consultation_effort(provider: CodingProvider) -> Option<String> {
     match provider {
         CodingProvider::Codex => Some(borg_provider::codex_default_effort().to_string()),
+        CodingProvider::Kimi => Some(borg_provider::kimi_default_effort().to_string()),
         CodingProvider::OpenRouter | CodingProvider::OpenAiCompatible => Some("medium".to_string()),
-        CodingProvider::Claude => None,
+        CodingProvider::Claude | CodingProvider::OpenCode => None,
     }
 }
 
@@ -4013,7 +4038,17 @@ async fn compact_subscription_context_for_budget(
                     conversation: Vec::new(),
                     agent_mcp_server: agent_mcp_server.clone(),
                     agent_tools: dispatcher.clone(),
-                    external_mcp_servers: Vec::new(),
+                    external_mcp_servers: launch
+                        .capabilities
+                        .runtime_mcp_context
+                        .as_ref()
+                        .map(crate::RuntimeMcpContext::provider_external_servers)
+                        .unwrap_or_default(),
+                    runtime_mcp_context: launch
+                        .capabilities
+                        .runtime_mcp_context
+                        .clone()
+                        .unwrap_or_default(),
                     extension_skill_roots: Vec::new(),
                     extension_workflows: Vec::new(),
                     system_prompt_appendix: format!(

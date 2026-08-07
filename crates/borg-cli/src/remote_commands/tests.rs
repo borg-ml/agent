@@ -532,6 +532,135 @@ fn reinstalling_the_remote_host_restarts_it_on_the_new_binary() {
 }
 
 #[test]
+fn isolated_remote_host_service_is_fail_closed_and_sandboxed() {
+    let config = HostConfig {
+        server: "https://borg.example".to_string(),
+        host_id: Uuid::new_v4(),
+        host_token: "secret".to_string(),
+        name: "isolated".to_string(),
+        roots: vec![PathBuf::from("/workspace")],
+        execution_profile: HostExecutionProfile::IsolatedHosted,
+        resource_limits: Default::default(),
+    };
+    let unit = host_service_unit(
+        Path::new("/usr/local/bin/borg"),
+        Path::new("/home/borg/.borg/remote/host.json"),
+        &config,
+        "/usr/bin:/bin",
+        &["203.0.113.10/32".to_string(), "127.0.0.53".to_string()],
+    )
+    .expect("isolated service unit");
+
+    for directive in [
+        "NoNewPrivileges=true",
+        "PrivateDevices=true",
+        "ProtectSystem=strict",
+        "CapabilityBoundingSet=",
+        "CPUQuota=400%",
+        "MemoryMax=8589934592",
+        "TasksMax=512",
+        "IPAddressDeny=any",
+        "IPAddressAllow=203.0.113.10/32",
+        "ReadWritePaths=\"/workspace\"",
+        "BORG_HOST_EXECUTION_PROFILE=isolated_hosted",
+        "BORG_HOST_ISOLATION_ATTESTATION=systemd-user-sandbox-v1",
+    ] {
+        assert!(unit.contains(directive), "missing {directive} in {unit}");
+    }
+}
+
+#[test]
+fn trusted_remote_host_service_keeps_legacy_unit_small() {
+    let config = HostConfig {
+        server: "https://borg.example".to_string(),
+        host_id: Uuid::new_v4(),
+        host_token: "secret".to_string(),
+        name: "trusted".to_string(),
+        roots: vec![PathBuf::from("/workspace")],
+        execution_profile: HostExecutionProfile::TrustedUser,
+        resource_limits: Default::default(),
+    };
+    let unit = host_service_unit(
+        Path::new("/usr/local/bin/borg"),
+        Path::new("/home/borg/.borg/remote/host.json"),
+        &config,
+        "/usr/bin:/bin",
+        &[],
+    )
+    .expect("trusted service unit");
+    assert!(!unit.contains("IPAddressDeny=any"));
+    assert!(!unit.contains("NoNewPrivileges=true"));
+    assert!(unit.contains("ExecStart=\"/usr/local/bin/borg\""));
+}
+
+#[test]
+fn isolated_remote_host_service_requires_network_allowlist() {
+    let config = HostConfig {
+        server: "https://borg.example".to_string(),
+        host_id: Uuid::new_v4(),
+        host_token: "secret".to_string(),
+        name: "isolated".to_string(),
+        roots: vec![PathBuf::from("/workspace")],
+        execution_profile: HostExecutionProfile::IsolatedHosted,
+        resource_limits: Default::default(),
+    };
+    assert!(
+        host_service_unit(
+            Path::new("/usr/local/bin/borg"),
+            Path::new("/home/borg/.borg/remote/host.json"),
+            &config,
+            "/usr/bin:/bin",
+            &[],
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn isolated_remote_host_network_allowlist_rejects_default_routes() {
+    assert!(parse_isolated_allowed_networks("0.0.0.0/0").is_err());
+    assert!(parse_isolated_allowed_networks("::/0").is_err());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn isolated_remote_host_service_passes_systemd_unit_validation() {
+    let config = HostConfig {
+        server: "https://borg.example".to_string(),
+        host_id: Uuid::new_v4(),
+        host_token: "secret".to_string(),
+        name: "isolated".to_string(),
+        roots: vec![PathBuf::from("/workspace")],
+        execution_profile: HostExecutionProfile::IsolatedHosted,
+        resource_limits: Default::default(),
+    };
+    let executable = std::env::current_exe().expect("current test executable");
+    let unit = host_service_unit(
+        &executable,
+        Path::new("/home/borg/.borg/remote/host.json"),
+        &config,
+        "/usr/bin:/bin",
+        &["203.0.113.10/32".to_string(), "127.0.0.53".to_string()],
+    )
+    .expect("isolated service unit");
+    let root = tempdir().expect("unit tempdir");
+    let path = root.path().join("borg-remote.service");
+    fs::write(&path, unit).expect("write unit");
+
+    let output = std::process::Command::new("systemd-analyze")
+        .arg("verify")
+        .arg(&path)
+        .output()
+        .expect("systemd-analyze");
+    assert!(
+        output.status.success(),
+        "systemd unit rejected: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn team_history_restores_every_agent_and_child_approval() {
     let root = Uuid::new_v4();
     let child = Uuid::new_v4();

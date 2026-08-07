@@ -1,0 +1,18 @@
+{
+  "protocol": "borg.agent_runtime",
+  "version": 1,
+  "request_id": "00000000-0000-0000-0000-000000000001",
+  "correlation_id": "00000000-0000-0000-0000-000000001000",
+  "idempotency_key": "fixture-prompt-1",
+  "sequence": 7,
+  "created_at": "2026-08-07T00:00:00Z",
+  "command": {
+    "type": "prompt",
+    "session_id": "00000000-0000-0000-0000-000000001000",
+    "message_id": "00000000-0000-0000-0000-000000002000",
+    "text": "Continue from the durable goal and report the next verified result.",
+    "attachments": [],
+    "output_schema": null,
+    "delivery": "queue"
+  }
+}

@@ -23,6 +23,11 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{Mutex, mpsc};
 
+#[path = "opencode_stream.rs"]
+mod opencode_stream;
+
+pub use opencode_stream::run_opencode_local_chat_stream;
+
 #[cfg(not(feature = "claude"))]
 #[allow(dead_code)]
 mod claude_agents {

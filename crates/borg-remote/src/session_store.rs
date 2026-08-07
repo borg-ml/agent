@@ -8,12 +8,14 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use regex::{Regex, RegexBuilder};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow, SqliteSynchronous,
 };
-use sqlx::{Row, Sqlite, SqlitePool, Transaction};
+use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool, Transaction};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -31,6 +33,138 @@ const MAX_HOST_LAUNCH_METADATA_BYTES: usize = 512 * 1024;
 pub const SESSION_PROJECTION_VERSION: i32 = 3;
 const SESSION_SCHEMA_VERSION: i64 = 5;
 const DISPOSABLE_SCHEMA_ERROR: &str = "Borg session database schema is incompatible";
+pub(crate) const DEFAULT_HISTORY_LIMIT: usize = 50;
+pub(crate) const MAX_HISTORY_LIMIT: usize = 200;
+pub(crate) const DEFAULT_HISTORY_SCAN_LIMIT: usize = 10_000;
+pub(crate) const MAX_HISTORY_SCAN_LIMIT: usize = 100_000;
+pub(crate) const DEFAULT_HISTORY_PAYLOAD_BYTES: usize = 256 * 1024;
+pub(crate) const MAX_HISTORY_PAYLOAD_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_HISTORY_QUERY_BYTES: usize = 8 * 1024;
+pub(crate) const MAX_RUNTIME_CHECKPOINT_BYTES: usize = 512 * 1024;
+
+/// Version of the durable runtime namespace manifest. The manifest describes
+/// how to reconnect to a trusted runtime; it is not a second semantic-memory
+/// store and never makes arbitrary code replay implicit.
+pub(crate) const RUNTIME_MANIFEST_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RuntimeManifestStatus {
+    Running,
+    Stopped,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RuntimeManifest {
+    pub manifest_version: u32,
+    pub session_id: Uuid,
+    pub runtime: String,
+    pub root: String,
+    pub command: String,
+    pub worker_id: Uuid,
+    pub status: RuntimeManifestStatus,
+    pub execution_count: u64,
+    pub last_code_hash: Option<String>,
+    pub last_error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct RuntimeCheckpoint {
+    pub session_id: Uuid,
+    pub key: String,
+    pub state: serde_json::Value,
+    pub content_hash: String,
+    pub revision: u64,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RuntimeManifestActivation {
+    pub manifest: RuntimeManifest,
+    pub recovered_from_previous_worker: bool,
+}
+
+/// The canonical session journal remains the authority; this selects only the
+/// derived discovery path used to find event ids inside it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionHistorySearchMode {
+    #[default]
+    Lexical,
+    Regex,
+}
+
+/// One bounded query over a session's lossless event history.
+///
+/// Sequence bounds are inclusive. An empty `text` performs an indexed typed
+/// or range read without consulting the text-search projection.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SessionHistoryQuery {
+    pub text: Option<String>,
+    pub mode: SessionHistorySearchMode,
+    /// Optional literal FTS narrowing applied before a regex. Supplying a
+    /// term known to occur in every desired match avoids a full bounded scan.
+    pub prefilter: Option<String>,
+    pub event_id: Option<Uuid>,
+    pub start_sequence: Option<u64>,
+    pub end_sequence: Option<u64>,
+    pub event_kinds: Vec<String>,
+    pub actors: Vec<crate::EventActor>,
+    pub newest_first: bool,
+    pub case_sensitive: bool,
+    pub limit: Option<usize>,
+    /// Maximum canonical candidates inspected by regex or lineage fallback.
+    pub scan_limit: Option<usize>,
+    pub expand_payloads: bool,
+    /// Aggregate byte budget for expanded payloads in the response.
+    pub max_payload_bytes: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionHistoryPayload {
+    pub reference: SessionPayloadRef,
+    pub text: String,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionHistoryHit {
+    /// Always rehydrated from the canonical journal, never returned directly
+    /// from FTS or a future semantic index.
+    pub event: SessionEvent,
+    pub snippet: Option<String>,
+    pub score: Option<f64>,
+    pub payloads: Vec<SessionHistoryPayload>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionHistoryPage {
+    pub hits: Vec<SessionHistoryHit>,
+    pub backend: String,
+    pub scanned_events: usize,
+    pub truncated: bool,
+}
+
+/// Rebuildable feed record for an external lexical/vector index such as
+/// BorgSearch/Vespa. The stable ids are locators only; callers must resolve a
+/// search hit through `query_history(event_id=...)` before treating it as
+/// canonical evidence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionHistoryIndexDocument {
+    pub schema_version: u32,
+    pub document_id: String,
+    pub session_id: Uuid,
+    pub event_id: Uuid,
+    pub sequence: u64,
+    pub event_kind: String,
+    pub actor: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub content: String,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventPersistence {
@@ -80,6 +214,7 @@ impl SessionEventKind {
             self,
             Self::ProviderSessionLinked { .. }
                 | Self::ProviderCapabilitiesUpdated { .. }
+                | Self::EffectiveCapabilitiesUpdated { .. }
                 | Self::TurnStarted { .. }
                 | Self::StatusChanged { .. }
                 | Self::SubagentActivity { .. }
@@ -289,6 +424,9 @@ pub struct SessionState {
     /// context and fork inheritance.
     #[serde(default)]
     pub provider_capabilities: Vec<crate::ProviderCapability>,
+    /// Host-normalized capability intersection and explicit denials.
+    #[serde(default)]
+    pub effective_capabilities: Option<crate::EffectiveCapabilities>,
     pub status: Option<SessionStatus>,
     pub status_detail: Option<String>,
     pub provider_session_id: Option<String>,
@@ -333,6 +471,10 @@ impl SessionState {
                 response_language,
                 permission_mode,
             } => {
+                let provider_changed = self
+                    .configuration
+                    .as_ref()
+                    .is_some_and(|old| old.provider != *provider);
                 let context_identity_changed = self.configuration.as_ref().is_some_and(|old| {
                     old.provider != *provider || old.model.as_ref() != model.as_ref()
                 });
@@ -347,12 +489,22 @@ impl SessionState {
                 });
                 if context_identity_changed {
                     self.context_generation = self.context_generation.saturating_add(1);
-                    self.provider_session_id = None;
+                    // A model change starts a new Borg context generation, but
+                    // an acknowledged Codex thread remains resumable under
+                    // the new provider lifecycle key. Other providers do not
+                    // have this durable resume path, and provider changes
+                    // necessarily invalidate the old session id.
+                    if provider_changed || *provider != CodingProvider::Codex {
+                        self.provider_session_id = None;
+                    }
                     self.usage.context_tokens = Some(0);
                 }
             }
             SessionEventKind::ProviderCapabilitiesUpdated { providers } => {
                 self.provider_capabilities = providers.clone();
+            }
+            SessionEventKind::EffectiveCapabilitiesUpdated { capabilities } => {
+                self.effective_capabilities = Some(capabilities.clone());
             }
             SessionEventKind::StatusChanged { status, detail } => {
                 self.status = Some(*status);
@@ -844,6 +996,474 @@ impl SqliteSessionStore {
         &self.pool
     }
 
+    /// Query the lossless session journal through exact/range, FTS5, or
+    /// bounded-regex retrieval. Search rows contain only a rebuildable
+    /// projection; every hit is resolved back to `session_events` before it is
+    /// returned.
+    pub async fn query_history(
+        &self,
+        session_id: Uuid,
+        query: SessionHistoryQuery,
+    ) -> Result<SessionHistoryPage> {
+        ensure!(
+            self.contains_session(session_id).await?,
+            "session {session_id} does not exist"
+        );
+        if let (Some(start), Some(end)) = (query.start_sequence, query.end_sequence) {
+            ensure!(start <= end, "history start_sequence exceeds end_sequence");
+        }
+        ensure!(
+            query.event_kinds.len() <= 64
+                && query
+                    .event_kinds
+                    .iter()
+                    .all(|kind| !kind.is_empty() && kind.len() <= 128),
+            "history event_kinds must contain at most 64 non-empty typed names"
+        );
+        ensure!(
+            query.actors.len() <= 4,
+            "history actors contains more than four values"
+        );
+        ensure!(
+            query.prefilter.is_none() || query.mode == SessionHistorySearchMode::Regex,
+            "history prefilter is only valid with regex mode"
+        );
+        let text = query
+            .text
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if let Some(text) = text {
+            ensure!(
+                text.len() <= MAX_HISTORY_QUERY_BYTES,
+                "history query exceeds {MAX_HISTORY_QUERY_BYTES} bytes"
+            );
+        }
+        if let Some(prefilter) = query
+            .prefilter
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            ensure!(
+                prefilter.len() <= MAX_HISTORY_QUERY_BYTES,
+                "history prefilter exceeds {MAX_HISTORY_QUERY_BYTES} bytes"
+            );
+        }
+        let session = self.session_row(session_id).await?;
+        if session.inherited_event_count > 0 {
+            return self.query_history_lineage(session_id, &query, text).await;
+        }
+        match (text, query.mode) {
+            (None, _) => self.query_history_exact(session_id, &query).await,
+            (Some(text), SessionHistorySearchMode::Lexical) => {
+                self.query_history_lexical(session_id, &query, text).await
+            }
+            (Some(text), SessionHistorySearchMode::Regex) => {
+                self.query_history_regex(session_id, &query, text).await
+            }
+        }
+    }
+
+    /// Stream full-text records for an optional external search index. This is
+    /// deliberately pull-based and sequence-cursored so Vespa/Postgres can be
+    /// rebuilt from SQLite after loss without joining the write transaction or
+    /// becoming a second journal.
+    pub async fn history_index_documents_after(
+        &self,
+        session_id: Uuid,
+        sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<SessionHistoryIndexDocument>> {
+        let limit = limit.clamp(1, 1_000);
+        let session = self.session_row(session_id).await?;
+        if sequence < session.inherited_event_count {
+            let events = self
+                .projected_events(session_id, None)
+                .await?
+                .into_iter()
+                .filter(|event| event.sequence > sequence)
+                .take(limit)
+                .collect::<Vec<_>>();
+            let mut documents = Vec::with_capacity(events.len());
+            for event in events {
+                documents.push(SessionHistoryIndexDocument {
+                    schema_version: 1,
+                    document_id: history_index_document_id(session_id, event.id),
+                    session_id,
+                    event_id: event.id,
+                    sequence: event.sequence,
+                    event_kind: event_kind(&event.kind)?,
+                    actor: event_actor(&event.kind).map(str::to_string),
+                    created_at: event.created_at,
+                    content: self.history_event_body(&event).await?,
+                });
+            }
+            return Ok(documents);
+        }
+
+        let rows = sqlx::query(
+            "select e.event_json, s.event_kind, s.actor, s.body \
+             from session_event_search s \
+             join session_events e on e.session_id=s.session_id and e.event_id=s.event_id \
+             where s.session_id=? and s.sequence>? order by s.sequence limit ?",
+        )
+        .bind(session_id.to_string())
+        .bind(i64::try_from(sequence).unwrap_or(i64::MAX))
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                let event: SessionEvent = serde_json::from_str(row.try_get("event_json")?)?;
+                Ok(SessionHistoryIndexDocument {
+                    schema_version: 1,
+                    document_id: history_index_document_id(session_id, event.id),
+                    session_id,
+                    event_id: event.id,
+                    sequence: event.sequence,
+                    event_kind: row.try_get("event_kind")?,
+                    actor: row.try_get("actor")?,
+                    created_at: event.created_at,
+                    content: row.try_get("body")?,
+                })
+            })
+            .collect()
+    }
+
+    async fn query_history_exact(
+        &self,
+        session_id: Uuid,
+        query: &SessionHistoryQuery,
+    ) -> Result<SessionHistoryPage> {
+        let limit = history_limit(query);
+        let mut sql = QueryBuilder::<Sqlite>::new(
+            "select e.event_json from session_events e where e.session_id = ",
+        );
+        sql.push_bind(session_id.to_string());
+        push_history_sql_filters(&mut sql, query, "e");
+        sql.push(" order by e.sequence ");
+        sql.push(if query.newest_first { "desc" } else { "asc" });
+        sql.push(" limit ")
+            .push_bind(i64::try_from(limit + 1).unwrap_or(i64::MAX));
+        let rows = sql.build().fetch_all(&self.pool).await?;
+        let truncated = rows.len() > limit;
+        let scanned_events = rows.len().min(limit);
+        let mut hits = Vec::with_capacity(scanned_events);
+        let mut payload_budget = history_payload_budget(query);
+        for row in rows.into_iter().take(limit) {
+            let event: SessionEvent = serde_json::from_str(row.try_get("event_json")?)?;
+            hits.push(
+                self.hydrate_history_hit(event, None, None, query, &mut payload_budget)
+                    .await?,
+            );
+        }
+        Ok(SessionHistoryPage {
+            hits,
+            backend: "sqlite_exact".to_string(),
+            scanned_events,
+            truncated,
+        })
+    }
+
+    async fn query_history_lexical(
+        &self,
+        session_id: Uuid,
+        query: &SessionHistoryQuery,
+        text: &str,
+    ) -> Result<SessionHistoryPage> {
+        let limit = history_limit(query);
+        let mut sql = QueryBuilder::<Sqlite>::new(
+            "select e.event_json, \
+             snippet(session_event_fts, 0, '[', ']', ' … ', 32) as search_snippet, \
+             bm25(session_event_fts) as search_rank \
+             from session_event_fts \
+             join session_event_search s on s.rowid=session_event_fts.rowid \
+             join session_events e on e.session_id=s.session_id and e.event_id=s.event_id \
+             where session_event_fts match ",
+        );
+        sql.push_bind(history_fts_query(text)?);
+        sql.push(" and s.session_id = ")
+            .push_bind(session_id.to_string());
+        push_history_sql_filters(&mut sql, query, "s");
+        if query.newest_first {
+            sql.push(" order by s.sequence desc");
+        } else {
+            sql.push(" order by search_rank asc, s.sequence asc");
+        }
+        sql.push(" limit ")
+            .push_bind(i64::try_from(limit + 1).unwrap_or(i64::MAX));
+        let rows = sql.build().fetch_all(&self.pool).await?;
+        let truncated = rows.len() > limit;
+        let scanned_events = rows.len().min(limit);
+        let mut hits = Vec::with_capacity(scanned_events);
+        let mut payload_budget = history_payload_budget(query);
+        for row in rows.into_iter().take(limit) {
+            let event: SessionEvent = serde_json::from_str(row.try_get("event_json")?)?;
+            let snippet = row.try_get::<Option<String>, _>("search_snippet")?;
+            let rank = row.try_get::<f64, _>("search_rank")?;
+            hits.push(
+                self.hydrate_history_hit(event, snippet, Some(-rank), query, &mut payload_budget)
+                    .await?,
+            );
+        }
+        Ok(SessionHistoryPage {
+            hits,
+            backend: "sqlite_fts5".to_string(),
+            scanned_events,
+            truncated,
+        })
+    }
+
+    async fn query_history_regex(
+        &self,
+        session_id: Uuid,
+        query: &SessionHistoryQuery,
+        text: &str,
+    ) -> Result<SessionHistoryPage> {
+        let expression = history_regex(text, query.case_sensitive)?;
+        let limit = history_limit(query);
+        let scan_limit = history_scan_limit(query);
+        let prefilter = query
+            .prefilter
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let mut sql = if let Some(prefilter) = prefilter {
+            let mut sql = QueryBuilder::<Sqlite>::new(
+                "with fts_candidates(rowid) as materialized ( \
+                 select session_event_fts.rowid from session_event_fts \
+                 join session_event_search s0 on s0.rowid=session_event_fts.rowid \
+                 where session_event_fts match ",
+            );
+            sql.push_bind(history_fts_query(prefilter)?);
+            sql.push(" and s0.session_id = ")
+                .push_bind(session_id.to_string());
+            sql.push(" order by bm25(session_event_fts) asc");
+            sql.push(" limit ")
+                .push_bind(i64::try_from(scan_limit + 1).unwrap_or(i64::MAX));
+            sql.push(
+                ") select e.event_json, s.body from fts_candidates c \
+                 join session_event_search s on s.rowid=c.rowid \
+                 join session_events e on e.session_id=s.session_id and e.event_id=s.event_id \
+                 where s.session_id = ",
+            );
+            sql.push_bind(session_id.to_string());
+            sql
+        } else {
+            let mut sql = QueryBuilder::<Sqlite>::new(
+                "select e.event_json, s.body from session_event_search s \
+                 join session_events e on e.session_id=s.session_id and e.event_id=s.event_id \
+                 where s.session_id = ",
+            );
+            sql.push_bind(session_id.to_string());
+            sql
+        };
+        push_history_sql_filters(&mut sql, query, "s");
+        sql.push(" order by s.sequence ");
+        sql.push(if query.newest_first { "desc" } else { "asc" });
+        sql.push(" limit ")
+            .push_bind(i64::try_from(scan_limit + 1).unwrap_or(i64::MAX));
+        let rows = sql.build().fetch_all(&self.pool).await?;
+        let candidate_overflow = rows.len() > scan_limit;
+        let mut hits = Vec::new();
+        let mut scanned_events = 0;
+        let mut payload_budget = history_payload_budget(query);
+        for row in rows.into_iter().take(scan_limit) {
+            scanned_events += 1;
+            let body: &str = row.try_get("body")?;
+            let Some(found) = expression.find(body) else {
+                continue;
+            };
+            let event: SessionEvent = serde_json::from_str(row.try_get("event_json")?)?;
+            hits.push(
+                self.hydrate_history_hit(
+                    event,
+                    Some(history_match_snippet(body, found.start(), found.end())),
+                    None,
+                    query,
+                    &mut payload_budget,
+                )
+                .await?,
+            );
+            if hits.len() > limit {
+                break;
+            }
+        }
+        let truncated = candidate_overflow || hits.len() > limit;
+        hits.truncate(limit);
+        Ok(SessionHistoryPage {
+            hits,
+            backend: if prefilter.is_some() {
+                "sqlite_regex_fts_prefilter"
+            } else {
+                "sqlite_regex"
+            }
+            .to_string(),
+            scanned_events,
+            truncated,
+        })
+    }
+
+    async fn query_history_lineage(
+        &self,
+        session_id: Uuid,
+        query: &SessionHistoryQuery,
+        text: Option<&str>,
+    ) -> Result<SessionHistoryPage> {
+        let limit = history_limit(query);
+        let scan_limit = history_scan_limit(query);
+        let regex = match (text, query.mode) {
+            (Some(text), SessionHistorySearchMode::Regex) => {
+                Some(history_regex(text, query.case_sensitive)?)
+            }
+            _ => None,
+        };
+        let lexical_terms = match (text, query.mode) {
+            (Some(text), SessionHistorySearchMode::Lexical) => {
+                history_literal_terms(text, query.case_sensitive)?
+            }
+            _ => Vec::new(),
+        };
+        let regex_prefilter = match (query.prefilter.as_deref(), query.mode) {
+            (Some(prefilter), SessionHistorySearchMode::Regex) if !prefilter.trim().is_empty() => {
+                history_literal_terms(prefilter, false)?
+            }
+            _ => Vec::new(),
+        };
+        let mut events = self.projected_events(session_id, None).await?;
+        if query.newest_first {
+            events.reverse();
+        }
+        let mut hits = Vec::new();
+        let mut scanned_events = 0;
+        let mut payload_budget = history_payload_budget(query);
+        let mut candidate_overflow = false;
+        for event in events {
+            if !history_event_matches_filters(&event, query)? {
+                continue;
+            }
+            if scanned_events == scan_limit {
+                candidate_overflow = true;
+                break;
+            }
+            scanned_events += 1;
+            let body = if text.is_some() {
+                self.history_event_body(&event).await?
+            } else {
+                String::new()
+            };
+            let matched = if let Some(regex) = &regex {
+                if !regex_prefilter.is_empty()
+                    && history_literal_match(&body, &regex_prefilter, false).is_none()
+                {
+                    None
+                } else {
+                    regex.find(&body).map(|found| (found.start(), found.end()))
+                }
+            } else if !lexical_terms.is_empty() {
+                history_literal_match(&body, &lexical_terms, query.case_sensitive)
+            } else {
+                Some((0, 0))
+            };
+            let Some((start, end)) = matched else {
+                continue;
+            };
+            let snippet = text.map(|_| history_match_snippet(&body, start, end));
+            hits.push(
+                self.hydrate_history_hit(event, snippet, None, query, &mut payload_budget)
+                    .await?,
+            );
+            if hits.len() > limit {
+                break;
+            }
+        }
+        let truncated = candidate_overflow || hits.len() > limit;
+        hits.truncate(limit);
+        Ok(SessionHistoryPage {
+            hits,
+            backend: "lineage_scan".to_string(),
+            scanned_events,
+            truncated,
+        })
+    }
+
+    async fn history_event_body(&self, event: &SessionEvent) -> Result<String> {
+        let mut body = serde_json::to_string(event)?;
+        let mut references = Vec::new();
+        history_payload_refs(&event.kind, &mut references);
+        for reference in references {
+            let payload = self.load_payload(reference).await?;
+            body.push('\n');
+            body.push_str(&String::from_utf8_lossy(&payload));
+        }
+        Ok(body)
+    }
+
+    async fn hydrate_history_hit(
+        &self,
+        event: SessionEvent,
+        snippet: Option<String>,
+        score: Option<f64>,
+        query: &SessionHistoryQuery,
+        payload_budget: &mut usize,
+    ) -> Result<SessionHistoryHit> {
+        let mut payloads = Vec::new();
+        if query.expand_payloads && *payload_budget > 0 {
+            let mut references = Vec::new();
+            history_payload_refs(&event.kind, &mut references);
+            for reference in references {
+                if *payload_budget == 0 {
+                    break;
+                }
+                let take = (*payload_budget)
+                    .min(usize::try_from(reference.byte_len).unwrap_or(usize::MAX));
+                let bytes = self.history_payload_prefix(reference, take).await?;
+                *payload_budget = payload_budget.saturating_sub(bytes.len());
+                payloads.push(SessionHistoryPayload {
+                    reference: reference.clone(),
+                    truncated: bytes.len() as u64 != reference.byte_len,
+                    text: String::from_utf8_lossy(&bytes).into_owned(),
+                });
+            }
+        }
+        Ok(SessionHistoryHit {
+            event,
+            snippet,
+            score,
+            payloads,
+        })
+    }
+
+    async fn history_payload_prefix(
+        &self,
+        reference: &SessionPayloadRef,
+        limit: usize,
+    ) -> Result<Vec<u8>> {
+        let row = sqlx::query(
+            "select payload_kind, byte_len, substr(payload, 1, ?) as payload \
+             from session_payloads where id = ?",
+        )
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .bind(reference.id.to_string())
+        .fetch_optional(&self.pool)
+        .await?
+        .with_context(|| format!("session payload {} does not exist", reference.id))?;
+        ensure!(
+            row.try_get::<&str, _>("payload_kind")? == payload_kind_name(reference.kind),
+            "session payload {} has a different typed kind",
+            reference.id
+        );
+        let stored_len =
+            u64::try_from(row.try_get::<i64, _>("byte_len")?).context("negative payload length")?;
+        ensure!(
+            stored_len == reference.byte_len,
+            "session payload {} length does not match its reference",
+            reference.id
+        );
+        Ok(row.try_get("payload")?)
+    }
+
     /// Open the provider-neutral team policy journal on this same SQLite
     /// authority. Keeping one pool makes policy decisions and session/event
     /// recovery share the same WAL, foreign-key, and durability settings.
@@ -926,6 +1546,314 @@ impl SqliteSessionStore {
             .transpose()
     }
 
+    /// Claim one trusted runtime namespace for a worker process. A running
+    /// manifest owned by a different worker is evidence that Borg restarted
+    /// or recovered; callers can then offer an explicit checkpoint restore
+    /// without replaying arbitrary Python or JavaScript code.
+    pub(crate) async fn activate_runtime_manifest(
+        &self,
+        session_id: Uuid,
+        runtime: &str,
+        root: &str,
+        command: &str,
+        worker_id: Uuid,
+    ) -> Result<RuntimeManifestActivation> {
+        ensure!(
+            self.contains_session(session_id).await?,
+            "session {session_id} does not exist"
+        );
+        ensure!(
+            !runtime.trim().is_empty() && runtime.len() <= 128,
+            "invalid runtime name"
+        );
+        ensure!(
+            !root.trim().is_empty() && root.len() <= 16 * 1024,
+            "invalid runtime root"
+        );
+        ensure!(
+            !command.trim().is_empty() && command.len() <= 4 * 1024,
+            "invalid runtime command"
+        );
+
+        let mut transaction = self.begin_write().await?;
+        let existing = sqlx::query(
+            "select manifest_version, session_id, runtime, root, command, worker_id, status, \
+                    execution_count, last_code_hash, last_error, created_at, updated_at \
+             from runtime_manifests where session_id=?",
+        )
+        .bind(session_id.to_string())
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let now = Utc::now();
+        let (manifest, recovered_from_previous_worker) = if let Some(row) = existing {
+            let existing = decode_runtime_manifest(&row)?;
+            ensure!(
+                existing.runtime == runtime,
+                "runtime manifest for session {session_id} is for `{}`, not `{runtime}`",
+                existing.runtime
+            );
+            ensure!(
+                existing.root == root,
+                "runtime manifest for session {session_id} is bound to a different root"
+            );
+            let recovered = existing.worker_id != worker_id
+                && !matches!(existing.status, RuntimeManifestStatus::Stopped);
+            sqlx::query(
+                "update runtime_manifests set command=?, worker_id=?, status='running', \
+                 updated_at=? where session_id=?",
+            )
+            .bind(command)
+            .bind(worker_id.to_string())
+            .bind(now.to_rfc3339())
+            .bind(session_id.to_string())
+            .execute(&mut *transaction)
+            .await?;
+            let mut manifest = existing;
+            manifest.command = command.to_string();
+            manifest.worker_id = worker_id;
+            manifest.status = RuntimeManifestStatus::Running;
+            manifest.updated_at = now;
+            (manifest, recovered)
+        } else {
+            sqlx::query(
+                "insert into runtime_manifests \
+                 (session_id, manifest_version, runtime, root, command, worker_id, status, \
+                  execution_count, last_code_hash, last_error, created_at, updated_at) \
+                 values (?, ?, ?, ?, ?, ?, 'running', 0, null, null, ?, ?)",
+            )
+            .bind(session_id.to_string())
+            .bind(i64::from(RUNTIME_MANIFEST_VERSION))
+            .bind(runtime)
+            .bind(root)
+            .bind(command)
+            .bind(worker_id.to_string())
+            .bind(now.to_rfc3339())
+            .bind(now.to_rfc3339())
+            .execute(&mut *transaction)
+            .await?;
+            (
+                RuntimeManifest {
+                    manifest_version: RUNTIME_MANIFEST_VERSION,
+                    session_id,
+                    runtime: runtime.to_string(),
+                    root: root.to_string(),
+                    command: command.to_string(),
+                    worker_id,
+                    status: RuntimeManifestStatus::Running,
+                    execution_count: 0,
+                    last_code_hash: None,
+                    last_error: None,
+                    created_at: now,
+                    updated_at: now,
+                },
+                false,
+            )
+        };
+        transaction.commit().await?;
+        Ok(RuntimeManifestActivation {
+            manifest,
+            recovered_from_previous_worker,
+        })
+    }
+
+    pub(crate) async fn record_runtime_execution(
+        &self,
+        session_id: Uuid,
+        worker_id: Uuid,
+        code_hash: &str,
+        worker_failed: bool,
+        error: Option<&str>,
+    ) -> Result<()> {
+        ensure!(
+            !code_hash.trim().is_empty(),
+            "runtime execution code hash is empty"
+        );
+        let error = error.map(|value| value.chars().take(8 * 1024).collect::<String>());
+        let status = if worker_failed { "failed" } else { "running" };
+        let result = sqlx::query(
+            "update runtime_manifests set status=?, execution_count=execution_count+1, \
+             last_code_hash=?, last_error=?, updated_at=? \
+             where session_id=? and worker_id=?",
+        )
+        .bind(status)
+        .bind(code_hash)
+        .bind(error)
+        .bind(Utc::now().to_rfc3339())
+        .bind(session_id.to_string())
+        .bind(worker_id.to_string())
+        .execute(&self.pool)
+        .await?;
+        ensure!(
+            result.rows_affected() == 1,
+            "runtime manifest for session {session_id} is not owned by worker {worker_id}"
+        );
+        Ok(())
+    }
+
+    pub(crate) async fn stop_runtime_manifest(
+        &self,
+        session_id: Uuid,
+        worker_id: Uuid,
+    ) -> Result<()> {
+        let result = sqlx::query(
+            "update runtime_manifests set status='stopped', updated_at=? \
+             where session_id=? and worker_id=?",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind(session_id.to_string())
+        .bind(worker_id.to_string())
+        .execute(&self.pool)
+        .await?;
+        ensure!(
+            result.rows_affected() == 1,
+            "runtime manifest for session {session_id} is not owned by worker {worker_id}"
+        );
+        Ok(())
+    }
+
+    pub(crate) async fn runtime_manifest(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Option<RuntimeManifest>> {
+        let row = sqlx::query(
+            "select manifest_version, session_id, runtime, root, command, worker_id, status, \
+                    execution_count, last_code_hash, last_error, created_at, updated_at \
+             from runtime_manifests where session_id=?",
+        )
+        .bind(session_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(decode_runtime_manifest).transpose()
+    }
+
+    pub(crate) async fn save_runtime_checkpoint(
+        &self,
+        session_id: Uuid,
+        worker_id: Uuid,
+        key: &str,
+        state: &serde_json::Value,
+    ) -> Result<RuntimeCheckpoint> {
+        ensure!(
+            !key.trim().is_empty() && key.len() <= 256,
+            "invalid runtime checkpoint key"
+        );
+        ensure!(
+            state.is_object(),
+            "runtime checkpoint state must be a JSON object"
+        );
+        let state_json = serde_json::to_vec(state)?;
+        ensure!(
+            state_json.len() <= MAX_RUNTIME_CHECKPOINT_BYTES,
+            "runtime checkpoint exceeds {MAX_RUNTIME_CHECKPOINT_BYTES} bytes"
+        );
+        let content_hash = format!("sha256:{:x}", Sha256::digest(&state_json));
+        let mut transaction = self.begin_write().await?;
+        let manifest_exists: i64 = sqlx::query_scalar(
+            "select exists(select 1 from runtime_manifests where session_id=? and worker_id=?)",
+        )
+        .bind(session_id.to_string())
+        .bind(worker_id.to_string())
+        .fetch_one(&mut *transaction)
+        .await?;
+        ensure!(
+            manifest_exists != 0,
+            "runtime manifest for session {session_id} is not owned by worker {worker_id}"
+        );
+        let existing = sqlx::query(
+            "select session_id, checkpoint_key, state_json, content_hash, revision, created_at \
+             from runtime_checkpoints where session_id=? and checkpoint_key=?",
+        )
+        .bind(session_id.to_string())
+        .bind(key)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if let Some(row) = existing {
+            let existing = decode_runtime_checkpoint(&row)?;
+            ensure!(
+                existing.content_hash == content_hash,
+                "runtime checkpoint `{key}` already exists with different content"
+            );
+            transaction.commit().await?;
+            return Ok(existing);
+        }
+        let revision: i64 = sqlx::query_scalar(
+            "select coalesce(max(revision), 0) + 1 from runtime_checkpoints where session_id=?",
+        )
+        .bind(session_id.to_string())
+        .fetch_one(&mut *transaction)
+        .await?;
+        let now = Utc::now();
+        sqlx::query(
+            "insert into runtime_checkpoints \
+             (session_id, checkpoint_key, state_json, content_hash, revision, created_at) \
+             values (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(session_id.to_string())
+        .bind(key)
+        .bind(String::from_utf8(state_json).context("runtime checkpoint JSON was not UTF-8")?)
+        .bind(&content_hash)
+        .bind(revision)
+        .bind(now.to_rfc3339())
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query("update runtime_manifests set updated_at=? where session_id=?")
+            .bind(now.to_rfc3339())
+            .bind(session_id.to_string())
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        Ok(RuntimeCheckpoint {
+            session_id,
+            key: key.to_string(),
+            state: state.clone(),
+            content_hash,
+            revision: u64::try_from(revision).context("negative runtime checkpoint revision")?,
+            created_at: now,
+        })
+    }
+
+    pub(crate) async fn runtime_checkpoint(
+        &self,
+        session_id: Uuid,
+        key: Option<&str>,
+    ) -> Result<Option<RuntimeCheckpoint>> {
+        let (sql, bind_key) = if key.is_some() {
+            (
+                "select session_id, checkpoint_key, state_json, content_hash, revision, created_at \
+                 from runtime_checkpoints where session_id=? and checkpoint_key=?",
+                true,
+            )
+        } else {
+            (
+                "select session_id, checkpoint_key, state_json, content_hash, revision, created_at \
+                 from runtime_checkpoints where session_id=? order by revision desc limit 1",
+                false,
+            )
+        };
+        let mut query = sqlx::query(sql).bind(session_id.to_string());
+        if bind_key {
+            query = query.bind(key.unwrap_or_default());
+        }
+        let row = query.fetch_optional(&self.pool).await?;
+        row.as_ref().map(decode_runtime_checkpoint).transpose()
+    }
+
+    pub(crate) async fn list_runtime_checkpoints(
+        &self,
+        session_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<RuntimeCheckpoint>> {
+        let rows = sqlx::query(
+            "select session_id, checkpoint_key, state_json, content_hash, revision, created_at \
+             from runtime_checkpoints where session_id=? order by revision desc limit ?",
+        )
+        .bind(session_id.to_string())
+        .bind(i64::try_from(limit.clamp(1, 100)).unwrap_or(100))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(decode_runtime_checkpoint).collect()
+    }
+
     /// Check the durable authority without reading prompt or tool payload data.
     pub async fn health(&self) -> Result<SessionStoreHealth> {
         let integrity: String = sqlx::query_scalar("pragma quick_check")
@@ -972,10 +1900,12 @@ impl SqliteSessionStore {
         })
     }
 
-    async fn begin_write(&self) -> Result<Transaction<'static, Sqlite>, sqlx::Error> {
+    pub(crate) async fn begin_sqlite_write(
+        pool: &SqlitePool,
+    ) -> Result<Transaction<'static, Sqlite>, sqlx::Error> {
         let mut reported_contention = false;
         loop {
-            match self.pool.begin_with(SQLITE_WRITE_TRANSACTION).await {
+            match pool.begin_with(SQLITE_WRITE_TRANSACTION).await {
                 Ok(transaction) => return Ok(transaction),
                 Err(error) if sqlite_lock_text(&error.to_string()) => {
                     if !reported_contention {
@@ -998,6 +1928,10 @@ impl SqliteSessionStore {
         }
     }
 
+    async fn begin_write(&self) -> Result<Transaction<'static, Sqlite>, sqlx::Error> {
+        Self::begin_sqlite_write(&self.pool).await
+    }
+
     pub async fn contains_session(&self, session_id: Uuid) -> Result<bool> {
         let found: i64 = sqlx::query_scalar("select exists(select 1 from sessions where id = ?)")
             .bind(session_id.to_string())
@@ -1016,6 +1950,7 @@ impl SqliteSessionStore {
     ) -> Result<SessionWorkspaceBinding> {
         self.create_session(session_id).await?;
         let attached_at = Utc::now();
+        let mut transaction = self.begin_write().await?;
         sqlx::query(
             "update session_workspace_bindings \
              set workspace_id=?, participant_id=?, host_id=null, attached_at=? \
@@ -1027,12 +1962,13 @@ impl SqliteSessionStore {
         .bind(session_id.to_string())
         .bind(session_id.to_string())
         .bind(session_id.to_string())
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?
         .rows_affected()
         .eq(&1)
         .then_some(())
         .context("new session workspace binding was not in its default state")?;
+        transaction.commit().await?;
         Ok(SessionWorkspaceBinding {
             session_id,
             workspace_id,
@@ -1177,6 +2113,48 @@ impl SqliteSessionStore {
             create index if not exists idx_session_payloads_event
                 on session_payloads (session_id, event_id);
 
+            -- Search is a disposable projection. The event row and payload
+            -- blobs above remain the only source of truth, while this table
+            -- gives exact tenant/range filtering and FTS a compact join key.
+            create table if not exists session_event_search (
+                rowid integer primary key,
+                session_id text not null references sessions(id) on delete cascade,
+                sequence integer not null,
+                event_id text not null,
+                event_kind text not null,
+                actor text,
+                body text not null,
+                unique (session_id, event_id)
+            );
+
+            create index if not exists idx_session_event_search_sequence
+                on session_event_search (session_id, sequence);
+
+            create virtual table if not exists session_event_fts using fts5(
+                body,
+                content='session_event_search',
+                content_rowid='rowid',
+                tokenize='unicode61 remove_diacritics 2'
+            );
+
+            create trigger if not exists session_event_search_insert
+            after insert on session_event_search begin
+                insert into session_event_fts(rowid, body) values (new.rowid, new.body);
+            end;
+
+            create trigger if not exists session_event_search_delete
+            after delete on session_event_search begin
+                insert into session_event_fts(session_event_fts, rowid, body)
+                    values ('delete', old.rowid, old.body);
+            end;
+
+            create trigger if not exists session_event_search_update
+            after update on session_event_search begin
+                insert into session_event_fts(session_event_fts, rowid, body)
+                    values ('delete', old.rowid, old.body);
+                insert into session_event_fts(rowid, body) values (new.rowid, new.body);
+            end;
+
             create index if not exists idx_session_events_message
                 on session_events (session_id, message_id)
                 where message_id is not null;
@@ -1217,7 +2195,61 @@ impl SqliteSessionStore {
                 created_at text not null,
                 updated_at text not null
             );
+
+            -- A runtime manifest records how a trusted namespace was opened
+            -- and whether its worker survived. Checkpoints are explicit JSON
+            -- data; executable code is never replayed automatically.
+            create table if not exists runtime_manifests (
+                session_id text primary key references sessions(id) on delete cascade,
+                manifest_version integer not null,
+                runtime text not null,
+                root text not null,
+                command text not null,
+                worker_id text not null,
+                status text not null,
+                execution_count integer not null default 0,
+                last_code_hash text,
+                last_error text,
+                created_at text not null,
+                updated_at text not null
+            );
+
+            create table if not exists runtime_checkpoints (
+                session_id text not null references sessions(id) on delete cascade,
+                checkpoint_key text not null,
+                state_json text not null,
+                content_hash text not null,
+                revision integer not null,
+                created_at text not null,
+                primary key (session_id, checkpoint_key),
+                unique (session_id, revision)
+            );
+
+            create index if not exists idx_runtime_checkpoints_revision
+                on runtime_checkpoints (session_id, revision desc);
             "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        // Populate only missing projection rows. This is safe to repeat and
+        // lets existing version-5 stores gain search without rewriting or
+        // invalidating their canonical journal. Payload blobs are folded into
+        // the projection so old large tool results remain discoverable too.
+        sqlx::query(
+            "insert into session_event_search \
+             (session_id, sequence, event_id, event_kind, actor, body) \
+             select e.session_id, e.sequence, e.event_id, e.event_kind, \
+                    json_extract(e.event_json, '$.kind.actor'), \
+                    e.event_json || coalesce(( \
+                        select char(10) || group_concat(cast(p.payload as text), char(10)) \
+                        from session_payloads p \
+                        where p.session_id=e.session_id and p.event_id=e.event_id \
+                    ), '') \
+             from session_events e \
+             where not exists ( \
+                 select 1 from session_event_search s \
+                 where s.session_id=e.session_id and s.event_id=e.event_id \
+             )",
         )
         .execute(&self.pool)
         .await?;
@@ -1344,6 +2376,34 @@ impl SqliteSessionStore {
                     "lease_expires_at",
                 ][..],
             ),
+            (
+                "runtime_manifests",
+                &[
+                    "session_id",
+                    "manifest_version",
+                    "runtime",
+                    "root",
+                    "command",
+                    "worker_id",
+                    "status",
+                    "execution_count",
+                    "last_code_hash",
+                    "last_error",
+                    "created_at",
+                    "updated_at",
+                ][..],
+            ),
+            (
+                "runtime_checkpoints",
+                &[
+                    "session_id",
+                    "checkpoint_key",
+                    "state_json",
+                    "content_hash",
+                    "revision",
+                    "created_at",
+                ][..],
+            ),
         ] {
             // `table` comes exclusively from the fixed schema inventory above;
             // SQLx 0.9 requires this dynamic identifier to be explicitly
@@ -1373,6 +2433,7 @@ impl SqliteSessionStore {
     /// turn key. Keep the context-window snapshot because it remains useful
     /// while idle.
     async fn clear_terminal_live_state(&self) -> Result<()> {
+        let mut transaction = self.begin_write().await?;
         sqlx::query(
             "delete from session_live_state \
              where live_key <> 'context_window' \
@@ -1382,8 +2443,9 @@ impl SqliteSessionStore {
                        ('ready', 'completed', 'failed', 'stopped') \
                )",
         )
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
+        transaction.commit().await?;
         Ok(())
     }
 
@@ -1399,10 +2461,11 @@ impl SqliteSessionStore {
         if !self.contains_session(session_id).await? {
             self.create_session(session_id).await?;
         }
+        let mut transaction = self.begin_write().await?;
         let existing_owner: Option<String> =
             sqlx::query_scalar("select owner_session_id from sessions where id = ?")
                 .bind(session_id.to_string())
-                .fetch_one(&self.pool)
+                .fetch_one(&mut *transaction)
                 .await?;
         if let Some(existing_owner) = existing_owner {
             anyhow::ensure!(
@@ -1413,14 +2476,14 @@ impl SqliteSessionStore {
             sqlx::query("update sessions set owner_session_id = ? where id = ?")
                 .bind(owner_session_id.to_string())
                 .bind(session_id.to_string())
-                .execute(&self.pool)
+                .execute(&mut *transaction)
                 .await?;
         }
         let owner_workspace: Option<String> = sqlx::query_scalar(
             "select workspace_id from session_workspace_bindings where session_id=?",
         )
         .bind(owner_session_id.to_string())
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *transaction)
         .await?;
         let owner_workspace = owner_workspace
             .with_context(|| format!("owner session {owner_session_id} has no workspace"))?;
@@ -1432,7 +2495,7 @@ impl SqliteSessionStore {
         .bind(session_id.to_string())
         .bind(Utc::now().to_rfc3339())
         .bind(session_id.to_string())
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
         // Attach the child before the resumed actor can accept durable team
         // messages, including when the registration was retried.
@@ -1445,8 +2508,9 @@ impl SqliteSessionStore {
         .bind(&owner_workspace)
         .bind(session_id.to_string())
         .bind(Utc::now().to_rfc3339())
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
+        transaction.commit().await?;
         let binding = self
             .workspace_binding(session_id)
             .await?
@@ -2180,6 +3244,9 @@ impl SqliteSessionStore {
         );
         let mut state: SessionState = serde_json::from_str(row.try_get("state_json")?)?;
         state.apply(&event)?;
+        let search_body = serde_json::to_string(&event)?;
+        let stored_event_kind = event_kind(&event.kind)?;
+        let actor = event_actor(&event.kind);
         let compact_event = self.compact_payloads(transaction, &event).await?;
         let event_json = serde_json::to_string(&compact_event)?;
         let projection_json = serde_json::to_string(&state)?;
@@ -2196,13 +3263,26 @@ impl SqliteSessionStore {
         .bind(event.session_id.to_string())
         .bind(i64::try_from(event.sequence).context("session sequence exceeds SQLite integer")?)
         .bind(event.id.to_string())
-        .bind(event_kind(&event.kind)?)
+        .bind(&stored_event_kind)
         .bind(event_json)
         .bind(&projection_json)
         .bind(i64::from(event.kind.is_fork_inheritable()))
         .bind(i64::from(event.kind.is_recovery_relevant()))
         .bind(message_id)
         .bind(event.created_at.to_rfc3339())
+        .execute(&mut **transaction)
+        .await?;
+        sqlx::query(
+            "insert into session_event_search \
+             (session_id, sequence, event_id, event_kind, actor, body) \
+             values (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(event.session_id.to_string())
+        .bind(i64::try_from(event.sequence).context("session sequence exceeds SQLite integer")?)
+        .bind(event.id.to_string())
+        .bind(stored_event_kind)
+        .bind(actor)
+        .bind(search_body)
         .execute(&mut **transaction)
         .await?;
         // Keep the action journal and the event proving its admission or
@@ -2300,7 +3380,15 @@ fn path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
 }
 
 fn sqlite_schema_lock(error: &anyhow::Error) -> bool {
-    sqlite_lock_text(&error.to_string())
+    let message = error.to_string().to_ascii_lowercase();
+    sqlite_lock_text(&message)
+        // SQLite can expose a partially constructed external-content FTS
+        // virtual table to the second opener while the first connection is
+        // still finishing the schema batch. Treat that projection-specific
+        // constructor error like the lock it represents and retry the whole
+        // idempotent schema batch.
+        || (message.contains("vtable constructor failed")
+            && message.contains("session_event_fts"))
 }
 
 fn enum_text<T: Serialize>(value: &T) -> Result<String> {
@@ -2324,6 +3412,60 @@ fn parse_timestamp(value: Option<&str>) -> Result<Option<DateTime<Utc>>> {
                 .map_err(Into::into)
         })
         .transpose()
+}
+
+fn decode_runtime_manifest(row: &SqliteRow) -> Result<RuntimeManifest> {
+    let manifest_version = u32::try_from(row.try_get::<i64, _>("manifest_version")?)
+        .context("negative runtime manifest version")?;
+    ensure!(
+        manifest_version == RUNTIME_MANIFEST_VERSION,
+        "unsupported runtime manifest version {manifest_version}"
+    );
+    Ok(RuntimeManifest {
+        manifest_version,
+        session_id: parse_uuid(row.try_get("session_id")?)?,
+        runtime: row.try_get("runtime")?,
+        root: row.try_get("root")?,
+        command: row.try_get("command")?,
+        worker_id: parse_uuid(row.try_get("worker_id")?)?,
+        status: parse_enum(row.try_get("status")?)?,
+        execution_count: u64::try_from(row.try_get::<i64, _>("execution_count")?)
+            .context("negative runtime execution count")?,
+        last_code_hash: row.try_get("last_code_hash")?,
+        last_error: row.try_get("last_error")?,
+        created_at: parse_timestamp(Some(row.try_get("created_at")?))?
+            .context("missing runtime manifest created_at")?,
+        updated_at: parse_timestamp(Some(row.try_get("updated_at")?))?
+            .context("missing runtime manifest updated_at")?,
+    })
+}
+
+fn decode_runtime_checkpoint(row: &SqliteRow) -> Result<RuntimeCheckpoint> {
+    let state_json: &str = row.try_get("state_json")?;
+    ensure!(
+        state_json.len() <= MAX_RUNTIME_CHECKPOINT_BYTES,
+        "runtime checkpoint exceeds {MAX_RUNTIME_CHECKPOINT_BYTES} bytes"
+    );
+    let state: serde_json::Value = serde_json::from_str(state_json)?;
+    ensure!(
+        state.is_object(),
+        "runtime checkpoint state is not a JSON object"
+    );
+    let content_hash: String = row.try_get("content_hash")?;
+    ensure!(
+        content_hash == format!("sha256:{:x}", Sha256::digest(state_json.as_bytes())),
+        "runtime checkpoint content hash does not match its state"
+    );
+    Ok(RuntimeCheckpoint {
+        session_id: parse_uuid(row.try_get("session_id")?)?,
+        key: row.try_get("checkpoint_key")?,
+        state,
+        content_hash,
+        revision: u64::try_from(row.try_get::<i64, _>("revision")?)
+            .context("negative runtime checkpoint revision")?,
+        created_at: parse_timestamp(Some(row.try_get("created_at")?))?
+            .context("missing runtime checkpoint created_at")?,
+    })
 }
 
 fn decode_action(row: &SqliteRow) -> Result<SessionAction> {
@@ -3089,6 +4231,7 @@ impl SessionStore for SqliteSessionStore {
 
     async fn create_session(&self, session_id: Uuid) -> Result<()> {
         let now = Utc::now().to_rfc3339();
+        let mut transaction = self.begin_write().await?;
         sqlx::query(
             "insert into sessions \
              (id, state_json, projection_version, created_at, updated_at) values (?, ?, 3, ?, ?) \
@@ -3098,7 +4241,7 @@ impl SessionStore for SqliteSessionStore {
         .bind(serde_json::to_string(&SessionState::default())?)
         .bind(&now)
         .bind(&now)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
         sqlx::query(
             "insert into session_workspace_bindings \
@@ -3109,8 +4252,9 @@ impl SessionStore for SqliteSessionStore {
         .bind(session_id.to_string())
         .bind(session_id.to_string())
         .bind(Utc::now().to_rfc3339())
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
+        transaction.commit().await?;
         Ok(())
     }
 
@@ -3796,6 +4940,221 @@ fn event_kind(kind: &SessionEventKind) -> Result<String> {
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned)
         .context("session event kind has no typed discriminant")
+}
+
+fn event_actor(kind: &SessionEventKind) -> Option<&'static str> {
+    let SessionEventKind::Message { actor, .. } = kind else {
+        return None;
+    };
+    Some(match actor {
+        crate::EventActor::User => "user",
+        crate::EventActor::Assistant => "assistant",
+        crate::EventActor::Tool => "tool",
+        crate::EventActor::System => "system",
+    })
+}
+
+fn history_index_document_id(session_id: Uuid, event_id: Uuid) -> String {
+    format!("borg-session-event:v1:{session_id}:{event_id}")
+}
+
+fn history_limit(query: &SessionHistoryQuery) -> usize {
+    query
+        .limit
+        .unwrap_or(DEFAULT_HISTORY_LIMIT)
+        .clamp(1, MAX_HISTORY_LIMIT)
+}
+
+fn history_scan_limit(query: &SessionHistoryQuery) -> usize {
+    query
+        .scan_limit
+        .unwrap_or(DEFAULT_HISTORY_SCAN_LIMIT)
+        .clamp(history_limit(query), MAX_HISTORY_SCAN_LIMIT)
+}
+
+fn history_payload_budget(query: &SessionHistoryQuery) -> usize {
+    if !query.expand_payloads {
+        return 0;
+    }
+    query
+        .max_payload_bytes
+        .unwrap_or(DEFAULT_HISTORY_PAYLOAD_BYTES)
+        .clamp(1, MAX_HISTORY_PAYLOAD_BYTES)
+}
+
+fn push_history_sql_filters(
+    sql: &mut QueryBuilder<Sqlite>,
+    query: &SessionHistoryQuery,
+    alias: &str,
+) {
+    if let Some(event_id) = query.event_id {
+        sql.push(format!(" and {alias}.event_id = "))
+            .push_bind(event_id.to_string());
+    }
+    if let Some(start) = query.start_sequence {
+        sql.push(format!(" and {alias}.sequence >= "))
+            .push_bind(i64::try_from(start).unwrap_or(i64::MAX));
+    }
+    if let Some(end) = query.end_sequence {
+        sql.push(format!(" and {alias}.sequence <= "))
+            .push_bind(i64::try_from(end).unwrap_or(i64::MAX));
+    }
+    if !query.event_kinds.is_empty() {
+        sql.push(format!(" and {alias}.event_kind in ("));
+        let mut separated = sql.separated(", ");
+        for kind in &query.event_kinds {
+            separated.push_bind(kind.clone());
+        }
+        separated.push_unseparated(")");
+    }
+    if !query.actors.is_empty() {
+        if alias == "e" {
+            sql.push(" and json_extract(e.event_json, '$.kind.actor') in (");
+        } else {
+            sql.push(format!(" and {alias}.actor in ("));
+        }
+        let mut separated = sql.separated(", ");
+        for actor in &query.actors {
+            separated.push_bind(history_actor_name(*actor));
+        }
+        separated.push_unseparated(")");
+    }
+}
+
+fn history_event_matches_filters(
+    event: &SessionEvent,
+    query: &SessionHistoryQuery,
+) -> Result<bool> {
+    if query.event_id.is_some_and(|event_id| event.id != event_id)
+        || query
+            .start_sequence
+            .is_some_and(|start| event.sequence < start)
+        || query.end_sequence.is_some_and(|end| event.sequence > end)
+    {
+        return Ok(false);
+    }
+    if !query.event_kinds.is_empty() {
+        let stored_kind = event_kind(&event.kind)?;
+        if !query.event_kinds.contains(&stored_kind) {
+            return Ok(false);
+        }
+    }
+    if !query.actors.is_empty() {
+        let SessionEventKind::Message { actor, .. } = event.kind else {
+            return Ok(false);
+        };
+        if !query.actors.contains(&actor) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn history_actor_name(actor: crate::EventActor) -> &'static str {
+    match actor {
+        crate::EventActor::User => "user",
+        crate::EventActor::Assistant => "assistant",
+        crate::EventActor::Tool => "tool",
+        crate::EventActor::System => "system",
+    }
+}
+
+fn history_fts_query(text: &str) -> Result<String> {
+    let terms = history_literal_terms(text, true)?;
+    ensure!(
+        !terms.is_empty(),
+        "history lexical query has no searchable terms"
+    );
+    Ok(terms
+        .into_iter()
+        .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" AND "))
+}
+
+fn history_literal_terms(text: &str, case_sensitive: bool) -> Result<Vec<String>> {
+    let terms = text
+        .split_whitespace()
+        .filter(|term| !term.is_empty())
+        .take(64)
+        .map(|term| {
+            if case_sensitive {
+                term.to_string()
+            } else {
+                term.to_lowercase()
+            }
+        })
+        .collect::<Vec<_>>();
+    ensure!(!terms.is_empty(), "history query has no searchable terms");
+    Ok(terms)
+}
+
+fn history_regex(text: &str, case_sensitive: bool) -> Result<Regex> {
+    RegexBuilder::new(text)
+        .case_insensitive(!case_sensitive)
+        .size_limit(8 * 1024 * 1024)
+        .dfa_size_limit(8 * 1024 * 1024)
+        .build()
+        .context("invalid bounded history regular expression")
+}
+
+fn history_literal_match(
+    body: &str,
+    terms: &[String],
+    case_sensitive: bool,
+) -> Option<(usize, usize)> {
+    let mut first = None;
+    for term in terms {
+        let expression = RegexBuilder::new(&regex::escape(term))
+            .case_insensitive(!case_sensitive)
+            .build()
+            .ok()?;
+        let found = expression.find(body)?;
+        first.get_or_insert((found.start(), found.end()));
+    }
+    first
+}
+
+fn history_match_snippet(body: &str, start: usize, end: usize) -> String {
+    let mut left = start.saturating_sub(160).min(body.len());
+    let mut right = end.saturating_add(240).min(body.len());
+    while left > 0 && !body.is_char_boundary(left) {
+        left -= 1;
+    }
+    while right > left && !body.is_char_boundary(right) {
+        right -= 1;
+    }
+    let prefix = if left > 0 { "… " } else { "" };
+    let suffix = if right < body.len() { " …" } else { "" };
+    format!("{prefix}{}{suffix}", &body[left..right])
+}
+
+fn history_payload_refs<'a>(
+    kind: &'a SessionEventKind,
+    references: &mut Vec<&'a SessionPayloadRef>,
+) {
+    match kind {
+        SessionEventKind::ToolStarted {
+            input_ref: Some(reference),
+            ..
+        } => references.push(reference),
+        SessionEventKind::ToolCompleted {
+            output_ref,
+            input_ref,
+            ..
+        } => {
+            if let Some(reference) = output_ref {
+                references.push(reference);
+            }
+            if let Some(reference) = input_ref {
+                references.push(reference);
+            }
+        }
+        SessionEventKind::SubagentActivity {
+            event: Some(event), ..
+        } => history_payload_refs(&event.kind, references),
+        _ => {}
+    }
 }
 
 fn workflow_event_id(kind: &SessionEventKind) -> Option<Uuid> {

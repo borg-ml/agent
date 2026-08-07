@@ -15,7 +15,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use uuid::Uuid;
 
 use crate::{
-    WorkspaceCommandErrorCode, WorkspaceCommandOutcome, WorkspaceCommandOutput,
+    HostResourceLimits, WorkspaceCommandErrorCode, WorkspaceCommandOutcome, WorkspaceCommandOutput,
     WorkspaceCommandRequest, WorkspaceCommandResponse,
 };
 
@@ -28,9 +28,18 @@ pub async fn execute_workspace_command(
     enrolled_roots: &[PathBuf],
     request: WorkspaceCommandRequest,
 ) -> WorkspaceCommandResponse {
+    execute_workspace_command_with_limits(enrolled_roots, request, &HostResourceLimits::default())
+        .await
+}
+
+pub async fn execute_workspace_command_with_limits(
+    enrolled_roots: &[PathBuf],
+    request: WorkspaceCommandRequest,
+    limits: &HostResourceLimits,
+) -> WorkspaceCommandResponse {
     let request_id = request.request_id;
     let workspace_id = request.workspace_id;
-    let outcome = match execute(enrolled_roots, request).await {
+    let outcome = match execute(enrolled_roots, request, limits).await {
         Ok(output) => WorkspaceCommandOutcome::Success {
             output: Box::new(output),
         },
@@ -48,15 +57,23 @@ type CommandResult<T> = Result<T, Box<WorkspaceCommandOutcome>>;
 async fn execute(
     enrolled_roots: &[PathBuf],
     request: WorkspaceCommandRequest,
+    limits: &HostResourceLimits,
 ) -> CommandResult<WorkspaceCommandOutput> {
     validate_command(&request.command)?;
     let root = canonical_workspace_root(enrolled_roots, &request.root_path)?;
     let cwd = canonical_workspace_cwd(&root, &request.cwd)?;
-    let timeout_ms = request.timeout_ms.clamp(1, MAX_TIMEOUT_MS);
-    let output_max_bytes = request.output_max_bytes.clamp(1, MAX_OUTPUT_BYTES);
+    let timeout_ms = request
+        .timeout_ms
+        .min(limits.max_workspace_command_timeout_ms)
+        .clamp(1, MAX_TIMEOUT_MS);
+    let output_max_bytes = request
+        .output_max_bytes
+        .min(limits.max_workspace_command_output_bytes)
+        .clamp(1, MAX_OUTPUT_BYTES);
     let command_id = Uuid::new_v4();
     let started_at = Utc::now();
     let mut process = tokio::process::Command::new(&request.command[0]);
+    crate::process_environment::configure_host_child_environment(&mut process);
     process
         .args(&request.command[1..])
         .current_dir(&cwd)
@@ -340,5 +357,37 @@ mod tests {
             output.manifest_path,
             PathBuf::from(format!("borg://artifact/command/{}", output.id))
         );
+    }
+
+    #[tokio::test]
+    async fn host_resource_limit_caps_requested_command_output() {
+        let root = tempfile::tempdir().expect("root");
+        let response = execute_workspace_command_with_limits(
+            &[root.path().to_path_buf()],
+            WorkspaceCommandRequest {
+                request_id: Uuid::new_v4(),
+                workspace_id: Uuid::new_v4(),
+                root_path: root.path().to_path_buf(),
+                cwd: PathBuf::from("."),
+                command: vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "printf 123456789".to_string(),
+                ],
+                timeout_ms: 1_000,
+                output_max_bytes: 1_024,
+            },
+            &HostResourceLimits {
+                max_workspace_command_output_bytes: 4,
+                ..HostResourceLimits::default()
+            },
+        )
+        .await;
+        let WorkspaceCommandOutcome::Success { output } = response.outcome else {
+            panic!("command should succeed");
+        };
+        assert_eq!(output.stdout, "1234");
+        assert!(output.stdout_truncated);
+        assert_eq!(output.output_max_bytes, 4);
     }
 }

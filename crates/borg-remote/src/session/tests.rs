@@ -3428,7 +3428,7 @@ async fn fresh_idle_session_has_one_durable_lifecycle() {
     while let Some(event) = event_rx.recv().await {
         observed.push(event);
     }
-    assert_eq!(observed.len(), 4);
+    assert_eq!(observed.len(), 5);
     assert!(matches!(observed[0].kind, SessionEventKind::SessionStarted));
     assert!(matches!(
         observed[1].kind,
@@ -3436,13 +3436,17 @@ async fn fresh_idle_session_has_one_durable_lifecycle() {
     ));
     assert!(matches!(
         observed[2].kind,
+        SessionEventKind::EffectiveCapabilitiesUpdated { .. }
+    ));
+    assert!(matches!(
+        observed[3].kind,
         SessionEventKind::StatusChanged {
             status: SessionStatus::Ready,
             ..
         }
     ));
     assert!(matches!(
-        observed[3].kind,
+        observed[4].kind,
         SessionEventKind::StatusChanged {
             status: SessionStatus::Stopped,
             ..
@@ -3518,7 +3522,7 @@ async fn sqlite_store_runs_the_canonical_session_actor() {
         observed.push(event);
     }
     let stored = store.read(session_id).await.unwrap();
-    assert_eq!(stored.len(), 4);
+    assert_eq!(stored.len(), 5);
     assert_eq!(
         stored
             .iter()
@@ -6320,6 +6324,148 @@ async fn reusable_subscription_pool_does_not_compact_large_durable_replay() {
         .await
         .unwrap();
     actor.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn same_provider_model_switch_does_not_compact_reusable_context() {
+    let root = tempdir().unwrap();
+    let journal_path = root.path().join("session.lock");
+    let session_id = Uuid::new_v4();
+    let first_id = Uuid::new_v4();
+    let second_id = Uuid::new_v4();
+    let (command_tx, command_rx) = mpsc::channel(8);
+    let (event_tx, mut event_rx) = mpsc::channel(256);
+    let called = Arc::new(Notify::new());
+    let prompt_lengths = Arc::new(Mutex::new(Vec::new()));
+    let executor = Arc::new(ReusableContextExecutor {
+        prompt_lengths: Arc::clone(&prompt_lengths),
+        called: Arc::clone(&called),
+    });
+    let actor = tokio::spawn(async move {
+        run_agent_session_with_executor(
+            &journal_path,
+            session_id,
+            LaunchSession {
+                request_id: Uuid::new_v4(),
+                cwd: root.path().to_path_buf(),
+                provider: CodingProvider::Codex,
+                model: Some("gpt-5.6-sol".to_string()),
+                effort: Some("xhigh".to_string()),
+                fast: Some(false),
+                response_language: crate::ResponseLanguage::Auto,
+                permission_mode: PermissionMode::Manual,
+                name: None,
+                initial_prompt: None,
+                capabilities: Default::default(),
+                subagent_concurrency_limit: None,
+                extension_skill_roots: Vec::new(),
+                team_policy: None,
+            },
+            command_rx,
+            event_tx,
+            executor,
+        )
+        .await
+    });
+
+    command_tx
+        .send(HostCommand::Prompt {
+            session_id,
+            message_id: first_id,
+            text: "u".repeat(450_000),
+            attachments: Vec::new(),
+            output_schema: None,
+            delivery: PromptDelivery::Queue,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), called.notified())
+        .await
+        .expect("first pooled turn completes");
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+            .await
+            .expect("first model-switch turn remains live")
+            .expect("session remains open");
+        if matches!(
+            event.kind,
+            SessionEventKind::TurnCompleted {
+                message_id,
+                error: None,
+                ..
+            } if message_id == first_id
+        ) {
+            break;
+        }
+    }
+
+    command_tx
+        .send(HostCommand::Configure {
+            session_id,
+            action: crate::SessionConfigAction::SetModel {
+                model: "gpt-5.6-luna".to_string(),
+            },
+        })
+        .await
+        .unwrap();
+    command_tx
+        .send(HostCommand::Prompt {
+            session_id,
+            message_id: second_id,
+            text: "continue".to_string(),
+            attachments: Vec::new(),
+            output_schema: None,
+            delivery: PromptDelivery::Queue,
+        })
+        .await
+        .unwrap();
+
+    let mut observed_model_switch = false;
+    let mut provider_input_compacted = false;
+    let second_error = loop {
+        let event = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+            .await
+            .expect("model-switch turn remains live")
+            .expect("session remains open");
+        match &event.kind {
+            SessionEventKind::SessionConfigured {
+                provider: CodingProvider::Codex,
+                model: Some(model),
+                ..
+            } if model == "gpt-5.6-luna" => {
+                observed_model_switch = true;
+            }
+            SessionEventKind::ProviderEvent { kind, payload, .. }
+                if kind == "context_compaction"
+                    && payload.get("trigger").and_then(Value::as_str)
+                        == Some("provider_input_size") =>
+            {
+                provider_input_compacted = true;
+            }
+            SessionEventKind::TurnCompleted {
+                message_id, error, ..
+            } if *message_id == second_id => {
+                break error.clone();
+            }
+            _ => {}
+        }
+    };
+
+    command_tx
+        .send(HostCommand::Stop { session_id })
+        .await
+        .unwrap();
+    actor.await.unwrap().unwrap();
+
+    assert!(observed_model_switch);
+    assert!(!provider_input_compacted);
+    assert!(
+        second_error.is_none(),
+        "model-switch turn failed: {second_error:?}"
+    );
+    let prompt_lengths = prompt_lengths.lock().unwrap().clone();
+    assert_eq!(prompt_lengths.len(), 2);
+    assert!(prompt_lengths[1] > SUBSCRIPTION_INPUT_BUDGET_CHARS);
 }
 
 #[tokio::test]

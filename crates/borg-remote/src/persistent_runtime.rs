@@ -17,6 +17,7 @@ use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
 use serde::Serialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
@@ -41,6 +42,8 @@ pub(crate) trait RuntimeHost: Send + Sync {
 pub(crate) struct PersistentRuntimeResult {
     pub runtime: &'static str,
     pub persistent: bool,
+    pub recovered_from_manifest: bool,
+    pub execution_count: u64,
     pub value: Value,
     pub stdout: String,
     pub stderr: String,
@@ -53,7 +56,8 @@ pub(crate) struct PersistentRuntimeResult {
 /// alive until the session stops.
 #[derive(Clone, Default)]
 pub(crate) struct PersistentRuntimeRegistry {
-    python: Arc<Mutex<HashMap<Uuid, Arc<PersistentPythonRuntime>>>>,
+    python: Arc<Mutex<HashMap<Uuid, Arc<PersistentRuntimeWorker>>>>,
+    bun: Arc<Mutex<HashMap<Uuid, Arc<PersistentRuntimeWorker>>>>,
 }
 
 impl PersistentRuntimeRegistry {
@@ -61,18 +65,59 @@ impl PersistentRuntimeRegistry {
         &self,
         session_id: Uuid,
         root: &Path,
-    ) -> Arc<PersistentPythonRuntime> {
+        store: Option<crate::SqliteSessionStore>,
+    ) -> Arc<PersistentRuntimeWorker> {
         let mut runtimes = self.python.lock().await;
         runtimes
             .entry(session_id)
-            .or_insert_with(|| Arc::new(PersistentPythonRuntime::new(root.to_path_buf())))
+            .or_insert_with(|| {
+                Arc::new(PersistentRuntimeWorker::for_python(
+                    session_id,
+                    root.to_path_buf(),
+                    store,
+                ))
+            })
+            .clone()
+    }
+
+    pub(crate) async fn bun_for_session(
+        &self,
+        session_id: Uuid,
+        root: &Path,
+        store: Option<crate::SqliteSessionStore>,
+    ) -> Arc<PersistentRuntimeWorker> {
+        let mut runtimes = self.bun.lock().await;
+        runtimes
+            .entry(session_id)
+            .or_insert_with(|| {
+                Arc::new(PersistentRuntimeWorker::for_bun(
+                    session_id,
+                    root.to_path_buf(),
+                    store,
+                ))
+            })
             .clone()
     }
 }
 
-pub(crate) struct PersistentPythonRuntime {
+pub(crate) struct PersistentRuntimeWorker {
+    session_id: Uuid,
     root: PathBuf,
+    store: Option<crate::SqliteSessionStore>,
+    worker_id: Uuid,
+    runtime: &'static str,
+    command: String,
+    worker_source: &'static str,
+    metadata: Mutex<RuntimeMetadata>,
     process: Mutex<Option<PythonProcess>>,
+}
+
+#[derive(Default)]
+struct RuntimeMetadata {
+    manifest_activated: bool,
+    recovered_from_manifest: bool,
+    execution_count: u64,
+    namespace_recovery_pending: bool,
 }
 
 struct PythonProcess {
@@ -81,12 +126,87 @@ struct PythonProcess {
     stdout: BufReader<ChildStdout>,
 }
 
-impl PersistentPythonRuntime {
+impl PersistentRuntimeWorker {
+    #[cfg(test)]
     fn new(root: PathBuf) -> Self {
-        Self {
+        Self::for_python(Uuid::nil(), root, None)
+    }
+
+    fn for_python(
+        session_id: Uuid,
+        root: PathBuf,
+        store: Option<crate::SqliteSessionStore>,
+    ) -> Self {
+        Self::with_session(
+            session_id,
             root,
+            store,
+            "python",
+            python_command(),
+            PYTHON_WORKER_SOURCE,
+        )
+    }
+
+    fn for_bun(session_id: Uuid, root: PathBuf, store: Option<crate::SqliteSessionStore>) -> Self {
+        Self::with_session(
+            session_id,
+            root,
+            store,
+            "javascript",
+            bun_command(),
+            BUN_WORKER_SOURCE,
+        )
+    }
+
+    fn with_session(
+        session_id: Uuid,
+        root: PathBuf,
+        store: Option<crate::SqliteSessionStore>,
+        runtime: &'static str,
+        command: String,
+        worker_source: &'static str,
+    ) -> Self {
+        Self {
+            session_id,
+            root,
+            store,
+            worker_id: Uuid::new_v4(),
+            runtime,
+            command,
+            worker_source,
+            metadata: Mutex::new(RuntimeMetadata::default()),
             process: Mutex::new(None),
         }
+    }
+
+    pub(crate) fn worker_id(&self) -> Uuid {
+        self.worker_id
+    }
+
+    async fn activate_manifest(&self) -> Result<bool> {
+        let mut metadata = self.metadata.lock().await;
+        if metadata.manifest_activated {
+            return Ok(metadata.recovered_from_manifest);
+        }
+        let recovered = if let Some(store) = &self.store {
+            let activation = store
+                .activate_runtime_manifest(
+                    self.session_id,
+                    self.runtime,
+                    &self.root.to_string_lossy(),
+                    &self.command,
+                    self.worker_id,
+                )
+                .await?;
+            metadata.execution_count = activation.manifest.execution_count;
+            metadata.namespace_recovery_pending = activation.recovered_from_previous_worker;
+            activation.recovered_from_previous_worker
+        } else {
+            false
+        };
+        metadata.manifest_activated = true;
+        metadata.recovered_from_manifest = recovered;
+        Ok(recovered)
     }
 
     pub(crate) async fn execute(
@@ -95,6 +215,23 @@ impl PersistentPythonRuntime {
         timeout_ms: Option<u64>,
         host: Arc<dyn RuntimeHost>,
     ) -> Result<PersistentRuntimeResult> {
+        self.execute_as(self.runtime, code, timeout_ms, host).await
+    }
+
+    pub(crate) async fn execute_as(
+        &self,
+        requested_runtime: &'static str,
+        code: &str,
+        timeout_ms: Option<u64>,
+        host: Arc<dyn RuntimeHost>,
+    ) -> Result<PersistentRuntimeResult> {
+        ensure!(
+            (self.runtime == "python" && requested_runtime == "python")
+                || (self.runtime == "javascript"
+                    && matches!(requested_runtime, "javascript" | "typescript")),
+            "runtime `{requested_runtime}` is incompatible with the persistent `{}` worker",
+            self.runtime
+        );
         ensure!(!code.trim().is_empty(), "runtime code is empty");
         ensure!(
             code.len() <= MAX_CODE_BYTES,
@@ -104,33 +241,88 @@ impl PersistentPythonRuntime {
             self.root.is_dir(),
             "runtime working directory does not exist"
         );
+        let recovered_from_manifest = self.activate_manifest().await?;
         let timeout = Duration::from_millis(
             timeout_ms
                 .unwrap_or(DEFAULT_EXECUTION_TIMEOUT_MS)
                 .clamp(1, MAX_EXECUTION_TIMEOUT_MS),
         );
 
-        let mut process = self.process.lock().await;
-        if process.is_none() {
-            *process = Some(spawn_python_worker(&self.root)?);
-        }
-
-        let request_id = Uuid::new_v4().to_string();
-        let result = execute_request(
-            process.as_mut().expect("persistent Python process exists"),
-            &request_id,
-            code,
-            timeout,
-            host,
-        )
-        .await;
-        if result.is_err() {
-            if let Some(process) = process.as_mut() {
-                let _ = process.child.kill().await;
+        let result = {
+            let mut process = self.process.lock().await;
+            let should_recover_namespace =
+                process.is_none() && self.metadata.lock().await.namespace_recovery_pending;
+            let checkpoint_state = if should_recover_namespace {
+                if let Some(store) = &self.store {
+                    store
+                        .runtime_checkpoint(self.session_id, None)
+                        .await?
+                        .map(|checkpoint| checkpoint.state)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if process.is_none() {
+                *process = Some(spawn_worker(
+                    &self.root,
+                    &self.command,
+                    self.worker_source,
+                    self.runtime,
+                )?);
             }
-            *process = None;
+
+            let request_id = Uuid::new_v4().to_string();
+            let result = execute_request(
+                process.as_mut().expect("persistent Python process exists"),
+                &request_id,
+                requested_runtime,
+                code,
+                timeout,
+                checkpoint_state.as_ref(),
+                host,
+            )
+            .await;
+            if result.is_err() {
+                if let Some(process) = process.as_mut() {
+                    let _ = process.child.kill().await;
+                }
+                *process = None;
+            }
+            {
+                let mut metadata = self.metadata.lock().await;
+                if result.is_err() {
+                    metadata.namespace_recovery_pending = true;
+                } else if should_recover_namespace {
+                    metadata.namespace_recovery_pending = false;
+                }
+            }
+            result
+        };
+
+        let code_hash = format!("sha256:{:x}", Sha256::digest(code.as_bytes()));
+        if let Some(store) = &self.store {
+            let execution_error = result.as_ref().err().map(ToString::to_string);
+            store
+                .record_runtime_execution(
+                    self.session_id,
+                    self.worker_id,
+                    &code_hash,
+                    result.is_err(),
+                    execution_error.as_deref(),
+                )
+                .await?;
         }
-        result
+        let execution_count = {
+            let mut metadata = self.metadata.lock().await;
+            metadata.execution_count = metadata.execution_count.saturating_add(1);
+            metadata.execution_count
+        };
+        let mut result = result?;
+        result.recovered_from_manifest = recovered_from_manifest;
+        result.execution_count = execution_count;
+        Ok(result)
     }
 
     pub(crate) async fn stop(&self) {
@@ -139,36 +331,56 @@ impl PersistentPythonRuntime {
             let _ = process.child.kill().await;
             let _ = process.child.wait().await;
         }
+        drop(process);
+        if let Some(store) = &self.store {
+            let _ = store
+                .stop_runtime_manifest(self.session_id, self.worker_id)
+                .await;
+        }
     }
 }
 
-fn spawn_python_worker(root: &Path) -> Result<PythonProcess> {
-    let command = std::env::var("BORG_PYTHON_RUNTIME").unwrap_or_else(|_| {
+fn python_command() -> String {
+    std::env::var("BORG_PYTHON_RUNTIME").unwrap_or_else(|_| {
         if cfg!(windows) {
             "python".to_string()
         } else {
             "python3".to_string()
         }
-    });
-    let mut child = Command::new(&command)
-        .arg("-u")
-        .arg("-c")
-        .arg(PYTHON_WORKER_SOURCE)
+    })
+}
+
+fn bun_command() -> String {
+    std::env::var("BORG_BUN_RUNTIME").unwrap_or_else(|_| "bun".to_string())
+}
+
+fn spawn_worker(root: &Path, command: &str, source: &str, runtime: &str) -> Result<PythonProcess> {
+    let mut process = Command::new(command);
+    // Model-authored code may use the worker namespace and the explicit Borg
+    // host-call protocol, but it must not inherit deployment, provider, or
+    // control-plane credentials from the supervising process.
+    crate::process_environment::configure_runtime_environment(&mut process);
+    if matches!(runtime, "javascript" | "typescript") {
+        process.arg("--eval").arg(source);
+    } else {
+        process.arg("-u").arg("-c").arg(source);
+    }
+    let mut child = process
         .current_dir(root)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true)
         .spawn()
-        .with_context(|| format!("failed to start persistent Python runtime `{command}`"))?;
+        .with_context(|| format!("failed to start persistent runtime `{command}`"))?;
     let stdin = child
         .stdin
         .take()
-        .context("persistent Python runtime stdin was not piped")?;
+        .context("persistent runtime stdin was not piped")?;
     let stdout = child
         .stdout
         .take()
-        .context("persistent Python runtime stdout was not piped")?;
+        .context("persistent runtime stdout was not piped")?;
     Ok(PythonProcess {
         child,
         stdin,
@@ -179,8 +391,10 @@ fn spawn_python_worker(root: &Path) -> Result<PythonProcess> {
 async fn execute_request(
     process: &mut PythonProcess,
     request_id: &str,
+    runtime: &'static str,
     code: &str,
     timeout: Duration,
+    bootstrap: Option<&Value>,
     host: Arc<dyn RuntimeHost>,
 ) -> Result<PersistentRuntimeResult> {
     write_json_line(
@@ -188,7 +402,9 @@ async fn execute_request(
         &json!({
             "type": "execute",
             "id": request_id,
+            "runtime": runtime,
             "code": code,
+            "bootstrap": bootstrap,
         }),
     )
     .await?;
@@ -201,7 +417,7 @@ async fn execute_request(
             "persistent runtime message exceeds {MAX_RUNTIME_RESULT_BYTES} bytes"
         );
         let message: Value = serde_json::from_str(&line)
-            .with_context(|| "persistent Python runtime returned invalid protocol JSON")?;
+            .with_context(|| "persistent runtime returned invalid protocol JSON")?;
         match message.get("type").and_then(Value::as_str) {
             Some("host_call") => {
                 let call_id = message
@@ -240,11 +456,13 @@ async fn execute_request(
                     message
                         .get("error")
                         .and_then(Value::as_str)
-                        .unwrap_or("persistent Python execution failed")
+                        .unwrap_or("persistent runtime execution failed")
                 );
                 let result = PersistentRuntimeResult {
-                    runtime: "python",
+                    runtime,
                     persistent: true,
+                    recovered_from_manifest: false,
+                    execution_count: 0,
                     value: message.get("value").cloned().unwrap_or(Value::Null),
                     stdout: message
                         .get("stdout")
@@ -264,7 +482,7 @@ async fn execute_request(
                 return Ok(result);
             }
             Some(other) => {
-                bail!("persistent Python runtime returned unknown message type `{other}`")
+                bail!("persistent runtime returned unknown message type `{other}`")
             }
             None => bail!("persistent Python runtime message has no type"),
         }
@@ -325,6 +543,17 @@ def _json_safe(value):
         return repr(value)
 
 
+def _restore_namespace(state):
+    if not isinstance(state, dict):
+        raise RuntimeError("runtime checkpoint namespace state must be an object")
+    for name, value in state.items():
+        # Checkpoints are data, not executable code. Only ordinary public
+        # Python identifiers become namespace bindings; internal/runtime names
+        # cannot be shadowed by persisted state.
+        if isinstance(name, str) and name.isidentifier() and not name.startswith("_"):
+            NAMESPACE[name] = value
+
+
 class Borg:
     def call(self, operation, arguments=None):
         call_id = str(uuid.uuid4())
@@ -361,6 +590,76 @@ class Borg:
         arguments.update(kwargs)
         return self.call("search_files", arguments)
 
+    def history(self, text=None, **kwargs):
+        arguments = {}
+        if text is not None:
+            arguments["text"] = text
+        arguments.update(kwargs)
+        return self.call("history", arguments)
+
+    def history_index(self, after_sequence=0, limit=1000):
+        return self.call("history_index", {
+            "after_sequence": after_sequence,
+            "limit": limit,
+        })
+
+    def semantic_search(self, query, **kwargs):
+        """Run read-only BorgSearch retrieval through the scoped Web MCP bridge.
+
+        Hits are candidates and must be resolved through the returned source
+        contract before they are treated as evidence.
+        """
+        arguments = {"query": query}
+        arguments.update(kwargs)
+        return self.call("mcp_call", {
+            "name": "mcp__borg__search_documents",
+            "arguments": arguments,
+        })
+
+    def retrieval_adapter(self, adapter_id, query=None):
+        spec = self.call("retrieval_adapter", {"id": adapter_id})
+        language = spec.get("manifest", {}).get("language")
+        if language != "python":
+            raise RuntimeError(
+                f"retrieval adapter {adapter_id!r} uses {language!r}; execute it from a matching runtime"
+            )
+        namespace = {"borg": self, "__name__": f"__borg_retriever_{adapter_id}__"}
+        exec(compile(spec["source"], f"<retrieval-adapter:{adapter_id}>", "exec"), namespace, namespace)
+        retrieve = namespace.get("retrieve")
+        if not callable(retrieve):
+            raise RuntimeError(f"retrieval adapter {adapter_id!r} has no retrieve(query) entrypoint")
+        value = retrieve(query)
+        if inspect.iscoroutine(value):
+            value = asyncio.run(value)
+        return _json_safe(value)
+
+    def test_retrieval_adapter(self, adapter_id):
+        spec = self.call("retrieval_adapter", {"id": adapter_id})
+        tests = spec.get("tests")
+        if not tests:
+            return {"id": adapter_id, "tested": False, "reason": "no tests.source"}
+        namespace = {"borg": self, "__name__": f"__borg_retriever_test_{adapter_id}__"}
+        exec(compile(spec["source"], f"<retrieval-adapter:{adapter_id}>", "exec"), namespace, namespace)
+        exec(compile(tests, f"<retrieval-adapter-tests:{adapter_id}>", "exec"), namespace, namespace)
+        retrieve = namespace.get("retrieve")
+        test = namespace.get("test")
+        if not callable(retrieve) or not callable(test):
+            raise RuntimeError(f"retrieval adapter {adapter_id!r} must define retrieve and test")
+        value = test(retrieve, self)
+        if inspect.iscoroutine(value):
+            value = asyncio.run(value)
+        return {"id": adapter_id, "tested": True, "passed": True, "result": _json_safe(value)}
+
+    def runtime_status(self):
+        return self.call("runtime_status", {})
+
+    def checkpoint(self, key, state):
+        return self.call("runtime_checkpoint", {"key": key, "state": state})
+
+    def restore(self, key=None):
+        arguments = {} if key is None else {"key": key}
+        return self.call("runtime_restore", arguments)
+
     def write(self, path, content, **kwargs):
         arguments = {"path": path, "content": content}
         arguments.update(kwargs)
@@ -368,6 +667,12 @@ class Borg:
 
     def tool(self, name, arguments=None):
         return self.call("borg_tool", {"name": name, "arguments": {} if arguments is None else arguments})
+
+    def mcp_tools(self):
+        return self.call("mcp_tools", {})
+
+    def mcp(self, name, arguments=None):
+        return self.call("mcp_call", {"name": name, "arguments": {} if arguments is None else arguments})
 
 
 NAMESPACE["borg"] = Borg()
@@ -400,6 +705,8 @@ for line in sys.stdin:
         if message.get("type") != "execute":
             continue
         try:
+            if message.get("bootstrap") is not None:
+                _restore_namespace(message["bootstrap"])
             value, stdout, stderr = _run_code(message.get("code", ""))
             response = {
                 "type": "result",
@@ -428,6 +735,172 @@ for line in sys.stdin:
         PROTOCOL_OUT.flush()
 "#;
 
+// Bun is optional. The worker uses one persistent VM context and the same
+// JSON-lines host protocol as Python. Synchronous top-level declarations and
+// assignments survive requests; code that needs an async block can use an
+// explicit `return` from the worker's async wrapper. TypeScript is transpiled
+// by Bun when its loader is available, while JavaScript is passed through.
+const BUN_WORKER_SOURCE: &str = r#"
+const readline = require("node:readline");
+const vm = require("node:vm");
+
+const protocolOut = process.stdout;
+const pending = new Map();
+const context = vm.createContext({});
+let stdout = "";
+let stderr = "";
+
+function send(message) {
+  protocolOut.write(JSON.stringify(message) + "\n");
+}
+
+function jsonSafe(value) {
+  if (value === undefined) return null;
+  try {
+    return JSON.parse(JSON.stringify(value));
+  } catch (_) {
+    return String(value);
+  }
+}
+
+function restoreNamespace(state) {
+  if (state === null || typeof state !== "object" || Array.isArray(state)) {
+    throw new Error("runtime checkpoint namespace state must be an object");
+  }
+  for (const [name, value] of Object.entries(state)) {
+    // Checkpoints are data, not executable code. Do not allow persisted data
+    // to shadow runtime internals or create arbitrary global property names.
+    if (/^[A-Za-z][A-Za-z0-9]*$/.test(name)) context[name] = value;
+  }
+}
+
+function format(value) {
+  if (typeof value === "string") return value;
+  return JSON.stringify(jsonSafe(value));
+}
+
+const runtimeConsole = {
+  log: (...values) => { stdout += values.map(format).join(" ") + "\n"; },
+  info: (...values) => { stdout += values.map(format).join(" ") + "\n"; },
+  warn: (...values) => { stderr += values.map(format).join(" ") + "\n"; },
+  error: (...values) => { stderr += values.map(format).join(" ") + "\n"; },
+};
+
+function hostCall(operation, arguments_) {
+  const id = crypto.randomUUID();
+  send({type: "host_call", id, operation, arguments: arguments_ ?? {}});
+  return new Promise((resolve, reject) => pending.set(id, {resolve, reject}));
+}
+
+const borg = {
+  call: hostCall,
+  exec: (command, options = {}) => hostCall("exec_command", {cmd: command, ...options}),
+  read: (path, options = {}) => hostCall("read_file", {path, ...options}),
+  search: (pattern, options = {}) => hostCall("search_files", {pattern, ...options}),
+  history: (text, options = {}) => hostCall("history", {
+    ...(text === undefined || text === null ? {} : {text}), ...options,
+  }),
+  history_index: (afterSequence = 0, limit = 1000) => hostCall("history_index", {
+    after_sequence: afterSequence, limit,
+  }),
+  semantic_search: (query, options = {}) => hostCall("mcp_call", {
+    name: "mcp__borg__search_documents",
+    arguments: {query, ...options},
+  }),
+  retrieval_adapter: async (adapterId, query = null) => {
+    const spec = await hostCall("retrieval_adapter", {id: adapterId});
+    const language = spec?.manifest?.language;
+    if (language !== "javascript") {
+      throw new Error(`retrieval adapter ${adapterId} uses ${language}; execute it from a matching runtime`);
+    }
+    const AsyncFunction = Object.getPrototypeOf(async function() {}).constructor;
+    const runner = new AsyncFunction("borg", "query", `${spec.source}\nif (typeof retrieve !== "function") throw new Error("retrieve(query) entrypoint is required");\nreturn await retrieve(query);`);
+    return jsonSafe(await runner(borg, query));
+  },
+  test_retrieval_adapter: async (adapterId) => {
+    const spec = await hostCall("retrieval_adapter", {id: adapterId});
+    if (!spec.tests) return {id: adapterId, tested: false, reason: "no tests.source"};
+    const AsyncFunction = Object.getPrototypeOf(async function() {}).constructor;
+    const runner = new AsyncFunction("borg", `${spec.source}\n${spec.tests}\nif (typeof retrieve !== "function" || typeof test !== "function") throw new Error("retrieve and test entrypoints are required");\nreturn await test(retrieve, borg);`);
+    return {id: adapterId, tested: true, passed: true, result: jsonSafe(await runner(borg))};
+  },
+  runtime_status: () => hostCall("runtime_status", {}),
+  checkpoint: (key, state) => hostCall("runtime_checkpoint", {key, state}),
+  restore: (key) => hostCall("runtime_restore", key === undefined ? {} : {key}),
+  write: (path, content, options = {}) => hostCall("write_file", {path, content, ...options}),
+  tool: (name, arguments_ = {}) => hostCall("borg_tool", {name, arguments: arguments_}),
+  mcp_tools: () => hostCall("mcp_tools", {}),
+  mcp: (name, arguments_ = {}) => hostCall("mcp_call", {name, arguments: arguments_}),
+};
+context.borg = borg;
+context.console = runtimeConsole;
+
+function finalExpressionParts(source) {
+  const lines = source.replace(/\r\n/g, "\n").split("\n");
+  while (lines.length && lines[lines.length - 1].trim() === "") lines.pop();
+  if (!lines.length) return null;
+  const last = lines[lines.length - 1].trim().replace(/;$/, "");
+  if (!last || /^(const|let|var|function|class|if|for|while|try|catch|switch|throw|return)\b/.test(last)) {
+    return null;
+  }
+  return {body: lines.slice(0, -1).join("\n"), expression: last};
+}
+
+async function execute(source, runtime) {
+  stdout = "";
+  stderr = "";
+  context.resultSlot = null;
+  let compiled = source;
+  if (runtime === "typescript" && typeof Bun !== "undefined" && Bun.Transpiler) {
+    compiled = new Bun.Transpiler({loader: "tsx"}).transformSync(source);
+  }
+  const parts = finalExpressionParts(compiled);
+  try {
+    if (parts) {
+      try {
+        const evaluated = vm.runInContext(`${parts.body}\n;(${parts.expression})`, context);
+        context.resultSlot = await Promise.resolve(evaluated);
+      } catch (error) {
+        if (!/await|return/.test(String(error))) throw error;
+        context.resultSlot = await vm.runInContext(`(async () => {${parts.body}\nreturn (${parts.expression});})()`, context);
+      }
+    } else {
+      try {
+        context.resultSlot = await Promise.resolve(vm.runInContext(compiled, context));
+      } catch (error) {
+        if (!/await|return/.test(String(error))) throw error;
+        context.resultSlot = await vm.runInContext(`(async () => {${compiled}\n})()`, context);
+      }
+    }
+  } catch (error) {
+    throw error;
+  }
+  return {value: jsonSafe(context.resultSlot), stdout, stderr};
+}
+
+const input = readline.createInterface({input: process.stdin, crlfDelay: Infinity});
+input.on("line", async (line) => {
+  let message;
+  try { message = JSON.parse(line); } catch (_) { return; }
+  if (message.type === "host_result") {
+    const waiter = pending.get(message.id);
+    if (!waiter) return;
+    pending.delete(message.id);
+    if (message.ok) waiter.resolve(message.result);
+    else waiter.reject(new Error(message.error || "Borg host call failed"));
+    return;
+  }
+  if (message.type !== "execute") return;
+  try {
+    if (message.bootstrap !== undefined && message.bootstrap !== null) restoreNamespace(message.bootstrap);
+    const output = await execute(message.code || "", message.runtime || "javascript");
+    send({type: "result", id: message.id, ok: true, ...output});
+  } catch (error) {
+    send({type: "result", id: message.id, ok: false, error: String(error && error.stack || error)});
+  }
+});
+"#;
+
 #[cfg(test)]
 mod tests {
     use tempfile::tempdir;
@@ -441,6 +914,50 @@ mod tests {
         async fn call(&self, operation: &str, arguments: Value) -> Result<Value> {
             match operation {
                 "echo" => Ok(arguments),
+                "history" => Ok(json!({ "query": arguments, "backend": "test" })),
+                "history_index" => Ok(json!({
+                    "documents": [],
+                    "after_sequence": arguments
+                        .get("after_sequence")
+                        .cloned()
+                        .unwrap_or(json!(0)),
+                    "next_after_sequence": arguments
+                        .get("after_sequence")
+                        .cloned()
+                        .unwrap_or(json!(0)),
+                    "has_more": false,
+                })),
+                "mcp_call" => {
+                    if arguments.get("name").and_then(Value::as_str)
+                        == Some("mcp__borg__search_documents")
+                    {
+                        Ok(json!({
+                            "query": arguments["arguments"]["query"],
+                            "hits": [{
+                                "document_id": "source-1",
+                                "locator": "source-1#chunk-0",
+                                "match_mode": "semantic"
+                            }]
+                        }))
+                    } else {
+                        bail!("unknown test MCP tool")
+                    }
+                }
+                "retrieval_adapter" => {
+                    if arguments.get("id").and_then(Value::as_str) == Some("js-ranker") {
+                        Ok(json!({
+                            "manifest": {"language": "javascript"},
+                            "source": "function retrieve(query) { return {query, source: 'adapter'}; }",
+                            "tests": "function test(retrieve, borg) { if (retrieve('test').source !== 'adapter') throw new Error('bad adapter'); return {ok: true}; }"
+                        }))
+                    } else {
+                        Ok(json!({
+                            "manifest": {"language": "python"},
+                            "source": "def retrieve(query):\n    return {'query': query, 'source': 'adapter'}\n",
+                            "tests": "def test(retrieve, borg):\n    assert retrieve('test')['source'] == 'adapter'\n    return {'ok': True}\n"
+                        }))
+                    }
+                }
                 other => bail!("unknown test operation `{other}`"),
             }
         }
@@ -460,13 +977,25 @@ mod tests {
         .is_ok_and(|output| output.status.success())
     }
 
+    #[test]
+    fn persistent_runtime_environment_contains_no_inherited_configuration() {
+        let environment = crate::process_environment::sanitized_environment();
+        assert_eq!(environment[0].0, "PATH");
+        assert!(
+            environment
+                .iter()
+                .all(|(name, _)| !name.starts_with("BORG_"))
+        );
+        assert!(!environment.iter().any(|(name, _)| *name == "HOME"));
+    }
+
     #[tokio::test]
     async fn python_namespace_survives_multiple_requests() {
         if !python_available().await {
             return;
         }
         let root = tempdir().expect("temporary runtime root");
-        let runtime = PersistentPythonRuntime::new(root.path().to_path_buf());
+        let runtime = PersistentRuntimeWorker::new(root.path().to_path_buf());
         let host: Arc<dyn RuntimeHost> = Arc::new(TestHost);
         let first = runtime
             .execute(
@@ -492,6 +1021,112 @@ mod tests {
             .expect("top-level await execution");
         assert_eq!(asynchronous.value, json!(44));
         assert_eq!(asynchronous.stdout, "namespace survives\n");
+        let retrieved = runtime
+            .execute(
+                "borg.retrieval_adapter('ranker', 'needle')",
+                None,
+                Arc::new(TestHost),
+            )
+            .await
+            .expect("Python retrieval adapter execution");
+        assert_eq!(
+            retrieved.value,
+            json!({"query": "needle", "source": "adapter"})
+        );
+        let tested = runtime
+            .execute(
+                "borg.test_retrieval_adapter('ranker')",
+                None,
+                Arc::new(TestHost),
+            )
+            .await
+            .expect("Python retrieval adapter test execution");
+        assert_eq!(tested.value["passed"], true);
+        runtime.stop().await;
+    }
+
+    #[tokio::test]
+    async fn optional_bun_namespace_survives_multiple_requests_and_host_calls() {
+        if !tokio::process::Command::new(bun_command())
+            .arg("--version")
+            .output()
+            .await
+            .is_ok_and(|output| output.status.success())
+        {
+            return;
+        }
+        let root = tempdir().expect("temporary runtime root");
+        let runtime =
+            PersistentRuntimeWorker::for_bun(Uuid::new_v4(), root.path().to_path_buf(), None);
+        let first = runtime
+            .execute(
+                "answer = 40\nanswer = answer + 2\nanswer",
+                None,
+                Arc::new(TestHost),
+            )
+            .await
+            .expect("first Bun execution");
+        assert_eq!(first.value, json!(42));
+        let second = runtime
+            .execute("answer += 1\nanswer", None, Arc::new(TestHost))
+            .await
+            .expect("second Bun execution");
+        assert_eq!(second.value, json!(43));
+        let host_call = runtime
+            .execute("borg.call('echo', {value: 7})", None, Arc::new(TestHost))
+            .await
+            .expect("Bun host call execution");
+        assert_eq!(host_call.value, json!({"value": 7}));
+        let history_index = runtime
+            .execute(
+                "borg.history_index(12, 4).then(page => page.next_after_sequence)",
+                None,
+                Arc::new(TestHost),
+            )
+            .await
+            .expect("Bun history index host call execution");
+        assert_eq!(history_index.value, json!(12));
+        let semantic = runtime
+            .execute(
+                "borg.semantic_search('contract risk', {limit: 3}).then(result => result.hits[0].match_mode)",
+                None,
+                Arc::new(TestHost),
+            )
+            .await
+            .expect("Bun semantic search host call execution");
+        assert_eq!(semantic.value, json!("semantic"));
+        let typescript = runtime
+            .execute_as(
+                "typescript",
+                "const typedAnswer: number = 41; typedAnswer + 1",
+                None,
+                Arc::new(TestHost),
+            )
+            .await
+            .expect("Bun TypeScript execution");
+        assert_eq!(typescript.runtime, "typescript");
+        assert_eq!(typescript.value, json!(42));
+        let retrieved = runtime
+            .execute(
+                "borg.retrieval_adapter('js-ranker', 'needle')",
+                None,
+                Arc::new(TestHost),
+            )
+            .await
+            .expect("Bun retrieval adapter execution");
+        assert_eq!(
+            retrieved.value,
+            json!({"query": "needle", "source": "adapter"})
+        );
+        let tested = runtime
+            .execute(
+                "borg.test_retrieval_adapter('js-ranker')",
+                None,
+                Arc::new(TestHost),
+            )
+            .await
+            .expect("Bun retrieval adapter test execution");
+        assert_eq!(tested.value["passed"], true);
         runtime.stop().await;
     }
 
@@ -501,13 +1136,42 @@ mod tests {
             return;
         }
         let root = tempdir().expect("temporary runtime root");
-        let runtime = PersistentPythonRuntime::new(root.path().to_path_buf());
+        let runtime = PersistentRuntimeWorker::new(root.path().to_path_buf());
         let host: Arc<dyn RuntimeHost> = Arc::new(TestHost);
         let result = runtime
             .execute("borg.call('echo', {'value': 7})", None, host)
             .await
             .expect("host call execution");
         assert_eq!(result.value, json!({"value": 7}));
+        let history = runtime
+            .execute(
+                "borg.history('needle', mode='regex', limit=3)",
+                None,
+                Arc::new(TestHost),
+            )
+            .await
+            .expect("history host call execution");
+        assert_eq!(history.value["backend"], "test");
+        assert_eq!(history.value["query"]["text"], "needle");
+        assert_eq!(history.value["query"]["mode"], "regex");
+        let history_index = runtime
+            .execute(
+                "borg.history_index(12, 4)['next_after_sequence']",
+                None,
+                Arc::new(TestHost),
+            )
+            .await
+            .expect("history index host call execution");
+        assert_eq!(history_index.value, json!(12));
+        let semantic = runtime
+            .execute(
+                "borg.semantic_search('contract risk', limit=3)",
+                None,
+                Arc::new(TestHost),
+            )
+            .await
+            .expect("Python semantic search host call execution");
+        assert_eq!(semantic.value["hits"][0]["match_mode"], "semantic");
         runtime.stop().await;
     }
 
@@ -519,8 +1183,12 @@ mod tests {
         let root = tempdir().expect("temporary runtime root");
         let registry = PersistentRuntimeRegistry::default();
         let session_id = Uuid::new_v4();
-        let first = registry.python_for_session(session_id, root.path()).await;
-        let second = registry.python_for_session(session_id, root.path()).await;
+        let first = registry
+            .python_for_session(session_id, root.path(), None)
+            .await;
+        let second = registry
+            .python_for_session(session_id, root.path(), None)
+            .await;
         assert!(Arc::ptr_eq(&first, &second));
     }
 }

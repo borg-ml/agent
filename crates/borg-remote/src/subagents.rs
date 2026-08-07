@@ -24,14 +24,14 @@ use uuid::Uuid;
 use crate::persistent_runtime::{PersistentRuntimeRegistry, RuntimeHost};
 use crate::{
     ApprovalDecision, AtomicWorkClaim, Audience, CodingProvider, DeliveryMode, EventActor,
-    HostCommand, LaunchSession, MessageStatus, ModelGoalStatus, PromptDelivery, Provenance,
-    SessionConsultationTools, SessionEvent, SessionEventKind, SessionGoalToolRequest,
+    HostCommand, HostResourceLimits, LaunchSession, MessageStatus, ModelGoalStatus, PromptDelivery,
+    Provenance, SessionConsultationTools, SessionEvent, SessionEventKind, SessionGoalToolRequest,
     SessionGoalTools, SessionStatus, SessionStore, SessionTodoToolRequest, SessionTodoTools,
     SharedWork, SqliteWorkspaceStore, StructuredMention, TodoItemUpdate, WorkDependency,
     WorkReview, WorkspaceArtifact, WorkspaceDecision, WorkspaceEvent, WorkspaceEventKind,
     WorkspaceFilesystemOperation, WorkspaceFilesystemOutcome, WorkspaceFilesystemRequest,
     WorkspaceMessage, WorkspaceMessageBody, WorkspaceReference, WorkspaceReviewRequest,
-    WorkspaceStore, execute_workspace_filesystem,
+    WorkspaceStore, execute_workspace_filesystem_with_limits,
 };
 
 pub const DEFAULT_MAX_SUBAGENTS: usize = 16;
@@ -163,8 +163,11 @@ pub struct AgentToolDispatcher {
     blu_workflows: Option<BluWorkflowToolContext>,
     runtime_root: PathBuf,
     runtime_permission: crate::PermissionMode,
+    resource_limits: Option<HostResourceLimits>,
     runtime_processes: crate::native_process::ProcessManager,
     persistent_runtimes: PersistentRuntimeRegistry,
+    runtime_mcp_servers: Arc<OnceCell<Vec<borg_provider::mcp::ExternalMcpServer>>>,
+    runtime_mcp: Arc<OnceCell<crate::native_mcp::NativeMcpRuntime>>,
     web_search: Option<Arc<dyn borg_search::WebSearchProvider>>,
 }
 
@@ -599,10 +602,75 @@ impl AgentToolDispatcher {
             blu_workflows,
             runtime_root,
             runtime_permission: permission,
+            resource_limits: None,
             runtime_processes,
             persistent_runtimes: PersistentRuntimeRegistry::default(),
+            runtime_mcp_servers: Arc::new(OnceCell::new()),
+            runtime_mcp: Arc::new(OnceCell::new()),
             web_search,
         }
+    }
+
+    pub(crate) fn with_resource_limits(mut self, limits: Option<HostResourceLimits>) -> Self {
+        self.resource_limits = limits;
+        self
+    }
+
+    /// Configure the external MCP grant for the session without starting any
+    /// child process yet. The persistent runtime starts its MCP clients only
+    /// when code explicitly calls `borg.mcp(...)`, so ordinary sessions do
+    /// not pay for unused integrations.
+    pub(crate) async fn configure_runtime_mcp(
+        &self,
+        servers: Vec<borg_provider::mcp::ExternalMcpServer>,
+    ) -> Result<()> {
+        if servers.is_empty() {
+            return Ok(());
+        }
+        if let Some(existing) = self.runtime_mcp_servers.get() {
+            ensure!(
+                existing.len() == servers.len()
+                    && existing.iter().zip(&servers).all(|(left, right)| {
+                        left.name == right.name
+                            && left.command == right.command
+                            && left.args == right.args
+                            && left.env == right.env
+                            && left.allowed_tools == right.allowed_tools
+                    }),
+                "runtime MCP grant cannot change after session startup"
+            );
+            return Ok(());
+        }
+        self.runtime_mcp_servers
+            .set(servers)
+            .map_err(|_| anyhow::anyhow!("runtime MCP grant was configured concurrently"))
+    }
+
+    async fn runtime_mcp_runtime(&self) -> Result<&crate::native_mcp::NativeMcpRuntime> {
+        let servers = self
+            .runtime_mcp_servers
+            .get()
+            .cloned()
+            .context("external MCP is unavailable for this session")?;
+        ensure!(
+            !servers.is_empty(),
+            "external MCP is unavailable for this session"
+        );
+        self.runtime_mcp
+            .get_or_try_init(
+                || async move { crate::native_mcp::NativeMcpRuntime::start(servers).await },
+            )
+            .await
+    }
+
+    pub(crate) async fn runtime_mcp_tools(&self) -> Result<Value> {
+        let runtime = self.runtime_mcp_runtime().await?;
+        Ok(serde_json::to_value(runtime.definitions())?)
+    }
+
+    pub(crate) async fn runtime_mcp_call(&self, name: &str, arguments: Value) -> Result<Value> {
+        let runtime = self.runtime_mcp_runtime().await?;
+        runtime.call(name, arguments, None).await
     }
 
     pub fn specs(&self) -> Vec<Value> {
@@ -726,6 +794,22 @@ impl AgentToolDispatcher {
                 let args: PersistentRuntimeArgs = serde_json::from_value(arguments)?;
                 self.run_persistent_runtime(args, workflow_approved, workflow_cancel)
                     .await
+            }
+            "query_history" => {
+                let query: crate::SessionHistoryQuery = serde_json::from_value(arguments)?;
+                let store = self
+                    .session_store()
+                    .context("lossless session history is unavailable for this session")?;
+                Ok(serde_json::to_value(
+                    store.query_history(self.actor_session_id, query).await?,
+                )?)
+            }
+            "history_index" => {
+                let args: HistoryIndexArgs = serde_json::from_value(arguments)?;
+                let store = self
+                    .session_store()
+                    .context("lossless session history is unavailable for this session")?;
+                history_index_response(&store, self.actor_session_id, args).await
             }
             "get_goal" => {
                 let _: NoArgs = serde_json::from_value(arguments)?;
@@ -955,10 +1039,14 @@ impl AgentToolDispatcher {
         cancellation: Option<CancellationToken>,
     ) -> Result<Value> {
         let runtime = args.runtime.as_deref().unwrap_or("python");
-        ensure!(
-            runtime == "python",
-            "persistent runtime `{runtime}` is not available yet; use `python`"
-        );
+        let runtime: &'static str = match runtime {
+            "python" => "python",
+            "javascript" => "javascript",
+            "typescript" => "typescript",
+            other => bail!(
+                "persistent runtime `{other}` is not available; use `python`, `javascript`, or `typescript`"
+            ),
+        };
         ensure!(
             self.runtime_permission == crate::PermissionMode::FullAccess || workflow_approved,
             "persistent runtime requires Full Access or an explicit approval"
@@ -966,10 +1054,27 @@ impl AgentToolDispatcher {
         if let Some(cancel) = cancellation.as_ref() {
             ensure!(!cancel.is_cancelled(), "persistent runtime was cancelled");
         }
-        let python = self
-            .persistent_runtimes
-            .python_for_session(self.actor_session_id, &self.runtime_root)
-            .await;
+        let runtime_worker = match runtime {
+            "python" => {
+                self.persistent_runtimes
+                    .python_for_session(
+                        self.actor_session_id,
+                        &self.runtime_root,
+                        self.session_store(),
+                    )
+                    .await
+            }
+            "javascript" | "typescript" => {
+                self.persistent_runtimes
+                    .bun_for_session(
+                        self.actor_session_id,
+                        &self.runtime_root,
+                        self.session_store(),
+                    )
+                    .await
+            }
+            _ => unreachable!("persistent runtime was validated above"),
+        };
         let host: Arc<dyn RuntimeHost> = Arc::new(DispatcherRuntimeHost {
             session_id: self.actor_session_id,
             root: self.runtime_root.clone(),
@@ -978,15 +1083,29 @@ impl AgentToolDispatcher {
             dispatcher: self.clone(),
             processes: self.runtime_processes.clone(),
             session_store: self.session_store(),
+            runtime_worker_id: runtime_worker.worker_id(),
         });
-        let execution = python.execute(&args.code, args.timeout_ms, host);
+        let timeout_ms = match (args.timeout_ms, self.resource_limits.as_ref()) {
+            (Some(requested), Some(limits)) => Some(requested.min(limits.max_runtime_execution_ms)),
+            (None, Some(limits)) => Some(limits.max_runtime_execution_ms),
+            (requested, None) => requested,
+        };
+        let execution = async {
+            if runtime == "typescript" {
+                runtime_worker
+                    .execute_as(runtime, &args.code, timeout_ms, host)
+                    .await
+            } else {
+                runtime_worker.execute(&args.code, timeout_ms, host).await
+            }
+        };
         tokio::pin!(execution);
         if let Some(cancel) = cancellation {
             tokio::select! {
                 result = &mut execution => Ok(serde_json::to_value(result?)?),
                 _ = cancel.cancelled() => {
                     drop(execution);
-                    python.stop().await;
+                    runtime_worker.stop().await;
                     bail!("persistent runtime was cancelled")
                 }
             }
@@ -1004,6 +1123,7 @@ struct DispatcherRuntimeHost {
     dispatcher: AgentToolDispatcher,
     processes: crate::native_process::ProcessManager,
     session_store: Option<crate::SqliteSessionStore>,
+    runtime_worker_id: Uuid,
 }
 
 impl DispatcherRuntimeHost {
@@ -1019,7 +1139,8 @@ impl DispatcherRuntimeHost {
         if operation.is_mutating() {
             self.ensure_effects()?;
         }
-        let response = execute_workspace_filesystem(
+        let limits = self.dispatcher.resource_limits.clone().unwrap_or_default();
+        let response = execute_workspace_filesystem_with_limits(
             std::slice::from_ref(&self.root),
             WorkspaceFilesystemRequest {
                 request_id: Uuid::new_v4(),
@@ -1028,6 +1149,7 @@ impl DispatcherRuntimeHost {
                 timeout_ms: 30_000,
                 operation,
             },
+            &limits,
         )
         .await;
         match response.outcome {
@@ -1055,6 +1177,13 @@ impl RuntimeHost for DispatcherRuntimeHost {
                         args.limit_lines.unwrap_or(2_000),
                         args.max_bytes
                             .unwrap_or(RUNTIME_DEFAULT_FILE_BYTES)
+                            .min(
+                                self.dispatcher
+                                    .resource_limits
+                                    .as_ref()
+                                    .map(|limits| limits.max_file_transfer_bytes)
+                                    .unwrap_or(RUNTIME_MAX_FILE_BYTES),
+                            )
                             .clamp(1, RUNTIME_MAX_FILE_BYTES) as usize,
                     )
                     .await?,
@@ -1096,6 +1225,16 @@ impl RuntimeHost for DispatcherRuntimeHost {
             "exec_command" => {
                 self.ensure_effects()?;
                 let args: RuntimeExecCommandArgs = serde_json::from_value(arguments)?;
+                let output_token_limit = self.dispatcher.resource_limits.as_ref().map(|limits| {
+                    usize::try_from((limits.max_workspace_command_output_bytes / 4).max(1))
+                        .unwrap_or(usize::MAX)
+                });
+                let timeout_limit = self
+                    .dispatcher
+                    .resource_limits
+                    .as_ref()
+                    .map(|limits| limits.max_workspace_command_timeout_ms)
+                    .unwrap_or(RUNTIME_MAX_COMMAND_TIMEOUT_MS);
                 Ok(serde_json::to_value(
                     self.processes
                         .exec(
@@ -1104,9 +1243,16 @@ impl RuntimeHost for DispatcherRuntimeHost {
                             args.cmd,
                             args.workdir.as_deref(),
                             args.yield_time_ms,
-                            args.max_output_tokens,
+                            args.max_output_tokens
+                                .map(|tokens| {
+                                    output_token_limit
+                                        .map(|limit| tokens.min(limit))
+                                        .unwrap_or(tokens)
+                                })
+                                .or(output_token_limit),
                             args.timeout_ms
                                 .unwrap_or(RUNTIME_DEFAULT_COMMAND_TIMEOUT_MS)
+                                .min(timeout_limit)
                                 .clamp(1, RUNTIME_MAX_COMMAND_TIMEOUT_MS),
                             self.session_store.clone(),
                         )
@@ -1134,9 +1280,143 @@ impl RuntimeHost for DispatcherRuntimeHost {
                     )
                     .await
             }
+            "mcp_tools" => self.dispatcher.runtime_mcp_tools().await,
+            "mcp_call" => {
+                let args: RuntimeMcpCallArgs = serde_json::from_value(arguments)?;
+                if args.name != "mcp__borg__search_documents" {
+                    self.ensure_effects()?;
+                }
+                self.dispatcher
+                    .runtime_mcp_call(&args.name, args.arguments)
+                    .await
+            }
+            "history" => {
+                let query: crate::SessionHistoryQuery = serde_json::from_value(arguments)?;
+                let store = self
+                    .session_store
+                    .as_ref()
+                    .context("lossless session history is unavailable for this runtime")?;
+                Ok(serde_json::to_value(
+                    store.query_history(self.session_id, query).await?,
+                )?)
+            }
+            "history_index" => {
+                let args: HistoryIndexArgs = serde_json::from_value(arguments)?;
+                let store = self
+                    .session_store
+                    .as_ref()
+                    .context("lossless session history is unavailable for this runtime")?;
+                history_index_response(store, self.session_id, args).await
+            }
+            "retrieval_adapter" => {
+                let id = arguments
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .context("retrieval adapter id is required")?;
+                self.dispatcher
+                    .call("read_retrieval_adapter", json!({ "id": id }))
+                    .await
+            }
+            "runtime_status" => {
+                let store = self
+                    .session_store
+                    .as_ref()
+                    .context("durable runtime manifests are unavailable for this session")?;
+                Ok(json!({
+                    "manifest": store.runtime_manifest(self.session_id).await?,
+                    "checkpoints": store.list_runtime_checkpoints(self.session_id, 100).await?,
+                }))
+            }
+            "runtime_checkpoint" => {
+                self.ensure_effects()?;
+                let key = arguments
+                    .get("key")
+                    .and_then(Value::as_str)
+                    .context("runtime checkpoint key is required")?;
+                let state = arguments
+                    .get("state")
+                    .cloned()
+                    .context("runtime checkpoint state is required")?;
+                let store = self
+                    .session_store
+                    .as_ref()
+                    .context("durable runtime checkpoints are unavailable for this session")?;
+                Ok(serde_json::to_value(
+                    store
+                        .save_runtime_checkpoint(
+                            self.session_id,
+                            self.runtime_worker_id,
+                            key,
+                            &state,
+                        )
+                        .await?,
+                )?)
+            }
+            "runtime_restore" => {
+                let key = arguments.get("key").and_then(Value::as_str);
+                let store = self
+                    .session_store
+                    .as_ref()
+                    .context("durable runtime checkpoints are unavailable for this session")?;
+                let checkpoint = store
+                    .runtime_checkpoint(self.session_id, key)
+                    .await?
+                    .with_context(|| {
+                        key.map_or_else(
+                            || "runtime has no durable checkpoint".to_string(),
+                            |key| format!("runtime checkpoint `{key}` does not exist"),
+                        )
+                    })?;
+                Ok(serde_json::to_value(checkpoint)?)
+            }
             other => bail!("unknown persistent runtime host operation `{other}`"),
         }
     }
+}
+
+pub(crate) async fn history_index_response(
+    store: &crate::SqliteSessionStore,
+    session_id: Uuid,
+    args: HistoryIndexArgs,
+) -> Result<Value> {
+    const MAX_PAGE_BYTES: usize = 768 * 1024;
+    let after_sequence = args.after_sequence.unwrap_or(0);
+    let limit = args.limit.unwrap_or(1_000).clamp(1, 1_000);
+    let fetched_documents = store
+        .history_index_documents_after(session_id, after_sequence, limit)
+        .await?;
+    let fetched_count = fetched_documents.len();
+    let mut documents = fetched_documents;
+    let mut oversized_document = None;
+    while serde_json::to_vec(&documents)?.len() > MAX_PAGE_BYTES {
+        if documents.len() == 1 {
+            oversized_document = documents.pop().map(|document| {
+                json!({
+                    "document_id": document.document_id,
+                    "event_id": document.event_id,
+                    "sequence": document.sequence,
+                    "content_bytes": document.content.len(),
+                })
+            });
+            break;
+        }
+        documents.pop();
+    }
+    let next_after_sequence = documents
+        .last()
+        .map_or(after_sequence, |document| document.sequence);
+    let page_truncated = documents.len() < fetched_count;
+    let has_more = page_truncated || documents.len() == limit;
+    let page_bytes = serde_json::to_vec(&documents)?.len();
+    Ok(json!({
+        "documents": documents,
+        "after_sequence": after_sequence,
+        "next_after_sequence": next_after_sequence,
+        "has_more": has_more,
+        "page_bytes": page_bytes,
+        "page_truncated": page_truncated,
+        "oversized_document": oversized_document,
+    }))
 }
 
 impl SharedWorkToolContext {
@@ -3162,6 +3442,8 @@ fn default_model_for_cross_provider_peer(provider: CodingProvider) -> Option<Str
     match provider {
         CodingProvider::Codex => Some(borg_provider::codex_product_model().to_string()),
         CodingProvider::Claude => None,
+        CodingProvider::OpenCode => None,
+        CodingProvider::Kimi => Some(borg_provider::kimi_product_model().to_string()),
         CodingProvider::OpenRouter => Some(borg_provider::openrouter_product_model().to_string()),
         CodingProvider::OpenAiCompatible => None,
     }
@@ -3170,9 +3452,11 @@ fn default_model_for_cross_provider_peer(provider: CodingProvider) -> Option<Str
 fn default_effort_for_cross_provider_peer(provider: CodingProvider) -> Option<String> {
     match provider {
         CodingProvider::Codex => Some(borg_provider::codex_default_effort().to_string()),
-        CodingProvider::Claude | CodingProvider::OpenRouter | CodingProvider::OpenAiCompatible => {
-            None
-        }
+        CodingProvider::Kimi => Some(borg_provider::kimi_default_effort().to_string()),
+        CodingProvider::Claude
+        | CodingProvider::OpenCode
+        | CodingProvider::OpenRouter
+        | CodingProvider::OpenAiCompatible => None,
     }
 }
 
@@ -3584,13 +3868,13 @@ fn agent_tool_specs_with_capabilities_and_consultation_and_search(
         ),
         tool(
             "runtime_exec",
-            "Execute Python in the session's persistent programming runtime. Variables, imports, helper functions, and parsed data survive across calls and turns. The `borg` object exposes read, search, exec, and selected Borg tool calls through the host's permission and journal boundary. This is trusted execution, not a sandbox.",
+            "Execute code in the session's persistent Python or optional Bun JavaScript/TypeScript runtime. Variables, imports, helper functions, and parsed data survive across calls and turns. The `borg` object exposes read, filesystem search, lossless history retrieval, a sequence-cursored full-log index feed, versioned retrieval_adapter/test_retrieval_adapter helpers, explicit checkpoints, restore, exec, and selected Borg tool calls through the host's permission and journal boundary. This is trusted execution, not a sandbox.",
             json!({
                 "type": "object",
                 "properties": {
                     "runtime": {
                         "type": "string",
-                        "enum": ["python"],
+                        "enum": ["python", "javascript", "typescript"],
                         "default": "python"
                     },
                     "code": {
@@ -3605,6 +3889,76 @@ fn agent_tool_specs_with_capabilities_and_consultation_and_search(
                     }
                 },
                 "required": ["code"],
+                "additionalProperties": false
+            }),
+        ),
+        tool(
+            "query_history",
+            "Search this session's canonical, lossless event journal. Empty text performs fast exact/typed/sequence retrieval; lexical uses the local FTS5 projection; regex is bounded. Results always resolve to canonical event ids and can expand deferred tool payloads. Use this for programmatic recall instead of relying on the compacted model transcript.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "text": { "type": "string", "maxLength": crate::session_store::MAX_HISTORY_QUERY_BYTES },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["lexical", "regex"],
+                        "default": "lexical"
+                    },
+                    "prefilter": {
+                        "type": "string",
+                        "maxLength": crate::session_store::MAX_HISTORY_QUERY_BYTES,
+                        "description": "Optional required literal terms used by FTS to narrow regex candidates before matching."
+                    },
+                    "event_id": { "type": "string", "format": "uuid" },
+                    "start_sequence": { "type": "integer", "minimum": 1 },
+                    "end_sequence": { "type": "integer", "minimum": 1 },
+                    "event_kinds": {
+                        "type": "array",
+                        "items": { "type": "string", "minLength": 1 },
+                        "maxItems": 64
+                    },
+                    "actors": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": ["user", "assistant", "tool", "system"]
+                        },
+                        "maxItems": 4
+                    },
+                    "newest_first": { "type": "boolean", "default": false },
+                    "case_sensitive": { "type": "boolean", "default": false },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": crate::session_store::MAX_HISTORY_LIMIT,
+                        "default": crate::session_store::DEFAULT_HISTORY_LIMIT
+                    },
+                    "scan_limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": crate::session_store::MAX_HISTORY_SCAN_LIMIT,
+                        "default": crate::session_store::DEFAULT_HISTORY_SCAN_LIMIT
+                    },
+                    "expand_payloads": { "type": "boolean", "default": false },
+                    "max_payload_bytes": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": crate::session_store::MAX_HISTORY_PAYLOAD_BYTES,
+                        "default": crate::session_store::DEFAULT_HISTORY_PAYLOAD_BYTES
+                    }
+                },
+                "additionalProperties": false
+            }),
+        ),
+        tool(
+            "history_index",
+            "Read a bounded, sequence-cursored feed of normalized canonical history documents. Use it to code a task-specific lexical, vector, graph, or BorgSearch retrieval adapter in the persistent runtime; document ids are locators and must be resolved through query_history before treating a hit as authoritative.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "after_sequence": { "type": "integer", "minimum": 0, "default": 0 },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 1000 }
+                },
                 "additionalProperties": false
             }),
         ),
@@ -4079,6 +4433,21 @@ struct RuntimeBorgToolArgs {
     name: String,
     #[serde(default)]
     arguments: Value,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeMcpCallArgs {
+    name: String,
+    #[serde(default)]
+    arguments: Value,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HistoryIndexArgs {
+    after_sequence: Option<u64>,
+    limit: Option<usize>,
 }
 
 #[derive(Deserialize)]

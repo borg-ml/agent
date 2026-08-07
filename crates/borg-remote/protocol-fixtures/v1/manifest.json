@@ -1,0 +1,16 @@
+{
+  "protocol": "borg.agent_runtime",
+  "version": 1,
+  "fixture_schema": 1,
+  "fixtures": [
+    "command-prompt.json",
+    "command-goal.json",
+    "event-message.json",
+    "snapshot.json"
+  ],
+  "compatibility": {
+    "legacy_host_protocol": "borg.remote",
+    "legacy_host_protocol_version": 5,
+    "adapter": "AgentRuntimeCommandEnvelope::from_legacy"
+  }
+}

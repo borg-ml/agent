@@ -1660,6 +1660,52 @@ fn effort_changes_do_not_relabel_usage_from_the_active_turn() {
 }
 
 #[test]
+fn model_changes_do_not_retain_the_old_context_percentage() {
+    let session_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    let configured = |model: &str| SessionEventKind::SessionConfigured {
+        cwd: PathBuf::from("/workspace"),
+        provider: CodingProvider::Codex,
+        model: Some(model.to_string()),
+        effort: Some("xhigh".to_string()),
+        fast: false,
+        response_language: ResponseLanguage::English,
+        permission_mode: PermissionMode::FullAccess,
+    };
+
+    transcript.apply(&SessionEvent::new(session_id, 1, configured("gpt-5.6-sol")));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::ContextWindowUpdated {
+            context_tokens: 137_000,
+            context_window_tokens: 258_400,
+        },
+    ));
+    assert_eq!(transcript.context_status().0, "49% context left");
+
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        3,
+        configured("gpt-5.6-luna"),
+    ));
+    assert_eq!(
+        transcript.context_status(),
+        ("context unknown".to_string(), false)
+    );
+
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        4,
+        SessionEventKind::ContextWindowUpdated {
+            context_tokens: 143_000,
+            context_window_tokens: 258_400,
+        },
+    ));
+    assert_eq!(transcript.context_status().0, "47% context left");
+}
+
+#[test]
 fn correlated_usage_from_another_turn_cannot_poison_cache_diagnostics() {
     let session_id = Uuid::new_v4();
     let active_turn = Uuid::new_v4();
@@ -2451,6 +2497,14 @@ fn shift_or_alt_enter_inserts_a_composer_newline() {
     assert!(is_composer_newline(
         &keymap,
         &KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT | KeyModifiers::SUPER)
+    ));
+    assert!(is_composer_newline(
+        &keymap,
+        &KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL)
+    ));
+    assert!(is_composer_newline(
+        &keymap,
+        &KeyEvent::new(KeyCode::Char('\n'), KeyModifiers::NONE)
     ));
     assert!(!is_composer_newline(
         &keymap,

@@ -121,16 +121,22 @@ impl NativeHarness {
         let mut messages = Vec::with_capacity(turn.conversation.len().saturating_add(3));
         let mut system_prompt = super::agent::CODING_SYSTEM_PROMPT.to_string();
         system_prompt.push_str(
-            "\n\nThe `runtime_exec` tool is a persistent Python control environment for this session. ",
+            "\n\nThe `runtime_exec` tool is a persistent Python/Bun control environment for this session; ",
         );
         system_prompt.push_str(
-            "Use it for programmatic inspection, transformations, reusable helper functions, ",
+            "set runtime to `javascript` or `typescript` when the optional Bun environment is more useful. Use it for programmatic inspection, transformations, reusable helper functions, ",
         );
         system_prompt.push_str(
             "and retaining structured working state across turns; use its `borg` bridge for ",
         );
         system_prompt.push_str(
             "host operations. It is trusted user-authority execution, not a security sandbox. ",
+        );
+        system_prompt.push_str(
+            "Use `query_history` (or `borg.history(...)` inside Python) to retrieve exact, ",
+        );
+        system_prompt.push_str(
+            "typed, lexical, or regex evidence from the lossless journal when compacted context is insufficient. Use `history_index` or `borg.history_index(...)` to page the full normalized log and build a task-specific retrieval or BorgSearch adapter; use `borg.semantic_search(...)` when the scoped Web BorgSearch MCP service is the right candidate retriever; persist mature adapters with `create_retrieval_adapter`, test them with `borg.test_retrieval_adapter(...)`, and resolve every index hit back through canonical history. ",
         );
         system_prompt.push_str(&runtime.context.prompt_appendix());
         if let Some(instruction) = turn.response_language.instruction() {
@@ -669,9 +675,12 @@ impl NativeModelClient for CompatibleModelClient {
         progress: Option<mpsc::UnboundedSender<ProviderProgress>>,
     ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
         let profile = match provider {
+            crate::CodingProvider::Kimi => OpenAiCompatibleProfile::Kimi,
             crate::CodingProvider::OpenRouter => OpenAiCompatibleProfile::OpenRouter,
             crate::CodingProvider::OpenAiCompatible => OpenAiCompatibleProfile::Generic,
-            crate::CodingProvider::Codex | crate::CodingProvider::Claude => {
+            crate::CodingProvider::Codex
+            | crate::CodingProvider::Claude
+            | crate::CodingProvider::OpenCode => {
                 return Err(ProviderCallError {
                     message: format!("{provider:?} does not use Borg's native model client"),
                     trace: ProviderAttemptTrace {

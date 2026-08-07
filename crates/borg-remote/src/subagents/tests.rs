@@ -1,6 +1,9 @@
 use super::*;
+use crate::persistent_runtime::{PersistentRuntimeRegistry, RuntimeHost};
 use crate::{PermissionMode, SessionEventKind};
+use std::collections::BTreeMap;
 use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tempfile::tempdir;
 
 #[test]
@@ -174,6 +177,908 @@ async fn persistent_runtime_supports_a_surf_calibration_notebook() {
     assert_eq!(metrics["value"]["ticks"], 2);
     assert_eq!(metrics["value"]["first_divergence"], 1);
     assert!(metrics["value"]["position_max"].as_f64().unwrap() > 0.24);
+}
+
+#[tokio::test]
+async fn dispatcher_can_select_the_optional_bun_javascript_runtime() {
+    let command = std::env::var("BORG_BUN_RUNTIME").unwrap_or_else(|_| "bun".to_string());
+    if !tokio::process::Command::new(command)
+        .arg("--version")
+        .output()
+        .await
+        .is_ok_and(|output| output.status.success())
+    {
+        return;
+    }
+    let directory = tempdir().unwrap();
+    let session_id = Uuid::new_v4();
+    let dispatcher = AgentToolDispatcher::new(
+        SessionGoalTools::disconnected(),
+        SessionTodoTools::disconnected(),
+        None,
+        crate::LspService::new(directory.path()),
+        CodingProvider::Codex,
+        session_id,
+        false,
+        None,
+        None,
+        directory.path().to_path_buf(),
+        None,
+        None,
+        Vec::new(),
+        None,
+        crate::native_process::ProcessManager::default(),
+        PermissionMode::FullAccess,
+    );
+    let result = dispatcher
+        .call(
+            "runtime_exec",
+            json!({
+                "runtime": "javascript",
+                "code": "answer = 40\nanswer = answer + 2\nanswer"
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result["runtime"], "javascript");
+    assert_eq!(result["value"], 42);
+}
+
+#[tokio::test]
+async fn dispatcher_and_python_share_the_canonical_lossless_history_query() {
+    let command = std::env::var("BORG_PYTHON_RUNTIME").unwrap_or_else(|_| {
+        if cfg!(windows) {
+            "python".to_string()
+        } else {
+            "python3".to_string()
+        }
+    });
+    if !tokio::process::Command::new(command)
+        .arg("--version")
+        .output()
+        .await
+        .is_ok_and(|output| output.status.success())
+    {
+        return;
+    }
+    let directory = tempdir().unwrap();
+    let store = crate::SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
+        .await
+        .unwrap();
+    let session_id = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+    store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::Message {
+                message_id: Uuid::new_v4(),
+                actor: EventActor::User,
+                text: "durable alpha evidence".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            },
+        ))
+        .await
+        .unwrap();
+    let autonomy = store.autonomy_store().await.unwrap();
+    let dispatcher = AgentToolDispatcher::new(
+        SessionGoalTools::disconnected(),
+        SessionTodoTools::disconnected(),
+        None,
+        crate::LspService::new(directory.path()),
+        CodingProvider::Codex,
+        session_id,
+        false,
+        None,
+        None,
+        directory.path().to_path_buf(),
+        None,
+        Some(autonomy),
+        Vec::new(),
+        None,
+        crate::native_process::ProcessManager::default(),
+        PermissionMode::FullAccess,
+    );
+
+    let direct = dispatcher
+        .call("query_history", json!({ "text": "alpha evidence" }))
+        .await
+        .unwrap();
+    assert_eq!(direct["backend"], "sqlite_fts5");
+    assert_eq!(direct["hits"].as_array().unwrap().len(), 1);
+
+    let direct_index = dispatcher
+        .call("history_index", json!({ "after_sequence": 0, "limit": 10 }))
+        .await
+        .unwrap();
+    assert_eq!(direct_index["documents"].as_array().unwrap().len(), 1);
+    assert_eq!(direct_index["next_after_sequence"], 1);
+    assert_eq!(direct_index["page_truncated"], false);
+    assert!(direct_index["page_bytes"].as_u64().unwrap() > 0);
+
+    let through_python = dispatcher
+        .call(
+            "runtime_exec",
+            json!({ "code": "borg.history('alpha evidence')['hits'][0]['event']['sequence']" }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(through_python["value"], 1);
+
+    let through_history_index = dispatcher
+        .call(
+            "runtime_exec",
+            json!({
+                "code": "page = borg.history_index(0, 10)\npage['documents'][0]['content']"
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(
+        through_history_index["value"]
+            .as_str()
+            .is_some_and(|content| content.contains("alpha evidence"))
+    );
+}
+
+#[tokio::test]
+async fn history_index_reports_oversized_documents_without_exceeding_runtime_budget() {
+    let directory = tempdir().unwrap();
+    let store = crate::SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
+        .await
+        .unwrap();
+    let session_id = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+    let event = SessionEvent::new(
+        session_id,
+        0,
+        SessionEventKind::Message {
+            message_id: Uuid::new_v4(),
+            actor: EventActor::User,
+            text: "x".repeat(800_000),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: None,
+        },
+    );
+    let event_id = event.id;
+    store.append(event).await.unwrap();
+
+    let page = history_index_response(
+        &store,
+        session_id,
+        HistoryIndexArgs {
+            after_sequence: Some(0),
+            limit: Some(10),
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(page["documents"].as_array().unwrap().is_empty());
+    assert_eq!(page["next_after_sequence"], 0);
+    assert_eq!(page["has_more"], true);
+    assert_eq!(page["page_truncated"], true);
+    assert!(page["page_bytes"].as_u64().unwrap() < 768 * 1024);
+    assert_eq!(page["oversized_document"]["event_id"], event_id.to_string());
+    assert!(
+        page["oversized_document"]["content_bytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 768 * 1024)
+    );
+}
+
+#[tokio::test]
+async fn persistent_runtime_can_call_only_the_granted_external_mcp_tools() {
+    let command = std::env::var("BORG_PYTHON_RUNTIME").unwrap_or_else(|_| {
+        if cfg!(windows) {
+            "python".to_string()
+        } else {
+            "python3".to_string()
+        }
+    });
+    if !tokio::process::Command::new(&command)
+        .arg("--version")
+        .output()
+        .await
+        .is_ok_and(|output| output.status.success())
+    {
+        return;
+    }
+    let directory = tempdir().unwrap();
+    let dispatcher = AgentToolDispatcher::new(
+        SessionGoalTools::disconnected(),
+        SessionTodoTools::disconnected(),
+        None,
+        crate::LspService::new(directory.path()),
+        CodingProvider::Codex,
+        Uuid::new_v4(),
+        false,
+        None,
+        None,
+        directory.path().to_path_buf(),
+        None,
+        None,
+        Vec::new(),
+        None,
+        crate::native_process::ProcessManager::default(),
+        PermissionMode::FullAccess,
+    );
+    let script = r#"
+read _initialize
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"fake","version":"1"}}}'
+read _initialized
+read _list
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"lookup","description":"Lookup","inputSchema":{"type":"object"}}]}}'
+read _call
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"retrieved"}]}}'
+read _call
+printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"content":[{"type":"text","text":"retrieved"}]}}'
+"#;
+    dispatcher
+        .configure_runtime_mcp(vec![borg_provider::mcp::ExternalMcpServer {
+            name: "retrieval".to_string(),
+            command: "sh".to_string(),
+            args: vec!["-c".to_string(), script.to_string()],
+            env: BTreeMap::new(),
+            allowed_tools: vec!["lookup".to_string()],
+        }])
+        .await
+        .unwrap();
+
+    let result = dispatcher
+        .call(
+            "runtime_exec",
+            json!({
+                "code": "tools = borg.mcp_tools()\nresponse = borg.mcp('mcp__retrieval__lookup', {'query': 'alpha'})\n{'tool': tools[0]['name'], 'text': response['content'][0]['text']}"
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        result["value"],
+        json!({"tool": "mcp__retrieval__lookup", "text": "retrieved"})
+    );
+
+    dispatcher
+        .call(
+            "create_retrieval_adapter",
+            json!({
+                "id": "mcp-ranker",
+                "description": "Use the granted product search boundary",
+                "source": "def retrieve(query):\n    response = borg.mcp('mcp__retrieval__lookup', {'query': query})\n    return {'query': query, 'text': response['content'][0]['text']}\n"
+            }),
+        )
+        .await
+        .unwrap();
+    let adapter_result = dispatcher
+        .call(
+            "runtime_exec",
+            json!({
+                "code": "borg.retrieval_adapter('mcp-ranker', 'beta')"
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        adapter_result["value"],
+        json!({"query": "beta", "text": "retrieved"})
+    );
+}
+
+#[tokio::test]
+async fn read_only_runtime_allows_scoped_semantic_search_only() {
+    let command = std::env::var("BORG_PYTHON_RUNTIME").unwrap_or_else(|_| {
+        if cfg!(windows) {
+            "python".to_string()
+        } else {
+            "python3".to_string()
+        }
+    });
+    if !tokio::process::Command::new(&command)
+        .arg("--version")
+        .output()
+        .await
+        .is_ok_and(|output| output.status.success())
+    {
+        return;
+    }
+    let directory = tempdir().unwrap();
+    let dispatcher = AgentToolDispatcher::new(
+        SessionGoalTools::disconnected(),
+        SessionTodoTools::disconnected(),
+        None,
+        crate::LspService::new(directory.path()),
+        CodingProvider::Codex,
+        Uuid::new_v4(),
+        false,
+        None,
+        None,
+        directory.path().to_path_buf(),
+        None,
+        None,
+        Vec::new(),
+        None,
+        crate::native_process::ProcessManager::default(),
+        PermissionMode::Manual,
+    );
+    let script = r#"
+read _initialize
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"fake","version":"1"}}}'
+read _initialized
+read _list
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"search_documents","description":"Search","inputSchema":{"type":"object"}}]}}'
+read _call
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"semantic hit"}]}}'
+"#;
+    dispatcher
+        .configure_runtime_mcp(vec![borg_provider::mcp::ExternalMcpServer {
+            name: "borg".to_string(),
+            command: "sh".to_string(),
+            args: vec!["-c".to_string(), script.to_string()],
+            env: BTreeMap::new(),
+            allowed_tools: vec!["search_documents".to_string()],
+        }])
+        .await
+        .unwrap();
+
+    let runtime = PersistentRuntimeRegistry::default()
+        .python_for_session(Uuid::new_v4(), directory.path(), None)
+        .await;
+    let host: Arc<dyn RuntimeHost> = Arc::new(DispatcherRuntimeHost {
+        session_id: Uuid::new_v4(),
+        root: directory.path().to_path_buf(),
+        allow_effects: false,
+        dispatcher: dispatcher.clone(),
+        processes: crate::native_process::ProcessManager::default(),
+        session_store: None,
+        runtime_worker_id: runtime.worker_id(),
+    });
+    let result = runtime
+        .execute("borg.semantic_search('alpha')", None, Arc::clone(&host))
+        .await
+        .unwrap();
+    assert_eq!(result.value["content"][0]["text"], "semantic hit");
+
+    let denied = runtime
+        .execute("borg.mcp('mcp__borg__read_document', {})", None, host)
+        .await
+        .expect_err("unapproved MCP calls must remain permission-gated");
+    assert!(
+        denied
+            .to_string()
+            .contains("persistent runtime host mutation")
+    );
+}
+
+#[tokio::test]
+async fn persistent_runtime_rehydrates_explicit_checkpoint_after_worker_restart() {
+    let command = std::env::var("BORG_PYTHON_RUNTIME").unwrap_or_else(|_| {
+        if cfg!(windows) {
+            "python".to_string()
+        } else {
+            "python3".to_string()
+        }
+    });
+    if !tokio::process::Command::new(command)
+        .arg("--version")
+        .output()
+        .await
+        .is_ok_and(|output| output.status.success())
+    {
+        return;
+    }
+    let directory = tempdir().unwrap();
+    let store = crate::SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
+        .await
+        .unwrap();
+    let session_id = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+    let first_autonomy = store.autonomy_store().await.unwrap();
+    let first = AgentToolDispatcher::new(
+        SessionGoalTools::disconnected(),
+        SessionTodoTools::disconnected(),
+        None,
+        crate::LspService::new(directory.path()),
+        CodingProvider::Codex,
+        session_id,
+        false,
+        None,
+        None,
+        directory.path().to_path_buf(),
+        None,
+        Some(first_autonomy),
+        Vec::new(),
+        None,
+        crate::native_process::ProcessManager::default(),
+        PermissionMode::FullAccess,
+    );
+    let first_result = first
+        .call(
+            "runtime_exec",
+            json!({
+                "code": "borg.checkpoint('v1', {'answer': 42, 'cursor': 7})"
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first_result["recovered_from_manifest"], false);
+    assert_eq!(first_result["execution_count"], 1);
+    drop(first);
+
+    let second_autonomy = store.autonomy_store().await.unwrap();
+    let second = AgentToolDispatcher::new(
+        SessionGoalTools::disconnected(),
+        SessionTodoTools::disconnected(),
+        None,
+        crate::LspService::new(directory.path()),
+        CodingProvider::Codex,
+        session_id,
+        false,
+        None,
+        None,
+        directory.path().to_path_buf(),
+        None,
+        Some(second_autonomy),
+        Vec::new(),
+        None,
+        crate::native_process::ProcessManager::default(),
+        PermissionMode::FullAccess,
+    );
+    let status = second
+        .call("runtime_exec", json!({ "code": "borg.runtime_status()" }))
+        .await
+        .unwrap();
+    assert_eq!(status["recovered_from_manifest"], true);
+    assert_eq!(status["value"]["manifest"]["status"], "running");
+    assert_eq!(status["value"]["checkpoints"][0]["key"], "v1");
+
+    let automatically_rehydrated = second
+        .call("runtime_exec", json!({ "code": "answer + cursor" }))
+        .await
+        .unwrap();
+    assert_eq!(automatically_rehydrated["value"], 49);
+
+    let restored = second
+        .call(
+            "runtime_exec",
+            json!({ "code": "borg.restore('v1')['state']['answer']" }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(restored["value"], 42);
+}
+
+#[derive(Clone)]
+struct CanonicalDogfoodExecutor {
+    phase: Arc<AtomicUsize>,
+}
+
+impl CanonicalDogfoodExecutor {
+    fn new() -> Self {
+        Self {
+            phase: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::AgentTurnExecutor for CanonicalDogfoodExecutor {
+    async fn execute(
+        &self,
+        turn: crate::AgentTurn,
+        events: mpsc::Sender<SessionEventKind>,
+        _controls: Option<mpsc::Receiver<crate::AgentTurnControl>>,
+    ) -> Result<crate::AgentTurnResult> {
+        let phase = self.phase.fetch_add(1, Ordering::SeqCst);
+        let final_text = match phase {
+            0 => {
+                let goal = turn
+                    .agent_tools
+                    .call(
+                        "create_goal",
+                        json!({
+                            "objective": "dogfood the canonical persistent workspace",
+                            "token_budget": 10_000
+                        }),
+                    )
+                    .await?;
+                let goal_id = goal["goal"]["id"]
+                    .as_str()
+                    .context("created goal did not return an id")?
+                    .to_string();
+
+                let plan = turn
+                    .agent_tools
+                    .call(
+                        "update_plan",
+                        json!({
+                            "plan": [{
+                                "content": "retrieve, verify, checkpoint, and recover durable state",
+                                "status": "in_progress"
+                            }]
+                        }),
+                    )
+                    .await?;
+                let plan_id = plan["items"][0]["id"]
+                    .as_str()
+                    .context("created plan did not return an id")?
+                    .to_string();
+
+                let index = turn
+                    .agent_tools
+                    .call("history_index", json!({"after_sequence": 0, "limit": 100}))
+                    .await?;
+                let indexed_event_id = index["documents"]
+                    .as_array()
+                    .and_then(|documents| {
+                        documents.iter().find_map(|document| {
+                            document["content"]
+                                .as_str()
+                                .filter(|content| content.contains("lossless-dogfood"))
+                                .and_then(|_| document["event_id"].as_str())
+                        })
+                    })
+                    .context("canonical history index did not contain the prompt")?
+                    .to_string();
+
+                let adapter = turn
+                    .agent_tools
+                    .call(
+                        "create_retrieval_adapter",
+                        json!({
+                            "id": "canonical-dogfood",
+                            "description": "Find durable session events through the canonical history index",
+                            "source": "def retrieve(query):\n    page = borg.history_index(0, 100)\n    return {'query': query, 'event_ids': [row['event_id'] for row in page['documents'] if query and query in row['content']]}\n",
+                            "tests": "def test(retrieve, borg):\n    result = retrieve('lossless-dogfood')\n    assert result['event_ids'], result\n    return {'found': len(result['event_ids'])}\n"
+                        }),
+                    )
+                    .await?;
+                let adapter_revision = adapter["revision"]
+                    .as_str()
+                    .context("created retrieval adapter did not return a revision")?
+                    .to_string();
+
+                let tested = turn
+                    .agent_tools
+                    .call(
+                        "runtime_exec",
+                        json!({
+                            "runtime": "python",
+                            "code": "borg.test_retrieval_adapter('canonical-dogfood')"
+                        }),
+                    )
+                    .await?;
+                anyhow::ensure!(
+                    tested["value"]["passed"] == true,
+                    "model-authored retrieval adapter test failed: {tested}"
+                );
+
+                let retrieved = turn
+                    .agent_tools
+                    .call(
+                        "runtime_exec",
+                        json!({
+                            "runtime": "python",
+                            "code": "borg.retrieval_adapter('canonical-dogfood', 'lossless-dogfood')"
+                        }),
+                    )
+                    .await?;
+                let retrieved_event_id = retrieved["value"]["event_ids"]
+                    .as_array()
+                    .and_then(|ids| ids.first())
+                    .and_then(Value::as_str)
+                    .context("retrieval adapter returned no canonical event id")?
+                    .to_string();
+                anyhow::ensure!(
+                    retrieved_event_id == indexed_event_id,
+                    "adapter did not preserve the indexed canonical locator"
+                );
+
+                let resolved = turn
+                    .agent_tools
+                    .call(
+                        "query_history",
+                        json!({"event_id": retrieved_event_id, "limit": 1}),
+                    )
+                    .await?;
+                anyhow::ensure!(
+                    resolved["hits"]
+                        .as_array()
+                        .is_some_and(|hits| !hits.is_empty()),
+                    "retrieved history locator did not resolve canonically"
+                );
+
+                let checkpoint_state = json!({
+                    "goal_id": goal_id,
+                    "plan_id": plan_id,
+                    "adapter_revision": adapter_revision,
+                    "history_event_id": retrieved_event_id,
+                    "cursor": index["next_after_sequence"]
+                });
+                let checkpoint_code = format!(
+                    "borg.checkpoint('canonical-dogfood', {})",
+                    serde_json::to_string(&checkpoint_state)?
+                );
+                let checkpoint = turn
+                    .agent_tools
+                    .call(
+                        "runtime_exec",
+                        json!({"runtime": "python", "code": checkpoint_code}),
+                    )
+                    .await?;
+                anyhow::ensure!(
+                    checkpoint["value"]["key"] == "canonical-dogfood",
+                    "runtime checkpoint was not persisted"
+                );
+                serde_json::to_string(&json!({
+                    "phase": 1,
+                    "goal_id": goal_id,
+                    "plan_id": plan_id,
+                    "event_id": retrieved_event_id
+                }))?
+            }
+            1 => {
+                let goal = turn.agent_tools.call("get_goal", json!({})).await?;
+                anyhow::ensure!(
+                    goal["goal"]["status"] == "active",
+                    "goal was not recovered as active: {goal}"
+                );
+                let plan = turn.agent_tools.call("get_plan", json!({})).await?;
+                let plan_id = plan["items"][0]["id"]
+                    .as_str()
+                    .context("recovered plan did not contain its id")?
+                    .to_string();
+
+                let status = turn
+                    .agent_tools
+                    .call(
+                        "runtime_exec",
+                        json!({
+                            "runtime": "python",
+                            "code": "borg.runtime_status()"
+                        }),
+                    )
+                    .await?;
+                anyhow::ensure!(
+                    status["recovered_from_manifest"] == true,
+                    "runtime did not report recovery from the prior worker: {status}"
+                );
+                let automatically_restored = turn
+                    .agent_tools
+                    .call(
+                        "runtime_exec",
+                        json!({
+                            "runtime": "python",
+                            "code": "plan_id"
+                        }),
+                    )
+                    .await?;
+                anyhow::ensure!(
+                    automatically_restored["value"] == plan_id,
+                    "checkpoint namespace was not automatically rehydrated: {automatically_restored}"
+                );
+                let restored = turn
+                    .agent_tools
+                    .call(
+                        "runtime_exec",
+                        json!({
+                            "runtime": "python",
+                            "code": "borg.restore('canonical-dogfood')"
+                        }),
+                    )
+                    .await?;
+                anyhow::ensure!(
+                    restored["value"]["state"]["plan_id"] == plan_id,
+                    "checkpoint did not restore the durable plan identity: {restored}"
+                );
+
+                let retrieved = turn
+                    .agent_tools
+                    .call(
+                        "runtime_exec",
+                        json!({
+                            "runtime": "python",
+                            "code": "borg.retrieval_adapter('canonical-dogfood', 'lossless-dogfood')"
+                        }),
+                    )
+                    .await?;
+                anyhow::ensure!(
+                    retrieved["value"]["event_ids"]
+                        .as_array()
+                        .is_some_and(|ids| !ids.is_empty()),
+                    "persisted retrieval adapter did not work after restart"
+                );
+
+                turn.agent_tools
+                    .call(
+                        "update_plan",
+                        json!({
+                            "plan": [{
+                                "id": plan_id,
+                                "content": "retrieve, verify, checkpoint, and recover durable state",
+                                "status": "completed"
+                            }]
+                        }),
+                    )
+                    .await?;
+                let completed = turn
+                    .agent_tools
+                    .call("update_goal", json!({"status": "complete"}))
+                    .await?;
+                anyhow::ensure!(
+                    completed["goal"]["status"] == "complete",
+                    "goal did not reach its terminal state: {completed}"
+                );
+                "{\"phase\":2,\"recovered\":true}".to_string()
+            }
+            other => anyhow::bail!("unexpected dogfood executor phase {other}"),
+        };
+
+        events
+            .send(SessionEventKind::Message {
+                message_id: Uuid::new_v4(),
+                actor: EventActor::Assistant,
+                text: final_text.clone(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            })
+            .await
+            .context("dogfood executor event receiver closed")?;
+        Ok(crate::AgentTurnResult {
+            provider_session_id: Some("canonical-dogfood".to_string()),
+            final_text,
+        })
+    }
+}
+
+async fn run_canonical_dogfood_actor(
+    directory: &Path,
+    session_id: Uuid,
+    store: Arc<crate::SqliteSessionStore>,
+    executor: Arc<dyn crate::AgentTurnExecutor>,
+    send_prompt: bool,
+) -> Result<Vec<crate::SessionEvent>> {
+    let mut session_launch = launch();
+    session_launch.cwd = directory.to_path_buf();
+    session_launch.permission_mode = PermissionMode::FullAccess;
+    session_launch.capabilities.subagents = false;
+    session_launch.capabilities.multiplayer = false;
+
+    let lock_path = directory.join(format!("{session_id}.lock"));
+    let writer = crate::SessionWriterLease::acquire(&lock_path)?;
+    let (command_tx, command_rx) = mpsc::channel(8);
+    let (event_tx, mut event_rx) = mpsc::channel(1_024);
+    let session_root = directory.to_path_buf();
+    let actor = tokio::spawn(async move {
+        crate::run_agent_session_with_store_and_writer(
+            &session_root,
+            session_id,
+            session_launch,
+            command_rx,
+            event_tx,
+            executor,
+            store,
+            writer,
+        )
+        .await
+    });
+
+    let message_id = send_prompt.then(Uuid::new_v4);
+    if let Some(message_id) = message_id {
+        command_tx
+            .send(HostCommand::Prompt {
+                session_id,
+                message_id,
+                text: "lossless-dogfood needle".to_string(),
+                attachments: Vec::new(),
+                output_schema: None,
+                delivery: PromptDelivery::Queue,
+            })
+            .await
+            .context("send canonical dogfood prompt")?;
+    }
+
+    let mut delivered = Vec::new();
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(30), event_rx.recv())
+            .await
+            .context("timed out waiting for canonical dogfood turn")?
+            .context("canonical dogfood actor closed its event stream")?;
+        let completed = matches!(
+            &event.kind,
+            SessionEventKind::TurnCompleted {
+                message_id: completed_id,
+                error: None,
+                ..
+            } if message_id.is_none_or(|message_id| *completed_id == message_id)
+        );
+        delivered.push(event);
+        if completed {
+            break;
+        }
+    }
+
+    command_tx
+        .send(HostCommand::Stop { session_id })
+        .await
+        .context("stop canonical dogfood actor")?;
+    drop(command_tx);
+    tokio::time::timeout(Duration::from_secs(30), actor)
+        .await
+        .context("timed out stopping canonical dogfood actor")??
+        .context("canonical dogfood actor task failed")?;
+    Ok(delivered)
+}
+
+#[tokio::test]
+async fn canonical_runtime_dogfood_completes_goal_through_restart() {
+    let command = std::env::var("BORG_PYTHON_RUNTIME").unwrap_or_else(|_| {
+        if cfg!(windows) {
+            "python".to_string()
+        } else {
+            "python3".to_string()
+        }
+    });
+    if !tokio::process::Command::new(command)
+        .arg("--version")
+        .output()
+        .await
+        .is_ok_and(|output| output.status.success())
+    {
+        return;
+    }
+
+    let directory = tempdir().unwrap();
+    let store = Arc::new(
+        crate::SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
+            .await
+            .unwrap(),
+    );
+    let session_id = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+    let executor = Arc::new(CanonicalDogfoodExecutor::new());
+
+    let first_events = run_canonical_dogfood_actor(
+        directory.path(),
+        session_id,
+        store.clone(),
+        executor.clone(),
+        true,
+    )
+    .await
+    .unwrap();
+    assert!(first_events.iter().any(|event| matches!(
+        event.kind,
+        SessionEventKind::TurnCompleted { error: None, .. }
+    )));
+
+    let second_events =
+        run_canonical_dogfood_actor(directory.path(), session_id, store.clone(), executor, false)
+            .await
+            .unwrap();
+    assert!(second_events.iter().any(|event| matches!(
+        event.kind,
+        SessionEventKind::TurnCompleted { error: None, .. }
+    )));
+
+    let state = store.state(session_id).await.unwrap();
+    assert_eq!(state.goal.unwrap().status, crate::GoalStatus::Complete);
+    assert_eq!(state.todos.len(), 1);
+    assert_eq!(state.todos[0].status, crate::PlanItemStatus::Completed);
+    assert!(
+        store
+            .runtime_checkpoint(session_id, Some("canonical-dogfood"))
+            .await
+            .unwrap()
+            .unwrap()
+            .state["cursor"]
+            .as_u64()
+            .is_some_and(|cursor| cursor > 0)
+    );
 }
 
 async fn bind_test_team(
@@ -887,6 +1792,8 @@ fn every_execution_lane_exposes_the_same_borg_control_plane() {
         "list_workflows",
         "run_workflow",
         "runtime_exec",
+        "query_history",
+        "history_index",
     ];
     for provider in [
         CodingProvider::Codex,

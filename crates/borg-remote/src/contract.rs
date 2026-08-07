@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
@@ -14,6 +15,8 @@ pub const REMOTE_PROTOCOL_VERSION: u16 = 5;
 pub enum CodingProvider {
     Codex,
     Claude,
+    OpenCode,
+    Kimi,
     OpenRouter,
     OpenAiCompatible,
 }
@@ -172,6 +175,8 @@ impl CodingProvider {
         match self {
             Self::Codex => "codex",
             Self::Claude => "claude",
+            Self::OpenCode => "open-code",
+            Self::Kimi => "kimi",
             Self::OpenRouter => "openrouter",
             Self::OpenAiCompatible => "openai-compatible",
         }
@@ -185,6 +190,8 @@ impl CodingProvider {
         match self {
             Self::Codex => "Codex",
             Self::Claude => "Claude",
+            Self::OpenCode => "OpenCode",
+            Self::Kimi => "Kimi",
             Self::OpenRouter => "OpenRouter",
             Self::OpenAiCompatible => "OpenAI-compatible",
         }
@@ -205,6 +212,13 @@ impl CodingProvider {
                     catalog.selectable_models.iter().any(|(id, _)| *id == model)
                 })
             })
+            .or_else(|| (model == borg_provider::kimi_product_model()).then_some(Self::Kimi))
+            .or_else(|| {
+                model
+                    .strip_prefix("opencode/")
+                    .filter(|suffix| !suffix.is_empty())
+                    .map(|_| Self::OpenCode)
+            })
             .or_else(|| {
                 (model == borg_provider::openrouter_product_model()
                     || borg_provider::openrouter_model_entries()
@@ -218,7 +232,8 @@ impl CodingProvider {
         match self {
             Self::Codex => "codex",
             Self::Claude => "claude",
-            Self::OpenRouter | Self::OpenAiCompatible => "borg",
+            Self::OpenCode => "opencode",
+            Self::Kimi | Self::OpenRouter | Self::OpenAiCompatible => "borg",
         }
     }
 
@@ -227,7 +242,7 @@ impl CodingProvider {
     }
 
     pub fn uses_native_harness(self) -> bool {
-        matches!(self, Self::OpenRouter | Self::OpenAiCompatible)
+        matches!(self, Self::Kimi | Self::OpenRouter | Self::OpenAiCompatible)
     }
 }
 
@@ -286,6 +301,147 @@ pub enum HostStatus {
     Offline,
 }
 
+/// Security boundary provided by an enrolled host.
+///
+/// `TrustedUser` is the current local/remote-user mode: Borg bounds requests
+/// and enforces permissions, but the worker still runs ordinary host
+/// processes. `IsolatedHosted` is reserved for a worker that has an
+/// independently enforced container/microVM (or equivalent) boundary. It is
+/// deliberately not inferred from permission mode or from the presence of a
+/// Python/Bun runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum HostExecutionProfile {
+    TrustedUser,
+    IsolatedHosted,
+}
+
+impl Default for HostExecutionProfile {
+    fn default() -> Self {
+        Self::TrustedUser
+    }
+}
+
+/// Host-local resource ceilings applied to model-authored runtime calls and
+/// workspace operations. These are limits, not an isolation boundary: a
+/// hosted worker still needs an independently enforced container/microVM and
+/// a server-side admission decision before it may handle untrusted tenants.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct HostResourceLimits {
+    #[serde(default = "default_max_session_seconds")]
+    pub max_session_seconds: u64,
+    #[serde(default = "default_max_runtime_execution_ms")]
+    pub max_runtime_execution_ms: u64,
+    #[serde(default = "default_max_workspace_command_timeout_ms")]
+    pub max_workspace_command_timeout_ms: u64,
+    #[serde(default = "default_max_workspace_command_output_bytes")]
+    pub max_workspace_command_output_bytes: u64,
+    #[serde(default = "default_max_file_transfer_bytes")]
+    pub max_file_transfer_bytes: u64,
+    #[serde(default = "default_max_concurrent_sessions")]
+    pub max_concurrent_sessions: u32,
+    /// OS-level memory ceiling for an isolated hosted worker, in bytes.
+    #[serde(default = "default_max_memory_bytes")]
+    pub max_memory_bytes: u64,
+    /// CPU quota for an isolated hosted worker, expressed as a percentage of
+    /// one CPU (400 means four CPUs).
+    #[serde(default = "default_max_cpu_percent")]
+    pub max_cpu_percent: u32,
+    /// Maximum process/thread count for an isolated hosted worker.
+    #[serde(default = "default_max_processes")]
+    pub max_processes: u32,
+}
+
+impl Default for HostResourceLimits {
+    fn default() -> Self {
+        Self {
+            max_session_seconds: default_max_session_seconds(),
+            max_runtime_execution_ms: default_max_runtime_execution_ms(),
+            max_workspace_command_timeout_ms: default_max_workspace_command_timeout_ms(),
+            max_workspace_command_output_bytes: default_max_workspace_command_output_bytes(),
+            max_file_transfer_bytes: default_max_file_transfer_bytes(),
+            max_concurrent_sessions: default_max_concurrent_sessions(),
+            max_memory_bytes: default_max_memory_bytes(),
+            max_cpu_percent: default_max_cpu_percent(),
+            max_processes: default_max_processes(),
+        }
+    }
+}
+
+impl HostResourceLimits {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.max_session_seconds > 0,
+            "max session duration must be positive"
+        );
+        anyhow::ensure!(
+            self.max_runtime_execution_ms > 0,
+            "max runtime execution timeout must be positive"
+        );
+        anyhow::ensure!(
+            self.max_workspace_command_timeout_ms > 0,
+            "max workspace command timeout must be positive"
+        );
+        anyhow::ensure!(
+            self.max_workspace_command_output_bytes > 0,
+            "max workspace command output limit must be positive"
+        );
+        anyhow::ensure!(
+            self.max_file_transfer_bytes > 0,
+            "max file transfer limit must be positive"
+        );
+        anyhow::ensure!(
+            self.max_concurrent_sessions > 0,
+            "max concurrent session limit must be positive"
+        );
+        anyhow::ensure!(
+            self.max_memory_bytes > 0,
+            "max memory limit must be positive"
+        );
+        anyhow::ensure!(self.max_cpu_percent > 0, "max CPU limit must be positive");
+        anyhow::ensure!(self.max_processes > 0, "max process limit must be positive");
+        Ok(())
+    }
+}
+
+const fn default_max_session_seconds() -> u64 {
+    24 * 60 * 60
+}
+
+const fn default_max_runtime_execution_ms() -> u64 {
+    30 * 60 * 1000
+}
+
+const fn default_max_workspace_command_timeout_ms() -> u64 {
+    30 * 60 * 1000
+}
+
+const fn default_max_workspace_command_output_bytes() -> u64 {
+    1024 * 1024
+}
+
+const fn default_max_file_transfer_bytes() -> u64 {
+    8 * 1024 * 1024
+}
+
+const fn default_max_concurrent_sessions() -> u32 {
+    16
+}
+
+const fn default_max_memory_bytes() -> u64 {
+    8 * 1024 * 1024 * 1024
+}
+
+const fn default_max_cpu_percent() -> u32 {
+    400
+}
+
+const fn default_max_processes() -> u32 {
+    512
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct ProviderCapability {
@@ -335,6 +491,14 @@ pub struct HostCapabilities {
     pub providers: Vec<ProviderCapability>,
     pub roots: Vec<PathBuf>,
     pub can_launch: bool,
+    /// Legacy payloads default to trusted user execution rather than making a
+    /// security claim they never declared.
+    #[serde(default)]
+    pub execution_profile: HostExecutionProfile,
+    /// Host-local ceilings. The Web control plane may use these for admission
+    /// diagnostics, but it must not treat them as proof of isolation.
+    #[serde(default)]
+    pub resource_limits: HostResourceLimits,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_attachment: Option<WorkspaceAttachmentCapabilities>,
 }
@@ -446,6 +610,56 @@ pub struct RemoteHost {
     pub identity: Option<RemoteHostIdentity>,
 }
 
+/// Ephemeral, Web-issued MCP capability material for a canonical host turn.
+/// The host fetches this over the authenticated control channel after launch,
+/// so the relay's durable launch command never contains the short-lived token.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct RuntimeMcpServer {
+    pub name: String,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    /// Opaque Web-issued references for environment values that are resolved
+    /// just before the provider process starts. References never contain the
+    /// secret itself.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub secret_refs: BTreeMap<String, String>,
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct RuntimeMcpContext {
+    /// Web audience binding for this ephemeral grant. Older control planes
+    /// omit it and remain compatible; enrolled hosts validate it whenever it
+    /// is present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_id: Option<Uuid>,
+    /// The grant lifetime is separate from the provider token itself so the
+    /// host can reject stale or unexpectedly long-lived control-plane data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issued_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
+    pub owner_id: Option<String>,
+    #[serde(default)]
+    pub allowed_scopes: Vec<String>,
+    pub user_id: Option<String>,
+    #[serde(default)]
+    pub external_servers: Vec<RuntimeMcpServer>,
+    pub api_token: Option<String>,
+    /// Backward-compatible alternative to `api_token`: the host resolves this
+    /// through the authenticated control plane before launching Borg MCP.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_token_ref: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct LaunchSession {
@@ -480,6 +694,21 @@ pub struct LaunchSession {
     pub team_policy: Option<crate::TeamPolicy>,
 }
 
+impl RuntimeMcpContext {
+    pub(crate) fn provider_external_servers(&self) -> Vec<borg_provider::mcp::ExternalMcpServer> {
+        self.external_servers
+            .iter()
+            .map(|server| borg_provider::mcp::ExternalMcpServer {
+                name: server.name.clone(),
+                command: server.command.clone(),
+                args: server.args.clone(),
+                env: server.env.clone(),
+                allowed_tools: server.allowed_tools.clone(),
+            })
+            .collect()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct SessionCapabilities {
@@ -496,6 +725,16 @@ pub struct SessionCapabilities {
     /// by local and enrolled hosts.
     #[serde(default)]
     pub provider_capabilities: Vec<ProviderCapability>,
+    /// Populated by an enrolled host after fetching the authenticated Web
+    /// context grant. It is intentionally omitted from serialized launch
+    /// state so short-lived credentials never enter the relay journal.
+    #[serde(default, skip_serializing)]
+    pub runtime_mcp_context: Option<RuntimeMcpContext>,
+    /// Effective host limits for this session. This is populated by the
+    /// canonical host and is never accepted as authority when supplied by a
+    /// remote controller.
+    #[serde(default, skip_serializing)]
+    pub resource_limits: Option<HostResourceLimits>,
 }
 
 impl Default for SessionCapabilities {
@@ -510,6 +749,8 @@ impl Default for SessionCapabilities {
             web_relay: true,
             telemetry: false,
             provider_capabilities: Vec::new(),
+            runtime_mcp_context: None,
+            resource_limits: None,
         }
     }
 }
@@ -528,6 +769,8 @@ pub fn provider_capabilities_prompt(capabilities: &[ProviderCapability]) -> Stri
     for provider in [
         CodingProvider::Codex,
         CodingProvider::Claude,
+        CodingProvider::OpenCode,
+        CodingProvider::Kimi,
         CodingProvider::OpenRouter,
         CodingProvider::OpenAiCompatible,
     ] {
@@ -597,6 +840,23 @@ pub struct EffectiveCapabilities {
 }
 
 impl SessionCapabilities {
+    /// Apply dependency intersection at the execution boundary. A controller
+    /// may request a capability, but it cannot make a dependent feature
+    /// effective when its prerequisite was denied.
+    pub fn apply_dependency_intersection(&mut self) -> EffectiveCapabilities {
+        if !self.subagents {
+            self.autonomous_team = false;
+        }
+        if !self.multiplayer {
+            self.shared_work = false;
+            self.presence = false;
+        }
+        if !self.cloud_sync {
+            self.web_relay = false;
+        }
+        self.effective()
+    }
+
     pub fn effective(&self) -> EffectiveCapabilities {
         let states = [
             (SessionCapability::Multiplayer, self.multiplayer, None),
@@ -1431,6 +1691,12 @@ pub enum SessionEventKind {
     ProviderCapabilitiesUpdated {
         providers: Vec<ProviderCapability>,
     },
+    /// The host-normalized capability intersection for this session. It is
+    /// durable metadata so a reconnect does not reinterpret a controller's
+    /// requested flags differently from the original actor.
+    EffectiveCapabilitiesUpdated {
+        capabilities: EffectiveCapabilities,
+    },
     /// Effective provider configuration captured for one admitted turn.
     ///
     /// `SessionConfigured` may change while this turn is still running; this
@@ -1805,6 +2071,62 @@ mod tests {
         );
     }
 
+    #[test]
+    fn dependency_intersection_cannot_leave_dependent_flags_enabled() {
+        let mut capabilities = SessionCapabilities {
+            multiplayer: false,
+            subagents: false,
+            cloud_sync: false,
+            shared_work: true,
+            presence: true,
+            autonomous_team: true,
+            web_relay: true,
+            telemetry: true,
+            ..Default::default()
+        };
+
+        let effective = capabilities.apply_dependency_intersection();
+
+        assert!(!capabilities.shared_work);
+        assert!(!capabilities.presence);
+        assert!(!capabilities.autonomous_team);
+        assert!(!capabilities.web_relay);
+        assert!(effective.active.contains(&SessionCapability::Telemetry));
+    }
+
+    #[test]
+    fn runtime_mcp_grants_are_in_memory_only_and_convert_to_provider_servers() {
+        let context = RuntimeMcpContext {
+            session_id: None,
+            host_id: None,
+            issued_at: None,
+            expires_at: None,
+            owner_id: Some("thread:owner".to_string()),
+            allowed_scopes: vec!["documents.read".to_string()],
+            user_id: Some("user".to_string()),
+            external_servers: vec![RuntimeMcpServer {
+                name: "workspace".to_string(),
+                command: "borg-mcp".to_string(),
+                args: vec!["serve".to_string()],
+                env: [("BORG_TOKEN".to_string(), "secret".to_string())]
+                    .into_iter()
+                    .collect(),
+                secret_refs: BTreeMap::new(),
+                allowed_tools: vec!["mcp__workspace__read".to_string()],
+            }],
+            api_token: Some("short-lived".to_string()),
+            api_token_ref: None,
+        };
+        let servers = context.provider_external_servers();
+        assert_eq!(servers[0].name, "workspace");
+        assert_eq!(servers[0].args, ["serve"]);
+
+        let mut capabilities = SessionCapabilities::default();
+        capabilities.runtime_mcp_context = Some(context);
+        let serialized = serde_json::to_value(capabilities).unwrap();
+        assert!(serialized.get("runtime_mcp_context").is_none());
+    }
+
     use super::*;
 
     #[test]
@@ -1842,6 +2164,10 @@ mod tests {
         }))
         .unwrap();
         assert!(capabilities.workspace_attachment.is_none());
+        assert_eq!(
+            capabilities.execution_profile,
+            HostExecutionProfile::TrustedUser
+        );
 
         let command: HostCommand = serde_json::from_value(json!({
             "type": "launch",
@@ -2047,6 +2373,11 @@ pub struct HostCommandEnvelope {
     pub id: Uuid,
     pub sequence: u64,
     pub created_at: DateTime<Utc>,
+    /// Ephemeral server-issued lease fence. It is absent for commands created
+    /// before claim fencing was introduced and is never part of command
+    /// semantics themselves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_token: Option<Uuid>,
     pub command: HostCommand,
 }
 
@@ -2058,6 +2389,9 @@ pub struct HostHeartbeat {
     pub hostname: String,
     pub capabilities: HostCapabilities,
     pub acknowledged_command_sequence: u64,
+    /// Fence for the highest claimed command acknowledged by this host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acknowledged_command_claim_token: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<RemoteHostIdentity>,
 }

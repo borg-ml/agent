@@ -14,7 +14,6 @@ use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 use uuid::Uuid;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-const WRITE_TRANSACTION: &str = "BEGIN IMMEDIATE";
 const WORKSPACE_SCHEMA_VERSION: i64 = 2;
 
 /// Stable identity for the local OS user across all personal workspaces in one
@@ -671,7 +670,7 @@ impl SqliteWorkspaceStore {
         Ok(result)
     }
     async fn write(&self) -> Result<Transaction<'static, Sqlite>, sqlx::Error> {
-        self.pool.begin_with(WRITE_TRANSACTION).await
+        crate::SqliteSessionStore::begin_sqlite_write(&self.pool).await
     }
     async fn schema(&self) -> Result<()> {
         sqlx::raw_sql(r#"
@@ -1319,19 +1318,21 @@ impl WorkspaceStore for SqliteWorkspaceStore {
             l.expires_at > Utc::now(),
             "presence lease must expire in the future"
         );
+        let mut transaction = crate::SqliteSessionStore::begin_sqlite_write(&self.pool).await?;
         let member: i64 = sqlx::query_scalar(
             "select exists(select 1 from workspace_members \
              where workspace_id=? and participant_id=?)",
         )
         .bind(l.workspace_id.to_string())
         .bind(l.participant_id.to_string())
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *transaction)
         .await?;
         ensure!(
             member != 0,
             "presence participant is not a workspace member"
         );
-        sqlx::query("insert into workspace_presence_leases values(?,?,?,?,?) on conflict(workspace_id,participant_id,client_id) do update set host_id=excluded.host_id,expires_at=excluded.expires_at").bind(l.workspace_id.to_string()).bind(l.participant_id.to_string()).bind(l.client_id.to_string()).bind(l.host_id.map(|x|x.to_string())).bind(l.expires_at.to_rfc3339()).execute(&self.pool).await?;
+        sqlx::query("insert into workspace_presence_leases values(?,?,?,?,?) on conflict(workspace_id,participant_id,client_id) do update set host_id=excluded.host_id,expires_at=excluded.expires_at").bind(l.workspace_id.to_string()).bind(l.participant_id.to_string()).bind(l.client_id.to_string()).bind(l.host_id.map(|x|x.to_string())).bind(l.expires_at.to_rfc3339()).execute(&mut *transaction).await?;
+        transaction.commit().await?;
         Ok(())
     }
     async fn active_presence(&self, w: Uuid, now: DateTime<Utc>) -> Result<Vec<PresenceLease>> {
@@ -1361,6 +1362,7 @@ impl WorkspaceStore for SqliteWorkspaceStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SessionStore;
 
     #[test]
     fn local_human_identity_is_stable_across_workspaces() {
@@ -1466,6 +1468,68 @@ mod tests {
                 .to_string()
                 .contains("not a workspace member")
         );
+    }
+
+    #[tokio::test]
+    async fn workspace_writes_wait_through_extended_writer_contention() {
+        let directory = tempfile::tempdir().unwrap();
+        let session_store =
+            crate::SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
+                .await
+                .unwrap();
+        let store = session_store.workspace_store().await.unwrap().unwrap();
+        let workspace = Workspace {
+            id: Uuid::new_v4(),
+            name: "contention".into(),
+            created_at: Utc::now(),
+        };
+        let author = Participant {
+            id: Uuid::new_v4(),
+            display_name: "author".into(),
+            kind: ParticipantKind::Agent,
+            created_at: Utc::now(),
+        };
+        store.create_workspace(workspace.clone()).await.unwrap();
+        store.create_participant(author.clone()).await.unwrap();
+        store
+            .add_member(WorkspaceMembership {
+                workspace_id: workspace.id,
+                participant_id: author.id,
+                role: WorkspaceRole::Editor,
+                joined_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+
+        let blocker = session_store
+            .pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .unwrap();
+        let append_store = store.clone();
+        let append = tokio::spawn(async move {
+            append_store
+                .append(event(
+                    workspace.id,
+                    author.id,
+                    Audience::Workspace,
+                    "contention",
+                ))
+                .await
+        });
+
+        tokio::time::sleep(Duration::from_secs(5) + Duration::from_millis(250)).await;
+        assert!(
+            !append.is_finished(),
+            "workspace writes must wait instead of failing on the busy timeout"
+        );
+
+        blocker.rollback().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), append)
+            .await
+            .expect("workspace write did not resume after the writer lock cleared")
+            .expect("workspace write task panicked")
+            .expect("workspace write failed after the writer lock cleared");
     }
 
     fn event(w: Uuid, a: Uuid, audience: Audience, key: &str) -> WorkspaceEvent {

@@ -983,6 +983,52 @@ impl HostBridge {
                     self.block_on(dispatcher.call(&name, arguments))
                 })?
             }
+            "history" => {
+                let query: crate::SessionHistoryQuery =
+                    serde_json::from_value(guest_json(args, 1, "query_json")?)?;
+                let request = serde_json::to_value(&query)?;
+                let store = self.journal.store.clone();
+                self.journal.call(call_id, operation, request, || {
+                    Ok(serde_json::to_value(
+                        self.block_on(store.query_history(self.session_id, query))?,
+                    )?)
+                })?
+            }
+            "history_index" => {
+                let query = guest_json(args, 1, "query_json")?;
+                let index_args: crate::subagents::HistoryIndexArgs =
+                    serde_json::from_value(query.clone())?;
+                let store = self.journal.store.clone();
+                self.journal.call(call_id, operation, query, || {
+                    self.block_on(crate::subagents::history_index_response(
+                        &store,
+                        self.session_id,
+                        index_args,
+                    ))
+                })?
+            }
+            "mcp_tools" => {
+                let dispatcher = self
+                    .dispatcher
+                    .clone()
+                    .context("Borg agent tools are unavailable")?;
+                self.journal.call(call_id, operation, json!({}), || {
+                    self.block_on(dispatcher.runtime_mcp_tools())
+                })?
+            }
+            "mcp" => {
+                self.require_full_access(operation)?;
+                let name = guest_string(args, 1, "name")?;
+                let arguments = guest_json(args, 2, "arguments_json")?;
+                let request = json!({ "name": name, "arguments": arguments });
+                let dispatcher = self
+                    .dispatcher
+                    .clone()
+                    .context("Borg agent tools are unavailable")?;
+                self.journal.call(call_id, operation, request, || {
+                    self.block_on(dispatcher.runtime_mcp_call(&name, arguments))
+                })?
+            }
             "enqueue" => {
                 self.require_full_access(operation)?;
                 let key = guest_string(args, 1, "idempotency_key")?;
@@ -1164,6 +1210,10 @@ fn execute_blu_source(
     for (name, operation, bridge) in [
         ("borg_emit", "emit", bridge.clone()),
         ("borg_tool", "tool", bridge.clone()),
+        ("borg_history", "history", bridge.clone()),
+        ("borg_history_index", "history_index", bridge.clone()),
+        ("borg_mcp_tools", "mcp_tools", bridge.clone()),
+        ("borg_mcp", "mcp", bridge.clone()),
         ("borg_enqueue", "enqueue", bridge.clone()),
         ("borg_job", "job", bridge.clone()),
         ("borg_checkpoint", "checkpoint", bridge.clone()),
@@ -1567,6 +1617,71 @@ mod tests {
                 ))
                 .count(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn blu_history_reads_the_same_canonical_journal_without_full_access() {
+        let runner = runner(PermissionMode::Manual).await;
+        runner
+            .store
+            .append(SessionEvent::new(
+                runner.session_id,
+                0,
+                SessionEventKind::Message {
+                    message_id: Uuid::new_v4(),
+                    actor: crate::EventActor::User,
+                    text: "durable Blu retrieval evidence".to_string(),
+                    attachments: Vec::new(),
+                    status: crate::MessageStatus::Complete,
+                    delivery: None,
+                },
+            ))
+            .await
+            .expect("message");
+        let result = runner
+            .run(BluWorkflowRequest {
+                workflow_id: Uuid::new_v4(),
+                name: "history".to_string(),
+                source: r#"return borg_history(1, "{\"text\":\"Blu retrieval\",\"event_kinds\":[\"message\"]}")"#.to_string(),
+            })
+            .await
+            .expect("run");
+        assert!(result.success, "{result:?}");
+        let page: crate::SessionHistoryPage = serde_json::from_str(
+            result.values[0]
+                .as_str()
+                .expect("history returns encoded JSON"),
+        )
+        .expect("history page");
+        assert_eq!(page.hits.len(), 1);
+        assert_eq!(page.hits[0].event.session_id, runner.session_id);
+
+        let index_result = runner
+            .run(BluWorkflowRequest {
+                workflow_id: Uuid::new_v4(),
+                name: "history-index".to_string(),
+                source: r#"return borg_history_index(1, "{\"after_sequence\":0,\"limit\":10}")"#
+                    .to_string(),
+            })
+            .await
+            .expect("run history index");
+        assert!(index_result.success, "{index_result:?}");
+        let index: serde_json::Value = serde_json::from_str(
+            index_result.values[0]
+                .as_str()
+                .expect("history index returns encoded JSON"),
+        )
+        .expect("history index page");
+        let documents = index["documents"].as_array().expect("history documents");
+        assert!(documents.iter().any(|document| {
+            document["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("durable Blu retrieval evidence"))
+        }));
+        assert_eq!(
+            index["next_after_sequence"],
+            documents.last().expect("last history document")["sequence"]
         );
     }
 

@@ -171,10 +171,15 @@ the same session namespace rather than provider-specific copies.
 The initial worker intentionally has no `ipykernel` dependency. It supports a
 normal persistent Python namespace, final-expression values, top-level await,
 captured stdout/stderr, and a small `borg` bridge (`read`, `search`, `exec`,
-`write`, and selected Borg tool calls). It is not yet an IPython kernel: IPython magics,
-rich display protocols, kernel extensions, and notebook-style comms are future
-adapter work. The selected Python environment still determines which packages
-are importable; Blu hot reload does not install Python or Bun dependencies.
+`history`, `runtime_status`, `checkpoint`, `restore`, `write`, and selected
+Borg tool calls). `search` searches workspace files; `history` queries the
+session's canonical event journal. It is not yet an IPython kernel: IPython
+magics, rich display protocols, kernel extensions, and notebook-style comms
+are future adapter work. When `bun` is installed, `runtime = "javascript"`
+or `runtime = "typescript"` selects a persistent Bun VM with the same host
+bridge; use an explicit `return` for an asynchronous JavaScript/TypeScript
+result. The selected environment still determines which packages are
+importable; Blu hot reload does not install Python or Bun dependencies.
 
 The lifecycle is:
 
@@ -185,16 +190,122 @@ execute ↔ Borg host-call bridge ↔ filesystem/process/Borg tools
         ↓ next runtime_exec / next native turn
 same in-memory namespace
         ↓ error, timeout, cancellation, or session teardown
-worker is killed; state is lost unless the skill writes an artifact
+worker is killed; the durable runtime manifest records the worker boundary
+and the last execution hash
+        ↓ next Borg process claims the same session
+new worker starts; the latest checkpoint is automatically applied to ordinary
+public identifiers, and `borg.runtime_status()` reports recovery/checkpoints
+        ↓ optional explicit restore
+`state = borg.restore("checkpoint-key")["state"]` reads the full JSON data
 ```
 
-The worker is trusted user-authority execution, not a sandbox. Runtime calls
+The worker is trusted user-authority execution, not a sandbox. In the
+canonical `isolated_hosted` service, model-authored shell commands, external
+workflow processes, and native MCP children receive the same fixed non-secret
+environment; explicitly declared MCP environment entries are the only
+additional variables. Runtime calls
 are permission-gated, host mutations use Borg's filesystem/process boundary,
-and command output is bounded. There is no kernel snapshot or namespace
-replay across a Borg process restart yet, so calibration skills should persist
-source traces, parameter sets, and comparison summaries as explicit files.
-Blu remains the small embedded extension/workflow backend; Python/IPython and
-Bun remain selectable supervised workers for cases that need their ecosystems.
+command output is bounded, and the worker starts with a fixed non-secret
+environment rather than inheriting provider, deployment, or control-plane
+variables. This environment hygiene is a credential-reduction measure, not a
+replacement for a container or microVM when hostile multi-tenant code is in
+scope. Borg does not replay arbitrary code after a
+restart: the session store owns a versioned runtime manifest and named,
+content-addressed JSON checkpoints. A skill that wants recovery should call
+`borg.checkpoint("name", {"parameters": ..., "cursor": ...})` at a safe
+boundary. After a worker restart, only public identifier keys are hydrated
+into the namespace; `borg.restore` remains available for the full checkpoint,
+and arbitrary Python objects/executable code are never replayed.
+The manifest also records worker ownership, execution count, and the last code
+hash, making restart and provenance visible without pretending that a Python
+heap can be serialized losslessly. Blu remains the small embedded
+extension/workflow backend; Python/IPython and Bun remain selectable
+supervised workers for cases that need their ecosystems.
+
+## Lossless history retrieval
+
+The durable SQLite journal is the authority for normalized model-visible
+inputs, messages, tool calls/results, workflow and child-agent events,
+approvals, goals, plans, and external outcomes. Large tool inputs and outputs
+remain lossless payload blobs referenced by compact event rows. Streaming UI
+deltas and redundant provider wire telemetry may still be coalesced or omitted;
+the guarantee is a replayable semantic execution record, not a packet capture.
+
+`query_history` exposes one provider-neutral read contract to native models,
+Codex/Claude/OpenCode MCP lanes, Blu workflows, and the persistent Python bridge:
+
+- empty `text`: exact event-id, typed actor/kind, and inclusive sequence-range
+  reads over canonical rows;
+- `mode=lexical`: tenant-scoped SQLite FTS5 discovery;
+- `mode=regex`: a bounded Rust regex scan, optionally narrowed first with a
+  literal `prefilter` through FTS;
+- `expand_payloads=true`: bounded expansion of deferred payloads under one
+  aggregate response byte budget.
+
+The FTS table is a rebuildable projection. It is updated in the same SQLite
+transaction as each durable append and backfilled from event rows and payload
+blobs when an existing store opens. Every result is rehydrated from
+`session_events`; search snippets and scores are discovery aids, never the
+source of truth. Forks retain projected child event ids/sequences. Their
+inherited prefix currently uses a bounded lineage scan for exact semantics,
+while root-session queries use indexed SQL directly.
+
+External semantic search follows the same rule. The store exports a
+sequence-cursored `SessionHistoryIndexDocument` feed with stable
+`borg-session-event:v1:<session-id>:<event-id>` locators and full searchable
+content. BorgSearch/Vespa may index that feed using the workspace as
+`owner_id`, but a semantic hit must be resolved back through `query_history`
+by event id before the model treats it as evidence. Vespa can therefore be
+dropped and rebuilt without losing memory, and it cannot silently replace or
+mutate the journal.
+
+Persistent Python/Bun runtimes expose the same feed as
+`borg.history_index(after_sequence, limit)`, and Blu exposes it as
+`borg_history_index(call_id, query_json)`. An agent can page the complete log
+into its durable namespace, build a task-specific lexical/vector/graph
+retriever, or submit the records to BorgSearch through an approved adapter;
+the returned ids and cursors remain locators, and canonical event resolution
+still happens through `borg.history(...)` or `query_history`.
+
+When Web or a host launch supplies a scoped external MCP grant, the persistent
+runtime also exposes `borg.mcp_tools()` and `borg.mcp(name, arguments)`. It
+provides `borg.semantic_search(query, ...)` as a small convenience for the
+scoped `mcp__borg__search_documents` BorgSearch service; this is still
+candidate retrieval, not a history or source authority. That one exact search
+call is available to a read-only runtime; arbitrary `borg.mcp(...)` calls still
+require Full Access because the host cannot infer whether an external MCP tool
+mutates state. These calls use the same namespaced MCP tools and credentials as
+the provider turn and start clients lazily. This lets an agent build
+a matter- or task-specific BorgSearch retriever in code while keeping the MCP
+server, workspace scope, and domain records authoritative outside the runtime.
+Blu workflows have the equivalent `borg_mcp_tools(call_id)` and
+`borg_mcp(call_id, name, arguments_json)` host functions; their calls are
+journaled with the workflow id and replayed idempotently.
+
+## Versioned retrieval adapters
+
+Native turns can persist a task-specific retriever under
+`.borg/retrievers/<id>`. `create_retrieval_adapter` stores a bounded Python or
+JavaScript source file with a `retrieve(query)` entrypoint and optional
+`test(retrieve, borg)` source. `list_retrieval_adapters` and
+`read_retrieval_adapter` expose the manifest, source, tests, and immutable
+revision history; `rollback_retrieval_adapter` atomically restores an earlier
+revision while archiving the current one.
+
+The persistent runtime helpers `borg.retrieval_adapter(id, query)` and
+`borg.test_retrieval_adapter(id)` load the matching language adapter through
+the host boundary. Adapter code can page `history_index`, call a scoped MCP
+retrieval service, or combine local ranking logic, but its output is only a
+candidate set. A caller must resolve returned event locators with
+`borg.history(..., event_id=...)` / `query_history` before using them as
+evidence. Adapter revisions therefore improve retrieval ergonomics without
+creating a second memory or semantic-state authority.
+
+The ignored `large_session_history_query_p95_gate` regression fixture builds a
+25,000-event journal. On the development host on 2026-08-07, an unoptimized
+test build measured about 0.7 ms p95 for a rare FTS hit and 39 ms p95 for a
+regex narrowed by FTS. These are local regression measurements, not hosted
+service latency claims.
 
 ## Compatibility
 
@@ -202,3 +313,11 @@ Legacy `.borg/extensions/*.toml` and user `extensions/*.toml` manifests are
 still discovered. Moving one into `<id>/blu.toml` opts into the package layout
 without changing manifest version 1. The original `borg extensions` and
 `borg extensions --json` list forms remain stable.
+
+Self-authored project skills and Blu extension packages carry a human version
+and a content revision. Replacing one atomically archives the previous package
+under `.versions/` (bounded to 32 revisions); `rollback_plugin` and
+`rollback_blu_extension` restore a selected revision while archiving the
+current one. A workflow execution remains the test/evidence boundary: its
+source revision and idempotent result are recorded before the next turn can
+use the package.

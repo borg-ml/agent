@@ -30,7 +30,8 @@ Automatic updates and their check interval are configurable.
 - a responsive terminal UI with durable resume, steering, compaction, image
   input, transcript selection, and configurable keybindings;
 - Codex and Claude subscription providers when the optional subscription
-  adapters are enabled, plus OpenRouter and explicitly configured
+  adapters are enabled, OpenCode's JSON subprocess protocol, Kimi's managed
+  OpenAI-compatible route, plus OpenRouter and explicitly configured
   OpenAI-compatible providers;
 - a standalone `borg-core` contract crate with no provider SDK, HTTP, MCP, or
   subprocess dependency;
@@ -98,6 +99,15 @@ Blu runtimes are trusted processes, not sandboxes. Project MCP remains disabled
 unless explicitly enabled. Remote host URLs require HTTPS, except for
 loopback HTTP development servers, and host configuration files are written
 with private permissions.
+
+An enrolled host persists its execution profile in its private host config.
+Set `BORG_HOST_EXECUTION_PROFILE=isolated_hosted` only when the host process is
+inside an independently enforced container or microVM; otherwise leave it at
+the safe `trusted_user` default. Borg Web still requires its own server-owned
+host allowlist before using that profile for hosted model-authored code.
+At enrollment, the `BORG_HOST_MAX_*` resource-limit variables can lower (never
+raise) the persisted ceilings for session duration, runtime/command timeouts,
+command output, file transfer, and concurrent sessions.
 
 Resume paints a bounded recent conversation synchronously, then fetches older
 pages only when you scroll. Restored subagents remain dormant metadata until an

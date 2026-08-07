@@ -179,6 +179,7 @@ impl NativeMcpClient {
 
     async fn spawn(server: &ExternalMcpServer) -> Result<Self> {
         let mut command = Command::new(&server.command);
+        crate::process_environment::configure_host_child_environment(&mut command);
         command
             .args(&server.args)
             .envs(&server.env)

@@ -595,6 +595,11 @@ impl Transcript {
             Some("left click expand · right click copy output")
         } else if code_view
             .as_ref()
+            .is_some_and(|(language, body)| language == "reasoning" && !body.trim().is_empty())
+        {
+            Some("left click expand · right click copy thinking")
+        } else if code_view
+            .as_ref()
             .is_some_and(|(_, body)| !body.trim().is_empty())
         {
             Some("left click expand · right click copy tool call")
@@ -784,6 +789,9 @@ impl Transcript {
                 permission_mode,
                 ..
             } => {
+                let context_identity_changed = self.config.as_ref().is_some_and(|old| {
+                    old.provider != *provider || old.model.as_ref() != model.as_ref()
+                });
                 self.config = Some(SessionDisplayConfig {
                     cwd: cwd.clone(),
                     provider: *provider,
@@ -793,6 +801,13 @@ impl Transcript {
                     fast: *fast,
                     permission_mode: *permission_mode,
                 });
+                if context_identity_changed {
+                    // Context usage belongs to the provider/model identity that
+                    // produced it. Do not carry the old model's percentage over
+                    // while the new provider is preparing its first report.
+                    self.context_known = false;
+                    self.context_remaining_percent = 100;
+                }
             }
             SessionEventKind::TurnStarted {
                 message_id,

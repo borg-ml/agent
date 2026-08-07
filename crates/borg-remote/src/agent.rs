@@ -11,6 +11,7 @@ use borg_provider::provider::{
     run_claude_chat_stream_with_control, run_claude_local_chat_stream,
     run_claude_local_chat_stream_pooled, run_codex_chat_stream_with_control,
     run_codex_local_chat_stream, run_codex_local_chat_stream_pooled,
+    run_opencode_local_chat_stream,
 };
 use borg_provider::{ProviderCallUsage, ProviderChannel};
 use serde_json::Value;
@@ -83,6 +84,10 @@ pub struct AgentTurn {
     pub agent_tools: crate::AgentToolDispatcher,
     /// Product/user MCP integrations available to a Borg-native turn.
     pub external_mcp_servers: Vec<borg_provider::mcp::ExternalMcpServer>,
+    /// Scoped Web MCP identity and token fetched for this host session. The
+    /// session actor keeps it in memory and provider setup consumes it only
+    /// for the current request.
+    pub runtime_mcp_context: crate::RuntimeMcpContext,
     /// Trusted extension-owned skill roots supplied by the launch contract.
     pub extension_skill_roots: Vec<PathBuf>,
     /// Executable workflows from the same atomic extension snapshot as the
@@ -369,7 +374,10 @@ impl SubscriptionPoolRegistry {
                     CodingProvider::Codex => {
                         SubscriptionPool::Codex(CodexSubscriptionPool::default())
                     }
-                    CodingProvider::OpenRouter | CodingProvider::OpenAiCompatible => {
+                    CodingProvider::OpenCode
+                    | CodingProvider::Kimi
+                    | CodingProvider::OpenRouter
+                    | CodingProvider::OpenAiCompatible => {
                         unreachable!("native providers do not use subscription pools")
                     }
                 };
@@ -619,7 +627,7 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
             return self.native_harness.run(turn, events, controls).await;
         }
         match turn.provider {
-            CodingProvider::Codex | CodingProvider::Claude => {
+            CodingProvider::Codex | CodingProvider::Claude | CodingProvider::OpenCode => {
                 run_borg_provider_turn(
                     turn,
                     events,
@@ -633,9 +641,9 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
                 )
                 .await
             }
-            provider => bail!(
-                "{provider:?} execution is unavailable; use OpenRouter or an explicitly configured OpenAI-compatible endpoint"
-            ),
+            CodingProvider::Kimi
+            | CodingProvider::OpenRouter
+            | CodingProvider::OpenAiCompatible => unreachable!("native provider handled above"),
         }
     }
 
@@ -805,10 +813,10 @@ pub async fn run_agent_turn_controlled(
         .await
         .ok();
     match turn.provider {
-        CodingProvider::OpenRouter | CodingProvider::OpenAiCompatible => {
+        CodingProvider::Kimi | CodingProvider::OpenRouter | CodingProvider::OpenAiCompatible => {
             NativeHarness::default().run(turn, events, controls).await
         }
-        CodingProvider::Codex | CodingProvider::Claude => {
+        CodingProvider::Codex | CodingProvider::Claude | CodingProvider::OpenCode => {
             run_borg_provider_turn(
                 turn,
                 events,
@@ -861,6 +869,10 @@ async fn run_borg_provider_turn(
                 request.fast = fast;
             }
             request.working_directory = Some(turn.cwd.clone());
+            request.mcp_owner_id = turn.runtime_mcp_context.owner_id.clone();
+            request.mcp_allowed_scopes = turn.runtime_mcp_context.allowed_scopes.clone();
+            request.mcp_user_id = turn.runtime_mcp_context.user_id.clone();
+            request.mcp_api_token = turn.runtime_mcp_context.api_token.clone();
             // Borg's journal is the canonical provider context for
             // subscription lanes. Replaying a provider-owned session here
             // would silently omit durable Borg tool events or duplicate the
@@ -885,6 +897,7 @@ async fn run_borg_provider_turn(
             request
         }
         None => {
+            let runtime_mcp_context = turn.runtime_mcp_context.clone();
             let mcp_external_servers = if tools_enabled {
                 let mut servers = turn.external_mcp_servers;
                 servers.push(turn.agent_mcp_server);
@@ -910,11 +923,11 @@ async fn run_borg_provider_turn(
                     "\n\n"
                 } + &turn.system_prompt_appendix,
                 output_schema: turn.output_schema,
-                mcp_owner_id: None,
-                mcp_allowed_scopes: Vec::new(),
-                mcp_user_id: None,
+                mcp_owner_id: runtime_mcp_context.owner_id,
+                mcp_allowed_scopes: runtime_mcp_context.allowed_scopes,
+                mcp_user_id: runtime_mcp_context.user_id,
                 mcp_external_servers,
-                mcp_api_token: None,
+                mcp_api_token: runtime_mcp_context.api_token,
                 provider_auth: None,
                 git_credentials: Vec::new(),
                 working_directory: Some(turn.cwd.clone()),
@@ -1008,6 +1021,10 @@ async fn run_borg_provider_turn(
             request,
             map_controls(controls, Arc::clone(&interrupted)),
         ),
+        CodingProvider::OpenCode if local => run_opencode_local_chat_stream(request, permission),
+        CodingProvider::OpenCode => {
+            bail!("OpenCode execution is only supported on an enrolled host")
+        }
         provider => bail!("{provider:?} must use a NativeHarness-compatible route"),
     };
     tracing::debug!(

@@ -25,6 +25,12 @@ serial tests are not a substitute for finding scheduling races.
 - Verify non-loopback Remote endpoints use HTTPS and that host config files do
   not expose bearer tokens through permissions or logs.
 - Run permission-mode, project-MCP trust, path-boundary, and symlink tests.
+- For hosted-isolation deployments, install the Linux host through `borg
+  remote install`, set `BORG_HOST_ALLOWED_NETWORKS` to reviewed Borg/provider/
+  DNS addresses or CIDRs, and verify the generated unit retains
+  `IPAddressDeny=any`, the expected `IPAddressAllow=` entries, and the
+  `ReadWritePaths=` scope. Do not treat a manually exported
+  `BORG_HOST_EXECUTION_PROFILE=isolated_hosted` as isolation.
 
 ## Package and update verification
 

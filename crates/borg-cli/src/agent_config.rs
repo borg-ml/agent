@@ -192,6 +192,8 @@ impl From<&CapabilityConfig> for borg_remote::SessionCapabilities {
             web_relay: value.web_relay,
             telemetry: value.telemetry,
             provider_capabilities: Vec::new(),
+            runtime_mcp_context: None,
+            resource_limits: None,
         }
     }
 }

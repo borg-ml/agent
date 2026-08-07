@@ -505,6 +505,48 @@ mod tests {
         assert_eq!(args.model.as_deref(), Some("vendor/future-model"));
         assert_eq!(args.peer_model.as_deref(), Some("another/vendor-model"));
     }
+
+    #[test]
+    fn remote_enroll_can_read_the_token_from_stdin() {
+        let command = Cli::try_parse_from([
+            "borg",
+            "remote",
+            "enroll",
+            "--server",
+            "https://borg.ml",
+            "--token-stdin",
+            "--root",
+            "/srv/borg-worker",
+        ])
+        .expect("stdin enrollment parses")
+        .command_or_agent();
+        let Command::Remote {
+            command: RemoteCommand::Enroll {
+                token, token_stdin, ..
+            },
+        } = command
+        else {
+            panic!("remote enroll command expected");
+        };
+        assert!(token.is_none());
+        assert!(token_stdin);
+
+        assert!(
+            Cli::try_parse_from([
+                "borg",
+                "remote",
+                "enroll",
+                "--server",
+                "https://borg.ml",
+                "--token",
+                "argv-token",
+                "--token-stdin",
+                "--root",
+                "/srv/borg-worker",
+            ])
+            .is_err()
+        );
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -524,8 +566,15 @@ pub(crate) enum RemoteCommand {
     Enroll {
         #[arg(long)]
         server: String,
-        #[arg(long)]
-        token: String,
+        #[arg(
+            long,
+            conflicts_with = "token_stdin",
+            required_unless_present = "token_stdin"
+        )]
+        token: Option<String>,
+        /// Read the one-time enrollment token from stdin instead of argv.
+        #[arg(long, conflicts_with = "token")]
+        token_stdin: bool,
         #[arg(long)]
         name: Option<String>,
         #[arg(long = "root", required = true)]
@@ -559,6 +608,8 @@ pub(crate) enum RemoteCommand {
 pub(crate) enum RemoteProviderArg {
     Codex,
     Claude,
+    OpenCode,
+    Kimi,
     OpenRouter,
     OpenAiCompatible,
 }
@@ -568,6 +619,8 @@ impl From<RemoteProviderArg> for borg_remote::CodingProvider {
         match value {
             RemoteProviderArg::Codex => Self::Codex,
             RemoteProviderArg::Claude => Self::Claude,
+            RemoteProviderArg::OpenCode => Self::OpenCode,
+            RemoteProviderArg::Kimi => Self::Kimi,
             RemoteProviderArg::OpenRouter => Self::OpenRouter,
             RemoteProviderArg::OpenAiCompatible => Self::OpenAiCompatible,
         }

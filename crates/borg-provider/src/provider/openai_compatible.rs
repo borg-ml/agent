@@ -36,6 +36,7 @@ pub struct ModelGateway {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenAiCompatibleProfile {
+    Kimi,
     OpenRouter,
     Generic,
 }
@@ -43,6 +44,7 @@ pub enum OpenAiCompatibleProfile {
 impl OpenAiCompatibleProfile {
     fn label(self) -> &'static str {
         match self {
+            Self::Kimi => "kimi",
             Self::OpenRouter => "openrouter",
             Self::Generic => "openai-compatible",
         }
@@ -50,6 +52,7 @@ impl OpenAiCompatibleProfile {
 
     fn endpoint(self) -> String {
         match self {
+            Self::Kimi => kimi_chat_completions_endpoint(),
             Self::OpenRouter => openrouter_chat_completions_endpoint(),
             Self::Generic => chat_completions_endpoint(),
         }
@@ -57,6 +60,9 @@ impl OpenAiCompatibleProfile {
 
     fn api_key(self) -> Option<String> {
         match self {
+            Self::Kimi => {
+                nonempty_env("BORG_KIMI_API_KEY").or_else(|| nonempty_env("MOONSHOT_API_KEY"))
+            }
             Self::OpenRouter => {
                 crate::credentials::api_key(crate::credentials::ApiKeyCredential::OpenRouter)
             }
@@ -173,6 +179,9 @@ impl OpenAiCompatibleProvider {
         if api_key.is_none() && profile != OpenAiCompatibleProfile::Generic {
             return Err(ProviderCallError {
                 message: match profile {
+                    OpenAiCompatibleProfile::Kimi => {
+                        "BORG_KIMI_API_KEY or MOONSHOT_API_KEY is not set".to_string()
+                    }
                     OpenAiCompatibleProfile::OpenRouter => {
                         "OPENROUTER_API_KEY is not set".to_string()
                     }
@@ -201,6 +210,10 @@ impl OpenAiCompatibleProvider {
             body["prompt_cache_key"] = json!(prompt_cache_key);
         }
         match profile {
+            OpenAiCompatibleProfile::Kimi => {
+                body["reasoning_effort"] = json!(kimi_reasoning_effort(self.effort.as_deref()));
+                body["max_completion_tokens"] = json!(kimi_max_completion_tokens());
+            }
             OpenAiCompatibleProfile::OpenRouter => {
                 if let Some(reasoning) = compatible_reasoning(self.effort.as_deref()) {
                     body["reasoning"] = reasoning;
@@ -237,6 +250,7 @@ impl OpenAiCompatibleProvider {
         }
         if let Some(schema) = request.output_schema.as_ref() {
             let format = match profile {
+                OpenAiCompatibleProfile::Kimi => Some("json_schema".to_string()),
                 OpenAiCompatibleProfile::OpenRouter => {
                     nonempty_env("BORG_OPENROUTER_RESPONSE_FORMAT")
                         .or_else(|| Some("json_schema".to_string()))
@@ -371,6 +385,7 @@ impl OpenAiCompatibleProvider {
         trace.exit_status = Some(0);
         let duration_ms = elapsed_millis_u64(started_at);
         let mut usage = match profile {
+            OpenAiCompatibleProfile::Kimi => kimi_usage_from_response(&streamed.raw, duration_ms),
             OpenAiCompatibleProfile::OpenRouter => extract_chat_completions_usage(
                 &streamed.raw,
                 duration_ms,
@@ -563,6 +578,60 @@ impl OpenAiCompatibleProvider {
             session_id: None,
         })
     }
+}
+
+fn kimi_chat_completions_endpoint() -> String {
+    let base = nonempty_env("BORG_KIMI_BASE_URL")
+        .unwrap_or_else(|| "https://api.moonshot.ai/v1".to_string());
+    let trimmed = base.trim_end_matches('/');
+    if trimmed.ends_with("/chat/completions") {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/chat/completions")
+    }
+}
+
+fn kimi_reasoning_effort(effort: Option<&str>) -> &'static str {
+    match effort.map(str::trim) {
+        Some("low") => "low",
+        Some("max") | Some("xhigh") | Some("ultra") => "max",
+        _ => "high",
+    }
+}
+
+fn kimi_max_completion_tokens() -> u64 {
+    nonempty_env("BORG_KIMI_MAX_COMPLETION_TOKENS")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(32_768)
+        .clamp(1, 1_048_576)
+}
+
+pub fn kimi_usage_from_response(
+    raw: &Value,
+    duration_ms: u64,
+) -> crate::runtime::ProviderCallUsage {
+    extract_chat_completions_usage(raw, duration_ms, Some(kimi_cost_microusd(raw)))
+}
+
+pub fn kimi_cost_microusd(raw: &Value) -> u64 {
+    let input = raw
+        .pointer("/usage/prompt_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let cached = raw
+        .pointer("/usage/prompt_tokens_details/cached_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .min(input);
+    let output = raw
+        .pointer("/usage/completion_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    input
+        .saturating_sub(cached)
+        .saturating_mul(3)
+        .saturating_add(cached.saturating_mul(3).div_ceil(10))
+        .saturating_add(output.saturating_mul(15))
 }
 
 /// Declared context window for a local OpenAI-compatible server, set from the
@@ -1147,6 +1216,121 @@ mod tests {
         assert_eq!(payload["attempt"], 1);
         assert_eq!(payload["max_attempts"], 3);
         assert_eq!(payload["delay_ms"], 750);
+    }
+
+    #[test]
+    fn kimi_cost_accounts_for_cached_input_at_provider_list_price() {
+        let raw = json!({
+            "usage": {
+                "prompt_tokens": 1_000_000,
+                "prompt_tokens_details": { "cached_tokens": 200_000 },
+                "completion_tokens": 100_000
+            }
+        });
+        assert_eq!(kimi_cost_microusd(&raw), 3_960_000);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn kimi_profile_uses_the_canonical_native_wire_contract() {
+        let _lock = OPENROUTER_ENV_LOCK.lock().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind Kimi test server");
+        let address = listener.local_addr().expect("test server address");
+        let _base = TestEnvGuard::set("BORG_KIMI_BASE_URL", &format!("http://{address}/v1"));
+        let _key = TestEnvGuard::set("BORG_KIMI_API_KEY", "test-kimi-key");
+        let _max = TestEnvGuard::set("BORG_KIMI_MAX_COMPLETION_TOKENS", "1234");
+
+        let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+        let response_body = [
+            r#"data: {"choices":[{"delta":{"reasoning_content":"inspect "},"finish_reason":null}]}"#,
+            r#"data: {"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}],"usage":{"prompt_tokens":12,"completion_tokens":3}}"#,
+            "data: [DONE]",
+            "",
+        ]
+        .join("\n");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept request");
+            let mut request = Vec::new();
+            let expected_len = loop {
+                let mut chunk = [0_u8; 8192];
+                let read = socket.read(&mut chunk).await.expect("read request");
+                assert!(read > 0, "request closed before headers");
+                request.extend_from_slice(&chunk[..read]);
+                let Some(header_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_len = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(str::trim)
+                            .and_then(|value| value.parse::<usize>().ok())
+                    })
+                    .expect("content-length header");
+                break header_end + 4 + content_len;
+            };
+            while request.len() < expected_len {
+                let mut chunk = [0_u8; 8192];
+                let read = socket.read(&mut chunk).await.expect("read request body");
+                assert!(read > 0, "request closed before body");
+                request.extend_from_slice(&chunk[..read]);
+            }
+            let header_end = request
+                .windows(4)
+                .position(|bytes| bytes == b"\r\n\r\n")
+                .expect("request headers");
+            let body: Value = serde_json::from_slice(&request[header_end + 4..expected_len])
+                .expect("Kimi JSON request");
+            request_tx.send(body).expect("return captured Kimi request");
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        response_body.len(), response_body
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("write Kimi response");
+        });
+
+        let provider = OpenAiCompatibleProvider {
+            model: "kimi-k3".to_string(),
+            effort: Some("max".to_string()),
+            system_prompt: "",
+        };
+        let result = provider
+            .model_turn_via_profile(
+                ModelTurnRequest {
+                    request_id: Some("kimi-test".to_string()),
+                    prompt_cache_key: None,
+                    messages: vec![ModelMessage::user("inspect")],
+                    tools: Vec::new(),
+                    output_schema: Some(json!({
+                        "type": "object",
+                        "properties": { "ok": { "type": "boolean" } }
+                    })),
+                },
+                None,
+                None,
+                OpenAiCompatibleProfile::Kimi,
+            )
+            .await
+            .expect("Kimi native turn");
+        let body = request_rx.await.expect("Kimi request body");
+        server.await.expect("Kimi test server task");
+
+        assert_eq!(body["model"], "kimi-k3");
+        assert_eq!(body["reasoning_effort"], "max");
+        assert_eq!(body["max_completion_tokens"], 1234);
+        assert_eq!(body["response_format"]["type"], "json_schema");
+        assert_eq!(result.finish_reason, "stop");
+        assert_eq!(result.usage.input_tokens, 12);
+        assert_eq!(result.usage.output_tokens, 3);
     }
 
     #[tokio::test]

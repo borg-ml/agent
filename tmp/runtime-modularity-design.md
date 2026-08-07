@@ -16,6 +16,18 @@ final-expression results, top-level await, captured output, and bounded host
 calls; it is deliberately not `ipykernel` yet. Blu package hot reload remains a
 next-turn catalog operation and is independent of the worker namespace.
 
+The second slice adds a shared lossless-history contract rather than placing
+memory inside any language kernel. The SQLite event/payload journal remains
+canonical; an atomically maintained, rebuildable FTS5 projection provides
+fast discovery. `query_history` is shared by every provider lane and
+`borg.history(...)` exposes the same operation in Python. Exact ids, typed
+filters, sequence ranges, bounded regex (with optional FTS prefilter), and
+bounded payload expansion all resolve back to canonical events. A
+sequence-cursored `SessionHistoryIndexDocument` feed gives BorgSearch/Vespa a
+stable semantic-index adapter without making a vector store authoritative.
+Blu and future Bun/IPython adapters must call this host contract rather than
+implementing private memory stores.
+
 The surf project exercises this boundary through the project-local
 `.borg/skills/surf-calibration/SKILL.md` skill. Its reference contract is a
 deterministic per-tick state/input trace; a Source `.dem` is retained as an

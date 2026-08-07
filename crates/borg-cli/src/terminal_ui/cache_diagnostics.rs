@@ -395,7 +395,10 @@ fn cache_window(provider: CodingProvider) -> Option<Duration> {
     match provider {
         CodingProvider::Codex => Some(CODEX_CACHE_WINDOW),
         CodingProvider::Claude => Some(CLAUDE_CACHE_WINDOW),
-        CodingProvider::OpenRouter | CodingProvider::OpenAiCompatible => None,
+        CodingProvider::OpenCode
+        | CodingProvider::Kimi
+        | CodingProvider::OpenRouter
+        | CodingProvider::OpenAiCompatible => None,
     }
 }
 
