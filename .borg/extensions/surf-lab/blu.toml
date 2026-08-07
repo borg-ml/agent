@@ -9,4 +9,4 @@ version = "0.2.0"
 [mcp.lab]
 command = "cargo"
 args = ["run", "--quiet", "--manifest-path", "${extension_dir}/../../../../surf/Cargo.toml", "--bin", "surf_lab"]
-allowed_tools = ["start", "step", "observe", "trace", "log", "branch", "compare", "config"]
+allowed_tools = ["start", "step", "observe", "trace", "log", "branch", "compare", "map.generate", "map.inspect", "map.preview", "map.route", "map.export", "config"]

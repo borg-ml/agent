@@ -15,7 +15,7 @@ session_id = started["session_id"]
 ```
 
 The environment exposes `start`, `step`, `observe`, `trace`, `log`, `branch`,
-`compare`, and `config`. Keep the returned session id in the persistent
+`compare`, `map.generate`, `map.inspect`, `map.preview`, `map.route`, `map.export`, and `config`. Keep the returned session id in the persistent
 namespace. Use `step` with bounded batches, save the observations, branch at a
 specific tick, apply a counterfactual command to the branch, and compare the
 two traces to identify the first divergent tick and position error. `log`
@@ -35,3 +35,15 @@ the model should use batches and query evidence after the run rather than try
 to steer a 66/165 Hz loop interactively. The extension log is the high-rate
 authority; Borg's canonical journal records the bounded MCP queries and their
 results, not an unbounded copy of every tick.
+
+For autonomous map work, use `map.generate` with a seed and bounded candidate
+budget. It returns the winning versioned `MapSpec`, compiled patch/bounds
+summary, measured route certificate, and conservative surfability/difficulty/
+fun-proxy metrics. Use `map.inspect` to validate a supplied `MapSpec` without
+running a route, and `map.preview` for bounded sampled surface strips. Use
+`map.route` to search a supplied spec in the compact fast
+simulator. Use `map.export` to persist a validated spec, then pass its path to
+`start` as `map_spec` to run the same geometry in Bevy/Avian. These are chunked policy searches; the LLM is not asked to steer
+individual physics ticks. Treat a route certificate as best-known evidence,
+not a proof of global optimality, and verify interesting candidates in the
+actual Bevy/Avian session afterward.
