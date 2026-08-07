@@ -1504,13 +1504,23 @@ impl BorgTerminal {
         let keymap = KeyMap::from_config(keybindings)?;
         enable_raw_mode().context("failed to enable terminal raw mode")?;
         let mut stdout = io::stdout();
+        reset_keyboard_enhancement();
         let keyboard_enhancement = supports_keyboard_enhancement().unwrap_or(false);
+        if mode == ScreenMode::Alternate
+            && let Err(error) = execute!(stdout, EnterAlternateScreen)
+        {
+            let _ = disable_raw_mode();
+            return Err(error.into());
+        }
         if keyboard_enhancement
             && let Err(error) = execute!(
                 stdout,
                 PushKeyboardEnhancementFlags(keyboard_enhancement_flags())
             )
         {
+            if mode == ScreenMode::Alternate {
+                let _ = execute!(stdout, LeaveAlternateScreen);
+            }
             let _ = disable_raw_mode();
             return Err(error).context("failed to enable enhanced keyboard input");
         }
@@ -1518,26 +1528,19 @@ impl BorgTerminal {
             if keyboard_enhancement {
                 let _ = execute!(stdout, PopKeyboardEnhancementFlags);
             }
-            let _ = disable_raw_mode();
-            return Err(error.into());
-        }
-        if mode == ScreenMode::Alternate
-            && let Err(error) = execute!(stdout, EnterAlternateScreen)
-        {
-            let _ = execute!(stdout, DisableBracketedPaste);
-            if keyboard_enhancement {
-                let _ = execute!(stdout, PopKeyboardEnhancementFlags);
+            if mode == ScreenMode::Alternate {
+                let _ = execute!(stdout, LeaveAlternateScreen);
             }
             let _ = disable_raw_mode();
             return Err(error.into());
         }
         if let Err(error) = execute!(stdout, EnableMouseCapture, SetCursorStyle::BlinkingBar) {
             let _ = execute!(stdout, DisableBracketedPaste);
-            if mode == ScreenMode::Alternate {
-                let _ = execute!(stdout, LeaveAlternateScreen);
-            }
             if keyboard_enhancement {
                 let _ = execute!(stdout, PopKeyboardEnhancementFlags);
+            }
+            if mode == ScreenMode::Alternate {
+                let _ = execute!(stdout, LeaveAlternateScreen);
             }
             let _ = disable_raw_mode();
             return Err(error.into());
@@ -1557,11 +1560,11 @@ impl BorgTerminal {
                 let mut stdout = io::stdout();
                 let _ = execute!(stdout, SetCursorStyle::DefaultUserShape);
                 let _ = execute!(stdout, DisableBracketedPaste);
-                if mode == ScreenMode::Alternate {
-                    let _ = execute!(stdout, LeaveAlternateScreen);
-                }
                 if keyboard_enhancement {
                     let _ = execute!(stdout, PopKeyboardEnhancementFlags);
+                }
+                if mode == ScreenMode::Alternate {
+                    let _ = execute!(stdout, LeaveAlternateScreen);
                 }
                 let _ = disable_raw_mode();
                 return Err(error).context("failed to initialize terminal renderer");
@@ -6039,6 +6042,11 @@ fn is_composer_newline(keymap: &KeyMap, key: &KeyEvent) -> bool {
         || matches!(key.code, KeyCode::Char('\n'))
         || (matches!(key.code, KeyCode::Char('j' | 'J'))
             && key.modifiers == KeyModifiers::CONTROL)
+}
+
+pub(crate) fn reset_keyboard_enhancement() {
+    let mut stdout = io::stdout();
+    let _ = execute!(stdout, PopKeyboardEnhancementFlags);
 }
 
 impl Drop for BorgTerminal {
