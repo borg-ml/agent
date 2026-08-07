@@ -302,6 +302,115 @@ fn first_resume_frame_keeps_real_recent_conversation_before_lazy_pages() {
 }
 
 #[test]
+fn first_resume_frame_drops_orphaned_output_and_queued_input() {
+    let session_id = Uuid::new_v4();
+    let current_user_id = Uuid::new_v4();
+    let mut events = (1..=160)
+        .map(|sequence| {
+            SessionEvent::new(
+                session_id,
+                sequence,
+                SessionEventKind::UsageUpdated {
+                    provider_duration_ms: 0,
+                    turn_id: None,
+                    provider_context_reused: None,
+                    input_tokens: 1,
+                    output_tokens: 0,
+                    total_tokens: 1,
+                    cached_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                    cost_usd: None,
+                    cost_microusd: None,
+                    cost_basis: String::new(),
+                    context_tokens: None,
+                    context_window_tokens: None,
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    events[100] = SessionEvent::new(
+        session_id,
+        101,
+        SessionEventKind::Message {
+            message_id: Uuid::new_v4(),
+            actor: EventActor::Assistant,
+            text: "orphaned old response".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: None,
+        },
+    );
+    events[110] = SessionEvent::new(
+        session_id,
+        111,
+        SessionEventKind::Message {
+            message_id: Uuid::new_v4(),
+            actor: EventActor::User,
+            text: "old queued input".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Queued,
+            delivery: Some(PromptDelivery::Queue),
+        },
+    );
+    events[149] = SessionEvent::new(
+        session_id,
+        150,
+        SessionEventKind::Message {
+            message_id: current_user_id,
+            actor: EventActor::User,
+            text: "current user request".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: Some(PromptDelivery::Queue),
+        },
+    );
+    events[150] = SessionEvent::new(
+        session_id,
+        151,
+        SessionEventKind::Message {
+            message_id: Uuid::new_v4(),
+            actor: EventActor::Assistant,
+            text: "current response".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: None,
+        },
+    );
+
+    let selected = select_resume_bootstrap_history(events);
+    assert!(selected.iter().any(|event| matches!(
+        &event.kind,
+        SessionEventKind::Message { text, .. } if text == "current user request"
+    )));
+    assert!(selected.iter().any(|event| matches!(
+        &event.kind,
+        SessionEventKind::Message { text, .. } if text == "current response"
+    )));
+    assert!(!selected.iter().any(|event| matches!(
+        &event.kind,
+        SessionEventKind::Message { text, .. } if text == "orphaned old response"
+    )));
+    assert!(!selected.iter().any(|event| matches!(
+        &event.kind,
+        SessionEventKind::Message {
+            status: MessageStatus::Queued,
+            ..
+        }
+    )));
+    assert_eq!(
+        selected.iter().find_map(|event| match &event.kind {
+            SessionEventKind::Message {
+                actor: EventActor::User,
+                text,
+                ..
+            } => Some(text.as_str()),
+            _ => None,
+        }),
+        Some("current user request")
+    );
+}
+
+#[test]
 fn history_reprojection_uses_delivered_durable_and_live_projection() {
     let session_id = Uuid::new_v4();
     let ready = SessionState {

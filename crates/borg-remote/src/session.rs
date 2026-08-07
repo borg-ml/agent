@@ -1094,7 +1094,7 @@ async fn run_agent_session_store_kernel(
         .is_some_and(|goal| goal.status.is_active())
         .then(Instant::now);
     let mut goal_turn_failures = ConsecutiveGoalTurnFailures::default();
-    let mut pending = recover_queued_prompts(&recovery.queue_events);
+    let mut pending = recover_prompts_on_resume(&initial_state, &recovery.queue_events);
     for action in recovered_actions {
         if let Some(prompt) = queued_prompt_from_action(&action)
             && !pending
@@ -1939,7 +1939,7 @@ async fn run_agent_session_store_kernel(
                                     "context_tokens_before": context_tokens,
                                     "effective_context_window_tokens": context_window_tokens,
                                     "remaining_percent_threshold":
-                                        NATIVE_AUTO_COMPACT_REMAINING_PERCENT,
+                                        AUTO_COMPACT_REMAINING_PERCENT,
                                     "provider_duration_ms": compaction.usage.duration_ms,
                                     "input_tokens": compaction.usage.input_tokens,
                                     "output_tokens": compaction.usage.output_tokens,
@@ -1991,6 +1991,15 @@ async fn run_agent_session_store_kernel(
             }
         }
 
+        let subscription_context_usage = if !launch.provider.uses_native_harness() {
+            let state = journal.state(session_id).await?;
+            (
+                state.usage.context_tokens,
+                state.usage.context_window_tokens,
+            )
+        } else {
+            (None, None)
+        };
         if !launch.provider.uses_native_harness()
             && retained_context.as_deref().is_some_and(|context| {
                 subscription_context_needs_compaction(
@@ -1999,6 +2008,8 @@ async fn run_agent_session_store_kernel(
                     &prompt.text,
                     subscription_context_reusable
                         && executor.supports_subscription_context_reuse(launch.provider),
+                    subscription_context_usage.0,
+                    subscription_context_usage.1,
                 )
             })
         {
@@ -2131,6 +2142,7 @@ async fn run_agent_session_store_kernel(
         };
         if !launch.provider.uses_native_harness()
             && subscription_input_chars > SUBSCRIPTION_INPUT_BUDGET_CHARS
+            && !usable_context_usage(subscription_context_usage.0, subscription_context_usage.1)
         {
             let message = format!(
                 "provider input remains {} characters after compaction; refusing an over-limit subscription request (budget {} characters)",
@@ -3833,7 +3845,7 @@ fn is_interrupted_turn_error(error: &str) -> bool {
     error.to_ascii_lowercase().contains("interrupted")
 }
 
-const NATIVE_AUTO_COMPACT_REMAINING_PERCENT: u64 = 10;
+const AUTO_COMPACT_REMAINING_PERCENT: u64 = 10;
 
 fn native_auto_compaction_needed(state: &SessionState) -> bool {
     let (Some(context_tokens), Some(context_window_tokens)) = (
@@ -3845,7 +3857,7 @@ fn native_auto_compaction_needed(state: &SessionState) -> bool {
     context_window_tokens > 0
         && u128::from(context_tokens).saturating_mul(100)
             >= u128::from(context_window_tokens)
-                .saturating_mul(100 - u128::from(NATIVE_AUTO_COMPACT_REMAINING_PERCENT))
+                .saturating_mul(100 - u128::from(AUTO_COMPACT_REMAINING_PERCENT))
 }
 
 fn native_usage_event(
@@ -3884,10 +3896,32 @@ fn subscription_context_needs_compaction(
     actor: EventActor,
     text: &str,
     provider_context_reusable: bool,
+    context_tokens: Option<u64>,
+    context_window_tokens: Option<u64>,
 ) -> bool {
-    !provider_context_reusable
-        && subscription_prompt_chars(Some(retained_context), actor, text)
-            > SUBSCRIPTION_INPUT_BUDGET_CHARS
+    if provider_context_reusable {
+        return false;
+    }
+    if usable_context_usage(context_tokens, context_window_tokens) {
+        let current_prompt_tokens =
+            chars_to_token_estimate(subscription_prompt_chars(None, actor, text));
+        let projected_context_tokens = context_tokens
+            .expect("usable context usage includes context tokens")
+            .saturating_add(current_prompt_tokens);
+        return u128::from(projected_context_tokens).saturating_mul(100)
+            >= u128::from(context_window_tokens.expect("usable context usage includes window"))
+                .saturating_mul(100 - u128::from(AUTO_COMPACT_REMAINING_PERCENT));
+    }
+    subscription_prompt_chars(Some(retained_context), actor, text) > SUBSCRIPTION_INPUT_BUDGET_CHARS
+}
+
+fn usable_context_usage(context_tokens: Option<u64>, context_window_tokens: Option<u64>) -> bool {
+    context_tokens.is_some_and(|tokens| tokens > 0)
+        && context_window_tokens.is_some_and(|window| window > 0)
+}
+
+fn chars_to_token_estimate(chars: usize) -> u64 {
+    u64::try_from(chars).unwrap_or(u64::MAX).saturating_add(3) / 4
 }
 
 fn subscription_context_reusable_after_turn(
@@ -4321,6 +4355,23 @@ fn retained_compaction_prompt(context: &str) -> String {
     format!(
         "Summarize this prior provider conversation for the next agent. Preserve user requirements, decisions, files changed, commands and tests run, unresolved errors, approvals, and next steps. Do not use tools or modify the workspace. Return only the continuation summary.\n\n<prior_provider_conversation>\n{context}\n</prior_provider_conversation>"
     )
+}
+
+fn recover_prompts_on_resume(
+    state: &SessionState,
+    events: &[SessionEvent],
+) -> VecDeque<QueuedPrompt> {
+    // A cleanly stopped/ready session has no unfinished provider turn. Its
+    // durable queue snapshots are historical input, not a request to run the
+    // same prompt the next time the user opens the thread. Active states still
+    // recover in-progress work so a host crash does not lose an admitted turn.
+    if !matches!(
+        state.status,
+        Some(SessionStatus::Starting | SessionStatus::Running | SessionStatus::WaitingForApproval)
+    ) {
+        return VecDeque::new();
+    }
+    recover_queued_prompts(events)
 }
 
 fn recover_queued_prompts(events: &[SessionEvent]) -> VecDeque<QueuedPrompt> {

@@ -4991,6 +4991,58 @@ fn queued_prompt_recovery_preserves_fifo_and_excludes_settled_messages() {
 }
 
 #[test]
+fn idle_resume_drops_old_queue_snapshots_but_active_resume_recovers_work() {
+    let session_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    let queued = SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::Message {
+            message_id,
+            actor: EventActor::User,
+            text: "do not replay this old queue entry".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Queued,
+            delivery: Some(PromptDelivery::Queue),
+        },
+    );
+    let in_progress = SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::Message {
+            message_id,
+            actor: EventActor::User,
+            text: "recover this admitted turn".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::InProgress,
+            delivery: Some(PromptDelivery::Queue),
+        },
+    );
+
+    assert!(
+        recover_prompts_on_resume(
+            &SessionState {
+                status: Some(SessionStatus::Ready),
+                ..SessionState::default()
+            },
+            &[queued.clone()],
+        )
+        .is_empty()
+    );
+
+    let recovered = recover_prompts_on_resume(
+        &SessionState {
+            status: Some(SessionStatus::Running),
+            ..SessionState::default()
+        },
+        &[queued, in_progress],
+    );
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].message_id, message_id);
+    assert_eq!(recovered[0].text, "recover this admitted turn");
+}
+
+#[test]
 fn in_progress_prompt_recovery_preserves_input_after_a_host_crash() {
     let session_id = Uuid::new_v4();
     let message_id = Uuid::new_v4();
@@ -6124,13 +6176,17 @@ fn reusable_subscription_context_does_not_compact_the_full_replay() {
         &context,
         EventActor::User,
         "continue",
-        false
+        false,
+        None,
+        None,
     ));
     assert!(!subscription_context_needs_compaction(
         &context,
         EventActor::User,
         "continue",
-        true
+        true,
+        None,
+        None,
     ));
     assert!(
         subscription_prompt_chars(Some(&context), EventActor::User, "continue")
@@ -6140,6 +6196,28 @@ fn reusable_subscription_context_does_not_compact_the_full_replay() {
         subscription_prompt_chars(None, EventActor::User, "continue")
             <= SUBSCRIPTION_INPUT_BUDGET_CHARS
     );
+}
+
+#[test]
+fn subscription_context_usage_prevents_character_limit_compaction_with_headroom() {
+    let context = "x".repeat(SUBSCRIPTION_INPUT_BUDGET_CHARS * 4);
+
+    assert!(!subscription_context_needs_compaction(
+        &context,
+        EventActor::User,
+        "continue",
+        false,
+        Some(179_468),
+        Some(258_400),
+    ));
+    assert!(subscription_context_needs_compaction(
+        &context,
+        EventActor::User,
+        "continue",
+        false,
+        Some(232_560),
+        Some(258_400),
+    ));
 }
 
 #[test]

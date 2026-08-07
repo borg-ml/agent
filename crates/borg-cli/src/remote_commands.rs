@@ -4802,8 +4802,23 @@ fn recent_tui_history_after(latest_sequence: u64) -> u64 {
 }
 
 fn select_resume_bootstrap_history(events: Vec<SessionEvent>) -> Vec<SessionEvent> {
+    // Queued input is a pending-work projection, not conversation history.
+    // Replaying it into the first frame made an old queue entry look like a
+    // fresh prompt and could also wake it during resume recovery.
+    let events = events
+        .into_iter()
+        .filter(|event| {
+            !matches!(
+                event.kind,
+                SessionEventKind::Message {
+                    status: MessageStatus::Queued,
+                    ..
+                }
+            )
+        })
+        .collect::<Vec<_>>();
     if events.len() <= RICH_TUI_HISTORY_EVENT_LIMIT {
-        return events;
+        return trim_resume_bootstrap_to_user_boundary(events);
     }
     let floor = events.len() - RICH_TUI_HISTORY_EVENT_LIMIT;
     let message_indices = events
@@ -4832,13 +4847,30 @@ fn select_resume_bootstrap_history(events: Vec<SessionEvent>) -> Vec<SessionEven
     // tool stream pushed them outside that tail. A contiguous slice starting
     // at the eighth message can contain thousands of irrelevant events and
     // makes the first render just as unusable as loading the whole history.
-    events
+    let selected = events
         .into_iter()
         .enumerate()
         .filter_map(|(index, event)| {
             (index >= floor || retained_messages.contains(&index)).then_some(event)
         })
-        .collect()
+        .collect();
+    trim_resume_bootstrap_to_user_boundary(selected)
+}
+
+fn trim_resume_bootstrap_to_user_boundary(events: Vec<SessionEvent>) -> Vec<SessionEvent> {
+    let Some(first_user) = events.iter().position(|event| {
+        matches!(
+            event.kind,
+            SessionEventKind::Message {
+                actor: EventActor::User,
+                status: MessageStatus::Complete | MessageStatus::Failed | MessageStatus::InProgress,
+                ..
+            }
+        )
+    }) else {
+        return Vec::new();
+    };
+    events.into_iter().skip(first_user).collect()
 }
 
 fn history_page_before(events: &[SessionEvent], latest_sequence: u64) -> u64 {
@@ -4857,7 +4889,20 @@ async fn older_tui_history(
         return Ok(Vec::new());
     };
     let limit = older_tui_history_limit(before_sequence, after_sequence);
-    store.events_after(session_id, after_sequence, limit).await
+    Ok(store
+        .events_after(session_id, after_sequence, limit)
+        .await?
+        .into_iter()
+        .filter(|event| {
+            !matches!(
+                event.kind,
+                SessionEventKind::Message {
+                    status: MessageStatus::Queued,
+                    ..
+                }
+            )
+        })
+        .collect())
 }
 
 fn older_tui_history_after(before_sequence: u64) -> Option<u64> {
@@ -5524,6 +5569,15 @@ fn print_history(events: &[SessionEvent]) {
     let mut order = Vec::new();
     let mut messages = HashMap::new();
     for event in events {
+        if matches!(
+            &event.kind,
+            SessionEventKind::Message {
+                status: MessageStatus::Queued,
+                ..
+            }
+        ) {
+            continue;
+        }
         if let SessionEventKind::Message {
             message_id,
             actor,
