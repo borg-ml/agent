@@ -694,6 +694,8 @@ pub(crate) async fn run_local_agent(args: LocalAgentCliArgs) -> Result<()> {
     let mut selected_session = None;
     let mut restored_prompt = None;
     loop {
+        let resume_requested =
+            args.resume.is_some() || args.continue_latest || selected_session.is_some();
         let result = AssertUnwindSafe(run_local_agent_session(
             &args,
             selected_session,
@@ -712,6 +714,14 @@ pub(crate) async fn run_local_agent(args: LocalAgentCliArgs) -> Result<()> {
             Ok(Ok(None)) => {
                 crash_context.tui_active.store(false, Ordering::Release);
                 return Ok(());
+            }
+            Ok(Err(error)) if resume_requested && local_resume_error_is_retryable(&error) => {
+                crash_context.tui_active.store(false, Ordering::Release);
+                crash_context.set_retry_notice(format!(
+                    "The resumed session is waiting on its journal and Borg is retrying: {error:#}"
+                ));
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                continue;
             }
             Ok(Err(error)) if crash_context.tui_active.swap(false, Ordering::AcqRel) => {
                 let Some(session_id) = crash_context.session_id() else {
@@ -4569,6 +4579,14 @@ fn repeated_ctrl_c(last: &mut Option<std::time::Instant>, now: std::time::Instan
         .is_some_and(|previous| now.saturating_duration_since(previous) <= DOUBLE_CTRL_C_WINDOW);
     *last = (!repeated).then_some(now);
     repeated
+}
+
+fn local_resume_error_is_retryable(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}").to_ascii_lowercase();
+    message.contains("database is locked")
+        || message.contains("database table is locked")
+        || message.contains("database is busy")
+        || message.contains("pool timed out")
 }
 
 async fn resolve_resume_target(

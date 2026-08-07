@@ -449,6 +449,7 @@ pub async fn run_attached_session(
         }
     };
 
+    let command_events = events.clone();
     let mut event_forwarder = tokio::spawn(forward_attached_events(
         Arc::clone(&store),
         session_id,
@@ -481,8 +482,27 @@ pub async fn run_attached_session(
                     }
                     Ok(false) => {}
                     Err(error) => {
-                        event_forwarder.abort();
-                        return Err(error);
+                        if writer_is_active(&lock_path)? {
+                            tracing::warn!(
+                                %error,
+                                %session_id,
+                                "local session owner command channel is unavailable; keeping the attached transcript open"
+                            );
+                            let _ = command_events
+                                .send(SessionEvent::new(
+                                    session_id,
+                                    0,
+                                    SessionEventKind::Error {
+                                        message: format!(
+                                            "The active session owner is not accepting commands yet: {error:#}"
+                                        ),
+                                    },
+                                ))
+                                .await;
+                        } else {
+                            event_forwarder.abort();
+                            return Ok(());
+                        }
                     }
                 }
             }

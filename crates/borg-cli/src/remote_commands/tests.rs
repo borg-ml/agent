@@ -4,6 +4,19 @@ use tempfile::tempdir;
 #[cfg(unix)]
 use tokio::io::AsyncReadExt;
 
+#[test]
+fn resume_retries_sqlite_contention_but_not_permanent_errors() {
+    assert!(local_resume_error_is_retryable(&anyhow::anyhow!(
+        "pool timed out while waiting for an open connection"
+    )));
+    assert!(local_resume_error_is_retryable(&anyhow::anyhow!(
+        "database is locked"
+    )));
+    assert!(!local_resume_error_is_retryable(&anyhow::anyhow!(
+        "recorded project directory no longer exists"
+    )));
+}
+
 #[cfg(unix)]
 fn short_socket_tempdir() -> tempfile::TempDir {
     tempfile::Builder::new()
