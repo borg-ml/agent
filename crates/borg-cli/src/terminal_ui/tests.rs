@@ -3662,6 +3662,42 @@ fn assistant_message_actions_stay_out_of_the_transcript() {
 }
 
 #[test]
+fn message_hover_shows_copy_hint_for_user_and_assistant() {
+    let entries = vec![
+        TranscriptEntry::Message {
+            actor: EventActor::Assistant,
+            text: "answer".to_string(),
+            attachments: Vec::new(),
+            model: None,
+            effort: None,
+            time: "12:00".to_string(),
+            status: MessageStatus::Complete,
+            complete: true,
+        },
+        TranscriptEntry::Message {
+            actor: EventActor::User,
+            text: "question".to_string(),
+            attachments: Vec::new(),
+            model: None,
+            effort: None,
+            time: "12:01".to_string(),
+            status: MessageStatus::Complete,
+            complete: true,
+        },
+    ];
+
+    assert_eq!(
+        message_interaction_hint(&entries, Some(0)),
+        Some("left click copy message")
+    );
+    assert_eq!(
+        message_interaction_hint(&entries, Some(1)),
+        Some("left click copy message")
+    );
+    assert_eq!(message_interaction_hint(&entries, Some(2)), None);
+}
+
+#[test]
 fn fuzzy_match_accepts_subsequences_and_rejects_reordering() {
     assert!(fuzzy_matches("/goal", "gl"));
     assert!(fuzzy_matches("/expand-tools", "expt"));
@@ -3856,7 +3892,7 @@ fn launch_resume_picker_height_is_stable_and_reserved_once() {
     assert_eq!(long_preview, 20);
 
     let bounded = bounded_launch_composer_height(short_preview, 24, 1);
-    assert_eq!(bounded, 17);
+    assert_eq!(bounded, 16);
     let chunks = terminal_vertical_chunks(Rect::new(0, 0, 100, 24), 0, bounded, 1, true);
     assert_eq!(chunks[0].height, 23);
     assert_eq!(

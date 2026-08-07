@@ -39,6 +39,7 @@ use crate::editor_preferences::{ActiveMessageBehavior, EditorPreferences};
 use crate::sleep_inhibitor::SleepInhibitor;
 use crate::terminal_ui::{
     BorgTerminal, ProviderAuthChoice, ResumeSessionOption, TerminalInputEvent, UiAction,
+    reset_keyboard_enhancement,
 };
 
 #[path = "local_server.rs"]
@@ -931,9 +932,15 @@ async fn run_local_agent_session(
     let session_id = if let Some(session_id) = selected_session.or(args.resume) {
         session_id_if_present(sqlite_store.as_ref(), session_id).await?
     } else if args.continue_latest {
-        latest_session_id(&sessions_dir, sqlite_store.as_ref())
+        let current_dir = args
+            .cwd
+            .as_deref()
+            .unwrap_or_else(|| Path::new("."))
+            .canonicalize()
+            .context("current project directory does not exist")?;
+        latest_session_id_in_directory(&sessions_dir, sqlite_store.as_ref(), &current_dir)
             .await?
-            .context("there are no local Borg sessions to continue")?
+            .context("there are no non-empty local Borg sessions to continue in this directory")?
     } else {
         Uuid::new_v4()
     };
@@ -1398,6 +1405,9 @@ async fn run_local_agent_session(
     };
     let mut shutdown_signals =
         ShutdownSignals::new().context("failed to install process shutdown handlers")?;
+    if can_prompt && io::stdout().is_terminal() {
+        reset_keyboard_enhancement();
+    }
     let mut terminal = if rich_tui_allowed {
         match BorgTerminal::enter(
             &sessions_dir,
@@ -1909,14 +1919,7 @@ async fn run_local_agent_session(
                         }
                     );
                 delivered_projection.observe(&event)?;
-                if let Some(message_id) = committed_prompt_id(&event.kind)
-                    && matches!(
-                        status,
-                        SessionStatus::Starting
-                            | SessionStatus::Running
-                            | SessionStatus::WaitingForApproval
-                    )
-                {
+                if let Some(message_id) = committed_prompt_id(&event.kind) {
                     pending_prompt_ids.remove(&message_id);
                     local_prompt_admissions
                         .lock()
@@ -1933,21 +1936,6 @@ async fn run_local_agent_session(
                     status = *next;
                     status_detail = detail.clone();
                     saw_running |= *next == SessionStatus::Running;
-                    if matches!(
-                        next,
-                        SessionStatus::Starting
-                            | SessionStatus::Running
-                            | SessionStatus::WaitingForApproval
-                    ) {
-                        // The durable status now protects terminal hangup. Any
-                        // prompt-admission guard that bridged the earlier Ready
-                        // window has served its purpose.
-                        pending_prompt_ids.clear();
-                        local_prompt_admissions
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .clear();
-                    }
                     sleep_inhibitor.set_turn_active(matches!(
                         next,
                         SessionStatus::Starting
@@ -4271,15 +4259,34 @@ async fn run_local_agent_session(
     let tui_was_active = crash_context.tui_active.load(Ordering::Acquire);
     shutdown_terminal(&mut terminal, &crash_context.tui_active).await;
     drop(session_events);
+    let mut actor_panicked = false;
     let actor_error = match actor.await {
         Ok(result) => result.err(),
-        Err(join_error) if join_error.is_panic() && tui_was_active => {
+        Err(join_error) => {
+            actor_panicked = join_error.is_panic();
+            Some(anyhow::anyhow!("agent session task failed: {join_error}"))
+        }
+    };
+    let discarded_empty_session = if session_access == LocalSessionAccess::Owned && !args.ephemeral
+    {
+        match sqlite_store.discard_empty_session(session_id).await {
+            Ok(discarded) => discarded,
+            Err(error) => {
+                tracing::warn!(%session_id, %error, "failed to discard empty local session");
+                false
+            }
+        }
+    } else {
+        false
+    };
+    if let Some(error) = actor_error {
+        if discarded_empty_session {
+            return Err(error);
+        }
+        if actor_panicked && tui_was_active {
             println!("{}", resume_instructions(session_id, false));
             return Ok(None);
         }
-        Err(join_error) => Some(anyhow::anyhow!("agent session task failed: {join_error}")),
-    };
-    if let Some(error) = actor_error {
         if tui_was_active {
             tracing::error!(%session_id, error = %error, "local agent session crashed");
             println!("{}", resume_instructions(session_id, false));
@@ -4599,16 +4606,28 @@ async fn recent_session_ids(sessions_dir: &Path, store: &SqliteSessionStore) -> 
 }
 
 fn session_has_resumable_activity(state: &borg_remote::SessionState) -> bool {
-    state.first_prompt.is_some()
-        || state.latest_response.is_some()
-        || state.provider_session_id.is_some()
-        || state.goal.is_some()
-        || !state.todos.is_empty()
-        || state.usage.calls > 0
-        // A prompt, interaction, context reset, or other durable user action
-        // advances beyond the launch-only Started/Configured/Ready/Stopped
-        // lifecycle emitted by automated terminal probes.
-        || state.latest_sequence > 4
+    state.has_resumable_activity()
+}
+
+async fn latest_session_id_in_directory(
+    sessions_dir: &Path,
+    store: &SqliteSessionStore,
+    current_dir: &Path,
+) -> Result<Option<Uuid>> {
+    fs::create_dir_all(sessions_dir)?;
+    Ok(store
+        .list_sessions(10_000)
+        .await?
+        .into_iter()
+        .find(|session| {
+            session_has_resumable_activity(&session.state)
+                && session
+                    .state
+                    .configuration
+                    .as_ref()
+                    .is_some_and(|configuration| configuration.cwd == current_dir)
+        })
+        .map(|session| session.session_id))
 }
 
 async fn recent_session_options(
@@ -5553,16 +5572,6 @@ async fn session_id_if_present(store: &SqliteSessionStore, session_id: Uuid) -> 
         "local Borg session {session_id} does not exist"
     );
     Ok(session_id)
-}
-
-async fn latest_session_id(
-    sessions_dir: &Path,
-    store: &SqliteSessionStore,
-) -> Result<Option<Uuid>> {
-    Ok(recent_session_ids(sessions_dir, store)
-        .await?
-        .into_iter()
-        .next())
 }
 
 fn print_history(events: &[SessionEvent]) {

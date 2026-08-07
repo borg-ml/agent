@@ -23,6 +23,7 @@ mod native_mcp;
 mod native_process;
 mod orchestration;
 mod persistent_runtime;
+mod plugin_store;
 mod process_environment;
 mod receipt;
 mod runtime_protocol;
@@ -60,6 +61,7 @@ pub use local_control::{
 };
 pub use lsp::LspService;
 pub use orchestration::*;
+pub(crate) use plugin_store::SqlitePluginStore;
 pub use runtime_protocol::{
     AGENT_RUNTIME_PROTOCOL, AGENT_RUNTIME_PROTOCOL_VERSION, AgentRuntimeCommandEnvelope,
     AgentRuntimeEventEnvelope, AgentRuntimeSnapshot,

@@ -4137,11 +4137,12 @@ impl BorgTerminal {
             .map(CacheStatus::cold_cache_guidance);
         let showing_primary_controls =
             !showing_slash_suggestions && notice.is_none() && cold_cache_guidance.is_none();
-        let tool_interaction_hint = self
+        let transcript_interaction_hint = self
             .hovered_tool
-            .and_then(|index| self.transcript.tool_copy_hint(index));
-        let showing_tool_interaction_hint =
-            showing_primary_controls && tool_interaction_hint.is_some();
+            .and_then(|index| self.transcript.tool_copy_hint(index))
+            .or_else(|| message_interaction_hint(&self.transcript.order, self.hovered_message));
+        let showing_transcript_interaction_hint =
+            showing_primary_controls && transcript_interaction_hint.is_some();
         let primary_controls = if resume_picker_open {
             format!(
                 "filter type · select ↑↓ · older PgUp/PgDn · resume {} · close {}",
@@ -4161,9 +4162,9 @@ impl BorgTerminal {
             effort_status_hovered: self.effort_status_hovered,
             permission_status_hovered: self.permission_status_hovered,
         });
-        let primary_controls_display = if showing_tool_interaction_hint {
-            tool_interaction_hint
-                .expect("tool interaction hint is present")
+        let primary_controls_display = if showing_transcript_interaction_hint {
+            transcript_interaction_hint
+                .expect("transcript interaction hint is present")
                 .to_string()
         } else {
             interaction_hint.map_or_else(
@@ -4195,9 +4196,9 @@ impl BorgTerminal {
                     .into_iter()
                     .map(|line| Line::from(Span::styled(line, Style::default().fg(Color::Yellow))))
                     .collect()
-            } else if showing_tool_interaction_hint {
+            } else if showing_transcript_interaction_hint {
                 vec![Line::from(Span::styled(
-                    tool_interaction_hint.expect("tool interaction hint is present"),
+                    transcript_interaction_hint.expect("transcript interaction hint is present"),
                     Style::default().fg(Color::Yellow),
                 ))]
             } else {
@@ -4348,7 +4349,7 @@ impl BorgTerminal {
             let (status_area, transcript_area, composer_area, footer_area) = if is_launch_screen {
                 let launch_width = composer_area_width.min(chunks[0].width);
                 let launch_height = composer_height
-                    .saturating_add(6)
+                    .saturating_add(7)
                     .saturating_add(controls_height)
                     .min(chunks[0].height);
                 let launch = Rect {
@@ -4360,7 +4361,7 @@ impl BorgTerminal {
                 let launch_chunks = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([
-                        Constraint::Length(5),
+                        Constraint::Length(6),
                         Constraint::Length(composer_height),
                         Constraint::Length(controls_height),
                     ])
@@ -4378,6 +4379,7 @@ impl BorgTerminal {
                             "What are we working on?",
                             Style::default().fg(Color::Gray),
                         )),
+                        Line::from(""),
                     ])
                     .alignment(Alignment::Center),
                     launch_chunks[0],
@@ -5292,7 +5294,7 @@ impl BorgTerminal {
                     );
                 }
             }
-            if showing_primary_controls && !showing_tool_interaction_hint {
+            if showing_primary_controls && !showing_transcript_interaction_hint {
                 let (controls_x, controls_y, controls_width) = if is_launch_screen {
                     let width = primary_controls_display.width() as u16;
                     (
@@ -8713,7 +8715,7 @@ fn composer_panel_height(
 fn bounded_launch_composer_height(desired: u16, terminal_height: u16, controls_height: u16) -> u16 {
     desired.min(
         terminal_height
-            .saturating_sub(6)
+            .saturating_sub(7)
             .saturating_sub(controls_height)
             .max(1),
     )
@@ -9565,6 +9567,22 @@ fn todo_tooltip_row_style(completed: bool) -> Style {
         } else {
             Modifier::empty()
         })
+}
+
+fn message_interaction_hint(
+    entries: &[TranscriptEntry],
+    hovered_message: Option<usize>,
+) -> Option<&'static str> {
+    hovered_message.and_then(|index| {
+        matches!(
+            entries.get(index),
+            Some(TranscriptEntry::Message {
+                actor: EventActor::User | EventActor::Assistant,
+                ..
+            })
+        )
+        .then_some("left click copy message")
+    })
 }
 
 #[derive(Clone, Copy, Default)]

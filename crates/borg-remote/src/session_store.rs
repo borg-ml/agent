@@ -452,6 +452,21 @@ impl SessionState {
         Ok(state)
     }
 
+    pub fn has_resumable_activity(&self) -> bool {
+        self.first_prompt.is_some()
+            || self.latest_response.is_some()
+            || self.provider_session_id.is_some()
+            || self.goal.is_some()
+            || !self.todos.is_empty()
+            || self.usage.calls > 0
+            || matches!(
+                self.status,
+                Some(SessionStatus::Running | SessionStatus::WaitingForApproval)
+            )
+            || self.pending_approval_id.is_some()
+            || self.pending_provider_interaction_id.is_some()
+    }
+
     pub fn apply(&mut self, event: &SessionEvent) -> Result<()> {
         let expected = self.latest_sequence.saturating_add(1);
         anyhow::ensure!(
@@ -995,6 +1010,10 @@ impl SqliteSessionStore {
 
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
+    }
+
+    pub(crate) fn plugin_store(&self) -> crate::SqlitePluginStore {
+        crate::SqlitePluginStore::new(self.pool.clone())
     }
 
     /// Query the lossless session journal through exact/range, FTS5, or
@@ -2101,6 +2120,47 @@ impl SqliteSessionStore {
         Ok(found != 0)
     }
 
+    pub async fn discard_empty_session(&self, session_id: Uuid) -> Result<bool> {
+        let mut transaction = self.begin_write().await?;
+        let Some(state_json) =
+            sqlx::query_scalar::<_, String>("select state_json from sessions where id = ?")
+                .bind(session_id.to_string())
+                .fetch_optional(&mut *transaction)
+                .await?
+        else {
+            transaction.commit().await?;
+            return Ok(false);
+        };
+        let state: SessionState = serde_json::from_str(&state_json)?;
+        if state.has_resumable_activity() {
+            transaction.commit().await?;
+            return Ok(false);
+        }
+        let has_children: i64 = sqlx::query_scalar(
+            "select exists(select 1 from sessions where owner_session_id = ? or parent_session_id = ?)",
+        )
+        .bind(session_id.to_string())
+        .bind(session_id.to_string())
+        .fetch_one(&mut *transaction)
+        .await?;
+        if has_children != 0 {
+            transaction.commit().await?;
+            return Ok(false);
+        }
+        sqlx::query("delete from host_launches where session_id = ?")
+            .bind(session_id.to_string())
+            .execute(&mut *transaction)
+            .await?;
+        let deleted = sqlx::query("delete from sessions where id = ?")
+            .bind(session_id.to_string())
+            .execute(&mut *transaction)
+            .await?
+            .rows_affected()
+            != 0;
+        transaction.commit().await?;
+        Ok(deleted)
+    }
+
     /// Create a new execution session directly inside an existing or
     /// caller-selected workspace. This is only valid before the session has
     /// events, so a resumed transcript can never silently move workspaces.
@@ -2438,6 +2498,7 @@ impl SqliteSessionStore {
         )
         .execute(&self.pool)
         .await?;
+        crate::plugin_store::ensure_schema(&self.pool).await?;
         let mut schema_transaction = self.begin_write().await?;
         let schema_version: Option<i64> =
             sqlx::query_scalar("select version from borg_session_schema where id=1")

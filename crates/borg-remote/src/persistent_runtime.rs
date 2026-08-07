@@ -681,6 +681,9 @@ class Borg:
     def environment(self, extension_id, server=None):
         return ExtensionEnvironment(self, extension_id, server)
 
+    def storage(self, extension_id):
+        return PluginStorage(self, extension_id)
+
 
 class Harness:
     def __init__(self, borg):
@@ -769,6 +772,42 @@ class ExtensionEnvironment:
 
     def __getattr__(self, name):
         return lambda arguments=None: self.call(name, arguments)
+
+
+class PluginStorage:
+    def __init__(self, borg, extension_id):
+        self.borg = borg
+        self.extension_id = str(extension_id)
+
+    def _call(self, operation, scope="session", **arguments):
+        return self.borg.call("plugin_store", {
+            "extension_id": self.extension_id,
+            "scope": scope,
+            "op": operation,
+            **arguments,
+        })
+
+    def get(self, key, scope="session"):
+        return self._call("get", scope, key=key).get("entry")
+
+    def list(self, prefix=None, scope="session", limit=200):
+        arguments = {"limit": limit}
+        if prefix is not None:
+            arguments["prefix"] = prefix
+        return self._call("list", scope, **arguments).get("entries", [])
+
+    def commit(self, idempotency_key, writes=None, artifacts=None, provenance=None, scope="session"):
+        return self._call(
+            "commit",
+            scope,
+            idempotency_key=idempotency_key,
+            writes=[] if writes is None else list(writes),
+            artifacts=[] if artifacts is None else list(artifacts),
+            provenance={} if provenance is None else provenance,
+        )
+
+    def verify_artifact(self, artifact_id, scope="session"):
+        return self._call("verify_artifact", scope, artifact_id=artifact_id)
 
 
 class RlmHandle:
@@ -1025,6 +1064,31 @@ borg.environment = (extensionId, server = undefined) => {
       }
       return borg.mcp(name, arguments_);
     },
+  };
+};
+
+borg.storage = (extensionId) => {
+  const id = String(extensionId);
+  const call = (operation, scope = "session", arguments_ = {}) => hostCall("plugin_store", {
+    extension_id: id,
+    scope,
+    op: operation,
+    ...arguments_,
+  });
+  return {
+    get: async (key, scope = "session") => (await call("get", scope, {key})).entry || null,
+    list: async (prefix = undefined, scope = "session", limit = 200) => {
+      const arguments_ = {limit};
+      if (prefix !== undefined && prefix !== null) arguments_.prefix = prefix;
+      return (await call("list", scope, arguments_)).entries || [];
+    },
+    commit: (idempotencyKey, writes = [], artifacts = [], provenance = {}, scope = "session") => call("commit", scope, {
+      idempotency_key: idempotencyKey,
+      writes,
+      artifacts,
+      provenance,
+    }),
+    verifyArtifact: (artifactId, scope = "session") => call("verify_artifact", scope, {artifact_id: artifactId}),
   };
 };
 

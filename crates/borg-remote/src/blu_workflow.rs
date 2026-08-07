@@ -85,6 +85,7 @@ pub(crate) struct RuntimeWorkflowResult {
 #[derive(Clone)]
 pub(crate) struct BluWorkflowRunner {
     session_id: Uuid,
+    extension_id: Option<String>,
     store: SqliteSessionStore,
     autonomy: SqliteAutonomyStore,
     dispatcher: Option<AgentToolDispatcher>,
@@ -106,6 +107,7 @@ impl BluWorkflowRunner {
     ) -> Self {
         Self {
             session_id,
+            extension_id: None,
             store,
             autonomy,
             dispatcher,
@@ -113,6 +115,11 @@ impl BluWorkflowRunner {
             root,
             permission,
         }
+    }
+
+    pub(crate) fn with_extension_id(mut self, extension_id: impl Into<String>) -> Self {
+        self.extension_id = Some(extension_id.into());
+        self
     }
 
     pub(crate) async fn run(&self, request: BluWorkflowRequest) -> Result<BluWorkflowResult> {
@@ -241,6 +248,7 @@ impl BluWorkflowRunner {
         )?;
         let bridge = HostBridge {
             session_id: self.session_id,
+            extension_id: self.extension_id.clone(),
             root: self.root.clone(),
             permission: self.permission,
             cancel: cancel.clone(),
@@ -947,6 +955,7 @@ impl WorkflowCallJournal {
 #[derive(Clone)]
 struct HostBridge {
     session_id: Uuid,
+    extension_id: Option<String>,
     root: PathBuf,
     permission: PermissionMode,
     cancel: CancellationToken,
@@ -1122,6 +1131,16 @@ impl HostBridge {
                     Ok(serde_json::to_value(checkpoint)?)
                 })?
             }
+            "plugin_store" => {
+                self.require_full_access(operation)?;
+                let request = guest_json(args, 1, "plugin_store_request_json")?;
+                let store = self.journal.store.plugin_store();
+                let extension_id = self.extension_id.as_deref();
+                let root = self.root.clone();
+                self.journal.call(call_id, operation, request.clone(), || {
+                    self.block_on(store.call(self.session_id, &root, extension_id, request))
+                })?
+            }
             "exec" => {
                 self.require_full_access(operation)?;
                 let command = guest_string(args, 1, "command")?;
@@ -1217,6 +1236,7 @@ fn execute_blu_source(
         ("borg_enqueue", "enqueue", bridge.clone()),
         ("borg_job", "job", bridge.clone()),
         ("borg_checkpoint", "checkpoint", bridge.clone()),
+        ("borg_plugin_store", "plugin_store", bridge.clone()),
         ("borg_exec", "exec", bridge),
     ] {
         let id = engine

@@ -400,11 +400,11 @@ pub async fn run_attached_session(
     session_id: Uuid,
     lock_path: PathBuf,
     socket_path: PathBuf,
-    mut last_sequence: u64,
+    last_sequence: u64,
     mut commands: mpsc::Receiver<HostCommand>,
     events: mpsc::Sender<SessionEvent>,
 ) -> Result<()> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncReadExt;
     use tokio::net::UnixStream;
 
     let presence_socket_path = session_control_presence_socket_path(
@@ -448,95 +448,142 @@ pub async fn run_attached_session(
         }
     };
 
+    let mut event_forwarder = tokio::spawn(forward_attached_events(
+        Arc::clone(&store),
+        session_id,
+        lock_path.clone(),
+        last_sequence,
+        events,
+    ));
+    loop {
+        tokio::select! {
+            result = &mut event_forwarder => {
+                return result.context("attached session event forwarder failed")?;
+            }
+            command = commands.recv() => {
+                let Some(command) = command else {
+                    event_forwarder.abort();
+                    return Ok(())
+                };
+                if matches!(command, HostCommand::Stop { .. }) {
+                    event_forwarder.abort();
+                    return Ok(());
+                }
+                match forward_attached_command(&lock_path, &socket_path, command).await {
+                    Ok(true) => {
+                        event_forwarder.abort();
+                        tracing::info!(
+                            lock_path = %lock_path.display(),
+                            "local session owner released its writer lease; detaching terminal"
+                        );
+                        return Ok(());
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        event_forwarder.abort();
+                        return Err(error);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn forward_attached_command(
+    lock_path: &Path,
+    socket_path: &Path,
+    command: HostCommand,
+) -> Result<bool> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::UnixStream;
+
+    if !writer_is_active(lock_path)? {
+        return Ok(true);
+    }
+    let mut stream = match UnixStream::connect(socket_path).await {
+        Ok(stream) => stream,
+        Err(_) if !writer_is_active(lock_path)? => return Ok(true),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "session writer is active but its local control channel is unavailable ({})",
+                    socket_path.display()
+                )
+            });
+        }
+    };
+    stream.write_all(&serde_json::to_vec(&command)?).await?;
+    stream.shutdown().await?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await?;
+    let response: serde_json::Value = serde_json::from_slice(&response)
+        .context("session owner returned an invalid control response")?;
+    if let Some(error) = response.get("error").and_then(serde_json::Value::as_str) {
+        bail!("session owner rejected command: {error}");
+    }
+    anyhow::ensure!(
+        response.get("ok").and_then(serde_json::Value::as_bool) == Some(true),
+        "session owner did not acknowledge command"
+    );
+    Ok(false)
+}
+
+/// Forward the canonical event stream independently from the command path.
+///
+/// The event channel is deliberately backpressured: dropping a durable event
+/// would make the attached projection unverifiable. That backpressure must not
+/// also stop an attached terminal from delivering Escape, prompts, or goal
+/// commands to the owner, so this loop owns only event forwarding.
+#[cfg(unix)]
+async fn forward_attached_events(
+    store: Arc<dyn SessionStore>,
+    session_id: Uuid,
+    lock_path: PathBuf,
+    mut last_sequence: u64,
+    events: mpsc::Sender<SessionEvent>,
+) -> Result<()> {
     let mut refresh = tokio::time::interval(ATTACHED_SESSION_REFRESH_INTERVAL);
     let mut live_revision = 0_u64;
     let mut reasoning_snapshot = String::new();
     loop {
-        tokio::select! {
-            command = commands.recv() => {
-                let Some(command) = command else { return Ok(()) };
-                if matches!(command, HostCommand::Stop { .. }) {
-                    return Ok(());
-                }
-                if !writer_is_active(&lock_path)? {
-                    tracing::info!(
-                        lock_path = %lock_path.display(),
-                        "local session owner released its writer lease; detaching terminal"
-                    );
-                    return Ok(());
-                }
-                let mut stream = match UnixStream::connect(&socket_path).await {
-                    Ok(stream) => stream,
-                    Err(_) if !writer_is_active(&lock_path)? => {
-                        tracing::info!(
-                            lock_path = %lock_path.display(),
-                            "local session owner exited before accepting a command; detaching terminal"
-                        );
-                        return Ok(());
-                    }
-                    Err(error) => {
-                        return Err(error).with_context(|| {
-                            format!(
-                                "session writer is active but its local control channel is unavailable ({})",
-                                socket_path.display()
-                            )
-                        });
-                    }
-                };
-                stream.write_all(&serde_json::to_vec(&command)?).await?;
-                stream.shutdown().await?;
-                let mut response = Vec::new();
-                stream.read_to_end(&mut response).await?;
-                let response: serde_json::Value = serde_json::from_slice(&response)
-                    .context("session owner returned an invalid control response")?;
-                if let Some(error) = response.get("error").and_then(serde_json::Value::as_str) {
-                    bail!("session owner rejected command: {error}");
-                }
-                anyhow::ensure!(
-                    response.get("ok").and_then(serde_json::Value::as_bool) == Some(true),
-                    "session owner did not acknowledge command"
-                );
+        refresh.tick().await;
+        for event in store.events_after(session_id, last_sequence, 1_000).await? {
+            if event.kind.clears_live_turn_state()
+                || event
+                    .kind
+                    .cleared_live_state_keys()
+                    .iter()
+                    .any(|key| key == "reasoning")
+            {
+                reasoning_snapshot.clear();
             }
-            _ = refresh.tick() => {
-                for event in store.events_after(session_id, last_sequence, 1_000).await? {
-                    last_sequence = event.sequence;
-                    if event.kind.clears_live_turn_state()
-                        || event
-                            .kind
-                            .cleared_live_state_keys()
-                            .iter()
-                            .any(|key| key == "reasoning")
-                    {
-                        reasoning_snapshot.clear();
-                    }
-                    let stopped = matches!(
-                        event.kind,
-                        SessionEventKind::StatusChanged {
-                            status: SessionStatus::Stopped,
-                            ..
-                        }
-                    );
-                    if events.send(event).await.is_err() || stopped {
-                        return Ok(());
-                    }
+            let stopped = matches!(
+                event.kind,
+                SessionEventKind::StatusChanged {
+                    status: SessionStatus::Stopped,
+                    ..
                 }
-                for live in store.live_events_after(session_id, live_revision).await? {
-                    live_revision = live_revision.max(live.revision);
-                    if let Some(event) =
-                        reasoning_delta_from_snapshot(live.event, &mut reasoning_snapshot)
-                        && events.send(event).await.is_err()
-                    {
-                        return Ok(());
-                    }
-                }
-                if !writer_is_active(&lock_path)? {
-                    tracing::info!(
-                        lock_path = %lock_path.display(),
-                        "local session owner released its writer lease; detaching terminal"
-                    );
-                    return Ok(());
-                }
+            );
+            let sequence = event.sequence;
+            if events.send(event).await.is_err() {
+                return Ok(());
             }
+            last_sequence = sequence;
+            if stopped {
+                return Ok(());
+            }
+        }
+        for live in store.live_events_after(session_id, live_revision).await? {
+            live_revision = live_revision.max(live.revision);
+            if let Some(event) = reasoning_delta_from_snapshot(live.event, &mut reasoning_snapshot)
+                && events.send(event).await.is_err()
+            {
+                return Ok(());
+            }
+        }
+        if !writer_is_active(&lock_path)? {
+            return Ok(());
         }
     }
 }
@@ -880,6 +927,79 @@ mod tests {
                 context_window_tokens: 100,
             }
         ));
+
+        command_tx
+            .send(HostCommand::Stop { session_id })
+            .await
+            .unwrap();
+        attachment.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn blocked_attached_event_delivery_does_not_block_owner_commands() {
+        let root = short_socket_tempdir();
+        let session_id = Uuid::new_v4();
+        let journal_path = root.path().join(format!("{session_id}.lock"));
+        let socket_path = session_control_socket_path(root.path(), session_id);
+        let _writer = SessionWriterLease::try_acquire(&journal_path)
+            .unwrap()
+            .unwrap();
+        let sqlite = Arc::new(
+            crate::SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+                .await
+                .unwrap(),
+        );
+        sqlite.create_session(session_id).await.unwrap();
+        sqlite
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::SessionStarted,
+            ))
+            .await
+            .unwrap();
+        sqlite
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::StatusChanged {
+                    status: SessionStatus::Ready,
+                    detail: None,
+                },
+            ))
+            .await
+            .unwrap();
+
+        let (owner_tx, mut owner_rx) = mpsc::channel(4);
+        let _server =
+            LocalSessionControlServer::start(socket_path.clone(), session_id, &_writer, owner_tx)
+                .unwrap();
+        let (command_tx, command_rx) = mpsc::channel(4);
+        let (event_tx, _event_rx) = mpsc::channel(1);
+        let store: Arc<dyn SessionStore> = sqlite;
+        let attachment = tokio::spawn(run_attached_session(
+            store,
+            session_id,
+            journal_path,
+            socket_path,
+            0,
+            command_rx,
+            event_tx,
+        ));
+
+        // The first durable event fills the bounded projection channel; the
+        // second event then blocks the event forwarder. Commands must still
+        // reach the owner while that backpressure is present.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        command_tx
+            .send(HostCommand::Interrupt { session_id })
+            .await
+            .unwrap();
+        let forwarded = tokio::time::timeout(std::time::Duration::from_secs(1), owner_rx.recv())
+            .await
+            .expect("owner command should not wait behind event backpressure")
+            .expect("owner command channel should remain open");
+        assert!(matches!(forwarded, HostCommand::Interrupt { session_id: id } if id == session_id));
 
         command_tx
             .send(HostCommand::Stop { session_id })

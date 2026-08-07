@@ -1485,6 +1485,15 @@ async fn resume_discovery_ignores_launch_only_probe_sessions() {
                 status: SessionStatus::Stopped,
                 detail: None,
             },
+            SessionEventKind::ProviderCapabilitiesUpdated {
+                providers: Vec::new(),
+            },
+            SessionEventKind::EffectiveCapabilitiesUpdated {
+                capabilities: borg_remote::EffectiveCapabilities {
+                    active: Vec::new(),
+                    inactive: Vec::new(),
+                },
+            },
         ] {
             store
                 .append(SessionEvent::new(session_id, 0, kind))
@@ -1513,6 +1522,54 @@ async fn resume_discovery_ignores_launch_only_probe_sessions() {
     assert!(
         store.contains_session(probe).await.unwrap(),
         "filtering the resume surface must not destructively delete stored sessions"
+    );
+}
+
+#[tokio::test]
+async fn continue_selects_the_latest_non_empty_session_in_the_current_directory() {
+    let dir = tempdir().expect("session directory");
+    let store = SqliteSessionStore::open(dir.path().join("sessions.sqlite3"))
+        .await
+        .unwrap();
+    let local = Uuid::new_v4();
+    let other = Uuid::new_v4();
+    for (session_id, cwd) in [
+        (local, dir.path().to_path_buf()),
+        (other, dir.path().join("other-project")),
+    ] {
+        store.create_session(session_id).await.unwrap();
+        for kind in [
+            SessionEventKind::SessionStarted,
+            SessionEventKind::SessionConfigured {
+                cwd,
+                provider: CodingProvider::Codex,
+                model: None,
+                effort: None,
+                fast: false,
+                response_language: ResponseLanguage::Auto,
+                permission_mode: PermissionMode::FullAccess,
+            },
+            SessionEventKind::Message {
+                message_id: Uuid::new_v4(),
+                actor: EventActor::User,
+                text: "resumable work".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            },
+        ] {
+            store
+                .append(SessionEvent::new(session_id, 0, kind))
+                .await
+                .unwrap();
+        }
+    }
+
+    assert_eq!(
+        latest_session_id_in_directory(dir.path(), &store, dir.path())
+            .await
+            .unwrap(),
+        Some(local)
     );
 }
 

@@ -199,6 +199,62 @@ async fn session_creation_waits_through_extended_writer_contention() {
 }
 
 #[tokio::test]
+async fn empty_sessions_are_discarded_but_real_sessions_are_kept() {
+    let (_directory, store) = store().await;
+    let empty = Uuid::new_v4();
+    let real = Uuid::new_v4();
+    store.create_session(empty).await.unwrap();
+    store.create_session(real).await.unwrap();
+
+    for kind in [
+        SessionEventKind::SessionStarted,
+        SessionEventKind::SessionConfigured {
+            cwd: std::path::PathBuf::from("/tmp/borg-empty"),
+            provider: CodingProvider::Codex,
+            model: None,
+            effort: None,
+            fast: false,
+            response_language: ResponseLanguage::Auto,
+            permission_mode: PermissionMode::FullAccess,
+        },
+        SessionEventKind::ProviderCapabilitiesUpdated {
+            providers: Vec::new(),
+        },
+        SessionEventKind::EffectiveCapabilitiesUpdated {
+            capabilities: crate::EffectiveCapabilities {
+                active: Vec::new(),
+                inactive: Vec::new(),
+            },
+        },
+    ] {
+        store
+            .append(SessionEvent::new(empty, 0, kind))
+            .await
+            .unwrap();
+    }
+    store
+        .append(SessionEvent::new(
+            real,
+            0,
+            SessionEventKind::Message {
+                message_id: Uuid::new_v4(),
+                actor: EventActor::User,
+                text: "keep this thread".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: Some(PromptDelivery::Queue),
+            },
+        ))
+        .await
+        .unwrap();
+
+    assert!(store.discard_empty_session(empty).await.unwrap());
+    assert!(!store.contains_session(empty).await.unwrap());
+    assert!(!store.discard_empty_session(real).await.unwrap());
+    assert!(store.contains_session(real).await.unwrap());
+}
+
+#[tokio::test]
 async fn opening_schema_v4_archives_and_recreates_the_database() {
     let (directory, store) = store().await;
     let path = directory.path().join("sessions.sqlite3");

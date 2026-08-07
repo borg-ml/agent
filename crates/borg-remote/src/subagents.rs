@@ -1087,7 +1087,8 @@ impl AgentToolDispatcher {
             context.processes.clone(),
             context.root.clone(),
             permission,
-        );
+        )
+        .with_extension_id(workflow.extension_id.clone());
         let cancel = workflow_cancel.unwrap_or_default();
         if workflow.runtime == crate::WorkflowRuntime::Blu {
             let profile = crate::blu_workflow::embedded_source_profile(&workflow.entrypoint);
@@ -1409,6 +1410,20 @@ impl RuntimeHost for DispatcherRuntimeHost {
                     .as_ref()
                     .context("lossless session history is unavailable for this runtime")?;
                 history_index_response(store, self.session_id, args).await
+            }
+            "plugin_store" => {
+                let is_mutation = arguments.get("op").and_then(Value::as_str) == Some("commit");
+                if is_mutation {
+                    self.ensure_effects()?;
+                }
+                let store = self
+                    .session_store
+                    .as_ref()
+                    .context("extension storage is unavailable for this session")?
+                    .plugin_store();
+                store
+                    .call(self.session_id, &self.root, None, arguments)
+                    .await
             }
             "retrieval_adapter" => {
                 let id = arguments

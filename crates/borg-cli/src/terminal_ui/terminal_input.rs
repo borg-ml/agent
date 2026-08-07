@@ -4,7 +4,8 @@ use std::time::Duration;
 use crossterm::event::{Event, EventStream, MouseEvent, MouseEventKind};
 use futures_util::{Stream, StreamExt};
 
-const DISCRETE_EVENT_CHANNEL_CAPACITY: usize = 32;
+const PRIORITY_EVENT_CHANNEL_CAPACITY: usize = 64;
+const VISUAL_EVENT_CHANNEL_CAPACITY: usize = 32;
 const WHEEL_FLUSH_INTERVAL: Duration = Duration::from_millis(4);
 const POINTER_MOVE_FLUSH_INTERVAL: Duration = Duration::from_millis(8);
 const DRAG_FLUSH_INTERVAL: Duration = Duration::from_millis(8);
@@ -26,75 +27,101 @@ impl TerminalInputEvent {
 }
 
 pub(super) struct TerminalInput {
-    discrete_events: tokio::sync::mpsc::Receiver<io::Result<Event>>,
+    priority_events: tokio::sync::mpsc::Receiver<io::Result<Event>>,
+    visual_events: tokio::sync::mpsc::Receiver<io::Result<Event>>,
     wheel_events: tokio::sync::mpsc::Receiver<WheelBurst>,
-    deferred_discrete: Option<io::Result<Event>>,
+    deferred_visual: Option<io::Result<Event>>,
+    priority_closed: bool,
+    visual_closed: bool,
+    wheel_closed: bool,
     pump: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl TerminalInput {
     pub(super) fn spawn() -> Self {
-        let (discrete_tx, discrete_events) =
-            tokio::sync::mpsc::channel(DISCRETE_EVENT_CHANNEL_CAPACITY);
+        let (priority_tx, priority_events) =
+            tokio::sync::mpsc::channel(PRIORITY_EVENT_CHANNEL_CAPACITY);
+        let (visual_tx, visual_events) = tokio::sync::mpsc::channel(VISUAL_EVENT_CHANNEL_CAPACITY);
         let (wheel_tx, wheel_events) = tokio::sync::mpsc::channel(1);
         let pump = tokio::spawn(async move {
-            pump_terminal_events(EventStream::new(), discrete_tx, wheel_tx).await;
+            pump_terminal_events(EventStream::new(), priority_tx, visual_tx, wheel_tx).await;
         });
         Self {
-            discrete_events,
+            priority_events,
+            visual_events,
             wheel_events,
-            deferred_discrete: None,
+            deferred_visual: None,
+            priority_closed: false,
+            visual_closed: false,
+            wheel_closed: false,
             pump: Some(pump),
         }
     }
 
     pub(super) async fn next_event(&mut self) -> Option<io::Result<TerminalInputEvent>> {
-        if let Some(event) = self.deferred_discrete.take() {
-            return Some(
-                self.coalesce_ready_resize(event)
-                    .map(TerminalInputEvent::single),
-            );
-        }
-        match self.discrete_events.try_recv() {
-            Ok(event) => {
-                return Some(
-                    self.coalesce_ready_resize(event)
-                        .map(TerminalInputEvent::single),
-                );
-            }
-            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                return self.wheel_events.recv().await.map(|wheel| Ok(wheel.into()));
-            }
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
-        }
-        match self.wheel_events.try_recv() {
-            Ok(wheel) => return Some(Ok(wheel.into())),
-            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                let event = self.discrete_events.recv().await?;
-                return Some(
-                    self.coalesce_ready_resize(event)
-                        .map(TerminalInputEvent::single),
-                );
-            }
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
-        }
-
-        tokio::select! {
-            biased;
-            event = self.discrete_events.recv() => {
-                match event {
-                    Some(event) => {
-                        Some(self.coalesce_ready_resize(event).map(TerminalInputEvent::single))
+        loop {
+            if !self.priority_closed {
+                match self.priority_events.try_recv() {
+                    Ok(event) => return Some(event.map(TerminalInputEvent::single)),
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        self.priority_closed = true;
                     }
-                    None => self.wheel_events.recv().await.map(|wheel| Ok(wheel.into())),
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
                 }
             }
-            wheel = self.wheel_events.recv() => {
-                match wheel {
-                    Some(wheel) => Some(Ok(wheel.into())),
-                    None => {
-                        let event = self.discrete_events.recv().await?;
-                        Some(self.coalesce_ready_resize(event).map(TerminalInputEvent::single))
+            if let Some(event) = self.deferred_visual.take() {
+                return Some(
+                    self.coalesce_ready_resize(event)
+                        .map(TerminalInputEvent::single),
+                );
+            }
+            if !self.visual_closed {
+                match self.visual_events.try_recv() {
+                    Ok(event) => {
+                        return Some(
+                            self.coalesce_ready_resize(event)
+                                .map(TerminalInputEvent::single),
+                        );
+                    }
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        self.visual_closed = true;
+                    }
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+                }
+            }
+            if !self.wheel_closed {
+                match self.wheel_events.try_recv() {
+                    Ok(wheel) => return Some(Ok(wheel.into())),
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        self.wheel_closed = true;
+                    }
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+                }
+            }
+            if self.priority_closed && self.visual_closed && self.wheel_closed {
+                return None;
+            }
+
+            tokio::select! {
+                biased;
+                event = self.priority_events.recv(), if !self.priority_closed => {
+                    match event {
+                        Some(event) => return Some(event.map(TerminalInputEvent::single)),
+                        None => self.priority_closed = true,
+                    }
+                }
+                event = self.visual_events.recv(), if !self.visual_closed => {
+                    match event {
+                        Some(event) => {
+                            return Some(self.coalesce_ready_resize(event).map(TerminalInputEvent::single));
+                        }
+                        None => self.visual_closed = true,
+                    }
+                }
+                wheel = self.wheel_events.recv(), if !self.wheel_closed => {
+                    match wheel {
+                        Some(wheel) => return Some(Ok(wheel.into())),
+                        None => self.wheel_closed = true,
                     }
                 }
             }
@@ -107,10 +134,10 @@ impl TerminalInput {
         }
         let mut latest = event;
         loop {
-            match self.discrete_events.try_recv() {
+            match self.visual_events.try_recv() {
                 Ok(event @ Ok(Event::Resize(_, _))) => latest = event,
                 Ok(event) => {
-                    self.deferred_discrete = Some(event);
+                    self.deferred_visual = Some(event);
                     break;
                 }
                 Err(
@@ -205,12 +232,12 @@ fn flush_wheel(
 
 fn flush_resize(
     pending: &mut Option<Event>,
-    discrete_tx: &tokio::sync::mpsc::Sender<io::Result<Event>>,
+    visual_tx: &tokio::sync::mpsc::Sender<io::Result<Event>>,
 ) -> bool {
     let Some(event) = pending.take() else {
         return true;
     };
-    match discrete_tx.try_send(Ok(event)) {
+    match visual_tx.try_send(Ok(event)) {
         Ok(()) => true,
         Err(tokio::sync::mpsc::error::TrySendError::Full(Ok(event))) => {
             *pending = Some(event);
@@ -223,14 +250,33 @@ fn flush_resize(
 
 fn flush_drag(
     pending: &mut Option<Event>,
-    discrete_tx: &tokio::sync::mpsc::Sender<io::Result<Event>>,
+    visual_tx: &tokio::sync::mpsc::Sender<io::Result<Event>>,
 ) -> bool {
-    flush_resize(pending, discrete_tx)
+    flush_resize(pending, visual_tx)
+}
+
+fn flush_pending_visual(
+    pending: &mut Option<Event>,
+    visual_tx: &tokio::sync::mpsc::Sender<io::Result<Event>>,
+) -> bool {
+    flush_resize(pending, visual_tx)
+}
+
+fn flush_pending_visuals(
+    pending_pointer_move: &mut Option<Event>,
+    pending_drag: &mut Option<Event>,
+    pending_resize: &mut Option<Event>,
+    visual_tx: &tokio::sync::mpsc::Sender<io::Result<Event>>,
+) -> bool {
+    flush_pending_visual(pending_pointer_move, visual_tx)
+        && flush_pending_visual(pending_drag, visual_tx)
+        && flush_pending_visual(pending_resize, visual_tx)
 }
 
 async fn pump_terminal_events<S>(
     mut events: S,
-    discrete_tx: tokio::sync::mpsc::Sender<io::Result<Event>>,
+    priority_tx: tokio::sync::mpsc::Sender<io::Result<Event>>,
+    visual_tx: tokio::sync::mpsc::Sender<io::Result<Event>>,
     wheel_tx: tokio::sync::mpsc::Sender<WheelBurst>,
 ) where
     S: Stream<Item = io::Result<Event>> + Unpin,
@@ -262,15 +308,12 @@ async fn pump_terminal_events<S>(
             event = events.next() => {
                 let Some(event) = event else {
                     let _ = flush_wheel(&mut pending_wheel, &wheel_tx);
-                    if let Some(event) = pending_pointer_move.take() {
-                        let _ = discrete_tx.send(Ok(event)).await;
-                    }
-                    if let Some(event) = pending_drag.take() {
-                        let _ = discrete_tx.send(Ok(event)).await;
-                    }
-                    if let Some(event) = pending_resize.take() {
-                        let _ = discrete_tx.send(Ok(event)).await;
-                    }
+                    let _ = flush_pending_visuals(
+                        &mut pending_pointer_move,
+                        &mut pending_drag,
+                        &mut pending_resize,
+                        &visual_tx,
+                    );
                     return;
                 };
                 if let Ok(Event::Resize(_, _)) = &event {
@@ -285,38 +328,30 @@ async fn pump_terminal_events<S>(
                 } else if let Ok(Event::Mouse(mouse)) = &event
                     && matches!(mouse.kind, MouseEventKind::Moved)
                 {
-                    if let Some(drag) = pending_drag.take()
-                        && discrete_tx.send(Ok(drag)).await.is_err()
-                    {
+                    if !flush_pending_visual(&mut pending_drag, &visual_tx) {
                         return;
                     }
                     pending_pointer_move = event.ok();
                 } else if let Ok(Event::Mouse(mouse)) = &event
                     && matches!(mouse.kind, MouseEventKind::Drag(_))
                 {
-                    if let Some(pointer_move) = pending_pointer_move.take()
-                        && discrete_tx.send(Ok(pointer_move)).await.is_err()
-                    {
+                    if !flush_pending_visual(&mut pending_pointer_move, &visual_tx) {
                         return;
                     }
                     pending_drag = event.ok();
                 } else {
-                    if let Some(pointer_move) = pending_pointer_move.take()
-                        && discrete_tx.send(Ok(pointer_move)).await.is_err()
-                    {
+                    // Visual events are best-effort and coalesced. Never let
+                    // their bounded queue delay a keyboard, paste, focus, or
+                    // mouse-button event that can change session state.
+                    if !flush_pending_visuals(
+                        &mut pending_pointer_move,
+                        &mut pending_drag,
+                        &mut pending_resize,
+                        &visual_tx,
+                    ) {
                         return;
                     }
-                    if let Some(drag) = pending_drag.take()
-                        && discrete_tx.send(Ok(drag)).await.is_err()
-                    {
-                        return;
-                    }
-                    if let Some(resize) = pending_resize.take()
-                        && discrete_tx.send(Ok(resize)).await.is_err()
-                    {
-                        return;
-                    }
-                    if discrete_tx.send(event).await.is_err() {
+                    if priority_tx.send(event).await.is_err() {
                         return;
                     }
                 }
@@ -327,17 +362,17 @@ async fn pump_terminal_events<S>(
                 }
             }
             _ = pointer_move_flush_tick.tick() => {
-                if !flush_drag(&mut pending_pointer_move, &discrete_tx) {
+                if !flush_drag(&mut pending_pointer_move, &visual_tx) {
                     return;
                 }
             }
             _ = drag_flush_tick.tick() => {
-                if !flush_drag(&mut pending_drag, &discrete_tx) {
+                if !flush_drag(&mut pending_drag, &visual_tx) {
                     return;
                 }
             }
             _ = resize_flush_tick.tick() => {
-                if !flush_resize(&mut pending_resize, &discrete_tx) {
+                if !flush_resize(&mut pending_resize, &visual_tx) {
                     return;
                 }
             }
@@ -365,8 +400,9 @@ mod tests {
 
     #[tokio::test]
     async fn wheel_flood_stays_out_of_the_discrete_input_queue() {
-        let (discrete_tx, mut discrete_events) =
-            tokio::sync::mpsc::channel(DISCRETE_EVENT_CHANNEL_CAPACITY);
+        let (priority_tx, mut priority_events) =
+            tokio::sync::mpsc::channel(PRIORITY_EVENT_CHANNEL_CAPACITY);
+        let (visual_tx, _visual_events) = tokio::sync::mpsc::channel(VISUAL_EVENT_CHANNEL_CAPACITY);
         let (wheel_tx, mut wheel_events) = tokio::sync::mpsc::channel(1);
         let events = (0..100_000)
             .map(|_| Ok(Event::Mouse(wheel_mouse(MouseEventKind::ScrollDown))))
@@ -375,16 +411,22 @@ mod tests {
                 KeyModifiers::NONE,
             )))));
 
-        pump_terminal_events(futures_util::stream::iter(events), discrete_tx, wheel_tx).await;
+        pump_terminal_events(
+            futures_util::stream::iter(events),
+            priority_tx,
+            visual_tx,
+            wheel_tx,
+        )
+        .await;
 
         assert!(matches!(
-            discrete_events.recv().await,
+            priority_events.recv().await,
             Some(Ok(Event::Key(KeyEvent {
                 code: KeyCode::Char('x'),
                 ..
             })))
         ));
-        assert!(discrete_events.recv().await.is_none());
+        assert!(priority_events.recv().await.is_none());
         let input: TerminalInputEvent = wheel_events.recv().await.unwrap().into();
         assert_eq!(input.scroll_repetitions, MAX_PENDING_WHEEL_EVENTS as usize);
         assert!(matches!(
@@ -398,9 +440,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn keyboard_events_bypass_a_full_visual_queue() {
+        let (priority_tx, mut priority_events) =
+            tokio::sync::mpsc::channel(PRIORITY_EVENT_CHANNEL_CAPACITY);
+        let (visual_tx, _visual_events) = tokio::sync::mpsc::channel(1);
+        visual_tx.send(Ok(Event::Resize(80, 24))).await.unwrap();
+        let (wheel_tx, _wheel_events) = tokio::sync::mpsc::channel(1);
+        let events = futures_util::stream::iter([
+            Ok(Event::Resize(120, 40)),
+            Ok(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))),
+        ]);
+
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            pump_terminal_events(events, priority_tx, visual_tx, wheel_tx),
+        )
+        .await
+        .expect("keyboard delivery must not wait for visual backpressure");
+        assert!(matches!(
+            priority_events.recv().await,
+            Some(Ok(Event::Key(KeyEvent {
+                code: KeyCode::Esc,
+                ..
+            })))
+        ));
+    }
+
+    #[tokio::test]
     async fn pointer_motion_cannot_queue_a_wheel_gesture_behind_stale_coordinates() {
-        let (discrete_tx, mut discrete_events) =
-            tokio::sync::mpsc::channel(DISCRETE_EVENT_CHANNEL_CAPACITY);
+        let (priority_tx, _priority_events) =
+            tokio::sync::mpsc::channel(PRIORITY_EVENT_CHANNEL_CAPACITY);
+        let (visual_tx, mut visual_events) =
+            tokio::sync::mpsc::channel(VISUAL_EVENT_CHANNEL_CAPACITY);
         let (wheel_tx, mut wheel_events) = tokio::sync::mpsc::channel(1);
         let events = (1..=10_000)
             .map(|row| {
@@ -415,17 +486,23 @@ mod tests {
                 MouseEventKind::ScrollDown,
             )))));
 
-        pump_terminal_events(futures_util::stream::iter(events), discrete_tx, wheel_tx).await;
+        pump_terminal_events(
+            futures_util::stream::iter(events),
+            priority_tx,
+            visual_tx,
+            wheel_tx,
+        )
+        .await;
 
         assert!(matches!(
-            discrete_events.recv().await,
+            visual_events.recv().await,
             Some(Ok(Event::Mouse(MouseEvent {
                 kind: MouseEventKind::Moved,
                 row: 10_000,
                 ..
             })))
         ));
-        assert!(discrete_events.recv().await.is_none());
+        assert!(visual_events.recv().await.is_none());
         let input: TerminalInputEvent = wheel_events.recv().await.unwrap().into();
         assert!(matches!(
             input.event,
@@ -438,8 +515,10 @@ mod tests {
 
     #[tokio::test]
     async fn resize_burst_keeps_only_the_latest_dimensions() {
-        let (discrete_tx, mut discrete_events) =
-            tokio::sync::mpsc::channel(DISCRETE_EVENT_CHANNEL_CAPACITY);
+        let (priority_tx, mut priority_events) =
+            tokio::sync::mpsc::channel(PRIORITY_EVENT_CHANNEL_CAPACITY);
+        let (visual_tx, mut visual_events) =
+            tokio::sync::mpsc::channel(VISUAL_EVENT_CHANNEL_CAPACITY);
         let (wheel_tx, _wheel_events) = tokio::sync::mpsc::channel(1);
         let events = (1..=10_000)
             .map(|width| Ok(Event::Resize(width, 40)))
@@ -448,26 +527,34 @@ mod tests {
                 KeyModifiers::NONE,
             )))));
 
-        pump_terminal_events(futures_util::stream::iter(events), discrete_tx, wheel_tx).await;
+        pump_terminal_events(
+            futures_util::stream::iter(events),
+            priority_tx,
+            visual_tx,
+            wheel_tx,
+        )
+        .await;
 
         assert!(matches!(
-            discrete_events.recv().await,
+            visual_events.recv().await,
             Some(Ok(Event::Resize(10_000, 40)))
         ));
         assert!(matches!(
-            discrete_events.recv().await,
+            priority_events.recv().await,
             Some(Ok(Event::Key(KeyEvent {
                 code: KeyCode::Char('x'),
                 ..
             })))
         ));
-        assert!(discrete_events.recv().await.is_none());
+        assert!(priority_events.recv().await.is_none());
     }
 
     #[tokio::test]
     async fn drag_burst_keeps_the_latest_pointer_position_before_release() {
-        let (discrete_tx, mut discrete_events) =
-            tokio::sync::mpsc::channel(DISCRETE_EVENT_CHANNEL_CAPACITY);
+        let (priority_tx, mut priority_events) =
+            tokio::sync::mpsc::channel(PRIORITY_EVENT_CHANNEL_CAPACITY);
+        let (visual_tx, mut visual_events) =
+            tokio::sync::mpsc::channel(VISUAL_EVENT_CHANNEL_CAPACITY);
         let (wheel_tx, _wheel_events) = tokio::sync::mpsc::channel(1);
         let events = (1..=10_000)
             .map(|row| {
@@ -485,61 +572,66 @@ mod tests {
                 modifiers: KeyModifiers::NONE,
             }))));
 
-        pump_terminal_events(futures_util::stream::iter(events), discrete_tx, wheel_tx).await;
+        pump_terminal_events(
+            futures_util::stream::iter(events),
+            priority_tx,
+            visual_tx,
+            wheel_tx,
+        )
+        .await;
 
-        let events = std::iter::from_fn(|| discrete_events.try_recv().ok()).collect::<Vec<_>>();
-        assert!(events.len() <= 2);
+        let visual = std::iter::from_fn(|| visual_events.try_recv().ok()).collect::<Vec<_>>();
+        let priority = std::iter::from_fn(|| priority_events.try_recv().ok()).collect::<Vec<_>>();
+        assert!(visual.len() <= 1);
+        assert_eq!(priority.len(), 1);
         assert!(matches!(
-            events.as_slice(),
-            [
-                Ok(Event::Mouse(MouseEvent {
-                    kind: MouseEventKind::Drag(_),
-                    row: 10_000,
-                    ..
-                })),
-                Ok(Event::Mouse(MouseEvent {
-                    kind: MouseEventKind::Up(_),
-                    row: 10_000,
-                    ..
-                }))
-            ]
+            visual.as_slice(),
+            [Ok(Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Drag(_),
+                row: 10_000,
+                ..
+            }))]
+        ));
+        assert!(matches!(
+            priority.as_slice(),
+            [Ok(Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Up(_),
+                row: 10_000,
+                ..
+            }))]
         ));
     }
 
     #[tokio::test]
     async fn queued_resize_frames_collapse_before_the_renderer_sees_them() {
-        let (discrete_tx, discrete_events) =
-            tokio::sync::mpsc::channel(DISCRETE_EVENT_CHANNEL_CAPACITY);
+        let (priority_tx, priority_events) =
+            tokio::sync::mpsc::channel(PRIORITY_EVENT_CHANNEL_CAPACITY);
+        let (visual_tx, visual_events) = tokio::sync::mpsc::channel(VISUAL_EVENT_CHANNEL_CAPACITY);
         let (_wheel_tx, wheel_events) = tokio::sync::mpsc::channel(1);
         for width in 1..=20 {
-            discrete_tx
-                .send(Ok(Event::Resize(width, 40)))
-                .await
-                .unwrap();
+            visual_tx.send(Ok(Event::Resize(width, 40))).await.unwrap();
         }
-        discrete_tx
+        priority_tx
             .send(Ok(Event::Key(KeyEvent::new(
                 KeyCode::Char('x'),
                 KeyModifiers::NONE,
             ))))
             .await
             .unwrap();
-        drop(discrete_tx);
+        drop(priority_tx);
+        drop(visual_tx);
         let pump = tokio::spawn(std::future::pending());
         let mut input = TerminalInput {
-            discrete_events,
+            priority_events,
+            visual_events,
             wheel_events,
-            deferred_discrete: None,
+            deferred_visual: None,
+            priority_closed: false,
+            visual_closed: false,
+            wheel_closed: false,
             pump: Some(pump),
         };
 
-        assert!(matches!(
-            input.next_event().await,
-            Some(Ok(TerminalInputEvent {
-                event: Event::Resize(20, 40),
-                ..
-            }))
-        ));
         assert!(matches!(
             input.next_event().await,
             Some(Ok(TerminalInputEvent {
@@ -550,14 +642,22 @@ mod tests {
                 ..
             }))
         ));
+        assert!(matches!(
+            input.next_event().await,
+            Some(Ok(TerminalInputEvent {
+                event: Event::Resize(20, 40),
+                ..
+            }))
+        ));
     }
 
     #[tokio::test]
     async fn discrete_input_takes_priority_over_pending_wheel_motion() {
-        let (discrete_tx, discrete_events) =
-            tokio::sync::mpsc::channel(DISCRETE_EVENT_CHANNEL_CAPACITY);
+        let (priority_tx, priority_events) =
+            tokio::sync::mpsc::channel(PRIORITY_EVENT_CHANNEL_CAPACITY);
+        let (_visual_tx, visual_events) = tokio::sync::mpsc::channel(VISUAL_EVENT_CHANNEL_CAPACITY);
         let (wheel_tx, wheel_events) = tokio::sync::mpsc::channel(1);
-        discrete_tx
+        priority_tx
             .send(Ok(Event::Key(KeyEvent::new(
                 KeyCode::Char('x'),
                 KeyModifiers::NONE,
@@ -573,9 +673,13 @@ mod tests {
             .unwrap();
         let pump = tokio::spawn(std::future::pending());
         let mut input = TerminalInput {
-            discrete_events,
+            priority_events,
+            visual_events,
             wheel_events,
-            deferred_discrete: None,
+            deferred_visual: None,
+            priority_closed: false,
+            visual_closed: false,
+            wheel_closed: false,
             pump: Some(pump),
         };
 
@@ -609,13 +713,18 @@ mod tests {
         });
         tokio::task::yield_now().await;
 
-        let (_discrete_tx, discrete_events) =
-            tokio::sync::mpsc::channel(DISCRETE_EVENT_CHANNEL_CAPACITY);
+        let (_priority_tx, priority_events) =
+            tokio::sync::mpsc::channel(PRIORITY_EVENT_CHANNEL_CAPACITY);
+        let (_visual_tx, visual_events) = tokio::sync::mpsc::channel(VISUAL_EVENT_CHANNEL_CAPACITY);
         let (_wheel_tx, wheel_events) = tokio::sync::mpsc::channel(1);
         let mut input = TerminalInput {
-            discrete_events,
+            priority_events,
+            visual_events,
             wheel_events,
-            deferred_discrete: None,
+            deferred_visual: None,
+            priority_closed: false,
+            visual_closed: false,
+            wheel_closed: false,
             pump: Some(pump),
         };
 
