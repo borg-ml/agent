@@ -1851,7 +1851,7 @@ impl Transcript {
                 false,
             ));
         } else if expanded && ordered.len() > MAX_COLLAPSED_PLAN_ITEMS {
-            rows.push(("    − click to show less".to_string(), false));
+            rows.push(("    − click to collapse".to_string(), false));
         }
         rows
     }

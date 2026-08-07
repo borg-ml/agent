@@ -2192,7 +2192,11 @@ fn todo_status_counts_open_items_and_tooltip_matches_plan_order_and_clipping() {
             .add_modifier
             .contains(Modifier::CROSSED_OUT)
     );
-    assert!(expanded.last().is_some_and(|row| row.contains("show less")));
+    assert!(
+        expanded
+            .last()
+            .is_some_and(|row| row.contains("click to collapse"))
+    );
 }
 
 /// Clicking the goal segment must submit exactly the slash command the user
