@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 #[cfg(unix)]
 use std::{fs::Permissions, os::unix::fs::PermissionsExt};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -21,6 +21,7 @@ use tokio_util::sync::CancellationToken;
 use ts_rs::TS;
 use uuid::Uuid;
 
+use crate::persistent_runtime::{PersistentRuntimeRegistry, RuntimeHost};
 use crate::{
     ApprovalDecision, AtomicWorkClaim, Audience, CodingProvider, DeliveryMode, EventActor,
     HostCommand, LaunchSession, MessageStatus, ModelGoalStatus, PromptDelivery, Provenance,
@@ -28,12 +29,17 @@ use crate::{
     SessionGoalTools, SessionStatus, SessionStore, SessionTodoToolRequest, SessionTodoTools,
     SharedWork, SqliteWorkspaceStore, StructuredMention, TodoItemUpdate, WorkDependency,
     WorkReview, WorkspaceArtifact, WorkspaceDecision, WorkspaceEvent, WorkspaceEventKind,
+    WorkspaceFilesystemOperation, WorkspaceFilesystemOutcome, WorkspaceFilesystemRequest,
     WorkspaceMessage, WorkspaceMessageBody, WorkspaceReference, WorkspaceReviewRequest,
-    WorkspaceStore,
+    WorkspaceStore, execute_workspace_filesystem,
 };
 
 pub const DEFAULT_MAX_SUBAGENTS: usize = 16;
 const ROOT_MESSAGE_RETRY_INTERVAL: Duration = Duration::from_millis(500);
+const RUNTIME_DEFAULT_FILE_BYTES: u64 = 256 * 1024;
+const RUNTIME_MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
+const RUNTIME_DEFAULT_COMMAND_TIMEOUT_MS: u64 = 120_000;
+const RUNTIME_MAX_COMMAND_TIMEOUT_MS: u64 = 30 * 60 * 1000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
@@ -155,6 +161,10 @@ pub struct AgentToolDispatcher {
     autonomy: Option<crate::SqliteAutonomyStore>,
     provider_capabilities: Vec<crate::ProviderCapability>,
     blu_workflows: Option<BluWorkflowToolContext>,
+    runtime_root: PathBuf,
+    runtime_permission: crate::PermissionMode,
+    runtime_processes: crate::native_process::ProcessManager,
+    persistent_runtimes: PersistentRuntimeRegistry,
 }
 
 #[derive(Debug)]
@@ -509,6 +519,8 @@ impl AgentToolDispatcher {
         let consultation_enabled = subagents
             .as_ref()
             .is_none_or(|team| team.is_root_session(actor_session_id));
+        let runtime_root = cwd.clone();
+        let runtime_processes = workflow_processes.clone();
         let blu_workflows = workflow_snapshot
             .zip(autonomy.clone())
             .map(|(snapshot, autonomy)| BluWorkflowToolContext {
@@ -536,6 +548,10 @@ impl AgentToolDispatcher {
             autonomy,
             provider_capabilities,
             blu_workflows,
+            runtime_root,
+            runtime_permission: permission,
+            runtime_processes,
+            persistent_runtimes: PersistentRuntimeRegistry::default(),
         }
     }
 
@@ -652,6 +668,11 @@ impl AgentToolDispatcher {
                     workflow_cancel,
                 )
                 .await
+            }
+            "runtime_exec" => {
+                let args: PersistentRuntimeArgs = serde_json::from_value(arguments)?;
+                self.run_persistent_runtime(args, workflow_approved, workflow_cancel)
+                    .await
             }
             "get_goal" => {
                 let _: NoArgs = serde_json::from_value(arguments)?;
@@ -858,6 +879,196 @@ impl AgentToolDispatcher {
                 )
                 .await?,
         )?)
+    }
+
+    async fn run_persistent_runtime(
+        &self,
+        args: PersistentRuntimeArgs,
+        workflow_approved: bool,
+        cancellation: Option<CancellationToken>,
+    ) -> Result<Value> {
+        let runtime = args.runtime.as_deref().unwrap_or("python");
+        ensure!(
+            runtime == "python",
+            "persistent runtime `{runtime}` is not available yet; use `python`"
+        );
+        ensure!(
+            self.runtime_permission == crate::PermissionMode::FullAccess || workflow_approved,
+            "persistent runtime requires Full Access or an explicit approval"
+        );
+        if let Some(cancel) = cancellation.as_ref() {
+            ensure!(!cancel.is_cancelled(), "persistent runtime was cancelled");
+        }
+        let python = self
+            .persistent_runtimes
+            .python_for_session(self.actor_session_id, &self.runtime_root)
+            .await;
+        let host: Arc<dyn RuntimeHost> = Arc::new(DispatcherRuntimeHost {
+            session_id: self.actor_session_id,
+            root: self.runtime_root.clone(),
+            allow_effects: self.runtime_permission == crate::PermissionMode::FullAccess
+                || workflow_approved,
+            dispatcher: self.clone(),
+            processes: self.runtime_processes.clone(),
+            session_store: self.session_store(),
+        });
+        let execution = python.execute(&args.code, args.timeout_ms, host);
+        tokio::pin!(execution);
+        if let Some(cancel) = cancellation {
+            tokio::select! {
+                result = &mut execution => Ok(serde_json::to_value(result?)?),
+                _ = cancel.cancelled() => {
+                    drop(execution);
+                    python.stop().await;
+                    bail!("persistent runtime was cancelled")
+                }
+            }
+        } else {
+            Ok(serde_json::to_value(execution.await?)?)
+        }
+    }
+}
+
+#[derive(Clone)]
+struct DispatcherRuntimeHost {
+    session_id: Uuid,
+    root: PathBuf,
+    allow_effects: bool,
+    dispatcher: AgentToolDispatcher,
+    processes: crate::native_process::ProcessManager,
+    session_store: Option<crate::SqliteSessionStore>,
+}
+
+impl DispatcherRuntimeHost {
+    fn ensure_effects(&self) -> Result<()> {
+        ensure!(
+            self.allow_effects,
+            "persistent runtime host mutation requires Full Access or an approved runtime call"
+        );
+        Ok(())
+    }
+
+    async fn filesystem(&self, operation: WorkspaceFilesystemOperation) -> Result<Value> {
+        if operation.is_mutating() {
+            self.ensure_effects()?;
+        }
+        let response = execute_workspace_filesystem(
+            std::slice::from_ref(&self.root),
+            WorkspaceFilesystemRequest {
+                request_id: Uuid::new_v4(),
+                workspace_id: self.session_id,
+                root_path: self.root.clone(),
+                timeout_ms: 30_000,
+                operation,
+            },
+        )
+        .await;
+        match response.outcome {
+            WorkspaceFilesystemOutcome::Success { output } => Ok(serde_json::to_value(output)?),
+            WorkspaceFilesystemOutcome::Failure {
+                code,
+                message,
+                retryable,
+            } => bail!("{code:?}: {message} (retryable={retryable})"),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl RuntimeHost for DispatcherRuntimeHost {
+    async fn call(&self, operation: &str, arguments: Value) -> Result<Value> {
+        match operation {
+            "read_file" => {
+                let args: RuntimeReadFileArgs = serde_json::from_value(arguments)?;
+                Ok(serde_json::to_value(
+                    crate::native_io::read_text_range(
+                        self.root.clone(),
+                        PathBuf::from(args.path),
+                        args.offset_line.unwrap_or(1),
+                        args.limit_lines.unwrap_or(2_000),
+                        args.max_bytes
+                            .unwrap_or(RUNTIME_DEFAULT_FILE_BYTES)
+                            .clamp(1, RUNTIME_MAX_FILE_BYTES) as usize,
+                    )
+                    .await?,
+                )?)
+            }
+            "search_files" => {
+                let args: RuntimeSearchFilesArgs = serde_json::from_value(arguments)?;
+                Ok(serde_json::to_value(
+                    crate::native_io::search_text(
+                        self.root.clone(),
+                        PathBuf::from(args.path.unwrap_or_else(|| ".".to_string())),
+                        args.pattern,
+                        args.literal.unwrap_or(false),
+                        args.case_sensitive.unwrap_or(true),
+                        args.offset.unwrap_or(0),
+                        args.limit.unwrap_or(200),
+                    )
+                    .await?,
+                )?)
+            }
+            "list_files" => {
+                let args: RuntimeListFilesArgs = serde_json::from_value(arguments)?;
+                self.filesystem(WorkspaceFilesystemOperation::List {
+                    path: PathBuf::from(args.path.unwrap_or_else(|| ".".to_string())),
+                    limit: args.limit.unwrap_or(200).clamp(1, 2_000),
+                })
+                .await
+            }
+            "write_file" => {
+                let args: RuntimeWriteFileArgs = serde_json::from_value(arguments)?;
+                self.filesystem(WorkspaceFilesystemOperation::WriteText {
+                    path: PathBuf::from(args.path),
+                    text: args.content,
+                    overwrite: args.overwrite.unwrap_or(false),
+                    create_parent_dirs: args.create_parent_dirs.unwrap_or(true),
+                })
+                .await
+            }
+            "exec_command" => {
+                self.ensure_effects()?;
+                let args: RuntimeExecCommandArgs = serde_json::from_value(arguments)?;
+                Ok(serde_json::to_value(
+                    self.processes
+                        .exec(
+                            self.session_id,
+                            &self.root,
+                            args.cmd,
+                            args.workdir.as_deref(),
+                            args.yield_time_ms,
+                            args.max_output_tokens,
+                            args.timeout_ms
+                                .unwrap_or(RUNTIME_DEFAULT_COMMAND_TIMEOUT_MS)
+                                .clamp(1, RUNTIME_MAX_COMMAND_TIMEOUT_MS),
+                            self.session_store.clone(),
+                        )
+                        .await?,
+                )?)
+            }
+            "borg_tool" => {
+                let args: RuntimeBorgToolArgs = serde_json::from_value(arguments)?;
+                ensure!(
+                    args.name != "runtime_exec",
+                    "nested runtime_exec calls are not supported"
+                );
+                if matches!(
+                    args.name.as_str(),
+                    "run_workflow" | "run_blu_workflow" | "run_blu_extension"
+                ) {
+                    self.ensure_effects()?;
+                }
+                self.dispatcher
+                    .call_with_workflow_control(
+                        &args.name,
+                        args.arguments,
+                        self.allow_effects,
+                        None,
+                    )
+                    .await
+            }
+            other => bail!("unknown persistent runtime host operation `{other}`"),
+        }
     }
 }
 
@@ -3287,6 +3498,32 @@ pub fn agent_tool_specs_with_capabilities_and_consultation(
             }),
         ),
         tool(
+            "runtime_exec",
+            "Execute Python in the session's persistent programming runtime. Variables, imports, helper functions, and parsed data survive across calls and turns. The `borg` object exposes read, search, exec, and selected Borg tool calls through the host's permission and journal boundary. This is trusted execution, not a sandbox.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "runtime": {
+                        "type": "string",
+                        "enum": ["python"],
+                        "default": "python"
+                    },
+                    "code": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 524288
+                    },
+                    "timeout_ms": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": RUNTIME_MAX_COMMAND_TIMEOUT_MS
+                    }
+                },
+                "required": ["code"],
+                "additionalProperties": false
+            }),
+        ),
+        tool(
             "consult_model",
             "Ask another configured model for a second opinion. The caller must choose the complete freeform briefing: include whatever context, excerpts, constraints, and questions the other model needs. The response is returned to the calling model for reconciliation; this does not switch the main session provider.",
             json!({
@@ -3657,6 +3894,68 @@ fn shared_work_tool_specs() -> Vec<Value> {
             }),
         ),
     ]
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistentRuntimeArgs {
+    runtime: Option<String>,
+    code: String,
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeReadFileArgs {
+    path: String,
+    offset_line: Option<usize>,
+    limit_lines: Option<usize>,
+    max_bytes: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeSearchFilesArgs {
+    pattern: String,
+    path: Option<String>,
+    literal: Option<bool>,
+    case_sensitive: Option<bool>,
+    offset: Option<usize>,
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeListFilesArgs {
+    path: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeWriteFileArgs {
+    path: String,
+    content: String,
+    overwrite: Option<bool>,
+    create_parent_dirs: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeExecCommandArgs {
+    cmd: String,
+    workdir: Option<String>,
+    yield_time_ms: Option<u64>,
+    max_output_tokens: Option<usize>,
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeBorgToolArgs {
+    name: String,
+    #[serde(default)]
+    arguments: Value,
 }
 
 #[derive(Deserialize)]

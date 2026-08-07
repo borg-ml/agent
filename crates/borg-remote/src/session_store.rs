@@ -499,6 +499,12 @@ impl SessionState {
         state.status = None;
         state.status_detail = None;
         state.provider_session_id = None;
+        // A fork keeps the canonical conversation, but it always starts a
+        // fresh provider context. Carrying the parent's near-full usage into
+        // the child makes the next prompt pass the pre-turn auto-compaction
+        // check before the new provider context has been built.
+        state.context_generation = state.context_generation.saturating_add(1);
+        state.usage.context_tokens = Some(0);
         state.pending_approval_id = None;
         state.pending_provider_interaction_id = None;
         state.pending_provider_interaction_kind = None;

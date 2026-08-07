@@ -609,6 +609,12 @@ pub struct SessionGoalTools {
 }
 
 impl SessionGoalTools {
+    #[cfg(test)]
+    pub(crate) fn disconnected() -> Self {
+        let (requests, _receiver) = mpsc::channel(1);
+        Self { requests }
+    }
+
     pub async fn call(
         &self,
         request: SessionGoalToolRequest,
@@ -631,6 +637,12 @@ pub struct SessionTodoTools {
 }
 
 impl SessionTodoTools {
+    #[cfg(test)]
+    pub(crate) fn disconnected() -> Self {
+        let (requests, _receiver) = mpsc::channel(1);
+        Self { requests }
+    }
+
     pub async fn call(
         &self,
         request: SessionTodoToolRequest,

@@ -108,6 +108,74 @@ fn launch() -> LaunchSession {
     }
 }
 
+#[tokio::test]
+async fn persistent_runtime_supports_a_surf_calibration_notebook() {
+    let command = std::env::var("BORG_PYTHON_RUNTIME").unwrap_or_else(|_| {
+        if cfg!(windows) {
+            "python".to_string()
+        } else {
+            "python3".to_string()
+        }
+    });
+    if !tokio::process::Command::new(command)
+        .arg("--version")
+        .output()
+        .await
+        .is_ok_and(|output| output.status.success())
+    {
+        return;
+    }
+    let directory = tempdir().unwrap();
+    std::fs::write(
+        directory.path().join("reference.jsonl"),
+        "{\"tick\":0,\"position\":[0.0,0.0],\"speed\":100.0}\n{\"tick\":1,\"position\":[1.0,0.0],\"speed\":101.0}\n",
+    )
+    .unwrap();
+    let session_id = Uuid::new_v4();
+    let dispatcher = AgentToolDispatcher::new(
+        SessionGoalTools::disconnected(),
+        SessionTodoTools::disconnected(),
+        None,
+        crate::LspService::new(directory.path()),
+        CodingProvider::Codex,
+        session_id,
+        false,
+        None,
+        None,
+        directory.path().to_path_buf(),
+        None,
+        None,
+        Vec::new(),
+        None,
+        crate::native_process::ProcessManager::default(),
+        PermissionMode::FullAccess,
+    );
+
+    dispatcher
+        .call(
+            "runtime_exec",
+            serde_json::json!({
+                "code": "import json\nreference = [json.loads(line) for line in borg.read('reference.jsonl')['text'].splitlines()]\ndef compare(candidate):\n    errors = [((row['position'][0] - ref['position'][0]) ** 2 + (row['position'][1] - ref['position'][1]) ** 2) ** 0.5 for row, ref in zip(candidate, reference)]\n    return {'ticks': len(errors), 'position_rmse': (sum(error * error for error in errors) / len(errors)) ** 0.5, 'position_max': max(errors), 'first_divergence': next((index for index, error in enumerate(errors) if error > 0.001), None)}"
+            }),
+        )
+        .await
+        .unwrap();
+    let metrics = dispatcher
+        .call(
+            "runtime_exec",
+            serde_json::json!({
+                "code": "candidate = [{'position': [0.0, 0.0]}, {'position': [1.25, 0.0]}]\ncompare(candidate)"
+            }),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(metrics["persistent"], true);
+    assert_eq!(metrics["value"]["ticks"], 2);
+    assert_eq!(metrics["value"]["first_divergence"], 1);
+    assert!(metrics["value"]["position_max"].as_f64().unwrap() > 0.24);
+}
+
 async fn bind_test_team(
     directory: &Path,
     store: &crate::SqliteSessionStore,
@@ -818,6 +886,7 @@ fn every_execution_lane_exposes_the_same_borg_control_plane() {
         "create_extension",
         "list_workflows",
         "run_workflow",
+        "runtime_exec",
     ];
     for provider in [
         CodingProvider::Codex,

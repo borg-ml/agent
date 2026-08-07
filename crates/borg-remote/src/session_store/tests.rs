@@ -1235,6 +1235,61 @@ async fn fork_records_lineage_without_copying_events() {
 }
 
 #[tokio::test]
+async fn fork_starts_a_fresh_provider_context_without_losing_capacity() {
+    let (directory, store) = store().await;
+    let parent_id = Uuid::new_v4();
+    let fork_id = Uuid::new_v4();
+    store.create_session(parent_id).await.unwrap();
+    for kind in [
+        SessionEventKind::SessionStarted,
+        configured(directory.path()),
+        message(Uuid::new_v4(), "retained context"),
+        SessionEventKind::UsageUpdated {
+            provider_duration_ms: 1,
+            turn_id: None,
+            provider_context_reused: None,
+            input_tokens: 1,
+            output_tokens: 1,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+            total_tokens: 2,
+            cost_microusd: None,
+            cost_basis: "unknown".to_string(),
+            cost_usd: None,
+            context_tokens: Some(95_000),
+            context_window_tokens: Some(100_000),
+        },
+    ] {
+        store
+            .append(SessionEvent::new(parent_id, 0, kind))
+            .await
+            .unwrap();
+    }
+
+    let parent_generation = store.state(parent_id).await.unwrap().context_generation;
+    store.fork_before(parent_id, fork_id, 5).await.unwrap();
+
+    let child = store.state(fork_id).await.unwrap();
+    assert!(child.provider_session_id.is_none());
+    assert_eq!(child.usage.context_tokens, Some(0));
+    assert_eq!(child.usage.context_window_tokens, Some(100_000));
+    assert_eq!(child.context_generation, parent_generation + 1);
+    assert_eq!(
+        store
+            .read(fork_id)
+            .await
+            .unwrap()
+            .iter()
+            .filter_map(|event| match &event.kind {
+                SessionEventKind::Message { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        vec!["retained context"]
+    );
+}
+
+#[tokio::test]
 async fn inherited_event_pages_match_the_full_projection_across_lineage_boundaries() {
     let (directory, store) = store().await;
     let parent_id = Uuid::new_v4();

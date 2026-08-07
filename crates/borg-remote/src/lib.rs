@@ -21,6 +21,7 @@ mod native_io;
 mod native_mcp;
 mod native_process;
 mod orchestration;
+mod persistent_runtime;
 mod receipt;
 mod self_service;
 mod session;

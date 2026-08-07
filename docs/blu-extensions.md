@@ -157,6 +157,45 @@ calls are intentionally not rewritten into fake Blu handles. Workflow source
 is bounded to 256 KiB, must remain inside its package, and is frozen for the
 turn that loaded it.
 
+## Persistent programming runtime
+
+`runtime_exec` is a separate model-facing primitive for iterative work. It is
+not a workflow and it is not the same as the per-invocation external process
+used by `run_workflow`. The first adapter is a session-scoped plain CPython
+worker started lazily with `python3 -u` (or `BORG_PYTHON_RUNTIME`), so variables,
+imports, helper functions, and parsed data survive multiple calls and native
+turns. The worker is owned by the provider-neutral agent-tool dispatcher, which
+also serves the local MCP bridge; native, Codex, and Claude paths therefore use
+the same session namespace rather than provider-specific copies.
+
+The initial worker intentionally has no `ipykernel` dependency. It supports a
+normal persistent Python namespace, final-expression values, top-level await,
+captured stdout/stderr, and a small `borg` bridge (`read`, `search`, `exec`,
+`write`, and selected Borg tool calls). It is not yet an IPython kernel: IPython magics,
+rich display protocols, kernel extensions, and notebook-style comms are future
+adapter work. The selected Python environment still determines which packages
+are importable; Blu hot reload does not install Python or Bun dependencies.
+
+The lifecycle is:
+
+```text
+first runtime_exec in a session
+        ↓ lazy worker start
+execute ↔ Borg host-call bridge ↔ filesystem/process/Borg tools
+        ↓ next runtime_exec / next native turn
+same in-memory namespace
+        ↓ error, timeout, cancellation, or session teardown
+worker is killed; state is lost unless the skill writes an artifact
+```
+
+The worker is trusted user-authority execution, not a sandbox. Runtime calls
+are permission-gated, host mutations use Borg's filesystem/process boundary,
+and command output is bounded. There is no kernel snapshot or namespace
+replay across a Borg process restart yet, so calibration skills should persist
+source traces, parameter sets, and comparison summaries as explicit files.
+Blu remains the small embedded extension/workflow backend; Python/IPython and
+Bun remain selectable supervised workers for cases that need their ecosystems.
+
 ## Compatibility
 
 Legacy `.borg/extensions/*.toml` and user `extensions/*.toml` manifests are

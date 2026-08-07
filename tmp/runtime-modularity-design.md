@@ -1,8 +1,27 @@
 # Borg Modular Runtime Design
 
-Status: design discussion capture; not an implementation plan or final ADR
+Status: design discussion capture with an implemented first vertical slice; not a final ADR
 Date: 2026-08-06
 Repository: `/home/shulgin/borg-cli`
+
+## First vertical slice (2026-08-07)
+
+The first model-facing slice now lives in `crates/borg-remote` without adding
+Python dependencies to the Borg binary. `persistent_runtime.rs` supervises one
+plain CPython worker per session, using a framed JSON-lines protocol and a
+language-neutral `RuntimeHost` bridge. `AgentToolDispatcher` exposes it as the
+provider-neutral `runtime_exec` tool, so native turns and the local MCP server
+share the same in-memory namespace. The worker supports persistent globals,
+final-expression results, top-level await, captured output, and bounded host
+calls; it is deliberately not `ipykernel` yet. Blu package hot reload remains a
+next-turn catalog operation and is independent of the worker namespace.
+
+The surf project exercises this boundary through the project-local
+`.borg/skills/surf-calibration/SKILL.md` skill. Its reference contract is a
+deterministic per-tick state/input trace; a Source `.dem` is retained as an
+optional end-to-end check rather than the tuning oracle. Kernel state is not
+durable across worker loss, so the skill persists traces and metric summaries
+as explicit artifacts.
 
 ## Executive summary
 

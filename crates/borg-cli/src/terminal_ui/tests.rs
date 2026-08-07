@@ -122,6 +122,103 @@ fn older_root_history_cannot_regress_an_authoritatively_stopped_child() {
 }
 
 #[test]
+fn fork_history_moves_a_late_user_completion_before_the_response() {
+    let session_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    let assistant = SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::Message {
+            message_id: Uuid::new_v4(),
+            actor: EventActor::Assistant,
+            text: "response".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: None,
+        },
+    );
+    let user_completion = SessionEvent::new(
+        session_id,
+        3,
+        SessionEventKind::Message {
+            message_id,
+            actor: EventActor::User,
+            text: "prompt".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: Some(PromptDelivery::Steer),
+        },
+    );
+
+    let history = transcript_history_in_display_order(&[assistant, user_completion]);
+    let mut transcript = Transcript::default();
+    for event in &history {
+        transcript.apply(event);
+    }
+
+    let actors = transcript
+        .order
+        .iter()
+        .filter_map(|entry| match entry {
+            TranscriptEntry::Message { actor, .. } => Some(*actor),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(actors, vec![EventActor::User, EventActor::Assistant]);
+}
+
+#[test]
+fn complete_user_messages_with_a_lifecycle_start_keep_event_order() {
+    let session_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    let start = SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::Message {
+            message_id,
+            actor: EventActor::User,
+            text: "prompt".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::InProgress,
+            delivery: Some(PromptDelivery::Steer),
+        },
+    );
+    let assistant = SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::Message {
+            message_id: Uuid::new_v4(),
+            actor: EventActor::Assistant,
+            text: "response".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: None,
+        },
+    );
+    let completion = SessionEvent::new(
+        session_id,
+        3,
+        SessionEventKind::Message {
+            message_id,
+            actor: EventActor::User,
+            text: "prompt".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: Some(PromptDelivery::Steer),
+        },
+    );
+
+    let history = transcript_history_in_display_order(&[start, assistant, completion]);
+    assert_eq!(
+        history
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
+}
+
+#[test]
 fn child_history_merge_prefers_completion_over_a_late_partial_snapshot() {
     let session_id = Uuid::new_v4();
     let message_id = Uuid::new_v4();

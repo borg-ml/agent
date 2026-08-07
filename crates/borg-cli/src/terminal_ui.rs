@@ -1711,9 +1711,10 @@ impl BorgTerminal {
         self.pending_transcript_anchor = None;
         self.transcript.reserve_history(events.len());
         self.rewind_targets.reserve(events.len() / 4);
-        self.composer.seed_session_events(events);
+        let display_events = transcript_history_in_display_order(events);
+        self.composer.seed_session_events(&display_events);
         self.replaying_history = true;
-        for event in events {
+        for event in &display_events {
             let _ = self.apply_session_event(event);
         }
         self.transcript.follow_tail = true;
@@ -6076,6 +6077,78 @@ fn fresh_transcript_like(previous: &Transcript) -> Transcript {
     }
 }
 
+fn transcript_history_in_display_order(events: &[SessionEvent]) -> Vec<SessionEvent> {
+    let mut ordered = Vec::with_capacity(events.len());
+    let mut turn = Vec::new();
+
+    for event in events {
+        let is_terminal_user_message = matches!(
+            event.kind,
+            SessionEventKind::Message {
+                actor: EventActor::User,
+                status: MessageStatus::Complete | MessageStatus::Failed,
+                ..
+            }
+        );
+        if !is_terminal_user_message {
+            turn.push(event.clone());
+            continue;
+        }
+
+        let message_id = match &event.kind {
+            SessionEventKind::Message { message_id, .. } => *message_id,
+            _ => unreachable!("terminal user message match must be a message event"),
+        };
+        let has_lifecycle_start = turn.iter().any(|candidate| {
+            matches!(
+                candidate.kind,
+                SessionEventKind::Message {
+                    message_id: candidate_id,
+                    actor: EventActor::User,
+                    status: MessageStatus::InProgress,
+                    ..
+                } if candidate_id == message_id
+            )
+        });
+
+        if has_lifecycle_start {
+            ordered.append(&mut turn);
+            ordered.push(event.clone());
+            continue;
+        }
+
+        // Fork projections deliberately omit in-progress user messages so a
+        // discarded prompt cannot be recovered and run again. The surviving
+        // terminal event is still durable, but it was appended after the
+        // assistant/tool output. Put that orphaned user boundary before the
+        // visible turn output so a partial projection reads like the original
+        // conversation instead of looking reversed.
+        if let Some(output_start) = turn.iter().position(transcript_turn_output) {
+            ordered.extend(turn.drain(..output_start));
+            ordered.push(event.clone());
+            ordered.append(&mut turn);
+        } else {
+            ordered.append(&mut turn);
+            ordered.push(event.clone());
+        }
+    }
+
+    ordered.extend(turn);
+    ordered
+}
+
+fn transcript_turn_output(event: &SessionEvent) -> bool {
+    matches!(
+        event.kind,
+        SessionEventKind::Message {
+            actor: EventActor::Assistant,
+            ..
+        } | SessionEventKind::ReasoningDelta { .. }
+            | SessionEventKind::ToolStarted { .. }
+            | SessionEventKind::ToolCompleted { .. }
+    )
+}
+
 fn replace_root_transcript_history(
     transcript: &mut Transcript,
     director_transcript: &mut Option<Box<Transcript>>,
@@ -6092,9 +6165,10 @@ fn replace_root_transcript_history(
         .values()
         .cloned()
         .collect::<Vec<_>>();
+    let display_events = transcript_history_in_display_order(events);
     let mut replacement = fresh_transcript_like(previous);
-    replacement.reserve_history(events.len());
-    for event in events {
+    replacement.reserve_history(display_events.len());
+    for event in &display_events {
         replacement.apply(event);
     }
     // Older-page hydration rebuilds the root transcript. It may contain the

@@ -120,6 +120,18 @@ impl NativeHarness {
         let tools = runtime.tool_definitions()?;
         let mut messages = Vec::with_capacity(turn.conversation.len().saturating_add(3));
         let mut system_prompt = super::agent::CODING_SYSTEM_PROMPT.to_string();
+        system_prompt.push_str(
+            "\n\nThe `runtime_exec` tool is a persistent Python control environment for this session. ",
+        );
+        system_prompt.push_str(
+            "Use it for programmatic inspection, transformations, reusable helper functions, ",
+        );
+        system_prompt.push_str(
+            "and retaining structured working state across turns; use its `borg` bridge for ",
+        );
+        system_prompt.push_str(
+            "host operations. It is trusted user-authority execution, not a security sandbox. ",
+        );
         system_prompt.push_str(&runtime.context.prompt_appendix());
         if let Some(instruction) = turn.response_language.instruction() {
             system_prompt.push_str("\n\n");
@@ -1212,6 +1224,7 @@ async fn execute_tool(
 ) -> Result<(String, bool, Option<NativeSteer>)> {
     let external_mcp = runtime.mcp.contains(&tool_call.function.name);
     if (tool_call.function.name == "exec_command"
+        || tool_call.function.name == "runtime_exec"
         || matches!(
             tool_call.function.name.as_str(),
             "run_workflow" | "run_blu_workflow" | "run_blu_extension"
@@ -1230,7 +1243,11 @@ async fn execute_tool(
             ("Run command", command.to_string())
         } else {
             (
-                "Use workflow or external tool",
+                if tool_call.function.name == "runtime_exec" {
+                    "Use persistent runtime"
+                } else {
+                    "Use workflow or external tool"
+                },
                 format!(
                     "{} {}",
                     tool_call.function.name,
@@ -1304,12 +1321,12 @@ async fn execute_tool(
 
     let workflow_approved = matches!(
         tool_call.function.name.as_str(),
-        "run_workflow" | "run_blu_workflow" | "run_blu_extension"
+        "run_workflow" | "run_blu_workflow" | "run_blu_extension" | "runtime_exec"
     ) && runtime.permission != PermissionMode::FullAccess;
     let call_cancel = (external_mcp
         || matches!(
             tool_call.function.name.as_str(),
-            "run_workflow" | "run_blu_workflow" | "run_blu_extension"
+            "run_workflow" | "run_blu_workflow" | "run_blu_extension" | "runtime_exec"
         ))
     .then(CancellationToken::new);
     let call = runtime.call(
