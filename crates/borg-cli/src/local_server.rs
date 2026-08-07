@@ -101,6 +101,12 @@ impl LocalServerLease {
         match timeout(SHUTDOWN_TIMEOUT, child.wait()).await {
             Ok(status) => {
                 status.context("failed to reap Borg-owned llama-server")?;
+                if let Some(pid) = pid {
+                    // The process-group leader can exit before one of its
+                    // descendants. Do not return while a helper process can
+                    // still keep the Borg-owned group alive.
+                    signal_process_group(pid, Signal::Kill);
+                }
             }
             Err(_) => {
                 if let Some(pid) = pid {
@@ -763,7 +769,13 @@ mod tests {
             model: "test".to_string(),
         };
         lease.shutdown().await.expect("shutdown");
-        assert_eq!(unsafe { killpg(pid as i32, 0) }, -1);
+        timeout(Duration::from_secs(1), async {
+            while unsafe { killpg(pid as i32, 0) } == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("process group should be reaped after shutdown");
     }
 
     #[test]
