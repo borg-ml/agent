@@ -35,6 +35,16 @@ if [[ -f "$repo_root/.github/workflows/release.yml" ]]; then
     fail "release workflow cannot recover an existing tag"
   grep -Fq 'tag_name: ${{ env.RELEASE_TAG }}' "$release_workflow" ||
     fail "release publication is not pinned to the requested tag"
+  if awk '
+    /^  build:$/ { inside_build = 1; next }
+    inside_build && /^  [[:alnum:]_-]+:$/ { exit }
+    inside_build && /^[[:space:]]+needs:/ { found = 1 }
+    END { exit found ? 0 : 1 }
+  ' "$release_workflow"; then
+    fail "release artifact builds wait for validation instead of running in parallel"
+  fi
+  grep -Fq 'needs: [validate, build]' "$release_workflow" ||
+    fail "release publication does not wait for both validation and artifacts"
   grep -Fq '$sdk_package/manifest.json' "$release_workflow" ||
     fail "Unix release packaging does not use the SDK manifest"
   grep -Fq 'Join-Path $sdkPackage "manifest.json"' "$release_workflow" ||
