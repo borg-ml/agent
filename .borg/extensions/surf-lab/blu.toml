@@ -1,11 +1,11 @@
-description = "Persistent deterministic surf simulation and counterfactual trajectory analysis."
+description = "Persistent deterministic surf simulation, learned-controller probes, and counterfactual trajectory analysis."
 enabled = true
 id = "surf-lab"
 manifest_version = 1
 name = "Surf Lab"
 skill_roots = ["skills"]
-version = "0.2.0"
+version = "0.3.0"
 
 [mcp.lab]
 command = "${extension_dir}/surf-lab"
-allowed_tools = ["start", "step", "observe", "trace", "log", "branch", "compare", "map.generate", "map.inspect", "map.preview", "map.route", "map.export", "config"]
+allowed_tools = ["start", "step", "observe", "trace", "log", "branch", "compare", "policy.train", "policy.inspect", "policy.compare", "policy.evolve", "map.generate", "map.inspect", "map.preview", "map.route", "map.export", "config"]

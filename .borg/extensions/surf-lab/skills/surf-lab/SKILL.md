@@ -1,6 +1,6 @@
 ---
 name: surf-lab
-description: "Use Borg's persistent runtime to run the actual headless surf world, inspect lossless tick telemetry, branch counterfactual inputs, and compare traces."
+description: "Use Borg's persistent runtime to run the actual headless surf world, train a replay-derived controller probe, and compare traces."
 ---
 
 # surf-lab
@@ -12,7 +12,7 @@ stateful deterministic environment, not a screenshot or GUI driver.
 import json
 
 env = borg.environment("surf-lab", "lab")
-started_response = env.start({"profile": "source"})
+started_response = env.start({"profile": "reference", "map": "/absolute/path/to/surf_utopia_njv.bsp"})
 started = json.loads(started_response["content"][0]["text"])
 session_id = started["session_id"]
 ```
@@ -21,7 +21,9 @@ Environment calls preserve the standard MCP response envelope; Surf Lab puts
 its structured JSON payload in the first text content block.
 
 The environment exposes `start`, `step`, `observe`, `trace`, `log`, `branch`,
-`compare`, `map.generate`, `map.inspect`, `map.preview`, `map.route`, `map.export`, and `config`. Keep the returned session id in the persistent
+`compare`, `policy.train`, `policy.inspect`, `policy.compare`, `policy.evolve`,
+`map.generate`, `map.inspect`, `map.preview`, `map.route`, `map.export`, and
+`config`. Keep the returned session id in the persistent
 namespace. Use `step` with bounded batches, save the observations, branch at a
 specific tick, apply a counterfactual command to the branch, and compare the
 two traces to identify the first divergent tick and position error. `log`
@@ -66,3 +68,38 @@ simulator. Use `map.export` to persist a validated spec, then pass its path to
 individual physics ticks. Treat a route certificate as best-known evidence,
 not a proof of global optimality, and verify interesting candidates in the
 actual Bevy/Avian session afterward.
+
+## Authentic surf-controller probes
+
+Acquire a public KSF `.rec` from the same map and keep the replay file outside
+the repository. KSF replay frames contain the reference buttons, view angles,
+positions, and velocities; they are the authority for the comparison, not the
+learned model. For example, use the installed Utopia/NJV BSP and a downloaded
+`surf_utopia_njv` world-record replay:
+
+```python
+trained = env.call("policy.train", {
+    "replay": "/tmp/utopia-njv-wr.rec",
+    "output": "/tmp/utopia-njv-policy.json",
+    "epochs": 240,
+    "hidden": 32,
+    "seed": 42,
+})
+
+comparison = env.call("policy.compare", {
+    "replay": "/tmp/utopia-njv-wr.rec",
+    "policy": "/tmp/utopia-njv-policy.json",
+    "map": "/home/user/.local/share/surf/maps/bsp/surf_utopia_njv.bsp",
+    "profile": "reference",
+    "ticks": 3880,
+})
+```
+
+`policy.compare` runs two independent trajectories on the same BSP: exact KSF
+commands establish the physics/reference error, while the frozen policy
+establishes controller-plus-physics error. Read the action-agreement metrics
+before attributing a learned-policy failure to collision or movement physics.
+`policy.evolve` performs a bounded deterministic yaw-perturbation search around
+the frozen policy and returns a trajectory certificate; it never changes policy
+weights or the physics authority. Use `policy.inspect` to validate a saved
+artifact before executing it.
