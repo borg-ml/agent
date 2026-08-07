@@ -693,6 +693,7 @@ pub(crate) async fn run_local_agent(args: LocalAgentCliArgs) -> Result<()> {
     let _tui_panic_hook = TuiPanicHook::install(Arc::clone(&crash_context.tui_active));
     let mut selected_session = None;
     let mut restored_prompt = None;
+    let mut reusable_terminal = None;
     loop {
         let resume_requested =
             args.resume.is_some() || args.continue_latest || selected_session.is_some();
@@ -702,14 +703,18 @@ pub(crate) async fn run_local_agent(args: LocalAgentCliArgs) -> Result<()> {
             restored_prompt.take(),
             ephemeral_sessions.as_ref().map(tempfile::TempDir::path),
             Arc::clone(&crash_context),
+            reusable_terminal.take(),
         ))
         .catch_unwind()
         .await;
         match result {
-            Ok(Ok(Some((next_session, next_prompt)))) => {
-                crash_context.tui_active.store(false, Ordering::Release);
+            Ok(Ok(Some((next_session, next_prompt, next_terminal)))) => {
+                crash_context
+                    .tui_active
+                    .store(next_terminal.is_some(), Ordering::Release);
                 selected_session = Some(next_session);
                 restored_prompt = next_prompt;
+                reusable_terminal = next_terminal;
             }
             Ok(Ok(None)) => {
                 crash_context.tui_active.store(false, Ordering::Release);
@@ -940,7 +945,8 @@ async fn run_local_agent_session(
     restored_prompt: Option<(String, Vec<PathBuf>)>,
     session_root_override: Option<&Path>,
     crash_context: Arc<TuiCrashContext>,
-) -> Result<Option<(Uuid, Option<(String, Vec<PathBuf>)>)>> {
+    reusable_terminal: Option<BorgTerminal>,
+) -> Result<Option<(Uuid, Option<(String, Vec<PathBuf>)>, Option<BorgTerminal>)>> {
     let mut agent_config = AgentConfig::load(args.config.as_deref())?;
     let _local_provider_env = agent_config.apply_local_provider_env();
     let agent_config_path = AgentConfig::path(args.config.as_deref());
@@ -1438,19 +1444,29 @@ async fn run_local_agent_session(
         reset_keyboard_enhancement();
     }
     let mut terminal = if rich_tui_allowed {
-        match BorgTerminal::enter(
-            &sessions_dir,
-            session_id,
-            cwd.clone(),
-            &agent_config.keybindings,
-        ) {
-            Ok(terminal) => Some(terminal),
-            Err(error) => {
-                eprintln!("  Rich terminal unavailable ({error}); using line input.");
-                if resuming {
-                    print_history(&history);
+        if let Some(mut terminal) = reusable_terminal {
+            terminal.retarget(
+                &sessions_dir,
+                session_id,
+                cwd.clone(),
+                &agent_config.keybindings,
+            )?;
+            Some(terminal)
+        } else {
+            match BorgTerminal::enter(
+                &sessions_dir,
+                session_id,
+                cwd.clone(),
+                &agent_config.keybindings,
+            ) {
+                Ok(terminal) => Some(terminal),
+                Err(error) => {
+                    eprintln!("  Rich terminal unavailable ({error}); using line input.");
+                    if resuming {
+                        print_history(&history);
+                    }
+                    None
                 }
-                None
             }
         }
     } else {
@@ -4291,7 +4307,10 @@ async fn run_local_agent_session(
         }
     }
     let tui_was_active = crash_context.tui_active.load(Ordering::Acquire);
-    shutdown_terminal(&mut terminal, &crash_context.tui_active).await;
+    let preserve_terminal = resume_session.is_some() && !user_requested_exit && terminal.is_some();
+    if !preserve_terminal {
+        shutdown_terminal(&mut terminal, &crash_context.tui_active).await;
+    }
     drop(session_events);
     let mut actor_panicked = false;
     let actor_error = match actor.await {
@@ -4318,6 +4337,9 @@ async fn run_local_agent_session(
             return Err(error);
         }
         if actor_panicked && tui_was_active {
+            if let Some(next_session) = resume_session {
+                return Ok(Some((next_session, rewind_prompt, terminal)));
+            }
             println!("{}", resume_instructions(session_id, false));
             return Ok(None);
         }
@@ -4327,7 +4349,8 @@ async fn run_local_agent_session(
                 "The resumed session stopped unexpectedly and Borg is reconnecting: {error:#}"
             ));
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-            return Ok(Some((session_id, None)));
+            let next_session = resume_session.unwrap_or(session_id);
+            return Ok(Some((next_session, rewind_prompt, terminal)));
         }
         let active_elsewhere = error
             .to_string()
@@ -4367,9 +4390,14 @@ async fn run_local_agent_session(
     }
     if session_access.is_attached() && !user_requested_exit && resume_session.is_none() {
         tracing::info!(%session_id, "active session owner exited; acquiring ownership");
-        return Ok(Some((session_id, None)));
+        return Ok(Some((session_id, None, None)));
     }
-    Ok(resume_session.map(|session| (session, rewind_prompt)))
+    let next_terminal = if resume_session.is_some() && !user_requested_exit {
+        terminal
+    } else {
+        None
+    };
+    Ok(resume_session.map(|session| (session, rewind_prompt, next_terminal)))
 }
 
 async fn start_collaboration_host(session_id: Uuid) -> Result<(Child, String, String)> {

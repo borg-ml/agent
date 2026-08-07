@@ -942,9 +942,12 @@ async fn run_agent_session_store_kernel(
         .unwrap_or_default();
     let runtime_mcp_servers = runtime_mcp_context.provider_external_servers();
     store.create_session(session_id).await?;
+    let initial_state = store.state(session_id).await?;
+    let fresh = initial_state.latest_sequence == 0;
     // A provider process can die after the durable TurnStarted boundary but
     // before its worker lease is installed. Requeue both unleased and expired
-    // in-flight actions before rebuilding the actor's prompt queue.
+    // in-flight actions before rebuilding the actor's prompt queue. A resumed
+    // session will discard these inputs below instead of replaying them.
     let recovered_actions = store
         .recover_expired_actions(session_id, Utc::now(), 256)
         .await?;
@@ -996,8 +999,6 @@ async fn run_agent_session_store_kernel(
     } else {
         None
     };
-    let initial_state = store.state(session_id).await?;
-    let fresh = initial_state.latest_sequence == 0;
     // Local and enrolled hosts populate this from their own environment. A
     // resumed session that predates the snapshot event can still reuse the
     // durable state until the host supplies a fresh observation.
@@ -1063,9 +1064,26 @@ async fn run_agent_session_store_kernel(
         )
         .await?;
     }
+    if !fresh && let Some(context_window_tokens) = initial_state.usage.context_window_tokens {
+        // Provider usage is a live observation, not durable conversation
+        // state. ZCode resets that observation on resume and lets the first
+        // request establish a fresh baseline instead of compacting from an
+        // old provider turn that may no longer exist.
+        record(
+            &mut journal,
+            &events,
+            session_id,
+            SessionEventKind::ContextWindowUpdated {
+                context_tokens: 0,
+                context_window_tokens,
+            },
+        )
+        .await?;
+    }
     let state = journal.state(session_id).await?;
     validate_session_state(session_id, &state)?;
     let initial_context_generation = state.context_generation;
+    let mut provider_context_usage_valid = fresh;
     let mut provider_session_id = state.provider_session_id;
     // Set when a provider switch lands mid-turn; drained at the next turn
     // boundary once the in-flight turn has reported its own session id.
@@ -1094,14 +1112,31 @@ async fn run_agent_session_store_kernel(
         .is_some_and(|goal| goal.status.is_active())
         .then(Instant::now);
     let mut goal_turn_failures = ConsecutiveGoalTurnFailures::default();
-    let mut pending = recover_prompts_on_resume(&initial_state, &recovery.queue_events);
+    let mut pending = if fresh {
+        recover_prompts_on_resume(&initial_state, &recovery.queue_events)
+    } else {
+        VecDeque::new()
+    };
+    let mut discarded_prompt_ids = HashSet::new();
+    if !fresh {
+        for prompt in recover_queued_prompts(&recovery.queue_events) {
+            if discarded_prompt_ids.insert(prompt.message_id) {
+                record_recalled_prompt(&mut journal, &events, session_id, &prompt).await?;
+            }
+        }
+    }
     for action in recovered_actions {
-        if let Some(prompt) = queued_prompt_from_action(&action)
-            && !pending
-                .iter()
-                .any(|existing| existing.message_id == prompt.message_id)
-        {
-            pending.push_back(prompt);
+        if let Some(prompt) = queued_prompt_from_action(&action) {
+            if fresh {
+                if !pending
+                    .iter()
+                    .any(|existing| existing.message_id == prompt.message_id)
+                {
+                    pending.push_back(prompt);
+                }
+            } else if discarded_prompt_ids.insert(prompt.message_id) {
+                record_recalled_prompt(&mut journal, &events, session_id, &prompt).await?;
+            }
         }
     }
     let mut deferred_commands = VecDeque::new();
@@ -1871,7 +1906,7 @@ async fn run_agent_session_store_kernel(
 
         if launch.provider.uses_native_harness() {
             let state = journal.state(session_id).await?;
-            if native_auto_compaction_needed(&state) {
+            if provider_context_usage_valid && native_auto_compaction_needed(&state) {
                 let context_tokens = state.usage.context_tokens.unwrap_or_default();
                 let context_window_tokens = state.usage.context_window_tokens.unwrap_or_default();
                 record(
@@ -1991,15 +2026,16 @@ async fn run_agent_session_store_kernel(
             }
         }
 
-        let subscription_context_usage = if !launch.provider.uses_native_harness() {
-            let state = journal.state(session_id).await?;
-            (
-                state.usage.context_tokens,
-                state.usage.context_window_tokens,
-            )
-        } else {
-            (None, None)
-        };
+        let subscription_context_usage =
+            if !launch.provider.uses_native_harness() && provider_context_usage_valid {
+                let state = journal.state(session_id).await?;
+                (
+                    state.usage.context_tokens,
+                    state.usage.context_window_tokens,
+                )
+            } else {
+                (None, None)
+            };
         if !launch.provider.uses_native_harness()
             && retained_context.as_deref().is_some_and(|context| {
                 subscription_context_needs_compaction(
@@ -2358,6 +2394,9 @@ async fn run_agent_session_store_kernel(
                             &kind,
                         )
                         .await?;
+                        if context_usage_observation(&kind) {
+                            provider_context_usage_valid = true;
+                        }
                         record(&mut journal, &events, session_id, kind).await?;
                         if let Some(tokens) = usage {
                             account_goal_tokens(
@@ -2583,6 +2622,9 @@ async fn run_agent_session_store_kernel(
                         &kind,
                     )
                     .await?;
+                    if context_usage_observation(&kind) {
+                        provider_context_usage_valid = true;
+                    }
                     record(&mut journal, &events, session_id, kind).await?;
                     if retry_steers && !context_compaction_in_progress {
                         retry_pending_steers(
@@ -3845,7 +3887,7 @@ fn is_interrupted_turn_error(error: &str) -> bool {
     error.to_ascii_lowercase().contains("interrupted")
 }
 
-const AUTO_COMPACT_REMAINING_PERCENT: u64 = 10;
+const AUTO_COMPACT_REMAINING_PERCENT: u64 = 5;
 
 fn native_auto_compaction_needed(state: &SessionState) -> bool {
     let (Some(context_tokens), Some(context_window_tokens)) = (
@@ -3879,6 +3921,18 @@ fn native_usage_event(
         context_tokens: usage.context_tokens,
         context_window_tokens: usage.context_window_tokens,
     }
+}
+
+fn context_usage_observation(event: &SessionEventKind) -> bool {
+    matches!(
+        event,
+        SessionEventKind::ContextWindowUpdated { .. }
+            | SessionEventKind::UsageUpdated {
+                context_tokens: Some(_),
+                context_window_tokens: Some(_),
+                ..
+            }
+    )
 }
 
 fn subscription_prompt_chars(

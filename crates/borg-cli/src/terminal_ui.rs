@@ -1680,6 +1680,118 @@ impl BorgTerminal {
         })
     }
 
+    /// Reuse the active screen and input reader while the owner switches to a
+    /// different durable session. Dropping a terminal here would briefly leave
+    /// the alternate screen, which makes `/resume` look like Borg exited.
+    pub fn retarget(
+        &mut self,
+        sessions_dir: &Path,
+        session_id: Uuid,
+        cwd: PathBuf,
+        keybindings: &KeybindingConfig,
+    ) -> Result<()> {
+        self.attachment_store = AttachmentStore::for_session(sessions_dir, session_id)?;
+        self.keymap = KeyMap::from_config(keybindings)?;
+        self.transcript = Transcript::default();
+        self.director_transcript = None;
+        self.child_transcripts.clear();
+        self.child_unhydrated_events.clear();
+        self.hydrated_children.clear();
+        self.child_history_hydration_complete = false;
+        self.child_queued_prompts.clear();
+        self.child_statuses.clear();
+        self.child_pending_approvals.clear();
+        self.focused_child = None;
+        self.sidecar_focus_request = None;
+        self.team_switcher_open = false;
+        self.team_roster_hit_areas.clear();
+        self.hovered_team_roster = None;
+        self.back_to_director_area = None;
+        self.back_to_director_hovered = false;
+        self.composer = Composer::default();
+        self.cwd = cwd;
+        self.git_status_cache = GitStatusCache::default();
+        self.status = SessionStatus::Starting;
+        self.session_state_sequence = 0;
+        self.pending_approval = false;
+        self.pending_provider_interaction = false;
+        self.pending_provider_interaction_secret = false;
+        self.scroll_from_bottom = 0;
+        self.scroll_motion = ScrollMotion::default();
+        self.scrollbar_area = None;
+        self.scrollbar_thumb_area = None;
+        self.scrollbar_drag_offset = 0;
+        self.transcript_viewport_area = None;
+        self.transcript_scroll_max = 0;
+        self.dragging_scrollbar = false;
+        self.scrollbar_hovered = false;
+        self.jump_to_bottom_area = None;
+        self.jump_to_bottom_hovered = false;
+        self.keybindings_hint_area = None;
+        self.keybindings_hovered = false;
+        self.tool_hit_areas.clear();
+        self.tool_run_hit_areas.clear();
+        self.tool_run_header_hit_areas.clear();
+        self.entry_hit_areas.clear();
+        self.message_hit_areas.clear();
+        self.link_hit_areas.clear();
+        self.picker_hit_areas.clear();
+        self.hovered_tool = None;
+        self.hovered_tool_run = None;
+        self.hovered_tool_run_header = None;
+        self.hovered_entry = None;
+        self.hovered_message = None;
+        self.hovered_link = None;
+        self.hovered_picker_option = None;
+        self.last_mouse_position = None;
+        self.status_area = None;
+        self.status_hovered = false;
+        self.goal_status_area = None;
+        self.goal_status_hovered = false;
+        self.todo_status_area = None;
+        self.todo_status_hovered = false;
+        self.todo_status_expanded = false;
+        self.agents_status_area = None;
+        self.agents_status_hovered = false;
+        self.model_status_area = None;
+        self.model_status_hovered = false;
+        self.effort_status_area = None;
+        self.effort_status_hovered = false;
+        self.fast_status_area = None;
+        self.fast_status_hovered = false;
+        self.permission_status_area = None;
+        self.permission_status_hovered = false;
+        self.nested_scroll_capture = None;
+        self.nested_scroll_motion = None;
+        self.text_selection = None;
+        self.pending_transcript_click = None;
+        self.pending_tool_copy = None;
+        self.active_since = None;
+        self.notice = None;
+        self.copy_notice_expires_at = None;
+        self.clipboard_lease = None;
+        self.last_ctrl_c = None;
+        self.queued_prompts.clear();
+        self.replaying_history = false;
+        self.history_page_requested = false;
+        self.history_page_loading = false;
+        self.picker = None;
+        self.pending_auth_model = None;
+        self.keybindings_open = false;
+        self.slash_selection = 0;
+        self.rewind_targets.clear();
+        self.rewind_primed = false;
+        self.borging_this_run = false;
+        self.last_terminal_title = None;
+        self.transcript_render_cache = None;
+        self.rendered_transcript_height = 0;
+        self.pending_scroll_anchor_height = None;
+        self.pending_transcript_anchor = None;
+        self.event_redraw_needed = true;
+        self.cursor_blink_started_at = Instant::now();
+        Ok(())
+    }
+
     pub async fn next_event(&mut self) -> Option<io::Result<TerminalInputEvent>> {
         self.input.next_event().await
     }

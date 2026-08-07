@@ -5064,6 +5064,158 @@ fn idle_resume_drops_old_queue_snapshots_but_active_resume_recovers_work() {
     );
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn resumed_session_discards_stale_input_and_context_usage() {
+    let root = tempdir().unwrap();
+    let journal_path = root.path().join("session.lock");
+    let session_id = Uuid::new_v4();
+    let stale_id = Uuid::new_v4();
+    let next_id = Uuid::new_v4();
+    let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+        .await
+        .unwrap();
+    store.create_session(session_id).await.unwrap();
+    for kind in [
+        SessionEventKind::SessionStarted,
+        SessionEventKind::SessionConfigured {
+            cwd: root.path().to_path_buf(),
+            provider: CodingProvider::OpenRouter,
+            model: Some("test-model".to_string()),
+            effort: Some("medium".to_string()),
+            fast: false,
+            response_language: crate::ResponseLanguage::Auto,
+            permission_mode: PermissionMode::FullAccess,
+        },
+        SessionEventKind::Message {
+            message_id: stale_id,
+            actor: EventActor::User,
+            text: "stale queued input".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Queued,
+            delivery: Some(PromptDelivery::Queue),
+        },
+        SessionEventKind::UsageUpdated {
+            provider_duration_ms: 1,
+            turn_id: None,
+            provider_context_reused: None,
+            input_tokens: 95_000,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+            total_tokens: 95_000,
+            cost_microusd: None,
+            cost_basis: String::new(),
+            cost_usd: None,
+            context_tokens: Some(95_000),
+            context_window_tokens: Some(100_000),
+        },
+        SessionEventKind::StatusChanged {
+            status: SessionStatus::Ready,
+            detail: None,
+        },
+    ] {
+        store
+            .append(SessionEvent::new(session_id, 0, kind))
+            .await
+            .unwrap();
+    }
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let called = Arc::new(Notify::new());
+    let (command_tx, command_rx) = mpsc::channel(8);
+    let (event_tx, mut event_rx) = mpsc::channel(64);
+    let actor = tokio::spawn({
+        let root = root.path().to_path_buf();
+        let seen = Arc::clone(&seen);
+        let called = Arc::clone(&called);
+        async move {
+            run_agent_session_with_executor(
+                &journal_path,
+                session_id,
+                LaunchSession {
+                    request_id: Uuid::new_v4(),
+                    cwd: root,
+                    provider: CodingProvider::OpenRouter,
+                    model: Some("test-model".to_string()),
+                    effort: Some("medium".to_string()),
+                    fast: Some(false),
+                    response_language: crate::ResponseLanguage::Auto,
+                    permission_mode: PermissionMode::FullAccess,
+                    name: None,
+                    initial_prompt: None,
+                    capabilities: Default::default(),
+                    subagent_concurrency_limit: None,
+                    extension_skill_roots: Vec::new(),
+                    team_policy: None,
+                },
+                command_rx,
+                event_tx,
+                Arc::new(RecordingExecutor { seen, called }),
+            )
+            .await
+        }
+    });
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let event = event_rx.recv().await.expect("session remains live");
+            if matches!(
+                event.kind,
+                SessionEventKind::PromptRecalled { message_id, .. } if message_id == stale_id
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("stale input is recalled during resume");
+    assert!(seen.lock().unwrap().is_empty());
+    assert!(
+        store
+            .live_events_after(session_id, 0)
+            .await
+            .unwrap()
+            .iter()
+            .any(|live| matches!(
+                live.event.kind,
+                SessionEventKind::ContextWindowUpdated {
+                    context_tokens: 0,
+                    ..
+                }
+            ))
+    );
+
+    command_tx
+        .send(HostCommand::Prompt {
+            session_id,
+            message_id: next_id,
+            text: "fresh input".to_string(),
+            attachments: Vec::new(),
+            output_schema: None,
+            delivery: PromptDelivery::Queue,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), called.notified())
+        .await
+        .expect("fresh input starts a turn");
+    command_tx
+        .send(HostCommand::Stop { session_id })
+        .await
+        .unwrap();
+    actor.await.unwrap().unwrap();
+
+    assert_eq!(
+        store
+            .action(session_id, stale_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        crate::SessionActionState::Cancelled
+    );
+}
+
 #[test]
 fn in_progress_prompt_recovery_preserves_input_after_a_host_crash() {
     let session_id = Uuid::new_v4();
@@ -6237,7 +6389,7 @@ fn subscription_context_usage_prevents_character_limit_compaction_with_headroom(
         EventActor::User,
         "continue",
         false,
-        Some(232_560),
+        Some(245_450),
         Some(258_400),
     ));
 }
@@ -6836,7 +6988,7 @@ fn retained_context_chunking_preserves_every_byte_and_utf8() {
 }
 
 #[test]
-fn native_auto_compaction_starts_at_ten_percent_effective_context_remaining() {
+fn native_auto_compaction_starts_at_five_percent_effective_context_remaining() {
     let state = |context_tokens, context_window_tokens| SessionState {
         usage: crate::SessionUsage {
             context_tokens: Some(context_tokens),
@@ -6845,8 +6997,8 @@ fn native_auto_compaction_starts_at_ten_percent_effective_context_remaining() {
         },
         ..SessionState::default()
     };
-    assert!(!native_auto_compaction_needed(&state(89_999, 100_000)));
-    assert!(native_auto_compaction_needed(&state(90_000, 100_000)));
+    assert!(!native_auto_compaction_needed(&state(94_999, 100_000)));
+    assert!(native_auto_compaction_needed(&state(95_000, 100_000)));
     assert!(native_auto_compaction_needed(&state(100_000, 100_000)));
     assert!(!native_auto_compaction_needed(&SessionState::default()));
 }

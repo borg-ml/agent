@@ -1628,7 +1628,7 @@ fn absorb_usage(total: &mut ProviderCallUsage, usage: &ProviderCallUsage) {
     };
 }
 
-const NATIVE_AUTO_COMPACT_REMAINING_PERCENT: u64 = 10;
+const NATIVE_AUTO_COMPACT_REMAINING_PERCENT: u64 = 5;
 
 fn native_usage_needs_auto_compaction(usage: &ProviderCallUsage) -> bool {
     let (Some(context_tokens), Some(context_window_tokens)) =
@@ -2154,14 +2154,13 @@ mod tests {
     }
 
     #[test]
-    fn tool_round_auto_compaction_uses_ten_percent_effective_headroom() {
+    fn tool_round_auto_compaction_uses_five_percent_effective_headroom() {
         let usage = |context_tokens, context_window_tokens| ProviderCallUsage {
             context_tokens: Some(context_tokens),
             context_window_tokens: Some(context_window_tokens),
             ..ProviderCallUsage::default()
         };
-        assert!(!native_usage_needs_auto_compaction(&usage(89_999, 100_000)));
-        assert!(native_usage_needs_auto_compaction(&usage(90_000, 100_000)));
+        assert!(!native_usage_needs_auto_compaction(&usage(94_999, 100_000)));
         assert!(native_usage_needs_auto_compaction(&usage(95_000, 100_000)));
         assert!(!native_usage_needs_auto_compaction(
             &ProviderCallUsage::default()
