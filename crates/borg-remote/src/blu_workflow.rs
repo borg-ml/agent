@@ -970,11 +970,9 @@ impl HostBridge {
         ensure!(!self.cancel.is_cancelled(), "Blu workflow was cancelled");
         let call_id = guest_u64(args, 0, "call_id")?;
         let response = match operation {
-            "workflow_id" => {
-                self.journal.call(call_id, operation, json!({}), || {
-                    Ok(json!(self.journal.workflow_id.to_string()))
-                })?
-            }
+            "workflow_id" => self.journal.call(call_id, operation, json!({}), || {
+                Ok(json!(self.journal.workflow_id.to_string()))
+            })?,
             "emit" => {
                 self.require_full_access(operation)?;
                 let kind = guest_string(args, 1, "kind")?;
@@ -1194,9 +1192,7 @@ impl HostBridge {
         } else {
             response.to_string()
         };
-        Ok(vec![BluValue::String(Arc::from(
-            serialized.into_bytes(),
-        ))])
+        Ok(vec![BluValue::String(Arc::from(serialized.into_bytes()))])
     }
 
     fn require_full_access(&self, operation: &str) -> Result<()> {
