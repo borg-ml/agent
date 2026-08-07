@@ -78,7 +78,6 @@ enum CacheMissCause {
 pub(super) struct CacheMissNotice {
     missed_tokens: u64,
     prompt_tokens: u64,
-    reusable_prefix_tokens: u64,
     cached_input_tokens: u64,
     cause: CacheMissCause,
     model: Option<String>,
@@ -161,7 +160,6 @@ impl CacheDiagnostics {
             Some(CacheMissNotice {
                 missed_tokens,
                 prompt_tokens,
-                reusable_prefix_tokens,
                 cached_input_tokens: usage.cached_input_tokens,
                 cause: cache_miss_cause(previous, &signature, at, usage.provider_context_reused),
                 model: signature.model.clone(),
@@ -172,18 +170,14 @@ impl CacheDiagnostics {
 
         // A first turn has no prior prompt to hit. Recording its natural zero
         // as a cache result makes the idle composer claim a false cache miss.
-        if cache_telemetry_available
-            && had_prior_prompt
-            && let Some(previous) = self.previous.as_ref()
-        {
-            let reusable_prefix_tokens = previous.prompt_tokens.min(prompt_tokens);
+        if cache_telemetry_available && had_prior_prompt {
             self.latest = Some(LatestCacheUse {
-                // The newly appended user/assistant suffix was never eligible
-                // for reuse. Report how much of the prior reusable prefix hit,
-                // rather than diluting the percentage with brand-new tokens.
+                // Match provider-reported cache hit rates (and ZCode's
+                // latestHitRate): cached prompt tokens divided by the full
+                // prompt processed for this request.
                 hit_percent: cache_hit_percent(
-                    usage.cached_input_tokens.min(reusable_prefix_tokens),
-                    reusable_prefix_tokens,
+                    usage.cached_input_tokens.min(prompt_tokens),
+                    prompt_tokens,
                 ),
                 signature: signature.clone(),
             });
@@ -290,8 +284,8 @@ fn material_cache_miss(missed_tokens: u64, reusable_prefix_tokens: u64) -> bool 
 impl CacheMissNotice {
     pub(super) fn text(&self) -> String {
         let hit_percent = cache_hit_percent(
-            self.cached_input_tokens.min(self.reusable_prefix_tokens),
-            self.reusable_prefix_tokens,
+            self.cached_input_tokens.min(self.prompt_tokens),
+            self.prompt_tokens,
         );
         let mut facts = vec![
             format!(
@@ -573,7 +567,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_hit_percentage_excludes_the_new_prompt_suffix() {
+    fn cache_hit_percentage_matches_the_full_provider_prompt() {
         let mut diagnostics = CacheDiagnostics::default();
         let at = Utc::now();
         diagnostics.observe(at, signature("gpt-5.6-sol", "high"), usage(1_000, 99_000));
@@ -589,7 +583,7 @@ mod tests {
                 &signature("gpt-5.6-sol", "high"),
             )
             .expect("measured cache status");
-        assert_eq!(status.label, "cache 100% hit");
+        assert_eq!(status.label, "cache 66% hit");
     }
 
     #[test]

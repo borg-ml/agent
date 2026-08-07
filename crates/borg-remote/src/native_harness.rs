@@ -153,6 +153,8 @@ impl NativeHarness {
         let user_message = native_user_message(&turn.cwd, &turn.prompt, &turn.attachments).await?;
         record_native_message(&events, turn.provider, &user_message).await?;
         messages.push(user_message);
+        canonicalize_native_messages(&mut messages);
+        let provider_session_id = format!("borg-session:{}", turn.session_id);
         let prompt_cache_key = native_prompt_cache_key(
             turn.session_id,
             turn.context_generation,
@@ -181,6 +183,7 @@ impl NativeHarness {
                     turn.effort.as_deref(),
                     ModelTurnRequest {
                         request_id: Some(format!("{}:{model_round}", turn.message_id)),
+                        session_id: Some(provider_session_id.clone()),
                         prompt_cache_key: Some(prompt_cache_key.clone()),
                         messages: messages.clone(),
                         tools: tools.clone(),
@@ -201,6 +204,7 @@ impl NativeHarness {
                         native_user_message(&turn.cwd, &steer.text, &steer.attachments).await?;
                     record_native_message(&events, turn.provider, &message).await?;
                     messages.push(message);
+                    canonicalize_native_messages(&mut messages);
                     assistant_message_id = Uuid::new_v4();
                     send(
                         &events,
@@ -399,6 +403,7 @@ impl NativeHarness {
                     native_user_message(&turn.cwd, &steer.text, &steer.attachments).await?;
                 record_native_message(&events, turn.provider, &message).await?;
                 messages.push(message);
+                canonicalize_native_messages(&mut messages);
             }
             tool_round += 1;
             send(
@@ -524,6 +529,7 @@ impl NativeHarness {
                 effort,
                 ModelTurnRequest {
                     request_id: Some(format!("consult:{}", Uuid::new_v4())),
+                    session_id: None,
                     prompt_cache_key: None,
                     messages: vec![
                         ModelMessage::System {
@@ -591,6 +597,7 @@ impl NativeHarness {
                 effort,
                 ModelTurnRequest {
                     request_id: Some(format!("compact:{}", Uuid::new_v4())),
+                    session_id: None,
                     prompt_cache_key: None,
                     messages,
                     tools: Vec::new(),
@@ -1192,6 +1199,41 @@ fn normalize_reasoning_delta(accumulated: &mut String, incoming: &str) -> Option
     Some(incoming.to_string())
 }
 
+/// Match ZCode's provider-side canonicalization without rewriting the durable
+/// journal. Adjacent ordinary user messages otherwise serialize as different
+/// message boundaries even though they are one logical prompt prefix.
+fn canonicalize_native_messages(messages: &mut Vec<ModelMessage>) {
+    let mut canonical = Vec::with_capacity(messages.len());
+    for message in std::mem::take(messages) {
+        match message {
+            ModelMessage::User {
+                content,
+                attachments,
+            } => {
+                if attachments.is_empty()
+                    && let Some(ModelMessage::User {
+                        content: previous_content,
+                        attachments: previous_attachments,
+                    }) = canonical.last_mut()
+                    && previous_attachments.is_empty()
+                {
+                    if !previous_content.is_empty() && !content.is_empty() {
+                        previous_content.push('\n');
+                    }
+                    previous_content.push_str(&content);
+                } else {
+                    canonical.push(ModelMessage::User {
+                        content,
+                        attachments,
+                    });
+                }
+            }
+            message => canonical.push(message),
+        }
+    }
+    *messages = canonical;
+}
+
 /// Derive a stable cache identity for the durable prefix, not for the entire
 /// request. Tool rounds therefore reuse the provider's prefix cache, while a
 /// provider/model change, compaction, or context clear is fenced into a new
@@ -1433,6 +1475,7 @@ async fn review_tool_automatically(
 ) -> Result<AutomaticReview> {
     let request = ModelTurnRequest {
         request_id: Some(format!("approval-review:{}", Uuid::new_v4())),
+        session_id: None,
         prompt_cache_key: None,
         messages: vec![
             ModelMessage::System {
@@ -2037,6 +2080,7 @@ mod tests {
                 None,
                 ModelTurnRequest {
                     request_id: Some("test-request".to_string()),
+                    session_id: None,
                     prompt_cache_key: None,
                     messages: vec![ModelMessage::user("hello")],
                     tools: Vec::new(),
@@ -2142,6 +2186,34 @@ mod tests {
                 "system",
                 &[],
             )
+        );
+    }
+
+    #[test]
+    fn native_request_canonicalization_merges_adjacent_users_without_crossing_roles() {
+        let attachment = ModelInputAttachment {
+            media_type: "image/png".to_string(),
+            data_base64: "aGVsbG8=".to_string(),
+            filename: Some("hello.png".to_string()),
+        };
+        let mut messages = vec![
+            ModelMessage::user("first"),
+            ModelMessage::user("second"),
+            ModelMessage::assistant(Some("answer".to_string()), None, None, Vec::new()),
+            ModelMessage::user_with_attachments("third", vec![attachment.clone()]),
+            ModelMessage::user_with_attachments("fourth", vec![attachment.clone()]),
+        ];
+
+        canonicalize_native_messages(&mut messages);
+
+        assert_eq!(
+            messages,
+            vec![
+                ModelMessage::user("first\nsecond"),
+                ModelMessage::assistant(Some("answer".to_string()), None, None, Vec::new()),
+                ModelMessage::user_with_attachments("third", vec![attachment.clone()]),
+                ModelMessage::user_with_attachments("fourth", vec![attachment]),
+            ]
         );
     }
 

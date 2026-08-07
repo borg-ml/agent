@@ -167,7 +167,9 @@ impl ModelToolDefinition {
 pub struct ModelTurnRequest {
     /// Stable idempotency key for one provider request.
     pub request_id: Option<String>,
-    /// Stable cache identity for the canonical session prefix.
+    /// Stable provider-routing identity for the whole logical session.
+    pub session_id: Option<String>,
+    /// Cache identity for the current canonical session prefix.
     pub prompt_cache_key: Option<String>,
     pub messages: Vec<ModelMessage>,
     pub tools: Vec<ModelToolDefinition>,

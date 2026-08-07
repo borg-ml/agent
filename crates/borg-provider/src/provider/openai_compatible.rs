@@ -203,15 +203,29 @@ impl OpenAiCompatibleProvider {
             "stream": true,
             "stream_options": { "include_usage": true },
         });
-        if profile == OpenAiCompatibleProfile::OpenRouter
-            && let Some(prompt_cache_key) = request.prompt_cache_key.as_deref()
-            && !prompt_cache_key.trim().is_empty()
-        {
-            // OpenRouter uses session_id to keep an agent workflow on the
-            // same upstream provider, which is what preserves implicit
-            // DeepSeek prefix caches across tool rounds and resumes.
-            body["session_id"] = json!(prompt_cache_key);
-            body["prompt_cache_key"] = json!(prompt_cache_key);
+        let session_id = request
+            .session_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty());
+        let prompt_cache_key = request
+            .prompt_cache_key
+            .as_deref()
+            .filter(|value| !value.trim().is_empty());
+        if profile == OpenAiCompatibleProfile::OpenRouter {
+            if let Some(session_id) = session_id {
+                // Keep provider affinity stable across context-generation
+                // changes. DeepSeek and Z.AI cache automatically; the stable
+                // session lane is what lets OpenRouter keep routing the
+                // evolving prefix to the same upstream cache.
+                body["session_id"] = json!(session_id);
+            } else if let Some(prompt_cache_key) = prompt_cache_key {
+                // Preserve the pre-session_id request contract for callers
+                // that only provide the older cache-key field.
+                body["session_id"] = json!(prompt_cache_key);
+            }
+            if let Some(prompt_cache_key) = prompt_cache_key {
+                body["prompt_cache_key"] = json!(prompt_cache_key);
+            }
         }
         match profile {
             OpenAiCompatibleProfile::Kimi => {
@@ -303,6 +317,9 @@ impl OpenAiCompatibleProvider {
                 request = request
                     .header("HTTP-Referer", "https://borg.ml")
                     .header("X-Title", "Borg");
+                if let Some(session_id) = session_id {
+                    request = request.header("x-session-id", session_id);
+                }
             }
             if let Some(request_id) = request_id.as_deref() {
                 request = request.header("x-borg-request-id", request_id);
@@ -1311,6 +1328,7 @@ mod tests {
             .model_turn_via_profile(
                 ModelTurnRequest {
                     request_id: Some("kimi-test".to_string()),
+                    session_id: None,
                     prompt_cache_key: None,
                     messages: vec![ModelMessage::user("inspect")],
                     tools: Vec::new(),
@@ -1474,7 +1492,8 @@ mod tests {
             .model_turn_via_profile(
                 ModelTurnRequest {
                     request_id: Some("openrouter-test".to_string()),
-                    prompt_cache_key: Some("borg-session:test".to_string()),
+                    session_id: Some("borg-session:stable".to_string()),
+                    prompt_cache_key: Some("borg-prefix:test".to_string()),
                     messages: vec![ModelMessage::user("inspect the repository")],
                     tools: vec![
                         super::super::ModelToolDefinition::new(
@@ -1510,11 +1529,12 @@ mod tests {
         let headers = String::from_utf8_lossy(&request[..header_end]).to_ascii_lowercase();
         assert!(headers.contains("authorization: bearer test-openrouter-key"));
         assert!(headers.contains("x-borg-request-id: openrouter-test"));
+        assert!(headers.contains("x-session-id: borg-session:stable"));
         let body: Value =
             serde_json::from_slice(&request[header_end + 4..]).expect("request JSON body");
         assert_eq!(body["model"], "vendor/future-model");
-        assert_eq!(body["session_id"], "borg-session:test");
-        assert_eq!(body["prompt_cache_key"], "borg-session:test");
+        assert_eq!(body["session_id"], "borg-session:stable");
+        assert_eq!(body["prompt_cache_key"], "borg-prefix:test");
         assert_eq!(body["reasoning"]["effort"], "high");
         assert_eq!(body["tool_choice"], "auto");
         assert_eq!(body["response_format"]["type"], "json_schema");
