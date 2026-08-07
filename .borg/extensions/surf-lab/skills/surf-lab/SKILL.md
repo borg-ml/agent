@@ -9,10 +9,16 @@ Use this extension through the session's persistent Python runtime. It is a
 stateful deterministic environment, not a screenshot or GUI driver.
 
 ```python
+import json
+
 env = borg.environment("surf-lab", "lab")
-started = env.start({"profile": "source"})
+started_response = env.start({"profile": "source"})
+started = json.loads(started_response["content"][0]["text"])
 session_id = started["session_id"]
 ```
+
+Environment calls preserve the standard MCP response envelope; Surf Lab puts
+its structured JSON payload in the first text content block.
 
 The environment exposes `start`, `step`, `observe`, `trace`, `log`, `branch`,
 `compare`, `map.generate`, `map.inspect`, `map.preview`, `map.route`, `map.export`, and `config`. Keep the returned session id in the persistent
@@ -31,6 +37,10 @@ fixed-step controller, and spatial queries. With `map` set to a Source BSP
 path, it uses the same BSP loader and imported collision geometry as the game;
 without one it uses the game's generated course. The process is pinned to one
 profile and map, so start a new environment to change either.
+
+For native Source-unit calibration, use the same BSP path that CS:S loads. The
+importer includes Source displacement grids and oriented surf-ramp faces in the
+headless collision world, in addition to BSP brush and packed-prop collision.
 
 MCP tool names containing punctuation are exposed to the runtime with
 runtime-safe underscores (for example, `map.generate` appears in `tools()` as
