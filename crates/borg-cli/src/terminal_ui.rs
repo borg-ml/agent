@@ -699,6 +699,8 @@ pub struct BorgTerminal {
     model_status_hovered: bool,
     effort_status_area: Option<Rect>,
     effort_status_hovered: bool,
+    context_status_area: Option<Rect>,
+    context_status_hovered: bool,
     fast_status_area: Option<Rect>,
     fast_status_hovered: bool,
     permission_status_area: Option<Rect>,
@@ -753,6 +755,7 @@ struct HoverState {
     agents_status_hovered: bool,
     model_status_hovered: bool,
     effort_status_hovered: bool,
+    context_status_hovered: bool,
     fast_status_hovered: bool,
     permission_status_hovered: bool,
     back_to_director_hovered: bool,
@@ -779,6 +782,7 @@ impl BorgTerminal {
             agents_status_hovered: self.agents_status_hovered,
             model_status_hovered: self.model_status_hovered,
             effort_status_hovered: self.effort_status_hovered,
+            context_status_hovered: self.context_status_hovered,
             fast_status_hovered: self.fast_status_hovered,
             permission_status_hovered: self.permission_status_hovered,
             back_to_director_hovered: self.back_to_director_hovered,
@@ -1648,6 +1652,8 @@ impl BorgTerminal {
             model_status_hovered: false,
             effort_status_area: None,
             effort_status_hovered: false,
+            context_status_area: None,
+            context_status_hovered: false,
             fast_status_area: None,
             fast_status_hovered: false,
             permission_status_area: None,
@@ -1764,6 +1770,8 @@ impl BorgTerminal {
         self.model_status_hovered = false;
         self.effort_status_area = None;
         self.effort_status_hovered = false;
+        self.context_status_area = None;
+        self.context_status_hovered = false;
         self.fast_status_area = None;
         self.fast_status_hovered = false;
         self.permission_status_area = None;
@@ -2461,6 +2469,7 @@ impl BorgTerminal {
         self.agents_status_hovered = false;
         self.model_status_hovered = false;
         self.effort_status_hovered = false;
+        self.context_status_hovered = false;
         self.fast_status_hovered = false;
         self.permission_status_hovered = false;
         self.back_to_director_hovered = false;
@@ -3055,6 +3064,9 @@ impl BorgTerminal {
                 self.effort_status_hovered = self
                     .effort_status_area
                     .is_some_and(|area| area.contains(pointer));
+                self.context_status_hovered = self
+                    .context_status_area
+                    .is_some_and(|area| area.contains(pointer));
                 self.fast_status_hovered = self
                     .fast_status_area
                     .is_some_and(|area| area.contains(pointer));
@@ -3189,6 +3201,13 @@ impl BorgTerminal {
                             .is_some_and(|area| area.contains(pointer))
                         {
                             self.open_effort_picker();
+                            return Ok(UiAction::None);
+                        }
+                        if self
+                            .context_status_area
+                            .is_some_and(|area| area.contains(pointer))
+                        {
+                            self.notice = Some(self.transcript.context_tooltip());
                             return Ok(UiAction::None);
                         }
                         if self
@@ -4212,7 +4231,9 @@ impl BorgTerminal {
             cwd_status.push_str(&git_status.compact_label());
         }
         let cache_status = self.transcript.cache_status(Utc::now());
-        let (context_status, context_imminent) = self.transcript.context_status();
+        let (_, context_imminent) = self.transcript.context_status();
+        let context_status = self.transcript.context_limit_label();
+        let context_tooltip = self.transcript.context_tooltip();
         let team_transcript = self
             .director_transcript
             .as_deref()
@@ -4280,6 +4301,7 @@ impl BorgTerminal {
             agents_status_hovered: self.agents_status_hovered,
             model_status_hovered: self.model_status_hovered,
             effort_status_hovered: self.effort_status_hovered,
+            context_status_hovered: self.context_status_hovered,
             permission_status_hovered: self.permission_status_hovered,
         });
         let primary_controls_display = if showing_transcript_interaction_hint {
@@ -4448,6 +4470,7 @@ impl BorgTerminal {
         let mut next_agents_status_area = None;
         let mut next_model_status_area = None;
         let mut next_effort_status_area = None;
+        let mut next_context_status_area = None;
         let mut next_fast_status_area = None;
         let mut next_permission_status_area = None;
         let mut next_team_roster_hit_areas = Vec::new();
@@ -5096,6 +5119,20 @@ impl BorgTerminal {
                 self.effort_status_hovered,
                 effort_status_color,
             );
+            let context_status_start = status_spans.iter().map(|span| span.width()).sum::<usize>();
+            let context_status_start =
+                context_status_start.saturating_add(STATUS_SEPARATOR.width());
+            let context_status_width = context_status.width();
+            push_interactive_status_segment(
+                &mut status_spans,
+                Some(context_status.clone()),
+                self.context_status_hovered,
+                if context_imminent {
+                    Color::Yellow
+                } else {
+                    Color::Gray
+                },
+            );
             let fast_status_start = status_spans.iter().map(|span| span.width()).sum::<usize>();
             let fast_status_start = fast_status_start
                 .saturating_add(usize::from(fast_status.is_some()) * STATUS_SEPARATOR.width());
@@ -5178,6 +5215,8 @@ impl BorgTerminal {
                 model_status_width.map(|width| status_hit_area(model_status_start, width));
             next_effort_status_area =
                 effort_status_width.map(|width| status_hit_area(effort_status_start, width));
+            next_context_status_area =
+                Some(status_hit_area(context_status_start, context_status_width));
             next_fast_status_area =
                 fast_status_width.map(|width| status_hit_area(fast_status_start, width));
             next_permission_status_area = permission_status_width
@@ -5375,9 +5414,51 @@ impl BorgTerminal {
                     tooltip,
                 );
             }
+            if self.context_status_hovered {
+                let tooltip_width = (context_tooltip.width() as u16)
+                    .saturating_add(4)
+                    .clamp(24, status_area.width.max(24).min(72));
+                let tooltip_lines = wrap_display(
+                    &context_tooltip,
+                    tooltip_width.saturating_sub(4).max(1) as usize,
+                );
+                let tooltip_height = (tooltip_lines.len() as u16)
+                    .saturating_add(2)
+                    .min(status_area.y.saturating_sub(area.y).max(1));
+                let tooltip = Rect {
+                    x: next_context_status_area
+                        .map(|context_area| context_area.x)
+                        .unwrap_or(status_area.x)
+                        .min(area.right().saturating_sub(tooltip_width)),
+                    y: status_area.y.saturating_sub(tooltip_height),
+                    width: tooltip_width,
+                    height: tooltip_height,
+                };
+                frame.render_widget(Clear, tooltip);
+                frame.render_widget(
+                    Paragraph::new(
+                        tooltip_lines
+                            .into_iter()
+                            .map(Line::from)
+                            .collect::<Vec<_>>(),
+                    )
+                    .style(Style::default().fg(Color::White).bg(COMMAND_PANEL_BG))
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(if context_imminent {
+                                Color::Yellow
+                            } else {
+                                Color::Gray
+                            }))
+                            .title(" Context window "),
+                    ),
+                    tooltip,
+                );
+            }
             if !is_launch_screen {
                 let footer_metadata = showing_primary_controls
-                    .then(|| footer_metadata_text(&context_status, &cwd_status, usize::MAX))
+                    .then(|| footer_metadata_text("", &cwd_status, usize::MAX))
                     .filter(|value| !value.is_empty());
                 let desired_metadata_width = footer_metadata
                     .as_ref()
@@ -5399,9 +5480,9 @@ impl BorgTerminal {
                 if footer_metadata.is_some() && metadata_width > 0 {
                     frame.render_widget(
                         Paragraph::new(footer_metadata_line(
-                            &context_status,
+                            "",
                             &cwd_status,
-                            context_imminent,
+                            false,
                             metadata_width as usize,
                         ))
                         .alignment(Alignment::Right)
@@ -5617,6 +5698,7 @@ impl BorgTerminal {
             next_agents_status_area = None;
             next_model_status_area = None;
             next_effort_status_area = None;
+            next_context_status_area = None;
             next_fast_status_area = None;
             next_permission_status_area = None;
             next_back_to_director_area = None;
@@ -5643,6 +5725,7 @@ impl BorgTerminal {
         self.agents_status_area = next_agents_status_area;
         self.model_status_area = next_model_status_area;
         self.effort_status_area = next_effort_status_area;
+        self.context_status_area = next_context_status_area;
         self.fast_status_area = next_fast_status_area;
         self.permission_status_area = next_permission_status_area;
         self.team_roster_hit_areas = next_team_roster_hit_areas;
@@ -7943,6 +8026,20 @@ fn context_remaining_percent(tokens: u64, window: u64) -> u8 {
         .round() as u8
 }
 
+fn format_context_tokens(tokens: u64) -> String {
+    const THOUSAND: u64 = 1_000;
+    const MILLION: u64 = 1_000_000;
+    if tokens >= MILLION {
+        let value = format!("{:.1}", tokens as f64 / MILLION as f64);
+        format!("{}m", value.trim_end_matches(".0"))
+    } else if tokens >= THOUSAND {
+        let value = format!("{:.1}", tokens as f64 / THOUSAND as f64);
+        format!("{}k", value.trim_end_matches(".0"))
+    } else {
+        tokens.to_string()
+    }
+}
+
 impl TranscriptEntry {
     fn copy_text_owned(&self) -> Option<String> {
         match self {
@@ -9753,6 +9850,7 @@ struct BottomInteractionHintState {
     agents_status_hovered: bool,
     model_status_hovered: bool,
     effort_status_hovered: bool,
+    context_status_hovered: bool,
     permission_status_hovered: bool,
 }
 
@@ -9767,6 +9865,8 @@ fn bottom_interaction_hint(state: BottomInteractionHintState) -> Option<&'static
         Some("left click change model")
     } else if state.effort_status_hovered {
         Some("left click change effort")
+    } else if state.context_status_hovered {
+        Some("left click show context details")
     } else if state.permission_status_hovered {
         Some("left click change permissions")
     } else {

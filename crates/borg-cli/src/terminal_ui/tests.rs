@@ -495,6 +495,7 @@ fn hover_redraw_gate_ignores_motion_inside_one_target() {
         agents_status_hovered: false,
         model_status_hovered: false,
         effort_status_hovered: false,
+        context_status_hovered: false,
         fast_status_hovered: false,
         permission_status_hovered: false,
         back_to_director_hovered: false,
@@ -1754,6 +1755,30 @@ fn model_changes_do_not_retain_the_old_context_percentage() {
         },
     ));
     assert_eq!(transcript.context_status().0, "47% context left");
+}
+
+#[test]
+fn context_limit_label_includes_window_and_tooltip_details() {
+    let session_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::ContextWindowUpdated {
+            context_tokens: 137_000,
+            context_window_tokens: 258_400,
+        },
+    ));
+
+    assert_eq!(
+        transcript.context_limit_label(),
+        "49% context left · 258.4k"
+    );
+    assert_eq!(
+        transcript.context_tooltip(),
+        "137k used of 258.4k window · 49% context left"
+    );
+    assert_eq!(format_context_tokens(1_000_000), "1m");
 }
 
 #[test]
@@ -3376,6 +3401,13 @@ fn model_effort_and_permission_hover_show_bottom_interaction_hints() {
     assert_eq!(
         hint(false, false, false, true),
         Some("left click change permissions")
+    );
+    assert_eq!(
+        bottom_interaction_hint(BottomInteractionHintState {
+            context_status_hovered: true,
+            ..BottomInteractionHintState::default()
+        }),
+        Some("left click show context details")
     );
     assert_eq!(hint(false, false, false, false), None);
 }

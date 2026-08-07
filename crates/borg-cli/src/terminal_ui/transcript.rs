@@ -22,6 +22,8 @@ struct Transcript {
     assistant_message_color: Color,
     context_remaining_percent: u8,
     context_known: bool,
+    context_tokens: Option<u64>,
+    context_window_tokens: Option<u64>,
     cache_diagnostics: CacheDiagnostics,
     tool_run_offsets: HashMap<usize, usize>,
     expanded_tool_runs: HashSet<usize>,
@@ -80,6 +82,8 @@ impl Default for Transcript {
             assistant_message_color: Color::White,
             context_remaining_percent: 100,
             context_known: false,
+            context_tokens: None,
+            context_window_tokens: None,
             cache_diagnostics: CacheDiagnostics::default(),
             tool_run_offsets: HashMap::new(),
             expanded_tool_runs: HashSet::new(),
@@ -354,6 +358,8 @@ impl Transcript {
             state.usage.context_window_tokens,
         ) {
             self.context_known = true;
+            self.context_tokens = Some(context_tokens);
+            self.context_window_tokens = Some(context_window_tokens);
             self.context_remaining_percent =
                 context_remaining_percent(context_tokens, context_window_tokens);
         }
@@ -807,6 +813,8 @@ impl Transcript {
                     // while the new provider is preparing its first report.
                     self.context_known = false;
                     self.context_remaining_percent = 100;
+                    self.context_tokens = None;
+                    self.context_window_tokens = None;
                 }
             }
             SessionEventKind::TurnStarted {
@@ -839,6 +847,8 @@ impl Transcript {
                     (context_tokens, context_window_tokens)
                 {
                     self.context_known = true;
+                    self.context_tokens = Some(*context_tokens);
+                    self.context_window_tokens = Some(*context_window_tokens);
                     self.context_remaining_percent =
                         context_remaining_percent(*context_tokens, *context_window_tokens);
                 }
@@ -882,6 +892,8 @@ impl Transcript {
                 context_window_tokens,
             } => {
                 self.context_known = true;
+                self.context_tokens = Some(*context_tokens);
+                self.context_window_tokens = Some(*context_window_tokens);
                 self.context_remaining_percent =
                     context_remaining_percent(*context_tokens, *context_window_tokens);
             }
@@ -889,6 +901,7 @@ impl Transcript {
                 self.clear_visible_entries();
                 self.context_remaining_percent = 100;
                 self.context_known = true;
+                self.context_tokens = self.context_window_tokens.map(|_| 0);
                 self.cache_diagnostics.reset();
             }
             SessionEventKind::PromptRecalled { message_id, .. } => {
@@ -1680,6 +1693,28 @@ impl Transcript {
             format!("{}% context left", self.context_remaining_percent)
         };
         (status, imminent)
+    }
+
+    fn context_limit_label(&self) -> String {
+        let (status, _) = self.context_status();
+        self.context_window_tokens.map_or(status.clone(), |window| {
+            format!("{status} · {}", format_context_tokens(window))
+        })
+    }
+
+    fn context_tooltip(&self) -> String {
+        if !self.context_known {
+            return "Context usage is not available yet".to_string();
+        }
+        match (self.context_tokens, self.context_window_tokens) {
+            (Some(tokens), Some(window)) => format!(
+                "{} used of {} window · {}",
+                format_context_tokens(tokens),
+                format_context_tokens(window),
+                self.context_status().0
+            ),
+            _ => self.context_status().0,
+        }
     }
 
     fn cache_status(&self, now: DateTime<Utc>) -> Option<CacheStatus> {
