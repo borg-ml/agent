@@ -22,12 +22,19 @@ two traces to identify the first divergent tick and position error. `log`
 returns recorder metadata and a bounded window from the same persistent log as
 `trace`.
 
-The lab runs a renderer-free Bevy/Avian world using the game's course setup,
-static collision representation, player hull, fixed-step controller, and
-spatial queries. With `map` set to a Source BSP path, it uses the same BSP
-loader and imported collision geometry as the game; without one it uses the
-game's generated course. The process is pinned to one profile and map, so start
-a new environment to change either.
+The lab launcher uses an already-built `surf_lab` executable (release first,
+then debug) so MCP startup does not block on a Cargo build. Set
+`SURF_LAB_BIN` to override the executable path or `SURF_LAB_ROOT` to override
+the sibling Surf checkout. The lab runs a renderer-free Bevy/Avian world using
+the game's course setup, static collision representation, player hull,
+fixed-step controller, and spatial queries. With `map` set to a Source BSP
+path, it uses the same BSP loader and imported collision geometry as the game;
+without one it uses the game's generated course. The process is pinned to one
+profile and map, so start a new environment to change either.
+
+MCP tool names containing punctuation are exposed to the runtime with
+runtime-safe underscores (for example, `map.generate` appears in `tools()` as
+`map_generate`), while `env.call("map.generate", ...)` remains accepted.
 
 Every simulated tick is appended to a per-episode JSONL log and flushed as the
 episode advances. Responses intentionally expose bounded observation windows;

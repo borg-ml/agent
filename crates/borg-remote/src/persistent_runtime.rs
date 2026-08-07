@@ -756,18 +756,33 @@ class ExtensionEnvironment:
             prefix += f"{server}__"
         return prefix
 
+    @staticmethod
+    def _normalize_tool_name(value):
+        return "".join(
+            character if ("A" <= character <= "Z" or "a" <= character <= "z" or "0" <= character <= "9" or character in "_-") else "_"
+            for character in str(value)
+        )
+
     def tools(self):
         return [tool for tool in self.borg.mcp_tools() if tool.get("name", "").startswith(self._prefix())]
 
     def call(self, tool, arguments=None):
         name = str(tool)
         if not name.startswith("mcp__"):
-            matches = [candidate["name"] for candidate in self.tools() if candidate["name"].endswith(f"__{name}")]
+            normalized = self._normalize_tool_name(name)
+            matches = [
+                candidate["name"]
+                for candidate in self.tools()
+                if candidate["name"].endswith(f"__{name}")
+                or candidate["name"].endswith(f"__{normalized}")
+            ]
             if len(matches) != 1:
                 raise RuntimeError(f"environment tool {name!r} resolved to {len(matches)} tools")
             name = matches[0]
-        elif not name.startswith(self._prefix()):
-            raise RuntimeError(f"tool {name!r} is outside this environment")
+        else:
+            name = self._normalize_tool_name(name)
+            if not name.startswith(self._prefix()):
+                raise RuntimeError(f"tool {tool!r} is outside this environment")
         return self.borg.mcp(name, arguments)
 
     def __getattr__(self, name):
@@ -1033,6 +1048,10 @@ function normalizeEnvironmentPart(value) {
   return String(value).replace(/[^A-Za-z0-9_]/g, "_");
 }
 
+function normalizeEnvironmentToolName(value) {
+  return String(value).replace(/[^A-Za-z0-9_-]/g, "_");
+}
+
 borg.harness = {
   list: async (kind = undefined, scope = undefined, limit = 128) => {
     const result = await hostCall("harness", {op: "list", ...(kind === undefined ? {} : {kind}), ...(scope === undefined ? {} : {scope}), limit});
@@ -1055,12 +1074,16 @@ borg.environment = (extensionId, server = undefined) => {
     call: async (tool, arguments_ = {}) => {
       let name = String(tool);
       if (!name.startsWith("mcp__")) {
+        const normalized = normalizeEnvironmentToolName(name);
         const matches = (await borg.mcp_tools())
-          .filter(candidate => String(candidate.name || "").startsWith(prefix) && String(candidate.name).endsWith(`__${name}`));
+          .filter(candidate => String(candidate.name || "").startsWith(prefix) && (String(candidate.name).endsWith(`__${name}`) || String(candidate.name).endsWith(`__${normalized}`)));
         if (matches.length !== 1) throw new Error(`environment tool ${name} resolved to ${matches.length} tools`);
         name = matches[0].name;
-      } else if (!name.startsWith(prefix)) {
-        throw new Error(`tool ${name} is outside this environment`);
+      } else {
+        name = normalizeEnvironmentToolName(name);
+        if (!name.startsWith(prefix)) {
+          throw new Error(`tool ${tool} is outside this environment`);
+        }
       }
       return borg.mcp(name, arguments_);
     },

@@ -510,7 +510,7 @@ read _initialize
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"surf","version":"1"}}}'
 read _initialized
 read _list
-printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"step","description":"Advance surf","inputSchema":{"type":"object"}}]}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"map.generate","description":"Generate a map","inputSchema":{"type":"object"}}]}}'
 read _call
 printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"tick advanced"}]}}'
 "#;
@@ -520,7 +520,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text
             command: "sh".to_string(),
             args: vec!["-c".to_string(), script.to_string()],
             env: BTreeMap::new(),
-            allowed_tools: vec!["step".to_string()],
+            allowed_tools: vec!["map.generate".to_string()],
         }])
         .await
         .unwrap();
@@ -529,14 +529,14 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text
         .call(
             "runtime_exec",
             json!({
-                "code": "env = borg.environment('surf-lab', 'lab')\ntools = env.tools()\nresponse = env.call('step', {'ticks': 3})\n{'tool': tools[0]['name'], 'text': response['content'][0]['text']}"
+                "code": "env = borg.environment('surf-lab', 'lab')\ntools = env.tools()\nresponse = env.call('map.generate', {'seed': 7})\n{'tool': tools[0]['name'], 'text': response['content'][0]['text']}"
             }),
         )
         .await
         .unwrap();
     assert_eq!(
         result["value"],
-        json!({"tool": "mcp__surf_lab__lab__step", "text": "tick advanced"})
+        json!({"tool": "mcp__surf_lab__lab__map_generate", "text": "tick advanced"})
     );
 }
 

@@ -7,6 +7,5 @@ skill_roots = ["skills"]
 version = "0.2.0"
 
 [mcp.lab]
-command = "cargo"
-args = ["run", "--quiet", "--manifest-path", "${extension_dir}/../../../../surf/Cargo.toml", "--bin", "surf_lab"]
+command = "${extension_dir}/surf-lab"
 allowed_tools = ["start", "step", "observe", "trace", "log", "branch", "compare", "map.generate", "map.inspect", "map.preview", "map.route", "map.export", "config"]

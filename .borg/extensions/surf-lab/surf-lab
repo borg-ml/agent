@@ -1,0 +1,19 @@
+#!/bin/sh
+set -eu
+
+extension_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+surf_root=${SURF_LAB_ROOT:-"$extension_dir/../../../../surf"}
+
+if [ -n "${SURF_LAB_BIN:-}" ]; then
+    surf_bin=$SURF_LAB_BIN
+elif [ -x "$surf_root/target/release/surf_lab" ]; then
+    surf_bin=$surf_root/target/release/surf_lab
+elif [ -x "$surf_root/target/debug/surf_lab" ]; then
+    surf_bin=$surf_root/target/debug/surf_lab
+else
+    echo "surf-lab executable not found under $surf_root" >&2
+    echo "build target/release/surf_lab or set SURF_LAB_BIN" >&2
+    exit 127
+fi
+
+exec "$surf_bin" "$@"

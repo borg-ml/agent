@@ -46,10 +46,11 @@ impl NativeMcpRuntime {
             for listed_tool in listed {
                 let full_name = external_tool_name(&server.name, &listed_tool.name);
                 if !server.allowed_tools.is_empty()
-                    && !server
-                        .allowed_tools
-                        .iter()
-                        .any(|allowed| allowed == &full_name || allowed == &listed_tool.name)
+                    && !server.allowed_tools.iter().any(|allowed| {
+                        allowed == &full_name
+                            || allowed == &listed_tool.name
+                            || external_tool_name(&server.name, allowed) == full_name
+                    })
                 {
                     continue;
                 }
@@ -90,7 +91,7 @@ impl NativeMcpRuntime {
     }
 
     pub(crate) fn contains(&self, name: &str) -> bool {
-        self.tools.contains_key(name)
+        self.tools.contains_key(name) || self.tools.contains_key(&normalize_tool_name(name))
     }
 
     pub(crate) async fn call(
@@ -99,9 +100,11 @@ impl NativeMcpRuntime {
         arguments: Value,
         cancel: Option<&CancellationToken>,
     ) -> Result<Value> {
+        let canonical_name = normalize_tool_name(name);
         let tool = self
             .tools
             .get(name)
+            .or_else(|| self.tools.get(&canonical_name))
             .with_context(|| format!("unknown native MCP tool `{name}`"))?;
         let mut client = self.clients[tool.client_index].lock().await;
         let result = client.call_tool(&tool.wire_name, arguments, cancel).await;
@@ -529,8 +532,9 @@ fn select_modern_version(supported: &[String]) -> Option<String> {
 }
 
 fn external_tool_name(server_name: &str, wire_name: &str) -> String {
+    let wire_name = normalize_tool_name(wire_name);
     if wire_name.starts_with("mcp__") {
-        return wire_name.to_string();
+        return wire_name;
     }
     let server = server_name
         .chars()
@@ -543,6 +547,18 @@ fn external_tool_name(server_name: &str, wire_name: &str) -> String {
         })
         .collect::<String>();
     format!("mcp__{server}__{wire_name}")
+}
+
+fn normalize_tool_name(name: &str) -> String {
+    name.chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '_' | '-') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 fn truncate(value: &str, max: usize) -> &str {
@@ -571,6 +587,10 @@ mod tests {
             external_tool_name("borg", "mcp__borg__read_document"),
             "mcp__borg__read_document"
         );
+        assert_eq!(
+            external_tool_name("surf-lab", "map.generate"),
+            "mcp__surf_lab__map_generate"
+        );
     }
 
     #[tokio::test]
@@ -580,7 +600,7 @@ read _initialize
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"fake","version":"1"}}}'
 read _initialized
 read _list
-printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo","description":"Echo","inputSchema":{"type":"object"}},{"name":"hidden","inputSchema":{"type":"object"}}]}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"map.generate","description":"Generate a map","inputSchema":{"type":"object"}},{"name":"hidden","inputSchema":{"type":"object"}}]}}'
 read _call
 printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"ok"}]}}'
 "#;
@@ -589,15 +609,19 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text
             command: "sh".to_string(),
             args: vec!["-c".to_string(), script.to_string()],
             env: BTreeMap::new(),
-            allowed_tools: vec!["echo".to_string()],
+            allowed_tools: vec!["map.generate".to_string()],
         }])
         .await
         .unwrap();
-        assert!(runtime.contains("mcp__fake_server__echo"));
+        assert!(runtime.contains("mcp__fake_server__map_generate"));
         assert!(!runtime.contains("mcp__fake_server__hidden"));
         assert_eq!(runtime.definitions().len(), 1);
         let result = runtime
-            .call("mcp__fake_server__echo", json!({ "value": "hello" }), None)
+            .call(
+                "mcp__fake_server__map.generate",
+                json!({ "value": "hello" }),
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(result["content"][0]["text"], "ok");
