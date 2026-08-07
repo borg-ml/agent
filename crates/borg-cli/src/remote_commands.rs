@@ -39,7 +39,7 @@ use crate::editor_preferences::{ActiveMessageBehavior, EditorPreferences};
 use crate::sleep_inhibitor::SleepInhibitor;
 use crate::terminal_ui::{
     BorgTerminal, ProviderAuthChoice, ResumeSessionOption, TerminalInputEvent, UiAction,
-    reset_keyboard_enhancement,
+    discard_pending_terminal_input, reset_keyboard_enhancement,
 };
 
 #[path = "local_server.rs"]
@@ -1440,9 +1440,6 @@ async fn run_local_agent_session(
     };
     let mut shutdown_signals =
         ShutdownSignals::new().context("failed to install process shutdown handlers")?;
-    if can_prompt && io::stdout().is_terminal() {
-        reset_keyboard_enhancement();
-    }
     let mut terminal = if rich_tui_allowed {
         if let Some(mut terminal) = reusable_terminal {
             terminal.retarget(
@@ -1472,6 +1469,9 @@ async fn run_local_agent_session(
     } else {
         None
     };
+    if terminal.is_none() && can_prompt && io::stdout().is_terminal() {
+        reset_keyboard_enhancement();
+    }
     crash_context
         .tui_active
         .store(terminal.is_some(), Ordering::Release);
@@ -4506,6 +4506,7 @@ fn read_hidden_line() -> Result<String> {
         Ok(key)
     })();
     disable_raw_mode().ok();
+    discard_pending_terminal_input();
     println!();
     result
 }

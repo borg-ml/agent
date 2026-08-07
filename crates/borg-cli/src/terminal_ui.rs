@@ -11,6 +11,8 @@ use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Stdout};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, mpsc};
@@ -1509,6 +1511,7 @@ impl BorgTerminal {
         if mode == ScreenMode::Alternate
             && let Err(error) = execute!(stdout, EnterAlternateScreen)
         {
+            discard_pending_terminal_input();
             let _ = disable_raw_mode();
             return Err(error.into());
         }
@@ -1521,6 +1524,7 @@ impl BorgTerminal {
             if mode == ScreenMode::Alternate {
                 let _ = execute!(stdout, LeaveAlternateScreen);
             }
+            discard_pending_terminal_input();
             let _ = disable_raw_mode();
             return Err(error).context("failed to enable enhanced keyboard input");
         }
@@ -1531,6 +1535,7 @@ impl BorgTerminal {
             if mode == ScreenMode::Alternate {
                 let _ = execute!(stdout, LeaveAlternateScreen);
             }
+            discard_pending_terminal_input();
             let _ = disable_raw_mode();
             return Err(error.into());
         }
@@ -1542,6 +1547,7 @@ impl BorgTerminal {
             if mode == ScreenMode::Alternate {
                 let _ = execute!(stdout, LeaveAlternateScreen);
             }
+            discard_pending_terminal_input();
             let _ = disable_raw_mode();
             return Err(error.into());
         }
@@ -1566,6 +1572,7 @@ impl BorgTerminal {
                 if mode == ScreenMode::Alternate {
                     let _ = execute!(stdout, LeaveAlternateScreen);
                 }
+                discard_pending_terminal_input();
                 let _ = disable_raw_mode();
                 return Err(error).context("failed to initialize terminal renderer");
             }
@@ -1819,8 +1826,8 @@ impl BorgTerminal {
     }
 
     pub async fn shutdown(mut self) {
-        self.restore_terminal();
         self.input.shutdown().await;
+        self.restore_terminal();
     }
 
     pub fn seed_history(&mut self, events: &[SessionEvent]) {
@@ -6164,6 +6171,20 @@ pub(crate) fn reset_keyboard_enhancement() {
     let _ = execute!(stdout, PopKeyboardEnhancementFlags);
 }
 
+/// Discard bytes that belong to an input sequence which was in flight while
+/// the event reader stopped. Without this, the shell can receive the tail of
+/// a Kitty CSI-u sequence after Borg gives the terminal back.
+pub(crate) fn discard_pending_terminal_input() {
+    #[cfg(unix)]
+    {
+        let stdin = io::stdin();
+        // The TUI owns the terminal while this is called, so losing a key that
+        // arrived during teardown is preferable to handing protocol bytes to
+        // the next line editor.
+        let _ = unsafe { libc::tcflush(stdin.as_raw_fd(), libc::TCIFLUSH) };
+    }
+}
+
 impl Drop for BorgTerminal {
     fn drop(&mut self) {
         self.restore_terminal();
@@ -6177,6 +6198,7 @@ impl BorgTerminal {
         }
         self.terminal_restored = true;
         self.input.abort();
+        discard_pending_terminal_input();
         // Inline viewports share the shell's scrollback. Clear the viewport
         // before restoring the terminal so the last rendered agent summary
         // and composer do not remain above the copyable resume handoff.
@@ -6198,6 +6220,10 @@ impl BorgTerminal {
         );
         let _ = disable_raw_mode();
         let _ = self.terminal.show_cursor();
+        // A drop-path teardown cannot await the event pump. Flush once more
+        // after the terminal modes are restored to catch bytes read during the
+        // synchronous cleanup above.
+        discard_pending_terminal_input();
     }
 }
 
