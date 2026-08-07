@@ -12,6 +12,7 @@ mod blu_workflow;
 mod command;
 mod contract;
 mod filesystem;
+mod harness;
 mod host;
 mod local_control;
 mod lsp;

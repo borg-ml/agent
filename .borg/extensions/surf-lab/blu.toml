@@ -1,0 +1,12 @@
+description = "Persistent deterministic surf simulation and counterfactual trajectory analysis."
+enabled = true
+id = "surf-lab"
+manifest_version = 1
+name = "Surf Lab"
+skill_roots = ["skills"]
+version = "0.1.0"
+
+[mcp.lab]
+command = "cargo"
+args = ["run", "--quiet", "--manifest-path", "${extension_dir}/../../../../surf/Cargo.toml", "--bin", "surf_lab"]
+allowed_tools = ["start", "step", "observe", "trace", "branch", "compare", "config"]

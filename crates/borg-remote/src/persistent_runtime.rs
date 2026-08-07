@@ -555,6 +555,10 @@ def _restore_namespace(state):
 
 
 class Borg:
+    def __init__(self):
+        self.rlm = Rlm(self)
+        self.harness = Harness(self)
+
     def call(self, operation, arguments=None):
         call_id = str(uuid.uuid4())
         PROTOCOL_OUT.write(json.dumps({
@@ -674,6 +678,151 @@ class Borg:
     def mcp(self, name, arguments=None):
         return self.call("mcp_call", {"name": name, "arguments": {} if arguments is None else arguments})
 
+    def environment(self, extension_id, server=None):
+        return ExtensionEnvironment(self, extension_id, server)
+
+
+class Harness:
+    def __init__(self, borg):
+        self.borg = borg
+
+    def _call(self, op, **arguments):
+        return self.borg.call("harness", {"op": op, **arguments})
+
+    def list(self, kind=None, scope=None, limit=128):
+        arguments = {"limit": limit}
+        if kind is not None:
+            arguments["kind"] = kind
+        if scope is not None:
+            arguments["scope"] = scope
+        return self._call("list", **arguments).get("entries", [])
+
+    def overview(self, limit=8):
+        return self._call("overview", limit=limit)
+
+    def get(self, kind, entry_id, scope="local"):
+        return self._call("get", kind=kind, id=entry_id, scope=scope).get("entry")
+
+    def create(self, kind, title, content, scope="local", **options):
+        return self._call("create", kind=kind, title=title, content=content, scope=scope, **options)["entry"]
+
+    def update(self, kind, entry_id, title=None, content=None, scope="local", **options):
+        arguments = {"kind": kind, "id": entry_id, "scope": scope, **options}
+        if title is not None:
+            arguments["title"] = title
+        if content is not None:
+            arguments["content"] = content
+        return self._call("update", **arguments)["entry"]
+
+    def delete(self, entry_id, kind=None, scope="local"):
+        arguments = {"id": entry_id, "scope": scope}
+        if kind is not None:
+            arguments["kind"] = kind
+        return self._call("delete", **arguments)
+
+    def refine(self, trigger, changes=None, evidence="", outcome="", scope="local"):
+        if isinstance(changes, str):
+            changes = [changes]
+        return self._call(
+            "refine",
+            trigger=trigger,
+            changes=[] if changes is None else list(changes),
+            evidence=evidence,
+            outcome=outcome,
+            scope=scope,
+        )["refinement"]
+
+    def plan_refinement(self, observation):
+        return self._call("plan_refinement", content=observation).get("steps", [])
+
+    def rollback(self, steps=1):
+        return self._call("rollback", steps=steps)["state"]
+
+
+class ExtensionEnvironment:
+    def __init__(self, borg, extension_id, server=None):
+        self.borg = borg
+        self.extension_id = str(extension_id)
+        self.server = None if server is None else str(server)
+
+    def _prefix(self):
+        extension = "".join(character if character.isalnum() or character == "_" else "_" for character in self.extension_id)
+        prefix = f"mcp__{extension}__"
+        if self.server:
+            server = "".join(character if character.isalnum() or character == "_" else "_" for character in self.server)
+            prefix += f"{server}__"
+        return prefix
+
+    def tools(self):
+        return [tool for tool in self.borg.mcp_tools() if tool.get("name", "").startswith(self._prefix())]
+
+    def call(self, tool, arguments=None):
+        name = str(tool)
+        if not name.startswith("mcp__"):
+            matches = [candidate["name"] for candidate in self.tools() if candidate["name"].endswith(f"__{name}")]
+            if len(matches) != 1:
+                raise RuntimeError(f"environment tool {name!r} resolved to {len(matches)} tools")
+            name = matches[0]
+        elif not name.startswith(self._prefix()):
+            raise RuntimeError(f"tool {name!r} is outside this environment")
+        return self.borg.mcp(name, arguments)
+
+    def __getattr__(self, name):
+        return lambda arguments=None: self.call(name, arguments)
+
+
+class RlmHandle:
+    def __init__(self, borg, snapshot):
+        self.borg = borg
+        self.snapshot = snapshot
+        self.session_id = snapshot.get("session_id")
+        self.task_name = snapshot.get("task_name")
+
+    def __await__(self):
+        async def ready():
+            return self
+        return ready().__await__()
+
+    def refresh(self):
+        agents = self.borg.rlm.list()
+        for agent in agents:
+            if agent.get("session_id") == self.session_id:
+                self.snapshot = agent
+                return self
+        return self
+
+    def followup(self, message):
+        return self.borg.tool("followup_task", {"target": self.task_name or self.session_id, "message": message})
+
+    def interrupt(self):
+        return self.borg.tool("interrupt_agent", {"target": self.task_name or self.session_id})
+
+    def send(self, message):
+        return self.borg.tool("send_message", {"target": self.task_name or self.session_id, "message": message})
+
+    def wait(self, timeout_ms=30000):
+        return self.borg.tool("wait_agent", {"timeout_ms": timeout_ms})
+
+
+class Rlm:
+    def __init__(self, borg):
+        self.borg = borg
+
+    def __call__(self, message, task_name=None, **options):
+        task_name = task_name or f"runtime-{uuid.uuid4().hex[:12]}"
+        arguments = {"task_name": task_name, "message": str(message)}
+        for key in ("provider", "model", "reasoning_effort"):
+            if key in options and options[key] is not None:
+                arguments[key] = options[key]
+        return RlmHandle(self.borg, self.borg.tool("spawn_agent", arguments))
+
+    def list(self, path_prefix=None):
+        arguments = {} if path_prefix is None else {"path_prefix": path_prefix}
+        return self.borg.tool("list_agents", arguments).get("agents", [])
+
+    run = __call__
+    list_subagents = list
+
 
 NAMESPACE["borg"] = Borg()
 
@@ -687,7 +836,15 @@ def _run_code(source):
         if tree.body and isinstance(tree.body[-1], ast.Expr):
             prefix = ast.Module(body=tree.body[:-1], type_ignores=[])
             if prefix.body:
-                exec(compile(prefix, "<borg-runtime>", "exec"), NAMESPACE, NAMESPACE)
+                prefix_code = compile(
+                    prefix,
+                    "<borg-runtime>",
+                    "exec",
+                    flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT,
+                )
+                prefix_value = eval(prefix_code, NAMESPACE, NAMESPACE)
+                if inspect.iscoroutine(prefix_value):
+                    asyncio.run(prefix_value)
             expression = ast.Expression(tree.body[-1].value)
             compiled = compile(expression, "<borg-runtime>", "eval", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
             value = eval(compiled, NAMESPACE, NAMESPACE)
@@ -832,6 +989,72 @@ const borg = {
   mcp_tools: () => hostCall("mcp_tools", {}),
   mcp: (name, arguments_ = {}) => hostCall("mcp_call", {name, arguments: arguments_}),
 };
+
+function normalizeEnvironmentPart(value) {
+  return String(value).replace(/[^A-Za-z0-9_]/g, "_");
+}
+
+borg.harness = {
+  list: async (kind = undefined, scope = undefined, limit = 128) => {
+    const result = await hostCall("harness", {op: "list", ...(kind === undefined ? {} : {kind}), ...(scope === undefined ? {} : {scope}), limit});
+    return result.entries || [];
+  },
+  overview: (limit = 8) => hostCall("harness", {op: "overview", limit}),
+  get: async (kind, id, scope = "local") => (await hostCall("harness", {op: "get", kind, id, scope})).entry || null,
+  create: async (kind, title, content, options = {}) => (await hostCall("harness", {op: "create", kind, title, content, scope: options.scope || "local", ...options})).entry,
+  update: async (kind, id, fields = {}) => (await hostCall("harness", {op: "update", kind, id, scope: fields.scope || "local", ...fields})).entry,
+  delete: (id, kind = undefined, scope = "local") => hostCall("harness", {op: "delete", id, scope, ...(kind === undefined ? {} : {kind})}),
+  refine: async (trigger, changes = [], options = {}) => (await hostCall("harness", {op: "refine", trigger, changes: typeof changes === "string" ? [changes] : changes, evidence: options.evidence || "", outcome: options.outcome || "", scope: options.scope || "local"})).refinement,
+  plan_refinement: async observation => (await hostCall("harness", {op: "plan_refinement", content: observation})).steps || [],
+  rollback: async (steps = 1) => (await hostCall("harness", {op: "rollback", steps})).state,
+};
+
+borg.environment = (extensionId, server = undefined) => {
+  const prefix = `mcp__${normalizeEnvironmentPart(extensionId)}__${server === undefined ? "" : `${normalizeEnvironmentPart(server)}__`}`;
+  return {
+    tools: async () => (await borg.mcp_tools()).filter(tool => String(tool.name || "").startsWith(prefix)),
+    call: async (tool, arguments_ = {}) => {
+      let name = String(tool);
+      if (!name.startsWith("mcp__")) {
+        const matches = (await borg.mcp_tools())
+          .filter(candidate => String(candidate.name || "").startsWith(prefix) && String(candidate.name).endsWith(`__${name}`));
+        if (matches.length !== 1) throw new Error(`environment tool ${name} resolved to ${matches.length} tools`);
+        name = matches[0].name;
+      } else if (!name.startsWith(prefix)) {
+        throw new Error(`tool ${name} is outside this environment`);
+      }
+      return borg.mcp(name, arguments_);
+    },
+  };
+};
+
+const rlm = async (message, options = {}) => {
+  const taskName = options.task_name || `runtime-${crypto.randomUUID().slice(0, 12)}`;
+  const snapshot = await borg.tool("spawn_agent", {
+    task_name: taskName,
+    message: String(message),
+    ...(options.provider === undefined ? {} : {provider: options.provider}),
+    ...(options.model === undefined ? {} : {model: options.model}),
+    ...(options.reasoning_effort === undefined ? {} : {reasoning_effort: options.reasoning_effort}),
+  });
+  const target = snapshot.task_name || snapshot.session_id;
+  return {
+    ...snapshot,
+    snapshot,
+    refresh: async () => {
+      const agents = await rlm.list();
+      return agents.find(agent => agent.session_id === snapshot.session_id) || snapshot;
+    },
+    followup: message_ => borg.tool("followup_task", {target, message: message_}),
+    send: message_ => borg.tool("send_message", {target, message: message_}),
+    interrupt: () => borg.tool("interrupt_agent", {target}),
+    wait: (timeout_ms = 30000) => borg.tool("wait_agent", {timeout_ms}),
+  };
+};
+rlm.list = async (pathPrefix = undefined) => (await borg.tool("list_agents", pathPrefix === undefined ? {} : {path_prefix: pathPrefix})).agents || [];
+rlm.run = rlm;
+rlm.list_subagents = rlm.list;
+borg.rlm = rlm;
 context.borg = borg;
 context.console = runtimeConsole;
 
@@ -936,13 +1159,32 @@ mod tests {
                             "hits": [{
                                 "document_id": "source-1",
                                 "locator": "source-1#chunk-0",
-                                "match_mode": "semantic"
+                            "match_mode": "semantic"
                             }]
+                        }))
+                    } else if arguments.get("name").and_then(Value::as_str)
+                        == Some("mcp__surf_lab__lab__step")
+                    {
+                        Ok(json!({
+                            "content": [{"type": "text", "text": "advanced"}]
                         }))
                     } else {
                         bail!("unknown test MCP tool")
                     }
                 }
+                "mcp_tools" => Ok(json!([
+                    {"name": "mcp__surf_lab__lab__step", "inputSchema": {"type": "object"}}
+                ])),
+                "borg_tool" => match arguments.get("name").and_then(Value::as_str) {
+                    Some("spawn_agent") => Ok(json!({
+                        "session_id": Uuid::nil(),
+                        "task_name": "runtime-child",
+                        "status": "starting"
+                    })),
+                    Some("list_agents") => Ok(json!({"agents": []})),
+                    other => bail!("unknown test Borg tool {other:?}"),
+                },
+                "harness" => Ok(json!({"counts": {"memory": 1}})),
                 "retrieval_adapter" => {
                     if arguments.get("id").and_then(Value::as_str) == Some("js-ranker") {
                         Ok(json!({
@@ -1172,6 +1414,33 @@ mod tests {
             .await
             .expect("Python semantic search host call execution");
         assert_eq!(semantic.value["hits"][0]["match_mode"], "semantic");
+        runtime.stop().await;
+    }
+
+    #[tokio::test]
+    async fn python_runtime_exposes_environment_rlm_and_harness_bridges() {
+        if !python_available().await {
+            return;
+        }
+        let root = tempdir().expect("temporary runtime root");
+        let runtime = PersistentRuntimeWorker::new(root.path().to_path_buf());
+        let result = runtime
+            .execute(
+                "env = borg.environment('surf-lab', 'lab')\ntools = env.tools()\nresponse = env.step({'ticks': 1})\nchild = await borg.rlm('inspect trajectory')\nsummary = borg.harness.overview()\n{'tool': tools[0]['name'], 'text': response['content'][0]['text'], 'child': child.task_name, 'memory_count': summary['counts']['memory']}",
+                None,
+                Arc::new(TestHost),
+            )
+            .await
+            .expect("environment, RLM, and harness bridge execution");
+        assert_eq!(
+            result.value,
+            json!({
+                "tool": "mcp__surf_lab__lab__step",
+                "text": "advanced",
+                "child": "runtime-child",
+                "memory_count": 1
+            })
+        );
         runtime.stop().await;
     }
 

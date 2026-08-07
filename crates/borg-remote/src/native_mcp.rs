@@ -125,6 +125,15 @@ struct NativeMcpClient {
     _child: Child,
 }
 
+impl Drop for NativeMcpClient {
+    fn drop(&mut self) {
+        // Runtime extension grants can be replaced between turns. Tokio does
+        // not kill a child merely because its Child handle is dropped, so make
+        // the replacement boundary terminate the old MCP process as well.
+        let _ = self._child.start_kill();
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum McpMode {
     Probing,

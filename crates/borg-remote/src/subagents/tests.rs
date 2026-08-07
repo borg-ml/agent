@@ -469,6 +469,78 @@ printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"content":[{"type":"text","text
 }
 
 #[tokio::test]
+async fn extension_mcp_grant_is_available_through_the_persistent_environment_binding() {
+    let command = std::env::var("BORG_PYTHON_RUNTIME").unwrap_or_else(|_| {
+        if cfg!(windows) {
+            "python".to_string()
+        } else {
+            "python3".to_string()
+        }
+    });
+    if !tokio::process::Command::new(&command)
+        .arg("--version")
+        .output()
+        .await
+        .is_ok_and(|output| output.status.success())
+    {
+        return;
+    }
+    let directory = tempdir().unwrap();
+    let dispatcher = AgentToolDispatcher::new(
+        SessionGoalTools::disconnected(),
+        SessionTodoTools::disconnected(),
+        None,
+        crate::LspService::new(directory.path()),
+        CodingProvider::Codex,
+        Uuid::new_v4(),
+        false,
+        None,
+        None,
+        directory.path().to_path_buf(),
+        None,
+        None,
+        Vec::new(),
+        None,
+        crate::native_process::ProcessManager::default(),
+        PermissionMode::FullAccess,
+    );
+    dispatcher.configure_runtime_mcp(Vec::new()).await.unwrap();
+    let script = r#"
+read _initialize
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"surf","version":"1"}}}'
+read _initialized
+read _list
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"step","description":"Advance surf","inputSchema":{"type":"object"}}]}}'
+read _call
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"tick advanced"}]}}'
+"#;
+    dispatcher
+        .configure_runtime_mcp_extensions(vec![borg_provider::mcp::ExternalMcpServer {
+            name: "surf-lab__lab".to_string(),
+            command: "sh".to_string(),
+            args: vec!["-c".to_string(), script.to_string()],
+            env: BTreeMap::new(),
+            allowed_tools: vec!["step".to_string()],
+        }])
+        .await
+        .unwrap();
+
+    let result = dispatcher
+        .call(
+            "runtime_exec",
+            json!({
+                "code": "env = borg.environment('surf-lab', 'lab')\ntools = env.tools()\nresponse = env.call('step', {'ticks': 3})\n{'tool': tools[0]['name'], 'text': response['content'][0]['text']}"
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        result["value"],
+        json!({"tool": "mcp__surf_lab__lab__step", "text": "tick advanced"})
+    );
+}
+
+#[tokio::test]
 async fn read_only_runtime_allows_scoped_semantic_search_only() {
     let command = std::env::var("BORG_PYTHON_RUNTIME").unwrap_or_else(|_| {
         if cfg!(windows) {

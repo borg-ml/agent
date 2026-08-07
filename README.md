@@ -160,6 +160,10 @@ scope-local JSONL audit record.
 Settings writes are atomic; slash aliases and keybindings reload in a running
 TUI, while Blu skills, MCP servers, and executable workflows reload at the next
 turn boundary.
+Persistent `runtime_exec` sessions can call an active package through
+`borg.environment(...)`, admit RLM-style child handles with `await borg.rlm(...)`,
+and maintain bounded local/global prompt, memory, skill, and subagent harness
+state with `borg.harness`; those entries are injected into later turns.
 `create_plugin` writes a project
 `.borg/skills/<id>/SKILL.md`; the live list/read tools see it immediately, and
 the native skill context rescans it at the start of the next native turn

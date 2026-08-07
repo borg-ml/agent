@@ -609,6 +609,11 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
+        turn.agent_tools
+            .configure_runtime_mcp_extensions(runtime_extensions.external_mcp_servers.clone())
+            .await?;
+        turn.system_prompt_appendix
+            .push_str(&turn.agent_tools.harness_prompt_appendix().await?);
         turn.external_mcp_servers
             .extend(runtime_extensions.external_mcp_servers);
         turn.extension_skill_roots

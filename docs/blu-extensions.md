@@ -181,6 +181,22 @@ bridge; use an explicit `return` for an asynchronous JavaScript/TypeScript
 result. The selected environment still determines which packages are
 importable; Blu hot reload does not install Python or Bun dependencies.
 
+The bridge also has the three pieces needed for a stateful environment loop:
+
+- `borg.environment("extension-id", "server")` discovers the extension's
+  namespaced MCP tools inside the same persistent process. Extension MCP
+  definitions are replaced at the next turn boundary; an already-running
+  environment is restarted only when its grant actually changes.
+- `await borg.rlm("subtask")` admits a child and returns a handle immediately;
+  the handle can refresh status, send a follow-up, interrupt, or wait. Child
+  results remain explicit agent events rather than being silently injected into
+  the parent namespace.
+- `borg.harness` provides bounded CRUD for prompt, memory, skill, and subagent
+  entries in local session or project-global scope, plus refinement evidence,
+  rollback of recent local revisions, and a refinement plan. Persisted entries
+  are included in the next turn's prompt, so a successful debugging loop can
+  become reusable harness state rather than a note in a lost context window.
+
 The lifecycle is:
 
 ```text

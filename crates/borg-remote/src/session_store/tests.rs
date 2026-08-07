@@ -94,6 +94,53 @@ async fn runtime_manifest_and_checkpoint_survive_store_reopen_and_detect_worker_
 }
 
 #[tokio::test]
+async fn harness_state_is_durable_and_rolls_back_without_polluting_runtime_checkpoints() {
+    let (directory, store) = store().await;
+    let path = directory.path().join("sessions.sqlite3");
+    let session_id = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+
+    let first = serde_json::json!({
+        "schema": 1,
+        "entries": [{"id": "memory-a", "content": "first"}],
+        "refinements": []
+    });
+    let second = serde_json::json!({
+        "schema": 1,
+        "entries": [{"id": "memory-a", "content": "second"}],
+        "refinements": [{"id": "refine-1"}]
+    });
+    store.save_harness_state(session_id, &first).await.unwrap();
+    store.save_harness_state(session_id, &second).await.unwrap();
+    assert_eq!(
+        store.load_harness_state(session_id).await.unwrap(),
+        Some(second.clone())
+    );
+
+    let restored = store.rollback_harness_state(session_id, 1).await.unwrap();
+    assert_eq!(restored, first);
+    assert_eq!(
+        store.load_harness_state(session_id).await.unwrap(),
+        Some(first.clone())
+    );
+    assert!(store.rollback_harness_state(session_id, 1).await.is_err());
+    assert!(
+        store
+            .runtime_checkpoint(session_id, None)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    store.pool().close().await;
+    let reopened = SqliteSessionStore::open(path).await.unwrap();
+    assert_eq!(
+        reopened.load_harness_state(session_id).await.unwrap(),
+        Some(first)
+    );
+}
+
+#[tokio::test]
 async fn durable_append_waits_through_extended_writer_contention() {
     let (_directory, store) = store().await;
     let session_id = Uuid::new_v4();

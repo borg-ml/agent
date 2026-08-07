@@ -133,6 +133,9 @@ impl NativeHarness {
             "host operations. It is trusted user-authority execution, not a security sandbox. ",
         );
         system_prompt.push_str(
+            "Inside the persistent runtime, `borg.environment(extension_id, server)` discovers and calls the extension's long-lived MCP environment, `await borg.rlm(task)` admits a subagent and returns a handle, and `borg.harness` manages bounded prompt, memory, skill, and subagent entries that are injected into later turns. ",
+        );
+        system_prompt.push_str(
             "Use `query_history` (or `borg.history(...)` inside Python) to retrieve exact, ",
         );
         system_prompt.push_str(

@@ -41,6 +41,7 @@ pub(crate) const DEFAULT_HISTORY_PAYLOAD_BYTES: usize = 256 * 1024;
 pub(crate) const MAX_HISTORY_PAYLOAD_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_HISTORY_QUERY_BYTES: usize = 8 * 1024;
 pub(crate) const MAX_RUNTIME_CHECKPOINT_BYTES: usize = 512 * 1024;
+pub(crate) const HARNESS_CHECKPOINT_PREFIX: &str = "__borg_harness__";
 
 /// Version of the durable runtime namespace manifest. The manifest describes
 /// how to reconnect to a trusted runtime; it is not a second semantic-memory
@@ -1779,6 +1780,10 @@ impl SqliteSessionStore {
             "invalid runtime checkpoint key"
         );
         ensure!(
+            !key.starts_with(HARNESS_CHECKPOINT_PREFIX),
+            "runtime checkpoint key is reserved for harness state"
+        );
+        ensure!(
             state.is_object(),
             "runtime checkpoint state must be a JSON object"
         );
@@ -1867,13 +1872,16 @@ impl SqliteSessionStore {
         } else {
             (
                 "select session_id, checkpoint_key, state_json, content_hash, revision, created_at \
-                 from runtime_checkpoints where session_id=? order by revision desc limit 1",
+                 from runtime_checkpoints where session_id=? and checkpoint_key not like ? \
+                 order by revision desc limit 1",
                 false,
             )
         };
         let mut query = sqlx::query(sql).bind(session_id.to_string());
         if bind_key {
             query = query.bind(key.unwrap_or_default());
+        } else {
+            query = query.bind(format!("{HARNESS_CHECKPOINT_PREFIX}%"));
         }
         let row = query.fetch_optional(&self.pool).await?;
         row.as_ref().map(decode_runtime_checkpoint).transpose()
@@ -1886,13 +1894,125 @@ impl SqliteSessionStore {
     ) -> Result<Vec<RuntimeCheckpoint>> {
         let rows = sqlx::query(
             "select session_id, checkpoint_key, state_json, content_hash, revision, created_at \
-             from runtime_checkpoints where session_id=? order by revision desc limit ?",
+             from runtime_checkpoints where session_id=? and checkpoint_key not like ? \
+             order by revision desc limit ?",
         )
         .bind(session_id.to_string())
+        .bind(format!("{HARNESS_CHECKPOINT_PREFIX}%"))
         .bind(i64::try_from(limit.clamp(1, 100)).unwrap_or(100))
         .fetch_all(&self.pool)
         .await?;
         rows.iter().map(decode_runtime_checkpoint).collect()
+    }
+
+    pub(crate) async fn load_harness_state(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Option<serde_json::Value>> {
+        let row = sqlx::query(
+            "select state_json from runtime_checkpoints \
+             where session_id=? and checkpoint_key like ? order by revision desc limit 1",
+        )
+        .bind(session_id.to_string())
+        .bind(format!("{HARNESS_CHECKPOINT_PREFIX}%"))
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| {
+            let state_json: &str = row.try_get("state_json")?;
+            let state: serde_json::Value = serde_json::from_str(state_json)?;
+            ensure!(
+                state.is_object(),
+                "stored harness state is not a JSON object"
+            );
+            Ok(state)
+        })
+        .transpose()
+    }
+
+    pub(crate) async fn save_harness_state(
+        &self,
+        session_id: Uuid,
+        state: &serde_json::Value,
+    ) -> Result<()> {
+        ensure!(state.is_object(), "harness state must be a JSON object");
+        let state_json = serde_json::to_vec(state)?;
+        ensure!(
+            state_json.len() <= MAX_RUNTIME_CHECKPOINT_BYTES,
+            "harness state exceeds {MAX_RUNTIME_CHECKPOINT_BYTES} bytes"
+        );
+        let content_hash = format!("sha256:{:x}", Sha256::digest(&state_json));
+        let mut transaction = self.begin_write().await?;
+        let revision: i64 = sqlx::query_scalar(
+            "select coalesce(max(revision), 0) + 1 from runtime_checkpoints where session_id=?",
+        )
+        .bind(session_id.to_string())
+        .fetch_one(&mut *transaction)
+        .await?;
+        let key = format!("{HARNESS_CHECKPOINT_PREFIX}{revision}");
+        let now = Utc::now();
+        sqlx::query(
+            "insert into runtime_checkpoints \
+             (session_id, checkpoint_key, state_json, content_hash, revision, created_at) \
+             values (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(session_id.to_string())
+        .bind(key)
+        .bind(String::from_utf8(state_json).context("harness state JSON was not UTF-8")?)
+        .bind(content_hash)
+        .bind(revision)
+        .bind(now.to_rfc3339())
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "delete from runtime_checkpoints \
+             where session_id=? and checkpoint_key like ? and revision < ?",
+        )
+        .bind(session_id.to_string())
+        .bind(format!("{HARNESS_CHECKPOINT_PREFIX}%"))
+        .bind(revision.saturating_sub(12))
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub(crate) async fn rollback_harness_state(
+        &self,
+        session_id: Uuid,
+        steps: usize,
+    ) -> Result<serde_json::Value> {
+        ensure!(
+            (1..=12).contains(&steps),
+            "harness rollback steps must be 1..=12"
+        );
+        let row = sqlx::query(
+            "select state_json, revision from runtime_checkpoints \
+             where session_id=? and checkpoint_key like ? order by revision desc limit 1 offset ?",
+        )
+        .bind(session_id.to_string())
+        .bind(format!("{HARNESS_CHECKPOINT_PREFIX}%"))
+        .bind(i64::try_from(steps).context("harness rollback offset exceeds SQLite integer")?)
+        .fetch_optional(&self.pool)
+        .await?
+        .context("harness rollback target does not exist")?;
+        let state_json: &str = row.try_get("state_json")?;
+        let target_revision: i64 = row.try_get("revision")?;
+        let state: serde_json::Value = serde_json::from_str(state_json)?;
+        ensure!(
+            state.is_object(),
+            "stored harness state is not a JSON object"
+        );
+        sqlx::query(
+            "delete from runtime_checkpoints \
+             where session_id=? and checkpoint_key like ? and revision >= ?",
+        )
+        .bind(session_id.to_string())
+        .bind(format!("{HARNESS_CHECKPOINT_PREFIX}%"))
+        .bind(target_revision)
+        .execute(&self.pool)
+        .await?;
+        self.save_harness_state(session_id, &state).await?;
+        Ok(state)
     }
 
     /// Check the durable authority without reading prompt or tool payload data.

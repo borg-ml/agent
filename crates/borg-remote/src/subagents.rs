@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -166,9 +166,77 @@ pub struct AgentToolDispatcher {
     resource_limits: Option<HostResourceLimits>,
     runtime_processes: crate::native_process::ProcessManager,
     persistent_runtimes: PersistentRuntimeRegistry,
-    runtime_mcp_servers: Arc<OnceCell<Vec<borg_provider::mcp::ExternalMcpServer>>>,
-    runtime_mcp: Arc<OnceCell<crate::native_mcp::NativeMcpRuntime>>,
+    runtime_mcp: Arc<Mutex<RuntimeMcpState>>,
+    harness_lock: Arc<Mutex<()>>,
     web_search: Option<Arc<dyn borg_search::WebSearchProvider>>,
+}
+
+struct RuntimeMcpState {
+    base_servers: Option<Vec<borg_provider::mcp::ExternalMcpServer>>,
+    extension_servers: Vec<borg_provider::mcp::ExternalMcpServer>,
+    configured_servers: Vec<borg_provider::mcp::ExternalMcpServer>,
+    runtime: Option<crate::native_mcp::NativeMcpRuntime>,
+}
+
+impl Default for RuntimeMcpState {
+    fn default() -> Self {
+        Self {
+            base_servers: None,
+            extension_servers: Vec::new(),
+            configured_servers: Vec::new(),
+            runtime: None,
+        }
+    }
+}
+
+fn same_mcp_server(
+    left: &borg_provider::mcp::ExternalMcpServer,
+    right: &borg_provider::mcp::ExternalMcpServer,
+) -> bool {
+    left.name == right.name
+        && left.command == right.command
+        && left.args == right.args
+        && left.env == right.env
+        && left.allowed_tools == right.allowed_tools
+}
+
+fn same_mcp_servers(
+    left: &[borg_provider::mcp::ExternalMcpServer],
+    right: &[borg_provider::mcp::ExternalMcpServer],
+) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| same_mcp_server(left, right))
+}
+
+fn effective_mcp_servers(
+    state: &RuntimeMcpState,
+) -> Result<Vec<borg_provider::mcp::ExternalMcpServer>> {
+    let mut names = BTreeSet::new();
+    let mut servers: Vec<borg_provider::mcp::ExternalMcpServer> = Vec::new();
+    let base = state.base_servers.as_deref().unwrap_or(&[]);
+    for server in base.iter().chain(&state.extension_servers) {
+        ensure!(
+            !server.name.trim().is_empty(),
+            "runtime MCP server name is empty"
+        );
+        if !names.insert(server.name.clone()) {
+            let existing = servers
+                .iter()
+                .find(|candidate| candidate.name == server.name)
+                .expect("duplicate MCP name has an existing server");
+            ensure!(
+                same_mcp_server(existing, server),
+                "runtime MCP server `{}` was configured with conflicting definitions",
+                server.name
+            );
+            continue;
+        }
+        servers.push(server.clone());
+    }
+    Ok(servers)
 }
 
 #[derive(Debug)]
@@ -605,8 +673,8 @@ impl AgentToolDispatcher {
             resource_limits: None,
             runtime_processes,
             persistent_runtimes: PersistentRuntimeRegistry::default(),
-            runtime_mcp_servers: Arc::new(OnceCell::new()),
-            runtime_mcp: Arc::new(OnceCell::new()),
+            runtime_mcp: Arc::new(Mutex::new(RuntimeMcpState::default())),
+            harness_lock: Arc::new(Mutex::new(())),
             web_search,
         }
     }
@@ -624,53 +692,76 @@ impl AgentToolDispatcher {
         &self,
         servers: Vec<borg_provider::mcp::ExternalMcpServer>,
     ) -> Result<()> {
-        if servers.is_empty() {
-            return Ok(());
-        }
-        if let Some(existing) = self.runtime_mcp_servers.get() {
+        let mut state = self.runtime_mcp.lock().await;
+        if let Some(existing) = &state.base_servers {
             ensure!(
-                existing.len() == servers.len()
-                    && existing.iter().zip(&servers).all(|(left, right)| {
-                        left.name == right.name
-                            && left.command == right.command
-                            && left.args == right.args
-                            && left.env == right.env
-                            && left.allowed_tools == right.allowed_tools
-                    }),
-                "runtime MCP grant cannot change after session startup"
+                same_mcp_servers(existing, &servers),
+                "runtime MCP base grant cannot change after session startup"
             );
-            return Ok(());
+        } else {
+            state.base_servers = Some(servers);
         }
-        self.runtime_mcp_servers
-            .set(servers)
-            .map_err(|_| anyhow::anyhow!("runtime MCP grant was configured concurrently"))
+        let effective = effective_mcp_servers(&state)?;
+        if !same_mcp_servers(&state.configured_servers, &effective) {
+            state.runtime = None;
+            state.configured_servers = effective;
+        }
+        Ok(())
     }
 
-    async fn runtime_mcp_runtime(&self) -> Result<&crate::native_mcp::NativeMcpRuntime> {
-        let servers = self
-            .runtime_mcp_servers
-            .get()
-            .cloned()
-            .context("external MCP is unavailable for this session")?;
-        ensure!(
-            !servers.is_empty(),
-            "external MCP is unavailable for this session"
-        );
-        self.runtime_mcp
-            .get_or_try_init(
-                || async move { crate::native_mcp::NativeMcpRuntime::start(servers).await },
-            )
-            .await
+    pub(crate) async fn configure_runtime_mcp_extensions(
+        &self,
+        servers: Vec<borg_provider::mcp::ExternalMcpServer>,
+    ) -> Result<()> {
+        let mut state = self.runtime_mcp.lock().await;
+        state.extension_servers = servers;
+        let effective = effective_mcp_servers(&state)?;
+        if !same_mcp_servers(&state.configured_servers, &effective) {
+            state.runtime = None;
+            state.configured_servers = effective;
+        }
+        Ok(())
     }
 
     pub(crate) async fn runtime_mcp_tools(&self) -> Result<Value> {
-        let runtime = self.runtime_mcp_runtime().await?;
-        Ok(serde_json::to_value(runtime.definitions())?)
+        let mut state = self.runtime_mcp.lock().await;
+        ensure!(
+            !state.configured_servers.is_empty(),
+            "external MCP is unavailable for this session"
+        );
+        if state.runtime.is_none() {
+            state.runtime = Some(
+                crate::native_mcp::NativeMcpRuntime::start(state.configured_servers.clone())
+                    .await?,
+            );
+        }
+        Ok(serde_json::to_value(
+            state
+                .runtime
+                .as_ref()
+                .expect("runtime was initialized")
+                .definitions(),
+        )?)
     }
 
     pub(crate) async fn runtime_mcp_call(&self, name: &str, arguments: Value) -> Result<Value> {
-        let runtime = self.runtime_mcp_runtime().await?;
-        runtime.call(name, arguments, None).await
+        let mut state = self.runtime_mcp.lock().await;
+        ensure!(
+            !state.configured_servers.is_empty(),
+            "external MCP is unavailable for this session"
+        );
+        if state.runtime.is_none() {
+            state.runtime = Some(
+                crate::native_mcp::NativeMcpRuntime::start(state.configured_servers.clone())
+                    .await?,
+            );
+        }
+        state
+            .runtime
+            .as_ref()
+            .expect("runtime was initialized")
+            .call(name, arguments, None)
+            .await
     }
 
     pub fn specs(&self) -> Vec<Value> {
@@ -694,6 +785,17 @@ impl AgentToolDispatcher {
         self.autonomy
             .as_ref()
             .map(crate::SqliteAutonomyStore::session_store)
+    }
+
+    pub(crate) async fn harness_prompt_appendix(&self) -> Result<String> {
+        let store = self.session_store();
+        crate::harness::prompt_appendix(
+            self.actor_session_id,
+            &self.runtime_root,
+            store.as_ref(),
+            &self.harness_lock,
+        )
+        .await
     }
 
     fn consultation_enabled(&self) -> bool {
@@ -1316,6 +1418,17 @@ impl RuntimeHost for DispatcherRuntimeHost {
                 self.dispatcher
                     .call("read_retrieval_adapter", json!({ "id": id }))
                     .await
+            }
+            "harness" => {
+                crate::harness::call(
+                    arguments,
+                    self.session_id,
+                    &self.root,
+                    self.session_store.as_ref(),
+                    &self.dispatcher.harness_lock,
+                    self.allow_effects,
+                )
+                .await
             }
             "runtime_status" => {
                 let store = self
@@ -3868,7 +3981,7 @@ fn agent_tool_specs_with_capabilities_and_consultation_and_search(
         ),
         tool(
             "runtime_exec",
-            "Execute code in the session's persistent Python or optional Bun JavaScript/TypeScript runtime. Variables, imports, helper functions, and parsed data survive across calls and turns. The `borg` object exposes read, filesystem search, lossless history retrieval, a sequence-cursored full-log index feed, versioned retrieval_adapter/test_retrieval_adapter helpers, explicit checkpoints, restore, exec, and selected Borg tool calls through the host's permission and journal boundary. This is trusted execution, not a sandbox.",
+            "Execute code in the session's persistent Python or optional Bun JavaScript/TypeScript runtime. Variables, imports, helper functions, and parsed data survive across calls and turns. The `borg` object exposes read, filesystem search, lossless history retrieval, a sequence-cursored full-log index feed, versioned retrieval_adapter/test_retrieval_adapter helpers, explicit checkpoints, restore, exec, persistent extension environments, RLM-style subagent handles, continual harness CRUD, and selected Borg tool calls through the host's permission and journal boundary. This is trusted execution, not a sandbox.",
             json!({
                 "type": "object",
                 "properties": {
