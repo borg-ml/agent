@@ -4371,7 +4371,48 @@ fn recover_prompts_on_resume(
     ) {
         return VecDeque::new();
     }
-    recover_queued_prompts(events)
+    // A queued snapshot by itself is not proof that the provider turn was
+    // admitted. It may be an old queue entry left behind by a previous clean
+    // boundary. Only retain it when the same message reached an in-progress
+    // boundary, or when it is an explicit retry after a failed turn.
+    let admitted = events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            SessionEventKind::Message {
+                message_id,
+                status: MessageStatus::InProgress,
+                ..
+            } => Some(*message_id),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    let failed = events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            SessionEventKind::Message {
+                message_id,
+                actor: EventActor::User | EventActor::System,
+                status: MessageStatus::Failed,
+                ..
+            } => Some(*message_id),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    let resumable_events = events
+        .iter()
+        .filter(|event| {
+            !matches!(
+                &event.kind,
+                SessionEventKind::Message {
+                    message_id,
+                    status: MessageStatus::Queued,
+                    ..
+                } if !admitted.contains(message_id) && !failed.contains(message_id)
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    recover_queued_prompts(&resumable_events)
 }
 
 fn recover_queued_prompts(events: &[SessionEvent]) -> VecDeque<QueuedPrompt> {

@@ -207,6 +207,10 @@ impl OpenAiCompatibleProvider {
             && let Some(prompt_cache_key) = request.prompt_cache_key.as_deref()
             && !prompt_cache_key.trim().is_empty()
         {
+            // OpenRouter uses session_id to keep an agent workflow on the
+            // same upstream provider, which is what preserves implicit
+            // DeepSeek prefix caches across tool rounds and resumes.
+            body["session_id"] = json!(prompt_cache_key);
             body["prompt_cache_key"] = json!(prompt_cache_key);
         }
         match profile {
@@ -1509,6 +1513,7 @@ mod tests {
         let body: Value =
             serde_json::from_slice(&request[header_end + 4..]).expect("request JSON body");
         assert_eq!(body["model"], "vendor/future-model");
+        assert_eq!(body["session_id"], "borg-session:test");
         assert_eq!(body["prompt_cache_key"], "borg-session:test");
         assert_eq!(body["reasoning"]["effort"], "high");
         assert_eq!(body["tool_choice"], "auto");

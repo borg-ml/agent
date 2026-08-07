@@ -114,6 +114,7 @@ fn rich_terminal_can_prompt(stdin_is_terminal: bool, stdout_is_terminal: bool, j
 #[derive(Default)]
 struct TuiCrashContext {
     session_id: Mutex<Option<Uuid>>,
+    retry_notice: Mutex<Option<String>>,
     tui_active: Arc<AtomicBool>,
 }
 
@@ -130,6 +131,20 @@ impl TuiCrashContext {
             .session_id
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn set_retry_notice(&self, notice: String) {
+        *self
+            .retry_notice
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(notice);
+    }
+
+    fn take_retry_notice(&self) -> Option<String> {
+        self.retry_notice
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
     }
 }
 
@@ -702,8 +717,12 @@ pub(crate) async fn run_local_agent(args: LocalAgentCliArgs) -> Result<()> {
                 let Some(session_id) = crash_context.session_id() else {
                     return Err(error);
                 };
-                println!("{}", resume_instructions(session_id, false));
-                return Ok(());
+                crash_context.set_retry_notice(format!(
+                    "The resumed session hit a transient error and Borg is reconnecting: {error:#}"
+                ));
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                selected_session = Some(session_id);
+                continue;
             }
             Ok(Err(error)) => return Err(error),
             Err(payload) if crash_context.tui_active.swap(false, Ordering::AcqRel) => {
@@ -1431,6 +1450,7 @@ async fn run_local_agent_session(
         .tui_active
         .store(terminal.is_some(), Ordering::Release);
     let startup_update_notice = crate::updater::manual_update_notice();
+    let retry_notice = crash_context.take_retry_notice();
     let display_session_state =
         resume_display_state(session_state.clone(), session_access, resuming);
     if let Some(terminal) = terminal.as_mut() {
@@ -1438,6 +1458,8 @@ async fn run_local_agent_session(
         terminal.seed_team_roster(&team_snapshots);
         terminal.seed_session_state(&display_session_state);
         if let Some(notice) = startup_update_notice.as_deref() {
+            terminal.set_notice(notice);
+        } else if let Some(notice) = retry_notice.as_deref() {
             terminal.set_notice(notice);
         } else if stale_local_owner {
             terminal.set_notice(
@@ -1467,6 +1489,8 @@ async fn run_local_agent_session(
         }
         terminal.draw()?;
     } else if let Some(notice) = startup_update_notice.as_deref() {
+        eprintln!("\n  {notice}\n");
+    } else if let Some(notice) = retry_notice.as_deref() {
         eprintln!("\n  {notice}\n");
     }
     let mut displayed_update_notice = startup_update_notice;
@@ -4289,8 +4313,11 @@ async fn run_local_agent_session(
         }
         if tui_was_active {
             tracing::error!(%session_id, error = %error, "local agent session crashed");
-            println!("{}", resume_instructions(session_id, false));
-            return Ok(None);
+            crash_context.set_retry_notice(format!(
+                "The resumed session stopped unexpectedly and Borg is reconnecting: {error:#}"
+            ));
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            return Ok(Some((session_id, None)));
         }
         let active_elsewhere = error
             .to_string()

@@ -1759,6 +1759,7 @@ impl BorgTerminal {
         if !replaced_displayed {
             return;
         }
+        self.rewind_targets = rewind_targets_from_history(events);
         self.text_selection = None;
         self.pending_transcript_click = None;
         self.pending_scroll_anchor_height = Some(previous_height);
@@ -6172,6 +6173,26 @@ fn transcript_turn_output(event: &SessionEvent) -> bool {
             | SessionEventKind::ToolStarted { .. }
             | SessionEventKind::ToolCompleted { .. }
     )
+}
+
+fn rewind_targets_from_history(events: &[SessionEvent]) -> Vec<RewindTarget> {
+    transcript_history_in_display_order(events)
+        .into_iter()
+        .filter_map(|event| match event.kind {
+            SessionEventKind::Message {
+                actor: EventActor::User,
+                text,
+                attachments,
+                status: MessageStatus::Complete,
+                ..
+            } => Some(RewindTarget {
+                sequence: event.sequence,
+                text,
+                attachments,
+            }),
+            _ => None,
+        })
+        .collect()
 }
 
 fn replace_root_transcript_history(

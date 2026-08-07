@@ -219,6 +219,57 @@ fn complete_user_messages_with_a_lifecycle_start_keep_event_order() {
 }
 
 #[test]
+fn history_replacement_rebuilds_rewind_targets_for_the_full_transcript() {
+    let session_id = Uuid::new_v4();
+    let first_user = SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::Message {
+            message_id: Uuid::new_v4(),
+            actor: EventActor::User,
+            text: "first prompt".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: Some(PromptDelivery::Queue),
+        },
+    );
+    let response = SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::Message {
+            message_id: Uuid::new_v4(),
+            actor: EventActor::Assistant,
+            text: "response".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: None,
+        },
+    );
+    let second_user = SessionEvent::new(
+        session_id,
+        3,
+        SessionEventKind::Message {
+            message_id: Uuid::new_v4(),
+            actor: EventActor::User,
+            text: "second prompt".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: Some(PromptDelivery::Queue),
+        },
+    );
+
+    let targets = rewind_targets_from_history(&[first_user, response, second_user]);
+
+    assert_eq!(
+        targets
+            .iter()
+            .map(|target| (target.sequence, target.text.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(1, "first prompt"), (3, "second prompt")]
+    );
+}
+
+#[test]
 fn child_history_merge_prefers_completion_over_a_late_partial_snapshot() {
     let session_id = Uuid::new_v4();
     let message_id = Uuid::new_v4();

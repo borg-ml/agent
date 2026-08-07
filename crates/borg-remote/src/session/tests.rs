@@ -5040,6 +5040,28 @@ fn idle_resume_drops_old_queue_snapshots_but_active_resume_recovers_work() {
     assert_eq!(recovered.len(), 1);
     assert_eq!(recovered[0].message_id, message_id);
     assert_eq!(recovered[0].text, "recover this admitted turn");
+
+    assert!(
+        recover_prompts_on_resume(
+            &SessionState {
+                status: Some(SessionStatus::Running),
+                ..SessionState::default()
+            },
+            &[SessionEvent::new(
+                session_id,
+                3,
+                SessionEventKind::Message {
+                    message_id: Uuid::new_v4(),
+                    actor: EventActor::User,
+                    text: "old queue entry without an admitted turn".to_string(),
+                    attachments: Vec::new(),
+                    status: MessageStatus::Queued,
+                    delivery: Some(PromptDelivery::Queue),
+                },
+            )],
+        )
+        .is_empty()
+    );
 }
 
 #[test]

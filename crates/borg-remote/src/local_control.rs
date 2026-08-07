@@ -17,6 +17,7 @@ use crate::{
 
 const MAX_CONTROL_COMMAND_BYTES: u64 = 1024 * 1024;
 const ATTACHED_SESSION_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
+const ATTACHED_STORE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 
 #[derive(Debug, Serialize, Deserialize)]
 struct LocalSessionOwnerMetadata {
@@ -548,7 +549,16 @@ async fn forward_attached_events(
     let mut reasoning_snapshot = String::new();
     loop {
         refresh.tick().await;
-        for event in store.events_after(session_id, last_sequence, 1_000).await? {
+        let historical = match store.events_after(session_id, last_sequence, 1_000).await {
+            Ok(events) => events,
+            Err(error) if attached_store_error_is_retryable(&error) => {
+                tracing::debug!(%error, %session_id, "attached session store read is busy; retrying");
+                tokio::time::sleep(ATTACHED_STORE_RETRY_DELAY).await;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        for event in historical {
             if event.kind.clears_live_turn_state()
                 || event
                     .kind
@@ -574,7 +584,16 @@ async fn forward_attached_events(
                 return Ok(());
             }
         }
-        for live in store.live_events_after(session_id, live_revision).await? {
+        let live_events = match store.live_events_after(session_id, live_revision).await {
+            Ok(events) => events,
+            Err(error) if attached_store_error_is_retryable(&error) => {
+                tracing::debug!(%error, %session_id, "attached live-state read is busy; retrying");
+                tokio::time::sleep(ATTACHED_STORE_RETRY_DELAY).await;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        for live in live_events {
             live_revision = live_revision.max(live.revision);
             if let Some(event) = reasoning_delta_from_snapshot(live.event, &mut reasoning_snapshot)
                 && events.send(event).await.is_err()
@@ -586,6 +605,14 @@ async fn forward_attached_events(
             return Ok(());
         }
     }
+}
+
+#[cfg(unix)]
+fn attached_store_error_is_retryable(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}").to_ascii_lowercase();
+    message.contains("database is locked")
+        || message.contains("database is busy")
+        || message.contains("pool timed out")
 }
 
 fn reasoning_delta_from_snapshot(

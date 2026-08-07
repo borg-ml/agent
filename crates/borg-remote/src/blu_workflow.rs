@@ -970,6 +970,11 @@ impl HostBridge {
         ensure!(!self.cancel.is_cancelled(), "Blu workflow was cancelled");
         let call_id = guest_u64(args, 0, "call_id")?;
         let response = match operation {
+            "workflow_id" => {
+                self.journal.call(call_id, operation, json!({}), || {
+                    Ok(json!(self.journal.workflow_id.to_string()))
+                })?
+            }
             "emit" => {
                 self.require_full_access(operation)?;
                 let kind = guest_string(args, 1, "kind")?;
@@ -1181,8 +1186,16 @@ impl HostBridge {
             _ => bail!("unknown Blu host operation {operation}"),
         };
         ensure_json_size(&response, MAX_RESULT_JSON_BYTES, "Blu host result")?;
+        let serialized = if operation == "workflow_id" {
+            response
+                .as_str()
+                .context("Blu workflow id host result was not a string")?
+                .to_string()
+        } else {
+            response.to_string()
+        };
         Ok(vec![BluValue::String(Arc::from(
-            response.to_string().into_bytes(),
+            serialized.into_bytes(),
         ))])
     }
 
@@ -1227,6 +1240,7 @@ fn execute_blu_source(
         interrupt_handle.interrupt();
     }
     for (name, operation, bridge) in [
+        ("borg_workflow_id", "workflow_id", bridge.clone()),
         ("borg_emit", "emit", bridge.clone()),
         ("borg_tool", "tool", bridge.clone()),
         ("borg_history", "history", bridge.clone()),
@@ -1423,6 +1437,20 @@ mod tests {
         let first = runner.run(request.clone()).await.expect("run");
         assert_eq!(first.values, vec![json!(4)]);
         assert!(first.success);
+        assert_eq!(first, runner.run(request).await.expect("replay"));
+    }
+
+    #[tokio::test]
+    async fn workflow_id_is_stable_and_replayed() {
+        let runner = runner(PermissionMode::Manual).await;
+        let request = BluWorkflowRequest {
+            workflow_id: Uuid::new_v4(),
+            name: "identity".to_string(),
+            source: "return borg_workflow_id(1)".to_string(),
+        };
+        let first = runner.run(request.clone()).await.expect("run");
+        assert!(first.success, "{first:?}");
+        assert_eq!(first.values, vec![json!(request.workflow_id.to_string())]);
         assert_eq!(first, runner.run(request).await.expect("replay"));
     }
 
