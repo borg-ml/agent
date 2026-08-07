@@ -1006,6 +1006,7 @@ fn tool_execution_class(name: &str) -> ToolExecutionClass {
         "list_files"
         | "read_file"
         | "search_files"
+        | "web_search"
         | "read_skill"
         | "list_workflows"
         | "list_blu_workflows"

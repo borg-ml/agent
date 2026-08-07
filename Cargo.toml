@@ -1,7 +1,9 @@
 [workspace]
 members = [
+    "crates/borg-core",
     "crates/borg-provider",
     "crates/borg-remote",
+    "crates/borg-search",
     "crates/borg-cli",
 ]
 resolver = "2"
@@ -20,9 +22,11 @@ anyhow = "1.0.104"
 agent-client-protocol = "2.0.0"
 async-trait = "0.1.89"
 base64 = "0.22.1"
+borg-core = { path = "crates/borg-core" }
 blu-lang = { git = "https://github.com/borg-ml/blu.git", rev = "9cf2a6b187d868471d50155ad37a5e5342006e66" }
 claude-agents = { git = "https://github.com/borg-ml/claude-agents.git", rev = "0e41be9eed5ffe91b77b79c6742b192b0d917f07" }
 chrono = { version = "0.4.42", features = ["serde"] }
+borg-search = { path = "crates/borg-search" }
 dirs = "6.0.0"
 futures = "0.3"
 ignore = "0.4"

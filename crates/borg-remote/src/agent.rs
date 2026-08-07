@@ -198,6 +198,13 @@ pub trait AgentTurnExecutor: Send + Sync {
         None
     }
 
+    /// Return the optional provider-neutral web-search capability for this
+    /// execution host. The session actor injects it into the shared Borg tool
+    /// dispatcher so native and subscription lanes see the same contract.
+    fn web_search_provider(&self) -> Option<Arc<dyn borg_search::WebSearchProvider>> {
+        None
+    }
+
     /// Run an isolated, one-shot consultation without attaching it to the
     /// main session's provider conversation or exposing the main session's
     /// tools. Providers that cannot offer this path report a normal tool error.
@@ -235,12 +242,34 @@ pub trait AgentTurnExecutor: Send + Sync {
 }
 
 /// Direct provider execution used by the CLI and enrolled hosts.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct LocalAgentTurnExecutor {
     native_harness: NativeHarness,
     runtime_extensions: Arc<RwLock<RuntimeExtensions>>,
     runtime_extension_loader: Option<RuntimeExtensionLoader>,
     subscription_pools: Arc<SubscriptionPoolRegistry>,
+    web_search: Option<Arc<dyn borg_search::WebSearchProvider>>,
+}
+
+impl Default for LocalAgentTurnExecutor {
+    fn default() -> Self {
+        let web_search = match borg_search::SearchService::from_env() {
+            Ok(service) => {
+                service.map(|service| Arc::new(service) as Arc<dyn borg_search::WebSearchProvider>)
+            }
+            Err(error) => {
+                tracing::warn!(%error, "web search configuration is invalid; search tool disabled");
+                None
+            }
+        };
+        Self {
+            native_harness: NativeHarness::default(),
+            runtime_extensions: Arc::new(RwLock::new(RuntimeExtensions::default())),
+            runtime_extension_loader: None,
+            subscription_pools: Arc::new(SubscriptionPoolRegistry::default()),
+            web_search,
+        }
+    }
 }
 
 type RuntimeExtensionLoader = Arc<
@@ -454,6 +483,14 @@ impl LocalAgentTurnExecutor {
         }
     }
 
+    pub fn with_web_search_provider(
+        mut self,
+        provider: Arc<dyn borg_search::WebSearchProvider>,
+    ) -> Self {
+        self.web_search = Some(provider);
+        self
+    }
+
     pub fn with_external_mcp_servers(
         self,
         servers: Vec<borg_provider::mcp::ExternalMcpServer>,
@@ -531,6 +568,10 @@ impl LocalAgentTurnExecutor {
 
 #[async_trait::async_trait]
 impl AgentTurnExecutor for LocalAgentTurnExecutor {
+    fn web_search_provider(&self) -> Option<Arc<dyn borg_search::WebSearchProvider>> {
+        self.web_search.clone()
+    }
+
     fn supports_subscription_context_reuse(&self, provider: CodingProvider) -> bool {
         matches!(provider, CodingProvider::Codex | CodingProvider::Claude)
     }

@@ -10,12 +10,17 @@ homepage.workspace = true
 authors.workspace = true
 publish = false
 
+[features]
+default = ["subscription-adapters"]
+subscription-adapters = ["borg-provider/codex", "borg-provider/claude"]
+
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
 base64.workspace = true
 blu-lang.workspace = true
-borg-provider = { path = "../borg-provider" }
+borg-provider = { path = "../borg-provider", default-features = false }
+borg-search.workspace = true
 chrono.workspace = true
 futures.workspace = true
 ignore.workspace = true

@@ -29,8 +29,13 @@ Automatic updates and their check interval are configurable.
 
 - a responsive terminal UI with durable resume, steering, compaction, image
   input, transcript selection, and configurable keybindings;
-- Codex and Claude subscription providers, plus OpenRouter and explicitly
-  configured OpenAI-compatible providers;
+- Codex and Claude subscription providers when the optional subscription
+  adapters are enabled, plus OpenRouter and explicitly configured
+  OpenAI-compatible providers;
+- a standalone `borg-core` contract crate with no provider SDK, HTTP, MCP, or
+  subprocess dependency;
+- one provider-neutral `web_search` tool with selectable Exa, Parallel, and
+  Brave backends (see [`docs/web-search.md`](docs/web-search.md));
 - a native harness with bounded file tools, background
   processes, LSP, goals, plans, subagents, MCP, project guidance, and skills;
 - Blu live extensions with dependency-aware skill, MCP, and bounded executable
@@ -209,7 +214,12 @@ decisions, reviews, references, and provenance records.
 
 ## Repository layout
 
-- `borg-provider`: provider-neutral messages, tools, usage and local adapters;
+- `borg-core`: the minimal provider-neutral messages, tools, usage, and
+  channel contracts;
+- `borg-provider`: model gateways and optional Codex/Claude subscription
+  adapters built on those contracts;
+- `borg-search`: bounded provider-neutral web search and Exa, Parallel, and
+  Brave adapters;
 - `borg-remote`: session protocol, store, actor, host and local tools; and
 - `borg`: public CLI commands and terminal UI.
 
@@ -218,6 +228,12 @@ decisions, reviews, references, and provenance records.
 ```sh
 cargo check --workspace
 cargo test --workspace
+
+# Build the provider-neutral CLI core without the subscription adapters.
+cargo check -p borg --no-default-features
+
+# Include Codex/Claude subscription lanes (the release default).
+cargo check -p borg --features subscription-adapters
 ```
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md) before submitting changes.

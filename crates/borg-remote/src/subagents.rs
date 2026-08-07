@@ -165,6 +165,7 @@ pub struct AgentToolDispatcher {
     runtime_permission: crate::PermissionMode,
     runtime_processes: crate::native_process::ProcessManager,
     persistent_runtimes: PersistentRuntimeRegistry,
+    web_search: Option<Arc<dyn borg_search::WebSearchProvider>>,
 }
 
 #[derive(Debug)]
@@ -179,6 +180,7 @@ pub struct AgentToolServer {
     subagents_enabled: bool,
     consultation_enabled: bool,
     shared_work_enabled: bool,
+    web_search_enabled: bool,
     team_policy: Option<crate::TeamPolicy>,
     cancel: CancellationToken,
 }
@@ -245,6 +247,7 @@ impl AgentToolServer {
         let subagents_enabled = dispatcher.subagents_enabled;
         let consultation_enabled = dispatcher.consultation_enabled();
         let shared_work_enabled = dispatcher.shared_work.is_some();
+        let web_search_enabled = dispatcher.web_search.is_some();
         let team_policy = dispatcher.team_policy.clone();
         tokio::spawn(async move {
             loop {
@@ -264,6 +267,7 @@ impl AgentToolServer {
             subagents_enabled,
             consultation_enabled,
             shared_work_enabled,
+            web_search_enabled,
             team_policy,
             cancel,
         })
@@ -288,6 +292,7 @@ impl AgentToolServer {
         let subagents_enabled = dispatcher.subagents_enabled;
         let consultation_enabled = dispatcher.consultation_enabled();
         let shared_work_enabled = dispatcher.shared_work.is_some();
+        let web_search_enabled = dispatcher.web_search.is_some();
         let team_policy = dispatcher.team_policy.clone();
         tokio::spawn(async move {
             loop {
@@ -313,6 +318,7 @@ impl AgentToolServer {
             subagents_enabled,
             consultation_enabled,
             shared_work_enabled,
+            web_search_enabled,
             team_policy,
             cancel,
         })
@@ -352,12 +358,13 @@ impl AgentToolServer {
             command: agent_mcp_executable()?.to_string_lossy().into_owned(),
             args: vec!["__agent-mcp".to_string()],
             env,
-            allowed_tools: agent_tool_specs_with_capabilities_and_consultation(
+            allowed_tools: agent_tool_specs_with_capabilities_and_consultation_and_search(
                 self.provider,
                 self.subagents_enabled,
                 self.shared_work_enabled,
                 self.team_policy.as_ref(),
                 self.consultation_enabled,
+                self.web_search_enabled,
             )
             .into_iter()
             .filter_map(|tool| {
@@ -498,6 +505,7 @@ impl AgentToolDispatcher {
     // The dispatcher deliberately receives each independently disableable
     // service explicitly at its construction boundary.
     #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
     pub(crate) fn new(
         goals: SessionGoalTools,
         todos: SessionTodoTools,
@@ -515,6 +523,47 @@ impl AgentToolDispatcher {
         workflow_snapshot: Option<Arc<dyn Fn() -> Vec<crate::BluWorkflowDefinition> + Send + Sync>>,
         workflow_processes: crate::native_process::ProcessManager,
         permission: crate::PermissionMode,
+    ) -> Self {
+        Self::new_with_search(
+            goals,
+            todos,
+            subagents,
+            lsp,
+            provider,
+            actor_session_id,
+            subagents_enabled,
+            shared_work,
+            team_policy,
+            cwd,
+            consultation,
+            autonomy,
+            provider_capabilities,
+            workflow_snapshot,
+            workflow_processes,
+            permission,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_search(
+        goals: SessionGoalTools,
+        todos: SessionTodoTools,
+        subagents: Option<SubagentCoordinator>,
+        lsp: crate::LspService,
+        provider: CodingProvider,
+        actor_session_id: Uuid,
+        subagents_enabled: bool,
+        shared_work: Option<SharedWorkToolContext>,
+        team_policy: Option<crate::TeamPolicy>,
+        cwd: PathBuf,
+        consultation: Option<SessionConsultationTools>,
+        autonomy: Option<crate::SqliteAutonomyStore>,
+        provider_capabilities: Vec<crate::ProviderCapability>,
+        workflow_snapshot: Option<Arc<dyn Fn() -> Vec<crate::BluWorkflowDefinition> + Send + Sync>>,
+        workflow_processes: crate::native_process::ProcessManager,
+        permission: crate::PermissionMode,
+        web_search: Option<Arc<dyn borg_search::WebSearchProvider>>,
     ) -> Self {
         let consultation_enabled = subagents
             .as_ref()
@@ -552,6 +601,7 @@ impl AgentToolDispatcher {
             runtime_permission: permission,
             runtime_processes,
             persistent_runtimes: PersistentRuntimeRegistry::default(),
+            web_search,
         }
     }
 
@@ -563,6 +613,9 @@ impl AgentToolDispatcher {
             self.team_policy.as_ref(),
             self.consultation_enabled,
         );
+        if self.web_search.is_some() {
+            specs.push(web_search_tool_spec());
+        }
         if self.autonomy.is_some() {
             specs.extend(autonomy_tool_specs());
         }
@@ -756,6 +809,20 @@ impl AgentToolDispatcher {
                     "providers": self.provider_capabilities,
                     "instruction": "Only providers with can_spawn=true are eligible for subagent admission."
                 }))
+            }
+            "web_search" => {
+                let args: WebSearchArgs = serde_json::from_value(arguments)?;
+                let provider = self
+                    .web_search
+                    .as_ref()
+                    .context("web search is unavailable for this session")?;
+                let request = borg_search::SearchRequest {
+                    query: args.query,
+                    max_results: args.max_results.unwrap_or(borg_search::DEFAULT_RESULTS),
+                    include_domains: args.include_domains.unwrap_or_default(),
+                    exclude_domains: args.exclude_domains.unwrap_or_default(),
+                };
+                Ok(serde_json::to_value(provider.search(request).await?)?)
             }
             "lsp_diagnostics" => {
                 let args: LspPathArgs = serde_json::from_value(arguments)?;
@@ -3446,6 +3513,24 @@ pub fn agent_tool_specs_with_capabilities_and_consultation(
     team_policy: Option<&crate::TeamPolicy>,
     consultation_enabled: bool,
 ) -> Vec<Value> {
+    agent_tool_specs_with_capabilities_and_consultation_and_search(
+        provider,
+        subagents_enabled,
+        shared_work_enabled,
+        team_policy,
+        consultation_enabled,
+        false,
+    )
+}
+
+fn agent_tool_specs_with_capabilities_and_consultation_and_search(
+    provider: CodingProvider,
+    subagents_enabled: bool,
+    shared_work_enabled: bool,
+    team_policy: Option<&crate::TeamPolicy>,
+    consultation_enabled: bool,
+    web_search_enabled: bool,
+) -> Vec<Value> {
     let mut specs = vec![
         tool(
             "list_workflows",
@@ -3677,6 +3762,9 @@ pub fn agent_tool_specs_with_capabilities_and_consultation(
             }),
         ),
     ];
+    if web_search_enabled {
+        specs.push(web_search_tool_spec());
+    }
     if subagents_enabled && consultation_enabled {
         specs.insert(
             1,
@@ -3735,6 +3823,41 @@ pub fn agent_tool_specs_with_capabilities_and_consultation(
         specs.extend(subagent_specs);
     }
     specs
+}
+
+fn web_search_tool_spec() -> Value {
+    tool(
+        "web_search",
+        "Search the public web through Borg's configured provider. Results include the selected backend, source URLs, snippets, and publication metadata; use the URLs as provenance and do not treat snippets as authoritative page contents.",
+        json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": borg_search::MAX_QUERY_CHARS
+                },
+                "max_results": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": borg_search::MAX_RESULTS,
+                    "default": borg_search::DEFAULT_RESULTS
+                },
+                "include_domains": {
+                    "type": "array",
+                    "maxItems": borg_search::MAX_DOMAIN_FILTERS,
+                    "items": { "type": "string", "minLength": 1, "maxLength": borg_search::MAX_DOMAIN_CHARS }
+                },
+                "exclude_domains": {
+                    "type": "array",
+                    "maxItems": borg_search::MAX_DOMAIN_FILTERS,
+                    "items": { "type": "string", "minLength": 1, "maxLength": borg_search::MAX_DOMAIN_CHARS }
+                }
+            },
+            "required": ["query"],
+            "additionalProperties": false
+        }),
+    )
 }
 
 fn shared_work_tool_specs() -> Vec<Value> {
@@ -3961,6 +4084,15 @@ struct RuntimeBorgToolArgs {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NoArgs {}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WebSearchArgs {
+    query: String,
+    max_results: Option<usize>,
+    include_domains: Option<Vec<String>>,
+    exclude_domains: Option<Vec<String>>,
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

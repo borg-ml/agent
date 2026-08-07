@@ -5,6 +5,8 @@
 //! thin wire adapters and do not own Borg's tool/runtime loop; the
 //! provider-neutral NativeHarness owns API-key/OpenAI-compatible model routes.
 
+#![cfg_attr(not(any(feature = "codex", feature = "claude")), allow(dead_code))]
+
 use crate::mcp::{ExternalMcpServer, ProviderMcpSetup, prepare_external_provider_mcp};
 use crate::runtime::ProviderCallUsage;
 use crate::{ProviderAuthBundle, ProviderAuthProvider, ProviderChannel};
@@ -20,6 +22,147 @@ use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{Mutex, mpsc};
+
+#[cfg(not(feature = "claude"))]
+#[allow(dead_code)]
+mod claude_agents {
+    use std::path::PathBuf;
+
+    use anyhow::{Result, bail};
+    use serde_json::Value;
+
+    #[derive(Debug, Clone)]
+    pub struct CommandSpec {
+        pub program: PathBuf,
+        pub args: Vec<String>,
+        pub current_dir: PathBuf,
+        pub environment: Vec<(String, String)>,
+        pub environment_remove: Vec<String>,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct ChatStreamRequest {
+        pub prompt: String,
+        pub attachments: Vec<PathBuf>,
+        pub system_prompt: String,
+        pub command: CommandSpec,
+        pub runtime_directory: Option<()>,
+        pub lifecycle_key: String,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    pub enum ChatApprovalDecision {
+        ApproveOnce,
+        ApproveSession,
+        Reject,
+    }
+
+    #[derive(Debug)]
+    pub enum ChatStreamControl {
+        Steer {
+            text: String,
+            attachments: Vec<PathBuf>,
+            ack: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+        },
+        Approval {
+            approval_id: String,
+            decision: ChatApprovalDecision,
+        },
+        ProviderInteractionResponse {
+            interaction_id: String,
+            response: Value,
+        },
+        Interrupt,
+    }
+
+    #[derive(Debug, Clone, Default)]
+    pub struct ProviderCallUsage {
+        pub duration_ms: u64,
+        pub input_tokens: u64,
+        pub cached_input_tokens: u64,
+        pub cache_creation_input_tokens: u64,
+        pub output_tokens: u64,
+        pub total_tokens: u64,
+        pub context_tokens: Option<u64>,
+        pub context_window_tokens: Option<u64>,
+        pub cost_microusd: Option<u64>,
+    }
+
+    #[derive(Debug, Clone)]
+    pub enum ChatStreamEvent {
+        ProviderEvent {
+            kind: String,
+            payload: Value,
+            raw_payload: Option<Value>,
+            stream_channel: Option<String>,
+            content_text: Option<String>,
+            provider_item_id: Option<String>,
+            tool_use_id: Option<String>,
+            tool_name: Option<String>,
+        },
+        Delta(String),
+        ReasoningDelta(String),
+        Narration {
+            text: String,
+        },
+        Phase {
+            name: String,
+            input: Value,
+        },
+        ToolCall {
+            id: String,
+            name: String,
+            input: Value,
+        },
+        ToolResult {
+            tool_use_id: String,
+            output: String,
+            is_error: bool,
+            input: Option<Value>,
+        },
+        ApprovalRequested {
+            approval_id: String,
+            title: String,
+            detail: String,
+            command: Option<String>,
+        },
+        ProviderInteractionRequested {
+            interaction_id: String,
+            kind: String,
+            title: String,
+            detail: String,
+            payload: Value,
+        },
+        Done {
+            final_text: String,
+            usage: Option<ProviderCallUsage>,
+            session_id: Option<String>,
+        },
+        Failed {
+            error: String,
+        },
+    }
+
+    #[derive(Clone, Default)]
+    pub struct ClaudePool;
+
+    pub async fn run(
+        _request: ChatStreamRequest,
+        _events: tokio::sync::mpsc::Sender<ChatStreamEvent>,
+        _controls: Option<tokio::sync::mpsc::Receiver<ChatStreamControl>>,
+    ) -> Result<()> {
+        bail!("Claude adapter is not compiled; enable the claude feature")
+    }
+
+    pub async fn run_pooled(
+        _request: ChatStreamRequest,
+        _events: tokio::sync::mpsc::Sender<ChatStreamEvent>,
+        _controls: Option<tokio::sync::mpsc::Receiver<ChatStreamControl>>,
+        _pool: ClaudePool,
+    ) -> Result<()> {
+        bail!("Claude adapter is not compiled; enable the claude feature")
+    }
+}
 
 // app-server rejects a single text input larger than 1 MiB. Keep this guard at
 // the resume fallback boundary so an unavailable native thread returns control
@@ -266,6 +409,12 @@ impl CodexSubscriptionPool {
 }
 
 pub fn run_claude_chat_stream(request: ChatStreamRequest) -> mpsc::Receiver<ChatStreamEvent> {
+    #[cfg(not(feature = "claude"))]
+    {
+        let _ = request;
+        return unavailable_stream("Claude", "claude");
+    }
+    #[cfg(feature = "claude")]
     run_subscription_stream(
         request,
         None,
@@ -278,6 +427,12 @@ pub fn run_claude_chat_stream_with_control(
     request: ChatStreamRequest,
     controls: Option<mpsc::Receiver<ChatStreamControl>>,
 ) -> mpsc::Receiver<ChatStreamEvent> {
+    #[cfg(not(feature = "claude"))]
+    {
+        let _ = (request, controls);
+        return unavailable_stream("Claude", "claude");
+    }
+    #[cfg(feature = "claude")]
     run_subscription_stream(
         request,
         controls,
@@ -291,6 +446,12 @@ pub fn run_claude_local_chat_stream(
     controls: Option<mpsc::Receiver<ChatStreamControl>>,
     permission: LocalAgentPermission,
 ) -> mpsc::Receiver<ChatStreamEvent> {
+    #[cfg(not(feature = "claude"))]
+    {
+        let _ = (request, controls, permission);
+        return unavailable_stream("Claude", "claude");
+    }
+    #[cfg(feature = "claude")]
     run_subscription_stream(request, controls, SubscriptionProvider::Claude, permission)
 }
 
@@ -301,28 +462,42 @@ pub fn run_claude_local_chat_stream_pooled(
     permission: LocalAgentPermission,
     pool: ClaudeSubscriptionPool,
 ) -> mpsc::Receiver<ChatStreamEvent> {
-    let (events, receiver) = mpsc::channel(64);
-    tokio::spawn(async move {
-        if let Err(error) = run_claude_subscription_process_pooled(
-            request,
-            controls,
-            permission,
-            events.clone(),
-            pool,
-        )
-        .await
-        {
-            let _ = events
-                .send(ChatStreamEvent::Failed {
-                    error: format!("{error:#}"),
-                })
-                .await;
-        }
-    });
-    receiver
+    #[cfg(not(feature = "claude"))]
+    {
+        let _ = (request, controls, permission, pool);
+        return unavailable_stream("Claude", "claude");
+    }
+    #[cfg(feature = "claude")]
+    {
+        let (events, receiver) = mpsc::channel(64);
+        tokio::spawn(async move {
+            if let Err(error) = run_claude_subscription_process_pooled(
+                request,
+                controls,
+                permission,
+                events.clone(),
+                pool,
+            )
+            .await
+            {
+                let _ = events
+                    .send(ChatStreamEvent::Failed {
+                        error: format!("{error:#}"),
+                    })
+                    .await;
+            }
+        });
+        receiver
+    }
 }
 
 pub fn run_codex_chat_stream(request: ChatStreamRequest) -> mpsc::Receiver<ChatStreamEvent> {
+    #[cfg(not(feature = "codex"))]
+    {
+        let _ = request;
+        return unavailable_stream("Codex", "codex");
+    }
+    #[cfg(feature = "codex")]
     run_subscription_stream(
         request,
         None,
@@ -335,6 +510,12 @@ pub fn run_codex_chat_stream_with_control(
     request: ChatStreamRequest,
     controls: Option<mpsc::Receiver<ChatStreamControl>>,
 ) -> mpsc::Receiver<ChatStreamEvent> {
+    #[cfg(not(feature = "codex"))]
+    {
+        let _ = (request, controls);
+        return unavailable_stream("Codex", "codex");
+    }
+    #[cfg(feature = "codex")]
     run_subscription_stream(
         request,
         controls,
@@ -348,6 +529,12 @@ pub fn run_codex_local_chat_stream(
     controls: Option<mpsc::Receiver<ChatStreamControl>>,
     permission: LocalAgentPermission,
 ) -> mpsc::Receiver<ChatStreamEvent> {
+    #[cfg(not(feature = "codex"))]
+    {
+        let _ = (request, controls, permission);
+        return unavailable_stream("Codex", "codex");
+    }
+    #[cfg(feature = "codex")]
     run_subscription_stream(request, controls, SubscriptionProvider::Codex, permission)
 }
 
@@ -358,25 +545,33 @@ pub fn run_codex_local_chat_stream_pooled(
     permission: LocalAgentPermission,
     pool: CodexSubscriptionPool,
 ) -> mpsc::Receiver<ChatStreamEvent> {
-    let (events, receiver) = mpsc::channel(64);
-    tokio::spawn(async move {
-        if let Err(error) = run_codex_subscription_process_pooled(
-            request,
-            controls,
-            permission,
-            events.clone(),
-            pool,
-        )
-        .await
-        {
-            let _ = events
-                .send(ChatStreamEvent::Failed {
-                    error: format!("{error:#}"),
-                })
-                .await;
-        }
-    });
-    receiver
+    #[cfg(not(feature = "codex"))]
+    {
+        let _ = (request, controls, permission, pool);
+        return unavailable_stream("Codex", "codex");
+    }
+    #[cfg(feature = "codex")]
+    {
+        let (events, receiver) = mpsc::channel(64);
+        tokio::spawn(async move {
+            if let Err(error) = run_codex_subscription_process_pooled(
+                request,
+                controls,
+                permission,
+                events.clone(),
+                pool,
+            )
+            .await
+            {
+                let _ = events
+                    .send(ChatStreamEvent::Failed {
+                        error: format!("{error:#}"),
+                    })
+                    .await;
+            }
+        });
+        receiver
+    }
 }
 
 pub fn run_codex_freeform_chat_stream(
@@ -402,6 +597,19 @@ fn run_subscription_stream(
                 })
                 .await;
         }
+    });
+    receiver
+}
+
+#[cfg(any(not(feature = "codex"), not(feature = "claude")))]
+fn unavailable_stream(provider: &str, feature: &str) -> mpsc::Receiver<ChatStreamEvent> {
+    let (events, receiver) = mpsc::channel(1);
+    let message =
+        format!("{provider} subscription adapter is not compiled; enable the {feature} feature");
+    tokio::spawn(async move {
+        let _ = events
+            .send(ChatStreamEvent::Failed { error: message })
+            .await;
     });
     receiver
 }
@@ -1116,7 +1324,7 @@ async fn run_pooled_codex_turn(
             line = process.lines.next_line() => {
                 let Some(line) = line.context("failed to read pooled Codex output")? else {
                     let stderr = String::from_utf8_lossy(&process.stderr.lock().await).trim().to_string();
-                    bail!("Codex app server closed unexpectedly{}", if stderr.is_empty() { String::new() } else { format!(": {stderr}") });
+                    return Err(anyhow::anyhow!("Codex app server closed unexpectedly{}", if stderr.is_empty() { String::new() } else { format!(": {stderr}") }));
                 };
                 if line.trim().is_empty() {
                     continue;

@@ -541,12 +541,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "borg-core"
+version = "0.1.48"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "borg-provider"
 version = "0.1.48"
 dependencies = [
  "anyhow",
  "async-trait",
  "base64",
+ "borg-core",
  "chrono",
  "claude-agents",
  "futures",
@@ -574,6 +583,7 @@ dependencies = [
  "base64",
  "blu-lang",
  "borg-provider",
+ "borg-search",
  "chrono",
  "futures",
  "ignore",
@@ -592,6 +602,18 @@ dependencies = [
  "ts-rs",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "borg-search"
+version = "0.1.48"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "url",
 ]
 
 [[package]]

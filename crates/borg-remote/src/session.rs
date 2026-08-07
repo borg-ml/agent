@@ -1170,7 +1170,8 @@ async fn run_agent_session_store_kernel(
         .flatten();
     let workflow_snapshot = executor.extension_workflow_snapshot();
     let workflow_processes = crate::native_process::ProcessManager::default();
-    let dispatcher = crate::AgentToolDispatcher::new(
+    let web_search = executor.web_search_provider();
+    let dispatcher = crate::AgentToolDispatcher::new_with_search(
         goal_tools.clone(),
         todo_tools.clone(),
         subagents.clone(),
@@ -1187,6 +1188,7 @@ async fn run_agent_session_store_kernel(
         workflow_snapshot,
         workflow_processes.clone(),
         launch.permission_mode,
+        web_search,
     );
     let workflow_autonomy_store = autonomy_store.clone();
     let agent_tool_server =
