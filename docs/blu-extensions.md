@@ -157,6 +157,30 @@ calls are intentionally not rewritten into fake Blu handles. Workflow source
 is bounded to 256 KiB, must remain inside its package, and is frozen for the
 turn that loaded it.
 
+## Extension-scoped durable storage
+
+Extensions can use the host-owned `plugin_store` boundary for correctness-critical
+state without receiving a SQLite handle. Persistent Python and Bun runtimes use
+`borg.storage("extension-id")`; Blu workflows use `borg_plugin_store(call_id,
+request_json)`. The store supports session or project scope, bounded JSON values,
+compare-and-swap revisions, content-addressed artifact receipts, provenance, and
+idempotent commits.
+
+A commit validates and hashes every declared artifact before one SQLite
+`BEGIN IMMEDIATE` transaction applies the state writes, artifact receipts, and
+mutation receipt. Reusing the same idempotency key with the same request replays
+the stored result; reusing it with different content is rejected. `verify_artifact`
+rehashes the current workspace file so a modified external result is visible as
+invalid. External files remain the plugin or benchmark's authority and cannot be
+rolled back by SQLite; Borg makes their receipt, hash, provenance, and recovery
+state durable.
+
+Workflows that need to preserve a failed process attempt should commit its
+append-only evidence first, then call `borg_assert_exec_success(call_id,
+snapshot_json)`. The assertion is journaled and makes the workflow fail after the
+receipt exists, while retries replay both boundaries without repeating the
+external effect.
+
 ## Persistent programming runtime
 
 `runtime_exec` is a separate model-facing primitive for iterative work. It is

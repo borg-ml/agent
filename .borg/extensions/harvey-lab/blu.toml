@@ -1,0 +1,15 @@
+description = "Durable Harvey LAB runs and all-pass evaluations with Borg provenance."
+enabled = true
+id = "harvey-lab"
+manifest_version = 1
+name = "Harvey LAB"
+skill_roots = ["skills"]
+version = "0.1.0"
+
+[workflows.run_task]
+description = "Run one configured Harvey LAB task and receipt its durable result."
+entrypoint = "workflows/run_task.blu"
+
+[workflows.grade_task]
+description = "Evaluate a completed Harvey LAB run and receipt its scores."
+entrypoint = "workflows/grade_task.blu"

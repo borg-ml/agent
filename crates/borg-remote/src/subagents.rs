@@ -3996,7 +3996,7 @@ fn agent_tool_specs_with_capabilities_and_consultation_and_search(
         ),
         tool(
             "runtime_exec",
-            "Execute code in the session's persistent Python or optional Bun JavaScript/TypeScript runtime. Variables, imports, helper functions, and parsed data survive across calls and turns. The `borg` object exposes read, filesystem search, lossless history retrieval, a sequence-cursored full-log index feed, versioned retrieval_adapter/test_retrieval_adapter helpers, explicit checkpoints, restore, exec, persistent extension environments, RLM-style subagent handles, continual harness CRUD, and selected Borg tool calls through the host's permission and journal boundary. This is trusted execution, not a sandbox.",
+            "Execute code in the session's persistent Python or optional Bun JavaScript/TypeScript runtime. Variables, imports, helper functions, and parsed data survive across calls and turns. The `borg` object exposes read, filesystem search, lossless history retrieval, a sequence-cursored full-log index feed, versioned retrieval_adapter/test_retrieval_adapter helpers, extension-scoped transactional storage and artifact verification, explicit checkpoints, restore, exec, persistent extension environments, RLM-style subagent handles, continual harness CRUD, and selected Borg tool calls through the host's permission and journal boundary. This is trusted execution, not a sandbox.",
             json!({
                 "type": "object",
                 "properties": {

@@ -1,0 +1,10 @@
+{
+  "lab_root": "../borg/third_party/harvey-labs",
+  "model": "anthropic/claude-sonnet-4-6",
+  "task": "corporate-ma/review-data-room-red-flag-review",
+  "max_turns": 200,
+  "shell_timeout": 60,
+  "timeout_seconds": 1740,
+  "judge_model": "claude-sonnet-4-6",
+  "dual": false
+}

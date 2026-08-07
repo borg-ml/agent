@@ -1144,6 +1144,23 @@ impl HostBridge {
                     self.block_on(store.call(self.session_id, &root, extension_id, request))
                 })?
             }
+            "assert_exec_success" => {
+                self.require_full_access(operation)?;
+                let snapshot = guest_json(args, 1, "process_snapshot_json")?;
+                let request = json!({ "snapshot": snapshot.clone() });
+                self.journal.call(call_id, operation, request, || {
+                    let timed_out = snapshot
+                        .get("timed_out")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let exit_code = snapshot.get("exit_code").and_then(Value::as_i64);
+                    ensure!(
+                        !timed_out && exit_code == Some(0),
+                        "process did not succeed (exit_code={exit_code:?}, timed_out={timed_out})"
+                    );
+                    Ok(json!({ "ok": true }))
+                })?
+            }
             "exec" => {
                 self.require_full_access(operation)?;
                 let command = guest_string(args, 1, "command")?;
@@ -1247,6 +1264,11 @@ fn execute_blu_source(
         ("borg_job", "job", bridge.clone()),
         ("borg_checkpoint", "checkpoint", bridge.clone()),
         ("borg_plugin_store", "plugin_store", bridge.clone()),
+        (
+            "borg_assert_exec_success",
+            "assert_exec_success",
+            bridge.clone(),
+        ),
         ("borg_exec", "exec", bridge),
     ] {
         let id = engine
@@ -1662,6 +1684,137 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn blu_plugin_store_receipts_are_replayed_and_verify_artifact_bytes() {
+        let (runner, root) = external_runner(PermissionMode::FullAccess).await;
+        let runner = runner.with_extension_id("harvey-lab");
+        tokio::fs::write(root.join("result.json"), br#"{"ok":true}"#)
+            .await
+            .expect("artifact");
+        let request = BluWorkflowRequest {
+            workflow_id: Uuid::new_v4(),
+            name: "plugin-store".to_string(),
+            source: r##"
+local workflow_id = borg_workflow_id(1)
+return borg_plugin_store(2, "{\"op\":\"commit\",\"scope\":\"session\",\"idempotency_key\":\"run-1\",\"writes\":[{\"op\":\"put\",\"key\":\"runs/run-1\",\"value\":{\"workflow_id\":\"" .. workflow_id .. "\",\"state\":\"recorded\"}}],\"artifacts\":[{\"artifact_id\":\"run-1\",\"path\":\"result.json\",\"run_id\":\"run-1\",\"media_type\":\"application/json\",\"metadata\":{\"kind\":\"result\"}}],\"provenance\":{\"workflow_id\":\"" .. workflow_id .. "\",\"extension_id\":\"harvey-lab\",\"phase\":\"run\"}}")
+"##
+                .to_string(),
+        };
+        let first = runner.run(request.clone()).await.expect("workflow");
+        assert!(first.success, "{first:?}");
+        let receipt: Value = serde_json::from_str(
+            first.values[0]
+                .as_str()
+                .expect("plugin store returns encoded JSON"),
+        )
+        .expect("commit receipt");
+        assert_eq!(receipt["extension_id"], "harvey-lab");
+        assert_eq!(receipt["replayed"], false);
+        assert_eq!(
+            receipt["artifacts"][0]["content_hash"],
+            format!("sha256:{:x}", Sha256::digest(br#"{"ok":true}"#))
+        );
+        assert_eq!(first, runner.run(request).await.expect("workflow replay"));
+
+        let entry = runner
+            .store
+            .plugin_store()
+            .call(
+                runner.session_id,
+                &root,
+                Some("harvey-lab"),
+                json!({"op":"get","scope":"session","key":"runs/run-1"}),
+            )
+            .await
+            .expect("stored entry");
+        assert_eq!(entry["entry"]["value"]["state"], "recorded");
+        let verified = runner
+            .store
+            .plugin_store()
+            .call(
+                runner.session_id,
+                &root,
+                Some("harvey-lab"),
+                json!({"op":"verify_artifact","scope":"session","artifact_id":"run-1"}),
+            )
+            .await
+            .expect("verify artifact");
+        assert_eq!(verified["valid"], true);
+        tokio::fs::write(root.join("result.json"), br#"{"ok":false}"#)
+            .await
+            .expect("change artifact");
+        let changed = runner
+            .store
+            .plugin_store()
+            .call(
+                runner.session_id,
+                &root,
+                Some("harvey-lab"),
+                json!({"op":"verify_artifact","scope":"session","artifact_id":"run-1"}),
+            )
+            .await
+            .expect("verify changed artifact");
+        assert_eq!(changed["valid"], false);
+
+        let events = runner.store.read(runner.session_id).await.expect("events");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event.kind,
+                    SessionEventKind::BluWorkflowCallRequested { ref operation, .. }
+                        if operation == "plugin_store"
+                ))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn plugin_receipt_commits_before_a_failed_process_assertion() {
+        let (runner, root) = external_runner(PermissionMode::FullAccess).await;
+        let runner = runner.with_extension_id("harvey-lab");
+        tokio::fs::write(root.join("failed.json"), br#"{"status":"failed"}"#)
+            .await
+            .expect("artifact");
+        let result = runner
+            .run(BluWorkflowRequest {
+                workflow_id: Uuid::new_v4(),
+                name: "failed-process".to_string(),
+                source: r##"
+local snapshot = borg_exec(1, "false", ".", 0, 1000, 1000)
+local receipt = borg_plugin_store(2, "{\"op\":\"commit\",\"scope\":\"session\",\"idempotency_key\":\"failed-run\",\"writes\":[{\"op\":\"put\",\"key\":\"runs/failed\",\"value\":{\"state\":\"recorded\"}}],\"artifacts\":[{\"artifact_id\":\"failed-run\",\"path\":\"failed.json\",\"metadata\":{\"kind\":\"result\"}}],\"provenance\":{\"extension_id\":\"harvey-lab\",\"phase\":\"run\"}}")
+borg_assert_exec_success(3, snapshot)
+return receipt
+"##
+                    .to_string(),
+            })
+            .await
+            .expect("workflow terminal failure");
+        assert!(!result.success, "{result:?}");
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("did not succeed"),
+            "{result:?}"
+        );
+        let entry = runner
+            .store
+            .plugin_store()
+            .call(
+                runner.session_id,
+                &root,
+                Some("harvey-lab"),
+                json!({"op":"get","scope":"session","key":"runs/failed"}),
+            )
+            .await
+            .expect("failed receipt");
+        assert_eq!(entry["entry"]["value"]["state"], "recorded");
     }
 
     #[tokio::test]

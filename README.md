@@ -197,13 +197,20 @@ borg_tool(call_id, name, arguments_json)
 borg_enqueue(call_id, idempotency_key, kind, payload_json, delay_ms, max_attempts)
 borg_job(call_id, job_uuid)
 borg_checkpoint(call_id, job_uuid, checkpoint_key, kind, state_json, evidence_json)
+borg_plugin_store(call_id, request_json)
 borg_exec(call_id, command, workdir, yield_time_ms, timeout_ms, max_output_tokens)
+borg_assert_exec_success(call_id, snapshot_json)
 ```
 
 Every workflow and host call has durable start/request and terminal records.
 `blu_workflow` autonomy jobs are supervised through the same SQLite lease and
 retry state machine. Workflow code does not receive raw filesystem, database,
 provider, or process handles.
+
+Extensions may use Borg's host-owned, extension-scoped SQLite storage for
+revisioned JSON state and content-addressed artifact receipts. Commits are
+idempotent and provenance-bearing; artifact files remain external authorities
+and can be rehashed through the same boundary after a crash or local change.
 
 ## Cross-model peer consultation
 

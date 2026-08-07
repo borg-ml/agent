@@ -1,0 +1,7 @@
+local workflow_id = borg_workflow_id(1)
+local artifact_dir = ".borg/harvey-lab/grades/" .. workflow_id
+local command = "python3 -u .borg/extensions/harvey-lab/workflows/runner.py --root . grade --workflow-id " .. workflow_id
+local execution = borg_exec(2, command, ".", 1000, 1800000, 64000)
+local receipt = borg_plugin_store(3, "{\"op\":\"commit\",\"scope\":\"project\",\"idempotency_key\":\"grade/" .. workflow_id .. "\",\"writes\":[{\"op\":\"put\",\"key\":\"grades/" .. workflow_id .. "\",\"value\":{\"workflow_id\":\"" .. workflow_id .. "\",\"benchmark\":\"harvey-lab\",\"phase\":\"grade\",\"state\":\"recorded\",\"artifact_path\":\"" .. artifact_dir .. "/grade.json\"}}],\"artifacts\":[{\"artifact_id\":\"grade-" .. workflow_id .. "\",\"path\":\"" .. artifact_dir .. "/grade.json\",\"run_id\":\"" .. workflow_id .. "\",\"media_type\":\"application/json\",\"metadata\":{\"kind\":\"harvey_grade_record\",\"source\":\"harvey-lab-adapter\"}},{\"artifact_id\":\"scores-" .. workflow_id .. "\",\"path\":\"" .. artifact_dir .. "/scores.json\",\"run_id\":\"" .. workflow_id .. "\",\"media_type\":\"application/json\",\"metadata\":{\"kind\":\"harvey_scores\",\"source\":\"harvey-lab-adapter\"}}],\"provenance\":{\"workflow_id\":\"" .. workflow_id .. "\",\"extension_id\":\"harvey-lab\",\"phase\":\"grade\",\"benchmark\":\"harvey-lab\",\"authority\":\"harvey-lab-adapter\"}}")
+borg_assert_exec_success(4, execution)
+return receipt
