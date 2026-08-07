@@ -2695,7 +2695,7 @@ fn keyboard_enhancement_does_not_request_release_events() {
     let flags = keyboard_enhancement_flags();
 
     assert!(flags.contains(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES));
-    assert!(flags.contains(KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES));
+    assert!(!flags.contains(KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES));
     assert!(!flags.contains(KeyboardEnhancementFlags::REPORT_EVENT_TYPES));
 }
 

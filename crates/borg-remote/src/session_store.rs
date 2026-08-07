@@ -1051,6 +1051,9 @@ impl SqliteSessionStore {
             );
         }
         let session = self.session_row(session_id).await?;
+        if session.inherited_event_count == 0 && text.is_some() {
+            self.ensure_history_projection(session_id).await?;
+        }
         if session.inherited_event_count > 0 {
             return self.query_history_lineage(session_id, &query, text).await;
         }
@@ -1101,6 +1104,7 @@ impl SqliteSessionStore {
             }
             return Ok(documents);
         }
+        self.ensure_history_projection(session_id).await?;
 
         let rows = sqlx::query(
             "select e.event_json, s.event_kind, s.actor, s.body \
@@ -1129,6 +1133,43 @@ impl SqliteSessionStore {
                 })
             })
             .collect()
+    }
+
+    async fn ensure_history_projection(&self, session_id: Uuid) -> Result<()> {
+        let missing: i64 = sqlx::query_scalar(
+            "select exists(\
+                select 1 from session_events e \
+                left join session_event_search s \
+                    on s.session_id=e.session_id and s.event_id=e.event_id \
+                where e.session_id=? and s.rowid is null limit 1\
+            )",
+        )
+        .bind(session_id.to_string())
+        .fetch_one(&self.pool)
+        .await?;
+        if missing == 0 {
+            return Ok(());
+        }
+        sqlx::query(
+            "insert into session_event_search \
+             (session_id, sequence, event_id, event_kind, actor, body) \
+             select e.session_id, e.sequence, e.event_id, e.event_kind, \
+                    json_extract(e.event_json, '$.kind.actor'), \
+                    e.event_json || coalesce(( \
+                        select char(10) || group_concat(cast(p.payload as text), char(10)) \
+                        from session_payloads p \
+                        where p.session_id=e.session_id and p.event_id=e.event_id \
+                    ), '') \
+             from session_events e \
+             where e.session_id=? and not exists ( \
+                 select 1 from session_event_search s \
+                 where s.session_id=e.session_id and s.event_id=e.event_id \
+             )",
+        )
+        .bind(session_id.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     async fn query_history_exact(
@@ -1986,6 +2027,18 @@ impl SqliteSessionStore {
         .fetch_one(&self.pool)
         .await?
             != 0;
+        let has_history_projection_table = sqlx::query_scalar::<_, i64>(
+            "select exists(select 1 from sqlite_master where type='table' and name='session_event_search')",
+        )
+        .fetch_one(&self.pool)
+        .await?
+            != 0;
+        let has_workspace_bindings_table = sqlx::query_scalar::<_, i64>(
+            "select exists(select 1 from sqlite_master where type='table' and name='session_workspace_bindings')",
+        )
+        .fetch_one(&self.pool)
+        .await?
+            != 0;
         let has_schema_marker = sqlx::query_scalar::<_, i64>(
             "select exists(select 1 from sqlite_master where type='table' and name='borg_session_schema')",
         )
@@ -2231,28 +2284,32 @@ impl SqliteSessionStore {
         )
         .execute(&self.pool)
         .await?;
-        // Populate only missing projection rows. This is safe to repeat and
-        // lets existing version-5 stores gain search without rewriting or
-        // invalidating their canonical journal. Payload blobs are folded into
-        // the projection so old large tool results remain discoverable too.
-        sqlx::query(
-            "insert into session_event_search \
-             (session_id, sequence, event_id, event_kind, actor, body) \
-             select e.session_id, e.sequence, e.event_id, e.event_kind, \
-                    json_extract(e.event_json, '$.kind.actor'), \
-                    e.event_json || coalesce(( \
-                        select char(10) || group_concat(cast(p.payload as text), char(10)) \
-                        from session_payloads p \
-                        where p.session_id=e.session_id and p.event_id=e.event_id \
-                    ), '') \
-             from session_events e \
-             where not exists ( \
-                 select 1 from session_event_search s \
-                 where s.session_id=e.session_id and s.event_id=e.event_id \
-             )",
-        )
-        .execute(&self.pool)
-        .await?;
+        // A current database already has both disposable projections. Do not
+        // rescan the canonical journal on every open; missing history rows
+        // are repaired for the requested session by ensure_history_projection.
+        // A newly-created store, or one missing the projection table, still
+        // receives the complete rebuild while its canonical journal is small
+        // or empty.
+        if !had_existing_schema || !has_history_projection_table {
+            sqlx::query(
+                "insert into session_event_search \
+                 (session_id, sequence, event_id, event_kind, actor, body) \
+                 select e.session_id, e.sequence, e.event_id, e.event_kind, \
+                        json_extract(e.event_json, '$.kind.actor'), \
+                        e.event_json || coalesce(( \
+                            select char(10) || group_concat(cast(p.payload as text), char(10)) \
+                            from session_payloads p \
+                            where p.session_id=e.session_id and p.event_id=e.event_id \
+                        ), '') \
+                 from session_events e \
+                 where not exists ( \
+                     select 1 from session_event_search s \
+                     where s.session_id=e.session_id and s.event_id=e.event_id \
+                 )",
+            )
+            .execute(&self.pool)
+            .await?;
+        }
         sqlx::query(
             "create table if not exists borg_session_schema (\
                 id integer primary key check(id=1),\
@@ -2302,17 +2359,19 @@ impl SqliteSessionStore {
         )
         .execute(&self.pool)
         .await?;
-        let now = Utc::now().to_rfc3339();
-        sqlx::query(
-            "insert into session_workspace_bindings \
-             (session_id, workspace_id, participant_id, attached_at) \
-             select id, coalesce(owner_session_id, parent_session_id, id), id, ? from sessions \
-             where true \
-             on conflict(session_id) do nothing",
-        )
-        .bind(now)
-        .execute(&self.pool)
-        .await?;
+        if !had_existing_schema || !has_workspace_bindings_table {
+            let now = Utc::now().to_rfc3339();
+            sqlx::query(
+                "insert into session_workspace_bindings \
+                 (session_id, workspace_id, participant_id, attached_at) \
+                 select id, coalesce(owner_session_id, parent_session_id, id), id, ? from sessions \
+                 where true \
+                 on conflict(session_id) do nothing",
+            )
+            .bind(now)
+            .execute(&self.pool)
+            .await?;
+        }
         self.clear_terminal_live_state().await?;
         Ok(())
     }

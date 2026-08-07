@@ -1144,9 +1144,12 @@ async fn run_local_agent_session(
     let rich_tui_allowed =
         rich_terminal_can_prompt(stdin_is_terminal, io::stdout().is_terminal(), args.json)
             && !BorgTerminal::fallback_requested();
-    if rich_tui_allowed && let Err(error) = borg_provider::refresh_openrouter_model_catalog().await
-    {
-        tracing::warn!(%error, "OpenRouter model catalog unavailable; keeping current/manual model fallback");
+    if rich_tui_allowed {
+        tokio::spawn(async {
+            if let Err(error) = borg_provider::refresh_openrouter_model_catalog().await {
+                tracing::debug!(%error, "OpenRouter model catalog unavailable; keeping current/manual model fallback");
+            }
+        });
     }
     let fallback_terminal = can_prompt && !rich_tui_allowed;
     let mut initial_prompt = if !args.prompt.is_empty() {
@@ -4564,6 +4567,11 @@ async fn resolve_resume_switch(
     status: SessionStatus,
 ) -> Result<(Uuid, SessionSwitch)> {
     let target = resolve_resume_target(sessions_dir, store, current, value).await?;
+    if store.load_host_launch_metadata(target).await?.is_some() {
+        anyhow::bail!(
+            "this session is still owned by the background Borg remote host; reopen it from the connected remote chat instead of starting a second local writer"
+        );
+    }
     let switch = access.switch(status)?;
     Ok((target, switch))
 }
@@ -4610,10 +4618,14 @@ async fn recent_session_options(
     current_dir: &Path,
     limit: usize,
 ) -> Result<Vec<ResumeSessionOption>> {
-    let session_ids = recent_session_ids(sessions_dir, store).await?;
-    let summaries = store
-        .list_sessions(10_000)
-        .await?
+    fs::create_dir_all(sessions_dir)?;
+    let summaries = store.list_sessions(10_000).await?;
+    let session_ids = summaries
+        .iter()
+        .filter(|summary| session_has_resumable_activity(&summary.state))
+        .map(|summary| summary.session_id)
+        .collect::<Vec<_>>();
+    let summaries = summaries
         .into_iter()
         .map(|summary| (summary.session_id, summary.state))
         .collect::<HashMap<_, _>>();

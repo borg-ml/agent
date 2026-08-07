@@ -1151,6 +1151,34 @@ async fn resume_target_resolves_saved_session_and_skips_current_for_last() {
 }
 
 #[tokio::test]
+async fn resume_switch_rejects_remote_owned_session_before_stopping_current() {
+    let dir = tempdir().expect("session directory");
+    let store = SqliteSessionStore::open(dir.path().join("sessions.sqlite3"))
+        .await
+        .unwrap();
+    let current = Uuid::new_v4();
+    let target = Uuid::new_v4();
+    store.create_session(current).await.unwrap();
+    store.create_session(target).await.unwrap();
+    store
+        .persist_host_launch_metadata(target, &serde_json::json!({ "source": "remote" }))
+        .await
+        .unwrap();
+
+    let error = resolve_resume_switch(
+        dir.path(),
+        &store,
+        current,
+        &target.to_string(),
+        LocalSessionAccess::Owned,
+        SessionStatus::Stopped,
+    )
+    .await
+    .expect_err("remote-owned sessions must not tear down the active TUI");
+    assert!(error.to_string().contains("background Borg remote host"));
+}
+
+#[tokio::test]
 async fn recent_sessions_are_ordered_by_latest_persisted_activity() {
     let dir = tempdir().expect("session directory");
     let store = SqliteSessionStore::open(dir.path().join("sessions.sqlite3"))

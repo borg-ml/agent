@@ -99,8 +99,9 @@ const TOOL_RUN_BOX_THRESHOLD: usize = 8;
 const MAX_COLLAPSED_PLAN_ITEMS: usize = 5;
 
 fn keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
+    // Keep modified/ambiguous keys distinguishable without putting the shell
+    // into Kitty's all-keys-as-escape-sequences mode if cleanup is interrupted.
     KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-        | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
 }
 #[cfg(test)]
 const DEFAULT_TOOL_RUN_VIEWPORT_HEIGHT: usize = 8;
