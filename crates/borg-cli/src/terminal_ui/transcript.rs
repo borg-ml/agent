@@ -528,12 +528,12 @@ impl Transcript {
 
     fn compaction_revert_sequence(&self, index: usize) -> Option<u64> {
         let TranscriptEntry::Compaction {
-            sequence, complete, ..
+            summary, sequence, complete, ..
         } = self.order.get(index)?
         else {
             return None;
         };
-        (*complete && *sequence > 0)
+        (*complete && *sequence > 0 && compaction_has_expandable_detail(summary))
             .then(|| sequence.checked_add(1))
             .flatten()
     }
@@ -2498,8 +2498,6 @@ impl Transcript {
                         } else {
                             " · click to expand · right-click for actions"
                         }
-                    } else if *complete {
-                        " · right-click for actions"
                     } else {
                         ""
                     };
@@ -2969,19 +2967,20 @@ impl Transcript {
     }
 
     fn copy_text(&self) -> Option<String> {
-        self.selected
-            .and_then(|index| self.order.get(index))
-            .and_then(TranscriptEntry::copy_text_owned)
-            .or_else(|| {
-                self.order.iter().rev().find_map(|entry| match entry {
-                    TranscriptEntry::Message {
-                        actor: EventActor::Assistant,
-                        text,
-                        ..
-                    } => Some(markdown_plain_text(text)),
-                    _ => None,
-                })
+        if let Some(index) = self.selected {
+            self.order
+                .get(index)
+                .and_then(TranscriptEntry::copy_text_owned)
+        } else {
+            self.order.iter().rev().find_map(|entry| match entry {
+                TranscriptEntry::Message {
+                    actor: EventActor::Assistant,
+                    text,
+                    ..
+                } => Some(markdown_plain_text(text)),
+                _ => None,
             })
+        }
     }
 
     fn select_previous(&mut self) {

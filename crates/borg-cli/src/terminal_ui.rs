@@ -2923,22 +2923,28 @@ impl BorgTerminal {
             Some(TranscriptEntry::Action { .. }) => ("Action details", vec!["Copy action"]),
             Some(TranscriptEntry::Compaction {
                 complete: true,
+                summary,
                 sequence,
                 ..
-            }) if *sequence > 0 => (
+            }) if *sequence > 0 && compaction_has_expandable_detail(summary) => (
                 "Compaction actions",
                 vec!["Revert to after compaction", "Copy compaction summary"],
             ),
-            Some(TranscriptEntry::Compaction { complete: true, .. }) => {
+            Some(TranscriptEntry::Compaction {
+                complete: true,
+                summary,
+                ..
+            }) if compaction_has_expandable_detail(summary) => {
                 ("Compaction actions", vec!["Copy compaction summary"])
             }
             _ => return UiAction::None,
         };
         self.transcript.selected = Some(index);
-        // A completed compaction advertises an action menu because its
-        // checkpoint may be revertable, and the first checkpoint still needs
-        // a visible way to choose its copy action.  Do not silently execute
-        // the one-option case as we do for ordinary message cards.
+        // A completed compaction with a real summary advertises an action
+        // menu because its checkpoint may be revertable, and the first
+        // checkpoint still needs a visible way to choose its copy action. Do
+        // not silently execute the one-option case as we do for ordinary
+        // message cards.
         let run_directly = self
             .transcript
             .order
@@ -8164,7 +8170,10 @@ impl TranscriptEntry {
                     })
                     .or_else(|| (!detail.trim().is_empty()).then(|| detail.clone()))
             }
-            Self::Compaction { summary, .. } => Some(summary.clone()),
+            Self::Compaction { summary, .. } if compaction_has_expandable_detail(summary) => {
+                Some(summary.clone())
+            }
+            Self::Compaction { .. } => None,
         }
     }
 }

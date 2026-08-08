@@ -5584,6 +5584,15 @@ fn compaction_without_provider_detail_is_not_tautological() {
         .join("\n");
     assert!(!rendered.contains("click to expand"));
     assert!(!rendered.contains("click to collapse"));
+    assert!(!rendered.contains("right-click for actions"));
+    assert!(
+        transcript
+            .order
+            .last()
+            .and_then(TranscriptEntry::copy_text_owned)
+            .is_none()
+    );
+    assert!(transcript.compaction_revert_sequence(0).is_none());
 }
 
 #[test]
@@ -5773,21 +5782,21 @@ fn compaction_completion_updates_the_live_card_and_can_expand() {
         .join("\n");
     assert!(rendered.contains("Compacted context:"));
     assert!(rendered.contains("Retained the durable conversation"));
+    assert!(rendered.contains("right-click for actions"));
 }
 
 #[test]
-fn completed_compaction_copy_action_stays_in_the_context_menu() {
+fn completed_compaction_copy_action_is_not_run_directly() {
     let entry = TranscriptEntry::Compaction {
-        summary: "Context compacted".to_string(),
+        summary: "Compacted context: Retained the durable conversation.".to_string(),
         time: "20:23".to_string(),
         sequence: 0,
         expanded: false,
         complete: true,
     };
 
-    // The first compaction has no valid revert target, but right-click must
-    // still leave its one copy action visible in the menu instead of running
-    // it silently.
+    // The first compaction has no valid revert target, but its real summary
+    // still needs to stay in the one-option action menu.
     assert!(!entry_action_runs_directly(&entry, 1));
 }
 
