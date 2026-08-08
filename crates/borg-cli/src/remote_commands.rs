@@ -838,7 +838,8 @@ impl DeliveredSessionProjection {
         &mut self,
         store: &dyn SessionStore,
         event: &SessionEvent,
-    ) -> Result<()> {
+    ) -> Result<Vec<SessionEvent>> {
+        let mut repaired_events = Vec::new();
         if event.sequence > 0 {
             let mut after = self.state.latest_sequence;
             while event.sequence > after.saturating_add(1) {
@@ -860,10 +861,12 @@ impl DeliveredSessionProjection {
                     );
                     self.observe(&missing_event)?;
                     after = missing_event.sequence;
+                    repaired_events.push(missing_event);
                 }
             }
         }
-        self.observe(event)
+        self.observe(event)?;
+        Ok(repaired_events)
     }
 
     fn observe(&mut self, event: &SessionEvent) -> Result<()> {
@@ -2021,9 +2024,25 @@ async fn run_local_agent_session(
                             ..
                         }
                     );
-                delivered_projection
+                let repaired_events = delivered_projection
                     .observe_from_store(store.as_ref(), &event)
                     .await?;
+                for repaired_event in repaired_events {
+                    if let Some(terminal) = terminal.as_mut() {
+                        terminal_dirty |= terminal.apply_session_event(&repaired_event);
+                        if !history.iter().any(|loaded| {
+                            loaded.sequence > 0 && loaded.sequence == repaired_event.sequence
+                        }) {
+                            let insertion = history
+                                .iter()
+                                .position(|loaded| loaded.sequence > repaired_event.sequence)
+                                .unwrap_or(history.len());
+                            history.insert(insertion, repaired_event);
+                        }
+                    } else if !detached_from_terminal {
+                        render_event(&repaired_event, args.json, &mut rendered)?;
+                    }
+                }
                 if let Some(message_id) = committed_prompt_id(&event.kind) {
                     pending_prompt_ids.remove(&message_id);
                     local_prompt_admissions

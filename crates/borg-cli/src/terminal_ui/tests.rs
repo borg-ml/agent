@@ -4611,6 +4611,13 @@ fn in_progress_steer_materializes_before_the_response_and_settles_on_commit() {
             ..
         }] if text == "follow up"
     ));
+    let rendered = transcript
+        .lines(80)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!rendered.contains("responding"), "{rendered}");
 
     transcript.apply(&message(3, MessageStatus::Complete));
     assert_eq!(transcript.order.len(), 1);

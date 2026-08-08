@@ -481,6 +481,22 @@ async fn delivered_projection_repairs_durable_workflow_events_missing_from_live_
         .await
         .unwrap();
     let initial = store.state(session_id).await.unwrap();
+    let message_id = Uuid::new_v4();
+    store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::Message {
+                message_id,
+                actor: EventActor::User,
+                text: "resumed steer".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::InProgress,
+                delivery: Some(PromptDelivery::Steer),
+            },
+        ))
+        .await
+        .unwrap();
     let workflow_id = Uuid::new_v4();
     for kind in [
         SessionEventKind::BluWorkflowStarted {
@@ -513,11 +529,21 @@ async fn delivered_projection_repairs_durable_workflow_events_missing_from_live_
         .unwrap();
     let mut delivered = DeliveredSessionProjection::new(initial);
 
-    delivered
+    let repaired = delivered
         .observe_from_store(&store, &final_event)
         .await
         .unwrap();
 
+    assert!(repaired.iter().any(|event| matches!(
+        &event.kind,
+        SessionEventKind::Message {
+            message_id: repaired_id,
+            actor: EventActor::User,
+            status: MessageStatus::InProgress,
+            delivery: Some(PromptDelivery::Steer),
+            ..
+        } if *repaired_id == message_id
+    )));
     assert_eq!(delivered.state().latest_sequence, final_event.sequence);
     assert_eq!(delivered.state().status, Some(SessionStatus::Running));
 }

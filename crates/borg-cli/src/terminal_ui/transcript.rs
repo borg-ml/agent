@@ -2194,7 +2194,7 @@ impl Transcript {
                             ),
                         ]));
                     }
-                    if !complete && !running_tool {
+                    if *actor == EventActor::Assistant && !complete && !running_tool {
                         lines.push(Line::from(Span::styled(
                             "    ◌ responding",
                             Style::default().fg(Color::Cyan),
