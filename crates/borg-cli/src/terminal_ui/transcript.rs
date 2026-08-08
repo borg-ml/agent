@@ -1697,6 +1697,13 @@ impl Transcript {
 
     fn context_limit_label(&self) -> String {
         let (status, _) = self.context_status();
+        if !self
+            .config
+            .as_ref()
+            .is_some_and(|config| config.provider == CodingProvider::OpenAiCompatible)
+        {
+            return status;
+        }
         self.context_window_tokens.map_or(status.clone(), |window| {
             format!("{status} · {}", format_context_tokens(window))
         })

@@ -961,8 +961,8 @@ async fn run_agent_session_store_kernel(
     let fresh = initial_state.latest_sequence == 0;
     // A provider process can die after the durable TurnStarted boundary but
     // before its worker lease is installed. Requeue both unleased and expired
-    // in-flight actions before rebuilding the actor's prompt queue. A resumed
-    // session will discard these inputs below instead of replaying them.
+    // in-flight actions before rebuilding the actor's prompt queue. Recovery
+    // promotes every unresolved input at the next safe turn boundary.
     let recovered_actions = store
         .recover_expired_actions(session_id, Utc::now(), 256)
         .await?;
@@ -1124,30 +1124,14 @@ async fn run_agent_session_store_kernel(
         .is_some_and(|goal| goal.status.is_active())
         .then(Instant::now);
     let mut goal_turn_failures = ConsecutiveGoalTurnFailures::default();
-    let mut pending = if fresh {
-        recover_prompts_on_resume(&initial_state, &recovery.queue_events)
-    } else {
-        VecDeque::new()
-    };
-    let mut discarded_prompt_ids = HashSet::new();
-    if !fresh {
-        for prompt in recover_queued_prompts(&recovery.queue_events) {
-            if discarded_prompt_ids.insert(prompt.message_id) {
-                record_recalled_prompt(&mut journal, &events, session_id, &prompt).await?;
-            }
-        }
-    }
+    let mut pending = recover_prompts_on_resume(&recovery.queue_events);
     for action in recovered_actions {
         if let Some(prompt) = queued_prompt_from_action(&action) {
-            if fresh {
-                if !pending
-                    .iter()
-                    .any(|existing| existing.message_id == prompt.message_id)
-                {
-                    pending.push_back(prompt);
-                }
-            } else if discarded_prompt_ids.insert(prompt.message_id) {
-                record_recalled_prompt(&mut journal, &events, session_id, &prompt).await?;
+            if !pending
+                .iter()
+                .any(|existing| existing.message_id == prompt.message_id)
+            {
+                pending.push_back(prompt);
             }
         }
     }
@@ -4666,62 +4650,11 @@ fn retained_compaction_prompt(context: &str) -> String {
     )
 }
 
-fn recover_prompts_on_resume(
-    state: &SessionState,
-    events: &[SessionEvent],
-) -> VecDeque<QueuedPrompt> {
-    // A cleanly stopped/ready session has no unfinished provider turn. Its
-    // durable queue snapshots are historical input, not a request to run the
-    // same prompt the next time the user opens the thread. Active states still
-    // recover in-progress work so a host crash does not lose an admitted turn.
-    if !matches!(
-        state.status,
-        Some(SessionStatus::Starting | SessionStatus::Running | SessionStatus::WaitingForApproval)
-    ) {
-        return VecDeque::new();
-    }
-    // A queued snapshot by itself is not proof that the provider turn was
-    // admitted. It may be an old queue entry left behind by a previous clean
-    // boundary. Only retain it when the same message reached an in-progress
-    // boundary, or when it is an explicit retry after a failed turn.
-    let admitted = events
-        .iter()
-        .filter_map(|event| match &event.kind {
-            SessionEventKind::Message {
-                message_id,
-                status: MessageStatus::InProgress,
-                ..
-            } => Some(*message_id),
-            _ => None,
-        })
-        .collect::<HashSet<_>>();
-    let failed = events
-        .iter()
-        .filter_map(|event| match &event.kind {
-            SessionEventKind::Message {
-                message_id,
-                actor: EventActor::User | EventActor::System,
-                status: MessageStatus::Failed,
-                ..
-            } => Some(*message_id),
-            _ => None,
-        })
-        .collect::<HashSet<_>>();
-    let resumable_events = events
-        .iter()
-        .filter(|event| {
-            !matches!(
-                &event.kind,
-                SessionEventKind::Message {
-                    message_id,
-                    status: MessageStatus::Queued,
-                    ..
-                } if !admitted.contains(message_id) && !failed.contains(message_id)
-            )
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    recover_queued_prompts(&resumable_events)
+fn recover_prompts_on_resume(events: &[SessionEvent]) -> VecDeque<QueuedPrompt> {
+    // A queued message is durable user input, not a disposable snapshot. Keep
+    // every unresolved entry and let the normal boundary drain admit it
+    // without interrupting any provider turn that may still be running.
+    recover_queued_prompts(events)
 }
 
 fn recover_queued_prompts(events: &[SessionEvent]) -> VecDeque<QueuedPrompt> {

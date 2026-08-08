@@ -3898,10 +3898,7 @@ impl BorgTerminal {
                 )
             })
             .count();
-        let Some(target) = user_message_count
-            .checked_sub(1)
-            .and_then(|target| self.rewind_targets.get(target))
-            .cloned()
+        let Some(target) = rewind_target_for_output(user_message_count, &self.rewind_targets)
         else {
             self.notice = Some("No user message precedes this response".to_string());
             return UiAction::None;
@@ -6373,6 +6370,15 @@ fn rewind_targets_from_history(events: &[SessionEvent]) -> Vec<RewindTarget> {
             _ => None,
         })
         .collect()
+}
+
+fn rewind_target_for_output(
+    preceding_user_messages: usize,
+    targets: &[RewindTarget],
+) -> Option<RewindTarget> {
+    targets
+        .get(preceding_user_messages.saturating_sub(1))
+        .cloned()
 }
 
 fn replace_root_transcript_history(

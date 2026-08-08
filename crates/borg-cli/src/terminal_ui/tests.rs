@@ -277,6 +277,22 @@ fn history_replacement_rebuilds_rewind_targets_for_the_full_transcript() {
 }
 
 #[test]
+fn first_response_rewind_uses_the_first_prompt_as_its_fork_target() {
+    let target = rewind_target_for_output(
+        0,
+        &[RewindTarget {
+            sequence: 7,
+            text: "first prompt".to_string(),
+            attachments: Vec::new(),
+        }],
+    )
+    .expect("the first prompt is a rewind target");
+
+    assert_eq!(target.sequence, 7);
+    assert_eq!(target.text, "first prompt");
+}
+
+#[test]
 fn child_history_merge_prefers_completion_over_a_late_partial_snapshot() {
     let session_id = Uuid::new_v4();
     let message_id = Uuid::new_v4();
@@ -1771,6 +1787,19 @@ fn context_limit_label_includes_window_and_tooltip_details() {
     transcript.apply(&SessionEvent::new(
         session_id,
         1,
+        SessionEventKind::SessionConfigured {
+            cwd: PathBuf::from("/workspace"),
+            provider: CodingProvider::OpenAiCompatible,
+            model: Some("local-model".to_string()),
+            effort: Some("medium".to_string()),
+            fast: false,
+            response_language: ResponseLanguage::Auto,
+            permission_mode: PermissionMode::FullAccess,
+        },
+    ));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        2,
         SessionEventKind::ContextWindowUpdated {
             context_tokens: 137_000,
             context_window_tokens: 258_400,
@@ -1786,6 +1815,39 @@ fn context_limit_label_includes_window_and_tooltip_details() {
         "137k used of 258.4k window · 49% context left"
     );
     assert_eq!(format_context_tokens(1_000_000), "1m");
+}
+
+#[test]
+fn fixed_provider_context_label_hides_the_unchangeable_window_size() {
+    let session_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::SessionConfigured {
+            cwd: PathBuf::from("/workspace"),
+            provider: CodingProvider::Codex,
+            model: Some("gpt-5.6-sol".to_string()),
+            effort: Some("medium".to_string()),
+            fast: false,
+            response_language: ResponseLanguage::Auto,
+            permission_mode: PermissionMode::FullAccess,
+        },
+    ));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::ContextWindowUpdated {
+            context_tokens: 137_000,
+            context_window_tokens: 258_400,
+        },
+    ));
+
+    assert_eq!(transcript.context_limit_label(), "49% context left");
+    assert_eq!(
+        transcript.context_tooltip(),
+        "137k used of 258.4k window · 49% context left"
+    );
 }
 
 #[test]

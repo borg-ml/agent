@@ -5145,7 +5145,7 @@ fn queued_prompt_recovery_preserves_fifo_and_excludes_settled_messages() {
 }
 
 #[test]
-fn idle_resume_drops_old_queue_snapshots_but_active_resume_recovers_work() {
+fn resume_recovers_unresolved_queue_entries_for_any_session_status() {
     let session_id = Uuid::new_v4();
     let message_id = Uuid::new_v4();
     let queued = SessionEvent::new(
@@ -5173,53 +5173,33 @@ fn idle_resume_drops_old_queue_snapshots_but_active_resume_recovers_work() {
         },
     );
 
-    assert!(
-        recover_prompts_on_resume(
-            &SessionState {
-                status: Some(SessionStatus::Ready),
-                ..SessionState::default()
-            },
-            &[queued.clone()],
-        )
-        .is_empty()
-    );
+    let recovered = recover_prompts_on_resume(&[queued.clone()]);
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].message_id, message_id);
+    assert_eq!(recovered[0].text, "do not replay this old queue entry");
 
-    let recovered = recover_prompts_on_resume(
-        &SessionState {
-            status: Some(SessionStatus::Running),
-            ..SessionState::default()
-        },
-        &[queued, in_progress],
-    );
+    let recovered = recover_prompts_on_resume(&[queued, in_progress]);
     assert_eq!(recovered.len(), 1);
     assert_eq!(recovered[0].message_id, message_id);
     assert_eq!(recovered[0].text, "recover this admitted turn");
 
-    assert!(
-        recover_prompts_on_resume(
-            &SessionState {
-                status: Some(SessionStatus::Running),
-                ..SessionState::default()
-            },
-            &[SessionEvent::new(
-                session_id,
-                3,
-                SessionEventKind::Message {
-                    message_id: Uuid::new_v4(),
-                    actor: EventActor::User,
-                    text: "old queue entry without an admitted turn".to_string(),
-                    attachments: Vec::new(),
-                    status: MessageStatus::Queued,
-                    delivery: Some(PromptDelivery::Queue),
-                },
-            )],
-        )
-        .is_empty()
-    );
+    let recovered = recover_prompts_on_resume(&[SessionEvent::new(
+        session_id,
+        3,
+        SessionEventKind::Message {
+            message_id: Uuid::new_v4(),
+            actor: EventActor::User,
+            text: "old queue entry without an admitted turn".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Queued,
+            delivery: Some(PromptDelivery::Queue),
+        },
+    )]);
+    assert_eq!(recovered.len(), 1);
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn resumed_session_discards_stale_input_and_context_usage() {
+async fn resumed_session_drains_unresolved_input_and_resets_context_usage() {
     let root = tempdir().unwrap();
     let journal_path = root.path().join("session.lock");
     let session_id = Uuid::new_v4();
@@ -5315,15 +5295,16 @@ async fn resumed_session_discards_stale_input_and_context_usage() {
             let event = event_rx.recv().await.expect("session remains live");
             if matches!(
                 event.kind,
-                SessionEventKind::PromptRecalled { message_id, .. } if message_id == stale_id
+                SessionEventKind::TurnCompleted { message_id, error: None, .. }
+                    if message_id == stale_id
             ) {
                 break;
             }
         }
     })
     .await
-    .expect("stale input is recalled during resume");
-    assert!(seen.lock().unwrap().is_empty());
+    .expect("unresolved input starts and completes during resume");
+    assert_eq!(seen.lock().unwrap().len(), 1);
     assert!(
         store
             .live_events_after(session_id, 0)
@@ -5350,9 +5331,20 @@ async fn resumed_session_discards_stale_input_and_context_usage() {
         })
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(1), called.notified())
-        .await
-        .expect("fresh input starts a turn");
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let event = event_rx.recv().await.expect("session remains live");
+            if matches!(
+                event.kind,
+                SessionEventKind::TurnCompleted { message_id, error: None, .. }
+                    if message_id == next_id
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("fresh input starts a turn");
     command_tx
         .send(HostCommand::Stop { session_id })
         .await
@@ -5366,7 +5358,7 @@ async fn resumed_session_discards_stale_input_and_context_usage() {
             .unwrap()
             .unwrap()
             .state,
-        crate::SessionActionState::Cancelled
+        crate::SessionActionState::Completed
     );
 }
 
