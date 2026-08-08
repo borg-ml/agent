@@ -6270,6 +6270,8 @@ fn remote_command_name(command: &HostCommand) -> &'static str {
         HostCommand::CancelWorkspaceFilesystem { .. } => "cancel workspace filesystem",
         HostCommand::WorkspaceCommand { .. } => "workspace command",
         HostCommand::CancelWorkspaceCommand { .. } => "cancel workspace command",
+        HostCommand::ShellCommand { .. } => "shell command",
+        HostCommand::OpenTerminal { .. } => "open terminal",
     }
 }
 

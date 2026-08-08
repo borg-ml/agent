@@ -7863,11 +7863,13 @@ fn update_queued_prompts(
 ) {
     match event {
         SessionEventKind::Message {
+            message_id,
             actor: EventActor::User,
+            text,
             status: MessageStatus::InProgress,
-            delivery: Some(PromptDelivery::Steer),
+            delivery: Some(delivery @ PromptDelivery::Steer),
             ..
-        } => {}
+        } => push_queued_prompt(queued_prompts, *message_id, text.clone(), *delivery),
         SessionEventKind::Message {
             message_id,
             actor: EventActor::User,

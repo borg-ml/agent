@@ -4387,6 +4387,22 @@ fn picker_numbers_are_visible_and_select_immediately() {
 fn accepted_steer_stays_pending_until_user_message_commit() {
     let message_id = Uuid::new_v4();
     let mut queue = Vec::new();
+    // A resumed session may hydrate the durable in-progress boundary without
+    // replaying the earlier optimistic/queued projection.
+    update_queued_prompts(
+        &mut queue,
+        &SessionEventKind::Message {
+            message_id,
+            actor: EventActor::User,
+            text: "follow up".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::InProgress,
+            delivery: Some(PromptDelivery::Steer),
+        },
+    );
+    assert_eq!(queue.len(), 1);
+    assert_eq!(queue[0].message_id, message_id);
+
     update_queued_prompts(
         &mut queue,
         &SessionEventKind::Message {
