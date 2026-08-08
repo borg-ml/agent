@@ -916,7 +916,9 @@ struct EmptyThenSuccessExecutor {
 
 struct HungProviderExecutor;
 
-struct CompletedThenHungExecutor;
+struct NarrationThenDelayedCompletionExecutor;
+
+struct ReadyThenHungExecutor;
 
 struct CleanupBarrierExecutor {
     started: Arc<Notify>,
@@ -938,7 +940,52 @@ impl AgentTurnExecutor for HungProviderExecutor {
 }
 
 #[async_trait::async_trait]
-impl AgentTurnExecutor for CompletedThenHungExecutor {
+impl AgentTurnExecutor for NarrationThenDelayedCompletionExecutor {
+    async fn execute(
+        &self,
+        turn: AgentTurn,
+        events: mpsc::Sender<SessionEventKind>,
+        _controls: Option<mpsc::Receiver<AgentTurnControl>>,
+    ) -> Result<AgentTurnResult> {
+        events
+            .send(SessionEventKind::Message {
+                message_id: Uuid::new_v4(),
+                actor: EventActor::Assistant,
+                text: "I am starting the consultation now.".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(PROVIDER_DRAIN_LIVENESS_TIMEOUT + Duration::from_millis(50)).await;
+        events
+            .send(SessionEventKind::Message {
+                message_id: turn.message_id,
+                actor: EventActor::Assistant,
+                text: "consultation complete".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            })
+            .await
+            .unwrap();
+        events
+            .send(SessionEventKind::StatusChanged {
+                status: SessionStatus::Ready,
+                detail: None,
+            })
+            .await
+            .unwrap();
+        Ok(AgentTurnResult {
+            provider_session_id: Some("provider-session".to_string()),
+            final_text: "consultation complete".to_string(),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentTurnExecutor for ReadyThenHungExecutor {
     async fn execute(
         &self,
         turn: AgentTurn,
@@ -953,6 +1000,13 @@ impl AgentTurnExecutor for CompletedThenHungExecutor {
                 attachments: Vec::new(),
                 status: MessageStatus::Complete,
                 delivery: None,
+            })
+            .await
+            .unwrap();
+        events
+            .send(SessionEventKind::StatusChanged {
+                status: SessionStatus::Ready,
+                detail: None,
             })
             .await
             .unwrap();
@@ -1686,7 +1740,89 @@ async fn provider_setup_stall_has_a_durable_terminal_boundary() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn completed_assistant_message_has_a_bounded_provider_drain() {
+async fn intermediate_narration_does_not_start_provider_drain_timeout() {
+    let root = tempdir().unwrap();
+    let journal_path = root.path().join("session.lock");
+    let session_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    let (command_tx, command_rx) = mpsc::channel(8);
+    let (event_tx, mut event_rx) = mpsc::channel(64);
+    let actor = tokio::spawn({
+        let journal_path = journal_path.clone();
+        let cwd = root.path().to_path_buf();
+        async move {
+            run_agent_session_with_executor(
+                &journal_path,
+                session_id,
+                LaunchSession {
+                    request_id: message_id,
+                    cwd,
+                    provider: CodingProvider::Claude,
+                    model: None,
+                    effort: None,
+                    fast: Some(false),
+                    response_language: crate::ResponseLanguage::Auto,
+                    permission_mode: PermissionMode::Manual,
+                    name: None,
+                    initial_prompt: Some("consult the peer".to_string()),
+                    capabilities: Default::default(),
+                    subagent_concurrency_limit: None,
+                    extension_skill_roots: Vec::new(),
+                    team_policy: None,
+                },
+                command_rx,
+                event_tx,
+                Arc::new(NarrationThenDelayedCompletionExecutor),
+            )
+            .await
+        }
+    });
+
+    let mut observed = Vec::new();
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+            .await
+            .expect("delayed consultation remains live");
+        let Some(event) = event else {
+            panic!("session ended early: {:?}", actor.await.unwrap());
+        };
+        let ready = matches!(
+            event.kind,
+            SessionEventKind::StatusChanged {
+                status: SessionStatus::Ready,
+                ..
+            }
+        );
+        observed.push(event.kind);
+        if ready {
+            break;
+        }
+    }
+
+    command_tx
+        .send(HostCommand::Stop { session_id })
+        .await
+        .unwrap();
+    actor.await.unwrap().unwrap();
+
+    assert!(observed.iter().any(|kind| matches!(
+        kind,
+        SessionEventKind::TurnCompleted {
+            message_id: completed_id,
+            final_text,
+            error: None,
+            ..
+        } if *completed_id == message_id && final_text == "consultation complete"
+    )));
+    assert!(!observed.iter().any(|kind| matches!(
+        kind,
+        SessionEventKind::Error { message }
+            if message.contains("provider draining")
+    )));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn executor_ready_has_a_bounded_provider_drain() {
     let root = tempdir().unwrap();
     let journal_path = root.path().join("session.lock");
     let session_id = Uuid::new_v4();
@@ -1718,7 +1854,7 @@ async fn completed_assistant_message_has_a_bounded_provider_drain() {
                 },
                 command_rx,
                 event_tx,
-                Arc::new(CompletedThenHungExecutor),
+                Arc::new(ReadyThenHungExecutor),
             )
             .await
         }

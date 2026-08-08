@@ -2566,6 +2566,12 @@ async fn run_agent_session_store_kernel(
                         continue;
                     };
                     if is_executor_lifecycle_status(&kind) {
+                        if executor_reports_provider_drained(&kind) {
+                            turn_phase = TurnPhase::Draining;
+                            liveness_deadline.as_mut().reset(
+                                tokio::time::Instant::now() + turn_phase.liveness_timeout()
+                            );
+                        }
                         continue;
                     }
                     turn_had_side_effects |= provider_event_has_side_effect(&kind);
@@ -2580,13 +2586,6 @@ async fn run_agent_session_store_kernel(
                                 detail: Some(turn_phase.detail().to_string()),
                             },
                         ).await?;
-                    }
-                    if provider_event_is_terminal_message(&kind) {
-                        turn_phase = TurnPhase::Draining;
-                    } else if turn_phase == TurnPhase::Draining
-                        && provider_event_has_side_effect(&kind)
-                    {
-                        turn_phase = TurnPhase::Active;
                     }
                     liveness_deadline.as_mut().reset(
                         tokio::time::Instant::now() + turn_phase.liveness_timeout()
@@ -5144,6 +5143,16 @@ fn is_executor_lifecycle_status(kind: &SessionEventKind) -> bool {
     )
 }
 
+fn executor_reports_provider_drained(kind: &SessionEventKind) -> bool {
+    matches!(
+        kind,
+        SessionEventKind::StatusChanged {
+            status: SessionStatus::Ready,
+            ..
+        }
+    )
+}
+
 fn provider_event_is_steer_boundary(kind: &SessionEventKind) -> bool {
     matches!(
         kind,
@@ -6114,17 +6123,6 @@ fn provider_event_has_side_effect(kind: &SessionEventKind) -> bool {
             | SessionEventKind::ApprovalResolved { .. }
             | SessionEventKind::ProviderInteractionRequested { .. }
             | SessionEventKind::ProviderInteractionResolved { .. }
-    )
-}
-
-fn provider_event_is_terminal_message(kind: &SessionEventKind) -> bool {
-    matches!(
-        kind,
-        SessionEventKind::Message {
-            actor: EventActor::Assistant,
-            status: MessageStatus::Complete,
-            ..
-        }
     )
 }
 
