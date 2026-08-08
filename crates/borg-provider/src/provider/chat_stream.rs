@@ -2147,22 +2147,43 @@ fn codex_subscription_event_kind(value: &Value, raw_kind: &str) -> String {
 struct CodexReasoningState {
     /// Codex has emitted both incremental deltas and cumulative snapshots
     /// across app-server versions. Track each reasoning item separately and
-    /// normalize either wire form into one incremental stream.
-    streams: HashMap<String, String>,
+    /// normalize either wire form into one incremental stream. Each
+    /// summaryIndex is a separate summary part and needs an explicit boundary.
+    streams: HashMap<(String, Option<u64>), String>,
+    aggregates: HashMap<String, String>,
 }
 
 impl CodexReasoningState {
     fn observe_delta(&mut self, value: &Value, incoming: &str) -> Option<String> {
-        let key = codex_reasoning_stream_key(value);
-        let previous = self.streams.entry(key).or_default();
-        let emitted = normalize_provider_delta(previous, incoming);
+        let (item_id, summary_index) = codex_reasoning_stream_key(value);
+        let key = (item_id.clone(), summary_index);
+        let previous = self.streams.get(&key).cloned().unwrap_or_default();
+        let emitted = normalize_provider_delta(&previous, incoming);
         if incoming.starts_with(previous.as_str()) {
-            previous.clear();
-            previous.push_str(incoming);
+            self.streams.insert(key, incoming.to_string());
         } else if previous.starts_with(incoming) {
             // A reconnect or lifecycle boundary replayed an older snapshot.
         } else {
-            previous.push_str(&emitted);
+            self.streams.insert(key, format!("{previous}{emitted}"));
+        }
+        self.emit_aggregate_delta(&item_id)
+    }
+
+    fn completion_suffix(&mut self, value: &Value, aggregate: &str) -> Option<String> {
+        let item_id = codex_reasoning_item_id(value);
+        let previous = self
+            .aggregates
+            .get(&item_id)
+            .cloned()
+            .unwrap_or_else(|| self.assembled_stream(&item_id));
+        let emitted = normalize_provider_delta(&previous, aggregate);
+        if aggregate.starts_with(previous.as_str()) {
+            self.aggregates.insert(item_id, aggregate.to_string());
+        } else if previous.starts_with(aggregate) {
+            // The completed item carried a shorter snapshot than the stream.
+        } else {
+            self.aggregates
+                .insert(item_id, format!("{previous}{emitted}"));
         }
         if emitted.is_empty() {
             return None;
@@ -2170,32 +2191,40 @@ impl CodexReasoningState {
         Some(emitted)
     }
 
-    fn completion_suffix(&mut self, value: &Value, aggregate: &str) -> Option<String> {
-        let mut key = codex_reasoning_stream_key(value);
-        if !self.streams.contains_key(&key)
-            && let Some(prefix) = key.strip_suffix(":-")
-            && let Some(existing) = self
-                .streams
-                .keys()
-                .find(|candidate| candidate.starts_with(&format!("{prefix}:")))
-                .cloned()
-        {
-            key = existing;
+    fn emit_aggregate_delta(&mut self, item_id: &str) -> Option<String> {
+        let assembled = self.assembled_stream(item_id);
+        let previous = self.aggregates.get(item_id).cloned().unwrap_or_default();
+        let emitted = normalize_provider_delta(&previous, &assembled);
+        if assembled.starts_with(previous.as_str()) {
+            self.aggregates.insert(item_id.to_string(), assembled);
+        } else if !previous.starts_with(assembled.as_str()) {
+            self.aggregates
+                .insert(item_id.to_string(), format!("{previous}{emitted}"));
         }
-        let previous = self.streams.entry(key).or_default();
-        let emitted = normalize_provider_delta(previous, aggregate);
-        if aggregate.starts_with(previous.as_str()) {
-            previous.clear();
-            previous.push_str(aggregate);
-        } else if previous.starts_with(aggregate) {
-            // The completed item carried a shorter snapshot than the stream.
-        } else {
-            previous.push_str(&emitted);
+        (!emitted.is_empty()).then_some(emitted)
+    }
+
+    fn assembled_stream(&self, item_id: &str) -> String {
+        let mut parts = self
+            .streams
+            .iter()
+            .filter_map(|((stream_item_id, summary_index), text)| {
+                (stream_item_id == item_id).then_some((*summary_index, text.as_str()))
+            })
+            .collect::<Vec<_>>();
+        parts.sort_by_key(|(summary_index, _)| summary_index.unwrap_or_default());
+
+        let mut assembled = String::new();
+        for (_, part) in parts {
+            if part.is_empty() {
+                continue;
+            }
+            if !assembled.is_empty() && !assembled.ends_with('\n') && !part.starts_with('\n') {
+                assembled.push('\n');
+            }
+            assembled.push_str(part);
         }
-        if emitted.is_empty() {
-            return None;
-        }
-        Some(emitted)
+        assembled
     }
 }
 
@@ -2222,17 +2251,22 @@ fn longest_suffix_prefix_overlap(left: &str, right: &str) -> usize {
         .unwrap_or(0)
 }
 
-fn codex_reasoning_stream_key(value: &Value) -> String {
-    let item_id = codex_event_item(value)
-        .and_then(|item| item.get("id"))
-        .and_then(Value::as_str)
-        .or_else(|| value.pointer("/params/itemId").and_then(Value::as_str))
-        .unwrap_or("default");
+fn codex_reasoning_stream_key(value: &Value) -> (String, Option<u64>) {
+    let item_id = codex_reasoning_item_id(value);
     let summary_index = value
         .pointer("/params/summaryIndex")
         .or_else(|| codex_event_item(value).and_then(|item| item.get("summaryIndex")))
-        .map_or_else(|| "-".to_string(), Value::to_string);
-    format!("{item_id}:{summary_index}")
+        .and_then(Value::as_u64);
+    (item_id, summary_index)
+}
+
+fn codex_reasoning_item_id(value: &Value) -> String {
+    codex_event_item(value)
+        .and_then(|item| item.get("id"))
+        .and_then(Value::as_str)
+        .or_else(|| value.pointer("/params/itemId").and_then(Value::as_str))
+        .unwrap_or("default")
+        .to_string()
 }
 
 #[cfg(test)]
@@ -2489,7 +2523,30 @@ fn codex_agent_message_text(item: &Value) -> Option<String> {
 }
 
 fn codex_reasoning_text(item: &Value) -> Option<String> {
-    codex_text_field(item, &["summary", "text", "content", "reasoning"])
+    ["summary", "text", "content", "reasoning"]
+        .iter()
+        .find_map(|field| item.get(*field).and_then(codex_reasoning_text_value))
+        .filter(|text| !text.trim().is_empty())
+}
+
+fn codex_reasoning_text_value(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(text.clone()),
+        Value::Array(items) => {
+            let text = items
+                .iter()
+                .filter_map(codex_reasoning_text_value)
+                .collect::<Vec<_>>()
+                .join("\n");
+            (!text.is_empty()).then_some(text)
+        }
+        Value::Object(object) => object
+            .get("text")
+            .or_else(|| object.get("summary"))
+            .or_else(|| object.get("content"))
+            .and_then(codex_reasoning_text_value),
+        _ => None,
+    }
 }
 
 fn codex_text_field(item: &Value, fields: &[&str]) -> Option<String> {
@@ -3361,6 +3418,70 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn codex_reasoning_summary_parts_preserve_newlines_without_completion_replay() {
+        let (sender, mut receiver) = mpsc::channel(8);
+        let mut state = CodexReasoningState::default();
+        let mut text = String::new();
+        let mut final_text = None;
+        let parts = [
+            "Confirming no official GPT-6/Astra",
+            "Assessing bottlenecks for GPT-6/Astra",
+            "Prioritizing Gate0 recurrence task",
+        ];
+
+        for (summary_index, part) in parts.iter().enumerate() {
+            observe_codex_output_event(
+                &sender,
+                &serde_json::json!({
+                    "method": "item/reasoning/summaryTextDelta",
+                    "params": {
+                        "delta": part,
+                        "itemId": "reasoning-1",
+                        "summaryIndex": summary_index
+                    }
+                }),
+                &mut state,
+                &mut text,
+                &mut final_text,
+            )
+            .await;
+        }
+
+        let mut emitted = String::new();
+        for _ in &parts {
+            match receiver.recv().await {
+                Some(ChatStreamEvent::ReasoningDelta(delta)) => emitted.push_str(&delta),
+                event => panic!("unexpected Codex reasoning event: {event:?}"),
+            }
+        }
+        assert_eq!(emitted, parts.join("\n"));
+
+        observe_codex_output_event(
+            &sender,
+            &serde_json::json!({
+                "method": "item/completed",
+                "params": {
+                    "item": {
+                        "id": "reasoning-1",
+                        "type": "reasoning",
+                        "summary": parts
+                    }
+                }
+            }),
+            &mut state,
+            &mut text,
+            &mut final_text,
+        )
+        .await;
+
+        assert!(matches!(
+            receiver.recv().await,
+            Some(ChatStreamEvent::Phase { name, .. }) if name == "reasoning_completed"
+        ));
+        assert!(receiver.try_recv().is_err());
     }
 
     #[test]
