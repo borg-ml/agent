@@ -6500,11 +6500,21 @@ fn reusable_subscription_context_does_not_compact_the_full_replay() {
 }
 
 #[test]
-fn subscription_context_usage_prevents_character_limit_compaction_with_headroom() {
-    let context = "x".repeat(SUBSCRIPTION_INPUT_BUDGET_CHARS * 4);
+fn subscription_context_usage_cannot_bypass_the_character_limit() {
+    let oversized_context = "x".repeat(SUBSCRIPTION_INPUT_BUDGET_CHARS * 4);
 
+    assert!(subscription_context_needs_compaction(
+        &oversized_context,
+        EventActor::User,
+        "continue",
+        false,
+        Some(179_468),
+        Some(258_400),
+    ));
+
+    let context_within_input_limit = "x".repeat(SUBSCRIPTION_INPUT_BUDGET_CHARS / 2);
     assert!(!subscription_context_needs_compaction(
-        &context,
+        &context_within_input_limit,
         EventActor::User,
         "continue",
         false,
@@ -6512,7 +6522,7 @@ fn subscription_context_usage_prevents_character_limit_compaction_with_headroom(
         Some(258_400),
     ));
     assert!(subscription_context_needs_compaction(
-        &context,
+        &context_within_input_limit,
         EventActor::User,
         "continue",
         false,

@@ -30,10 +30,12 @@ two traces to identify the first divergent tick and position error. `log`
 returns recorder metadata and a bounded window from the same persistent log as
 `trace`.
 
-The lab launcher uses an already-built `surf_lab` executable (release first,
-then debug) so MCP startup does not block on a Cargo build. Set
-`SURF_LAB_BIN` to override the executable path or `SURF_LAB_ROOT` to override
-the sibling Surf checkout. The lab runs a renderer-free Bevy/Avian world using
+The lab launcher uses an already-built `surf_lab` executable and refuses to
+select one older than the Surf source tree, so MCP startup does not block on a
+Cargo build or silently run stale physics. It selects the freshest release or
+debug binary; set `SURF_LAB_BIN` to explicitly override this check, or set
+`SURF_LAB_ROOT` to override the sibling Surf checkout. The lab runs a
+renderer-free Bevy/Avian world using
 the game's course setup, static collision representation, player hull,
 fixed-step controller, and spatial queries. With `map` set to a Source BSP
 path, it uses the same BSP loader and imported collision geometry as the game;
@@ -99,6 +101,10 @@ comparison = env.call("policy.compare", {
 commands establish the physics/reference error, while the frozen policy
 establishes controller-plus-physics error. Read the action-agreement metrics
 before attributing a learned-policy failure to collision or movement physics.
+The exact-reference result also reports the first divergent movement phase
+(`after_acceleration`, `after_move`, or `final`) and source-BSP contacts include
+raw brush and plane IDs, so a mismatch can be localized before changing the
+physics authority.
 `policy.evolve` performs a bounded deterministic yaw-perturbation search around
 the frozen policy and returns a trajectory certificate; it never changes policy
 weights or the physics authority. Use `policy.inspect` to validate a saved

@@ -2185,7 +2185,6 @@ async fn run_agent_session_store_kernel(
         };
         if !launch.provider.uses_native_harness()
             && subscription_input_chars > SUBSCRIPTION_INPUT_BUDGET_CHARS
-            && !usable_context_usage(subscription_context_usage.0, subscription_context_usage.1)
         {
             let message = format!(
                 "provider input remains {} characters after compaction; refusing an over-limit subscription request (budget {} characters)",
@@ -3970,6 +3969,11 @@ fn subscription_context_needs_compaction(
     if provider_context_reusable {
         return false;
     }
+    if subscription_prompt_chars(Some(retained_context), actor, text)
+        > SUBSCRIPTION_INPUT_BUDGET_CHARS
+    {
+        return true;
+    }
     if usable_context_usage(context_tokens, context_window_tokens) {
         let current_prompt_tokens =
             chars_to_token_estimate(subscription_prompt_chars(None, actor, text));
@@ -3980,7 +3984,7 @@ fn subscription_context_needs_compaction(
             >= u128::from(context_window_tokens.expect("usable context usage includes window"))
                 .saturating_mul(100 - u128::from(AUTO_COMPACT_REMAINING_PERCENT));
     }
-    subscription_prompt_chars(Some(retained_context), actor, text) > SUBSCRIPTION_INPUT_BUDGET_CHARS
+    false
 }
 
 fn usable_context_usage(context_tokens: Option<u64>, context_window_tokens: Option<u64>) -> bool {
