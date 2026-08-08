@@ -7862,6 +7862,9 @@ fn update_queued_prompts(
     event: &SessionEventKind,
 ) {
     match event {
+        SessionEventKind::TurnStarted { message_id, .. } => {
+            queued_prompts.retain(|queued| queued.message_id != *message_id);
+        }
         SessionEventKind::Message {
             message_id,
             actor: EventActor::User,

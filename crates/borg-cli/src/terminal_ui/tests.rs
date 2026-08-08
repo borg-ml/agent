@@ -4452,6 +4452,34 @@ fn accepted_steer_stays_pending_until_user_message_commit() {
 }
 
 #[test]
+fn turn_start_promotes_a_resumed_steer_out_of_pending_input() {
+    let message_id = Uuid::new_v4();
+    let mut queue = Vec::new();
+    update_queued_prompts(
+        &mut queue,
+        &SessionEventKind::Message {
+            message_id,
+            actor: EventActor::User,
+            text: "follow up".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::InProgress,
+            delivery: Some(PromptDelivery::Steer),
+        },
+    );
+    update_queued_prompts(
+        &mut queue,
+        &SessionEventKind::TurnStarted {
+            message_id,
+            provider: CodingProvider::Codex,
+            model: None,
+            effort: None,
+            fast: false,
+        },
+    );
+    assert!(queue.is_empty());
+}
+
+#[test]
 fn optimistic_idle_submission_is_visible_before_session_persistence() {
     let session_id = Uuid::new_v4();
     let message_id = Uuid::new_v4();
@@ -4553,7 +4581,7 @@ fn optimistic_idle_submission_immediately_hides_cold_cache_guidance() {
 }
 
 #[test]
-fn in_progress_steer_never_materializes_as_a_responding_message() {
+fn in_progress_steer_materializes_before_the_response_and_settles_on_commit() {
     let session_id = Uuid::new_v4();
     let message_id = Uuid::new_v4();
     let message = |sequence, status| {
@@ -4574,7 +4602,15 @@ fn in_progress_steer_never_materializes_as_a_responding_message() {
 
     transcript.apply(&message(1, MessageStatus::Queued));
     transcript.apply(&message(2, MessageStatus::InProgress));
-    assert!(transcript.order.is_empty());
+    assert!(matches!(
+        transcript.order.as_slice(),
+        [TranscriptEntry::Message {
+            actor: EventActor::User,
+            text,
+            complete: false,
+            ..
+        }] if text == "follow up"
+    ));
 
     transcript.apply(&message(3, MessageStatus::Complete));
     assert_eq!(transcript.order.len(), 1);

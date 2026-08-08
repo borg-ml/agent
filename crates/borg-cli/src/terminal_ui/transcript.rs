@@ -927,7 +927,7 @@ impl Transcript {
                 text,
                 status,
                 attachments,
-                delivery,
+                delivery: _,
             } => {
                 // A coalesced live snapshot can arrive after its durable
                 // terminal boundary during reconnect. Never resurrect a
@@ -957,17 +957,6 @@ impl Transcript {
                     // in-progress transcript row. If the turn is interrupted,
                     // its later queue transition must withdraw that row again.
                     removed_entry = self.remove_message(*message_id);
-                    return removed_entry;
-                }
-                // A transport-level provider acknowledgement is not yet a
-                // real user-message boundary. Keep an acknowledged steer in
-                // the pending-input panel until its provider commit;
-                // this also suppresses stale InProgress events written by
-                // older runtimes when resuming a session.
-                if *actor == EventActor::User
-                    && *status == MessageStatus::InProgress
-                    && *delivery == Some(PromptDelivery::Steer)
-                {
                     return removed_entry;
                 }
                 if *actor == EventActor::Assistant && text.trim().is_empty() {
@@ -1031,9 +1020,15 @@ impl Transcript {
                     {
                         self.collapse_previous_edit();
                     }
+                    let queued = self.queued_messages.remove(message_id);
                     let insertion_index = if *actor == EventActor::User
-                        && matches!(status, MessageStatus::Complete | MessageStatus::Failed)
-                        && !self.queued_messages.remove(message_id)
+                        && matches!(
+                            status,
+                            MessageStatus::Complete
+                                | MessageStatus::Failed
+                                | MessageStatus::InProgress
+                        )
+                        && !queued
                     {
                         self.late_user_message_insertion_index()
                     } else {
