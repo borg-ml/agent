@@ -21,7 +21,7 @@ Environment calls preserve the standard MCP response envelope; Surf Lab puts
 its structured JSON payload in the first text content block.
 
 The environment exposes `start`, `step`, `observe`, `trace`, `log`, `branch`,
-`compare`, `policy.train`, `policy.inspect`, `policy.compare`, `policy.evolve`,
+`compare`, `replay.audit`, `policy.train`, `policy.inspect`, `policy.compare`, `policy.evolve`,
 `map.generate`, `map.inspect`, `map.preview`, `map.route`, `map.export`, and
 `config`. Keep the returned session id in the persistent
 namespace. Use `step` with bounded batches, save the observations, branch at a
@@ -50,8 +50,9 @@ MCP tool names containing punctuation are exposed to the runtime with
 runtime-safe underscores (for example, `map.generate` appears in `tools()` as
 `map_generate`), while `env.call("map.generate", ...)` remains accepted.
 
-Every simulated tick is appended to a per-episode JSONL log and flushed as the
-episode advances. Responses intentionally expose bounded observation windows;
+Every simulated tick is appended to a lossless per-episode JSONL log. The log
+flushes every 64 ticks by default; set `SURF_LAB_FLUSH_INTERVAL=1` when strict
+per-tick crash durability is needed. Responses intentionally expose bounded observation windows;
 the model should use batches and query evidence after the run rather than try
 to steer a 66/165 Hz loop interactively. The extension log is the high-rate
 authority; Borg's canonical journal records the bounded MCP queries and their
@@ -104,7 +105,12 @@ before attributing a learned-policy failure to collision or movement physics.
 The exact-reference result also reports the first divergent movement phase
 (`after_acceleration`, `after_move`, or `final`) and source-BSP contacts include
 raw brush and plane IDs, so a mismatch can be localized before changing the
-physics authority.
+physics authority. For physics-only work, `replay.audit` runs the exact KSF
+command path without a policy artifact and returns effective movement
+parameters, coordinate scale, trajectory metrics, and a durable trace path. Use
+`diagnostics: "full"` for contact/phase evidence or `diagnostics: "compact"`
+for throughput-sensitive sweeps. Evolution candidates automatically use the
+compact state-only recorder because their score does not depend on contacts.
 `policy.evolve` performs a bounded deterministic yaw-perturbation search around
 the frozen policy and returns a trajectory certificate; it never changes policy
 weights or the physics authority. Use `policy.inspect` to validate a saved
