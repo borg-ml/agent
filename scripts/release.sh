@@ -187,11 +187,16 @@ prebumped_release_commit() {
   return 1
 }
 
-run_release_checks() {
+run_release_checks() (
+  local repo_root test_tmp
+  repo_root="$(git rev-parse --show-toplevel)"
+  mkdir -p "$repo_root/target"
+  test_tmp="$(mktemp -d "$repo_root/target/borg-release-tests.XXXXXX")"
+  trap 'rm -rf -- "$test_tmp"' EXIT
   cargo fmt --all -- --check
-  cargo test --workspace --locked
+  TMPDIR="$test_tmp" cargo test --workspace --locked
   git diff --check
-}
+)
 
 mode="release"
 release_kind="patch"
