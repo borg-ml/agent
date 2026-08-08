@@ -518,6 +518,8 @@ struct CrossProviderCompactionExecutor {
     compacted: Arc<Notify>,
 }
 
+struct OversizedCompactionExecutor;
+
 fn test_provider_capabilities() -> Vec<crate::ProviderCapability> {
     [
         CodingProvider::Codex,
@@ -834,6 +836,29 @@ impl AgentTurnExecutor for CrossProviderCompactionExecutor {
             summary: "retained summary".to_string(),
             usage: Default::default(),
             provider_session_id: Some("codex-compacted-session".to_string()),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentTurnExecutor for OversizedCompactionExecutor {
+    async fn execute(
+        &self,
+        _turn: AgentTurn,
+        _events: mpsc::Sender<SessionEventKind>,
+        _controls: Option<mpsc::Receiver<AgentTurnControl>>,
+    ) -> Result<AgentTurnResult> {
+        anyhow::bail!("ordinary execution is not used by the compaction test")
+    }
+
+    async fn compact_retained_context(&self, _turn: AgentTurn) -> Result<AgentCompaction> {
+        Ok(AgentCompaction {
+            summary: format!(
+                "summary-start{}summary-end",
+                "s".repeat(SUBSCRIPTION_COMPACTION_CONTEXT_MAX_BYTES * 4)
+            ),
+            usage: ProviderCallUsage::default(),
+            provider_session_id: None,
         })
     }
 }
@@ -6245,6 +6270,89 @@ fn subscription_compaction_projection_truncates_large_tool_results() {
     assert!(compaction_context.contains("more characters truncated"));
     assert!(!compaction_context.contains(&tool_output));
     assert!(compaction_context.chars().count() < full_context.chars().count());
+}
+
+#[test]
+fn subscription_compaction_projection_has_a_hard_total_bound() {
+    let oversized = format!(
+        "head-α{}middle{}tail-🛠️",
+        "x".repeat(SUBSCRIPTION_COMPACTION_CONTEXT_MAX_BYTES),
+        "y".repeat(SUBSCRIPTION_COMPACTION_CONTEXT_MAX_BYTES)
+    );
+
+    let bounded =
+        truncate_compaction_context(&oversized, SUBSCRIPTION_COMPACTION_CONTEXT_MAX_BYTES);
+
+    assert!(bounded.len() <= SUBSCRIPTION_COMPACTION_CONTEXT_MAX_BYTES);
+    assert!(bounded.starts_with("head-α"));
+    assert!(bounded.ends_with("tail-🛠️"));
+    assert!(bounded.contains(COMPACTION_CONTEXT_ELISION));
+}
+
+#[tokio::test]
+async fn subscription_compaction_truncates_provider_summary_before_replay() {
+    let root = tempdir().unwrap();
+    let session_id = Uuid::new_v4();
+    let cwd = root.path().to_path_buf();
+    let dispatcher = crate::AgentToolDispatcher::new(
+        SessionGoalTools::disconnected(),
+        SessionTodoTools::disconnected(),
+        None,
+        crate::LspService::new(&cwd),
+        CodingProvider::Codex,
+        session_id,
+        false,
+        None,
+        None,
+        cwd.clone(),
+        None,
+        None,
+        Vec::new(),
+        None,
+        crate::native_process::ProcessManager::default(),
+        PermissionMode::FullAccess,
+    );
+    let launch = LaunchSession {
+        request_id: Uuid::new_v4(),
+        cwd,
+        provider: CodingProvider::Codex,
+        model: Some("test-model".to_string()),
+        effort: Some("medium".to_string()),
+        fast: Some(false),
+        response_language: crate::ResponseLanguage::Auto,
+        permission_mode: PermissionMode::FullAccess,
+        name: None,
+        initial_prompt: None,
+        capabilities: Default::default(),
+        subagent_concurrency_limit: None,
+        extension_skill_roots: Vec::new(),
+        team_policy: None,
+    };
+    let agent_mcp_server = borg_provider::mcp::ExternalMcpServer {
+        name: "test".to_string(),
+        command: "test".to_string(),
+        args: Vec::new(),
+        env: std::collections::BTreeMap::new(),
+        allowed_tools: Vec::new(),
+    };
+    let executor: Arc<dyn AgentTurnExecutor> = Arc::new(OversizedCompactionExecutor);
+
+    let compaction = compact_subscription_context_for_budget(SubscriptionCompactionRequest {
+        executor: &executor,
+        session_id,
+        launch: &launch,
+        agent_mcp_server: &agent_mcp_server,
+        dispatcher: &dispatcher,
+        context: "durable context",
+        actor: EventActor::User,
+        current_prompt: "continue",
+    })
+    .await
+    .unwrap();
+
+    assert!(compaction.summary.len() <= SUBSCRIPTION_COMPACTION_CONTEXT_MAX_BYTES);
+    assert!(compaction.summary.starts_with("summary-start"));
+    assert!(compaction.summary.ends_with("summary-end"));
 }
 
 #[test]

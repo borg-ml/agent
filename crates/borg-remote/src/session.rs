@@ -37,7 +37,9 @@ const SUBSCRIPTION_CONTEXT_HEADER: &str = "Borg canonical provider context v2. T
 // remains complete; this is only the input shape sent on a full replay.
 const SUBSCRIPTION_INPUT_BUDGET_CHARS: usize = 1 << 20;
 const SUBSCRIPTION_COMPACTION_CHUNK_BYTES: usize = 600 * 1024;
-const MAX_SUBSCRIPTION_COMPACTION_ROUNDS: usize = 4;
+const SUBSCRIPTION_COMPACTION_CONTEXT_MAX_BYTES: usize = 256 * 1024;
+const COMPACTION_CONTEXT_ELISION: &str =
+    "\n\n[... middle of retained context elided for compaction ...]\n\n";
 // Tool output is durable evidence, but sending every byte of old output to a
 // summarizer makes compaction itself hit the provider input limit. Keep the
 // leading portion for diagnostics and let the durable journal remain complete.
@@ -1112,9 +1114,7 @@ async fn run_agent_session_store_kernel(
     // Borg's journal remains authoritative. Native subscription sessions are
     // cache-preserving checkpoints only; whenever one cannot be proven usable,
     // the exact durable branch below is replayed.
-    let mut retained_context = (!launch.provider.uses_native_harness())
-        .then(|| retained_conversation_context(journal.context_events()))
-        .flatten();
+    let mut retained_context: Option<String> = None;
     let mut goal = state.goal;
     let mut todos = state.todos;
     let mut goal_active_since = goal
@@ -2014,6 +2014,13 @@ async fn run_agent_session_store_kernel(
                     }
                 }
             }
+        }
+
+        if !launch.provider.uses_native_harness() && retained_context.is_none() {
+            // Resume recovery is durable and complete, but provider replay is
+            // lazy. Do not serialize a large journal until a request actually
+            // needs the canonical prompt.
+            retained_context = retained_conversation_context(journal.context_events());
         }
 
         let subscription_context_usage =
@@ -4102,85 +4109,89 @@ async fn compact_subscription_context_for_budget(
         actor,
         current_prompt,
     } = request;
-    let mut chunks = split_retained_context(context, SUBSCRIPTION_COMPACTION_CHUNK_BYTES);
+    let bounded_context =
+        truncate_compaction_context(context, SUBSCRIPTION_COMPACTION_CONTEXT_MAX_BYTES);
+    let chunks = split_retained_context(&bounded_context, SUBSCRIPTION_COMPACTION_CHUNK_BYTES);
     anyhow::ensure!(!chunks.is_empty(), "retained context is empty");
     let mut usage = ProviderCallUsage::default();
 
-    for _ in 0..MAX_SUBSCRIPTION_COMPACTION_ROUNDS {
-        let single_chunk = chunks.len() == 1;
-        let mut summaries = Vec::with_capacity(chunks.len());
-        let mut provider_session_id = None;
-        for chunk in chunks {
-            let compaction = executor
-                .compact_retained_context(AgentTurn {
-                    session_id,
-                    message_id: Uuid::new_v4(),
-                    context_generation: 0,
-                    provider: launch.provider,
-                    provider_session_id: None,
-                    cwd: launch.cwd.clone(),
-                    prompt_delta: retained_compaction_prompt(&chunk),
-                    prompt: retained_compaction_prompt(&chunk),
-                    attachments: Vec::new(),
-                    output_schema: None,
-                    model: launch.model.clone(),
-                    effort: launch.effort.clone(),
-                    fast: launch.fast,
-                    response_language: launch.response_language,
-                    permission_mode: launch.permission_mode,
-                    conversation: Vec::new(),
-                    agent_mcp_server: agent_mcp_server.clone(),
-                    agent_tools: dispatcher.clone(),
-                    external_mcp_servers: launch
-                        .capabilities
-                        .runtime_mcp_context
-                        .as_ref()
-                        .map(crate::RuntimeMcpContext::provider_external_servers)
-                        .unwrap_or_default(),
-                    runtime_mcp_context: launch
-                        .capabilities
-                        .runtime_mcp_context
-                        .clone()
-                        .unwrap_or_default(),
-                    extension_skill_roots: Vec::new(),
-                    extension_workflows: Vec::new(),
-                    system_prompt_appendix: format!(
-                        "{RETAINED_COMPACTION_SYSTEM_PROMPT}\n\n{}",
-                        crate::provider_capabilities_prompt(
-                            &launch.capabilities.provider_capabilities
-                        )
-                    ),
-                })
-                .await?;
-            anyhow::ensure!(
-                !compaction.summary.trim().is_empty(),
-                "subscription context compaction returned an empty summary"
-            );
-            accumulate_provider_usage(&mut usage, &compaction.usage);
-            if single_chunk {
-                provider_session_id = compaction.provider_session_id.clone();
-            }
-            summaries.push(compaction.summary);
+    anyhow::ensure!(
+        subscription_prompt_chars(None, actor, current_prompt) <= SUBSCRIPTION_INPUT_BUDGET_CHARS,
+        "current subscription prompt exceeds the {}-character provider input budget",
+        SUBSCRIPTION_INPUT_BUDGET_CHARS
+    );
+    let single_chunk = chunks.len() == 1;
+    let mut summaries = Vec::with_capacity(chunks.len());
+    let mut provider_session_id = None;
+    for chunk in chunks {
+        let compaction = executor
+            .compact_retained_context(AgentTurn {
+                session_id,
+                message_id: Uuid::new_v4(),
+                context_generation: 0,
+                provider: launch.provider,
+                provider_session_id: None,
+                cwd: launch.cwd.clone(),
+                prompt_delta: retained_compaction_prompt(&chunk),
+                prompt: retained_compaction_prompt(&chunk),
+                attachments: Vec::new(),
+                output_schema: None,
+                model: launch.model.clone(),
+                effort: launch.effort.clone(),
+                fast: launch.fast,
+                response_language: launch.response_language,
+                permission_mode: launch.permission_mode,
+                conversation: Vec::new(),
+                agent_mcp_server: agent_mcp_server.clone(),
+                agent_tools: dispatcher.clone(),
+                external_mcp_servers: launch
+                    .capabilities
+                    .runtime_mcp_context
+                    .as_ref()
+                    .map(crate::RuntimeMcpContext::provider_external_servers)
+                    .unwrap_or_default(),
+                runtime_mcp_context: launch
+                    .capabilities
+                    .runtime_mcp_context
+                    .clone()
+                    .unwrap_or_default(),
+                extension_skill_roots: Vec::new(),
+                extension_workflows: Vec::new(),
+                system_prompt_appendix: format!(
+                    "{RETAINED_COMPACTION_SYSTEM_PROMPT}\n\n{}",
+                    crate::provider_capabilities_prompt(&launch.capabilities.provider_capabilities)
+                ),
+            })
+            .await?;
+        anyhow::ensure!(
+            !compaction.summary.trim().is_empty(),
+            "subscription context compaction returned an empty summary"
+        );
+        accumulate_provider_usage(&mut usage, &compaction.usage);
+        if single_chunk {
+            provider_session_id = compaction.provider_session_id.clone();
         }
-
-        let combined = summaries.join("\n\n--- retained context segment ---\n\n");
-        if subscription_prompt_chars(Some(&combined), actor, current_prompt)
-            <= SUBSCRIPTION_INPUT_BUDGET_CHARS
-        {
-            return Ok(AgentCompaction {
-                summary: combined,
-                usage,
-                provider_session_id,
-            });
-        }
-        chunks = split_retained_context(&combined, SUBSCRIPTION_COMPACTION_CHUNK_BYTES);
+        summaries.push(truncate_compaction_context(
+            &compaction.summary,
+            SUBSCRIPTION_COMPACTION_CONTEXT_MAX_BYTES,
+        ));
     }
 
-    anyhow::bail!(
-        "compacted subscription context still exceeds the {}-character provider input budget after {} passes",
-        SUBSCRIPTION_INPUT_BUDGET_CHARS,
-        MAX_SUBSCRIPTION_COMPACTION_ROUNDS
-    )
+    let summary = truncate_compaction_context(
+        &summaries.join("\n\n--- retained context segment ---\n\n"),
+        SUBSCRIPTION_COMPACTION_CONTEXT_MAX_BYTES,
+    );
+    anyhow::ensure!(
+        subscription_prompt_chars(Some(&summary), actor, current_prompt)
+            <= SUBSCRIPTION_INPUT_BUDGET_CHARS,
+        "subscription context compaction summary exceeds the {}-character provider input budget",
+        SUBSCRIPTION_INPUT_BUDGET_CHARS
+    );
+    Ok(AgentCompaction {
+        summary,
+        usage,
+        provider_session_id,
+    })
 }
 
 fn accumulate_provider_usage(total: &mut ProviderCallUsage, next: &ProviderCallUsage) {
@@ -4215,6 +4226,47 @@ fn retained_conversation_context(events: &[SessionEvent]) -> Option<String> {
 
 fn retained_compaction_context(events: &[SessionEvent]) -> Option<String> {
     retained_conversation_context_with_tool_limit(events, Some(COMPACTION_TOOL_RESULT_MAX_CHARS))
+        .map(|context| {
+            truncate_compaction_context(&context, SUBSCRIPTION_COMPACTION_CONTEXT_MAX_BYTES)
+        })
+}
+
+fn truncate_compaction_context(context: &str, max_bytes: usize) -> String {
+    if context.len() <= max_bytes {
+        return context.to_string();
+    }
+    if max_bytes <= COMPACTION_CONTEXT_ELISION.len() {
+        let end = floor_char_boundary(context, max_bytes);
+        return context[..end].to_string();
+    }
+
+    let available = max_bytes - COMPACTION_CONTEXT_ELISION.len();
+    let head_budget = available / 3;
+    let tail_budget = available - head_budget;
+    let head_end = floor_char_boundary(context, head_budget);
+    let tail_start = ceil_char_boundary(context, context.len().saturating_sub(tail_budget));
+    format!(
+        "{}{}{}",
+        &context[..head_end],
+        COMPACTION_CONTEXT_ELISION,
+        &context[tail_start..]
+    )
+}
+
+fn floor_char_boundary(text: &str, index: usize) -> usize {
+    let mut index = index.min(text.len());
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+fn ceil_char_boundary(text: &str, index: usize) -> usize {
+    let mut index = index.min(text.len());
+    while index < text.len() && !text.is_char_boundary(index) {
+        index += 1;
+    }
+    index
 }
 
 fn retained_conversation_context_with_tool_limit(

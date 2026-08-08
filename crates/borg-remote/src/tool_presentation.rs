@@ -929,6 +929,7 @@ enum GitAction {
     WorktreePrune,
     WorktreeLock,
     WorktreeUnlock,
+    Add,
     Status,
     Diff,
     Log,
@@ -956,6 +957,7 @@ impl GitAction {
             Self::WorktreePrune => "Prune worktrees",
             Self::WorktreeLock => "Lock worktree",
             Self::WorktreeUnlock => "Unlock worktree",
+            Self::Add => "Git add",
             Self::Status => "Git status",
             Self::Diff => "Git diff",
             Self::Log => "Git log",
@@ -1191,6 +1193,7 @@ fn git_action_from_parts(parts: &[&str]) -> Option<GitAction> {
         ["worktree", "prune", ..] => Some(GitAction::WorktreePrune),
         ["worktree", "lock", ..] => Some(GitAction::WorktreeLock),
         ["worktree", "unlock", ..] => Some(GitAction::WorktreeUnlock),
+        ["add", ..] => Some(GitAction::Add),
         ["status", ..] => Some(GitAction::Status),
         ["diff", ..] => Some(GitAction::Diff),
         ["log", ..] => Some(GitAction::Log),
@@ -1328,6 +1331,7 @@ fn git_action_name(action: GitAction) -> &'static str {
         GitAction::WorktreePrune => "prune worktrees",
         GitAction::WorktreeLock => "lock worktree",
         GitAction::WorktreeUnlock => "unlock worktree",
+        GitAction::Add => "add",
         GitAction::Status => "status",
         GitAction::Diff => "diff",
         GitAction::Log => "log",
@@ -2468,6 +2472,11 @@ mod tests {
         let cases = [
             ("git status --short", "Git status", ""),
             (
+                "git add src/lib.rs src/main.rs",
+                "Git add",
+                "src/lib.rs · src/main.rs",
+            ),
+            (
                 "git worktree add -b topic ../topic main",
                 "Add worktree",
                 "topic · ../topic · main",
@@ -2564,7 +2573,7 @@ mod tests {
     }
 
     #[test]
-    fn command_summary_preserves_the_shell_command_over_generated_description() {
+    fn composed_git_commands_keep_each_operation_visible() {
         let presentation = project_tool_presentation(
             "functions.exec_command",
             &json!({
@@ -2574,10 +2583,10 @@ mod tests {
             None,
             false,
         );
-        assert_eq!(presentation.label, "Run");
+        assert_eq!(presentation.label, "Run Git operations");
         assert_eq!(
             presentation.detail,
-            "git add docs/model-adaptation/review.md && git commit -m 'Prefer donor-preserving functionality'"
+            "add: docs/model-adaptation/review.md, commit: Prefer donor-preserving functionality"
         );
         assert_eq!(presentation.category, ToolPresentationCategory::Execute);
     }
@@ -2602,6 +2611,12 @@ mod tests {
                 json!({"remote": "origin", "branch": "main"}),
                 "Push changes",
                 "main · origin",
+            ),
+            (
+                "git_add",
+                json!({"path": "src/main.rs"}),
+                "Git add",
+                "src/main.rs",
             ),
             ("mcp__git__remote", json!({}), "Git remotes", ""),
         ];
