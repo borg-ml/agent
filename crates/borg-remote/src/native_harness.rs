@@ -583,9 +583,14 @@ impl NativeHarness {
             !conversation.is_empty(),
             "there is no native conversation to compact yet"
         );
+        // Tool output is the disposable bulk of a long transcript. Keep the
+        // durable message sequence and let the shared semantic projection
+        // clear old results before the compaction model sees them. This keeps
+        // native and subscription compaction on the same evidence policy.
+        let conversation = crate::session::prune_conversation_for_compaction(&conversation);
         let mut messages = Vec::with_capacity(conversation.len().saturating_add(2));
         messages.push(ModelMessage::System {
-            content: "Summarize the conversation for another agent that will continue the work. Preserve user requirements, decisions, files changed, commands and tests run, unresolved errors, approvals, and next steps. Be compact but do not omit details needed to continue safely. Return only the summary.".to_string(),
+            content: "Summarize the conversation for another agent that will continue the work. Preserve user requirements, decisions, files changed, commands and tests run, unresolved errors, approvals, and next steps. Be compact but do not omit details needed to continue safely. Return only the summary. Use these sections when applicable: Goal, Instructions, Discoveries, Accomplished, Relevant files, and Open issues.".to_string(),
         });
         messages.extend(conversation);
         messages.push(ModelMessage::user("Create the continuation summary now."));

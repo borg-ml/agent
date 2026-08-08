@@ -6,6 +6,8 @@ use serde_json::json;
 use tempfile::tempdir;
 use tokio::sync::Notify;
 
+use borg_provider::ProviderCallUsage;
+
 use super::*;
 use crate::{AgentCompaction, AgentTurnResult, CodingProvider, PermissionMode};
 
@@ -855,7 +857,7 @@ impl AgentTurnExecutor for OversizedCompactionExecutor {
         Ok(AgentCompaction {
             summary: format!(
                 "summary-start{}summary-end",
-                "s".repeat(SUBSCRIPTION_COMPACTION_CONTEXT_MAX_BYTES * 4)
+                "s".repeat(SUBSCRIPTION_INPUT_BUDGET_CHARS * 4)
             ),
             usage: ProviderCallUsage::default(),
             provider_session_id: None,
@@ -6204,7 +6206,11 @@ fn provider_neutral_replay_carries_subscription_tools_across_provider_switches()
 fn subscription_compaction_projection_truncates_large_tool_results() {
     let session_id = Uuid::new_v4();
     let message_id = Uuid::new_v4();
-    let tool_output = format!("keep-this-{}", "x".repeat(5_000));
+    let second_message_id = Uuid::new_v4();
+    let third_message_id = Uuid::new_v4();
+    let tool_output = format!("old-tool-output-{}", "x".repeat(5_000));
+    let recent_tool_output = format!("recent-tool-output-{}", "y".repeat(5_000));
+    let newest_tool_output = format!("newest-tool-output-{}", "z".repeat(5_000));
     let events = vec![
         SessionEvent::new(
             session_id,
@@ -6261,14 +6267,128 @@ fn subscription_compaction_projection_truncates_large_tool_results() {
                 error: None,
             },
         ),
+        SessionEvent::new(
+            session_id,
+            6,
+            SessionEventKind::TurnStarted {
+                message_id: second_message_id,
+                provider: CodingProvider::Codex,
+                model: None,
+                effort: None,
+                fast: false,
+            },
+        ),
+        SessionEvent::new(
+            session_id,
+            7,
+            SessionEventKind::Message {
+                message_id: second_message_id,
+                actor: EventActor::User,
+                text: "continue from the repository inspection".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            },
+        ),
+        SessionEvent::new(
+            session_id,
+            8,
+            SessionEventKind::ToolStarted {
+                tool_call_id: "call-2".to_string(),
+                name: "read_file".to_string(),
+                input: json!({"path": "recent.txt"}),
+                input_ref: None,
+            },
+        ),
+        SessionEvent::new(
+            session_id,
+            9,
+            SessionEventKind::ToolCompleted {
+                tool_call_id: "call-2".to_string(),
+                output: recent_tool_output.clone(),
+                output_ref: None,
+                is_error: false,
+                input: None,
+                input_ref: None,
+            },
+        ),
+        SessionEvent::new(
+            session_id,
+            10,
+            SessionEventKind::TurnCompleted {
+                message_id: second_message_id,
+                provider_session_id: None,
+                final_text: "continued".to_string(),
+                error: None,
+            },
+        ),
+        SessionEvent::new(
+            session_id,
+            11,
+            SessionEventKind::TurnStarted {
+                message_id: third_message_id,
+                provider: CodingProvider::Codex,
+                model: None,
+                effort: None,
+                fast: false,
+            },
+        ),
+        SessionEvent::new(
+            session_id,
+            12,
+            SessionEventKind::Message {
+                message_id: third_message_id,
+                actor: EventActor::User,
+                text: "finish the inspection".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            },
+        ),
+        SessionEvent::new(
+            session_id,
+            13,
+            SessionEventKind::ToolStarted {
+                tool_call_id: "call-3".to_string(),
+                name: "read_file".to_string(),
+                input: json!({"path": "newest.txt"}),
+                input_ref: None,
+            },
+        ),
+        SessionEvent::new(
+            session_id,
+            14,
+            SessionEventKind::ToolCompleted {
+                tool_call_id: "call-3".to_string(),
+                output: newest_tool_output.clone(),
+                output_ref: None,
+                is_error: false,
+                input: None,
+                input_ref: None,
+            },
+        ),
+        SessionEvent::new(
+            session_id,
+            15,
+            SessionEventKind::TurnCompleted {
+                message_id: third_message_id,
+                provider_session_id: None,
+                final_text: "finished".to_string(),
+                error: None,
+            },
+        ),
     ];
 
     let full_context = retained_conversation_context(&events).unwrap();
-    let compaction_context = retained_compaction_context(&events).unwrap();
+    let compaction_context =
+        retained_compaction_context_with_budget(&events, SUBSCRIPTION_INPUT_BUDGET_CHARS).unwrap();
 
-    assert!(compaction_context.contains("keep-this-"));
-    assert!(compaction_context.contains("more characters truncated"));
+    assert!(compaction_context.contains("recent-tool-output-"));
     assert!(!compaction_context.contains(&tool_output));
+    assert!(compaction_context.contains(COMPACTION_OLD_TOOL_RESULT_MARKER));
+    assert!(compaction_context.contains("continue from the repository inspection"));
+    assert!(compaction_context.contains(&recent_tool_output));
+    assert!(compaction_context.contains(&newest_tool_output));
     assert!(compaction_context.chars().count() < full_context.chars().count());
 }
 
@@ -6276,14 +6396,13 @@ fn subscription_compaction_projection_truncates_large_tool_results() {
 fn subscription_compaction_projection_has_a_hard_total_bound() {
     let oversized = format!(
         "head-α{}middle{}tail-🛠️",
-        "x".repeat(SUBSCRIPTION_COMPACTION_CONTEXT_MAX_BYTES),
-        "y".repeat(SUBSCRIPTION_COMPACTION_CONTEXT_MAX_BYTES)
+        "x".repeat(SUBSCRIPTION_INPUT_BUDGET_CHARS),
+        "y".repeat(SUBSCRIPTION_INPUT_BUDGET_CHARS)
     );
 
-    let bounded =
-        truncate_compaction_context(&oversized, SUBSCRIPTION_COMPACTION_CONTEXT_MAX_BYTES);
+    let bounded = truncate_compaction_context(&oversized, SUBSCRIPTION_INPUT_BUDGET_CHARS);
 
-    assert!(bounded.len() <= SUBSCRIPTION_COMPACTION_CONTEXT_MAX_BYTES);
+    assert!(bounded.chars().count() <= SUBSCRIPTION_INPUT_BUDGET_CHARS);
     assert!(bounded.starts_with("head-α"));
     assert!(bounded.ends_with("tail-🛠️"));
     assert!(bounded.contains(COMPACTION_CONTEXT_ELISION));
@@ -6350,7 +6469,7 @@ async fn subscription_compaction_truncates_provider_summary_before_replay() {
     .await
     .unwrap();
 
-    assert!(compaction.summary.len() <= SUBSCRIPTION_COMPACTION_CONTEXT_MAX_BYTES);
+    assert!(compaction.summary.chars().count() <= SUBSCRIPTION_INPUT_BUDGET_CHARS);
     assert!(compaction.summary.starts_with("summary-start"));
     assert!(compaction.summary.ends_with("summary-end"));
 }
@@ -7291,17 +7410,6 @@ async fn acknowledged_codex_escape_does_not_compact_a_reusable_large_context() {
                     == Some("provider_input_size")
     )));
     assert_eq!(prompt_lengths.lock().unwrap().len(), 3);
-}
-
-#[test]
-fn retained_context_chunking_preserves_every_byte_and_utf8() {
-    let context = format!("first αβγ\n{}\nlast", "🛠️".repeat(2_000));
-    let chunks = split_retained_context(&context, 97);
-
-    assert!(chunks.iter().all(|chunk| chunk.len() <= 97));
-    assert_eq!(chunks.concat(), context);
-    assert!(chunks.iter().any(|chunk| chunk.contains("αβγ")));
-    assert!(chunks.iter().any(|chunk| chunk.contains("🛠️")));
 }
 
 #[test]

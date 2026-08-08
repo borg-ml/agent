@@ -24,7 +24,6 @@ use crate::{
     SubagentControlOutcome, SubagentCoordinator, TodoAction, TodoItemUpdate, WorkspaceEvent,
     WorkspaceEventKind, WorkspaceStore,
 };
-use borg_provider::ProviderCallUsage;
 
 const ROOT_INBOX_REFRESH_INTERVAL: Duration = Duration::from_millis(50);
 const WORKSPACE_PROJECTION_REPAIR_BATCH_SIZE: usize = 512;
@@ -36,14 +35,17 @@ const SUBSCRIPTION_CONTEXT_HEADER: &str = "Borg canonical provider context v2. T
 // boundary rather than an unrelated serialized-byte threshold. The journal
 // remains complete; this is only the input shape sent on a full replay.
 const SUBSCRIPTION_INPUT_BUDGET_CHARS: usize = 1 << 20;
-const SUBSCRIPTION_COMPACTION_CHUNK_BYTES: usize = 600 * 1024;
-const SUBSCRIPTION_COMPACTION_CONTEXT_MAX_BYTES: usize = 256 * 1024;
 const COMPACTION_CONTEXT_ELISION: &str =
     "\n\n[... middle of retained context elided for compaction ...]\n\n";
-// Tool output is durable evidence, but sending every byte of old output to a
-// summarizer makes compaction itself hit the provider input limit. Keep the
-// leading portion for diagnostics and let the durable journal remain complete.
-const COMPACTION_TOOL_RESULT_MAX_CHARS: usize = 2_000;
+// Match the useful shape of Pi/OpenCode compaction: old tool output is the
+// first thing evicted, while the most recent tool evidence remains available
+// to the summarizer. These are character budgets; the provider's hard limit is
+// also expressed in characters for the Codex app-server route.
+const COMPACTION_PRUNE_PROTECT_CHARS: usize = 40_000 * 4;
+const COMPACTION_HIGH_VALUE_TOOL_RESULT_MAX_CHARS: usize = 8_000;
+const COMPACTION_OLD_TOOL_RESULT_MARKER: &str =
+    "[Old tool result content cleared for compaction; tool call retained]";
+const COMPACTION_OLD_ASSISTANT_MARKER: &str = "[Earlier assistant narrative retained in the durable journal but omitted from this compaction input]";
 
 struct SessionAutonomyDispatch {
     job: crate::AutonomyJob,
@@ -1706,8 +1708,11 @@ async fn run_agent_session_store_kernel(
                                     .await
                                     .map(Some)
                             } else {
-                                let context = retained_compaction_context(journal.context_events())
-                                    .context("there is no conversation to compact yet")?;
+                                let context = retained_compaction_context_with_budget(
+                                    journal.context_events(),
+                                    subscription_compaction_context_budget(EventActor::User, ""),
+                                )
+                                .context("there is no conversation to compact yet")?;
                                 compact_subscription_context_for_budget(
                                     SubscriptionCompactionRequest {
                                         executor: &executor,
@@ -2049,8 +2054,11 @@ async fn run_agent_session_store_kernel(
             let full_context = retained_context
                 .take()
                 .expect("oversized subscription context was present");
-            let context = retained_compaction_context(journal.context_events())
-                .unwrap_or_else(|| full_context.clone());
+            let context = retained_compaction_context_with_budget(
+                journal.context_events(),
+                subscription_compaction_context_budget(prompt.actor, &prompt.text),
+            )
+            .unwrap_or_else(|| full_context.clone());
             let context_chars = full_context.chars().count();
             subscription_context_reusable = false;
             record(
@@ -2112,7 +2120,6 @@ async fn run_agent_session_store_kernel(
                                 "native": false,
                                 "automatic": true,
                                 "trigger": "provider_input_size",
-                                "context_chars_before": context_chars,
                                 "input_budget_chars": SUBSCRIPTION_INPUT_BUDGET_CHARS,
                             }),
                         },
@@ -4018,73 +4025,6 @@ fn codex_checkpoint_is_acknowledged(events: &[SessionEvent], provider_session_id
     }) == Some(true)
 }
 
-/// Split retained provider-context bytes without dropping them. An unusually
-/// large record is split at UTF-8 boundaries only for the intermediate
-/// compaction request, where a partial record is still useful evidence for the
-/// summarizer.
-fn split_retained_context(context: &str, max_bytes: usize) -> Vec<String> {
-    assert!(
-        max_bytes > 0,
-        "retained context chunk size must be positive"
-    );
-    let mut chunks = Vec::new();
-    let mut current = String::new();
-
-    for piece in context.split_inclusive('\n') {
-        if piece.len() <= max_bytes {
-            if !current.is_empty() && current.len() + piece.len() > max_bytes {
-                chunks.push(std::mem::take(&mut current));
-            }
-            current.push_str(piece);
-            continue;
-        }
-
-        if !current.is_empty() {
-            chunks.push(std::mem::take(&mut current));
-        }
-        let pieces = split_utf8_chunks(piece, max_bytes);
-        let piece_count = pieces.len();
-        for (index, segment) in pieces.into_iter().enumerate() {
-            if index + 1 == piece_count {
-                current = segment;
-            } else {
-                chunks.push(segment);
-            }
-        }
-    }
-    if !current.is_empty() {
-        chunks.push(current);
-    }
-    chunks
-}
-
-fn split_utf8_chunks(text: &str, max_bytes: usize) -> Vec<String> {
-    let mut chunks = Vec::new();
-    let mut start = 0;
-    while start < text.len() {
-        let mut end = start;
-        for (offset, character) in text[start..].char_indices() {
-            let candidate = start + offset + character.len_utf8();
-            if candidate - start > max_bytes && end > start {
-                break;
-            }
-            end = candidate;
-            if end - start == max_bytes {
-                break;
-            }
-        }
-        if end == start {
-            end = text[start..]
-                .chars()
-                .next()
-                .map_or(text.len(), |character| start + character.len_utf8());
-        }
-        chunks.push(text[start..end].to_string());
-        start = end;
-    }
-    chunks
-}
-
 struct SubscriptionCompactionRequest<'a> {
     executor: &'a Arc<dyn AgentTurnExecutor>,
     session_id: Uuid,
@@ -4109,78 +4049,70 @@ async fn compact_subscription_context_for_budget(
         actor,
         current_prompt,
     } = request;
-    let bounded_context =
-        truncate_compaction_context(context, SUBSCRIPTION_COMPACTION_CONTEXT_MAX_BYTES);
-    let chunks = split_retained_context(&bounded_context, SUBSCRIPTION_COMPACTION_CHUNK_BYTES);
-    anyhow::ensure!(!chunks.is_empty(), "retained context is empty");
-    let mut usage = ProviderCallUsage::default();
-
+    let context_budget = subscription_compaction_context_budget(actor, current_prompt);
+    anyhow::ensure!(!context.is_empty(), "retained context is empty");
+    anyhow::ensure!(
+        context.chars().count() <= context_budget,
+        "semantic compaction projection remains {} characters after pruning (budget {})",
+        context.chars().count(),
+        context_budget
+    );
     anyhow::ensure!(
         subscription_prompt_chars(None, actor, current_prompt) <= SUBSCRIPTION_INPUT_BUDGET_CHARS,
         "current subscription prompt exceeds the {}-character provider input budget",
         SUBSCRIPTION_INPUT_BUDGET_CHARS
     );
-    let single_chunk = chunks.len() == 1;
-    let mut summaries = Vec::with_capacity(chunks.len());
-    let mut provider_session_id = None;
-    for chunk in chunks {
-        let compaction = executor
-            .compact_retained_context(AgentTurn {
-                session_id,
-                message_id: Uuid::new_v4(),
-                context_generation: 0,
-                provider: launch.provider,
-                provider_session_id: None,
-                cwd: launch.cwd.clone(),
-                prompt_delta: retained_compaction_prompt(&chunk),
-                prompt: retained_compaction_prompt(&chunk),
-                attachments: Vec::new(),
-                output_schema: None,
-                model: launch.model.clone(),
-                effort: launch.effort.clone(),
-                fast: launch.fast,
-                response_language: launch.response_language,
-                permission_mode: launch.permission_mode,
-                conversation: Vec::new(),
-                agent_mcp_server: agent_mcp_server.clone(),
-                agent_tools: dispatcher.clone(),
-                external_mcp_servers: launch
-                    .capabilities
-                    .runtime_mcp_context
-                    .as_ref()
-                    .map(crate::RuntimeMcpContext::provider_external_servers)
-                    .unwrap_or_default(),
-                runtime_mcp_context: launch
-                    .capabilities
-                    .runtime_mcp_context
-                    .clone()
-                    .unwrap_or_default(),
-                extension_skill_roots: Vec::new(),
-                extension_workflows: Vec::new(),
-                system_prompt_appendix: format!(
-                    "{RETAINED_COMPACTION_SYSTEM_PROMPT}\n\n{}",
-                    crate::provider_capabilities_prompt(&launch.capabilities.provider_capabilities)
-                ),
-            })
-            .await?;
-        anyhow::ensure!(
-            !compaction.summary.trim().is_empty(),
-            "subscription context compaction returned an empty summary"
-        );
-        accumulate_provider_usage(&mut usage, &compaction.usage);
-        if single_chunk {
-            provider_session_id = compaction.provider_session_id.clone();
-        }
-        summaries.push(truncate_compaction_context(
-            &compaction.summary,
-            SUBSCRIPTION_COMPACTION_CONTEXT_MAX_BYTES,
-        ));
-    }
 
-    let summary = truncate_compaction_context(
-        &summaries.join("\n\n--- retained context segment ---\n\n"),
-        SUBSCRIPTION_COMPACTION_CONTEXT_MAX_BYTES,
+    let prompt = retained_compaction_prompt(context);
+    anyhow::ensure!(
+        prompt.chars().count() <= SUBSCRIPTION_INPUT_BUDGET_CHARS,
+        "subscription compaction prompt exceeds the {}-character provider input budget",
+        SUBSCRIPTION_INPUT_BUDGET_CHARS
     );
+    let compaction = executor
+        .compact_retained_context(AgentTurn {
+            session_id,
+            message_id: Uuid::new_v4(),
+            context_generation: 0,
+            provider: launch.provider,
+            provider_session_id: None,
+            cwd: launch.cwd.clone(),
+            prompt_delta: prompt.clone(),
+            prompt,
+            attachments: Vec::new(),
+            output_schema: None,
+            model: launch.model.clone(),
+            effort: launch.effort.clone(),
+            fast: launch.fast,
+            response_language: launch.response_language,
+            permission_mode: launch.permission_mode,
+            conversation: Vec::new(),
+            agent_mcp_server: agent_mcp_server.clone(),
+            agent_tools: dispatcher.clone(),
+            external_mcp_servers: launch
+                .capabilities
+                .runtime_mcp_context
+                .as_ref()
+                .map(crate::RuntimeMcpContext::provider_external_servers)
+                .unwrap_or_default(),
+            runtime_mcp_context: launch
+                .capabilities
+                .runtime_mcp_context
+                .clone()
+                .unwrap_or_default(),
+            extension_skill_roots: Vec::new(),
+            extension_workflows: Vec::new(),
+            system_prompt_appendix: format!(
+                "{RETAINED_COMPACTION_SYSTEM_PROMPT}\n\n{}",
+                crate::provider_capabilities_prompt(&launch.capabilities.provider_capabilities)
+            ),
+        })
+        .await?;
+    anyhow::ensure!(
+        !compaction.summary.trim().is_empty(),
+        "subscription context compaction returned an empty summary"
+    );
+    let summary = truncate_compaction_context(&compaction.summary, context_budget);
     anyhow::ensure!(
         subscription_prompt_chars(Some(&summary), actor, current_prompt)
             <= SUBSCRIPTION_INPUT_BUDGET_CHARS,
@@ -4189,62 +4121,46 @@ async fn compact_subscription_context_for_budget(
     );
     Ok(AgentCompaction {
         summary,
-        usage,
-        provider_session_id,
+        usage: compaction.usage,
+        provider_session_id: compaction.provider_session_id,
     })
-}
-
-fn accumulate_provider_usage(total: &mut ProviderCallUsage, next: &ProviderCallUsage) {
-    total.duration_ms = total.duration_ms.saturating_add(next.duration_ms);
-    total.input_tokens = total.input_tokens.saturating_add(next.input_tokens);
-    total.cached_input_tokens = total
-        .cached_input_tokens
-        .saturating_add(next.cached_input_tokens);
-    total.cache_creation_input_tokens = total
-        .cache_creation_input_tokens
-        .saturating_add(next.cache_creation_input_tokens);
-    total.output_tokens = total.output_tokens.saturating_add(next.output_tokens);
-    total.total_tokens = total.total_tokens.saturating_add(next.total_tokens);
-    total.context_window_tokens = match (total.context_window_tokens, next.context_window_tokens) {
-        (Some(left), Some(right)) => Some(left.max(right)),
-        (Some(window), None) | (None, Some(window)) => Some(window),
-        (None, None) => None,
-    };
-    total.cost_microusd = match (total.cost_microusd, next.cost_microusd) {
-        (Some(left), Some(right)) => Some(left.saturating_add(right)),
-        (Some(cost), None) | (None, Some(cost)) => Some(cost),
-        (None, None) => None,
-    };
-    if next.cost_microusd.is_some() {
-        total.cost_basis = next.cost_basis;
-    }
 }
 
 fn retained_conversation_context(events: &[SessionEvent]) -> Option<String> {
     retained_conversation_context_with_tool_limit(events, None)
 }
 
-fn retained_compaction_context(events: &[SessionEvent]) -> Option<String> {
-    retained_conversation_context_with_tool_limit(events, Some(COMPACTION_TOOL_RESULT_MAX_CHARS))
-        .map(|context| {
-            truncate_compaction_context(&context, SUBSCRIPTION_COMPACTION_CONTEXT_MAX_BYTES)
-        })
+fn retained_compaction_context_with_budget(
+    events: &[SessionEvent],
+    max_chars: usize,
+) -> Option<String> {
+    let conversation = provider_neutral_conversation(events)?;
+    Some(fit_compaction_context(&conversation, max_chars))
 }
 
-fn truncate_compaction_context(context: &str, max_bytes: usize) -> String {
-    if context.len() <= max_bytes {
+fn subscription_compaction_context_budget(actor: EventActor, current_prompt: &str) -> usize {
+    let compaction_wrapper_chars = retained_compaction_prompt("").chars().count();
+    let replay_wrapper_chars = subscription_prompt_chars(None, actor, current_prompt);
+    SUBSCRIPTION_INPUT_BUDGET_CHARS
+        .saturating_sub(compaction_wrapper_chars)
+        .min(SUBSCRIPTION_INPUT_BUDGET_CHARS.saturating_sub(replay_wrapper_chars))
+}
+
+fn truncate_compaction_context(context: &str, max_chars: usize) -> String {
+    if context.chars().count() <= max_chars {
         return context.to_string();
     }
-    if max_bytes <= COMPACTION_CONTEXT_ELISION.len() {
-        let end = floor_char_boundary(context, max_bytes);
+    if max_chars <= COMPACTION_CONTEXT_ELISION.chars().count() {
+        let end = char_boundary_at(context, max_chars);
         return context[..end].to_string();
     }
 
-    let available = max_bytes - COMPACTION_CONTEXT_ELISION.len();
+    let available = max_chars - COMPACTION_CONTEXT_ELISION.chars().count();
     let head_budget = available / 3;
     let tail_budget = available - head_budget;
-    let head_end = floor_char_boundary(context, head_budget);
-    let tail_start = ceil_char_boundary(context, context.len().saturating_sub(tail_budget));
+    let total_chars = context.chars().count();
+    let head_end = char_boundary_at(context, head_budget);
+    let tail_start = char_boundary_at(context, total_chars.saturating_sub(tail_budget));
     format!(
         "{}{}{}",
         &context[..head_end],
@@ -4253,26 +4169,26 @@ fn truncate_compaction_context(context: &str, max_bytes: usize) -> String {
     )
 }
 
-fn floor_char_boundary(text: &str, index: usize) -> usize {
-    let mut index = index.min(text.len());
-    while index > 0 && !text.is_char_boundary(index) {
-        index -= 1;
-    }
-    index
-}
-
-fn ceil_char_boundary(text: &str, index: usize) -> usize {
-    let mut index = index.min(text.len());
-    while index < text.len() && !text.is_char_boundary(index) {
-        index += 1;
-    }
-    index
+fn char_boundary_at(text: &str, character_index: usize) -> usize {
+    text.char_indices()
+        .nth(character_index)
+        .map_or(text.len(), |(byte_index, _)| byte_index)
 }
 
 fn retained_conversation_context_with_tool_limit(
     events: &[SessionEvent],
     tool_result_max_chars: Option<usize>,
 ) -> Option<String> {
+    let conversation = provider_neutral_conversation(events)?;
+    Some(format_subscription_conversation_with_tool_limit(
+        &conversation,
+        tool_result_max_chars,
+    ))
+}
+
+fn provider_neutral_conversation(
+    events: &[SessionEvent],
+) -> Option<Vec<borg_provider::provider::ModelMessage>> {
     // Newer journals carry TurnStarted boundaries, allowing the structured
     // provider-neutral replay path to include subscription tool calls/results
     // alongside native model messages. Keep the legacy text fallback for
@@ -4283,27 +4199,20 @@ fn retained_conversation_context_with_tool_limit(
     {
         return native_conversation(events, CodingProvider::OpenRouter)
             .ok()
-            .filter(|conversation| !conversation.is_empty())
-            .map(|conversation| {
-                format_subscription_conversation_with_tool_limit(
-                    &conversation,
-                    tool_result_max_chars,
-                )
-            });
+            .filter(|conversation| !conversation.is_empty());
     }
 
-    let mut entries = Vec::new();
+    let mut conversation = Vec::new();
     for event in events {
         match &event.kind {
             SessionEventKind::ProviderEvent { kind, payload, .. }
                 if kind == "context_compaction" =>
             {
-                entries.clear();
+                conversation.clear();
                 if let Some(summary) = payload.get("summary").and_then(Value::as_str) {
-                    entries.push(format_subscription_text_value(
-                        "user",
-                        &format!("Previous conversation summary:\n\n{summary}"),
-                    ));
+                    conversation.push(borg_provider::provider::ModelMessage::user(format!(
+                        "Previous conversation summary:\n\n{summary}"
+                    )));
                 }
             }
             SessionEventKind::Message {
@@ -4316,37 +4225,277 @@ fn retained_conversation_context_with_tool_limit(
                 EventActor::User | EventActor::Assistant | EventActor::System
             ) =>
             {
-                entries.push(format_subscription_actor_value(*actor, text));
+                conversation.push(match actor {
+                    EventActor::System => borg_provider::provider::ModelMessage::System {
+                        content: text.clone(),
+                    },
+                    EventActor::User => borg_provider::provider::ModelMessage::user(text.clone()),
+                    EventActor::Assistant => borg_provider::provider::ModelMessage::assistant(
+                        Some(text.clone()),
+                        None,
+                        None,
+                        Vec::new(),
+                    ),
+                    EventActor::Tool => unreachable!("tool messages use ToolCompleted"),
+                });
             }
             SessionEventKind::ToolStarted {
                 tool_call_id,
                 name,
                 input,
                 ..
-            } => entries.push(format_subscription_tool_call_value(
-                tool_call_id,
-                name,
-                input,
+            } => conversation.push(borg_provider::provider::ModelMessage::assistant(
+                None,
+                None,
+                None,
+                vec![borg_provider::provider::ModelToolCall::function(
+                    tool_call_id.clone(),
+                    name.clone(),
+                    serde_json::to_string(input).unwrap_or_else(|_| input.to_string()),
+                )],
             )),
             SessionEventKind::ToolCompleted {
                 tool_call_id,
                 output,
                 ..
-            } => entries.push(format_subscription_tool_result_value_with_limit(
-                tool_call_id,
-                output,
-                tool_result_max_chars,
-            )),
+            } => conversation.push(borg_provider::provider::ModelMessage::Tool {
+                tool_call_id: tool_call_id.clone(),
+                content: output.clone(),
+            }),
             _ => {}
         }
     }
-    (!entries.is_empty()).then(|| {
-        entries
-            .iter()
-            .map(format_subscription_frame)
-            .collect::<Vec<_>>()
-            .join("\n")
-    })
+    (!conversation.is_empty()).then_some(conversation)
+}
+
+/// Build the context seen by an LLM compaction turn without mutating the
+/// durable journal. Old tool output is disposable transcript bulk; user and
+/// assistant messages, tool calls, and recent evidence remain structured.
+pub(crate) fn prune_conversation_for_compaction(
+    conversation: &[borg_provider::provider::ModelMessage],
+) -> Vec<borg_provider::provider::ModelMessage> {
+    use borg_provider::provider::ModelMessage;
+
+    let tool_names = conversation
+        .iter()
+        .flat_map(|message| match message {
+            ModelMessage::Assistant { tool_calls, .. } => tool_calls
+                .iter()
+                .map(|call| (call.id.clone(), call.function.name.clone()))
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
+        })
+        .collect::<HashMap<_, _>>();
+    let mut projected = conversation.to_vec();
+    let mut user_turns = 0;
+    let mut protected_tool_chars = 0;
+
+    for index in (0..conversation.len()).rev() {
+        match &conversation[index] {
+            ModelMessage::User { .. } => user_turns += 1,
+            ModelMessage::Tool {
+                tool_call_id,
+                content,
+            } => {
+                let tool_name = tool_names.get(tool_call_id).map(String::as_str);
+                let replacement = if user_turns < 2 {
+                    let remaining =
+                        COMPACTION_PRUNE_PROTECT_CHARS.saturating_sub(protected_tool_chars);
+                    if remaining == 0 {
+                        COMPACTION_OLD_TOOL_RESULT_MARKER.to_string()
+                    } else {
+                        let replacement = truncate_compaction_tool_result(content, remaining);
+                        protected_tool_chars = protected_tool_chars
+                            .saturating_add(replacement.chars().count().min(remaining));
+                        replacement
+                    }
+                } else if compaction_tool_is_high_value(tool_name, content) {
+                    truncate_compaction_tool_result(
+                        content,
+                        COMPACTION_HIGH_VALUE_TOOL_RESULT_MAX_CHARS,
+                    )
+                } else {
+                    COMPACTION_OLD_TOOL_RESULT_MARKER.to_string()
+                };
+                if let ModelMessage::Tool { content, .. } = &mut projected[index] {
+                    *content = replacement;
+                }
+            }
+            _ => {}
+        }
+    }
+    projected
+}
+
+fn compaction_tool_is_high_value(tool_name: Option<&str>, content: &str) -> bool {
+    if tool_name.is_some_and(|name| name.eq_ignore_ascii_case("skill")) {
+        return true;
+    }
+    // Inspect only a bounded sample: an old tool result can itself be many
+    // megabytes, and compaction must not allocate another copy just to decide
+    // whether it contains a diagnostic marker.
+    let lower = content
+        .chars()
+        .take(COMPACTION_HIGH_VALUE_TOOL_RESULT_MAX_CHARS)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    [
+        "error",
+        "failed",
+        "failure",
+        "exception",
+        "panic",
+        "test result",
+        "diagnostic",
+        "approval",
+        "permission denied",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn fit_compaction_context(
+    conversation: &[borg_provider::provider::ModelMessage],
+    max_chars: usize,
+) -> String {
+    let mut projected = prune_conversation_for_compaction(conversation);
+    let mut rendered = format_subscription_conversation_with_tool_limit(&projected, None);
+    if rendered.chars().count() <= max_chars {
+        return rendered;
+    }
+
+    // If non-tool messages themselves are unusually large, reduce them at
+    // message boundaries. This keeps the user/system records identifiable and
+    // avoids a blind cut through the middle of the whole transcript.
+    let recent_user_indices = recent_user_turn_indices(&projected, 2);
+    for (index, message) in projected.iter_mut().enumerate() {
+        if recent_user_indices.contains(&index) {
+            continue;
+        }
+        if let borg_provider::provider::ModelMessage::Assistant {
+            content,
+            reasoning_content,
+            reasoning_details,
+            tool_calls,
+        } = message
+        {
+            if content.is_some() || reasoning_content.is_some() || reasoning_details.is_some() {
+                *content = Some(COMPACTION_OLD_ASSISTANT_MARKER.to_string());
+            }
+            *reasoning_content = None;
+            *reasoning_details = None;
+            for call in tool_calls {
+                call.function.arguments = truncate_compaction_context(
+                    &call.function.arguments,
+                    COMPACTION_HIGH_VALUE_TOOL_RESULT_MAX_CHARS,
+                );
+            }
+        }
+    }
+    let mut content_limit = 64_000;
+    while rendered.chars().count() > max_chars && content_limit > 1_024 {
+        for message in &mut projected {
+            compact_message_for_budget(message, content_limit);
+        }
+        rendered = format_subscription_conversation_with_tool_limit(&projected, None);
+        content_limit /= 2;
+    }
+    if rendered.chars().count() <= max_chars {
+        return rendered;
+    }
+
+    // A pathological transcript can contain more non-tool text than the
+    // provider accepts. Keep the first system/user context and the newest two
+    // user turns, with an explicit durable-history marker for the omitted
+    // middle. The final bounded cut is defense-in-depth only; ordinary
+    // tool-heavy histories are handled by the semantic pruning above.
+    let recent_user_indices = recent_user_turn_indices(&projected, 2);
+    let mut selected = Vec::with_capacity(projected.len());
+    let mut omitted = false;
+    for (index, message) in projected.into_iter().enumerate() {
+        let keep = matches!(
+            message,
+            borg_provider::provider::ModelMessage::System { .. }
+                | borg_provider::provider::ModelMessage::User { .. }
+        ) || recent_user_indices.contains(&index);
+        if keep {
+            if omitted {
+                selected.push(borg_provider::provider::ModelMessage::user(
+                    "[Older conversation messages omitted from compaction input; durable journal retained]",
+                ));
+                omitted = false;
+            }
+            selected.push(message);
+        } else {
+            omitted = true;
+        }
+    }
+    if omitted {
+        selected.push(borg_provider::provider::ModelMessage::user(
+            "[Older conversation messages omitted from compaction input; durable journal retained]",
+        ));
+    }
+    rendered = format_subscription_conversation_with_tool_limit(&selected, None);
+    if rendered.chars().count() > max_chars {
+        truncate_compaction_context(&rendered, max_chars)
+    } else {
+        rendered
+    }
+}
+
+fn compact_message_for_budget(
+    message: &mut borg_provider::provider::ModelMessage,
+    content_limit: usize,
+) {
+    use borg_provider::provider::ModelMessage;
+
+    match message {
+        ModelMessage::System { content } | ModelMessage::User { content, .. } => {
+            *content = truncate_compaction_context(content, content_limit);
+        }
+        ModelMessage::Assistant {
+            content,
+            reasoning_content,
+            reasoning_details,
+            tool_calls,
+        } => {
+            if let Some(content) = content {
+                *content = truncate_compaction_context(content, content_limit / 2);
+            }
+            *reasoning_content = None;
+            *reasoning_details = None;
+            for call in tool_calls {
+                call.function.arguments =
+                    truncate_compaction_context(&call.function.arguments, content_limit / 4);
+            }
+        }
+        ModelMessage::Tool { content, .. } => {
+            *content = truncate_compaction_tool_result(content, content_limit);
+        }
+    }
+}
+
+fn recent_user_turn_indices(
+    conversation: &[borg_provider::provider::ModelMessage],
+    turns_to_keep: usize,
+) -> HashSet<usize> {
+    let mut indices = HashSet::new();
+    let mut turns = 0;
+    for index in (0..conversation.len()).rev() {
+        if matches!(
+            conversation[index],
+            borg_provider::provider::ModelMessage::User { .. }
+        ) {
+            turns += 1;
+            if turns > turns_to_keep {
+                break;
+            }
+        }
+        if turns > 0 && turns <= turns_to_keep {
+            indices.insert(index);
+        }
+    }
+    indices
 }
 
 fn format_subscription_conversation_with_tool_limit(
@@ -4464,23 +4613,6 @@ fn format_subscription_actor_value(actor: EventActor, text: &str) -> Value {
     format_subscription_text_value(role, text)
 }
 
-fn format_subscription_tool_call_value(tool_call_id: &str, name: &str, input: &Value) -> Value {
-    let arguments = serde_json::to_string(input).unwrap_or_else(|_| input.to_string());
-    let tool_call = SubscriptionContextToolCall {
-        id: tool_call_id,
-        name,
-        arguments: &arguments,
-    };
-    serde_json::to_value(SubscriptionContextMessage {
-        role: "assistant",
-        content: None,
-        thinking: None,
-        tool_calls: Some(vec![tool_call]),
-        tool_call_id: None,
-    })
-    .expect("subscription context message is serializable")
-}
-
 fn format_subscription_tool_result_value_with_limit(
     tool_call_id: &str,
     output: &str,
@@ -4497,13 +4629,24 @@ fn format_subscription_tool_result_value_with_limit(
 }
 
 fn truncate_compaction_tool_result(output: &str, max_chars: usize) -> String {
-    let mut characters = output.chars();
-    let prefix = characters.by_ref().take(max_chars).collect::<String>();
-    if characters.next().is_none() {
+    let total_chars = output.chars().count();
+    if total_chars <= max_chars {
         return output.to_string();
     }
-    let omitted = characters.count() + 1;
-    format!("{prefix}\n\n[... {omitted} more characters truncated]")
+    if max_chars == 0 {
+        return String::new();
+    }
+    let omitted = total_chars.saturating_sub(max_chars);
+    let marker = format!("\n\n[... {omitted} more characters truncated]");
+    if marker.chars().count() >= max_chars {
+        return truncate_compaction_context(output, max_chars);
+    }
+    let available = max_chars - marker.chars().count();
+    let head_chars = available.saturating_mul(2) / 3;
+    let tail_chars = available - head_chars;
+    let head_end = char_boundary_at(output, head_chars);
+    let tail_start = char_boundary_at(output, total_chars.saturating_sub(tail_chars));
+    format!("{}{}{}", &output[..head_end], marker, &output[tail_start..])
 }
 
 /// A provider adapter receives one text prompt, but its history is still a
@@ -4519,7 +4662,7 @@ fn format_subscription_frame(value: &Value) -> String {
 
 fn retained_compaction_prompt(context: &str) -> String {
     format!(
-        "Summarize this prior provider conversation for the next agent. Preserve user requirements, decisions, files changed, commands and tests run, unresolved errors, approvals, and next steps. Do not use tools or modify the workspace. Return only the continuation summary.\n\n<prior_provider_conversation>\n{context}\n</prior_provider_conversation>"
+        "Summarize this prior provider conversation for the next agent. Preserve user requirements, decisions, files changed, commands and tests run, unresolved errors, approvals, and next steps. Do not use tools or modify the workspace. Return only the continuation summary. Use these sections when applicable: Goal, Instructions, Discoveries, Accomplished, Relevant files, and Open issues.\n\n<prior_provider_conversation>\n{context}\n</prior_provider_conversation>"
     )
 }
 
