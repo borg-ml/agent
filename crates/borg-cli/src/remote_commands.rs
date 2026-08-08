@@ -1586,6 +1586,7 @@ async fn run_local_agent_session(
     let mut pending_prompt_ids = HashSet::new();
     let mut stop_sent = false;
     let mut user_requested_exit = false;
+    let mut force_exit_requested = false;
     let mut exit_notice = None;
     let mut detached_from_terminal = false;
     let mut handoff_on_safe_boundary = false;
@@ -3133,6 +3134,16 @@ async fn run_local_agent_session(
                             session_command_tx.send(HostCommand::Interrupt { session_id }).await.ok();
                         }
                     }
+                    UiAction::ForceQuit => {
+                        // Repeated Ctrl-C means "give the shell back now".
+                        // In particular, never keep this foreground process
+                        // alive merely because a remote viewer is attached.
+                        user_requested_exit = true;
+                        force_exit_requested = true;
+                        shutdown_terminal(&mut terminal, &crash_context.tui_active).await;
+                        let _ = session_command_tx.try_send(HostCommand::Stop { session_id });
+                        break;
+                    }
                     UiAction::Quit => {
                         user_requested_exit = true;
                         if owner_shutdown_should_handoff_to_viewer(
@@ -4222,23 +4233,10 @@ async fn run_local_agent_session(
             _ = tokio::signal::ctrl_c(), if interactive => {
                 if repeated_ctrl_c(&mut last_ctrl_c, std::time::Instant::now()) {
                     user_requested_exit = true;
-                    if owner_shutdown_should_handoff_to_viewer(
-                        session_access,
-                        status,
-                        local_prompt_submission_pending(
-                            &pending_prompt_ids,
-                            &local_prompt_admissions,
-                        ),
-                        control_server.as_ref(),
-                    ) {
-                        handoff_on_safe_boundary = true;
-                        detached_from_terminal = true;
-                        shutdown_terminal(&mut terminal, &crash_context.tui_active).await;
-                    } else {
-                        stop_sent = true;
-                        shutdown_terminal(&mut terminal, &crash_context.tui_active).await;
-                        session_command_tx.send(HostCommand::Stop { session_id }).await.ok();
-                    }
+                    force_exit_requested = true;
+                    shutdown_terminal(&mut terminal, &crash_context.tui_active).await;
+                    let _ = session_command_tx.try_send(HostCommand::Stop { session_id });
+                    break;
                 } else if let Some(terminal) = terminal.as_mut() {
                     terminal.handle_external_interrupt();
                     terminal_dirty = true;
@@ -4309,13 +4307,30 @@ async fn run_local_agent_session(
         shutdown_terminal(&mut terminal, &crash_context.tui_active).await;
     }
     drop(session_events);
+    let mut actor = actor;
+    if force_exit_requested {
+        actor.abort();
+    }
+    let actor_result = if force_exit_requested {
+        match tokio::time::timeout(std::time::Duration::from_millis(500), &mut actor).await {
+            Ok(result) => Some(result),
+            Err(_) => {
+                tracing::warn!(%session_id, "forced exit detached an actor that did not cancel within 500ms");
+                None
+            }
+        }
+    } else {
+        Some(actor.await)
+    };
     let mut actor_panicked = false;
-    let actor_error = match actor.await {
-        Ok(result) => result.err(),
-        Err(join_error) => {
+    let actor_error = match actor_result {
+        Some(Ok(result)) => result.err(),
+        Some(Err(join_error)) if force_exit_requested && join_error.is_cancelled() => None,
+        Some(Err(join_error)) => {
             actor_panicked = join_error.is_panic();
             Some(anyhow::anyhow!("agent session task failed: {join_error}"))
         }
+        None => None,
     };
     let discarded_empty_session = if session_access == LocalSessionAccess::Owned && !args.ephemeral
     {

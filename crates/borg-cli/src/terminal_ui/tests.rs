@@ -466,6 +466,55 @@ fn focused_subagent_status_preserves_semantic_failures_and_uses_pink_for_work() 
 }
 
 #[test]
+fn focused_subagent_escape_targets_that_subagent() {
+    let keymap = KeyMap::from_config(&KeybindingConfig::default()).unwrap();
+    let child = Uuid::new_v4();
+
+    assert_eq!(
+        focused_child_interrupt_target(
+            &keymap,
+            &KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            Some(child),
+        ),
+        Some(child)
+    );
+    assert_eq!(
+        focused_child_interrupt_target(
+            &keymap,
+            &KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            None,
+        ),
+        None
+    );
+}
+
+#[test]
+fn subagent_activity_timers_are_independent_and_stop_with_their_agent() {
+    let first = Uuid::new_v4();
+    let second = Uuid::new_v4();
+    let first_started = Utc::now() - chrono::Duration::seconds(9);
+    let second_started = Utc::now() - chrono::Duration::seconds(3);
+    let mut active_since = HashMap::new();
+
+    track_child_activity(
+        &mut active_since,
+        first,
+        SessionStatus::Running,
+        first_started,
+    );
+    track_child_activity(
+        &mut active_since,
+        second,
+        SessionStatus::Starting,
+        second_started,
+    );
+    track_child_activity(&mut active_since, first, SessionStatus::Stopped, Utc::now());
+
+    assert!(!active_since.contains_key(&first));
+    assert_eq!(active_since.get(&second), Some(&second_started));
+}
+
+#[test]
 fn a_late_message_snapshot_can_supply_the_attachment_without_renumbering_it() {
     let session_id = Uuid::new_v4();
     let message_id = Uuid::new_v4();
@@ -3439,7 +3488,7 @@ fn agents_status_hover_underlines_only_the_label() {
 }
 
 #[test]
-fn model_effort_and_permission_hover_show_bottom_interaction_hints() {
+fn actionable_status_segments_show_bottom_interaction_hints() {
     let hint = |agents, model, effort, permission| {
         bottom_interaction_hint(BottomInteractionHintState {
             agents_status_hovered: agents,
@@ -3465,13 +3514,6 @@ fn model_effort_and_permission_hover_show_bottom_interaction_hints() {
     assert_eq!(
         hint(false, false, false, true),
         Some("left click change permissions")
-    );
-    assert_eq!(
-        bottom_interaction_hint(BottomInteractionHintState {
-            context_status_hovered: true,
-            ..BottomInteractionHintState::default()
-        }),
-        Some("left click show context details")
     );
     assert_eq!(hint(false, false, false, false), None);
 }

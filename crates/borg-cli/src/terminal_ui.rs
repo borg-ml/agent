@@ -531,6 +531,9 @@ pub enum UiAction {
     Interrupt {
         target: Option<Uuid>,
     },
+    /// A repeated Ctrl-C is an explicit request to return control to the
+    /// parent shell now. It must not be converted into a background handoff.
+    ForceQuit,
     Quit,
 }
 
@@ -630,6 +633,7 @@ pub struct BorgTerminal {
     child_history_hydration_complete: bool,
     child_queued_prompts: HashMap<Uuid, Vec<PendingPromptProjection>>,
     child_statuses: HashMap<Uuid, SessionStatus>,
+    child_active_since: HashMap<Uuid, DateTime<Utc>>,
     child_pending_approvals: HashSet<Uuid>,
     focused_child: Option<Uuid>,
     sidecar_focus_request: Option<String>,
@@ -1561,6 +1565,7 @@ impl BorgTerminal {
             child_history_hydration_complete: false,
             child_queued_prompts: HashMap::new(),
             child_statuses: HashMap::new(),
+            child_active_since: HashMap::new(),
             child_pending_approvals: HashSet::new(),
             focused_child: None,
             sidecar_focus_request: None,
@@ -1680,6 +1685,7 @@ impl BorgTerminal {
         self.child_history_hydration_complete = false;
         self.child_queued_prompts.clear();
         self.child_statuses.clear();
+        self.child_active_since.clear();
         self.child_pending_approvals.clear();
         self.focused_child = None;
         self.sidecar_focus_request = None;
@@ -1801,8 +1807,13 @@ impl BorgTerminal {
     }
 
     pub async fn shutdown(mut self) {
-        self.input.shutdown().await;
+        // Stop the reader before changing terminal modes, but restore the
+        // terminal synchronously before awaiting task cancellation. A second
+        // interrupt must never strand the shell behind an async teardown.
+        self.input.abort();
         self.restore_terminal();
+        self.input.shutdown().await;
+        discard_pending_terminal_input();
     }
 
     pub fn seed_history(&mut self, events: &[SessionEvent]) {
@@ -2178,8 +2189,14 @@ impl BorgTerminal {
             return false;
         };
         let child_id = agent.session_id;
-        self.child_statuses
-            .insert(child_id, subagent_session_status(agent.status));
+        let status = subagent_session_status(agent.status);
+        self.child_statuses.insert(child_id, status);
+        track_child_activity(
+            &mut self.child_active_since,
+            child_id,
+            status,
+            agent.created_at,
+        );
         if !self.hydrated_children.contains(&child_id) && self.child_history_hydration_complete {
             self.hydrated_children.insert(child_id);
         }
@@ -2194,6 +2211,12 @@ impl BorgTerminal {
         }
         if let SessionEventKind::StatusChanged { status, .. } = child_event.kind {
             self.child_statuses.insert(child_id, status);
+            track_child_activity(
+                &mut self.child_active_since,
+                child_id,
+                status,
+                child_event.created_at,
+            );
         }
         update_queued_prompts(
             self.child_queued_prompts.entry(child_id).or_default(),
@@ -2329,6 +2352,12 @@ impl BorgTerminal {
         for event in &events {
             if let SessionEventKind::StatusChanged { status, .. } = event.kind {
                 self.child_statuses.insert(child_id, status);
+                track_child_activity(
+                    &mut self.child_active_since,
+                    child_id,
+                    status,
+                    event.created_at,
+                );
             }
             update_queued_prompts(
                 self.child_queued_prompts.entry(child_id).or_default(),
@@ -2374,8 +2403,14 @@ impl BorgTerminal {
             .unwrap_or(&mut self.transcript);
         for agent in agents {
             transcript.upsert_subagent_snapshot(agent);
-            self.child_statuses
-                .insert(agent.session_id, subagent_session_status(agent.status));
+            let status = subagent_session_status(agent.status);
+            self.child_statuses.insert(agent.session_id, status);
+            track_child_activity(
+                &mut self.child_active_since,
+                agent.session_id,
+                status,
+                agent.created_at,
+            );
         }
     }
 
@@ -2383,6 +2418,13 @@ impl BorgTerminal {
         self.focused_child()
             .and_then(|child| self.child_statuses.get(&child).copied())
             .unwrap_or(self.status)
+    }
+
+    fn active_status_started_at(&self) -> Option<DateTime<Utc>> {
+        match self.focused_child() {
+            Some(child) => self.child_active_since.get(&child).copied(),
+            None => self.active_since,
+        }
     }
 
     fn active_pending_approval(&self) -> bool {
@@ -4216,6 +4258,7 @@ impl BorgTerminal {
             .collect::<Vec<_>>();
         let total_subagents = agent_roster_entries.len().saturating_sub(1);
         let session_is_active = matches!(status, SessionStatus::Starting | SessionStatus::Running);
+        let active_status_started_at = self.active_status_started_at();
         let active_goal = self.active_goal().cloned();
         let goal_status = self
             .director_transcript
@@ -4265,7 +4308,6 @@ impl BorgTerminal {
             agents_status_hovered: self.agents_status_hovered,
             model_status_hovered: self.model_status_hovered,
             effort_status_hovered: self.effort_status_hovered,
-            context_status_hovered: self.context_status_hovered,
             permission_status_hovered: self.permission_status_hovered,
         });
         let primary_controls_display = if showing_transcript_interaction_hint {
@@ -4959,8 +5001,8 @@ impl BorgTerminal {
                 });
             }
             let status_highlight = self.status_hovered && status_is_interruptible;
-            let status_duration = if session_is_active && self.focused_child.is_none() {
-                format_elapsed_duration(self.active_since.map_or(0, |started| {
+            let status_duration = if session_is_active {
+                format_elapsed_duration(active_status_started_at.map_or(0, |started| {
                     Utc::now()
                         .signed_duration_since(started)
                         .num_seconds()
@@ -5899,6 +5941,12 @@ impl BorgTerminal {
             self.keybindings_open = false;
             return Ok(UiAction::None);
         }
+        if let Some(target) = focused_child_interrupt_target(&self.keymap, &key, self.focused_child)
+        {
+            return Ok(UiAction::Interrupt {
+                target: Some(target),
+            });
+        }
         if self.keymap.matches(KeyAction::Interrupt, &key)
             && self.composer.text.is_empty()
             && !self.pending_approval
@@ -5928,7 +5976,7 @@ impl BorgTerminal {
                 return Ok(UiAction::None);
             }
             if repeated_ctrl_c(&mut self.last_ctrl_c, Instant::now()) {
-                return Ok(UiAction::Quit);
+                return Ok(UiAction::ForceQuit);
             }
             self.composer.clear();
             self.notice = Some(format!(
@@ -6519,6 +6567,30 @@ fn subagent_session_status(status: SubagentStatus) -> SessionStatus {
         SubagentStatus::WaitingForApproval => SessionStatus::WaitingForApproval,
         SubagentStatus::Stopped => SessionStatus::Stopped,
         SubagentStatus::Failed => SessionStatus::Failed,
+    }
+}
+
+fn focused_child_interrupt_target(
+    keymap: &KeyMap,
+    key: &KeyEvent,
+    focused_child: Option<Uuid>,
+) -> Option<Uuid> {
+    keymap
+        .matches(KeyAction::Interrupt, key)
+        .then_some(focused_child)
+        .flatten()
+}
+
+fn track_child_activity(
+    active_since: &mut HashMap<Uuid, DateTime<Utc>>,
+    child_id: Uuid,
+    status: SessionStatus,
+    observed_at: DateTime<Utc>,
+) {
+    if matches!(status, SessionStatus::Starting | SessionStatus::Running) {
+        active_since.entry(child_id).or_insert(observed_at);
+    } else {
+        active_since.remove(&child_id);
     }
 }
 
@@ -9815,7 +9887,6 @@ struct BottomInteractionHintState {
     agents_status_hovered: bool,
     model_status_hovered: bool,
     effort_status_hovered: bool,
-    context_status_hovered: bool,
     permission_status_hovered: bool,
 }
 
@@ -9830,8 +9901,6 @@ fn bottom_interaction_hint(state: BottomInteractionHintState) -> Option<&'static
         Some("left click change model")
     } else if state.effort_status_hovered {
         Some("left click change effort")
-    } else if state.context_status_hovered {
-        Some("left click show context details")
     } else if state.permission_status_hovered {
         Some("left click change permissions")
     } else {
