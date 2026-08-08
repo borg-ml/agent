@@ -3970,16 +3970,27 @@ fn resolve_persistent_peer_profile(
             .map_or((profile.as_str(), None), |(profile, effort)| {
                 (profile, (!effort.is_empty()).then_some(effort))
             });
-        let (provider_hint, explicit_model) = profile
-            .split_once('/')
-            .map_or((profile, None), |(provider, model)| {
-                (provider, (!model.is_empty()).then_some(model))
-            });
-        let provider = match provider_hint {
-            "claude" | "anthropic" => CodingProvider::Claude,
-            "gpt" | "codex" | "openai" => CodingProvider::Codex,
-            _ => CodingProvider::for_model(provider_hint)
-                .with_context(|| format!("unknown persistent peer profile `{profile}`"))?,
+        let (provider, explicit_model) = if let Some((provider_hint, model)) =
+            profile.split_once('/')
+        {
+            let provider = match provider_hint {
+                "claude" | "anthropic" => CodingProvider::Claude,
+                "gpt" | "codex" | "openai" => CodingProvider::Codex,
+                _ => CodingProvider::for_model(provider_hint).with_context(|| {
+                    format!("unknown persistent peer provider `{provider_hint}`")
+                })?,
+            };
+            (provider, (!model.is_empty()).then_some(model))
+        } else {
+            match profile {
+                "claude" | "anthropic" => (CodingProvider::Claude, None),
+                "gpt" | "codex" | "openai" => (CodingProvider::Codex, None),
+                model => (
+                    CodingProvider::for_model(model)
+                        .with_context(|| format!("unknown persistent peer profile `{profile}`"))?,
+                    Some(model),
+                ),
+            }
         };
         (
             provider,

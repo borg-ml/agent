@@ -1617,6 +1617,13 @@ fn persistent_peer_defaults_to_the_opposite_provider_and_stable_sidecar_profile(
     assert_eq!(provider, CodingProvider::Claude);
     assert_eq!(model.as_deref(), Some("claude-opus-5"));
     assert_eq!(effort.as_deref(), Some("high"));
+
+    let (provider, model, effort) =
+        resolve_persistent_peer_profile(CodingProvider::Codex, Some("claude-sonnet-5@low"))
+            .unwrap();
+    assert_eq!(provider, CodingProvider::Claude);
+    assert_eq!(model.as_deref(), Some("claude-sonnet-5"));
+    assert_eq!(effort.as_deref(), Some("low"));
 }
 
 #[test]
