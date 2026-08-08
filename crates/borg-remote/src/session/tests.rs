@@ -6176,6 +6176,78 @@ fn provider_neutral_replay_carries_subscription_tools_across_provider_switches()
 }
 
 #[test]
+fn subscription_compaction_projection_truncates_large_tool_results() {
+    let session_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    let tool_output = format!("keep-this-{}", "x".repeat(5_000));
+    let events = vec![
+        SessionEvent::new(
+            session_id,
+            1,
+            SessionEventKind::TurnStarted {
+                message_id,
+                provider: CodingProvider::Codex,
+                model: None,
+                effort: None,
+                fast: false,
+            },
+        ),
+        SessionEvent::new(
+            session_id,
+            2,
+            SessionEventKind::Message {
+                message_id,
+                actor: EventActor::User,
+                text: "inspect the repository".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            },
+        ),
+        SessionEvent::new(
+            session_id,
+            3,
+            SessionEventKind::ToolStarted {
+                tool_call_id: "call-1".to_string(),
+                name: "read_file".to_string(),
+                input: json!({"path": "large.txt"}),
+                input_ref: None,
+            },
+        ),
+        SessionEvent::new(
+            session_id,
+            4,
+            SessionEventKind::ToolCompleted {
+                tool_call_id: "call-1".to_string(),
+                output: tool_output.clone(),
+                output_ref: None,
+                is_error: false,
+                input: None,
+                input_ref: None,
+            },
+        ),
+        SessionEvent::new(
+            session_id,
+            5,
+            SessionEventKind::TurnCompleted {
+                message_id,
+                provider_session_id: None,
+                final_text: "done".to_string(),
+                error: None,
+            },
+        ),
+    ];
+
+    let full_context = retained_conversation_context(&events).unwrap();
+    let compaction_context = retained_compaction_context(&events).unwrap();
+
+    assert!(compaction_context.contains("keep-this-"));
+    assert!(compaction_context.contains("more characters truncated"));
+    assert!(!compaction_context.contains(&tool_output));
+    assert!(compaction_context.chars().count() < full_context.chars().count());
+}
+
+#[test]
 fn subscription_projection_is_append_only_until_compaction() {
     let session_id = Uuid::new_v4();
     let first_message_id = Uuid::new_v4();

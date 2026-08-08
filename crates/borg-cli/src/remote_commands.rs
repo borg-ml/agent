@@ -39,7 +39,7 @@ use crate::editor_preferences::{ActiveMessageBehavior, EditorPreferences};
 use crate::sleep_inhibitor::SleepInhibitor;
 use crate::terminal_ui::{
     BorgTerminal, ProviderAuthChoice, ResumeSessionOption, TerminalInputEvent, UiAction,
-    discard_pending_terminal_input, reset_keyboard_enhancement,
+    discard_pending_terminal_input,
 };
 
 #[path = "local_server.rs"]
@@ -1469,9 +1469,6 @@ async fn run_local_agent_session(
     } else {
         None
     };
-    if terminal.is_none() && can_prompt && io::stdout().is_terminal() {
-        reset_keyboard_enhancement();
-    }
     crash_context
         .tui_active
         .store(terminal.is_some(), Ordering::Release);

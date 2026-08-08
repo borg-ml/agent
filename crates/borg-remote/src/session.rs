@@ -38,6 +38,10 @@ const SUBSCRIPTION_CONTEXT_HEADER: &str = "Borg canonical provider context v2. T
 const SUBSCRIPTION_INPUT_BUDGET_CHARS: usize = 1 << 20;
 const SUBSCRIPTION_COMPACTION_CHUNK_BYTES: usize = 600 * 1024;
 const MAX_SUBSCRIPTION_COMPACTION_ROUNDS: usize = 4;
+// Tool output is durable evidence, but sending every byte of old output to a
+// summarizer makes compaction itself hit the provider input limit. Keep the
+// leading portion for diagnostics and let the durable journal remain complete.
+const COMPACTION_TOOL_RESULT_MAX_CHARS: usize = 2_000;
 
 struct SessionAutonomyDispatch {
     job: crate::AutonomyJob,
@@ -1089,7 +1093,6 @@ async fn run_agent_session_store_kernel(
     }
     let state = journal.state(session_id).await?;
     validate_session_state(session_id, &state)?;
-    let initial_context_generation = state.context_generation;
     let mut provider_context_usage_valid = fresh;
     let mut provider_session_id = state.provider_session_id;
     // Set when a provider switch lands mid-turn; drained at the next turn
@@ -1703,42 +1706,22 @@ async fn run_agent_session_store_kernel(
                                     .await
                                     .map(Some)
                             } else {
-                                let context =
-                                    retained_conversation_context(journal.context_events())
-                                        .context("there is no conversation to compact yet")?;
-                                executor
-                                    .compact_retained_context(AgentTurn {
+                                let context = retained_compaction_context(journal.context_events())
+                                    .context("there is no conversation to compact yet")?;
+                                compact_subscription_context_for_budget(
+                                    SubscriptionCompactionRequest {
+                                        executor: &executor,
                                         session_id,
-                                        message_id: Uuid::new_v4(),
-                                        context_generation: initial_context_generation,
-                                        provider: launch.provider,
-                                        provider_session_id: None,
-                                        cwd: launch.cwd.clone(),
-                                        prompt_delta: retained_compaction_prompt(&context),
-                                        prompt: retained_compaction_prompt(&context),
-                                        attachments: Vec::new(),
-                                        output_schema: None,
-                                        model: launch.model.clone(),
-                                        effort: launch.effort.clone(),
-                                        fast: launch.fast,
-                                        response_language: launch.response_language,
-                                        permission_mode: launch.permission_mode,
-                                        conversation: Vec::new(),
-                                        agent_mcp_server: agent_mcp_server.clone(),
-                                        agent_tools: dispatcher.clone(),
-                                        external_mcp_servers: runtime_mcp_servers.clone(),
-                                        runtime_mcp_context: runtime_mcp_context.clone(),
-                                        extension_skill_roots: Vec::new(),
-                                        extension_workflows: Vec::new(),
-                                        system_prompt_appendix: format!(
-                                            "{RETAINED_COMPACTION_SYSTEM_PROMPT}\n\n{}",
-                                            crate::provider_capabilities_prompt(
-                                                &launch.capabilities.provider_capabilities
-                                            )
-                                        ),
-                                    })
-                                    .await
-                                    .map(Some)
+                                        launch: &launch,
+                                        agent_mcp_server: &agent_mcp_server,
+                                        dispatcher: &dispatcher,
+                                        context: &context,
+                                        actor: EventActor::User,
+                                        current_prompt: "",
+                                    },
+                                )
+                                .await
+                                .map(Some)
                             }
                         }
                         .await;
@@ -2056,10 +2039,12 @@ async fn run_agent_session_store_kernel(
                 )
             })
         {
-            let context = retained_context
+            let full_context = retained_context
                 .take()
                 .expect("oversized subscription context was present");
-            let context_chars = context.chars().count();
+            let context = retained_compaction_context(journal.context_events())
+                .unwrap_or_else(|| full_context.clone());
+            let context_chars = full_context.chars().count();
             subscription_context_reusable = false;
             record(
                 &mut journal,
@@ -2138,7 +2123,7 @@ async fn run_agent_session_store_kernel(
                         error = %error,
                         "automatic subscription context compaction failed"
                     );
-                    retained_context = Some(context);
+                    retained_context = Some(full_context);
                     record(
                         &mut journal,
                         &events,
@@ -4122,7 +4107,9 @@ async fn compact_subscription_context_for_budget(
     let mut usage = ProviderCallUsage::default();
 
     for _ in 0..MAX_SUBSCRIPTION_COMPACTION_ROUNDS {
+        let single_chunk = chunks.len() == 1;
         let mut summaries = Vec::with_capacity(chunks.len());
+        let mut provider_session_id = None;
         for chunk in chunks {
             let compaction = executor
                 .compact_retained_context(AgentTurn {
@@ -4170,6 +4157,9 @@ async fn compact_subscription_context_for_budget(
                 "subscription context compaction returned an empty summary"
             );
             accumulate_provider_usage(&mut usage, &compaction.usage);
+            if single_chunk {
+                provider_session_id = compaction.provider_session_id.clone();
+            }
             summaries.push(compaction.summary);
         }
 
@@ -4180,7 +4170,7 @@ async fn compact_subscription_context_for_budget(
             return Ok(AgentCompaction {
                 summary: combined,
                 usage,
-                provider_session_id: None,
+                provider_session_id,
             });
         }
         chunks = split_retained_context(&combined, SUBSCRIPTION_COMPACTION_CHUNK_BYTES);
@@ -4220,6 +4210,17 @@ fn accumulate_provider_usage(total: &mut ProviderCallUsage, next: &ProviderCallU
 }
 
 fn retained_conversation_context(events: &[SessionEvent]) -> Option<String> {
+    retained_conversation_context_with_tool_limit(events, None)
+}
+
+fn retained_compaction_context(events: &[SessionEvent]) -> Option<String> {
+    retained_conversation_context_with_tool_limit(events, Some(COMPACTION_TOOL_RESULT_MAX_CHARS))
+}
+
+fn retained_conversation_context_with_tool_limit(
+    events: &[SessionEvent],
+    tool_result_max_chars: Option<usize>,
+) -> Option<String> {
     // Newer journals carry TurnStarted boundaries, allowing the structured
     // provider-neutral replay path to include subscription tool calls/results
     // alongside native model messages. Keep the legacy text fallback for
@@ -4231,7 +4232,12 @@ fn retained_conversation_context(events: &[SessionEvent]) -> Option<String> {
         return native_conversation(events, CodingProvider::OpenRouter)
             .ok()
             .filter(|conversation| !conversation.is_empty())
-            .map(|conversation| format_subscription_conversation(&conversation));
+            .map(|conversation| {
+                format_subscription_conversation_with_tool_limit(
+                    &conversation,
+                    tool_result_max_chars,
+                )
+            });
     }
 
     let mut entries = Vec::new();
@@ -4274,7 +4280,11 @@ fn retained_conversation_context(events: &[SessionEvent]) -> Option<String> {
                 tool_call_id,
                 output,
                 ..
-            } => entries.push(format_subscription_tool_result_value(tool_call_id, output)),
+            } => entries.push(format_subscription_tool_result_value_with_limit(
+                tool_call_id,
+                output,
+                tool_result_max_chars,
+            )),
             _ => {}
         }
     }
@@ -4287,12 +4297,26 @@ fn retained_conversation_context(events: &[SessionEvent]) -> Option<String> {
     })
 }
 
-fn format_subscription_conversation(
+fn format_subscription_conversation_with_tool_limit(
     conversation: &[borg_provider::provider::ModelMessage],
+    tool_result_max_chars: Option<usize>,
 ) -> String {
     conversation
         .iter()
-        .map(format_subscription_message)
+        .map(|message| match (message, tool_result_max_chars) {
+            (
+                borg_provider::provider::ModelMessage::Tool {
+                    tool_call_id,
+                    content,
+                },
+                Some(max_chars),
+            ) => format_subscription_tool_result_value_with_limit(
+                tool_call_id,
+                content,
+                Some(max_chars),
+            ),
+            _ => format_subscription_message(message),
+        })
         .map(|value| format_subscription_frame(&value))
         .collect::<Vec<_>>()
         .join("\n")
@@ -4405,11 +4429,29 @@ fn format_subscription_tool_call_value(tool_call_id: &str, name: &str, input: &V
     .expect("subscription context message is serializable")
 }
 
-fn format_subscription_tool_result_value(tool_call_id: &str, output: &str) -> Value {
+fn format_subscription_tool_result_value_with_limit(
+    tool_call_id: &str,
+    output: &str,
+    max_chars: Option<usize>,
+) -> Value {
+    let content = max_chars.map_or_else(
+        || output.to_string(),
+        |max_chars| truncate_compaction_tool_result(output, max_chars),
+    );
     format_subscription_message(&borg_provider::provider::ModelMessage::Tool {
         tool_call_id: tool_call_id.to_string(),
-        content: output.to_string(),
+        content,
     })
+}
+
+fn truncate_compaction_tool_result(output: &str, max_chars: usize) -> String {
+    let mut characters = output.chars();
+    let prefix = characters.by_ref().take(max_chars).collect::<String>();
+    if characters.next().is_none() {
+        return output.to_string();
+    }
+    let omitted = characters.count() + 1;
+    format!("{prefix}\n\n[... {omitted} more characters truncated]")
 }
 
 /// A provider adapter receives one text prompt, but its history is still a

@@ -37,13 +37,11 @@ use chrono::{DateTime, Local, NaiveDate, Utc};
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
-    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseButton,
-    MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, SetTitle, disable_raw_mode, enable_raw_mode,
-    supports_keyboard_enhancement,
 };
 use pulldown_cmark::{
     Alignment as MarkdownAlignment, CodeBlockKind, Event as MarkdownEvent, HeadingLevel, Options,
@@ -100,11 +98,6 @@ const MAX_PENDING_WHEEL_SCROLL_LINES: isize = 160;
 const TOOL_RUN_BOX_THRESHOLD: usize = 8;
 const MAX_COLLAPSED_PLAN_ITEMS: usize = 5;
 
-fn keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
-    // Keep modified/ambiguous keys distinguishable without putting the shell
-    // into Kitty's all-keys-as-escape-sequences mode if cleanup is interrupted.
-    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-}
 #[cfg(test)]
 const DEFAULT_TOOL_RUN_VIEWPORT_HEIGHT: usize = 8;
 const MIN_TOOL_RUN_VIEWPORT_HEIGHT: usize = 6;
@@ -714,7 +707,6 @@ pub struct BorgTerminal {
     notice: Option<String>,
     copy_notice_expires_at: Option<Instant>,
     clipboard_lease: Option<clipboard::ClipboardLease>,
-    keyboard_enhancement: bool,
     last_ctrl_c: Option<Instant>,
     queued_prompts: Vec<PendingPromptProjection>,
     replaying_history: bool,
@@ -1510,8 +1502,6 @@ impl BorgTerminal {
         let keymap = KeyMap::from_config(keybindings)?;
         enable_raw_mode().context("failed to enable terminal raw mode")?;
         let mut stdout = io::stdout();
-        reset_keyboard_enhancement();
-        let keyboard_enhancement = supports_keyboard_enhancement().unwrap_or(false);
         if mode == ScreenMode::Alternate
             && let Err(error) = execute!(stdout, EnterAlternateScreen)
         {
@@ -1519,23 +1509,7 @@ impl BorgTerminal {
             let _ = disable_raw_mode();
             return Err(error.into());
         }
-        if keyboard_enhancement
-            && let Err(error) = execute!(
-                stdout,
-                PushKeyboardEnhancementFlags(keyboard_enhancement_flags())
-            )
-        {
-            if mode == ScreenMode::Alternate {
-                let _ = execute!(stdout, LeaveAlternateScreen);
-            }
-            discard_pending_terminal_input();
-            let _ = disable_raw_mode();
-            return Err(error).context("failed to enable enhanced keyboard input");
-        }
         if let Err(error) = execute!(stdout, EnableBracketedPaste) {
-            if keyboard_enhancement {
-                let _ = execute!(stdout, PopKeyboardEnhancementFlags);
-            }
             if mode == ScreenMode::Alternate {
                 let _ = execute!(stdout, LeaveAlternateScreen);
             }
@@ -1545,9 +1519,6 @@ impl BorgTerminal {
         }
         if let Err(error) = execute!(stdout, EnableMouseCapture, SetCursorStyle::BlinkingBar) {
             let _ = execute!(stdout, DisableBracketedPaste);
-            if keyboard_enhancement {
-                let _ = execute!(stdout, PopKeyboardEnhancementFlags);
-            }
             if mode == ScreenMode::Alternate {
                 let _ = execute!(stdout, LeaveAlternateScreen);
             }
@@ -1570,9 +1541,6 @@ impl BorgTerminal {
                 let mut stdout = io::stdout();
                 let _ = execute!(stdout, SetCursorStyle::DefaultUserShape);
                 let _ = execute!(stdout, DisableBracketedPaste);
-                if keyboard_enhancement {
-                    let _ = execute!(stdout, PopKeyboardEnhancementFlags);
-                }
                 if mode == ScreenMode::Alternate {
                     let _ = execute!(stdout, LeaveAlternateScreen);
                 }
@@ -1667,7 +1635,6 @@ impl BorgTerminal {
             notice: None,
             copy_notice_expires_at: None,
             clipboard_lease: None,
-            keyboard_enhancement,
             last_ctrl_c: None,
             queued_prompts: Vec::new(),
             replaying_history: false,
@@ -6249,11 +6216,6 @@ fn is_composer_newline(keymap: &KeyMap, key: &KeyEvent) -> bool {
             && key.modifiers == KeyModifiers::CONTROL)
 }
 
-pub(crate) fn reset_keyboard_enhancement() {
-    let mut stdout = io::stdout();
-    let _ = execute!(stdout, PopKeyboardEnhancementFlags);
-}
-
 /// Discard bytes that belong to an input sequence which was in flight while
 /// the event reader stopped. Without this, the shell can receive the tail of
 /// a Kitty CSI-u sequence after Borg gives the terminal back.
@@ -6291,9 +6253,6 @@ impl BorgTerminal {
         let _ = execute!(self.terminal.backend_mut(), SetTitle("Borg CLI"));
         let _ = execute!(self.terminal.backend_mut(), DisableMouseCapture);
         let _ = execute!(self.terminal.backend_mut(), DisableBracketedPaste);
-        if self.keyboard_enhancement {
-            let _ = execute!(self.terminal.backend_mut(), PopKeyboardEnhancementFlags);
-        }
         if self.mode == ScreenMode::Alternate {
             let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
         }

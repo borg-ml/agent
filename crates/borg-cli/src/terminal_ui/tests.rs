@@ -2778,15 +2778,6 @@ fn dumb_or_explicit_plain_terminals_use_the_line_input_fallback() {
 }
 
 #[test]
-fn keyboard_enhancement_does_not_request_release_events() {
-    let flags = keyboard_enhancement_flags();
-
-    assert!(flags.contains(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES));
-    assert!(!flags.contains(KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES));
-    assert!(!flags.contains(KeyboardEnhancementFlags::REPORT_EVENT_TYPES));
-}
-
-#[test]
 fn slash_command_picker_selects_the_highlighted_match() {
     assert_eq!(slash_matches("/int")[0].0, "/interrupt");
     assert_eq!(slash_matches("/dir")[0].0, "/director");
