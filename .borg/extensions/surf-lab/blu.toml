@@ -8,4 +8,4 @@ version = "0.3.0"
 
 [mcp.lab]
 command = "${extension_dir}/surf-lab"
-allowed_tools = ["start", "step", "observe", "trace", "log", "branch", "compare", "replay.audit", "policy.train", "policy.inspect", "policy.compare", "policy.evolve", "map.generate", "map.inspect", "map.preview", "map.route", "map.export", "config"]
+allowed_tools = ["start", "step", "observe", "trace", "log", "branch", "compare", "native.audit", "replay.audit", "policy.train", "policy.inspect", "policy.compare", "policy.evolve", "map.generate", "map.inspect", "map.preview", "map.route", "map.export", "config"]
