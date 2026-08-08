@@ -464,6 +464,64 @@ fn history_reprojection_uses_delivered_durable_and_live_projection() {
     assert_eq!(delivered.state().status, Some(SessionStatus::Running));
 }
 
+#[tokio::test]
+async fn delivered_projection_repairs_durable_workflow_events_missing_from_live_stream() {
+    let root = tempdir().unwrap();
+    let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+        .await
+        .unwrap();
+    let session_id = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+    store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::SessionStarted,
+        ))
+        .await
+        .unwrap();
+    let initial = store.state(session_id).await.unwrap();
+    let workflow_id = Uuid::new_v4();
+    for kind in [
+        SessionEventKind::BluWorkflowStarted {
+            workflow_id,
+            source_hash: "hash".to_string(),
+            name: "health".to_string(),
+        },
+        SessionEventKind::BluWorkflowCallRequested {
+            workflow_id,
+            call_id: 1,
+            operation: "history".to_string(),
+            request: serde_json::json!({}),
+        },
+    ] {
+        store
+            .append(SessionEvent::new(session_id, 0, kind))
+            .await
+            .unwrap();
+    }
+    let final_event = store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::StatusChanged {
+                status: SessionStatus::Running,
+                detail: None,
+            },
+        ))
+        .await
+        .unwrap();
+    let mut delivered = DeliveredSessionProjection::new(initial);
+
+    delivered
+        .observe_from_store(&store, &final_event)
+        .await
+        .unwrap();
+
+    assert_eq!(delivered.state().latest_sequence, final_event.sequence);
+    assert_eq!(delivered.state().status, Some(SessionStatus::Running));
+}
+
 #[test]
 fn child_history_tail_stays_bounded_after_long_runs_and_forks() {
     assert_eq!(recent_child_history_after(0, 100), 0);

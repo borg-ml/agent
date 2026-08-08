@@ -812,6 +812,38 @@ impl DeliveredSessionProjection {
         Self { state }
     }
 
+    async fn observe_from_store(
+        &mut self,
+        store: &dyn SessionStore,
+        event: &SessionEvent,
+    ) -> Result<()> {
+        if event.sequence > 0 {
+            let mut after = self.state.latest_sequence;
+            while event.sequence > after.saturating_add(1) {
+                let remaining = event.sequence - after - 1;
+                let missing = store
+                    .events_after(event.session_id, after, remaining.min(1_024) as usize)
+                    .await?;
+                anyhow::ensure!(
+                    !missing.is_empty(),
+                    "session projection could not repair the durable gap after {after} before {}",
+                    event.sequence
+                );
+                for missing_event in missing {
+                    anyhow::ensure!(
+                        missing_event.sequence == after.saturating_add(1),
+                        "session projection repair expected sequence {}, received {}",
+                        after.saturating_add(1),
+                        missing_event.sequence
+                    );
+                    self.observe(&missing_event)?;
+                    after = missing_event.sequence;
+                }
+            }
+        }
+        self.observe(event)
+    }
+
     fn observe(&mut self, event: &SessionEvent) -> Result<()> {
         if event.sequence > 0 {
             self.state.apply(event)?;
@@ -1589,6 +1621,7 @@ async fn run_local_agent_session(
     let mut force_exit_requested = false;
     let mut exit_notice = None;
     let mut detached_from_terminal = false;
+    let mut detached_prompt = None;
     let mut handoff_on_safe_boundary = false;
     let mut last_ctrl_c = None;
     let mut terminal_dirty = false;
@@ -1966,7 +1999,9 @@ async fn run_local_agent_session(
                             ..
                         }
                     );
-                delivered_projection.observe(&event)?;
+                delivered_projection
+                    .observe_from_store(store.as_ref(), &event)
+                    .await?;
                 if let Some(message_id) = committed_prompt_id(&event.kind) {
                     pending_prompt_ids.remove(&message_id);
                     local_prompt_admissions
@@ -4258,6 +4293,9 @@ async fn run_local_agent_session(
                     attached_prompt_pending,
                     control_server.as_ref(),
                 );
+                let terminal_draft = terminal
+                    .as_ref()
+                    .and_then(BorgTerminal::composer_draft);
                 shutdown_terminal(&mut terminal, &crash_context.tui_active).await;
                 if should_detach_on_terminal_hangup(
                     signal,
@@ -4268,6 +4306,9 @@ async fn run_local_agent_session(
                     // example, a GPU/renderer crash). Keep the durable actor and
                     // control socket alive so a new `borg resume` can attach to the
                     // in-flight turn instead of cancelling it.
+                    if detached_prompt.is_none() {
+                        detached_prompt = terminal_draft;
+                    }
                     if handoff_to_viewer {
                         handoff_on_safe_boundary = true;
                     }
@@ -4348,9 +4389,13 @@ async fn run_local_agent_session(
         if discarded_empty_session {
             return Err(error);
         }
+        let retry_prompt = detached_prompt.clone().or_else(|| rewind_prompt.clone());
         if actor_panicked && tui_was_active {
             if let Some(next_session) = resume_session {
-                return Ok(Some((next_session, rewind_prompt, terminal)));
+                return Ok(Some((next_session, retry_prompt, terminal)));
+            }
+            if retry_prompt.is_some() {
+                return Ok(Some((session_id, retry_prompt, terminal)));
             }
             println!("{}", resume_instructions(session_id, false));
             return Ok(None);
@@ -4362,7 +4407,7 @@ async fn run_local_agent_session(
             ));
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             let next_session = resume_session.unwrap_or(session_id);
-            return Ok(Some((next_session, rewind_prompt, terminal)));
+            return Ok(Some((next_session, retry_prompt, terminal)));
         }
         let active_elsewhere = error
             .to_string()
@@ -4400,16 +4445,22 @@ async fn run_local_agent_session(
         }
         println!("\n{}", resume_instructions(session_id, false));
     }
+    let reopen_after_detach =
+        detached_prompt.is_some() && !user_requested_exit && resume_session.is_none();
+    let next_prompt = detached_prompt.or(rewind_prompt);
+    if reopen_after_detach {
+        return Ok(Some((session_id, next_prompt, None)));
+    }
     if session_access.is_attached() && !user_requested_exit && resume_session.is_none() {
         tracing::info!(%session_id, "active session owner exited; acquiring ownership");
-        return Ok(Some((session_id, None, None)));
+        return Ok(Some((session_id, next_prompt, None)));
     }
     let next_terminal = if resume_session.is_some() && !user_requested_exit {
         terminal
     } else {
         None
     };
-    Ok(resume_session.map(|session| (session, rewind_prompt, next_terminal)))
+    Ok(resume_session.map(|session| (session, next_prompt, next_terminal)))
 }
 
 async fn start_collaboration_host(session_id: Uuid) -> Result<(Child, String, String)> {

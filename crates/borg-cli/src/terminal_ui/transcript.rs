@@ -10,6 +10,7 @@ struct Transcript {
     subagents: HashMap<Uuid, SubagentStatus>,
     subagent_snapshots: HashMap<Uuid, SubagentSnapshot>,
     subagent_entries: HashMap<Uuid, usize>,
+    queued_messages: HashSet<Uuid>,
     follow_tail: bool,
     selected: Option<usize>,
     auto_expand_edits: bool,
@@ -70,6 +71,7 @@ impl Default for Transcript {
             subagents: HashMap::new(),
             subagent_snapshots: HashMap::new(),
             subagent_entries: HashMap::new(),
+            queued_messages: HashSet::new(),
             follow_tail: true,
             selected: None,
             auto_expand_edits: true,
@@ -251,6 +253,16 @@ fn tool_has_expandable_body(
             .any(|(_, body)| !body.trim().is_empty())
 }
 
+fn transcript_entry_is_turn_output(entry: &TranscriptEntry) -> bool {
+    matches!(
+        entry,
+        TranscriptEntry::Message {
+            actor: EventActor::Assistant,
+            ..
+        } | TranscriptEntry::Tool { .. }
+    )
+}
+
 impl Transcript {
     fn upsert_subagent_snapshot(&mut self, agent: &SubagentSnapshot) {
         self.subagents.insert(agent.session_id, agent.status);
@@ -392,6 +404,7 @@ impl Transcript {
         self.messages.clear();
         self.tools.clear();
         self.subagent_entries.clear();
+        self.queued_messages.clear();
         self.tool_run_offsets.clear();
         self.expanded_tool_runs.clear();
         self.active_reasoning = None;
@@ -905,6 +918,7 @@ impl Transcript {
                 self.cache_diagnostics.reset();
             }
             SessionEventKind::PromptRecalled { message_id, .. } => {
+                self.queued_messages.remove(message_id);
                 removed_entry = self.remove_message(*message_id);
             }
             SessionEventKind::Message {
@@ -938,6 +952,7 @@ impl Transcript {
                 // eventual admitted message to its enqueue position instead of
                 // the real provider-boundary chronology.
                 if *status == MessageStatus::Queued {
+                    self.queued_messages.insert(*message_id);
                     // An accepted steer may have briefly materialized as an
                     // in-progress transcript row. If the turn is interrupted,
                     // its later queue transition must withdraw that row again.
@@ -998,7 +1013,6 @@ impl Transcript {
                 } else {
                     let attachments =
                         number_message_attachments(text, attachments, &mut self.next_image_number);
-                    self.messages.insert(*message_id, self.order.len());
                     let (model, effort) = if *actor == EventActor::Assistant {
                         self.active_turn
                             .as_ref()
@@ -1017,7 +1031,19 @@ impl Transcript {
                     {
                         self.collapse_previous_edit();
                     }
-                    self.order.push(TranscriptEntry::Message {
+                    let insertion_index = if *actor == EventActor::User
+                        && matches!(status, MessageStatus::Complete | MessageStatus::Failed)
+                        && !self.queued_messages.remove(message_id)
+                    {
+                        self.late_user_message_insertion_index()
+                    } else {
+                        self.order.len()
+                    };
+                    if insertion_index < self.order.len() {
+                        self.reindex_after_insertion(insertion_index);
+                    }
+                    self.messages.insert(*message_id, insertion_index);
+                    self.order.insert(insertion_index, TranscriptEntry::Message {
                         actor: *actor,
                         text: text.clone(),
                         attachments,
@@ -1471,6 +1497,68 @@ impl Transcript {
                 Some(edit - usize::from(edit > index))
             }
         });
+    }
+
+    fn late_user_message_insertion_index(&self) -> usize {
+        let output_start = self
+            .order
+            .iter()
+            .rposition(|entry| {
+                matches!(
+                    entry,
+                    TranscriptEntry::Message {
+                        actor: EventActor::User,
+                        ..
+                    }
+                )
+            })
+            .and_then(|last_user| {
+                self.order
+                    .iter()
+                    .skip(last_user + 1)
+                    .position(transcript_entry_is_turn_output)
+                    .map(|offset| last_user + 1 + offset)
+            });
+        output_start.unwrap_or_else(|| {
+            self.order
+                .iter()
+                .position(transcript_entry_is_turn_output)
+                .unwrap_or(self.order.len())
+        })
+    }
+
+    fn reindex_after_insertion(&mut self, index: usize) {
+        self.message_markdown_cache.get_mut().messages.clear();
+        self.tool_body_cache.get_mut().lines.clear();
+        for stored_index in self
+            .messages
+            .values_mut()
+            .chain(self.tools.values_mut())
+            .chain(self.subagent_entries.values_mut())
+        {
+            if *stored_index >= index {
+                *stored_index += 1;
+            }
+        }
+        self.selected = self.selected.map(|selected| {
+            selected + usize::from(selected >= index)
+        });
+        self.tool_run_offsets = self
+            .tool_run_offsets
+            .drain()
+            .map(|(start, offset)| (start + usize::from(start >= index), offset))
+            .collect();
+        self.expanded_tool_runs = self
+            .expanded_tool_runs
+            .drain()
+            .map(|start| start + usize::from(start >= index))
+            .collect();
+        self.active_reasoning = self
+            .active_reasoning
+            .map(|reasoning| reasoning + usize::from(reasoning >= index));
+        self.last_edit = self
+            .last_edit
+            .map(|edit| edit + usize::from(edit >= index));
     }
 
     fn append_reasoning(&mut self, text: &str, started_at: DateTime<Utc>, time: String) {

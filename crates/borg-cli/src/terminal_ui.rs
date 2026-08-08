@@ -1930,6 +1930,10 @@ impl BorgTerminal {
         self.composer.restore(text, attachments);
     }
 
+    pub fn composer_draft(&self) -> Option<(String, Vec<PathBuf>)> {
+        self.composer.draft()
+    }
+
     pub fn project_pending_prompt(
         &mut self,
         target: Option<Uuid>,
@@ -7005,6 +7009,16 @@ impl Composer {
                 .map(|attachment| attachment.path)
                 .collect(),
         )
+    }
+
+    fn draft(&self) -> Option<(String, Vec<PathBuf>)> {
+        let text = self.expanded_text();
+        let attachments = self
+            .attachments
+            .iter()
+            .map(|attachment| attachment.path.clone())
+            .collect::<Vec<_>>();
+        (!text.is_empty() || !attachments.is_empty()).then_some((text, attachments))
     }
 
     fn clear(&mut self) {

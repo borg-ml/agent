@@ -175,6 +175,49 @@ fn fork_history_moves_a_late_user_completion_before_the_response() {
 }
 
 #[test]
+fn live_late_user_completion_is_inserted_before_existing_turn_output() {
+    let session_id = Uuid::new_v4();
+    let assistant = SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::Message {
+            message_id: Uuid::new_v4(),
+            actor: EventActor::Assistant,
+            text: "response".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: None,
+        },
+    );
+    let user_completion = SessionEvent::new(
+        session_id,
+        3,
+        SessionEventKind::Message {
+            message_id: Uuid::new_v4(),
+            actor: EventActor::User,
+            text: "prompt".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: Some(PromptDelivery::Steer),
+        },
+    );
+
+    let mut transcript = Transcript::default();
+    transcript.apply(&assistant);
+    transcript.apply(&user_completion);
+
+    let actors = transcript
+        .order
+        .iter()
+        .filter_map(|entry| match entry {
+            TranscriptEntry::Message { actor, .. } => Some(*actor),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(actors, vec![EventActor::User, EventActor::Assistant]);
+}
+
+#[test]
 fn complete_user_messages_with_a_lifecycle_start_keep_event_order() {
     let session_id = Uuid::new_v4();
     let message_id = Uuid::new_v4();
@@ -2136,6 +2179,20 @@ fn composer_clear_discards_the_unsent_prompt_and_attachments() {
     assert!(composer.attachments.is_empty());
     assert!(composer.pasted_texts.is_empty());
     assert_eq!(composer.cursor, 0);
+}
+
+#[test]
+fn composer_draft_snapshot_expands_paste_and_keeps_attachments() {
+    let mut composer = Composer::default();
+    let image = PathBuf::from("/tmp/image.png");
+    composer.insert("before ");
+    composer.insert_attachment(image.clone());
+    composer.insert_pasted_text("pasted payload".to_string());
+
+    assert_eq!(
+        composer.draft(),
+        Some(("before [Image 1]pasted payload".to_string(), vec![image]))
+    );
 }
 
 #[test]
