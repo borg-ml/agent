@@ -202,6 +202,7 @@ impl QueuedPrompt {
 struct PendingSteer {
     prompt: QueuedPrompt,
     state: PendingSteerState,
+    attempt_boundary: u64,
 }
 
 enum PendingSteerState {
@@ -2328,6 +2329,7 @@ async fn run_agent_session_store_kernel(
         let mut pending_approval: Option<String> = None;
         let mut pending_provider_interaction: Option<String> = None;
         let mut pending_steers = VecDeque::<PendingSteer>::new();
+        let mut steer_boundary_generation = 0_u64;
         let mut context_compaction_in_progress = false;
         let (steer_result_tx, mut steer_results) =
             mpsc::channel::<(Uuid, std::result::Result<(), String>)>(32);
@@ -2622,10 +2624,12 @@ async fn run_agent_session_store_kernel(
                     }
                     record(&mut journal, &events, session_id, kind).await?;
                     if retry_steers && !context_compaction_in_progress {
+                        steer_boundary_generation = steer_boundary_generation.saturating_add(1);
                         retry_pending_steers(
                             &control_tx,
                             &steer_result_tx,
                             &mut pending_steers,
+                            steer_boundary_generation,
                         )
                         .await;
                     }
@@ -2856,6 +2860,17 @@ async fn run_agent_session_store_kernel(
                             // what makes it honestly recallable meanwhile.
                             pending_steers[index].state =
                                 PendingSteerState::RetryAtBoundary { error };
+                            let boundary_already_passed = pending_steers[index].attempt_boundary
+                                < steer_boundary_generation;
+                            if boundary_already_passed {
+                                retry_pending_steers(
+                                    &control_tx,
+                                    &steer_result_tx,
+                                    &mut pending_steers,
+                                    steer_boundary_generation,
+                                )
+                                .await;
+                            }
                         }
                     }
                 }
@@ -2962,6 +2977,7 @@ async fn run_agent_session_store_kernel(
                                         },
                                     }
                                 },
+                                attempt_boundary: steer_boundary_generation,
                             });
                         }
                         HostCommand::Prompt {
@@ -5226,6 +5242,7 @@ async fn retry_pending_steers(
     control_tx: &mpsc::Sender<AgentTurnControl>,
     steer_result_tx: &mpsc::Sender<(Uuid, std::result::Result<(), String>)>,
     pending_steers: &mut VecDeque<PendingSteer>,
+    boundary_generation: u64,
 ) {
     for steer in pending_steers.iter_mut() {
         let PendingSteerState::RetryAtBoundary { error } = &steer.state else {
@@ -5238,6 +5255,7 @@ async fn retry_pending_steers(
         );
         if dispatch_steer(control_tx, steer_result_tx, &steer.prompt).await {
             steer.state = PendingSteerState::AwaitingAcknowledgement;
+            steer.attempt_boundary = boundary_generation;
         }
     }
 }

@@ -1022,12 +1022,7 @@ impl Transcript {
                     }
                     let queued = self.queued_messages.remove(message_id);
                     let insertion_index = if *actor == EventActor::User
-                        && matches!(
-                            status,
-                            MessageStatus::Complete
-                                | MessageStatus::Failed
-                                | MessageStatus::InProgress
-                        )
+                        && matches!(status, MessageStatus::Complete | MessageStatus::Failed)
                         && !queued
                     {
                         self.late_user_message_insertion_index()

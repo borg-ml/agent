@@ -4626,6 +4626,76 @@ fn in_progress_steer_materializes_before_the_response_and_settles_on_commit() {
 }
 
 #[test]
+fn resumed_in_progress_steer_is_appended_to_the_live_timeline() {
+    let session_id = Uuid::new_v4();
+    let previous_user_id = Uuid::new_v4();
+    let previous_assistant_id = Uuid::new_v4();
+    let resumed_user_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::Message {
+            message_id: previous_user_id,
+            actor: EventActor::User,
+            text: "previous prompt".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: Some(PromptDelivery::Steer),
+        },
+    ));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::Message {
+            message_id: previous_assistant_id,
+            actor: EventActor::Assistant,
+            text: "previous response".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: None,
+        },
+    ));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        3,
+        SessionEventKind::Message {
+            message_id: resumed_user_id,
+            actor: EventActor::User,
+            text: "resumed prompt".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::InProgress,
+            delivery: Some(PromptDelivery::Steer),
+        },
+    ));
+
+    assert!(matches!(
+        transcript.order.as_slice(),
+        [
+            TranscriptEntry::Message {
+                actor: EventActor::User,
+                text: previous_text,
+                ..
+            },
+            TranscriptEntry::Message {
+                actor: EventActor::Assistant,
+                text: previous_response,
+                ..
+            },
+            TranscriptEntry::Message {
+                actor: EventActor::User,
+                text: resumed_text,
+                complete: false,
+                ..
+            },
+        ] if previous_text == "previous prompt"
+            && previous_response == "previous response"
+            && resumed_text == "resumed prompt"
+    ));
+}
+
+#[test]
 fn active_turn_assistant_segments_preserve_event_order() {
     let session_id = Uuid::new_v4();
     let prompt_id = Uuid::new_v4();

@@ -4688,6 +4688,7 @@ fn only_an_uncommitted_steer_is_withdrawable_from_the_active_turn() {
             batch: Vec::new(),
         },
         state,
+        attempt_boundary: 0,
     };
     let mut pending_steers = VecDeque::from([
         steer(awaiting_id, PendingSteerState::AwaitingAcknowledgement),
