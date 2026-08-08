@@ -2169,6 +2169,19 @@ impl SqliteSessionStore {
         session_id: Uuid,
         workspace_id: Uuid,
     ) -> Result<SessionWorkspaceBinding> {
+        self.create_session_in_workspace_as(session_id, workspace_id, session_id)
+            .await
+    }
+
+    /// Create a fresh execution session attached to an existing durable agent
+    /// participant. Cloud workspaces may keep that participant stable across
+    /// many disposable execution sessions.
+    pub async fn create_session_in_workspace_as(
+        &self,
+        session_id: Uuid,
+        workspace_id: Uuid,
+        participant_id: Uuid,
+    ) -> Result<SessionWorkspaceBinding> {
         self.create_session(session_id).await?;
         let attached_at = Utc::now();
         let mut transaction = self.begin_write().await?;
@@ -2178,7 +2191,7 @@ impl SqliteSessionStore {
              where session_id=? and workspace_id=? and participant_id=?",
         )
         .bind(workspace_id.to_string())
-        .bind(session_id.to_string())
+        .bind(participant_id.to_string())
         .bind(attached_at.to_rfc3339())
         .bind(session_id.to_string())
         .bind(session_id.to_string())
@@ -2193,7 +2206,7 @@ impl SqliteSessionStore {
         Ok(SessionWorkspaceBinding {
             session_id,
             workspace_id,
-            participant_id: session_id,
+            participant_id,
             host_id: None,
             attached_at,
         })

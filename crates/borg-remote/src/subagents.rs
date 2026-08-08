@@ -16,7 +16,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader
 use tokio::net::TcpListener;
 #[cfg(unix)]
 use tokio::net::UnixListener;
-use tokio::sync::{Mutex, OnceCell, broadcast, mpsc};
+use tokio::sync::{Mutex, OnceCell, broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use ts_rs::TS;
 use uuid::Uuid;
@@ -24,14 +24,14 @@ use uuid::Uuid;
 use crate::persistent_runtime::{PersistentRuntimeRegistry, RuntimeHost};
 use crate::{
     ApprovalDecision, AtomicWorkClaim, Audience, CodingProvider, DeliveryMode, EventActor,
-    HostCommand, HostResourceLimits, LaunchSession, MessageStatus, ModelGoalStatus, PromptDelivery,
-    Provenance, SessionConsultationTools, SessionEvent, SessionEventKind, SessionGoalToolRequest,
-    SessionGoalTools, SessionStatus, SessionStore, SessionTodoToolRequest, SessionTodoTools,
-    SharedWork, SqliteWorkspaceStore, StructuredMention, TodoItemUpdate, WorkDependency,
-    WorkReview, WorkspaceArtifact, WorkspaceDecision, WorkspaceEvent, WorkspaceEventKind,
-    WorkspaceFilesystemOperation, WorkspaceFilesystemOutcome, WorkspaceFilesystemRequest,
-    WorkspaceMessage, WorkspaceMessageBody, WorkspaceReference, WorkspaceReviewRequest,
-    WorkspaceStore, execute_workspace_filesystem_with_limits,
+    HostCommand, HostResourceLimits, LaunchSession, MessageStatus, ModelGoalStatus,
+    NewWorkspaceMessage, PromptDelivery, Provenance, SessionConsultationTools, SessionEvent,
+    SessionEventKind, SessionGoalToolRequest, SessionGoalTools, SessionStatus, SessionStore,
+    SessionTodoToolRequest, SessionTodoTools, SharedWork, SqliteWorkspaceStore, StructuredMention,
+    TodoItemUpdate, WorkDependency, WorkReview, WorkspaceArtifact, WorkspaceDecision,
+    WorkspaceEvent, WorkspaceEventKind, WorkspaceFilesystemOperation, WorkspaceFilesystemOutcome,
+    WorkspaceFilesystemRequest, WorkspaceMessageReceipt, WorkspaceReference,
+    WorkspaceReviewRequest, WorkspaceStore, execute_workspace_filesystem_with_limits,
 };
 
 pub const DEFAULT_MAX_SUBAGENTS: usize = 16;
@@ -40,6 +40,7 @@ const RUNTIME_DEFAULT_FILE_BYTES: u64 = 256 * 1024;
 const RUNTIME_MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const RUNTIME_DEFAULT_COMMAND_TIMEOUT_MS: u64 = 120_000;
 const RUNTIME_MAX_COMMAND_TIMEOUT_MS: u64 = 30 * 60 * 1000;
+const PERSISTENT_PEER_CONSULTATION_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
@@ -1896,6 +1897,18 @@ pub struct TeamMessageOptions {
     pub reply_to_message_id: Option<Uuid>,
 }
 
+struct RoutedTeamMessage {
+    receipt: Option<WorkspaceMessageReceipt>,
+    dispatched_locally: bool,
+    relay_pending: bool,
+}
+
+#[derive(Clone)]
+enum PeerConsultationOutcome {
+    Completed(String),
+    Failed(String),
+}
+
 /// Borg-native child sessions for one root CLI session.
 ///
 /// Each child reuses the canonical session actor with its own provider context
@@ -2129,15 +2142,18 @@ impl SubagentCoordinator {
         prompt_delivery: PromptDelivery,
         delivery_mode: DeliveryMode,
         options: TeamMessageOptions,
-    ) -> Result<TeamInboxMessage> {
+    ) -> Result<(TeamInboxMessage, Option<WorkspaceMessageReceipt>)> {
         if !self.root_launch.capabilities.multiplayer {
-            return Ok(TeamInboxMessage {
-                message_id: Uuid::new_v4(),
-                text: attributed_team_message(actor, message),
-                report_text: message.to_string(),
-                sender_session_id: actor_session_id,
-                delivery: prompt_delivery,
-            });
+            return Ok((
+                TeamInboxMessage {
+                    message_id: Uuid::new_v4(),
+                    text: attributed_team_message(actor, message),
+                    report_text: message.to_string(),
+                    sender_session_id: actor_session_id,
+                    delivery: prompt_delivery,
+                },
+                None,
+            ));
         }
         let actor_binding = self
             .store
@@ -2151,49 +2167,44 @@ impl SubagentCoordinator {
             .with_context(|| {
                 format!("team recipient session {recipient_session_id} has no workspace")
             })?;
-        anyhow::ensure!(
-            actor_binding.workspace_id == recipient_binding.workspace_id,
-            "team participants are attached to different workspaces"
-        );
-        let text = attributed_team_message(actor, message);
-        let message_id = Uuid::new_v4();
-        let created_at = Utc::now();
         let workspace_store = self.workspace_store().await?;
-        workspace_store
-            .append(WorkspaceEvent {
-                id: message_id,
-                workspace_id: actor_binding.workspace_id,
-                sequence: 0,
+        let workspace_id = if actor_binding.workspace_id == recipient_binding.workspace_id {
+            actor_binding.workspace_id
+        } else {
+            workspace_store
+                .ensure_direct_workspace(
+                    actor_binding.participant_id,
+                    recipient_binding.participant_id,
+                )
+                .await?
+        };
+        let text = attributed_team_message(actor, message);
+        let idempotency_id = Uuid::new_v4();
+        let receipt = workspace_store
+            .append_message(NewWorkspaceMessage {
+                workspace_id,
                 author_id: actor_binding.participant_id,
-                idempotency_key: format!("team-message:{message_id}"),
-                created_at,
-                kind: WorkspaceEventKind::Message {
-                    message: WorkspaceMessage {
-                        id: message_id,
-                        workspace_id: actor_binding.workspace_id,
-                        thread_id: None,
-                        reply_to_message_id: options.reply_to_message_id,
-                        author_id: actor_binding.participant_id,
-                        body: WorkspaceMessageBody {
-                            text: message.to_string(),
-                            mentions: options.mentions,
-                        },
-                        audience: Audience::Direct {
-                            participant: recipient_binding.participant_id,
-                        },
-                        created_at,
-                    },
-                    mode: delivery_mode,
+                text: message.to_string(),
+                mentions: options.mentions,
+                audience: Audience::Direct {
+                    participant: recipient_binding.participant_id,
                 },
+                mode: delivery_mode,
+                thread_id: None,
+                reply_to_message_id: options.reply_to_message_id,
+                idempotency_key: format!("team-message:{idempotency_id}"),
             })
             .await?;
-        Ok(TeamInboxMessage {
-            message_id,
-            text,
-            report_text: message.to_string(),
-            sender_session_id: actor_session_id,
-            delivery: prompt_delivery,
-        })
+        Ok((
+            TeamInboxMessage {
+                message_id: receipt.message_id,
+                text,
+                report_text: message.to_string(),
+                sender_session_id: actor_session_id,
+                delivery: prompt_delivery,
+            },
+            Some(receipt),
+        ))
     }
 
     async fn pending_messages_for_session(
@@ -2209,29 +2220,46 @@ impl SubagentCoordinator {
             .await?
             .with_context(|| format!("team session {session_id} has no workspace"))?;
         let workspace_store = self.workspace_store().await?;
-        let pending = workspace_store
-            .pending_message_events(binding.workspace_id, binding.participant_id, 10_000)
+        let workspaces = workspace_store
+            .list_workspaces_for_participant(binding.participant_id)
             .await?;
-        let mut messages = Vec::with_capacity(pending.len());
-        for (event, delivery) in pending {
-            let WorkspaceEventKind::Message { message, .. } = event.kind else {
-                continue;
-            };
-            let Ok(actor) = self.task_name_for_session(message.author_id).await else {
-                continue;
-            };
-            messages.push(TeamInboxMessage {
-                message_id: message.id,
-                text: attributed_team_message(&actor, &message.body.text),
-                report_text: message.body.text,
-                sender_session_id: message.author_id,
-                delivery: match delivery.mode {
-                    DeliveryMode::Boundary | DeliveryMode::Wake => PromptDelivery::Steer,
-                    DeliveryMode::NextTurn | DeliveryMode::Notify => PromptDelivery::Queue,
-                },
-            });
+        let mut messages = Vec::new();
+        for workspace in workspaces {
+            let pending = workspace_store
+                .pending_message_events(workspace.id, binding.participant_id, 10_000)
+                .await?;
+            for (event, delivery) in pending {
+                let ordering = (event.created_at, event.workspace_id, event.sequence);
+                let WorkspaceEventKind::Message { message, .. } = event.kind else {
+                    continue;
+                };
+                let actor = match self.task_name_for_session(message.author_id).await {
+                    Ok(task_name) => task_name,
+                    Err(_) => workspace_store
+                        .participant(message.author_id)
+                        .await?
+                        .map(|participant| {
+                            format!("{} ({})", participant.display_name, message.author_id)
+                        })
+                        .unwrap_or_else(|| message.author_id.to_string()),
+                };
+                messages.push((
+                    ordering,
+                    TeamInboxMessage {
+                        message_id: message.id,
+                        text: attributed_team_message(&actor, &message.body.text),
+                        report_text: message.body.text,
+                        sender_session_id: message.author_id,
+                        delivery: match delivery.mode {
+                            DeliveryMode::Boundary | DeliveryMode::Wake => PromptDelivery::Steer,
+                            DeliveryMode::NextTurn | DeliveryMode::Notify => PromptDelivery::Queue,
+                        },
+                    },
+                ));
+            }
         }
-        Ok(messages)
+        messages.sort_by_key(|(ordering, _)| *ordering);
+        Ok(messages.into_iter().map(|(_, message)| message).collect())
     }
 
     pub(crate) async fn unread_messages_for_session(
@@ -2256,12 +2284,25 @@ impl SubagentCoordinator {
             .await?
             .context("team session has no workspace")?;
         let store = self.workspace_store().await?;
-        let _ = store.pending_message_events(binding.workspace_id, binding.participant_id, 10_000).await?
-            .into_iter().find(|(event, _)| matches!(&event.kind, WorkspaceEventKind::Message { message, .. } if message.id == message_id))
-            .context("unread team message not found")?;
+        let mut addressed_workspace_id = None;
+        for workspace in store
+            .list_workspaces_for_participant(binding.participant_id)
+            .await?
+        {
+            if store
+                .pending_message_events(workspace.id, binding.participant_id, 10_000)
+                .await?
+                .into_iter()
+                .any(|(event, _)| matches!(&event.kind, WorkspaceEventKind::Message { message, .. } if message.id == message_id))
+            {
+                addressed_workspace_id = Some(workspace.id);
+                break;
+            }
+        }
+        let workspace_id = addressed_workspace_id.context("unread team message not found")?;
         store
             .transition_message_delivery(
-                binding.workspace_id,
+                workspace_id,
                 message_id,
                 binding.participant_id,
                 crate::DeliveryState::Admitted,
@@ -2270,7 +2311,7 @@ impl SubagentCoordinator {
             .await?;
         store
             .transition_message_delivery(
-                binding.workspace_id,
+                workspace_id,
                 message_id,
                 binding.participant_id,
                 crate::DeliveryState::Acknowledged,
@@ -2632,65 +2673,134 @@ impl SubagentCoordinator {
             CodingProvider::Codex => ("gpt", "GPT"),
             _ => unreachable!("persistent peer profile is restricted to GPT and Claude"),
         };
-        let mut activity = self.subscribe();
+        let activity = self.subscribe();
         let sidecar = self
             .ensure_sidecar(task_name, provider, model.clone(), effort.clone())
             .await?;
         let message_id = Uuid::new_v4();
         let peer_prompt = format!(
-            "You are the persistent private {label} peer for the primary Borg agent. This is an +             internal consultation, not a user-facing turn. Do not invoke another model, send +             team messages, edit files, or ask the human for clarification. You may inspect +             workspace state when it is necessary to validate the briefing. Return concise, +             self-contained analysis that the primary agent can use immediately.\n\n{prompt}"
+            "You are the persistent private {label} peer for the primary Borg agent. This is an \
+             internal consultation, not a user-facing turn. Do not invoke another model, send \
+             team messages, edit files, or ask the human for clarification. You may inspect \
+             workspace state when it is necessary to validate the briefing. Return concise, \
+             self-contained analysis that the primary agent can use immediately.\n\n{prompt}"
         );
         self.prompt_child(
             &sidecar.task_name,
             message_id,
             peer_prompt,
             Vec::new(),
-            PromptDelivery::Steer,
+            // A canceled primary turn must not steer or replace peer work that
+            // is still completing. Queueing also gives every consultation a
+            // distinct TurnCompleted boundary that can be correlated below.
+            PromptDelivery::Queue,
         )
         .await?;
 
-        let deadline = Instant::now() + Duration::from_secs(120);
+        // The waiter is intentionally detached from the originating MCP call.
+        // Provider steering can cancel that call while the peer is still
+        // reasoning. In that case the completed result is queued privately at
+        // the director's next boundary instead of being orphaned.
+        let (result_tx, result_rx) = oneshot::channel();
+        let (ack_tx, ack_rx) = oneshot::channel();
+        let coordinator = self.clone();
+        let background_sidecar = sidecar.clone();
+        let background_label = label.to_string();
+        tokio::spawn(async move {
+            let outcome = coordinator
+                .await_peer_consultation(
+                    activity,
+                    &background_sidecar,
+                    message_id,
+                    &background_label,
+                )
+                .await;
+            if (result_tx.send(outcome.clone()).is_err() || ack_rx.await.is_err())
+                && let Err(error) = coordinator
+                    .queue_abandoned_peer_outcome(
+                        &background_sidecar,
+                        message_id,
+                        &background_label,
+                        outcome,
+                    )
+                    .await
+            {
+                tracing::warn!(
+                    %error,
+                    consultation_id = %message_id,
+                    peer = %background_sidecar.task_name,
+                    "could not queue an abandoned peer consultation result"
+                );
+            }
+        });
+
+        let outcome = result_rx
+            .await
+            .context("persistent peer consultation waiter stopped")?;
+        let _ = ack_tx.send(());
+        match outcome {
+            PeerConsultationOutcome::Completed(response) => Ok(json!({
+                "persistent": true,
+                "completed": true,
+                "consultation_id": message_id,
+                "provider": provider.catalog_backend(),
+                "model": model,
+                "thread": sidecar.task_name,
+                "response": response,
+            })),
+            PeerConsultationOutcome::Failed(error) => bail!(error),
+        }
+    }
+
+    async fn await_peer_consultation(
+        &self,
+        mut activity: broadcast::Receiver<SubagentActivity>,
+        sidecar: &SubagentSnapshot,
+        message_id: Uuid,
+        label: &str,
+    ) -> PeerConsultationOutcome {
+        let deadline = Instant::now() + PERSISTENT_PEER_CONSULTATION_TIMEOUT;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
-            anyhow::ensure!(
-                !remaining.is_zero(),
-                "persistent peer consultation timed out"
-            );
+            if remaining.is_zero() {
+                return PeerConsultationOutcome::Failed(format!(
+                    "persistent {label} peer consultation {message_id} timed out after 15 minutes"
+                ));
+            }
             match tokio::time::timeout(remaining, activity.recv()).await {
                 Ok(Ok(SubagentActivity::SessionEvent { event, .. }))
                     if event.session_id == sidecar.session_id =>
                 {
                     match event.kind {
-                        SessionEventKind::Message {
-                            actor: EventActor::Assistant,
-                            text,
-                            status: MessageStatus::Complete,
+                        SessionEventKind::TurnCompleted {
+                            message_id: completed_message_id,
+                            final_text,
+                            error,
                             ..
-                        } => {
-                            let text = text.trim().to_string();
-                            anyhow::ensure!(
-                                !text.is_empty(),
-                                "persistent peer returned an empty response"
-                            );
-                            return Ok(json!({
-                                "persistent": true,
-                                "provider": provider.catalog_backend(),
-                                "model": model,
-                                "thread": sidecar.task_name,
-                                "response": text,
-                            }));
+                        } if completed_message_id == message_id => {
+                            if let Some(error) = error {
+                                return PeerConsultationOutcome::Failed(format!(
+                                    "persistent {label} peer failed consultation {message_id}: {error}"
+                                ));
+                            }
+                            let response = final_text.trim().to_string();
+                            if response.is_empty() {
+                                return PeerConsultationOutcome::Failed(format!(
+                                    "persistent {label} peer returned an empty response for consultation {message_id}"
+                                ));
+                            }
+                            return PeerConsultationOutcome::Completed(response);
                         }
                         SessionEventKind::StatusChanged {
                             status: SessionStatus::Failed | SessionStatus::Stopped,
                             detail,
                         } => {
-                            bail!(
-                                "persistent {} peer stopped before replying{}",
-                                label,
+                            return PeerConsultationOutcome::Failed(format!(
+                                "persistent {label} peer stopped before replying{}",
                                 detail
                                     .map(|detail| format!(": {detail}"))
                                     .unwrap_or_default()
-                            );
+                            ));
                         }
                         _ => {}
                     }
@@ -2698,36 +2808,60 @@ impl SubagentCoordinator {
                 Ok(Ok(SubagentActivity::Failed { agent }))
                     if agent.session_id == sidecar.session_id =>
                 {
-                    bail!(
-                        "persistent {} peer failed{}",
-                        label,
+                    return PeerConsultationOutcome::Failed(format!(
+                        "persistent {label} peer failed{}",
                         agent
                             .detail
                             .map(|detail| format!(": {detail}"))
                             .unwrap_or_default()
+                    ));
+                }
+                Ok(Ok(_)) | Ok(Err(broadcast::error::RecvError::Lagged(_))) => {}
+                Ok(Err(broadcast::error::RecvError::Closed)) => {
+                    return PeerConsultationOutcome::Failed(
+                        "persistent peer activity stream closed".to_string(),
                     );
                 }
-                Ok(Ok(SubagentActivity::Completed { agent }))
-                    if agent.session_id == sidecar.session_id =>
-                {
-                    if let Some(text) = agent.final_text.filter(|text| !text.trim().is_empty()) {
-                        return Ok(json!({
-                            "persistent": true,
-                            "provider": provider.catalog_backend(),
-                            "model": model,
-                            "thread": sidecar.task_name,
-                            "response": text,
-                        }));
-                    }
+                Err(_) => {
+                    return PeerConsultationOutcome::Failed(format!(
+                        "persistent {label} peer consultation {message_id} timed out after 15 minutes"
+                    ));
                 }
-                Ok(Ok(_)) => {}
-                Ok(Err(broadcast::error::RecvError::Lagged(_))) => {}
-                Ok(Err(broadcast::error::RecvError::Closed)) => {
-                    bail!("persistent peer activity stream closed")
-                }
-                Err(_) => bail!("persistent peer consultation timed out"),
             }
         }
+    }
+
+    async fn queue_abandoned_peer_outcome(
+        &self,
+        sidecar: &SubagentSnapshot,
+        consultation_id: Uuid,
+        label: &str,
+        outcome: PeerConsultationOutcome,
+    ) -> Result<()> {
+        let message = match outcome {
+            PeerConsultationOutcome::Completed(response) => format!(
+                "Persistent {label} peer consultation {consultation_id} completed after its \
+                 original tool call ended. Reconcile this private result before answering the \
+                 user.\n\n{response}"
+            ),
+            PeerConsultationOutcome::Failed(error) => format!(
+                "Persistent {label} peer consultation {consultation_id} finished after its \
+                 original tool call ended, but did not return a usable result: {error}"
+            ),
+        };
+        let (inbox, _) = self
+            .persist_team_message(
+                sidecar.session_id,
+                self.root_session_id,
+                &sidecar.task_name,
+                &message,
+                PromptDelivery::Queue,
+                DeliveryMode::NextTurn,
+                TeamMessageOptions::default(),
+            )
+            .await?;
+        self.root_inbox.lock().await.push(inbox);
+        Ok(())
     }
 
     /// Lazily start one metadata-only child after an explicit action targets
@@ -3036,12 +3170,14 @@ impl SubagentCoordinator {
         self.send_message_as(root_session_id, target, message).await
     }
 
-    /// Append one workspace message and fan its single ID out to every visible team member.
+    /// Append one workspace message and immediately fan its single ID out to
+    /// locally visible team members. Independent sessions receive the same
+    /// durable message from the workspace delivery log.
     pub async fn broadcast_message_as(
         &self,
         actor_session_id: Uuid,
         message: &str,
-    ) -> Result<Uuid> {
+    ) -> Result<WorkspaceMessageReceipt> {
         anyhow::ensure!(
             self.root_launch.capabilities.multiplayer,
             "team broadcast requires multiplayer capability"
@@ -3064,52 +3200,24 @@ impl SubagentCoordinator {
             .workspace_binding(actor_session_id)
             .await?
             .context("team sender has no workspace")?;
-        let mut participant_ids = Vec::with_capacity(recipients.len());
-        for recipient in &recipients {
-            let binding = self
-                .store
-                .workspace_binding(*recipient)
-                .await?
-                .context("team recipient has no workspace")?;
-            anyhow::ensure!(
-                binding.workspace_id == sender.workspace_id,
-                "team participants are attached to different workspaces"
-            );
-            participant_ids.push(binding.participant_id);
-        }
-        let message_id = Uuid::new_v4();
-        let created_at = Utc::now();
-        self.workspace_store()
+        let idempotency_id = Uuid::new_v4();
+        let receipt = self
+            .workspace_store()
             .await?
-            .append(WorkspaceEvent {
-                id: message_id,
+            .append_message(NewWorkspaceMessage {
                 workspace_id: sender.workspace_id,
-                sequence: 0,
                 author_id: sender.participant_id,
-                idempotency_key: format!("team-broadcast:{message_id}"),
-                created_at,
-                kind: WorkspaceEventKind::Message {
-                    message: WorkspaceMessage {
-                        id: message_id,
-                        workspace_id: sender.workspace_id,
-                        thread_id: None,
-                        reply_to_message_id: None,
-                        author_id: sender.participant_id,
-                        body: WorkspaceMessageBody {
-                            text: message.clone(),
-                            mentions: Vec::new(),
-                        },
-                        audience: Audience::Participants {
-                            participants: participant_ids,
-                        },
-                        created_at,
-                    },
-                    mode: DeliveryMode::NextTurn,
-                },
+                text: message.clone(),
+                mentions: Vec::new(),
+                audience: Audience::Workspace,
+                mode: DeliveryMode::NextTurn,
+                thread_id: None,
+                reply_to_message_id: None,
+                idempotency_key: format!("team-broadcast:{idempotency_id}"),
             })
             .await?;
         let inbox = TeamInboxMessage {
-            message_id,
+            message_id: receipt.message_id,
             text: attributed_team_message(&actor, &message),
             report_text: message,
             sender_session_id: actor_session_id,
@@ -3138,7 +3246,7 @@ impl SubagentCoordinator {
                 }
             }
         }
-        Ok(message_id)
+        Ok(receipt)
     }
 
     /// Send a team-attributed message. Child reports addressed to `/root` use
@@ -3165,19 +3273,59 @@ impl SubagentCoordinator {
         message: &str,
         options: TeamMessageOptions,
     ) -> Result<()> {
+        self.route_message_with_options_as(actor_session_id, target, message, options)
+            .await
+            .map(|_| ())
+    }
+
+    async fn route_message_with_options_as(
+        &self,
+        actor_session_id: Uuid,
+        target: &str,
+        message: &str,
+        options: TeamMessageOptions,
+    ) -> Result<RoutedTeamMessage> {
         let message = required_message(message)?;
-        let (actor, id, root_session_id, status) = {
+        let (actor, local_id, root_session_id, status) = {
             let table = self.table.lock().await;
             let actor = table.task_name(actor_session_id)?;
-            let id = table.resolve(target)?;
-            let status = table.entries.get(&id).map(|entry| entry.snapshot.status);
+            let id = table.resolve(target).ok();
+            let status =
+                id.and_then(|id| table.entries.get(&id).map(|entry| entry.snapshot.status));
             (actor, id, table.root_session_id, status)
         };
+        if local_id.is_none()
+            && let Some(participant_id) = parse_workspace_participant_target(target)?
+        {
+            return self
+                .route_workspace_participant_message_as(
+                    actor_session_id,
+                    participant_id,
+                    &message,
+                    options,
+                    DeliveryMode::NextTurn,
+                )
+                .await;
+        }
+        let id = match local_id {
+            Some(id) => id,
+            None => parse_session_message_target(target)?,
+        };
+        ensure!(
+            id != actor_session_id,
+            "message recipient must differ from its author"
+        );
+        if local_id.is_none() {
+            self.store
+                .workspace_binding(id)
+                .await?
+                .with_context(|| format!("unknown session message target: {id}"))?;
+        }
         if status.is_some_and(SubagentStatus::is_terminal) {
             bail!("subagent {target} is not running");
         }
         let wakes_root = id == root_session_id && actor_session_id != root_session_id;
-        let inbox_message = self
+        let (inbox_message, receipt) = self
             .persist_team_message(
                 actor_session_id,
                 id,
@@ -3196,6 +3344,48 @@ impl SubagentCoordinator {
                 options,
             )
             .await?;
+        let relay_pending = self
+            .store
+            .workspace_binding(actor_session_id)
+            .await?
+            .is_some_and(|binding| binding.host_id.is_some());
+        if local_id.is_none() {
+            let socket_path = crate::session_control_socket_path(&self.journal_root, id);
+            let dispatched_locally =
+                if !relay_pending && tokio::fs::try_exists(&socket_path).await.unwrap_or(false) {
+                    match crate::send_local_session_command(
+                        &socket_path,
+                        id,
+                        HostCommand::Prompt {
+                            session_id: id,
+                            message_id: inbox_message.message_id,
+                            text: inbox_message.text.clone(),
+                            attachments: Vec::new(),
+                            output_schema: None,
+                            delivery: inbox_message.delivery,
+                        },
+                    )
+                    .await
+                    {
+                        Ok(()) => true,
+                        Err(error) => {
+                            tracing::debug!(
+                                %error,
+                                target_session_id = %id,
+                                "durable session message awaits the recipient boundary"
+                            );
+                            false
+                        }
+                    }
+                } else {
+                    false
+                };
+            return Ok(RoutedTeamMessage {
+                receipt,
+                dispatched_locally,
+                relay_pending,
+            });
+        }
         if id == root_session_id {
             if wakes_root {
                 self.broadcast_root_message(inbox_message.clone()).await;
@@ -3223,7 +3413,11 @@ impl SubagentCoordinator {
                     ),
                 });
             }
-            return Ok(());
+            return Ok(RoutedTeamMessage {
+                receipt,
+                dispatched_locally: true,
+                relay_pending,
+            });
         }
         let mut table = self.table.lock().await;
         let entry = table
@@ -3237,11 +3431,15 @@ impl SubagentCoordinator {
             entry.snapshot.status,
             SubagentStatus::Running | SubagentStatus::WaitingForApproval | SubagentStatus::Starting
         ) {
-            send_prompt(entry, id, inbox_message).await
+            send_prompt(entry, id, inbox_message).await?;
         } else {
             entry.inbox.push(inbox_message);
-            Ok(())
         }
+        Ok(RoutedTeamMessage {
+            receipt,
+            dispatched_locally: true,
+            relay_pending,
+        })
     }
 
     /// Wake an idle child, or steer a running provider when supported.
@@ -3274,25 +3472,65 @@ impl SubagentCoordinator {
         message: &str,
         options: TeamMessageOptions,
     ) -> Result<()> {
+        self.route_followup_task_with_options_as(actor_session_id, target, message, options)
+            .await
+            .map(|_| ())
+    }
+
+    async fn route_followup_task_with_options_as(
+        &self,
+        actor_session_id: Uuid,
+        target: &str,
+        message: &str,
+        options: TeamMessageOptions,
+    ) -> Result<RoutedTeamMessage> {
         let message = required_message(message)?;
-        let (actor, id, root_session_id, status) = {
+        let (actor, local_id, root_session_id, status) = {
             let table = self.table.lock().await;
             let actor = table.task_name(actor_session_id)?;
-            let id = table.resolve(target)?;
-            let status = table.entries.get(&id).map(|entry| entry.snapshot.status);
+            let id = table.resolve(target).ok();
+            let status =
+                id.and_then(|id| table.entries.get(&id).map(|entry| entry.snapshot.status));
             (actor, id, table.root_session_id, status)
         };
+        if local_id.is_none()
+            && let Some(participant_id) = parse_workspace_participant_target(target)?
+        {
+            return self
+                .route_workspace_participant_message_as(
+                    actor_session_id,
+                    participant_id,
+                    &message,
+                    options,
+                    DeliveryMode::Wake,
+                )
+                .await;
+        }
+        let id = match local_id {
+            Some(id) => id,
+            None => parse_session_message_target(target)?,
+        };
+        ensure!(
+            id != actor_session_id,
+            "message recipient must differ from its author"
+        );
+        if local_id.is_none() {
+            self.store
+                .workspace_binding(id)
+                .await?
+                .with_context(|| format!("unknown session message target: {id}"))?;
+        }
         if status.is_some_and(SubagentStatus::is_terminal) {
             bail!("subagent {target} is not running");
         }
-        let inbox_message = self
+        let (inbox_message, receipt) = self
             .persist_team_message(
                 actor_session_id,
                 id,
                 &actor,
                 &message,
                 PromptDelivery::Steer,
-                if status == Some(SubagentStatus::Ready) {
+                if local_id.is_none() || status == Some(SubagentStatus::Ready) {
                     DeliveryMode::Wake
                 } else {
                     DeliveryMode::Boundary
@@ -3300,13 +3538,59 @@ impl SubagentCoordinator {
                 options,
             )
             .await?;
+        let relay_pending = self
+            .store
+            .workspace_binding(actor_session_id)
+            .await?
+            .is_some_and(|binding| binding.host_id.is_some());
+        if local_id.is_none() {
+            let socket_path = crate::session_control_socket_path(&self.journal_root, id);
+            let dispatched_locally =
+                if !relay_pending && tokio::fs::try_exists(&socket_path).await.unwrap_or(false) {
+                    match crate::send_local_session_command(
+                        &socket_path,
+                        id,
+                        HostCommand::Prompt {
+                            session_id: id,
+                            message_id: inbox_message.message_id,
+                            text: inbox_message.text,
+                            attachments: Vec::new(),
+                            output_schema: None,
+                            delivery: PromptDelivery::Steer,
+                        },
+                    )
+                    .await
+                    {
+                        Ok(()) => true,
+                        Err(error) => {
+                            tracing::debug!(
+                                %error,
+                                target_session_id = %id,
+                                "durable follow-up awaits the recipient boundary"
+                            );
+                            false
+                        }
+                    }
+                } else {
+                    false
+                };
+            return Ok(RoutedTeamMessage {
+                receipt,
+                dispatched_locally,
+                relay_pending,
+            });
+        }
         if id == root_session_id {
             let mut messages = self.take_root_inbox().await;
             messages.push(inbox_message);
             for message in messages {
                 self.broadcast_root_message(message).await;
             }
-            return Ok(());
+            return Ok(RoutedTeamMessage {
+                receipt,
+                dispatched_locally: true,
+                relay_pending,
+            });
         }
         self.ensure_child_actor(id).await?;
         let mut table = self.table.lock().await;
@@ -3322,7 +3606,61 @@ impl SubagentCoordinator {
         for message in messages {
             send_prompt(entry, id, message).await?;
         }
-        Ok(())
+        Ok(RoutedTeamMessage {
+            receipt,
+            dispatched_locally: true,
+            relay_pending,
+        })
+    }
+
+    async fn route_workspace_participant_message_as(
+        &self,
+        actor_session_id: Uuid,
+        recipient_participant_id: Uuid,
+        message: &str,
+        options: TeamMessageOptions,
+        mode: DeliveryMode,
+    ) -> Result<RoutedTeamMessage> {
+        let actor = self
+            .store
+            .workspace_binding(actor_session_id)
+            .await?
+            .context("message sender has no workspace")?;
+        ensure!(
+            actor.participant_id != recipient_participant_id,
+            "message recipient must differ from its author"
+        );
+        let store = self.workspace_store().await?;
+        let roster = store
+            .workspace_roster(actor.workspace_id, actor.participant_id)
+            .await?;
+        ensure!(
+            roster
+                .iter()
+                .any(|entry| entry.participant.id == recipient_participant_id),
+            "workspace participant {recipient_participant_id} is not an authorized member"
+        );
+        let idempotency_id = Uuid::new_v4();
+        let receipt = store
+            .append_message(NewWorkspaceMessage {
+                workspace_id: actor.workspace_id,
+                author_id: actor.participant_id,
+                text: message.to_string(),
+                mentions: options.mentions,
+                audience: Audience::Direct {
+                    participant: recipient_participant_id,
+                },
+                mode,
+                thread_id: None,
+                reply_to_message_id: options.reply_to_message_id,
+                idempotency_key: format!("participant-message:{idempotency_id}"),
+            })
+            .await?;
+        Ok(RoutedTeamMessage {
+            receipt: Some(receipt),
+            dispatched_locally: false,
+            relay_pending: actor.host_id.is_some(),
+        })
     }
 
     pub async fn interrupt(&self, target: &str) -> Result<()> {
@@ -3512,34 +3850,64 @@ impl SubagentCoordinator {
                 let args: ListAgentsArgs = serde_json::from_value(arguments)?;
                 Ok(json!({ "agents": self.list(args.path_prefix.as_deref()).await }))
             }
+            "list_workspace_participants" => {
+                let _: NoArgs = serde_json::from_value(arguments)?;
+                let binding = self
+                    .store
+                    .workspace_binding(actor_session_id)
+                    .await?
+                    .context("session has no workspace")?;
+                Ok(json!({
+                    "workspace_id": binding.workspace_id,
+                    "participants": self.workspace_store().await?
+                        .workspace_roster(binding.workspace_id, binding.participant_id)
+                        .await?,
+                }))
+            }
             "send_message" => {
                 let args: MessageArgs = serde_json::from_value(arguments)?;
-                self.send_message_with_options_as(
-                    actor_session_id,
-                    &args.target,
-                    &args.message,
-                    args.options(),
-                )
-                .await?;
-                Ok(json!({ "queued": true }))
+                let routed = self
+                    .route_message_with_options_as(
+                        actor_session_id,
+                        &args.target,
+                        &args.message,
+                        args.options(),
+                    )
+                    .await?;
+                Ok(routed_message_json(routed, "queued"))
             }
             "followup_task" => {
                 let args: MessageArgs = serde_json::from_value(arguments)?;
-                self.followup_task_with_options_as(
-                    actor_session_id,
-                    &args.target,
-                    &args.message,
-                    args.options(),
-                )
-                .await?;
-                Ok(json!({ "accepted": true }))
+                let routed = self
+                    .route_followup_task_with_options_as(
+                        actor_session_id,
+                        &args.target,
+                        &args.message,
+                        args.options(),
+                    )
+                    .await?;
+                Ok(routed_message_json(routed, "accepted"))
             }
             "broadcast_team" => {
                 let args: BroadcastArgs = serde_json::from_value(arguments)?;
-                let message_id = self
+                let receipt = self
                     .broadcast_message_as(actor_session_id, &args.message)
                     .await?;
-                Ok(json!({ "message_id": message_id, "queued": true }))
+                let relay_pending = self
+                    .store
+                    .workspace_binding(actor_session_id)
+                    .await?
+                    .is_some_and(|binding| binding.host_id.is_some());
+                Ok(json!({
+                    "message_id": receipt.message_id,
+                    "workspace_id": receipt.workspace_id,
+                    "sequence": receipt.sequence,
+                    "recipient_count": receipt.recipient_ids.len(),
+                    "recipient_ids": receipt.recipient_ids,
+                    "delivery_mode": receipt.mode,
+                    "queued": true,
+                    "relay_pending": relay_pending,
+                }))
             }
             "list_unread_team_messages" => Ok(serde_json::to_value(
                 self.unread_messages_for_session(actor_session_id).await?,
@@ -3721,14 +4089,22 @@ pub fn subagent_tool_specs(provider: CodingProvider) -> Vec<Value> {
                 "additionalProperties": false
             }),
         ),
+        tool(
+            "list_workspace_participants",
+            "List every durable participant visible in the current workspace, including independent and remote-synced agents. Use participant:<UUID> to message one.",
+            json!({"type":"object","properties":{},"additionalProperties":false}),
+        ),
         message_tool(
             "send_message",
-            "Queue a message for a child without waking an idle child. Reports sent by a child to /root wake the director for reconciliation.",
+            "Queue a durable message for a team member or explicitly addressed peer. Use session:<UUID> for an independent local session or participant:<UUID> for a member from list_workspace_participants; cross-workspace local sessions use a private channel in the same authorized Borg store. Reports sent by a child to /root wake the director for reconciliation.",
         ),
-        message_tool("followup_task", "Send a follow-up and wake an idle child."),
+        message_tool(
+            "followup_task",
+            "Send a durable follow-up and wake or steer a local recipient when possible. Use session:<UUID> for an independent session.",
+        ),
         tool(
             "broadcast_team",
-            "Broadcast one durable team message to all visible team participants.",
+            "Broadcast one durable message to every participant in the current workspace, including independent sessions and remote-synced participants.",
             json!({"type":"object","properties":{"message":{"type":"string"}},"required":["message"],"additionalProperties":false}),
         ),
         tool(
@@ -5078,6 +5454,46 @@ fn required_message(message: &str) -> Result<String> {
         bail!("subagent message must not be empty");
     }
     Ok(message.to_string())
+}
+
+fn parse_session_message_target(target: &str) -> Result<Uuid> {
+    let target = target.trim();
+    let target = target.strip_prefix("session:").unwrap_or(target);
+    Uuid::parse_str(target).with_context(|| {
+        "unknown team target; use a visible task name or session:<UUID> for an independent session"
+    })
+}
+
+fn parse_workspace_participant_target(target: &str) -> Result<Option<Uuid>> {
+    let target = target.trim();
+    let Some(target) = target.strip_prefix("participant:") else {
+        return Ok(None);
+    };
+    Ok(Some(Uuid::parse_str(target).with_context(
+        || "workspace participant target must be participant:<UUID>",
+    )?))
+}
+
+fn routed_message_json(routed: RoutedTeamMessage, accepted_field: &str) -> Value {
+    let mut value = match routed.receipt {
+        Some(receipt) => json!({
+            "message_id": receipt.message_id,
+            "workspace_id": receipt.workspace_id,
+            "sequence": receipt.sequence,
+            "recipient_count": receipt.recipient_ids.len(),
+            "recipient_ids": receipt.recipient_ids,
+            "delivery_mode": receipt.mode,
+            "dispatched_locally": routed.dispatched_locally,
+            "relay_pending": routed.relay_pending,
+        }),
+        None => json!({
+            "recipient_count": 1,
+            "dispatched_locally": routed.dispatched_locally,
+            "relay_pending": routed.relay_pending,
+        }),
+    };
+    value[accepted_field] = Value::Bool(true);
+    value
 }
 
 fn required_idempotency_key(value: &str) -> Result<String> {

@@ -91,6 +91,26 @@ restart recovery, and references remain consistent. A participant can
 explicitly promote a useful direct-message result into a shared thread; Borg
 never does so implicitly.
 
+Agent collaboration tools are address adapters over this same machinery:
+
+- `/root/...` addresses a member of the current in-memory team and preserves
+  the immediate wake/steer fast path;
+- `session:<UUID>` addresses any session in the same durable local session
+  store, including another root process or project workspace;
+- `participant:<UUID>` addresses a member returned by
+  `list_workspace_participants`, including a participant synchronized from an
+  enrolled remote host;
+- `broadcast_team` uses the current workspace audience rather than the
+  caller's in-memory child list.
+
+Local cross-workspace direct messages materialize one stable private peer
+workspace for the two participants. Cloud and cross-machine messages require
+the sender and recipient to share an authorized cloud workspace; membership
+is the routing grant, not knowledge of a UUID. Every successful send returns
+the committed message ID, workspace sequence, delivery mode, and exact
+recipient IDs/count. Immediate local dispatch is reported separately and is
+never presented as proof of durable recipient delivery.
+
 Visibility and delivery are different. Visibility determines who may read a
 message. `MessageDelivery` records how each recipient agent should admit it:
 
@@ -231,6 +251,16 @@ authority. Attaching a local workspace to cloud is an explicit one-time
 authority transfer/import with recorded provenance; Borg never silently merges
 two writable authorities with the same workspace ID.
 
+An enrolled host receives the workspace and participant attachment on launch,
+projects the authenticated cloud roster into its local cache, and uploads
+locally authored message events with their event ID as the cloud idempotency
+key. Borg.ml appends them to the existing `chat_messages` authority, creates
+per-recipient deliveries, and enqueues a deterministic prompt command for each
+attached remote recipient. Session admission and turn-completion events move
+the corresponding cloud delivery to admitted and acknowledged. Retries across
+API instances, host reconnects, or machine changes therefore converge on one
+message and one recipient admission.
+
 Execution is disposable; coordination is durable. Workers, sandboxes,
 worktrees, containers, and cloud hosts may be ephemeral, but their lifecycle,
 authority, costs, approvals, reports, and published outputs are committed to
@@ -271,6 +301,10 @@ they must not corrupt the core projection.
 Extensions cannot bypass membership checks, forge authorship, mutate committed
 audiences, weaken delivery idempotency, or obtain host capabilities not granted
 by the user.
+
+Blu workflows consume the normal participant directory and message tools. They
+may choose routing policy or compose communication with work events, but they
+do not own a separate inbox, relay, cursor, or delivery state machine.
 
 ### Capability composition
 

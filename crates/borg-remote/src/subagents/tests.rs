@@ -55,7 +55,7 @@ impl crate::AgentTurnExecutor for RecordingPeerExecutor {
             .send(SessionEventKind::Message {
                 message_id: Uuid::new_v4(),
                 actor: EventActor::Assistant,
-                text: response.clone(),
+                text: "I am checking the supplied evidence before deciding.".to_string(),
                 attachments: Vec::new(),
                 status: MessageStatus::Complete,
                 delivery: None,
@@ -65,6 +65,62 @@ impl crate::AgentTurnExecutor for RecordingPeerExecutor {
         Ok(crate::AgentTurnResult {
             provider_session_id: Some("persistent-peer-session".to_string()),
             final_text: response,
+        })
+    }
+}
+
+#[derive(Clone)]
+struct ControlledPeerExecutor {
+    calls: Arc<AtomicUsize>,
+    first_started: Arc<tokio::sync::Notify>,
+    release_first: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl crate::AgentTurnExecutor for ControlledPeerExecutor {
+    async fn execute(
+        &self,
+        turn: crate::AgentTurn,
+        events: mpsc::Sender<SessionEventKind>,
+        _controls: Option<mpsc::Receiver<crate::AgentTurnControl>>,
+    ) -> Result<crate::AgentTurnResult> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        events
+            .send(SessionEventKind::Message {
+                message_id: Uuid::new_v4(),
+                actor: EventActor::Assistant,
+                text: format!("peer progress {call}: {}", turn.prompt.len()),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("peer event receiver closed"))?;
+        if call == 1 {
+            self.first_started.notify_waiters();
+            self.release_first.notified().await;
+        }
+        Ok(crate::AgentTurnResult {
+            provider_session_id: Some("controlled-peer-session".to_string()),
+            final_text: format!("peer final {call}"),
+        })
+    }
+}
+
+#[derive(Clone, Default)]
+struct EmptyPeerExecutor;
+
+#[async_trait::async_trait]
+impl crate::AgentTurnExecutor for EmptyPeerExecutor {
+    async fn execute(
+        &self,
+        _turn: crate::AgentTurn,
+        _events: mpsc::Sender<SessionEventKind>,
+        _controls: Option<mpsc::Receiver<crate::AgentTurnControl>>,
+    ) -> Result<crate::AgentTurnResult> {
+        Ok(crate::AgentTurnResult {
+            provider_session_id: Some("empty-peer-session".to_string()),
+            final_text: String::new(),
         })
     }
 }
@@ -1371,6 +1427,150 @@ async fn persistent_peer_consultation_reuses_the_sidecar_and_returns_to_the_prim
     coordinator.stop("/root/gpt").await.unwrap();
 }
 
+#[tokio::test]
+async fn canceled_peer_consultation_is_queued_privately_and_cannot_satisfy_the_next_call() {
+    let directory = tempdir().unwrap();
+    let root = Uuid::new_v4();
+    let store = Arc::new(
+        crate::SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
+            .await
+            .unwrap(),
+    );
+    store.create_session(root).await.unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let first_started = Arc::new(tokio::sync::Notify::new());
+    let release_first = Arc::new(tokio::sync::Notify::new());
+    let executor = ControlledPeerExecutor {
+        calls: Arc::clone(&calls),
+        first_started: Arc::clone(&first_started),
+        release_first: Arc::clone(&release_first),
+    };
+    let mut root_launch = launch();
+    root_launch.capabilities.multiplayer = false;
+    root_launch.cwd = directory.path().to_path_buf();
+    let coordinator = SubagentCoordinator::new_with_store_and_executor(
+        directory.path(),
+        root,
+        root_launch,
+        2,
+        Arc::new(executor),
+        store.clone(),
+    )
+    .unwrap();
+
+    let started = first_started.notified();
+    tokio::pin!(started);
+    let first = tokio::spawn({
+        let coordinator = coordinator.clone();
+        async move {
+            coordinator
+                .consult_peer(CodingProvider::Codex, None, "first consultation")
+                .await
+        }
+    });
+    started.await;
+    let sidecar = coordinator.resolve_snapshot("/root/claude").await.unwrap();
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+
+    let second = tokio::spawn({
+        let coordinator = coordinator.clone();
+        async move {
+            coordinator
+                .consult_peer(CodingProvider::Codex, None, "second consultation")
+                .await
+        }
+    });
+    let mut queued_second = false;
+    for _ in 0..200 {
+        queued_second = store
+            .read(sidecar.session_id)
+            .await
+            .unwrap()
+            .iter()
+            .any(|event| {
+                matches!(
+                    &event.kind,
+                    SessionEventKind::Message {
+                        actor: EventActor::User,
+                        text,
+                        status: MessageStatus::Queued,
+                        ..
+                    } if text.contains("second consultation")
+                )
+            });
+        if queued_second {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        queued_second,
+        "the second consultation was not safely queued"
+    );
+
+    release_first.notify_one();
+    let second = tokio::time::timeout(Duration::from_secs(3), second)
+        .await
+        .expect("second consultation should finish")
+        .unwrap()
+        .unwrap();
+    assert_eq!(second["response"], "peer final 2");
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+    let mut abandoned_result = None;
+    for _ in 0..200 {
+        abandoned_result = coordinator
+            .take_root_inbox()
+            .await
+            .into_iter()
+            .find(|message| message.text.contains("peer final 1"));
+        if abandoned_result.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let abandoned_result = abandoned_result.expect("abandoned result should reach the director");
+    assert_eq!(abandoned_result.delivery, PromptDelivery::Queue);
+    assert!(abandoned_result.text.contains("original tool call ended"));
+    coordinator.stop("/root/claude").await.unwrap();
+}
+
+#[tokio::test]
+async fn persistent_peer_empty_turn_fails_at_its_correlated_completion_boundary() {
+    let directory = tempdir().unwrap();
+    let root = Uuid::new_v4();
+    let store = Arc::new(
+        crate::SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
+            .await
+            .unwrap(),
+    );
+    store.create_session(root).await.unwrap();
+    let mut root_launch = launch();
+    root_launch.capabilities.multiplayer = false;
+    root_launch.cwd = directory.path().to_path_buf();
+    let coordinator = SubagentCoordinator::new_with_store_and_executor(
+        directory.path(),
+        root,
+        root_launch,
+        2,
+        Arc::new(EmptyPeerExecutor),
+        store,
+    )
+    .unwrap();
+
+    let error = tokio::time::timeout(
+        Duration::from_secs(2),
+        coordinator.consult_peer(CodingProvider::Codex, None, "return no answer"),
+    )
+    .await
+    .expect("empty peer turn should fail immediately")
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("empty response"));
+    coordinator.stop("/root/claude").await.unwrap();
+}
+
 #[test]
 fn cross_provider_peer_does_not_inherit_an_incompatible_model_or_effort() {
     assert_eq!(
@@ -1664,17 +1864,17 @@ async fn sibling_messages_use_the_shared_team_directory() {
     assert!(text.contains("Team message from /root/sender"));
     assert!(text.contains("share the benchmark"));
 
-    let broadcast_id = coordinator
+    let broadcast = coordinator
         .broadcast_message_as(sender.session_id, "team checkpoint")
         .await
         .unwrap();
     let HostCommand::Prompt { message_id, .. } = received.recv().await.unwrap() else {
         panic!("expected broadcast prompt");
     };
-    assert_eq!(message_id, broadcast_id);
+    assert_eq!(message_id, broadcast.message_id);
     assert_eq!(
         coordinator.take_root_inbox().await[0].message_id,
-        broadcast_id
+        broadcast.message_id
     );
     let workspace = store
         .workspace_store()
@@ -1697,7 +1897,7 @@ async fn sibling_messages_use_the_shared_team_directory() {
         2
     );
     coordinator
-        .acknowledge_message_for_session(recipient.session_id, broadcast_id)
+        .acknowledge_message_for_session(recipient.session_id, broadcast.message_id)
         .await
         .unwrap();
     assert!(
@@ -1706,7 +1906,229 @@ async fn sibling_messages_use_the_shared_team_directory() {
             .await
             .unwrap()
             .iter()
-            .all(|message| message.message_id != broadcast_id)
+            .all(|message| message.message_id != broadcast.message_id)
+    );
+}
+
+#[tokio::test]
+async fn independent_sessions_share_workspace_broadcasts_exactly_once() {
+    let directory = tempdir().unwrap();
+    let first = Uuid::new_v4();
+    let second = Uuid::new_v4();
+    let workspace_id = Uuid::new_v4();
+    let store = Arc::new(
+        crate::SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
+            .await
+            .unwrap(),
+    );
+    store
+        .create_session_in_workspace(first, workspace_id)
+        .await
+        .unwrap();
+    store
+        .create_session_in_workspace(second, workspace_id)
+        .await
+        .unwrap();
+    let workspace = store.workspace_store().await.unwrap().unwrap();
+    let human = crate::local_human_participant_id("Human");
+    workspace
+        .ensure_execution_workspace(
+            workspace_id,
+            "shared project",
+            human,
+            "Human",
+            first,
+            "First root",
+        )
+        .await
+        .unwrap();
+    workspace
+        .ensure_execution_workspace(
+            workspace_id,
+            "shared project",
+            human,
+            "Human",
+            second,
+            "Second root",
+        )
+        .await
+        .unwrap();
+    let first_coordinator = SubagentCoordinator::new_with_store_and_executor(
+        directory.path(),
+        first,
+        launch(),
+        1,
+        Arc::new(crate::LocalAgentTurnExecutor::default()),
+        store.clone(),
+    )
+    .unwrap();
+    let second_coordinator = SubagentCoordinator::new_with_store_and_executor(
+        directory.path(),
+        second,
+        launch(),
+        1,
+        Arc::new(crate::LocalAgentTurnExecutor::default()),
+        store,
+    )
+    .unwrap();
+
+    let receipt = first_coordinator
+        .broadcast_message_as(first, "workspace checkpoint")
+        .await
+        .unwrap();
+    assert!(receipt.recipient_ids.contains(&second));
+    assert_eq!(
+        receipt.recipient_ids.len(),
+        2,
+        "the other root and human participant receive the workspace broadcast"
+    );
+    let unread = second_coordinator
+        .unread_messages_for_session(second)
+        .await
+        .unwrap();
+    assert_eq!(unread.len(), 1);
+    assert_eq!(unread[0].message_id, receipt.message_id);
+    second_coordinator
+        .acknowledge_message_for_session(second, receipt.message_id)
+        .await
+        .unwrap();
+    assert!(
+        second_coordinator
+            .unread_messages_for_session(second)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let roster = first_coordinator
+        .call_tool_as(first, "list_workspace_participants", json!({}))
+        .await
+        .unwrap();
+    assert!(
+        roster["participants"]
+            .as_array()
+            .is_some_and(|participants| {
+                participants
+                    .iter()
+                    .any(|entry| entry["participant"]["id"] == second.to_string())
+            })
+    );
+    let direct = first_coordinator
+        .call_tool_as(
+            first,
+            "send_message",
+            json!({
+                "target": format!("participant:{second}"),
+                "message": "participant-addressed checkpoint"
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(direct["recipient_count"], 1);
+    let direct_id: Uuid = serde_json::from_value(direct["message_id"].clone()).unwrap();
+    assert!(
+        second_coordinator
+            .unread_messages_for_session(second)
+            .await
+            .unwrap()
+            .iter()
+            .any(|message| message.message_id == direct_id)
+    );
+}
+
+#[tokio::test]
+async fn explicitly_addressed_sessions_get_an_authorized_cross_workspace_channel() {
+    let directory = tempdir().unwrap();
+    let sender = Uuid::new_v4();
+    let recipient = Uuid::new_v4();
+    let store = Arc::new(
+        crate::SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
+            .await
+            .unwrap(),
+    );
+    store.create_session(sender).await.unwrap();
+    store.create_session(recipient).await.unwrap();
+    let workspace = store.workspace_store().await.unwrap().unwrap();
+    let human = crate::local_human_participant_id("Human");
+    workspace
+        .ensure_execution_workspace(sender, "sender", human, "Human", sender, "Sender")
+        .await
+        .unwrap();
+    workspace
+        .ensure_execution_workspace(
+            recipient,
+            "recipient",
+            human,
+            "Human",
+            recipient,
+            "Recipient",
+        )
+        .await
+        .unwrap();
+    let sender_coordinator = SubagentCoordinator::new_with_store_and_executor(
+        directory.path(),
+        sender,
+        launch(),
+        1,
+        Arc::new(crate::LocalAgentTurnExecutor::default()),
+        store.clone(),
+    )
+    .unwrap();
+    let recipient_coordinator = SubagentCoordinator::new_with_store_and_executor(
+        directory.path(),
+        recipient,
+        launch(),
+        1,
+        Arc::new(crate::LocalAgentTurnExecutor::default()),
+        store,
+    )
+    .unwrap();
+
+    let result = sender_coordinator
+        .call_tool_as(
+            sender,
+            "send_message",
+            json!({
+                "target": format!("session:{recipient}"),
+                "message": "cross-workspace handoff"
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result["queued"], true);
+    assert_eq!(result["recipient_count"], 1);
+    assert_eq!(result["dispatched_locally"], false);
+    let message_id: Uuid = serde_json::from_value(result["message_id"].clone()).unwrap();
+    let unread = recipient_coordinator
+        .unread_messages_for_session(recipient)
+        .await
+        .unwrap();
+    assert_eq!(unread.len(), 1);
+    assert_eq!(unread[0].message_id, message_id);
+    recipient_coordinator
+        .acknowledge_message_for_session(recipient, message_id)
+        .await
+        .unwrap();
+    assert!(
+        recipient_coordinator
+            .unread_messages_for_session(recipient)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let unknown = Uuid::new_v4();
+    assert!(
+        sender_coordinator
+            .call_tool_as(
+                sender,
+                "send_message",
+                json!({"target": format!("session:{unknown}"), "message": "not authorized"}),
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("unknown session message target")
     );
 }
 
@@ -1819,6 +2241,7 @@ fn tool_catalog_exposes_one_complete_lifecycle() {
         [
             "spawn_agent",
             "list_agents",
+            "list_workspace_participants",
             "send_message",
             "followup_task",
             "broadcast_team",

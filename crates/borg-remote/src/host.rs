@@ -19,14 +19,16 @@ use uuid::Uuid;
 
 use crate::receipt::{ReceiptState, SqliteReceiptStore};
 use crate::{
-    AgentRuntimeCommandEnvelope, AgentRuntimeEventEnvelope, AgentTurnExecutor, CodingProvider,
-    HostCapabilities, HostCommand, HostCommandEnvelope, HostExecutionProfile, HostHeartbeat,
-    HostResourceLimits, LaunchSession, ProviderAuthMethod, ProviderCapability,
-    REMOTE_PROTOCOL_VERSION, RemoteHost, RemoteHostIdentity, RuntimeMcpContext, SessionEvent,
-    SessionLiveEvent, SessionPayloadRef, SessionStore, SessionWriterLease, SqliteSessionStore,
+    AgentRuntimeCommandEnvelope, AgentRuntimeEventEnvelope, AgentTurnExecutor, Audience,
+    CodingProvider, HostCapabilities, HostCommand, HostCommandEnvelope, HostExecutionProfile,
+    HostHeartbeat, HostResourceLimits, LaunchSession, Participant, ParticipantKind,
+    ProviderAuthMethod, ProviderCapability, REMOTE_PROTOCOL_VERSION, RemoteHost,
+    RemoteHostIdentity, RuntimeMcpContext, SessionEvent, SessionLiveEvent, SessionPayloadRef,
+    SessionStore, SessionWriterLease, SqliteSessionStore, SqliteWorkspaceStore,
     WorkspaceAttachment, WorkspaceCommandErrorCode, WorkspaceCommandOutcome,
-    WorkspaceCommandRequest, WorkspaceCommandResponse, WorkspaceFilesystemErrorCode,
-    WorkspaceFilesystemOutcome, WorkspaceFilesystemRequest, WorkspaceFilesystemResponse,
+    WorkspaceCommandRequest, WorkspaceCommandResponse, WorkspaceEventKind,
+    WorkspaceFilesystemErrorCode, WorkspaceFilesystemOutcome, WorkspaceFilesystemRequest,
+    WorkspaceFilesystemResponse, WorkspaceRole, WorkspaceStore,
     execute_workspace_command_with_limits, execute_workspace_filesystem_with_limits,
     run_agent_session_with_store_and_writer,
 };
@@ -180,6 +182,20 @@ struct RegisterSessionResponse {
 struct SessionSyncResponse {
     event_cursor: u64,
     live_revision: u64,
+}
+
+#[derive(Deserialize)]
+struct RelayWorkspaceRoster {
+    participants: Vec<RelayWorkspaceParticipant>,
+}
+
+#[derive(Deserialize)]
+struct RelayWorkspaceParticipant {
+    id: Uuid,
+    kind: ParticipantKind,
+    role: WorkspaceRole,
+    display_name: String,
+    created_at: DateTime<Utc>,
 }
 
 /// Reconnect cursors are lower bounds, never instructions to rewind.  Taking
@@ -1764,8 +1780,11 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
             session_root,
             sessions,
             Arc::clone(&executor_factory),
-            session_id,
-            *request,
+            HostSessionLaunch {
+                session_id,
+                request: *request,
+                attachment,
+            },
         )
         .await;
         return true;
@@ -1810,8 +1829,11 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
                             session_root,
                             sessions,
                             Arc::clone(&executor_factory),
-                            session_id,
-                            metadata.request,
+                            HostSessionLaunch {
+                                session_id,
+                                request: metadata.request,
+                                attachment: metadata.attachment,
+                            },
                         )
                         .await,
                     )
@@ -2088,29 +2110,27 @@ fn discard_serialized_extension_roots(launch: &mut LaunchSession) {
     }
 }
 
+struct HostSessionLaunch {
+    session_id: Uuid,
+    request: LaunchSession,
+    attachment: Option<WorkspaceAttachment>,
+}
+
 async fn spawn_host_session(
     client: Client,
     config: HostConfig,
     session_root: PathBuf,
     sessions: Arc<Mutex<HashMap<Uuid, mpsc::Sender<HostCommand>>>>,
     executor_factory: HostExecutorFactory,
-    session_id: Uuid,
-    request: LaunchSession,
+    launch: HostSessionLaunch,
 ) -> mpsc::Sender<HostCommand> {
+    let session_id = launch.session_id;
     let (tx, rx) = mpsc::channel(64);
     sessions.lock().await.insert(session_id, tx.clone());
     let sessions_for_cleanup = sessions.clone();
     tokio::spawn(async move {
-        if let Err(error) = run_session(
-            client,
-            config,
-            session_root,
-            executor_factory,
-            session_id,
-            request,
-            rx,
-        )
-        .await
+        if let Err(error) =
+            run_session(client, config, session_root, executor_factory, launch, rx).await
         {
             tracing::error!(session_id = %session_id, %error, "remote agent session failed");
         }
@@ -2124,10 +2144,14 @@ async fn run_session(
     config: HostConfig,
     session_root: PathBuf,
     executor_factory: HostExecutorFactory,
-    session_id: Uuid,
-    mut launch: LaunchSession,
+    launch_request: HostSessionLaunch,
     commands: mpsc::Receiver<HostCommand>,
 ) -> Result<()> {
+    let HostSessionLaunch {
+        session_id,
+        request: mut launch,
+        attachment,
+    } = launch_request;
     launch.cwd = validate_host_cwd(&config.roots, &launch.cwd)?;
     discard_serialized_extension_roots(&mut launch);
     // The controller may have sent a stale or malicious capability snapshot.
@@ -2143,17 +2167,73 @@ async fn run_session(
     let writer = SessionWriterLease::acquire(&lock_path)?;
     let sqlite_store =
         Arc::new(SqliteSessionStore::open(session_root.join("sessions.sqlite3")).await?);
+    let workspace_attachment = attachment
+        .as_ref()
+        .and_then(|attachment| attachment.workspace_id.zip(attachment.participant_id));
     if !sqlite_store.contains_session(session_id).await? {
-        sqlite_store.create_session(session_id).await?;
+        if let Some((workspace_id, participant_id)) = workspace_attachment {
+            sqlite_store
+                .create_session_in_workspace_as(session_id, workspace_id, participant_id)
+                .await?;
+        } else {
+            sqlite_store.create_session(session_id).await?;
+        }
+    }
+    if let Some((workspace_id, participant_id)) = workspace_attachment {
+        sqlite_store
+            .attach_workspace(crate::SessionWorkspaceBinding {
+                session_id,
+                workspace_id,
+                participant_id,
+                host_id: Some(config.host_id),
+                attached_at: Utc::now(),
+            })
+            .await?;
+    }
+    let workspace_store = sqlite_store.workspace_store().await?;
+    if let (Some(store), Some((workspace_id, participant_id))) =
+        (workspace_store.as_ref(), workspace_attachment)
+    {
+        let human_display_name = std::env::var("USER").unwrap_or_else(|_| "Local user".to_string());
+        let human_participant_id = crate::local_human_participant_id(&human_display_name);
+        let workspace_name = launch
+            .cwd
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or("Borg workspace");
+        store
+            .ensure_execution_workspace(
+                workspace_id,
+                workspace_name,
+                human_participant_id,
+                &human_display_name,
+                participant_id,
+                launch.name.as_deref().unwrap_or("Borg"),
+            )
+            .await?;
     }
     let store: Arc<dyn SessionStore> = sqlite_store.clone();
     let cursor = load_session_sync(&client, &config, session_id).await?;
     let mut sync = JournalSync {
         uploaded_sequence: cursor.event_cursor,
         uploaded_live_revision: cursor.live_revision,
+        uploaded_workspace_sequence: 0,
+        workspace_relay_available: attachment.is_some(),
+        next_workspace_roster_sync: Instant::now(),
         retry_at: Instant::now(),
     };
     flush_pending(&client, &config, store.as_ref(), session_id, &mut sync).await?;
+    flush_workspace_messages(
+        &client,
+        &config,
+        sqlite_store.as_ref(),
+        workspace_store.as_ref(),
+        session_id,
+        attachment.as_ref(),
+        &mut sync,
+    )
+    .await?;
     let (event_tx, mut event_rx) = mpsc::channel(256);
     let actor_session_root = session_root.clone();
     let actor_store = Arc::clone(&sqlite_store);
@@ -2195,17 +2275,47 @@ async fn run_session(
             _ = tokio::time::sleep(Duration::from_secs(1)) => {}
         }
         flush_pending(&client, &config, store.as_ref(), session_id, &mut sync).await?;
+        flush_workspace_messages(
+            &client,
+            &config,
+            sqlite_store.as_ref(),
+            workspace_store.as_ref(),
+            session_id,
+            attachment.as_ref(),
+            &mut sync,
+        )
+        .await?;
     }
     if session_expired {
         let _ = actor.await;
         flush_pending(&client, &config, store.as_ref(), session_id, &mut sync).await?;
+        flush_workspace_messages(
+            &client,
+            &config,
+            sqlite_store.as_ref(),
+            workspace_store.as_ref(),
+            session_id,
+            attachment.as_ref(),
+            &mut sync,
+        )
+        .await?;
         bail!(
             "host session exceeded the configured {} second limit",
             config.resource_limits.max_session_seconds
         );
     }
     actor.await.context("agent session task failed")??;
-    flush_pending(&client, &config, store.as_ref(), session_id, &mut sync).await
+    flush_pending(&client, &config, store.as_ref(), session_id, &mut sync).await?;
+    flush_workspace_messages(
+        &client,
+        &config,
+        sqlite_store.as_ref(),
+        workspace_store.as_ref(),
+        session_id,
+        attachment.as_ref(),
+        &mut sync,
+    )
+    .await
 }
 
 async fn fetch_runtime_mcp_context(
@@ -2511,7 +2621,184 @@ fn isolated_mcp_command_allowed(command: &str, allowlist: &[String]) -> bool {
 struct JournalSync {
     uploaded_sequence: u64,
     uploaded_live_revision: u64,
+    uploaded_workspace_sequence: u64,
+    workspace_relay_available: bool,
+    next_workspace_roster_sync: Instant,
     retry_at: Instant,
+}
+
+async fn flush_workspace_messages(
+    client: &Client,
+    config: &HostConfig,
+    session_store: &SqliteSessionStore,
+    workspace_store: Option<&SqliteWorkspaceStore>,
+    session_id: Uuid,
+    attachment: Option<&WorkspaceAttachment>,
+    sync: &mut JournalSync,
+) -> Result<()> {
+    if !sync.workspace_relay_available || Instant::now() < sync.retry_at {
+        return Ok(());
+    }
+    let Some(store) = workspace_store else {
+        return Ok(());
+    };
+    let Some((workspace_id, participant_id)) =
+        attachment.and_then(|attachment| attachment.workspace_id.zip(attachment.participant_id))
+    else {
+        return Ok(());
+    };
+    if Instant::now() >= sync.next_workspace_roster_sync {
+        let response = client
+            .get(endpoint(
+                &config.server,
+                &format!("/api/remote/host/sessions/{session_id}/workspace/participants"),
+            ))
+            .bearer_auth(&config.host_token)
+            .send()
+            .await;
+        match response {
+            Ok(response) if response.status().is_success() => {
+                let roster: RelayWorkspaceRoster = response
+                    .json()
+                    .await
+                    .context("borg.ml returned an invalid workspace roster")?;
+                for remote in roster.participants {
+                    store
+                        .upsert_relay_roster_entry(
+                            workspace_id,
+                            Participant {
+                                id: remote.id,
+                                display_name: remote.display_name,
+                                kind: remote.kind,
+                                created_at: remote.created_at,
+                            },
+                            remote.role,
+                        )
+                        .await?;
+                }
+                sync.next_workspace_roster_sync = Instant::now() + Duration::from_secs(30);
+            }
+            Ok(response) if response.status() == StatusCode::NOT_FOUND => {
+                sync.workspace_relay_available = false;
+                return Ok(());
+            }
+            Ok(response) => {
+                tracing::warn!(
+                    status = %response.status(),
+                    "workspace roster synchronization failed"
+                );
+                sync.next_workspace_roster_sync = Instant::now() + Duration::from_secs(5);
+            }
+            Err(error) => {
+                tracing::warn!(%error, "workspace roster synchronization failed");
+                sync.next_workspace_roster_sync = Instant::now() + Duration::from_secs(5);
+            }
+        }
+    }
+    const PAGE_SIZE: usize = 256;
+    loop {
+        let events = store
+            .replay(
+                workspace_id,
+                participant_id,
+                sync.uploaded_workspace_sequence,
+                PAGE_SIZE,
+            )
+            .await?;
+        let caught_up = events.len() < PAGE_SIZE;
+        for event in events {
+            if event.author_id == participant_id
+                && let WorkspaceEventKind::Message { message, mode } = &event.kind
+            {
+                let (audience, audience_role, mut recipients) = match &message.audience {
+                    Audience::Workspace => ("workspace", None, Vec::new()),
+                    Audience::Participants { participants } => {
+                        ("participants", None, participants.clone())
+                    }
+                    Audience::Role { role } => {
+                        ("role", Some(serde_json::to_value(role)?), Vec::new())
+                    }
+                    Audience::Direct { participant } => ("direct", None, vec![*participant]),
+                };
+                if matches!(
+                    &message.audience,
+                    Audience::Direct { .. } | Audience::Participants { .. }
+                ) {
+                    let mut cloud_recipients = Vec::with_capacity(recipients.len());
+                    for recipient in recipients {
+                        let local_only = session_store
+                            .workspace_binding(recipient)
+                            .await?
+                            .is_some_and(|binding| binding.host_id.is_none());
+                        if !local_only {
+                            cloud_recipients.push(recipient);
+                        }
+                    }
+                    recipients = cloud_recipients;
+                    if recipients.is_empty() {
+                        sync.uploaded_workspace_sequence = event.sequence;
+                        continue;
+                    }
+                }
+                let response = client
+                    .post(endpoint(
+                        &config.server,
+                        &format!("/api/remote/host/sessions/{session_id}/workspace/messages"),
+                    ))
+                    .bearer_auth(&config.host_token)
+                    .json(&serde_json::json!({
+                        "text": message.body.text,
+                        "audience": audience,
+                        "audience_role": audience_role,
+                        "recipient_participant_ids": recipients,
+                        "mentions": message.body.mentions,
+                        "thread_id": message.thread_id,
+                        "reply_to_message_id": message.reply_to_message_id,
+                        "idempotency_key": event.id.to_string(),
+                        "delivery_mode": mode,
+                        "metadata": {
+                            "local_workspace_event_id": event.id,
+                            "local_workspace_sequence": event.sequence,
+                        }
+                    }))
+                    .send()
+                    .await;
+                match response {
+                    Ok(response) if response.status().is_success() => {}
+                    Ok(response) if response.status() == StatusCode::NOT_FOUND => {
+                        tracing::warn!(
+                            "borg.ml does not expose the workspace relay endpoint; disabling it for this session"
+                        );
+                        sync.workspace_relay_available = false;
+                        return Ok(());
+                    }
+                    Ok(response) => {
+                        tracing::warn!(
+                            status = %response.status(),
+                            workspace_event_id = %event.id,
+                            "workspace message relay rejected an event"
+                        );
+                        sync.retry_at = Instant::now() + Duration::from_secs(2);
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            workspace_event_id = %event.id,
+                            "workspace message relay upload failed"
+                        );
+                        sync.retry_at = Instant::now() + Duration::from_secs(2);
+                        return Ok(());
+                    }
+                }
+            }
+            sync.uploaded_workspace_sequence = event.sequence;
+        }
+        if caught_up {
+            break;
+        }
+    }
+    Ok(())
 }
 
 async fn flush_pending(

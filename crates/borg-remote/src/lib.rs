@@ -99,10 +99,11 @@ pub use tool_presentation::{
 };
 pub use workspace::{
     AtomicWorkClaim, Audience, DeliveryAttempt, DeliveryCursor, DeliveryMode, DeliveryState,
-    HostAttachment, HostIdentity, Participant, ParticipantKind, PresenceLease, Provenance,
-    RecipientDelivery, SharedWork, SqliteWorkspaceStore, StructuredMention, Thread, WorkDependency,
-    WorkReview, Workspace, WorkspaceArtifact, WorkspaceDecision, WorkspaceEvent,
+    HostAttachment, HostIdentity, NewWorkspaceMessage, Participant, ParticipantKind, PresenceLease,
+    Provenance, RecipientDelivery, SharedWork, SqliteWorkspaceStore, StructuredMention, Thread,
+    WorkDependency, WorkReview, Workspace, WorkspaceArtifact, WorkspaceDecision, WorkspaceEvent,
     WorkspaceEventKind, WorkspaceHost, WorkspaceHostCapabilities, WorkspaceMembership,
-    WorkspaceMessage, WorkspaceMessageBody, WorkspaceReference, WorkspaceReviewRequest,
-    WorkspaceRole, WorkspaceRosterEntry, WorkspaceStore, local_human_participant_id,
+    WorkspaceMessage, WorkspaceMessageBody, WorkspaceMessageReceipt, WorkspaceReference,
+    WorkspaceReviewRequest, WorkspaceRole, WorkspaceRosterEntry, WorkspaceStore,
+    local_human_participant_id,
 };

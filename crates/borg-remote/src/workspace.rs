@@ -106,6 +106,34 @@ pub struct WorkspaceMessage {
     pub audience: Audience,
     pub created_at: DateTime<Utc>,
 }
+/// Provider-neutral input to the single durable workspace message router.
+///
+/// Callers choose an authorized workspace and audience. The store owns the
+/// message ID, sequence, audience validation, and recipient delivery rows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewWorkspaceMessage {
+    pub workspace_id: Uuid,
+    pub author_id: Uuid,
+    pub text: String,
+    #[serde(default)]
+    pub mentions: Vec<StructuredMention>,
+    pub audience: Audience,
+    pub mode: DeliveryMode,
+    pub thread_id: Option<Uuid>,
+    pub reply_to_message_id: Option<Uuid>,
+    pub idempotency_key: String,
+}
+/// Truthful durable acceptance receipt. A successful route always names at
+/// least one recipient delivery; immediate wake/steer is an optional layer on
+/// top of this receipt, never a second mailbox.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceMessageReceipt {
+    pub message_id: Uuid,
+    pub workspace_id: Uuid,
+    pub sequence: u64,
+    pub recipient_ids: Vec<Uuid>,
+    pub mode: DeliveryMode,
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeliveryMode {
@@ -434,6 +462,271 @@ impl SqliteWorkspaceStore {
                 })
             })
             .collect()
+    }
+
+    pub async fn participant(&self, participant_id: Uuid) -> Result<Option<Participant>> {
+        let row = sqlx::query(
+            "select id,display_name,kind,created_at from workspace_participants where id=?",
+        )
+        .bind(participant_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| {
+            Ok(Participant {
+                id: Uuid::parse_str(row.try_get("id")?)?,
+                display_name: row.try_get("display_name")?,
+                kind: serde_json::from_str(row.try_get("kind")?)?,
+                created_at: DateTime::parse_from_rfc3339(row.try_get("created_at")?)?
+                    .with_timezone(&Utc),
+            })
+        })
+        .transpose()
+    }
+
+    /// Apply one authenticated relay roster projection idempotently. This is
+    /// a cache of cloud membership, not a local authority grant.
+    pub async fn upsert_relay_roster_entry(
+        &self,
+        workspace_id: Uuid,
+        participant: Participant,
+        role: WorkspaceRole,
+    ) -> Result<()> {
+        let mut transaction = self.write().await?;
+        let workspace_exists: i64 =
+            sqlx::query_scalar("select exists(select 1 from workspaces where id=?)")
+                .bind(workspace_id.to_string())
+                .fetch_one(&mut *transaction)
+                .await?;
+        ensure!(
+            workspace_exists != 0,
+            "relay workspace is not materialized locally"
+        );
+        sqlx::query(
+            "insert into workspace_participants(id,display_name,kind,created_at) \
+             values(?,?,?,?) on conflict(id) do update set \
+             display_name=excluded.display_name,kind=excluded.kind",
+        )
+        .bind(participant.id.to_string())
+        .bind(participant.display_name)
+        .bind(serde_json::to_string(&participant.kind)?)
+        .bind(participant.created_at.to_rfc3339())
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "insert into workspace_members(workspace_id,participant_id,role,joined_at) \
+             values(?,?,?,?) on conflict(workspace_id,participant_id) do update set role=excluded.role",
+        )
+        .bind(workspace_id.to_string())
+        .bind(participant.id.to_string())
+        .bind(serde_json::to_string(&role)?)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    /// Materialize a private direct-message workspace for two participants in
+    /// this SQLite authority. The stable UUID makes concurrent/retried sends
+    /// converge on the same channel without coupling either execution session
+    /// to the other's project workspace.
+    pub async fn ensure_direct_workspace(
+        &self,
+        left_participant_id: Uuid,
+        right_participant_id: Uuid,
+    ) -> Result<Uuid> {
+        ensure!(
+            left_participant_id != right_participant_id,
+            "direct message recipient must differ from its author"
+        );
+        let mut participant_ids = [left_participant_id, right_participant_id];
+        participant_ids.sort_unstable();
+        let workspace_id = Uuid::new_v5(
+            &Uuid::NAMESPACE_URL,
+            format!(
+                "borg://local-direct/{}/{}",
+                participant_ids[0], participant_ids[1]
+            )
+            .as_bytes(),
+        );
+        let now = Utc::now().to_rfc3339();
+        let mut transaction = self.write().await?;
+        for participant_id in participant_ids {
+            let exists: i64 = sqlx::query_scalar(
+                "select exists(select 1 from workspace_participants where id=?)",
+            )
+            .bind(participant_id.to_string())
+            .fetch_one(&mut *transaction)
+            .await?;
+            ensure!(
+                exists != 0,
+                "direct message participant {participant_id} is unknown"
+            );
+        }
+        sqlx::query(
+            "insert into workspaces(id,name,created_at) values(?,?,?) on conflict(id) do nothing",
+        )
+        .bind(workspace_id.to_string())
+        .bind("Borg direct message")
+        .bind(&now)
+        .execute(&mut *transaction)
+        .await?;
+        for participant_id in participant_ids {
+            sqlx::query(
+                "insert into workspace_members(workspace_id,participant_id,role,joined_at) \
+                 values(?,?,?,?) on conflict(workspace_id,participant_id) do nothing",
+            )
+            .bind(workspace_id.to_string())
+            .bind(participant_id.to_string())
+            .bind(serde_json::to_string(&WorkspaceRole::Editor)?)
+            .bind(&now)
+            .execute(&mut *transaction)
+            .await?;
+        }
+        transaction.commit().await?;
+        Ok(workspace_id)
+    }
+
+    /// Route one message through the canonical workspace event and delivery
+    /// tables and report the exact durable recipients.
+    pub async fn append_message(
+        &self,
+        input: NewWorkspaceMessage,
+    ) -> Result<WorkspaceMessageReceipt> {
+        ensure!(!input.text.trim().is_empty(), "workspace message is empty");
+        ensure!(
+            !input.idempotency_key.trim().is_empty(),
+            "workspace message idempotency key is empty"
+        );
+        let roster = self
+            .workspace_roster(input.workspace_id, input.author_id)
+            .await?;
+        let members = roster
+            .iter()
+            .map(|entry| (entry.participant.id, entry.role))
+            .collect::<Vec<_>>();
+        let mut expected_recipients = Self::recipients(&input.audience, &members)?;
+        expected_recipients.retain(|recipient| *recipient != input.author_id);
+        ensure!(
+            !expected_recipients.is_empty(),
+            "message audience resolves only to its author"
+        );
+
+        if let Some(event) = self.existing_message_event(&input).await? {
+            return self.message_receipt(&event, &expected_recipients).await;
+        }
+
+        let message_id = Uuid::new_v4();
+        let created_at = Utc::now();
+        let mode = input.mode;
+        let candidate = WorkspaceEvent {
+            id: message_id,
+            workspace_id: input.workspace_id,
+            sequence: 0,
+            author_id: input.author_id,
+            idempotency_key: input.idempotency_key.clone(),
+            created_at,
+            kind: WorkspaceEventKind::Message {
+                message: WorkspaceMessage {
+                    id: message_id,
+                    workspace_id: input.workspace_id,
+                    thread_id: input.thread_id,
+                    reply_to_message_id: input.reply_to_message_id,
+                    author_id: input.author_id,
+                    body: WorkspaceMessageBody {
+                        text: input.text.clone(),
+                        mentions: input.mentions.clone(),
+                    },
+                    audience: input.audience.clone(),
+                    created_at,
+                },
+                mode,
+            },
+        };
+        let event = match self.append(candidate).await {
+            Ok(event) => event,
+            Err(error) => {
+                // Two exact retries can race between the optimistic lookup
+                // above and SQLite's unique idempotency constraint. Resolve
+                // the winner semantically before reporting a conflict.
+                if let Some(event) = self.existing_message_event(&input).await? {
+                    return self.message_receipt(&event, &expected_recipients).await;
+                }
+                return Err(error);
+            }
+        };
+        self.message_receipt(&event, &expected_recipients).await
+    }
+
+    async fn existing_message_event(
+        &self,
+        input: &NewWorkspaceMessage,
+    ) -> Result<Option<WorkspaceEvent>> {
+        let row = sqlx::query(
+            "select event_json from workspace_events \
+             where workspace_id=? and author_id=? and idempotency_key=?",
+        )
+        .bind(input.workspace_id.to_string())
+        .bind(input.author_id.to_string())
+        .bind(&input.idempotency_key)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let event: WorkspaceEvent = serde_json::from_str(row.try_get("event_json")?)?;
+        let matches = matches!(
+            &event.kind,
+            WorkspaceEventKind::Message { message, mode }
+                if event.workspace_id == input.workspace_id
+                    && event.author_id == input.author_id
+                    && message.workspace_id == input.workspace_id
+                    && message.author_id == input.author_id
+                    && message.thread_id == input.thread_id
+                    && message.reply_to_message_id == input.reply_to_message_id
+                    && message.body.text == input.text
+                    && message.body.mentions == input.mentions
+                    && message.audience == input.audience
+                    && *mode == input.mode
+        );
+        ensure!(
+            matches,
+            "idempotency conflict: key was used with a different payload"
+        );
+        Ok(Some(event))
+    }
+
+    async fn message_receipt(
+        &self,
+        event: &WorkspaceEvent,
+        expected_recipients: &[Uuid],
+    ) -> Result<WorkspaceMessageReceipt> {
+        let WorkspaceEventKind::Message { message, mode } = &event.kind else {
+            bail!("workspace message receipt references a non-message event");
+        };
+        let rows = sqlx::query(
+            "select recipient_id from workspace_deliveries \
+             where workspace_id=? and sequence=? order by recipient_id",
+        )
+        .bind(event.workspace_id.to_string())
+        .bind(i64::try_from(event.sequence)?)
+        .fetch_all(&self.pool)
+        .await?;
+        let recipient_ids = rows
+            .into_iter()
+            .map(|row| Uuid::parse_str(row.get("recipient_id")))
+            .collect::<Result<Vec<_>, _>>()?;
+        ensure!(
+            recipient_ids == expected_recipients,
+            "workspace delivery receipt does not match the authorized audience"
+        );
+        Ok(WorkspaceMessageReceipt {
+            message_id: message.id,
+            workspace_id: event.workspace_id,
+            sequence: event.sequence,
+            recipient_ids,
+            mode: *mode,
+        })
     }
 
     pub async fn workspace_threads(
@@ -1572,6 +1865,57 @@ mod tests {
         .unwrap();
         assert!(
             s.append(event(w.id, a.id, Audience::Workspace, "k"))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("idempotency conflict")
+        );
+    }
+
+    #[tokio::test]
+    async fn message_router_exact_retries_share_one_receipt_and_delivery() {
+        let (store, workspace, author, recipient, _) = fixture().await;
+        let input = NewWorkspaceMessage {
+            workspace_id: workspace.id,
+            author_id: author.id,
+            text: "one durable handoff".to_string(),
+            mentions: Vec::new(),
+            audience: Audience::Direct {
+                participant: recipient.id,
+            },
+            mode: DeliveryMode::Wake,
+            thread_id: None,
+            reply_to_message_id: None,
+            idempotency_key: "message-router-retry".to_string(),
+        };
+        let mut attempts = Vec::new();
+        for _ in 0..8 {
+            let store = store.clone();
+            let input = input.clone();
+            attempts.push(tokio::spawn(
+                async move { store.append_message(input).await },
+            ));
+        }
+        let mut receipts = Vec::new();
+        for attempt in attempts {
+            receipts.push(attempt.await.unwrap().unwrap());
+        }
+        assert!(receipts.iter().all(|receipt| receipt == &receipts[0]));
+        assert_eq!(receipts[0].recipient_ids, vec![recipient.id]);
+        assert_eq!(
+            store
+                .replay(workspace.id, recipient.id, 0, 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let mut conflicting = input;
+        conflicting.text = "different handoff".to_string();
+        assert!(
+            store
+                .append_message(conflicting)
                 .await
                 .unwrap_err()
                 .to_string()
