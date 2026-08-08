@@ -3339,7 +3339,9 @@ async fn run_agent_session_store_kernel(
                         | HostCommand::WorkspaceFilesystem { .. }
                         | HostCommand::CancelWorkspaceFilesystem { .. }
                         | HostCommand::WorkspaceCommand { .. }
-                        | HostCommand::CancelWorkspaceCommand { .. } => {}
+                        | HostCommand::CancelWorkspaceCommand { .. }
+                        | HostCommand::ShellCommand { .. }
+                        | HostCommand::OpenTerminal { .. } => {}
                     }
                 }
                 request = goal_tool_rx.recv() => {

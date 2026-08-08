@@ -512,6 +512,28 @@ fn host_service_unit(
         systemd_quote(&validated_systemd_value(&config_path.to_string_lossy())?),
         systemd_quote(&validated_systemd_value(&format!("PATH={path}"))?),
     );
+    for name in [
+        "DISPLAY",
+        "WAYLAND_DISPLAY",
+        "DBUS_SESSION_BUS_ADDRESS",
+        "XDG_RUNTIME_DIR",
+        "XDG_CURRENT_DESKTOP",
+        "XDG_SESSION_TYPE",
+        "NIRI_SOCKET",
+        "SWAYSOCK",
+        "HYPRLAND_INSTANCE_SIGNATURE",
+        "TERMINAL",
+        "BORG_TERMINAL",
+    ] {
+        if let Some(value) = std::env::var_os(name)
+            && let Some(value) = value.to_str()
+        {
+            let assignment = format!("{name}={value}");
+            service.push_str("Environment=");
+            service.push_str(&systemd_quote(&validated_systemd_value(&assignment)?));
+            service.push('\n');
+        }
+    }
 
     if config.execution_profile == HostExecutionProfile::IsolatedHosted {
         ensure!(

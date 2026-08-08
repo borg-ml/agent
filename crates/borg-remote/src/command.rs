@@ -15,14 +15,211 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use uuid::Uuid;
 
 use crate::{
-    HostResourceLimits, WorkspaceCommandErrorCode, WorkspaceCommandOutcome, WorkspaceCommandOutput,
-    WorkspaceCommandRequest, WorkspaceCommandResponse,
+    HostResourceLimits, HostShellCommandOutcome, HostShellCommandOutput, HostShellCommandRequest,
+    HostShellCommandResponse, WorkspaceCommandErrorCode, WorkspaceCommandOutcome,
+    WorkspaceCommandOutput, WorkspaceCommandRequest, WorkspaceCommandResponse,
 };
 
 const MAX_COMMAND_ARGS: usize = 128;
 const MAX_COMMAND_ARG_CHARS: usize = 16_384;
 const MAX_OUTPUT_BYTES: u64 = 1024 * 1024;
 const MAX_TIMEOUT_MS: u64 = 30 * 60 * 1000;
+const MAX_SHELL_COMMAND_CHARS: usize = 64 * 1024;
+
+pub async fn execute_host_shell_command_with_limits(
+    enrolled_roots: &[PathBuf],
+    request: HostShellCommandRequest,
+    limits: &HostResourceLimits,
+) -> HostShellCommandResponse {
+    let request_id = request.request_id;
+    let outcome = match execute_shell_command(enrolled_roots, request, limits).await {
+        Ok(output) => HostShellCommandOutcome::Success {
+            output: Box::new(output),
+        },
+        Err(outcome) => *outcome,
+    };
+    HostShellCommandResponse {
+        request_id,
+        outcome,
+    }
+}
+
+type ShellCommandResult<T> = Result<T, Box<HostShellCommandOutcome>>;
+
+async fn execute_shell_command(
+    enrolled_roots: &[PathBuf],
+    request: HostShellCommandRequest,
+    limits: &HostResourceLimits,
+) -> ShellCommandResult<HostShellCommandOutput> {
+    validate_shell_command(&request.command)?;
+    let cwd = canonical_host_cwd(enrolled_roots, &request.cwd)?;
+    let timeout_ms = request
+        .timeout_ms
+        .min(limits.max_workspace_command_timeout_ms)
+        .clamp(1, MAX_TIMEOUT_MS);
+    let output_max_bytes = request
+        .output_max_bytes
+        .min(limits.max_workspace_command_output_bytes)
+        .clamp(1, MAX_OUTPUT_BYTES);
+    let started_at = Utc::now();
+    let mut process = {
+        #[cfg(windows)]
+        {
+            let shell = std::env::var_os("ComSpec").unwrap_or_else(|| "cmd.exe".into());
+            let mut process = tokio::process::Command::new(shell);
+            process.args(["/C", &request.command]);
+            process
+        }
+        #[cfg(not(windows))]
+        {
+            let shell = std::env::var_os("SHELL").unwrap_or_else(|| "/bin/sh".into());
+            let mut process = tokio::process::Command::new(shell);
+            process.args(["-lc", &request.command]);
+            process
+        }
+    };
+    crate::process_environment::configure_host_child_environment(&mut process);
+    process
+        .current_dir(&cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = process.spawn().map_err(shell_io_failure)?;
+    let stdout = child.stdout.take().ok_or_else(|| {
+        shell_failure(
+            WorkspaceCommandErrorCode::Io,
+            "host shell command stdout pipe missing",
+            false,
+        )
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| {
+        shell_failure(
+            WorkspaceCommandErrorCode::Io,
+            "host shell command stderr pipe missing",
+            false,
+        )
+    })?;
+    let stdout_task = tokio::spawn(read_limited_pipe(stdout, output_max_bytes as usize));
+    let stderr_task = tokio::spawn(read_limited_pipe(stderr, output_max_bytes as usize));
+    let wait =
+        tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), child.wait()).await;
+    let (exit_code, timed_out) = match wait {
+        Ok(Ok(status)) => (status.code(), false),
+        Ok(Err(error)) => return Err(shell_io_failure(error)),
+        Err(_) => {
+            let _ = child.kill().await;
+            (None, true)
+        }
+    };
+    let (stdout, stdout_truncated) = stdout_task
+        .await
+        .context("host shell stdout task panicked")
+        .and_then(|result| result)
+        .map_err(shell_anyhow_failure)?;
+    let (stderr, stderr_truncated) = stderr_task
+        .await
+        .context("host shell stderr task panicked")
+        .and_then(|result| result)
+        .map_err(shell_anyhow_failure)?;
+    Ok(HostShellCommandOutput {
+        id: request.request_id,
+        cwd,
+        command: request.command,
+        timeout_seconds: timeout_ms.div_ceil(1000),
+        timed_out,
+        exit_code,
+        stdout,
+        stderr,
+        stdout_truncated,
+        stderr_truncated,
+        output_max_bytes,
+        started_at,
+        finished_at: Utc::now(),
+    })
+}
+
+fn validate_shell_command(command: &str) -> ShellCommandResult<()> {
+    if command.trim().is_empty() || command.chars().count() > MAX_SHELL_COMMAND_CHARS {
+        return Err(shell_failure(
+            WorkspaceCommandErrorCode::InvalidCommand,
+            format!("shell command must be between 1 and {MAX_SHELL_COMMAND_CHARS} characters"),
+            false,
+        ));
+    }
+    if command.chars().any(|character| {
+        character == '\0' || (character.is_control() && !matches!(character, '\t' | '\n' | '\r'))
+    }) {
+        return Err(shell_failure(
+            WorkspaceCommandErrorCode::InvalidCommand,
+            "shell command contains an invalid control character",
+            false,
+        ));
+    }
+    Ok(())
+}
+
+fn canonical_host_cwd(enrolled_roots: &[PathBuf], requested: &Path) -> ShellCommandResult<PathBuf> {
+    if !requested.is_absolute() {
+        return Err(shell_failure(
+            WorkspaceCommandErrorCode::InvalidCwd,
+            "host shell cwd must be absolute",
+            false,
+        ));
+    }
+    let cwd = requested.canonicalize().map_err(shell_io_failure)?;
+    if !cwd.is_dir() {
+        return Err(shell_failure(
+            WorkspaceCommandErrorCode::InvalidCwd,
+            "host shell cwd is not a directory",
+            false,
+        ));
+    }
+    if !enrolled_roots.is_empty()
+        && !enrolled_roots
+            .iter()
+            .filter_map(|root| root.canonicalize().ok())
+            .any(|root| cwd.starts_with(root))
+    {
+        return Err(shell_failure(
+            WorkspaceCommandErrorCode::PermissionDenied,
+            "host shell cwd is outside this host's enrolled roots",
+            false,
+        ));
+    }
+    Ok(cwd)
+}
+
+fn shell_io_failure(error: std::io::Error) -> Box<HostShellCommandOutcome> {
+    shell_failure(
+        if error.kind() == ErrorKind::PermissionDenied {
+            WorkspaceCommandErrorCode::PermissionDenied
+        } else {
+            WorkspaceCommandErrorCode::Io
+        },
+        error.to_string(),
+        matches!(
+            error.kind(),
+            ErrorKind::Interrupted | ErrorKind::WouldBlock | ErrorKind::TimedOut
+        ),
+    )
+}
+
+fn shell_anyhow_failure(error: anyhow::Error) -> Box<HostShellCommandOutcome> {
+    shell_failure(WorkspaceCommandErrorCode::Io, error.to_string(), false)
+}
+
+fn shell_failure(
+    code: WorkspaceCommandErrorCode,
+    message: impl Into<String>,
+    retryable: bool,
+) -> Box<HostShellCommandOutcome> {
+    Box::new(HostShellCommandOutcome::Failure {
+        code,
+        message: message.into(),
+        retryable,
+    })
+}
 
 pub async fn execute_workspace_command(
     enrolled_roots: &[PathBuf],
@@ -296,6 +493,57 @@ fn failure(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn host_shell_command_runs_multiline_script_inside_enrolled_root() {
+        let root = tempfile::tempdir().expect("root");
+        let command = if cfg!(windows) {
+            "echo one"
+        } else {
+            "printf 'one\\ntwo\\n'"
+        };
+        let response = execute_host_shell_command_with_limits(
+            &[root.path().to_path_buf()],
+            HostShellCommandRequest {
+                request_id: Uuid::new_v4(),
+                cwd: root.path().to_path_buf(),
+                command: command.to_string(),
+                timeout_ms: 1_000,
+                output_max_bytes: 1_024,
+            },
+            &HostResourceLimits::default(),
+        )
+        .await;
+        let HostShellCommandOutcome::Success { output } = response.outcome else {
+            panic!("host shell command failed: {response:?}");
+        };
+        assert!(output.stdout.contains("one"));
+    }
+
+    #[tokio::test]
+    async fn host_shell_command_rejects_cwd_outside_enrolled_root() {
+        let root = tempfile::tempdir().expect("root");
+        let outside = tempfile::tempdir().expect("outside");
+        let response = execute_host_shell_command_with_limits(
+            &[root.path().to_path_buf()],
+            HostShellCommandRequest {
+                request_id: Uuid::new_v4(),
+                cwd: outside.path().to_path_buf(),
+                command: "pwd".to_string(),
+                timeout_ms: 1_000,
+                output_max_bytes: 1_024,
+            },
+            &HostResourceLimits::default(),
+        )
+        .await;
+        assert!(matches!(
+            response.outcome,
+            HostShellCommandOutcome::Failure {
+                code: WorkspaceCommandErrorCode::PermissionDenied,
+                ..
+            }
+        ));
+    }
 
     #[tokio::test]
     async fn command_cwd_cannot_escape_enrolled_root_through_symlink() {

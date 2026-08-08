@@ -7,7 +7,7 @@ use serde_json::Value;
 use ts_rs::TS;
 use uuid::Uuid;
 
-pub const REMOTE_PROTOCOL_VERSION: u16 = 5;
+pub const REMOTE_PROTOCOL_VERSION: u16 = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
@@ -491,6 +491,13 @@ pub struct HostCapabilities {
     pub providers: Vec<ProviderCapability>,
     pub roots: Vec<PathBuf>,
     pub can_launch: bool,
+    /// Whether this host accepts bounded arbitrary shell scripts from the
+    /// remote control plane.
+    #[serde(default)]
+    pub can_run_shell_commands: bool,
+    /// Whether this host can create a fresh local terminal window.
+    #[serde(default)]
+    pub can_open_terminal: bool,
     /// Legacy payloads default to trusted user execution rather than making a
     /// security claim they never declared.
     #[serde(default)]
@@ -1001,6 +1008,12 @@ pub enum HostCommand {
     CancelWorkspaceCommand {
         request_id: Uuid,
     },
+    ShellCommand {
+        request: HostShellCommandRequest,
+    },
+    OpenTerminal {
+        request: OpenTerminalRequest,
+    },
 }
 
 impl HostCommand {
@@ -1022,7 +1035,9 @@ impl HostCommand {
             Self::WorkspaceFilesystem { .. }
             | Self::CancelWorkspaceFilesystem { .. }
             | Self::WorkspaceCommand { .. }
-            | Self::CancelWorkspaceCommand { .. } => None,
+            | Self::CancelWorkspaceCommand { .. }
+            | Self::ShellCommand { .. }
+            | Self::OpenTerminal { .. } => None,
         }
     }
 }
@@ -1225,6 +1240,102 @@ pub struct WorkspaceCommandResponse {
     pub request_id: Uuid,
     pub workspace_id: Uuid,
     pub outcome: WorkspaceCommandOutcome,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct HostShellCommandRequest {
+    pub request_id: Uuid,
+    pub cwd: PathBuf,
+    pub command: String,
+    pub timeout_ms: u64,
+    pub output_max_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct HostShellCommandOutput {
+    pub id: Uuid,
+    pub cwd: PathBuf,
+    pub command: String,
+    pub timeout_seconds: u64,
+    pub timed_out: bool,
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
+    pub output_max_bytes: u64,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[ts(export)]
+pub enum HostShellCommandOutcome {
+    Success {
+        output: Box<HostShellCommandOutput>,
+    },
+    Failure {
+        code: WorkspaceCommandErrorCode,
+        message: String,
+        retryable: bool,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct HostShellCommandResponse {
+    pub request_id: Uuid,
+    pub outcome: HostShellCommandOutcome,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct OpenTerminalRequest {
+    pub request_id: Uuid,
+    pub cwd: PathBuf,
+    pub provider: CodingProvider,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    #[serde(default)]
+    pub fast: bool,
+    #[serde(default)]
+    pub response_language: ResponseLanguage,
+    pub permission_mode: PermissionMode,
+    pub initial_prompt: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct OpenTerminalOutput {
+    pub id: Uuid,
+    pub cwd: PathBuf,
+    pub terminal: String,
+    pub pid: Option<u32>,
+    pub started_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[ts(export)]
+pub enum OpenTerminalOutcome {
+    Success {
+        output: Box<OpenTerminalOutput>,
+    },
+    Failure {
+        code: WorkspaceCommandErrorCode,
+        message: String,
+        retryable: bool,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct OpenTerminalResponse {
+    pub request_id: Uuid,
+    pub outcome: OpenTerminalOutcome,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

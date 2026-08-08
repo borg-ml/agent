@@ -21,16 +21,17 @@ use crate::receipt::{ReceiptState, SqliteReceiptStore};
 use crate::{
     AgentRuntimeCommandEnvelope, AgentRuntimeEventEnvelope, AgentTurnExecutor, Audience,
     CodingProvider, HostCapabilities, HostCommand, HostCommandEnvelope, HostExecutionProfile,
-    HostHeartbeat, HostResourceLimits, LaunchSession, Participant, ParticipantKind,
-    ProviderAuthMethod, ProviderCapability, REMOTE_PROTOCOL_VERSION, RemoteHost,
-    RemoteHostIdentity, RuntimeMcpContext, SessionEvent, SessionLiveEvent, SessionPayloadRef,
-    SessionStore, SessionWriterLease, SqliteSessionStore, SqliteWorkspaceStore,
-    WorkspaceAttachment, WorkspaceCommandErrorCode, WorkspaceCommandOutcome,
-    WorkspaceCommandRequest, WorkspaceCommandResponse, WorkspaceEventKind,
+    HostHeartbeat, HostResourceLimits, HostShellCommandOutcome, HostShellCommandRequest,
+    HostShellCommandResponse, LaunchSession, OpenTerminalOutcome, OpenTerminalRequest,
+    OpenTerminalResponse, Participant, ParticipantKind, PermissionMode, ProviderAuthMethod,
+    ProviderCapability, REMOTE_PROTOCOL_VERSION, RemoteHost, RemoteHostIdentity, RuntimeMcpContext,
+    SessionEvent, SessionLiveEvent, SessionPayloadRef, SessionStore, SessionWriterLease,
+    SqliteSessionStore, SqliteWorkspaceStore, WorkspaceAttachment, WorkspaceCommandErrorCode,
+    WorkspaceCommandOutcome, WorkspaceCommandRequest, WorkspaceCommandResponse, WorkspaceEventKind,
     WorkspaceFilesystemErrorCode, WorkspaceFilesystemOutcome, WorkspaceFilesystemRequest,
     WorkspaceFilesystemResponse, WorkspaceRole, WorkspaceStore,
-    execute_workspace_command_with_limits, execute_workspace_filesystem_with_limits,
-    run_agent_session_with_store_and_writer,
+    execute_host_shell_command_with_limits, execute_workspace_command_with_limits,
+    execute_workspace_filesystem_with_limits, run_agent_session_with_store_and_writer,
 };
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -765,6 +766,8 @@ async fn probe_capabilities_with_profile(
         providers,
         roots,
         can_launch: true,
+        can_run_shell_commands: true,
+        can_open_terminal: terminal_emulator().is_some(),
         execution_profile,
         resource_limits: configured_resource_limits(),
         workspace_attachment: Some(workspace_attachment_capabilities()),
@@ -1650,6 +1653,32 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
         receipts,
         executor_factory,
     } = context;
+    if let HostCommand::ShellCommand { request } = &command {
+        let Some(response) = shell_command_response(&receipts, &config, request).await else {
+            return false;
+        };
+        return upload_host_action_result(
+            &client,
+            &config,
+            "/api/remote/host/shell-command-results",
+            response.request_id,
+            &response,
+        )
+        .await;
+    }
+    if let HostCommand::OpenTerminal { request } = &command {
+        let Some(response) = open_terminal_response(&receipts, &config, request).await else {
+            return false;
+        };
+        return upload_host_action_result(
+            &client,
+            &config,
+            "/api/remote/host/terminal-results",
+            response.request_id,
+            &response,
+        )
+        .await;
+    }
     if let HostCommand::WorkspaceFilesystem { request } = &command {
         let Some(response) = filesystem_response(&receipts, &config, request).await else {
             return false;
@@ -1849,6 +1878,36 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
     true
 }
 
+async fn upload_host_action_result<T: Serialize>(
+    client: &Client,
+    config: &HostConfig,
+    path: &str,
+    request_id: Uuid,
+    response: &T,
+) -> bool {
+    match client
+        .post(endpoint(&config.server, path))
+        .bearer_auth(&config.host_token)
+        .json(response)
+        .send()
+        .await
+    {
+        Ok(result) if result.status().is_success() => true,
+        Ok(result) if matches!(result.status(), StatusCode::NOT_FOUND | StatusCode::GONE) => {
+            tracing::warn!(status = %result.status(), %request_id, "remote host action is no longer present on the relay");
+            true
+        }
+        Ok(result) => {
+            tracing::warn!(status = %result.status(), %request_id, "remote host action result upload failed");
+            false
+        }
+        Err(error) => {
+            tracing::warn!(%error, %request_id, "remote host action result upload failed");
+            false
+        }
+    }
+}
+
 async fn filesystem_response(
     receipts: &SqliteReceiptStore,
     config: &HostConfig,
@@ -1923,6 +1982,338 @@ fn indeterminate_filesystem_response(
             retryable: false,
         },
     }
+}
+
+async fn shell_command_response(
+    receipts: &SqliteReceiptStore,
+    config: &HostConfig,
+    request: &HostShellCommandRequest,
+) -> Option<HostShellCommandResponse> {
+    let state = match receipts.load(request.request_id, request).await {
+        Ok(state) => state,
+        Err(error) => {
+            tracing::warn!(%error, request_id = %request.request_id, "failed to read host shell receipt");
+            return None;
+        }
+    };
+    match state {
+        ReceiptState::Terminal(response) => Some(response),
+        ReceiptState::Started => {
+            let response = indeterminate_shell_response(
+                request,
+                "the host restarted after this shell command began; Borg will not replay it because its side effects cannot be proven",
+            );
+            persist_shell_terminal(receipts, request, &response).await
+        }
+        ReceiptState::Conflict => Some(indeterminate_shell_response(
+            request,
+            "request_id was already used for a different host shell command",
+        )),
+        ReceiptState::Corrupt => Some(indeterminate_shell_response(
+            request,
+            "the durable shell command receipt is unreadable; Borg will not replay it",
+        )),
+        ReceiptState::Missing => {
+            if let Err(error) = receipts.begin(request.request_id, request).await {
+                tracing::warn!(%error, request_id = %request.request_id, "failed to durably begin host shell command");
+                return None;
+            }
+            let response = execute_host_shell_command_with_limits(
+                &config.roots,
+                request.clone(),
+                &config.resource_limits,
+            )
+            .await;
+            persist_shell_terminal(receipts, request, &response).await
+        }
+    }
+}
+
+async fn persist_shell_terminal(
+    receipts: &SqliteReceiptStore,
+    request: &HostShellCommandRequest,
+    response: &HostShellCommandResponse,
+) -> Option<HostShellCommandResponse> {
+    if let Err(error) = receipts.finish(request.request_id, request, response).await {
+        tracing::warn!(%error, request_id = %request.request_id, "failed to persist terminal host shell receipt");
+        return None;
+    }
+    Some(response.clone())
+}
+
+fn indeterminate_shell_response(
+    request: &HostShellCommandRequest,
+    message: &str,
+) -> HostShellCommandResponse {
+    HostShellCommandResponse {
+        request_id: request.request_id,
+        outcome: HostShellCommandOutcome::Failure {
+            code: WorkspaceCommandErrorCode::Indeterminate,
+            message: message.to_string(),
+            retryable: false,
+        },
+    }
+}
+
+async fn open_terminal_response(
+    receipts: &SqliteReceiptStore,
+    config: &HostConfig,
+    request: &OpenTerminalRequest,
+) -> Option<OpenTerminalResponse> {
+    let state = match receipts.load(request.request_id, request).await {
+        Ok(state) => state,
+        Err(error) => {
+            tracing::warn!(%error, request_id = %request.request_id, "failed to read terminal receipt");
+            return None;
+        }
+    };
+    match state {
+        ReceiptState::Terminal(response) => Some(response),
+        ReceiptState::Started => {
+            let response = indeterminate_terminal_response(
+                request,
+                "the host restarted after opening this terminal was requested; Borg will not open a duplicate window",
+            );
+            persist_terminal_terminal(receipts, request, &response).await
+        }
+        ReceiptState::Conflict => Some(indeterminate_terminal_response(
+            request,
+            "request_id was already used for a different terminal request",
+        )),
+        ReceiptState::Corrupt => Some(indeterminate_terminal_response(
+            request,
+            "the durable terminal receipt is unreadable; Borg will not open a duplicate window",
+        )),
+        ReceiptState::Missing => {
+            if let Err(error) = receipts.begin(request.request_id, request).await {
+                tracing::warn!(%error, request_id = %request.request_id, "failed to durably begin terminal request");
+                return None;
+            }
+            let response = launch_terminal(config, request);
+            persist_terminal_terminal(receipts, request, &response).await
+        }
+    }
+}
+
+async fn persist_terminal_terminal(
+    receipts: &SqliteReceiptStore,
+    request: &OpenTerminalRequest,
+    response: &OpenTerminalResponse,
+) -> Option<OpenTerminalResponse> {
+    if let Err(error) = receipts.finish(request.request_id, request, response).await {
+        tracing::warn!(%error, request_id = %request.request_id, "failed to persist terminal launch receipt");
+        return None;
+    }
+    Some(response.clone())
+}
+
+fn indeterminate_terminal_response(
+    request: &OpenTerminalRequest,
+    message: &str,
+) -> OpenTerminalResponse {
+    OpenTerminalResponse {
+        request_id: request.request_id,
+        outcome: OpenTerminalOutcome::Failure {
+            code: WorkspaceCommandErrorCode::Indeterminate,
+            message: message.to_string(),
+            retryable: false,
+        },
+    }
+}
+
+fn launch_terminal(config: &HostConfig, request: &OpenTerminalRequest) -> OpenTerminalResponse {
+    let result = (|| -> Result<OpenTerminalResponse> {
+        let cwd = validate_host_cwd(&config.roots, &request.cwd)?;
+        let terminal = terminal_emulator().context(
+            "no supported terminal emulator was found; set BORG_TERMINAL or install Ghostty, Kitty, WezTerm, GNOME Terminal, Konsole, Alacritty, or xterm",
+        )?;
+        let executable = std::env::current_exe().context("failed to locate the Borg executable")?;
+        let mut args = vec![
+            "agent".to_string(),
+            "--cwd".to_string(),
+            cwd.display().to_string(),
+            "--provider".to_string(),
+            provider_arg(request.provider).to_string(),
+            "--permission".to_string(),
+            permission_arg(request.permission_mode).to_string(),
+        ];
+        if let Some(model) = request
+            .model
+            .as_deref()
+            .filter(|model| !model.trim().is_empty())
+        {
+            args.extend(["--model".to_string(), model.to_string()]);
+        }
+        if let Some(effort) = request
+            .effort
+            .as_deref()
+            .filter(|effort| !effort.trim().is_empty())
+        {
+            args.extend(["--effort".to_string(), effort.to_string()]);
+        }
+        if request.fast {
+            args.push("--fast".to_string());
+        }
+        if let Some(prompt) = request
+            .initial_prompt
+            .as_deref()
+            .filter(|prompt| !prompt.trim().is_empty())
+        {
+            args.push(prompt.to_string());
+        }
+        let terminal_name = terminal
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("terminal")
+            .to_ascii_lowercase();
+        let mut process = terminal_process(&terminal_name, &terminal, &cwd, &executable, &args);
+        crate::process_environment::configure_host_child_environment(&mut process);
+        process
+            .current_dir(&cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let child = process
+            .spawn()
+            .with_context(|| format!("failed to open terminal emulator {}", terminal.display()))?;
+        Ok(OpenTerminalResponse {
+            request_id: request.request_id,
+            outcome: OpenTerminalOutcome::Success {
+                output: Box::new(crate::OpenTerminalOutput {
+                    id: request.request_id,
+                    cwd,
+                    terminal: terminal.display().to_string(),
+                    pid: child.id(),
+                    started_at: chrono::Utc::now(),
+                }),
+            },
+        })
+    })();
+    result.unwrap_or_else(|error| OpenTerminalResponse {
+        request_id: request.request_id,
+        outcome: OpenTerminalOutcome::Failure {
+            code: if error.to_string().contains("outside") {
+                WorkspaceCommandErrorCode::PermissionDenied
+            } else {
+                WorkspaceCommandErrorCode::Io
+            },
+            message: error.to_string(),
+            retryable: false,
+        },
+    })
+}
+
+fn provider_arg(provider: CodingProvider) -> &'static str {
+    match provider {
+        CodingProvider::Codex => "codex",
+        CodingProvider::Claude => "claude",
+        CodingProvider::OpenCode => "open-code",
+        CodingProvider::Kimi => "kimi",
+        CodingProvider::OpenRouter => "open-router",
+        CodingProvider::OpenAiCompatible => "open-ai-compatible",
+    }
+}
+
+fn permission_arg(permission: PermissionMode) -> &'static str {
+    match serde_json::to_value(permission)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .as_deref()
+    {
+        Some("full_access") => "full-access",
+        Some("auto") => "auto",
+        _ => "manual",
+    }
+}
+
+fn terminal_process(
+    name: &str,
+    terminal: &Path,
+    cwd: &Path,
+    executable: &Path,
+    args: &[String],
+) -> Command {
+    let mut process = Command::new(terminal);
+    match name {
+        "ghostty" => {
+            process.arg("-e").arg(executable).args(args);
+        }
+        "kitty" => {
+            process
+                .args(["--single-instance", "--directory"])
+                .arg(cwd)
+                .arg(executable)
+                .args(args);
+        }
+        "wezterm" => {
+            process
+                .args(["start", "--cwd"])
+                .arg(cwd)
+                .arg("--")
+                .arg(executable)
+                .args(args);
+        }
+        "gnome-terminal" => {
+            process
+                .arg(format!("--working-directory={}", cwd.display()))
+                .arg("--")
+                .arg(executable)
+                .args(args);
+        }
+        "konsole" => {
+            process
+                .args(["--workdir"])
+                .arg(cwd)
+                .args(["-e"])
+                .arg(executable)
+                .args(args);
+        }
+        "alacritty" => {
+            process
+                .args(["--working-directory"])
+                .arg(cwd)
+                .args(["--command"])
+                .arg(executable)
+                .args(args);
+        }
+        _ => {
+            process.arg("-e").arg(executable).args(args);
+        }
+    }
+    process
+}
+
+fn terminal_emulator() -> Option<PathBuf> {
+    #[cfg(unix)]
+    if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
+        return None;
+    }
+    let configured = std::env::var_os("BORG_TERMINAL")
+        .or_else(|| std::env::var_os("TERMINAL"))
+        .and_then(|value| executable_in_path(Path::new(&value)));
+    configured.or_else(|| {
+        [
+            "ghostty",
+            "kitty",
+            "wezterm",
+            "gnome-terminal",
+            "konsole",
+            "alacritty",
+            "xterm",
+        ]
+        .iter()
+        .find_map(|name| executable_in_path(Path::new(name)))
+    })
+}
+
+fn executable_in_path(candidate: &Path) -> Option<PathBuf> {
+    if candidate.components().count() > 1 {
+        return candidate.is_file().then(|| candidate.to_path_buf());
+    }
+    std::env::split_paths(&std::env::var_os("PATH")?).find_map(|directory| {
+        let path = directory.join(candidate);
+        path.is_file().then_some(path)
+    })
 }
 
 async fn workspace_command_response(
@@ -2059,7 +2450,9 @@ fn authorize_workspace_command(
         | HostCommand::WorkspaceFilesystem { .. }
         | HostCommand::CancelWorkspaceFilesystem { .. }
         | HostCommand::WorkspaceCommand { .. }
-        | HostCommand::CancelWorkspaceCommand { .. } => return Ok(()),
+        | HostCommand::CancelWorkspaceCommand { .. }
+        | HostCommand::ShellCommand { .. }
+        | HostCommand::OpenTerminal { .. } => return Ok(()),
     };
     ensure!(
         authority.allowed.contains(&kind),

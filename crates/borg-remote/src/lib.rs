@@ -47,7 +47,10 @@ pub use autonomy::{
     SqliteAutonomySupervisor,
 };
 pub use blu_workflow::{BluWorkflowRequest, BluWorkflowResult};
-pub use command::{execute_workspace_command, execute_workspace_command_with_limits};
+pub use command::{
+    execute_host_shell_command_with_limits, execute_workspace_command,
+    execute_workspace_command_with_limits,
+};
 pub use contract::*;
 pub use filesystem::{execute_workspace_filesystem, execute_workspace_filesystem_with_limits};
 pub use host::{
