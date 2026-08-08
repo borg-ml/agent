@@ -1,6 +1,13 @@
 use super::*;
 
 #[test]
+fn statusline_names_active_workers_as_subagents() {
+    assert_eq!(agents_status_label(0), None);
+    assert_eq!(agents_status_label(1).as_deref(), Some("1 subagent"));
+    assert_eq!(agents_status_label(2).as_deref(), Some("2 subagents"));
+}
+
+#[test]
 fn focused_child_transcript_round_trips_back_to_director() {
     let child_id = Uuid::new_v4();
     let mut displayed = Transcript::default();
@@ -3264,8 +3271,8 @@ fn agents_status_label_counts_only_working_children() {
     let larger_team = agents_status_label(2).expect("two agents are working");
     let idle = agents_status_label(0);
 
-    assert_eq!(working, "1 agent");
-    assert_eq!(larger_team, "2 agents");
+    assert_eq!(working, "1 subagent");
+    assert_eq!(larger_team, "2 subagents");
     assert_eq!(idle, None);
 }
 
@@ -3316,7 +3323,7 @@ fn persistent_peers_follow_ordinary_agent_visibility() {
     assert_eq!(transcript.active_subagent_count(), 1);
     assert_eq!(
         agents_status_label(transcript.active_subagent_count()).as_deref(),
-        Some("1 agent")
+        Some("1 subagent")
     );
 }
 

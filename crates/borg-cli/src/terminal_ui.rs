@@ -10023,7 +10023,7 @@ fn history_loading_line() -> Line<'static> {
 fn agents_status_label(active_agents: usize) -> Option<String> {
     (active_agents > 0).then(|| {
         format!(
-            "{active_agents} agent{}",
+            "{active_agents} subagent{}",
             if active_agents == 1 { "" } else { "s" }
         )
     })

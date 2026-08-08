@@ -561,6 +561,10 @@ const PROVIDER_ACTIVE_LIVENESS_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 
 #[cfg(test)]
 const PROVIDER_ACTIVE_LIVENESS_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(not(test))]
+const PROVIDER_DRAIN_LIVENESS_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const PROVIDER_DRAIN_LIVENESS_TIMEOUT: Duration = Duration::from_millis(200);
+#[cfg(not(test))]
 const LIVE_EVENT_DELIVERY_TIMEOUT: Duration = Duration::from_secs(1);
 #[cfg(test)]
 const LIVE_EVENT_DELIVERY_TIMEOUT: Duration = Duration::from_millis(50);
@@ -569,6 +573,7 @@ const LIVE_EVENT_DELIVERY_TIMEOUT: Duration = Duration::from_millis(50);
 enum TurnPhase {
     AwaitingProvider,
     Active,
+    Draining,
     Cancelling,
 }
 
@@ -577,6 +582,7 @@ impl TurnPhase {
         match self {
             Self::AwaitingProvider => "turn phase: awaiting provider",
             Self::Active => "turn phase: provider active",
+            Self::Draining => "turn phase: provider draining",
             Self::Cancelling => "turn phase: cancelling",
         }
     }
@@ -585,6 +591,7 @@ impl TurnPhase {
         match self {
             Self::AwaitingProvider => PROVIDER_SETUP_LIVENESS_TIMEOUT,
             Self::Active | Self::Cancelling => PROVIDER_ACTIVE_LIVENESS_TIMEOUT,
+            Self::Draining => PROVIDER_DRAIN_LIVENESS_TIMEOUT,
         }
     }
 }
@@ -2591,6 +2598,13 @@ async fn run_agent_session_store_kernel(
                                 detail: Some(turn_phase.detail().to_string()),
                             },
                         ).await?;
+                    }
+                    if provider_event_is_terminal_message(&kind) {
+                        turn_phase = TurnPhase::Draining;
+                    } else if turn_phase == TurnPhase::Draining
+                        && provider_event_has_side_effect(&kind)
+                    {
+                        turn_phase = TurnPhase::Active;
                     }
                     liveness_deadline.as_mut().reset(
                         tokio::time::Instant::now() + turn_phase.liveness_timeout()
@@ -5926,6 +5940,17 @@ fn provider_event_has_side_effect(kind: &SessionEventKind) -> bool {
             | SessionEventKind::ApprovalResolved { .. }
             | SessionEventKind::ProviderInteractionRequested { .. }
             | SessionEventKind::ProviderInteractionResolved { .. }
+    )
+}
+
+fn provider_event_is_terminal_message(kind: &SessionEventKind) -> bool {
+    matches!(
+        kind,
+        SessionEventKind::Message {
+            actor: EventActor::Assistant,
+            status: MessageStatus::Complete,
+            ..
+        }
     )
 }
 

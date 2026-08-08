@@ -889,6 +889,8 @@ struct EmptyThenSuccessExecutor {
 
 struct HungProviderExecutor;
 
+struct CompletedThenHungExecutor;
+
 struct CleanupBarrierExecutor {
     started: Arc<Notify>,
     cleanup_started: Arc<Notify>,
@@ -904,6 +906,29 @@ impl AgentTurnExecutor for HungProviderExecutor {
         _events: mpsc::Sender<SessionEventKind>,
         _controls: Option<mpsc::Receiver<AgentTurnControl>>,
     ) -> Result<AgentTurnResult> {
+        std::future::pending().await
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentTurnExecutor for CompletedThenHungExecutor {
+    async fn execute(
+        &self,
+        turn: AgentTurn,
+        events: mpsc::Sender<SessionEventKind>,
+        _controls: Option<mpsc::Receiver<AgentTurnControl>>,
+    ) -> Result<AgentTurnResult> {
+        events
+            .send(SessionEventKind::Message {
+                message_id: turn.message_id,
+                actor: EventActor::Assistant,
+                text: "final answer".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            })
+            .await
+            .unwrap();
         std::future::pending().await
     }
 }
@@ -1630,6 +1655,108 @@ async fn provider_setup_stall_has_a_durable_terminal_boundary() {
             ..
         } if *completed == message_id
             && error.contains("liveness timeout while awaiting provider")
+    )));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn completed_assistant_message_has_a_bounded_provider_drain() {
+    let root = tempdir().unwrap();
+    let journal_path = root.path().join("session.lock");
+    let session_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    let (command_tx, command_rx) = mpsc::channel(8);
+    let (event_tx, mut event_rx) = mpsc::channel(64);
+    let actor = tokio::spawn({
+        let journal_path = journal_path.clone();
+        let cwd = root.path().to_path_buf();
+        async move {
+            run_agent_session_with_executor(
+                &journal_path,
+                session_id,
+                LaunchSession {
+                    request_id: message_id,
+                    cwd,
+                    provider: CodingProvider::Claude,
+                    model: None,
+                    effort: None,
+                    fast: Some(false),
+                    response_language: crate::ResponseLanguage::Auto,
+                    permission_mode: PermissionMode::Manual,
+                    name: None,
+                    initial_prompt: Some("finish and hang".to_string()),
+                    capabilities: Default::default(),
+                    subagent_concurrency_limit: None,
+                    extension_skill_roots: Vec::new(),
+                    team_policy: None,
+                },
+                command_rx,
+                event_tx,
+                Arc::new(CompletedThenHungExecutor),
+            )
+            .await
+        }
+    });
+
+    let mut observed = Vec::new();
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+            .await
+            .expect("provider drain timeout is bounded")
+            .expect("session remains attached");
+        let ready = matches!(
+            event.kind,
+            SessionEventKind::StatusChanged {
+                status: SessionStatus::Ready,
+                ..
+            }
+        );
+        observed.push(event.kind);
+        if ready {
+            break;
+        }
+    }
+
+    command_tx
+        .send(HostCommand::Stop { session_id })
+        .await
+        .unwrap();
+    actor.await.unwrap().unwrap();
+
+    let completed = observed.iter().position(|kind| {
+        matches!(
+            kind,
+            SessionEventKind::TurnCompleted {
+                message_id: completed_id,
+                error: Some(error),
+                ..
+            } if *completed_id == message_id && error.contains("provider draining")
+        )
+    });
+    let ready = observed.iter().position(|kind| {
+        matches!(
+            kind,
+            SessionEventKind::StatusChanged {
+                status: SessionStatus::Ready,
+                ..
+            }
+        )
+    });
+    assert!(
+        completed.is_some(),
+        "draining timeout must complete the turn"
+    );
+    assert!(
+        ready.is_some_and(|ready| ready > completed.unwrap()),
+        "Ready must follow the draining TurnCompleted boundary"
+    );
+    assert!(observed.iter().any(|kind| matches!(
+        kind,
+        SessionEventKind::Message {
+            actor: EventActor::Assistant,
+            text,
+            status: MessageStatus::Complete,
+            ..
+        } if text == "final answer"
     )));
 }
 
