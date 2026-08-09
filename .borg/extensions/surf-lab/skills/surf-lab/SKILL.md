@@ -24,8 +24,8 @@ The environment exposes `start`, `step`, `observe`, `trace`, `log`, `branch`,
 `compare`, `native.inspect`, `native.sweep`, `native.audit`, `replay.audit`,
 `policy.train`, `policy.train-native`, `policy.inspect`, `policy.compare`,
 `policy.compare-native`, `policy.track`, `policy.correct`, `policy.evolve`,
-`map.generate`, `map.inspect`, `map.preview`, `map.route`, `map.export`, and
-`config`. Keep the returned session id in the persistent
+`policy.evolve-native`, `map.generate`, `map.inspect`, `map.preview`,
+`map.route`, `map.export`, and `config`. Keep the returned session id in the persistent
 namespace. Use `step` with bounded batches, save the observations, branch at a
 specific tick, apply a counterfactual command to the branch, and compare the
 two traces to identify the first divergent tick and position error. `log`
@@ -318,6 +318,26 @@ not produce independent completion; the best resulting weights-only rollout
 reset at tick 786. Treat high offline agreement as insufficient and require a
 full neural-only rollout plus bounded spawn/state perturbation runs before
 claiming neural controller parity or generalization.
+
+Use `policy.evolve-native` for bounded closed-loop search on a weights-only
+analog policy. It rejects any artifact with `state_memory` or an
+`action_schedule`, mutates only the neural movement/yaw output head, scores
+ordered progress against the authentic native position/velocity route, and
+reruns the winning candidate deterministically in a fresh CPU-authoritative
+Source-brush world before optional persistence. Floor resets end a candidate;
+for equal unfinished progress, longer survival ranks ahead of geometric
+tie-breaks. Keep populations modest because the physics rollout is CPU-side;
+32 candidates is the established compositor-safe Utopia width.
+
+The first Utopia native-neural evolution probe is also negative evidence. On a
+tick-440 curriculum checkpoint, the strict 512-unit corridor moved v18's
+furthest authentic checkpoint from tick 344 to 413. A temporary wide-corridor
+pass followed by 768-unit annealing reached tick 434 and reduced terminal
+position error to `897.64` Source units, but it never met the strict `64`-unit
+position and `64`-unit/second velocity gate. More importantly, its independent
+full rollout reset at tick 708, worse than v18's tick 786. Do not publish that
+temporary branch or treat curriculum progress as controller improvement; the
+next approach must improve full-rollout survival as well as route progress.
 
 For training-data generation only, `native_correction_policy_base: true`
 runs bounded future-state correction around a frozen neural policy.
