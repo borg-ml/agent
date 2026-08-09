@@ -126,12 +126,13 @@ controller. A failed sweep rules out simple clock alignment before spending a
 large evolutionary population.
 
 Use `policy.correct` only after fixed-clock and phase-tracking evidence. It runs
-bounded receding-horizon yaw candidates from the actual controller state in a
-separate authoritative CPU probe world, applies the best short correction, and
-reports both the extra simulated ticks and strict route reward. Treat it as an
-MPC diagnostic and a source of off-trajectory corrective examples, not as a
-trained policy. If it does not materially improve strict terminal state, stop
-instead of widening the candidate set blindly.
+bounded receding-horizon yaw and temporary replay-phase candidates from the
+actual controller state in a separate authoritative CPU probe world, applies
+the best short correction, and reports both the extra simulated ticks and
+strict route reward. Treat it as an MPC diagnostic and a source of
+off-trajectory corrective examples, not as a trained policy. If it does not
+materially improve strict terminal state, stop instead of widening the
+candidate set blindly.
 
 `policy.evolve` checkpoint completion is state-valid: the candidate must be
 within both the terminal position and velocity bounds. The defaults are 1
