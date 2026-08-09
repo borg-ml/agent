@@ -330,11 +330,14 @@ controller parity or generalization.
 
 Use `policy.evolve-native` for bounded closed-loop search on a weights-only
 analog policy. It rejects any artifact with `state_memory` or an
-`action_schedule`, mutates only the neural movement/yaw output head, scores
-ordered progress against the authentic native position/velocity route, and
-reruns GPU-ranked candidates in the CPU-authoritative Source-brush world before
-they may update or persist the controller. Floor resets end a candidate; for
-equal unfinished progress, longer survival ranks ahead of geometric tie-breaks.
+`action_schedule`, and mixes compact neural movement/yaw output-head mutations
+with candidate-specific second-hidden-layer bias mutations. The latter change
+ReLU gates without cloning each 512×512 hidden matrix. ROCm scores ordered
+progress against the authentic native position/velocity route, and GPU-ranked
+candidates are baked into ordinary policy weights and rerun in the
+CPU-authoritative Source-brush world before they may update or persist the
+controller. Floor resets end a candidate; for equal unfinished progress,
+longer survival ranks ahead of geometric tie-breaks.
 ROCm builds default to `gpu_population: 256` and `gpu_top_k: 16`; use
 `gpu_population: 0` only for the serial CPU fallback. Keep the default width
 until a larger batch is explicitly measured on the active desktop. A 256-wide
@@ -356,6 +359,20 @@ ranks 0–7 plus 28, 56, 85, 113, 141, 170, 198, and 226 in every generation
 and still found no CPU-authoritative improvement. Treat this output-head
 mutation set as exhausted; changing only shortlist selection is not a path
 beyond v40.
+
+Compact second-layer-bias evolution passed a live 32-wide differential with
+18 output candidates, 13 hidden-bias candidates, and the parent. The parent
+matched CPU termination exactly; a CPU-checked hidden-bias candidate differed
+by four route ticks and one termination tick. A desktop-safe 2,048-proposal
+search was then checkpointed as 3+3+2 generations to stay below the MCP call
+deadline. Its first stage promoted an output-head candidate from checkpoint
+633 to 692. Its second stage promoted a genuine second-hidden-bias candidate
+from 692 to 767, `9.2117%` ordered progress, and reset tick 1104. The last 512
+proposals found no further gain. V45 is the promoted weights-only neural
+baseline; v46 has identical weights and records the final negative stage.
+Neither completes Utopia. Some shortlisted proposals differed from CPU by up
+to 186 route ticks and 579 termination ticks, so the GPU remains a proposal
+engine and CPU reruns remain the sole promotion authority.
 
 The first Utopia native-neural evolution probe is also negative evidence. On a
 tick-440 curriculum checkpoint, the strict 512-unit corridor moved v18's
