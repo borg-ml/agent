@@ -331,10 +331,11 @@ controller parity or generalization.
 Use `policy.evolve-native` for bounded closed-loop search on a weights-only
 analog policy. It rejects any artifact with `state_memory` or an
 `action_schedule`, and mixes compact neural movement/yaw output-head mutations
-with candidate-specific second-hidden-layer bias mutations. The latter change
-ReLU gates without cloning each 512×512 hidden matrix. ROCm scores ordered
-progress against the authentic native position/velocity route, and GPU-ranked
-candidates are baked into ordinary policy weights and rerun in the
+with candidate-specific second-hidden-layer bias and rank-one hidden-matrix
+mutations. The latter change ReLU gates or the shared 512×512 representation
+without cloning that matrix per candidate. ROCm scores ordered progress against
+the authentic native position/velocity route, and GPU-ranked candidates are
+baked into ordinary policy weights and rerun in the
 CPU-authoritative Source-brush world before they may update or persist the
 controller. Floor resets end a candidate; for equal unfinished progress,
 longer survival ranks ahead of geometric tie-breaks.
@@ -374,6 +375,17 @@ Neither completes Utopia. Some shortlisted proposals differed from CPU by up
 to 186 route ticks and 579 termination ticks, so the GPU remains a proposal
 engine and CPU reruns remain the sole promotion authority.
 
+A follow-up rank-one hidden-matrix path stored only two 512-value vectors per
+candidate, computed their projection in the ROCm kernel, and baked the outer
+product exactly into ordinary policy weights for CPU promotion. A live
+32-wide smoke CPU-checked a rank-one candidate with zero route and termination
+tick delta. A desktop-safe 2,048-proposal search from v45 used a mutation scale
+of `0.01` for its first 1,536 proposals and a final 512-proposal `0.0025` local
+pass; it produced no CPU-authoritative improvement. Steady-state 256-wide GPU
+generations took about 19–28 seconds, with some first generations near 39
+seconds. Treat this rank-one mutation family as exhausted at those bounds
+rather than widening it.
+
 The first Utopia native-neural evolution probe is also negative evidence. On a
 tick-440 curriculum checkpoint, the strict 512-unit corridor moved v18's
 furthest authentic checkpoint from tick 344 to 413. A temporary wide-corridor
@@ -393,7 +405,7 @@ two full-route evolutionary searches produced v35 at checkpoint 614 and
 `5.6518%` (`8,009.71` Source units). V35 reset at tick 706, so it is better on
 the primary unfinished-run route objective but not on survival. A final bounded
 serial search produced v40 at checkpoint 633 and `6.1152%` (`8,666.56` Source
-units), with reset tick 766; v40 is the current CPU-authoritative baseline.
+units), with reset tick 766; v40 was the pre-adapter CPU-authoritative baseline.
 These artifacts have neural weights only, no state memory, and no schedule, so
 they are genuine closed-loop improvements, but still far from completion and
 must not be described as parity.
