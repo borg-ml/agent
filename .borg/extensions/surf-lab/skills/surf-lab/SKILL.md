@@ -315,9 +315,15 @@ on the 3,955 corrective-memory examples, yet reset at demo tick 683. Two
 nearest-memory-labelled DAgger rounds moved the reset to tick 763. A second
 near-full corrective trajectory and stricter movement-threshold losses did
 not produce independent completion; the best resulting weights-only rollout
-reset at tick 786. Treat high offline agreement as insufficient and require a
-full neural-only rollout plus bounded spawn/state perturbation runs before
-claiming neural controller parity or generalization.
+reset at tick 786. Unconstrained nearest-memory DAgger can select labels
+hundreds of route ticks away after autoregressive history drifts. The GPU
+trainer can therefore bound labels with `--teacher-phase-window-ticks`, omit
+history from matching with `--teacher-ignore-history`, cap rollout prefixes,
+freeze the hidden representation, and explicitly clip otherwise
+unrepresentable teacher yaw deltas. Clipping remains opt-in and is reported.
+Treat high offline agreement as insufficient and require a full neural-only
+rollout plus bounded spawn/state perturbation runs before claiming neural
+controller parity or generalization.
 
 Use `policy.evolve-native` for bounded closed-loop search on a weights-only
 analog policy. It rejects any artifact with `state_memory` or an
@@ -339,6 +345,14 @@ full rollout reset at tick 708, worse than v18's tick 786. Do not publish that
 temporary branch or treat curriculum progress as controller improvement; the
 next approach must improve full-rollout survival as well as route progress.
 
+Phase-gated DAgger produced v21, which independently reset at tick 1387 and
+reached authentic checkpoint 459 (`2.08%` ordered route progress). A
+full-route 16×32 CPU-authoritative output-head evolution then produced v28.
+Fresh verification reset at tick 1675, reached checkpoint 498, and covered
+`2.9229%` of ordered route distance. V28 has neural weights only, no state
+memory, and no schedule, so this is a genuine closed-loop improvement, but it
+is still far from completion and must not be described as parity.
+
 For training-data generation only, `native_correction_policy_base: true`
 runs bounded future-state correction around a frozen neural policy.
 `native_correction_authentic_movement_candidates` adds authentic movement
@@ -350,6 +364,15 @@ and full-command continuation reached tick 4193 with `83.01` Source-unit
 terminal position error. The latter used authentic commands for 443 of 495
 decisions and therefore remains expert-label generation, not independent
 neural evidence.
+
+A v21 full-command corrective pass survived 3,069 simulated ticks before
+reset, but selected authentic full commands for 352 of 384 decisions. Only 5
+of its 10,976 combined teacher labels exceeded the neural yaw-output bound;
+explicit clipping made the data representable, but whole-network and
+output-only distillation both regressed. Removing full-command candidates
+reset at tick 766. This shows that the longer trace depended on authentic
+command rescue rather than a directly distillable local correction; reject
+offline-fit improvements unless the authoritative full rollout also improves.
 
 ## Native policy visualization
 
