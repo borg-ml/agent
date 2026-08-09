@@ -305,9 +305,11 @@ Do not describe that v6 controller as neural. A genuine neural artifact has
 no `state_memory` and no `action_schedule`; version 4 artifacts may use a
 second ReLU hidden layer. `tools/train_native_corrective_gpu.py` in the Surf
 checkout trains those weights with PyTorch on ROCm/CUDA, then bakes feature
-normalization into the exported runtime weights. Keep GPU batches modest and
-remember that this accelerates neural fitting, not the authoritative CPU
-Avian/Source-brush rollout.
+normalization into the exported runtime weights. Native neural evolution also
+has a closed-loop ROCm path: it evaluates neural inference, Source movement,
+BSP brush sweeps, route progress, and reset triggers on GPU, then reruns a
+bounded shortlist in the CPU Source-brush world before promotion. The CPU
+world remains the validation oracle rather than the population hot loop.
 
 The current Utopia neural results are negative but informative. A 512×512
 ReLU policy reached 99.90% movement-direction agreement and `0.086°` yaw MAE
@@ -330,11 +332,16 @@ Use `policy.evolve-native` for bounded closed-loop search on a weights-only
 analog policy. It rejects any artifact with `state_memory` or an
 `action_schedule`, mutates only the neural movement/yaw output head, scores
 ordered progress against the authentic native position/velocity route, and
-reruns the winning candidate deterministically in a fresh CPU-authoritative
-Source-brush world before optional persistence. Floor resets end a candidate;
-for equal unfinished progress, longer survival ranks ahead of geometric
-tie-breaks. Keep populations modest because the physics rollout is CPU-side;
-32 candidates is the established compositor-safe Utopia width.
+reruns GPU-ranked candidates in the CPU-authoritative Source-brush world before
+they may update or persist the controller. Floor resets end a candidate; for
+equal unfinished progress, longer survival ranks ahead of geometric tie-breaks.
+ROCm builds default to `gpu_population: 256` and `gpu_top_k: 16`; use
+`gpu_population: 0` only for the serial CPU fallback. Keep the default width
+until a larger batch is explicitly measured on the active desktop. A 256-wide
+full-route Utopia validation screened in `20.46s`; its four CPU finalists had
+furthest-route deltas `[1,0,0,0]` ticks, and the parent terminated after 526
+episode ticks in both GPU and CPU worlds. Only CPU-rechecked candidates are
+promotion evidence.
 
 The first Utopia native-neural evolution probe is also negative evidence. On a
 tick-440 curriculum checkpoint, the strict 512-unit corridor moved v18's
@@ -353,10 +360,12 @@ checkpoint 498 and `2.9229%`. Removing autoregressive history and fully
 converging a fresh 512×512 policy raised this to checkpoint 558 and `4.3701%`;
 two full-route evolutionary searches produced v35 at checkpoint 614 and
 `5.6518%` (`8,009.71` Source units). V35 reset at tick 706, so it is better on
-the primary unfinished-run route objective but not on survival. These
-artifacts have neural weights only, no state memory, and no schedule, so they
-are genuine closed-loop improvements, but still far from completion and must
-not be described as parity.
+the primary unfinished-run route objective but not on survival. A final bounded
+serial search produced v40 at checkpoint 633 and `6.1152%` (`8,666.56` Source
+units), with reset tick 766; v40 is the current CPU-authoritative baseline.
+These artifacts have neural weights only, no state memory, and no schedule, so
+they are genuine closed-loop improvements, but still far from completion and
+must not be described as parity.
 
 For training-data generation only, `native_correction_policy_base: true`
 runs bounded future-state correction around a frozen neural policy.
