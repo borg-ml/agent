@@ -134,6 +134,14 @@ off-trajectory corrective examples, not as a trained policy. If it does not
 materially improve strict terminal state, stop instead of widening the
 candidate set blindly.
 
+Set `beam_width` only for a bounded multi-block ablation. Beam mode retains
+several authoritative states at each control block and commits the complete
+selected horizon so receding-horizon replanning cannot defer a necessary
+intervention. On the Utopia tick-808 checkpoint, a 16-state, 16-tick beam over
+nine yaw/phase controls reduced terminal-state error from 18.63 to 13.51 but
+still reset and did not beat the prior joint greedy result of 12.77. Treat that
+as evidence against further beam widening on the same state and objective.
+
 `policy.evolve` checkpoint completion is state-valid: the candidate must be
 within both the terminal position and velocity bounds. The defaults are 1
 world unit and 1 world unit/second, while the wider route corridor still scores
