@@ -301,6 +301,36 @@ does not establish neural or perturbation-robust controller parity. Packet
 reinjection remains mixed: mean endpoint error `0.751`, p99 `6.957`, max
 `13.091`, with 143 of 1,183 intervals over 2 Source units.
 
+Do not describe that v6 controller as neural. A genuine neural artifact has
+no `state_memory` and no `action_schedule`; version 4 artifacts may use a
+second ReLU hidden layer. `tools/train_native_corrective_gpu.py` in the Surf
+checkout trains those weights with PyTorch on ROCm/CUDA, then bakes feature
+normalization into the exported runtime weights. Keep GPU batches modest and
+remember that this accelerates neural fitting, not the authoritative CPU
+Avian/Source-brush rollout.
+
+The current Utopia neural results are negative but informative. A 512×512
+ReLU policy reached 99.90% movement-direction agreement and `0.086°` yaw MAE
+on the 3,955 corrective-memory examples, yet reset at demo tick 683. Two
+nearest-memory-labelled DAgger rounds moved the reset to tick 763. A second
+near-full corrective trajectory and stricter movement-threshold losses did
+not produce independent completion; the best resulting weights-only rollout
+reset at tick 786. Treat high offline agreement as insufficient and require a
+full neural-only rollout plus bounded spawn/state perturbation runs before
+claiming neural controller parity or generalization.
+
+For training-data generation only, `native_correction_policy_base: true`
+runs bounded future-state correction around a frozen neural policy.
+`native_correction_authentic_movement_candidates` adds authentic movement
+vectors during each committed control block, while
+`native_correction_authentic_command_candidates` also adds a full authentic
+command continuation to the probe horizon. On Utopia, yaw-only correction
+moved the v12 neural reset from tick 763 to 802, movement candidates to 965,
+and full-command continuation reached tick 4193 with `83.01` Source-unit
+terminal position error. The latter used authentic commands for 443 of 495
+decisions and therefore remains expert-label generation, not independent
+neural evidence.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
