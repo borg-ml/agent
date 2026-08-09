@@ -319,8 +319,9 @@ reset at tick 786. Unconstrained nearest-memory DAgger can select labels
 hundreds of route ticks away after autoregressive history drifts. The GPU
 trainer can therefore bound labels with `--teacher-phase-window-ticks`, omit
 history from matching with `--teacher-ignore-history`, cap rollout prefixes,
-freeze the hidden representation, and explicitly clip otherwise
-unrepresentable teacher yaw deltas. Clipping remains opt-in and is reported.
+freeze the hidden representation, disable autoregressive history inputs with
+`--disable-history-features`, and explicitly clip otherwise unrepresentable
+teacher yaw deltas. Clipping remains opt-in and is reported.
 Treat high offline agreement as insufficient and require a full neural-only
 rollout plus bounded spawn/state perturbation runs before claiming neural
 controller parity or generalization.
@@ -347,11 +348,15 @@ next approach must improve full-rollout survival as well as route progress.
 
 Phase-gated DAgger produced v21, which independently reset at tick 1387 and
 reached authentic checkpoint 459 (`2.08%` ordered route progress). A
-full-route 16×32 CPU-authoritative output-head evolution then produced v28.
-Fresh verification reset at tick 1675, reached checkpoint 498, and covered
-`2.9229%` of ordered route distance. V28 has neural weights only, no state
-memory, and no schedule, so this is a genuine closed-loop improvement, but it
-is still far from completion and must not be described as parity.
+full-route 16×32 CPU-authoritative output-head evolution then produced v28 at
+checkpoint 498 and `2.9229%`. Removing autoregressive history and fully
+converging a fresh 512×512 policy raised this to checkpoint 558 and `4.3701%`;
+two full-route evolutionary searches produced v35 at checkpoint 614 and
+`5.6518%` (`8,009.71` Source units). V35 reset at tick 706, so it is better on
+the primary unfinished-run route objective but not on survival. These
+artifacts have neural weights only, no state memory, and no schedule, so they
+are genuine closed-loop improvements, but still far from completion and must
+not be described as parity.
 
 For training-data generation only, `native_correction_policy_base: true`
 runs bounded future-state correction around a frozen neural policy.
@@ -373,6 +378,16 @@ output-only distillation both regressed. Removing full-command candidates
 reset at tick 766. This shows that the longer trace depended on authentic
 command rescue rather than a directly distillable local correction; reject
 offline-fit improvements unless the authoritative full rollout also improves.
+
+Use `native_correction_start_episode_tick` with policy-base correction to run
+the frozen neural controller unchanged to an episode-relative boundary, then
+start MPC from the state it actually visited. On v28, the first 1,101 logged
+prefix records matched the independent baseline exactly. Handoffs at episode
+ticks 1100 and 1250 reset earlier than the uncorrected controller; a handoff at
+1375 reproduced its original reset. This proved that fixed-clock MPC was
+chasing unreachable future targets after v28 fell behind the authentic route;
+the boundary is valid diagnostic/data-generation machinery, not evidence of a
+successful recovery policy.
 
 ## Native policy visualization
 
