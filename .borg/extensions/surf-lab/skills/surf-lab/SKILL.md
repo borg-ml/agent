@@ -22,7 +22,7 @@ its structured JSON payload in the first text content block.
 
 The environment exposes `start`, `step`, `observe`, `trace`, `log`, `branch`,
 `compare`, `native.inspect`, `native.sweep`, `native.audit`, `replay.audit`,
-`policy.train`, `policy.inspect`, `policy.compare`, `policy.evolve`,
+`policy.train`, `policy.inspect`, `policy.compare`, `policy.track`, `policy.evolve`,
 `map.generate`, `map.inspect`, `map.preview`, `map.route`, `map.export`, and
 `config`. Keep the returned session id in the persistent
 namespace. Use `step` with bounded batches, save the observations, branch at a
@@ -116,6 +116,21 @@ compact state-only recorder because their score does not depend on contacts.
 the frozen policy and returns a trajectory certificate; it never changes policy
 weights or the physics authority. Use `policy.inspect` to validate a saved
 artifact before executing it.
+
+Use `policy.track` as a bounded diagnostic when an open-loop schedule appears
+to lose replay phase. It sweeps monotonic repeat/forward-skip windows and
+velocity matching horizons in one loaded world, then verifies the best result.
+It remains replay-guided state feedback, not an independently learned
+controller. A failed sweep rules out simple clock alignment before spending a
+large evolutionary population.
+
+`policy.evolve` checkpoint completion is state-valid: the candidate must be
+within both the terminal position and velocity bounds. The defaults are 1
+world unit and 1 world unit/second, while the wider route corridor still scores
+ordered progress. This prevents a curriculum stage from accepting a positional
+near miss whose velocity cannot execute the demonstrated continuation. Use
+`completion_radius` and `completion_velocity_radius` only for explicit bounded
+sensitivity runs; report overrides with the result.
 
 ## Native POV calibration
 
