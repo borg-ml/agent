@@ -343,6 +343,15 @@ furthest-route deltas `[1,0,0,0]` ticks, and the parent terminated after 526
 episode ticks in both GPU and CPU worlds. Only CPU-rechecked candidates are
 promotion evidence.
 
+The first production GPU search screened 2,048 mutations as 8 generations of
+256 and CPU-rechecked 128 candidates. It found no authoritative improvement
+over v40. Most generation-level GPU/CPU finalist progress deltas were within
+four ticks, but two generations contained GPU false positives up to 102 route
+ticks and 158 termination ticks away. This confirms that ROCm is a proposal
+engine, not the authority. The shortlist therefore spends half its CPU budget
+on top GPU ranks, always includes the parent, and stratifies the remainder
+across GPU ranks to retain recall when approximate physics misranks candidates.
+
 The first Utopia native-neural evolution probe is also negative evidence. On a
 tick-440 curriculum checkpoint, the strict 512-unit corridor moved v18's
 furthest authentic checkpoint from tick 344 to 413. A temporary wide-corridor
