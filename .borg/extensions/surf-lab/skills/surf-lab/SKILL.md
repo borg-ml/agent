@@ -22,7 +22,8 @@ its structured JSON payload in the first text content block.
 
 The environment exposes `start`, `step`, `observe`, `trace`, `log`, `branch`,
 `compare`, `native.inspect`, `native.sweep`, `native.audit`, `replay.audit`,
-`policy.train`, `policy.inspect`, `policy.compare`, `policy.track`, `policy.evolve`,
+`policy.train`, `policy.inspect`, `policy.compare`, `policy.track`,
+`policy.correct`, `policy.evolve`,
 `map.generate`, `map.inspect`, `map.preview`, `map.route`, `map.export`, and
 `config`. Keep the returned session id in the persistent
 namespace. Use `step` with bounded batches, save the observations, branch at a
@@ -123,6 +124,14 @@ velocity matching horizons in one loaded world, then verifies the best result.
 It remains replay-guided state feedback, not an independently learned
 controller. A failed sweep rules out simple clock alignment before spending a
 large evolutionary population.
+
+Use `policy.correct` only after fixed-clock and phase-tracking evidence. It runs
+bounded receding-horizon yaw candidates from the actual controller state in a
+separate authoritative CPU probe world, applies the best short correction, and
+reports both the extra simulated ticks and strict route reward. Treat it as an
+MPC diagnostic and a source of off-trajectory corrective examples, not as a
+trained policy. If it does not materially improve strict terminal state, stop
+instead of widening the candidate set blindly.
 
 `policy.evolve` checkpoint completion is state-valid: the candidate must be
 within both the terminal position and velocity bounds. The defaults are 1
