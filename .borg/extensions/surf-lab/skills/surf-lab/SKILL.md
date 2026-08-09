@@ -232,6 +232,18 @@ are sparse and their interpolated in-between ticks are not native physical
 states. A long rollout can expose accumulation and reset behavior, but cannot
 identify controller error when the exact-command rollout fails first.
 
+Set `native_tracking: true` only as a bounded replay-guided upper-bound probe.
+It sweeps monotonic repeat/forward-skip windows against current native position
+and velocity, reruns the best setting deterministically, and reports it under
+`closed_loop.tracked_native_commands`. It still applies authentic UserCmds and
+is not an independently learned controller. On Utopia, max advances through
+64, velocity horizons through 16 ticks, and phase penalties 0.1, 1, and 10
+produced no full-route completion. The ordinary sweep delayed the exact
+open-loop reset from tick 2702 to 3007; a phase-heavy setting reached 3582 only
+by lagging 1,095 command ticks and accumulating multi-thousand-unit route
+error. Treat simple native phase alignment as exhausted there rather than
+widening it again.
+
 On the calibrated Utopia user demo, exact commands across 1,183 independent
 packet intervals and 3,942 simulated server ticks produced mean endpoint error
 `0.00377`, p99 `0.00249`, and max `1.486` Source units, with no reset or error
