@@ -508,9 +508,9 @@ fn host_service_unit(
 ) -> Result<String> {
     let mut service = format!(
         "[Unit]\nDescription=Borg Remote host\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStart={} remote host --config {}\nEnvironment={}\nRestart=always\nRestartSec=2\n",
-        systemd_quote(&validated_systemd_value(&executable.to_string_lossy())?),
-        systemd_quote(&validated_systemd_value(&config_path.to_string_lossy())?),
-        systemd_quote(&validated_systemd_value(&format!("PATH={path}"))?),
+        systemd_quote(validated_systemd_value(&executable.to_string_lossy())?),
+        systemd_quote(validated_systemd_value(&config_path.to_string_lossy())?),
+        systemd_quote(validated_systemd_value(&format!("PATH={path}"))?),
     );
     for name in [
         "DISPLAY",
@@ -530,7 +530,7 @@ fn host_service_unit(
         {
             let assignment = format!("{name}={value}");
             service.push_str("Environment=");
-            service.push_str(&systemd_quote(&validated_systemd_value(&assignment)?));
+            service.push_str(&systemd_quote(validated_systemd_value(&assignment)?));
             service.push('\n');
         }
     }
@@ -567,7 +567,7 @@ IPAddressDeny=any\n",
         ));
         for network in allowed_networks {
             service.push_str("IPAddressAllow=");
-            service.push_str(&validated_systemd_value(network)?);
+            service.push_str(validated_systemd_value(network)?);
             service.push('\n');
         }
         let mut write_paths = vec![
@@ -584,7 +584,7 @@ IPAddressDeny=any\n",
                 path.display()
             );
             service.push_str("ReadWritePaths=");
-            service.push_str(&systemd_quote(&validated_systemd_value(
+            service.push_str(&systemd_quote(validated_systemd_value(
                 &path.to_string_lossy(),
             )?));
             service.push('\n');

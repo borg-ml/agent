@@ -462,9 +462,11 @@ async fn response_json(response: reqwest::Response, label: &str) -> Result<Value
         bail!(
             "{label} returned HTTP {}{}",
             status.as_u16(),
-            (!detail.is_empty())
-                .then(|| format!(": {detail}"))
-                .unwrap_or_default()
+            if !detail.is_empty() {
+                format!(": {detail}")
+            } else {
+                String::new()
+            }
         );
     }
     serde_json::from_slice(&body).with_context(|| format!("decode {label} JSON response"))

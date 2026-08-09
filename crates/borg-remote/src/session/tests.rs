@@ -5310,7 +5310,7 @@ fn resume_recovers_unresolved_queue_entries_for_any_session_status() {
         },
     );
 
-    let recovered = recover_prompts_on_resume(&[queued.clone()]);
+    let recovered = recover_prompts_on_resume(std::slice::from_ref(&queued));
     assert_eq!(recovered.len(), 1);
     assert_eq!(recovered[0].message_id, message_id);
     assert_eq!(recovered[0].text, "do not replay this old queue entry");

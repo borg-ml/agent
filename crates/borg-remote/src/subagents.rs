@@ -172,22 +172,12 @@ pub struct AgentToolDispatcher {
     web_search: Option<Arc<dyn borg_search::WebSearchProvider>>,
 }
 
+#[derive(Default)]
 struct RuntimeMcpState {
     base_servers: Option<Vec<borg_provider::mcp::ExternalMcpServer>>,
     extension_servers: Vec<borg_provider::mcp::ExternalMcpServer>,
     configured_servers: Vec<borg_provider::mcp::ExternalMcpServer>,
     runtime: Option<crate::native_mcp::NativeMcpRuntime>,
-}
-
-impl Default for RuntimeMcpState {
-    fn default() -> Self {
-        Self {
-            base_servers: None,
-            extension_servers: Vec::new(),
-            configured_servers: Vec::new(),
-            runtime: None,
-        }
-    }
 }
 
 fn same_mcp_server(
@@ -1194,27 +1184,35 @@ impl AgentToolDispatcher {
             (None, Some(limits)) => Some(limits.max_runtime_execution_ms),
             (requested, None) => requested,
         };
-        let execution = async {
+        let execute = || async {
             if runtime == "typescript" {
                 runtime_worker
-                    .execute_as(runtime, &args.code, timeout_ms, host)
+                    .execute_as(runtime, &args.code, timeout_ms, host.clone())
                     .await
             } else {
-                runtime_worker.execute(&args.code, timeout_ms, host).await
+                runtime_worker
+                    .execute(&args.code, timeout_ms, host.clone())
+                    .await
             }
         };
-        tokio::pin!(execution);
         if let Some(cancel) = cancellation {
-            tokio::select! {
-                result = &mut execution => Ok(serde_json::to_value(result?)?),
-                _ = cancel.cancelled() => {
-                    drop(execution);
+            let result = {
+                let execution = execute();
+                tokio::pin!(execution);
+                tokio::select! {
+                    result = &mut execution => Some(result),
+                    _ = cancel.cancelled() => None,
+                }
+            };
+            match result {
+                Some(result) => Ok(serde_json::to_value(result?)?),
+                None => {
                     runtime_worker.stop().await;
                     bail!("persistent runtime was cancelled")
                 }
             }
         } else {
-            Ok(serde_json::to_value(execution.await?)?)
+            Ok(serde_json::to_value(execute().await?)?)
         }
     }
 }

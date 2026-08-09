@@ -5433,7 +5433,7 @@ impl BorgTerminal {
             if self.context_status_hovered {
                 let tooltip_width = (context_tooltip.width() as u16)
                     .saturating_add(4)
-                    .clamp(24, status_area.width.max(24).min(72));
+                    .clamp(24, 72);
                 let tooltip_lines = wrap_display(
                     &context_tooltip,
                     tooltip_width.saturating_sub(4).max(1) as usize,

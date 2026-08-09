@@ -309,18 +309,13 @@ pub enum HostStatus {
 /// independently enforced container/microVM (or equivalent) boundary. It is
 /// deliberately not inferred from permission mode or from the presence of a
 /// Python/Bun runtime.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(export)]
 pub enum HostExecutionProfile {
+    #[default]
     TrustedUser,
     IsolatedHosted,
-}
-
-impl Default for HostExecutionProfile {
-    fn default() -> Self {
-        Self::TrustedUser
-    }
 }
 
 /// Host-local resource ceilings applied to model-authored runtime calls and
@@ -2232,8 +2227,10 @@ mod tests {
         assert_eq!(servers[0].name, "workspace");
         assert_eq!(servers[0].args, ["serve"]);
 
-        let mut capabilities = SessionCapabilities::default();
-        capabilities.runtime_mcp_context = Some(context);
+        let capabilities = SessionCapabilities {
+            runtime_mcp_context: Some(context),
+            ..Default::default()
+        };
         let serialized = serde_json::to_value(capabilities).unwrap();
         assert!(serialized.get("runtime_mcp_context").is_none());
     }

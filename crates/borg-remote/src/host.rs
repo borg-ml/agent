@@ -96,7 +96,7 @@ fn ensure_execution_boundary(config: &HostConfig) -> Result<()> {
             linux_process_belongs_to_generated_service(),
             "isolated hosted execution requires the generated borg-remote.service cgroup"
         );
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(target_os = "linux"))]

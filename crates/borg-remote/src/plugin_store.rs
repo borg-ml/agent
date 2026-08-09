@@ -151,6 +151,12 @@ struct PreparedArtifact {
     content_hash: String,
 }
 
+struct CommitScope<'a> {
+    extension_id: &'a str,
+    scope: PluginScope,
+    scope_id: &'a str,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct CommitResult {
     extension_id: String,
@@ -338,9 +344,11 @@ impl SqlitePluginStore {
                     .context("prepare plugin artifact receipts")?;
                 Ok(serde_json::to_value(
                     self.commit(
-                        extension_id,
-                        scope,
-                        &scope_id,
+                        CommitScope {
+                            extension_id,
+                            scope,
+                            scope_id: &scope_id,
+                        },
                         idempotency_key,
                         &request_hash,
                         &request.writes,
@@ -465,15 +473,18 @@ impl SqlitePluginStore {
 
     async fn commit(
         &self,
-        extension_id: &str,
-        scope: PluginScope,
-        scope_id: &str,
+        commit_scope: CommitScope<'_>,
         idempotency_key: &str,
         request_hash: &str,
         writes: &[PluginWrite],
         artifacts: &[PreparedArtifact],
         provenance: &Value,
     ) -> Result<CommitResult> {
+        let CommitScope {
+            extension_id,
+            scope,
+            scope_id,
+        } = commit_scope;
         validate_idempotency_key(idempotency_key)?;
         validate_metadata(provenance)?;
         let mut transaction = SqliteSessionStore::begin_sqlite_write(&self.pool).await?;

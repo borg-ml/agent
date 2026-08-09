@@ -1054,12 +1054,12 @@ impl SelfServiceContext {
             }
             return Err(error).context("activate staged Blu extension");
         }
-        if backup.exists() {
-            if let Err(error) = self.archive_extension_package(scope, &args.id, &backup) {
-                let _ = fs::remove_dir_all(&destination);
-                let _ = fs::rename(&backup, &destination);
-                return Err(error).context("archive previous Blu extension revision");
-            }
+        if backup.exists()
+            && let Err(error) = self.archive_extension_package(scope, &args.id, &backup)
+        {
+            let _ = fs::remove_dir_all(&destination);
+            let _ = fs::rename(&backup, &destination);
+            return Err(error).context("archive previous Blu extension revision");
         }
         let reload_signal = self.reload_blu_extensions(scope)?;
         let audit = self.audit_blu(scope, "create", &args.id)?;

@@ -1127,13 +1127,12 @@ async fn run_agent_session_store_kernel(
     let mut goal_turn_failures = ConsecutiveGoalTurnFailures::default();
     let mut pending = recover_prompts_on_resume(&recovery.queue_events);
     for action in recovered_actions {
-        if let Some(prompt) = queued_prompt_from_action(&action) {
-            if !pending
+        if let Some(prompt) = queued_prompt_from_action(&action)
+            && !pending
                 .iter()
                 .any(|existing| existing.message_id == prompt.message_id)
-            {
-                pending.push_back(prompt);
-            }
+        {
+            pending.push_back(prompt);
         }
     }
     let mut deferred_commands = VecDeque::new();
