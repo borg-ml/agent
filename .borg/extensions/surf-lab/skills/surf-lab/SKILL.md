@@ -211,6 +211,16 @@ trained = env.call("policy.train-native", {
 })
 ```
 
+Successful native yaw-correction episode logs can be fed back through
+`corrective_traces`. Each logged command is paired with the immediately
+preceding visited state. Use `corrective_only: true` to keep only the authentic
+initial example plus those corrected labels; otherwise nearly identical
+authentic and corrected states can receive conflicting actions. Setting
+`state_memory: true` installs the corrective-only labels as a nearest-state
+feedback controller with no action schedule and no runtime future-state
+lookup. This is a useful route-specific control bound, not a neural model or a
+generalization result.
+
 The POV stream itself has no authoritative grounded flag, so native policy
 features hold it false even when the paired network trace can seed physics
 ground state. Velocity in the training examples is the forward difference of
@@ -277,6 +287,20 @@ units from the authentic pose. Exact commands reset at tick 2702 in the same
 continuous mode. This cleanly separates strong local physics parity and weak
 no-reset completion from still-incomplete route parity.
 
+Fitting the Utopia MPC corrections into the existing 128-wide neural head did
+not materially improve the continuous route, whether the authentic and
+corrective examples were combined or the corrective labels were used alone.
+The corrective-only nearest-state v6 controller instead reproduced the MPC
+trajectory in an independent continuous rollout: it completed at demo tick
+4195 with no failure reset and `22.52` Source-unit terminal position error.
+Its artifact contains 3,955 state-memory samples and zero scheduled actions;
+runtime prediction reads only the current simulated state. This demonstrates
+that the corrected trajectory can be distilled out of the future-state MPC,
+but the nonparametric memory is heavily specific to this demonstration and
+does not establish neural or perturbation-robust controller parity. Packet
+reinjection remains mixed: mean endpoint error `0.751`, p99 `6.957`, max
+`13.091`, with 143 of 1,183 intervals over 2 Source units.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
@@ -284,8 +308,10 @@ The playable `surf` binary can attach a policy whose source starts with
 `SURF_NATIVE_NETWORK_TRACE` for an authoritative initial state, uses the same
 native-to-policy feature transform as headless validation, and runs the full
 artifact episode across interpolation-only supervision boundaries. A floor or
-teleport-trigger contact is logged and immediately restarts from the
-authoritative initial state. It does not copy a replay action schedule into
+nonterminal teleport-trigger contact is logged as a failure and immediately
+restarts from the authoritative initial state. A terminal trigger within 64
+Source units and 64 Source units/second of the authentic finish is logged as
+completion before restarting. It does not copy a replay action schedule into
 the controller. Always select the playable binary explicitly because this
 crate also contains `surf_lab`:
 
