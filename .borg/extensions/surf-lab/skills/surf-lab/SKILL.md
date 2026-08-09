@@ -244,6 +244,25 @@ by lagging 1,095 command ticks and accumulating multi-thousand-unit route
 error. Treat simple native phase alignment as exhausted there rather than
 widening it again.
 
+Set `native_yaw_correction: true` only for a full-episode bounded corrective
+probe after phase tracking is exhausted. `policy.compare-native` evaluates a
+small yaw-offset set around the authentic UserCmds in a separate authoritative
+CPU world, retains zero yaw as a candidate, and reports the result under
+`closed_loop.yaw_corrected_native_commands`. A reset counts as terminal only
+when its pre-teleport position and velocity are both within the configured
+authentic end-state radii and it occurs within the end slack. The defaults are
+64 Source units, 64 Source units/second, and 2 ticks. Every earlier floor or
+teleport reset remains a failure.
+
+On Utopia, a 32-tick horizon with 8-tick control blocks and yaw candidates
+`[-8,-4,-2,0,2,4,8]` completed at demo tick 4195. Its pre-teleport position
+error was `22.52` Source units; 121 of 495 decisions used a nonzero yaw and the
+search evaluated 110,404 candidate ticks. This proves a small bounded control
+correction can carry the authoritative Surf Lab world through the full route.
+It still uses the authentic commands and future position/velocity targets, so
+treat it as corrective-label generation—not as schedule-free controller
+parity. Distill the corrections and rerun without future-state access.
+
 On the calibrated Utopia user demo, exact commands across 1,183 independent
 packet intervals and 3,942 simulated server ticks produced mean endpoint error
 `0.00377`, p99 `0.00249`, and max `1.486` Source units, with no reset or error
