@@ -22,8 +22,8 @@ its structured JSON payload in the first text content block.
 
 The environment exposes `start`, `step`, `observe`, `trace`, `log`, `branch`,
 `compare`, `native.inspect`, `native.sweep`, `native.audit`, `replay.audit`,
-`policy.train`, `policy.inspect`, `policy.compare`, `policy.track`,
-`policy.correct`, `policy.evolve`,
+`policy.train`, `policy.train-native`, `policy.inspect`, `policy.compare`,
+`policy.track`, `policy.correct`, `policy.evolve`,
 `map.generate`, `map.inspect`, `map.preview`, `map.route`, `map.export`, and
 `config`. Keep the returned session id in the persistent
 namespace. Use `step` with bounded batches, save the observations, branch at a
@@ -179,3 +179,35 @@ with `native.audit`, its exact `start_tick`/`ticks`, and `diagnostics: "full"`
 before treating it as a physics discrepancy. `max_velocity` is a diagnostic
 override; do not silently promote it to a production profile without an
 authoritative server cvar or a demonstrated lower bound.
+
+After calibrating `command_tick_offset` and diagnosing any collision-sensitive
+outlier, use `policy.train-native` to train directly from the reset-safe native
+POV transitions. It preserves independent forward and side magnitudes
+(including full diagonal `[1, 1]` commands), never writes an action schedule,
+and can omit only the explicitly diagnosed transitions. Use
+`validation_segment_index` to hold out one complete reset-safe attempt; the
+held-out examples do not enter gradient updates. Repeat this across the usable
+attempts before fitting the all-attempt artifact.
+
+```python
+trained = env.call("policy.train-native", {
+    "demo": "/absolute/path/to/native-pov.dem",
+    "output": "/absolute/path/to/native-policy.json",
+    "command_tick_offset": -3,
+    "exclude_transition_ticks": [2927, 2928, 2929, 2930],
+    "validation_segment_index": 3,
+    "phase_features": False,
+    "history_features": True,
+    "hidden": 128,
+    "epochs": 2000,
+})
+```
+
+The POV stream has no authoritative grounded flag, so native training holds it
+false. Velocity is the forward difference of consecutive interpolated packet
+poses. These assumptions and the split kind are returned with every artifact.
+Do not call the interleaved training-sample metric a holdout. Analog-magnitude
+commands are sparse; increase `analog_weight` only through a bounded holdout
+sweep and retain the ordinary-movement and yaw metrics alongside the analog
+RMSE. Offline command agreement is controller evidence, not closed-loop physics
+parity.
