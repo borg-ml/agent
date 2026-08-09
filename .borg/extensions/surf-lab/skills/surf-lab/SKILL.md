@@ -164,21 +164,31 @@ This is substantially faster and produces one log instead of scripting one
 sweep = env.call("native.sweep", {
     "demo": "/absolute/path/to/native-pov.dem",
     "map": "/absolute/path/to/surf_utopia_njv.bsp",
+    "network_trace": "/absolute/path/to/decoded-packet-entities.jsonl",
     "profile": "native",
-    "command_tick_offset": -3,
+    "command_tick_offset": 0,
     "start_velocity": "ballistic",
     "collision": "source",
-    "max_velocity": 4000,
 })
 ```
 
-The ballistic estimator removes half the configured gravity impulse over the
-next packet interval. It is an assumption-dependent lower bound, particularly
-when a landing occurs exactly at a packet boundary. Rerun a reported outlier
-with `native.audit`, its exact `start_tick`/`ticks`, and `diagnostics: "full"`
-before treating it as a physics discrepancy. `max_velocity` is a diagnostic
-override; do not silently promote it to a production profile without an
-authoritative server cvar or a demonstrated lower bound.
+Decode each sparse `dem_usercmd` payload against a zero command. Omitted fields
+do not inherit from the preceding payload. Preserve `tick_count`; when a
+decoded PacketEntities trace is available, `policy.compare-native` advances
+the server world clock and selects commands on that clock rather than using
+the usually sparse demo-packet gap. The trace is authoritative for start
+position, velocity, and ground state. Without it, the ballistic estimator
+removes half the configured gravity impulse over the next packet interval and
+remains assumption-dependent, particularly at a landing boundary. Rerun a
+reported outlier with `native.audit`, its exact `start_tick`/`ticks`, and
+`diagnostics: "full"` before treating it as a physics discrepancy.
+
+On the captured Utopia demo, the calibrated alignment is offset `0`, native
+ground acceleration is `5`, ground speed is `250`, movement commands are
+normalized by `250`, and Source-authoritative collision uses zero additional
+slide skin because the Source box sweep already applies its 1/32-unit epsilon.
+Do not reuse the former `-3` alignment or a `4000` max-velocity diagnostic
+override without fresh evidence from the target demo/map.
 
 After calibrating `command_tick_offset` and diagnosing any collision-sensitive
 outlier, use `policy.train-native` to train directly from the reset-safe native
@@ -193,24 +203,25 @@ attempts before fitting the all-attempt artifact.
 trained = env.call("policy.train-native", {
     "demo": "/absolute/path/to/native-pov.dem",
     "output": "/absolute/path/to/native-policy.json",
-    "command_tick_offset": -3,
-    "exclude_transition_ticks": [2927, 2928, 2929, 2930],
-    "validation_segment_index": 3,
-    "phase_features": False,
+    "command_tick_offset": 0,
+    "phase_features": True,
     "history_features": True,
     "hidden": 128,
     "epochs": 2000,
 })
 ```
 
-The POV stream has no authoritative grounded flag, so native training holds it
-false. Velocity is the forward difference of consecutive interpolated packet
-poses. These assumptions and the split kind are returned with every artifact.
-Do not call the interleaved training-sample metric a holdout. Analog-magnitude
-commands are sparse; increase `analog_weight` only through a bounded holdout
-sweep and retain the ordinary-movement and yaw metrics alongside the analog
-RMSE. Offline command agreement is controller evidence, not closed-loop physics
-parity.
+The POV stream itself has no authoritative grounded flag, so native policy
+features hold it false even when the paired network trace can seed physics
+ground state. Velocity in the training examples is the forward difference of
+consecutive interpolated packet poses. Native view control is learned as a
+delta from the preceding authentic UserCmd yaw, with previous yaw delta in the
+history features. These assumptions and the split kind are returned with every
+artifact. Do not call the interleaved training-sample metric a holdout.
+Analog-magnitude commands are sparse; increase `analog_weight` only through a
+bounded attempt-level holdout sweep and retain ordinary-movement and yaw
+metrics alongside analog RMSE. Offline command agreement is controller
+evidence, not closed-loop physics parity.
 
 Use `policy.compare-native` for the paired validation. It runs exact UserCmd and
 the frozen schedule-free policy in separate native BSP worlds, splitting at
@@ -221,10 +232,38 @@ are sparse and their interpolated in-between ticks are not native physical
 states. A long rollout can expose accumulation and reset behavior, but cannot
 identify controller error when the exact-command rollout fails first.
 
-On the calibrated Utopia user demo, 1,182 clean packet intervals produced no
-resets. The final all-attempt policy added 0.000022 Source units of mean endpoint
-error over exact commands and 0.0071 at worst. The corresponding teacher-forced
-metrics were 98.76% movement-direction agreement and 3.26° yaw MAE; analog-only
-movement RMSE remained 0.607 across 70 sparse examples. Exact commands still
-diverged and reset in three long spans, so this is strong local controller
-evidence, not full-route parity.
+On the calibrated Utopia user demo, exact commands across 1,183 independent
+packet intervals and 3,942 simulated server ticks produced mean endpoint error
+`0.00377`, p99 `0.00249`, and max `1.486` Source units, with no reset or error
+over 2 units. This is the bounded physics authority. The final schedule-free
+v3 controller reached 97.62% teacher-forced movement-direction agreement and
+`0.370°` yaw MAE, but its packet endpoint error was mean `0.907`, p99 `5.936`,
+and max `31.30`; 129 intervals exceeded 2 units. Two of four long spans reset,
+and an exact-command long rollout also reset once. This cleanly separates
+strong local physics parity from still-incomplete closed-loop route parity.
+
+## Native policy visualization
+
+The playable `surf` binary can attach a policy whose source starts with
+`native-demo:`. It loads the demo named in the artifact, requires
+`SURF_NATIVE_NETWORK_TRACE` for an authoritative initial state, uses the same
+native-to-policy feature transform as headless validation, and loops only the
+first reset-safe attempt. It does not copy a replay action schedule into the
+controller. Always select the playable binary explicitly because this crate
+also contains `surf_lab`:
+
+```bash
+cd /absolute/path/to/surf
+SURF_WINDOW_MODE=windowed \
+SURF_MOVEMENT_MODE=native \
+SURF_NATIVE_BSP_COLLISION=source \
+SURF_BSP='/absolute/path/to/surf_utopia_njv.bsp' \
+SURF_POLICY='/absolute/path/to/native-policy.json' \
+SURF_NATIVE_NETWORK_TRACE='/absolute/path/to/decoded-packet-entities.jsonl' \
+cargo run --release --bin surf
+```
+
+Use `SURF_WINDOW_MODE=hidden` for a renderer smoke test. A natural loop reload
+after the reported reset-safe `rollout_ticks` proves the attempt completed
+without an earlier floor/teleport restart; it does not prove the learned path
+matches the authentic route.
