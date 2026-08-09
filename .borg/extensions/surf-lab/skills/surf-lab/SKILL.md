@@ -21,7 +21,8 @@ Environment calls preserve the standard MCP response envelope; Surf Lab puts
 its structured JSON payload in the first text content block.
 
 The environment exposes `start`, `step`, `observe`, `trace`, `log`, `branch`,
-`compare`, `replay.audit`, `policy.train`, `policy.inspect`, `policy.compare`, `policy.evolve`,
+`compare`, `native.inspect`, `native.sweep`, `native.audit`, `replay.audit`,
+`policy.train`, `policy.inspect`, `policy.compare`, `policy.evolve`,
 `map.generate`, `map.inspect`, `map.preview`, `map.route`, `map.export`, and
 `config`. Keep the returned session id in the persistent
 namespace. Use `step` with bounded batches, save the observations, branch at a
@@ -115,3 +116,33 @@ compact state-only recorder because their score does not depend on contacts.
 the frozen policy and returns a trajectory certificate; it never changes policy
 weights or the physics authority. Use `policy.inspect` to validate a saved
 artifact before executing it.
+
+## Native POV calibration
+
+Use `native.inspect` first to recover reset-safe supervision segments and
+authentic packet-pose anchors from an old-engine Source POV `.dem`. Use
+`native.sweep` for an exhaustive bounded comparison: it loads the demo and BSP
+once, re-injects every valid consecutive packet anchor into one headless world,
+and returns endpoint-error quantiles plus the largest outliers in one call.
+This is substantially faster and produces one log instead of scripting one
+`native.audit` request per anchor.
+
+```python
+sweep = env.call("native.sweep", {
+    "demo": "/absolute/path/to/native-pov.dem",
+    "map": "/absolute/path/to/surf_utopia_njv.bsp",
+    "profile": "native",
+    "command_tick_offset": -3,
+    "start_velocity": "ballistic",
+    "collision": "source",
+    "max_velocity": 4000,
+})
+```
+
+The ballistic estimator removes half the configured gravity impulse over the
+next packet interval. It is an assumption-dependent lower bound, particularly
+when a landing occurs exactly at a packet boundary. Rerun a reported outlier
+with `native.audit`, its exact `start_tick`/`ticks`, and `diagnostics: "full"`
+before treating it as a physics discrepancy. `max_velocity` is a diagnostic
+override; do not silently promote it to a production profile without an
+authoritative server cvar or a demonstrated lower bound.
