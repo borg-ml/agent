@@ -23,7 +23,7 @@ its structured JSON payload in the first text content block.
 The environment exposes `start`, `step`, `observe`, `trace`, `log`, `branch`,
 `compare`, `native.inspect`, `native.sweep`, `native.audit`, `replay.audit`,
 `policy.train`, `policy.train-native`, `policy.inspect`, `policy.compare`,
-`policy.track`, `policy.correct`, `policy.evolve`,
+`policy.compare-native`, `policy.track`, `policy.correct`, `policy.evolve`,
 `map.generate`, `map.inspect`, `map.preview`, `map.route`, `map.export`, and
 `config`. Keep the returned session id in the persistent
 namespace. Use `step` with bounded batches, save the observations, branch at a
@@ -211,3 +211,20 @@ commands are sparse; increase `analog_weight` only through a bounded holdout
 sweep and retain the ordinary-movement and yaw metrics alongside the analog
 RMSE. Offline command agreement is controller evidence, not closed-loop physics
 parity.
+
+Use `policy.compare-native` for the paired validation. It runs exact UserCmd and
+the frozen schedule-free policy in separate native BSP worlds, splitting at
+every reset or explicitly excluded transition. It also re-injects every
+consecutive packet anchor and reports policy-minus-exact endpoint error. Treat
+that packet-interval comparison as the bounded physics authority: packet poses
+are sparse and their interpolated in-between ticks are not native physical
+states. A long rollout can expose accumulation and reset behavior, but cannot
+identify controller error when the exact-command rollout fails first.
+
+On the calibrated Utopia user demo, 1,182 clean packet intervals produced no
+resets. The final all-attempt policy added 0.000022 Source units of mean endpoint
+error over exact commands and 0.0071 at worst. The corresponding teacher-forced
+metrics were 98.76% movement-direction agreement and 3.26° yaw MAE; analog-only
+movement RMSE remained 0.607 across 70 sparse examples. Exact commands still
+diverged and reset in three long spans, so this is strong local controller
+evidence, not full-route parity.
