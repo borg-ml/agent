@@ -386,6 +386,35 @@ generations took about 19–28 seconds, with some first generations near 39
 seconds. Treat this rank-one mutation family as exhausted at those bounds
 rather than widening it.
 
+Candidate-specific suffix reconstruction then exposed mutation scale as the
+next constraint. At `0.0001`, most candidates reset before the exact focus and
+the wide search did not improve v45. Opening the lower bound and searching at
+`0.00001` produced v53: checkpoint 777, `9.4229%` ordered progress, and reset
+tick 1369. Every promotion was a complete authentic-start CPU Source-brush
+rerun; the GPU remained a proposal engine.
+
+Version 5 policies can carry a phase-gated neural residual over the second
+hidden and output biases. Its residual is exactly zero before
+`phase_adapter_start_tick`, then ramps for 64 ticks. Focused evolution can
+therefore reconstruct one exact CPU parent state, reuse it for the entire GPU
+suffix batch, and omit the inaccurate per-candidate prefix screen without
+changing any candidate's pre-focus behavior. This remains a weights-only
+state-feedback neural policy: it has neither state memory nor an action
+schedule. A unit contract verifies the zero-prefix and ramp behavior through
+serialization, and full normal/ROCm suites cover both binaries.
+
+On Utopia, a focus-650 phase search raised survival to reset tick 1427 but held
+checkpoint 777. Moving the exact focus to episode tick 1000 reduced the parent
+GPU/CPU route discrepancy from 70 ticks to 8 in the calibration smoke. A
+`0.1` phase-adapter probe then promoted checkpoint 778 with reset tick 1408;
+the six-generation 256-wide v58 continuation retained checkpoint 778,
+`9.4438%` progress, and raised reset to tick 1415. Its later-generation GPU
+finalists were typically 5–8 route ticks from CPU, although termination timing
+remained less faithful. The 256-wide suffix generations took roughly 7–30
+seconds, one shared exact prefix took 0.3–1.3 seconds, and 16 complete CPU
+promotion reruns took 9–28 seconds. V58 is the current genuine-neural
+baseline; it does not complete Utopia and is not parity evidence.
+
 The first Utopia native-neural evolution probe is also negative evidence. On a
 tick-440 curriculum checkpoint, the strict 512-unit corridor moved v18's
 furthest authentic checkpoint from tick 344 to 413. A temporary wide-corridor
