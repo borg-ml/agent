@@ -1024,6 +1024,7 @@ impl Transcript {
                     let insertion_index = if *actor == EventActor::User
                         && matches!(status, MessageStatus::Complete | MessageStatus::Failed)
                         && !queued
+                        && event.sequence > 0
                     {
                         self.late_user_message_insertion_index()
                     } else {
