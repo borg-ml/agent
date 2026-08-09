@@ -239,18 +239,24 @@ over 2 units. This is the bounded physics authority. The final schedule-free
 v3 controller reached 97.62% teacher-forced movement-direction agreement and
 `0.370°` yaw MAE, but its packet endpoint error was mean `0.907`, p99 `5.936`,
 and max `31.30`; 129 intervals exceeded 2 units. Two of four long spans reset,
-and an exact-command long rollout also reset once. This cleanly separates
-strong local physics parity from still-incomplete closed-loop route parity.
+but those checkpointed spans zero controller history at interpolation-only
+supervision boundaries. A separate continuous v3 rollout preserved history and
+completed all 3,956 usable ticks without a reset, while ending `27,320` Source
+units from the authentic pose. Exact commands reset at tick 2702 in the same
+continuous mode. This cleanly separates strong local physics parity and weak
+no-reset completion from still-incomplete route parity.
 
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
 `native-demo:`. It loads the demo named in the artifact, requires
 `SURF_NATIVE_NETWORK_TRACE` for an authoritative initial state, uses the same
-native-to-policy feature transform as headless validation, and loops only the
-first reset-safe attempt. It does not copy a replay action schedule into the
-controller. Always select the playable binary explicitly because this crate
-also contains `surf_lab`:
+native-to-policy feature transform as headless validation, and runs the full
+artifact episode across interpolation-only supervision boundaries. A floor or
+teleport-trigger contact is logged and immediately restarts from the
+authoritative initial state. It does not copy a replay action schedule into
+the controller. Always select the playable binary explicitly because this
+crate also contains `surf_lab`:
 
 ```bash
 cd /absolute/path/to/surf
@@ -264,6 +270,8 @@ cargo run --release --bin surf
 ```
 
 Use `SURF_WINDOW_MODE=hidden` for a renderer smoke test. A natural loop reload
-after the reported reset-safe `rollout_ticks` proves the attempt completed
-without an earlier floor/teleport restart; it does not prove the learned path
-matches the authentic route.
+after the reported full `rollout_ticks` proves the episode completed without
+an earlier floor/teleport restart; it does not prove the learned path matches
+the authentic route. Read `closed_loop.continuous` from
+`policy.compare-native` for the matching trajectory error, while retaining the
+independently reinjected packet intervals as the bounded local authority.
