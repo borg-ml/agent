@@ -351,6 +351,11 @@ ticks and 158 termination ticks away. This confirms that ROCm is a proposal
 engine, not the authority. The shortlist therefore spends half its CPU budget
 on top GPU ranks, always includes the parent, and stratifies the remainder
 across GPU ranks to retain recall when approximate physics misranks candidates.
+A controlled rerun of the same 2,048 mutations with that strategy checked GPU
+ranks 0–7 plus 28, 56, 85, 113, 141, 170, 198, and 226 in every generation
+and still found no CPU-authoritative improvement. Treat this output-head
+mutation set as exhausted; changing only shortlist selection is not a path
+beyond v40.
 
 The first Utopia native-neural evolution probe is also negative evidence. On a
 tick-440 curriculum checkpoint, the strict 512-unit corridor moved v18's
