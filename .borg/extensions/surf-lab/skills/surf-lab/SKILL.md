@@ -798,6 +798,21 @@ intervals, exact native commands have maximum endpoint error 0.00432 Source
 units and no resets. Retain v7002 as the traced furthest-route neural authority,
 not as CS:S parity.
 
+Match the demo header to the BSP before diagnosing a route failure. This demo
+names `surf_utopia_njv`; running it on the separate `surf_utopia_v3.bsp` raised
+the exact-command packet-anchor maximum from `0.00432` to `19.12` Source units.
+That cross-map result is invalid controller and physics evidence even when the
+early route looks similar.
+
+Playable policy inference must run before same-tick collider sizing and movement.
+The former visual ordering computed v7002's action after collider sizing, so its
+duck state first disagreed with headless validation at policy tick 1222, exceeded
+100 Source units of position error by tick 1236, and reset at tick 1355. With
+`prepare_policy_command` scheduled first in both binaries, a hidden-renderer run
+matched all 1,969 headless state bits, did not reset, and accumulated at most
+5.67 Source units of floating-point position drift. This fixes the observed
+post-ramp-3 pirouette without changing the network or adding geometry features.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
