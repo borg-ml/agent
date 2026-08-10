@@ -533,6 +533,23 @@ chasing unreachable future targets after v28 fell behind the authentic route;
 the boundary is valid diagnostic/data-generation machinery, not evidence of a
 successful recovery policy.
 
+Focused ROCm neural rollouts must initialize their view from
+`simulation_yaw` and `simulation_pitch`, not the stale sampled `yaw` and
+`pitch` fields in `HeadlessPlayerState`. The stale handoff changed the very
+first controller action and made focused GPU ranking untrustworthy. The fixed
+path records the first GPU and CPU actions and, when an exact CPU suffix screen
+is requested, uses the same bounded suffix horizon on both devices. On v85,
+the repaired one-tick rollout had identical position and about `1.8e-5`
+Source-unit/second velocity error; a 512-tick suffix had identical route and
+reset timing with about `0.18` Source-unit terminal position error. Six checked
+route/survival pairs ranked identically. Three subsequent 16-generation,
+256-wide route-reward searches screened 12,288 candidates at roughly
+31,000--36,000 candidate ticks/second without advancing checkpoint 778 or
+reset tick 1430. Keep 256 as the desktop-safe width, retain CPU authentic-start
+promotion, and treat the late constant-bias adapter family as exhausted; the
+next search must add state-dependent recovery capacity or better
+off-trajectory supervision.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
