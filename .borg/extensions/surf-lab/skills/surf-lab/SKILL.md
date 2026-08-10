@@ -550,6 +550,30 @@ promotion, and treat the late constant-bias adapter family as exhausted; the
 next search must add state-dependent recovery capacity or better
 off-trajectory supervision.
 
+Version 7 adds that state-dependent capacity as a phase-gated linear recovery
+head over the same 19 live neural observation features. Its 6x19 weights and
+six biases are exactly zero before `recovery_adapter_start_tick`; afterward
+they add a state-dependent residual to the existing neural outputs. It remains
+a weights-only controller with no action schedule, state memory, or future
+replay access. CPU serialization tests cover the zero prefix, ramp, and
+opposite responses to opposite positions. A live focused ROCm check on a
+nonzero version-7 policy matched CPU first movement within `3e-8`, matched yaw
+exactly, produced identical one-tick position, and differed in velocity by
+about `1.9e-5` Source units/second.
+
+The first recovery-head searches used the desktop-safe 256-wide batch at
+episode tick 1100. A `0.01` pass learned side-movement feedback from position,
+yaw, and phase but retained reset tick 1430. A `0.1` continuation moved the
+pre-reset x coordinate about five Source units toward safety but still reset
+at 1430. A bounded `0.5` pass cleared that old contact and promoted a complete
+authentic-start CPU result that resets at demo tick 1431, with the same ordered
+route checkpoint. Its controller is
+`utopia-user-native-controller-v103-recovery-controller.json`; it has 17
+nonzero recovery weights and neither a schedule nor state memory. A subsequent
+16x256 continuation produced no further CPU promotion, so retain v103 as the
+current genuine-neural controller and do not describe the one-tick gain as
+completion, perturbation robustness, or CS:S parity.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
