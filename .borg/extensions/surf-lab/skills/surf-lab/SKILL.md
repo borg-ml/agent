@@ -689,6 +689,36 @@ replace the displayed route authority for that secondary-only gain; retain
 v120 and change the recovery/search evidence before another distillation
 sweep.
 
+Trace alignment localizes v120's next failure before its bad brush contact.
+Its speed follows the authentic attempt closely through episode tick 1100,
+but the first sustained world-space wish-direction error above 25 degrees
+begins at tick 1115 when the authentic strafe changes side. The error exceeds
+170 degrees around ticks 1149--1152, sustained speed loss begins at tick 1142,
+and speed falls to 42% of authentic by tick 1200. The later contact with brush
+3581 at tick 1212 is therefore downstream of controller phase/command drift,
+not evidence of a BSP collision mismatch.
+
+Match each recovery objective horizon to the ticks the candidate can actually
+control. With three four-tick decisions, `start_tick: 1050`, `horizon: 12`, a
+desktop-safe 256-wide GPU batch, and an exact 32-candidate CPU shortlist, the
+v120 recovery teacher reached checkpoint 2092, 94.1057% ordered route
+progress, and did not reset during the requested span. A 128-tick horizon had
+judged 104 uncontrollable baseline ticks after only 24 mutated ticks and
+selected slow, off-route survival instead. The checkpoint-2092 result is a
+stateful action teacher only; it is not an independently executable neural
+controller and remains short of the authentic first-attempt finish.
+
+Distilling the matched-horizon teacher into the phase-gated recovery head
+produced
+`utopia-user-native-controller-v128-first-segment-recovery-dagger8.json`.
+An independent authentic-start CPU rerun reproduced checkpoint 1456, 53.5134%
+ordered route progress, and no reset over all 1969 requested ticks. The
+version-7 512x512 ReLU artifact has no action schedule, state memory, or
+autoregressive history features; its 50% recovery-head update supersedes v120
+as the current weights-only neural route authority. It still has no terminal
+completion and has not passed bounded spawn/state perturbation tests, so it is
+not evidence of generalization or CS:S parity.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
