@@ -733,10 +733,19 @@ independent authentic-start exact-CPU reruns both reached checkpoint 1464,
 54.0371% progress, and no reset over all 1969 ticks. V130 has no action
 schedule, state memory, or history features and supersedes v128 as the current
 weights-only neural authority. It remains nonterminal and untested under
-spawn/state perturbations. The approximate ROCm neural-rollout path explicitly
-rejects the new hidden residual until its HIP kernel implements that field;
-continue using GPU action-program recovery for proposals and exact CPU Source
-brush rollouts for promotion rather than silently omitting the residual.
+spawn/state perturbations.
+
+The HIP neural rollout now carries the version-8 6x512 hidden recovery residual
+through both single-lane and cooperative inference. A desktop-safe 256-wide
+integration screened the full v130 controller at about 20,142 candidate ticks
+per second and its leading GPU route had zero checkpoint and termination delta
+when rerun in the CPU Source-brush world. The promoted
+`utopia-user-native-controller-v131-hidden-recovery-gpu-evolve1.json` then
+reproduced checkpoint 1465, 54.0953% progress, and no reset over all 1969 ticks
+in two independent CPU-only reruns. V131 supersedes v130 as the current
+weights-only neural authority. It remains nonterminal and untested under
+spawn/state perturbations; the exact CPU world remains the sole promotion
+authority and no result here establishes completion or CS:S parity.
 
 ## Native policy visualization
 
