@@ -931,6 +931,23 @@ phase-gated route-state family at the desktop-safe width; retain v7002 and
 require a genuinely new closed-loop objective or supervision source before
 adding geometry/history inputs or widening the search.
 
+The follow-up transition microscope narrows the failure further. In the
+v7002 and exact CPU logs, episode tick 1050 is already about 8.7 degrees too
+positive in yaw and roughly 120 Source units off-line; the exact and learned
+worlds still share the same ramp plane immediately before the next contact.
+The learned side-input jump at episode tick 1109 is therefore a consequence
+of controller state drift, not an unmodeled collision plane. Moving the
+existing recovery gate from tick 1100 to 1120--1968 either reset earlier or
+ended much farther from the route. Zeroing its movement rows reset at tick
+1486; zeroing its yaw row preserved survival but ended about 15,967 units
+off-route. A route-relative 128-wide ReLU policy reached 99.95% offline
+movement agreement yet reset at tick 505 in independent CPU playback. Finally,
+a yaw-only, 2-degree closed-loop recovery teacher from tick 1050 reset at
+tick 1321. None is a controller promotion. These bounded ablations support
+keeping the current 19-feature policy and collision/order implementation; the
+remaining work needs a new closed-loop supervision signal, not more feature
+columns or a wider version of these adapters.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
