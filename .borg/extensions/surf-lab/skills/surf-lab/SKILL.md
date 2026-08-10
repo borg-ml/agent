@@ -957,6 +957,12 @@ pairing the same labels with v7002's actual off-trajectory states (including
 failures, so retain v7002 and do not promote local adapter fits from this
 supervision family.
 
+Moving that perturbed off-trajectory objective upstream did not help. An
+authentic-command window from ticks 850--1050 with a recovery gate at tick
+900 reset at tick 1296 in the full CPU rollout. The apparent late-window
+boundary is therefore not the missing signal; retain the v7002 gate timing and
+require a different closed-loop target rather than sliding this adapter again.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
