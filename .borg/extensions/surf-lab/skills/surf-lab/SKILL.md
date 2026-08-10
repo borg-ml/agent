@@ -636,12 +636,20 @@ teacher together with the four successful visited-state rounds produced the
 512x512 ReLU v116 controller with `98.31%` offline movement agreement and
 `0.194°` yaw MAE. A bounded exact-CPU output-head mutation advanced it from
 checkpoint/reset `1340/1442` to `1343/1446`; an independent authentic-start
-rerun reproduced that result exactly. Retain the weights-only artifact
-`utopia-user-native-controller-v116-first-segment-recovery-dagger5.json`. It
-has no action schedule or state memory. A sixth round that appended v116's
-failure trace regressed to checkpoint/reset `726/753`, so do not promote it.
-V116 supersedes v113 and v103 for authentic ordered route progress, but it has
-not completed the first attempt or passed state/spawn perturbation tests.
+rerun reproduced that result exactly. A sixth from-scratch round that appended
+v116's failure trace regressed to checkpoint/reset `726/753`.
+
+Use `--model-update-scale` with `--initialize` in the GPU corrective trainer to
+bound full-model DAgger updates around a proven controller. A zero-scale v116
+control reproduced checkpoint/reset `1343/1446` exactly. Exact CPU screening
+of 1%, 3%, 6%, 8%, 10%, 12%, 14%, 14.5%, 15%, 15.5%, 16%, 20%, and 30%
+updates exposed a narrow ReLU promotion basin: the 15% update reached
+checkpoint/reset `1404/1468`, while 14.5% and 16% both regressed below
+checkpoint 1200. Retain the independently reproduced weights-only artifact
+`utopia-user-native-controller-v118-first-segment-trust-dagger6.json`. It has
+no action schedule or state memory. V118 supersedes v116, v113, and v103 for
+authentic ordered route progress, but it has not completed the first attempt
+or passed state/spawn perturbation tests.
 
 ## Native policy visualization
 
