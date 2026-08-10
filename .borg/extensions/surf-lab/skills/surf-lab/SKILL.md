@@ -849,6 +849,25 @@ earlier on CPU. Do not promote amplitude variants or widen this local mutation
 family; a new teacher objective or off-trajectory data source is required
 before another controller change.
 
+The native command microscope explains why a context ablation is now
+warranted. Around the measured route gap, the authentic stream holds
+`side_move=400` through demo tick 1354, goes neutral at 1355, changes to
+`-200/-400` on ticks 1356--1357, goes neutral at 1387, then changes to
+`+200/+400` at ticks 1389--1390. The latter reversal is exactly where the
+continuous v7002 wish-direction error exceeds 25 degrees. A matched diagnostic
+pair trained 128-wide tanh policies on the first reset-safe segment with and
+without authentic previous-command features. History raised offline movement
+agreement from 54.57% to 97.72% and reduced yaw MAE from 0.288 to 0.267
+degrees. It also reduced packet policy-minus-exact error from mean 2.424/p99
+11.358 (215 intervals over 2 units) to mean 1.068/p99 5.881 (116 over 2), but
+both teacher-forced policies suffered early closed-loop resets at absolute demo
+ticks 633 (history) and 655 (no history). Treat this as evidence that command
+context carries useful information, not as a production controller result:
+naive teacher-forced history training is covariate-shifted. The next bounded
+ablation should use visited-state/off-trajectory labels with history-aware
+trust-region training and full authentic-start CPU validation; explicit ramp
+geometry remains unsupported by the current failure evidence.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
