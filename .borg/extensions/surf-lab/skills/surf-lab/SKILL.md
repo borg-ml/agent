@@ -1123,6 +1123,31 @@ furthest route, reinforcing the CPU authority. The artifact is one phase-free
 or adapters. It still resets, does not complete Utopia, and does not replace
 v7002; it does supersede v4tiny as the clean PPO training parent.
 
+A second aligned mixed generation from that v8 parent regressed at every
+screened scale from 0.001 through 0.75, so retain v8 for the route-relative PPO
+lineage. It still does not supersede the farther phase-free `scale1e5` clean
+route authority.
+
+Surf commit `86158e1` removes an artificial PPO admission restriction and lets
+the same GPU collector/trainer optimize either supported phase-free weights-only
+schema. The existing `scale1e5` controller is a 512x512 pose-policy network with
+no clock, history, schedule, memory, or adapters. Its zero-noise 32-tick GPU/CPU
+differential had bit-identical first-state features, first-action error
+`6.8e-8`, maximum 32-tick feature/mean errors `7.2e-7`/`3.8e-6`, equal route and
+terminal flags, and reward drift `5.6e-9`. Full deterministic GPU and CPU
+rollouts both reset after 993 ticks and reached route indices 893 and 894,
+respectively, making this the tightest long-horizon neural transfer tested.
+
+Two direct ROCm PPO objectives still failed promotion. A broad full-start plus
+random-route batch contained 99,715 transitions; scales 0.001--0.0011 tied the
+894/993 CPU baseline with slightly worse reward, and larger scales regressed.
+A near-policy 80,765-transition batch raised average perturbed survival to 631
+ticks, but only scales 0.003--0.004 tied the baseline and none advanced route or
+survival. Keep all generated PPO variants as diagnostics and retain unchanged
+`utopia-user-native-clean-vnext-scale1e5.json` as the clean route authority.
+The pose-policy PPO path is now valid and well aligned, but needs a different
+closed-loop objective rather than another scale refinement of these directions.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
