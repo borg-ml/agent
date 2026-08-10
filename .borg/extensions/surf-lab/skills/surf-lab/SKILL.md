@@ -678,6 +678,17 @@ preceding visited state; use it only for bounded recovery teachers, while
 ordinary `--rollout-trace` inputs retain nearest-authentic labels. Retain v120
 after this non-promotion.
 
+Doubling the recovery horizon to 256 ticks and increasing route lookahead
+regressed the teacher slightly to checkpoint/reset `1474/2126` while reducing
+exact CPU throughput to about 1,650 ticks/second. A zero version-7
+state-dependent recovery head at tick 1250 also reproduced v120 exactly.
+Direct-action fits of its 6x19 gated linear weights produced at most the same
+checkpoint 1450; the 5% update moved reset from 1550 to 1551 and fitness from
+`0.4263106` to `0.4263188`, but did not advance ordered route progress. Do not
+replace the displayed route authority for that secondary-only gain; retain
+v120 and change the recovery/search evidence before another distillation
+sweep.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
