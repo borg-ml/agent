@@ -102,16 +102,12 @@ fn director_command_extracts_text_without_matching_longer_commands() {
     assert!(director_prompt_command("/director").is_some_and(|result| result.is_err()));
     assert!(director_prompt_command("/directorate review").is_none());
     assert_eq!(
-        director_prompt_delivery(true, CodingProvider::Codex, true, false),
+        director_prompt_delivery(true, CodingProvider::Codex, true),
         PromptDelivery::Steer
     );
     assert_eq!(
-        director_prompt_delivery(false, CodingProvider::Codex, true, false),
+        director_prompt_delivery(false, CodingProvider::Codex, true),
         PromptDelivery::Steer
-    );
-    assert_eq!(
-        director_prompt_delivery(true, CodingProvider::Codex, true, true),
-        PromptDelivery::Queue
     );
     let session_id = Uuid::new_v4();
     let message_id = Uuid::new_v4();
@@ -182,7 +178,7 @@ fn consultation_aliases_route_through_the_primary_model() {
         "/ask claude review this"
     );
     assert_eq!(
-        running_input("/gpt compare this", CodingProvider::Claude, true, false).1,
+        running_input("/gpt compare this", CodingProvider::Claude, true).1,
         "/ask gpt compare this"
     );
 }
@@ -311,6 +307,116 @@ fn first_resume_frame_keeps_real_recent_conversation_before_lazy_pages() {
     assert!(selected.iter().any(|event| matches!(
         &event.kind,
         SessionEventKind::Message { text, .. } if text == "meaningful resume context"
+    )));
+}
+
+#[tokio::test]
+async fn first_resume_frame_splices_in_the_latest_completed_compaction() {
+    let directory = tempdir().unwrap();
+    let store = SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
+        .await
+        .unwrap();
+    let session_id = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+    for kind in [
+        SessionEventKind::SessionStarted,
+        SessionEventKind::ProviderEvent {
+            provider: CodingProvider::Codex,
+            kind: "context_compaction".to_string(),
+            payload: serde_json::json!({"status": "started"}),
+        },
+        SessionEventKind::ProviderEvent {
+            provider: CodingProvider::Codex,
+            kind: "context_compaction".to_string(),
+            payload: serde_json::json!({
+                "status": "completed",
+                "summary": "durable resume summary"
+            }),
+        },
+    ] {
+        store
+            .append(SessionEvent::new(session_id, 0, kind))
+            .await
+            .unwrap();
+    }
+    for _ in 0..=RICH_TUI_HISTORY_BOOTSTRAP_SCAN_LIMIT {
+        store
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::UsageUpdated {
+                    provider_duration_ms: 0,
+                    turn_id: None,
+                    provider_context_reused: None,
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    total_tokens: 0,
+                    cached_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                    cost_usd: None,
+                    cost_microusd: None,
+                    cost_basis: String::new(),
+                    context_tokens: None,
+                    context_window_tokens: None,
+                },
+            ))
+            .await
+            .unwrap();
+    }
+    store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::ProviderEvent {
+                provider: CodingProvider::Codex,
+                kind: "context_compaction".to_string(),
+                payload: serde_json::json!({"status": "started"}),
+            },
+        ))
+        .await
+        .unwrap();
+    store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::Message {
+                message_id: Uuid::new_v4(),
+                actor: EventActor::User,
+                text: "current request".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: Some(PromptDelivery::Queue),
+            },
+        ))
+        .await
+        .unwrap();
+
+    let latest_sequence = store.state(session_id).await.unwrap().latest_sequence;
+    let history = recent_tui_history(&store, session_id, latest_sequence)
+        .await
+        .unwrap();
+
+    assert!(history[0].kind.is_completed_context_compaction());
+    assert!(matches!(
+        &history[0].kind,
+        SessionEventKind::ProviderEvent { payload, .. }
+            if payload.get("summary").and_then(serde_json::Value::as_str)
+                == Some("durable resume summary")
+    ));
+    assert_eq!(
+        history
+            .iter()
+            .filter(|event| matches!(
+                &event.kind,
+                SessionEventKind::ProviderEvent { kind, .. }
+                    if kind == "context_compaction"
+            ))
+            .count(),
+        1
+    );
+    assert!(history.iter().any(|event| matches!(
+        &event.kind,
+        SessionEventKind::Message { text, .. } if text == "current request"
     )));
 }
 
@@ -1004,57 +1110,57 @@ fn provider_mcp_elicitation_accepts_structured_content_and_cancellation() {
 #[test]
 fn active_message_delivery_respects_provider_capability_and_explicit_override() {
     assert_eq!(
-        running_input("plain", CodingProvider::Codex, true, false).0,
+        running_input("plain", CodingProvider::Codex, true).0,
         PromptDelivery::Steer
     );
     assert_eq!(
-        running_input("plain", CodingProvider::Codex, false, false).0,
+        running_input("plain", CodingProvider::Codex, false).0,
         PromptDelivery::Queue
     );
     assert_eq!(
-        running_input("/queue later", CodingProvider::Codex, true, false).0,
+        running_input("/queue later", CodingProvider::Codex, true).0,
         PromptDelivery::Queue
     );
     assert_eq!(
-        running_input("/steer now", CodingProvider::Codex, false, false).0,
+        running_input("/steer now", CodingProvider::Codex, false).0,
         PromptDelivery::Steer
     );
     assert_eq!(
-        running_input("plain", CodingProvider::OpenRouter, true, false).0,
+        running_input("plain", CodingProvider::OpenRouter, true).0,
         PromptDelivery::Steer
     );
     assert_eq!(
-        running_input("/steer now", CodingProvider::OpenAiCompatible, false, false).0,
+        running_input("/steer now", CodingProvider::OpenAiCompatible, false).0,
         PromptDelivery::Steer
     );
     assert_eq!(
-        running_input("plain", CodingProvider::Claude, true, false).0,
+        running_input("plain", CodingProvider::Claude, true).0,
         PromptDelivery::Steer
     );
     assert_eq!(
-        running_input("/steer now", CodingProvider::Claude, false, false).0,
+        running_input("/steer now", CodingProvider::Claude, false).0,
         PromptDelivery::Steer
     );
 }
 
 #[test]
-fn ordinary_followups_queue_while_context_is_compacting() {
+fn compaction_does_not_change_active_input_delivery() {
     assert_eq!(
-        running_input("usage details", CodingProvider::Codex, true, true).0,
-        PromptDelivery::Queue
-    );
-    assert_eq!(
-        running_input("usage details", CodingProvider::Claude, true, true).0,
-        PromptDelivery::Queue
-    );
-    assert_eq!(
-        running_input("/steer now", CodingProvider::Codex, false, true).0,
+        running_input("usage details", CodingProvider::Codex, true).0,
         PromptDelivery::Steer
     );
-    assert!(status_is_compacting(Some(
-        "Automatically compacting context"
-    )));
-    assert!(!status_is_compacting(Some("turn phase: provider active")));
+    assert_eq!(
+        running_input("usage details", CodingProvider::Claude, true).0,
+        PromptDelivery::Steer
+    );
+    assert_eq!(
+        running_input("/steer now", CodingProvider::Codex, false).0,
+        PromptDelivery::Steer
+    );
+    assert_eq!(
+        running_input("/queue later", CodingProvider::Codex, true).0,
+        PromptDelivery::Queue
+    );
 }
 
 #[test]

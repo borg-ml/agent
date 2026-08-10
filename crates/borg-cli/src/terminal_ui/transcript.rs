@@ -1300,6 +1300,22 @@ impl Transcript {
                 self.todos = items.clone();
                 self.upsert_plan(items.clone(), local_event_time(event));
             }
+            SessionEventKind::ProviderEvent { kind, .. }
+                if kind == "context_compaction_failed" =>
+            {
+                self.finish_reasoning(event.created_at);
+                self.cache_diagnostics.reset();
+                if matches!(
+                    self.order.last(),
+                    Some(TranscriptEntry::Compaction {
+                        complete: false,
+                        ..
+                    })
+                ) {
+                    removed_entry = self.order.len().checked_sub(1);
+                    self.order.pop();
+                }
+            }
             SessionEventKind::ProviderEvent { kind, payload, .. }
                 if is_context_compaction(kind) =>
             {

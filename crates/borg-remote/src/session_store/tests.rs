@@ -1496,6 +1496,52 @@ async fn fork_starts_a_fresh_provider_context_without_losing_capacity() {
 }
 
 #[tokio::test]
+async fn latest_completed_compaction_is_projected_through_a_fork() {
+    let (directory, store) = store().await;
+    let parent_id = Uuid::new_v4();
+    let fork_id = Uuid::new_v4();
+    store.create_session(parent_id).await.unwrap();
+    for kind in [
+        SessionEventKind::SessionStarted,
+        configured(directory.path()),
+        SessionEventKind::ProviderEvent {
+            provider: CodingProvider::Codex,
+            kind: "context_compaction".to_string(),
+            payload: serde_json::json!({"status": "started"}),
+        },
+        SessionEventKind::ProviderEvent {
+            provider: CodingProvider::Codex,
+            kind: "context_compaction".to_string(),
+            payload: serde_json::json!({
+                "status": "completed",
+                "summary": "retained checkpoint"
+            }),
+        },
+    ] {
+        store
+            .append(SessionEvent::new(parent_id, 0, kind))
+            .await
+            .unwrap();
+    }
+    store.fork_before(parent_id, fork_id, 5).await.unwrap();
+
+    let checkpoint = store
+        .latest_completed_context_compaction(fork_id)
+        .await
+        .unwrap()
+        .expect("inherited checkpoint");
+    assert_eq!(checkpoint.session_id, fork_id);
+    assert_eq!(checkpoint.sequence, 4);
+    assert!(checkpoint.kind.is_completed_context_compaction());
+    assert!(matches!(
+        checkpoint.kind,
+        SessionEventKind::ProviderEvent { payload, .. }
+            if payload.get("summary").and_then(serde_json::Value::as_str)
+                == Some("retained checkpoint")
+    ));
+}
+
+#[tokio::test]
 async fn inherited_event_pages_match_the_full_projection_across_lineage_boundaries() {
     let (directory, store) = store().await;
     let parent_id = Uuid::new_v4();

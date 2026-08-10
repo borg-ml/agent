@@ -1799,13 +1799,25 @@ async fn run_agent_session_store_kernel(
                                 }
                             }
                             Err(error) => {
+                                let message = error.to_string();
                                 record(
                                     &mut journal,
                                     &events,
                                     session_id,
-                                    SessionEventKind::Error {
-                                        message: error.to_string(),
+                                    SessionEventKind::ProviderEvent {
+                                        provider: launch.provider,
+                                        kind: "context_compaction_failed".to_string(),
+                                        payload: serde_json::json!({
+                                            "error": message,
+                                        }),
                                     },
+                                )
+                                .await?;
+                                record(
+                                    &mut journal,
+                                    &events,
+                                    session_id,
+                                    SessionEventKind::Error { message },
                                 )
                                 .await?;
                             }

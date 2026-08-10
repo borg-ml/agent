@@ -5962,6 +5962,48 @@ fn automatic_compaction_event_reports_work_in_progress() {
 }
 
 #[test]
+fn failed_compaction_withdraws_the_in_progress_card() {
+    let session_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::ProviderEvent {
+            provider: CodingProvider::Codex,
+            kind: "context_compaction".to_string(),
+            payload: serde_json::json!({
+                "status": "started",
+                "summary": "Compacting context…"
+            }),
+        },
+    ));
+    assert!(matches!(
+        transcript.order.last(),
+        Some(TranscriptEntry::Compaction {
+            complete: false,
+            ..
+        })
+    ));
+
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::ProviderEvent {
+            provider: CodingProvider::Codex,
+            kind: "context_compaction_failed".to_string(),
+            payload: serde_json::json!({"error": "summary provider unavailable"}),
+        },
+    ));
+
+    assert!(
+        !transcript
+            .order
+            .iter()
+            .any(|entry| matches!(entry, TranscriptEntry::Compaction { .. }))
+    );
+}
+
+#[test]
 fn compaction_completion_updates_the_live_card_and_can_expand() {
     let session_id = Uuid::new_v4();
     let mut transcript = Transcript::default();

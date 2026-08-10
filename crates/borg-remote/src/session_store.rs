@@ -175,6 +175,18 @@ pub enum EventPersistence {
 }
 
 impl SessionEventKind {
+    pub fn is_completed_context_compaction(&self) -> bool {
+        matches!(
+            self,
+            Self::ProviderEvent { kind, payload, .. }
+                if kind == "context_compaction"
+                    && matches!(
+                        payload.get("status").and_then(serde_json::Value::as_str),
+                        None | Some("completed")
+                    )
+        )
+    }
+
     pub fn persistence(&self) -> EventPersistence {
         match self {
             Self::ProviderEvent { provider, kind, .. }
@@ -270,9 +282,7 @@ impl SessionEventKind {
             // structure in its session entries; Borg needs this metadata in
             // the recovered context slice for cross-provider replay.
             Self::TurnStarted { .. } | Self::TurnCompleted { .. } | Self::ContextCleared => true,
-            Self::ProviderEvent { kind, payload, .. } if kind == "context_compaction" => {
-                payload.get("status").and_then(serde_json::Value::as_str) != Some("started")
-            }
+            kind if kind.is_completed_context_compaction() => true,
             Self::ProviderEvent { provider, kind, .. } if provider.uses_native_harness() => {
                 matches!(
                     kind.as_str(),
@@ -629,11 +639,7 @@ impl SessionState {
                 self.usage.context_tokens = Some(0);
                 self.context_generation = self.context_generation.saturating_add(1);
             }
-            SessionEventKind::ProviderEvent { kind, payload, .. }
-                if kind == "context_compaction"
-                    && payload.get("status").and_then(serde_json::Value::as_str)
-                        == Some("completed") =>
-            {
+            kind if kind.is_completed_context_compaction() => {
                 self.context_generation = self.context_generation.saturating_add(1);
                 self.provider_session_id = None;
                 self.usage.context_tokens = Some(0);
@@ -823,6 +829,10 @@ pub trait SessionStore: Send + Sync {
         sequence: u64,
         limit: usize,
     ) -> Result<Vec<SessionEvent>>;
+    async fn latest_completed_context_compaction(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Option<SessionEvent>>;
     /// Return the newest recallable user messages authored in this session,
     /// including failed prompts, ordered from oldest to newest.
     ///
@@ -2949,6 +2959,65 @@ impl SqliteSessionStore {
             .collect()
     }
 
+    fn latest_completed_context_compaction_before<'a>(
+        &'a self,
+        session_id: Uuid,
+        before_or_at: Option<u64>,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<SessionEvent>>> + Send + 'a>> {
+        Box::pin(async move {
+            let session = self.session_row(session_id).await?;
+            let logical_limit = before_or_at
+                .unwrap_or(session.next_sequence.saturating_sub(1))
+                .min(session.next_sequence.saturating_sub(1));
+            if logical_limit > session.inherited_event_count {
+                let event = sqlx::query_scalar::<_, String>(
+                    "select event_json from session_events \
+                     where session_id = ? and sequence > ? and sequence <= ? \
+                     and event_kind = 'provider_event' \
+                     and json_extract(event_json, '$.kind.kind') = 'context_compaction' \
+                     and (json_extract(event_json, '$.kind.payload.status') = 'completed' \
+                          or json_extract(event_json, '$.kind.payload.status') is null) \
+                     order by sequence desc limit 1",
+                )
+                .bind(session_id.to_string())
+                .bind(i64::try_from(session.inherited_event_count).unwrap_or(i64::MAX))
+                .bind(i64::try_from(logical_limit).unwrap_or(i64::MAX))
+                .fetch_optional(&self.pool)
+                .await?;
+                if let Some(event) = event {
+                    return Ok(Some(serde_json::from_str(&event)?));
+                }
+            }
+
+            let Some(parent_session_id) = session.parent_session_id else {
+                return Ok(None);
+            };
+            let Some(parent_cut_sequence) = session.parent_cut_sequence else {
+                return Ok(None);
+            };
+            let Some(mut event) = self
+                .latest_completed_context_compaction_before(
+                    parent_session_id,
+                    Some(parent_cut_sequence),
+                )
+                .await?
+            else {
+                return Ok(None);
+            };
+            let parent = self.session_row(parent_session_id).await?;
+            let (sequence, _) = self
+                .fork_projection(parent_session_id, event.sequence.saturating_add(1), &parent)
+                .await?;
+            if sequence == 0 || sequence > logical_limit.min(session.inherited_event_count) {
+                return Ok(None);
+            }
+            event.id = inherited_event_id(session_id, event.id);
+            event.session_id = session_id;
+            event.sequence = sequence;
+            Ok(Some(event))
+        })
+    }
+
     fn composed_recovery_events<'a>(
         &'a self,
         session_id: Uuid,
@@ -4815,6 +4884,14 @@ impl SessionStore for SqliteSessionStore {
                 .collect();
         }
         self.projected_event_slice(session_id, sequence, limit)
+            .await
+    }
+
+    async fn latest_completed_context_compaction(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Option<SessionEvent>> {
+        self.latest_completed_context_compaction_before(session_id, None)
             .await
     }
 

@@ -1619,7 +1619,6 @@ async fn run_local_agent_session(
     let mut status = display_session_state
         .status
         .unwrap_or(SessionStatus::Starting);
-    let mut status_detail = display_session_state.status_detail.clone();
     let mut pending_approval = display_session_state.pending_approval_id.clone();
     let mut pending_provider_interaction = display_session_state
         .pending_provider_interaction_id
@@ -2056,9 +2055,8 @@ async fn run_local_agent_session(
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .remove(message_id);
                 }
-                if let SessionEventKind::StatusChanged { status: next, detail } = &event.kind {
+                if let SessionEventKind::StatusChanged { status: next, .. } = &event.kind {
                     status = *next;
-                    status_detail = detail.clone();
                     saw_running |= *next == SessionStatus::Running;
                     sleep_inhibitor.set_turn_active(matches!(
                         next,
@@ -2630,7 +2628,6 @@ async fn run_local_agent_session(
                                 active,
                                 provider,
                                 steer_active_codex,
-                                status_is_compacting(status_detail.as_deref()),
                             );
                             let message_id = Uuid::new_v4();
                             if session_command_tx
@@ -2665,7 +2662,6 @@ async fn run_local_agent_session(
                                     line,
                                     provider,
                                     steer_active_codex,
-                                    status_is_compacting(status_detail.as_deref()),
                                 )
                                 .0
                             } else {
@@ -2740,7 +2736,6 @@ async fn run_local_agent_session(
                                 line,
                                 provider,
                                 steer_active_codex,
-                                status_is_compacting(status_detail.as_deref()),
                             )
                         } else {
                             idle_input(line)
@@ -3392,7 +3387,6 @@ async fn run_local_agent_session(
                                         active,
                                         provider,
                                         steer_active_codex,
-                                        status_is_compacting(status_detail.as_deref()),
                                     );
                                     let message_id = Uuid::new_v4();
                                     if active {
@@ -3491,11 +3485,8 @@ async fn run_local_agent_session(
                                 .as_ref()
                                 .and_then(BorgTerminal::session_provider)
                                 .unwrap_or(provider);
-                            let delivery = if status_is_compacting(status_detail.as_deref()) {
-                                PromptDelivery::Queue
-                            } else {
-                                default_active_delivery(active_provider, steer_active_codex)
-                            };
+                            let delivery =
+                                default_active_delivery(active_provider, steer_active_codex);
                             terminal
                                 .as_mut()
                                 .expect("terminal")
@@ -4211,7 +4202,6 @@ async fn run_local_agent_session(
                                             &text,
                                             active_provider,
                                             steer_active_codex,
-                                            status_is_compacting(status_detail.as_deref()),
                                         )
                                     } else {
                                         idle_input(&text)
@@ -4984,6 +4974,9 @@ async fn recent_tui_history(
     session_id: Uuid,
     latest_sequence: u64,
 ) -> Result<Vec<SessionEvent>> {
+    let checkpoint = store
+        .latest_completed_context_compaction(session_id)
+        .await?;
     let scanned = store
         .events_after(
             session_id,
@@ -4991,7 +4984,14 @@ async fn recent_tui_history(
             RICH_TUI_HISTORY_BOOTSTRAP_SCAN_LIMIT,
         )
         .await?;
-    Ok(select_resume_bootstrap_history(scanned))
+    let mut selected = select_resume_bootstrap_history(scanned);
+    if let Some(checkpoint) = checkpoint
+        && !selected.iter().any(|event| event.id == checkpoint.id)
+    {
+        let index = selected.partition_point(|event| event.sequence < checkpoint.sequence);
+        selected.insert(index, checkpoint);
+    }
+    Ok(selected)
 }
 
 fn recent_tui_history_after(latest_sequence: u64) -> u64 {
@@ -5011,6 +5011,11 @@ fn select_resume_bootstrap_history(events: Vec<SessionEvent>) -> Vec<SessionEven
                     status: MessageStatus::Queued,
                     ..
                 }
+            ) && !matches!(
+                &event.kind,
+                kind @ SessionEventKind::ProviderEvent { kind: event_kind, .. }
+                    if event_kind == "context_compaction"
+                        && !kind.is_completed_context_compaction()
             )
         })
         .collect::<Vec<_>>();
@@ -5471,7 +5476,6 @@ fn running_input(
     line: &str,
     provider: CodingProvider,
     steer_active_turn: bool,
-    compacting: bool,
 ) -> (PromptDelivery, String) {
     let line = normalize_consultation_command(line);
     if let Some(text) = line.strip_prefix("/queue ") {
@@ -5490,11 +5494,7 @@ fn running_input(
         );
     }
     (
-        if compacting {
-            PromptDelivery::Queue
-        } else {
-            default_active_delivery(provider, steer_active_turn)
-        },
+        default_active_delivery(provider, steer_active_turn),
         line.to_string(),
     )
 }
@@ -5676,10 +5676,6 @@ pub(crate) fn normalize_consultation_command(line: &str) -> String {
     line.to_string()
 }
 
-fn status_is_compacting(detail: Option<&str>) -> bool {
-    detail.is_some_and(|detail| detail.to_ascii_lowercase().contains("compact"))
-}
-
 fn director_prompt_command(line: &str) -> Option<Result<String>> {
     let trimmed = line.trim();
     let rest = trimmed.strip_prefix("/director")?;
@@ -5703,14 +5699,9 @@ fn director_prompt_delivery(
     active: bool,
     provider: CodingProvider,
     steer_active_turn: bool,
-    compacting: bool,
 ) -> PromptDelivery {
     if active {
-        if compacting {
-            PromptDelivery::Queue
-        } else {
-            default_active_delivery(provider, steer_active_turn)
-        }
+        default_active_delivery(provider, steer_active_turn)
     } else {
         PromptDelivery::Steer
     }
