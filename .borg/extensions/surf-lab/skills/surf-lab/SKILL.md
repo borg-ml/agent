@@ -743,9 +743,18 @@ when rerun in the CPU Source-brush world. The promoted
 `utopia-user-native-controller-v131-hidden-recovery-gpu-evolve1.json` then
 reproduced checkpoint 1465, 54.0953% progress, and no reset over all 1969 ticks
 in two independent CPU-only reruns. V131 supersedes v130 as the current
-weights-only neural authority. It remains nonterminal and untested under
-spawn/state perturbations; the exact CPU world remains the sole promotion
-authority and no result here establishes completion or CS:S parity.
+weights-only neural authority at that checkpoint.
+
+Full and focused ROCm evolution now mutate the hidden recovery field instead
+of merely carrying it through inference. An eight-generation, 256-wide search
+from v131 devoted 63 candidates per generation to that field and screened
+2,048 new candidates at about 19,400--21,400 candidate ticks per second. Its
+promoted v132 controller changes 496 hidden recovery weights and one output
+bias. Two independent authentic-start CPU-only reruns both reached checkpoint
+1469, 54.3287% progress, and no reset over all 1969 ticks. V132 supersedes
+v131 as the current weights-only neural authority. It remains nonterminal and
+untested under spawn/state perturbations; the exact CPU world remains the sole
+promotion authority and no result here establishes completion or CS:S parity.
 
 ## Native policy visualization
 
