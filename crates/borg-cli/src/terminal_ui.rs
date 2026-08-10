@@ -2978,10 +2978,11 @@ impl BorgTerminal {
     }
 
     fn active_goal(&self) -> Option<&SessionGoal> {
-        self.director_transcript
-            .as_deref()
-            .and_then(|transcript| transcript.goal.as_ref())
-            .or(self.transcript.goal.as_ref())
+        active_goal_for_view(
+            self.focused_child,
+            self.director_transcript.as_deref(),
+            &self.transcript,
+        )
     }
 
     pub fn handle_event(&mut self, input: TerminalInputEvent) -> Result<UiAction> {
@@ -4270,11 +4271,7 @@ impl BorgTerminal {
         let session_is_active = matches!(status, SessionStatus::Starting | SessionStatus::Running);
         let active_status_started_at = self.active_status_started_at();
         let active_goal = self.active_goal().cloned();
-        let goal_status = self
-            .director_transcript
-            .as_deref()
-            .unwrap_or(&self.transcript)
-            .goal_status();
+        let goal_status = self.transcript.goal_status();
         let todo_status = self.transcript.todo_status();
         let slash_suggestions = (self.picker.is_none())
             .then(|| slash_suggestion_lines(&self.composer.text, self.slash_selection))
@@ -6250,6 +6247,20 @@ impl BorgTerminal {
     }
 }
 
+fn active_goal_for_view<'a>(
+    focused_child: Option<Uuid>,
+    director_transcript: Option<&'a Transcript>,
+    displayed_transcript: &'a Transcript,
+) -> Option<&'a SessionGoal> {
+    if focused_child.is_some() {
+        displayed_transcript.goal.as_ref()
+    } else {
+        director_transcript
+            .and_then(|transcript| transcript.goal.as_ref())
+            .or(displayed_transcript.goal.as_ref())
+    }
+}
+
 fn entry_action_runs_directly(entry: &TranscriptEntry, option_count: usize) -> bool {
     option_count == 1 && !matches!(entry, TranscriptEntry::Compaction { complete: true, .. })
 }
@@ -7553,6 +7564,14 @@ pub(crate) fn subagent_activity_summary(
                     120
                 )
             )),
+            Some(SessionEventKind::StatusChanged {
+                status: SessionStatus::Ready | SessionStatus::Completed,
+                ..
+            }) => Some(format!("agent · {task} · done · waiting for input")),
+            Some(SessionEventKind::StatusChanged {
+                status: SessionStatus::WaitingForApproval,
+                ..
+            }) => Some(format!("agent · {task} · waiting for input")),
             Some(SessionEventKind::Error { message }) => Some(format!(
                 "agent · {task} · error · {}",
                 compact_text(message, 120)
@@ -7654,6 +7673,22 @@ fn subagent_action_projection(
                 (!detail.trim().is_empty()).then(|| detail.clone()),
                 TranscriptActionState::Waiting,
             ),
+            Some(SessionEventKind::StatusChanged {
+                status: SessionStatus::Ready | SessionStatus::Completed,
+                ..
+            }) => project(
+                "done · waiting for input".to_string(),
+                agent.final_text.clone(),
+                TranscriptActionState::Complete,
+            ),
+            Some(SessionEventKind::StatusChanged {
+                status: SessionStatus::WaitingForApproval,
+                detail,
+            }) => project(
+                "waiting for input".to_string(),
+                detail.clone(),
+                TranscriptActionState::Waiting,
+            ),
             Some(SessionEventKind::Error { message }) => project(
                 format!("error · {}", compact_text(message, 120)),
                 Some(message.clone()),
@@ -7671,18 +7706,12 @@ fn subagent_action_projection(
                     None,
                     TranscriptActionState::Waiting,
                 ),
-                SubagentStatus::Ready => agent
-                    .final_text
-                    .as_ref()
-                    .filter(|text| !text.trim().is_empty())
-                    .map(|text| {
-                        (
-                            "Agent".to_string(),
-                            format!("{task} · report ready"),
-                            Some(text.clone()),
-                            TranscriptActionState::Complete,
-                        )
-                    }),
+                SubagentStatus::Ready => Some((
+                    "Agent".to_string(),
+                    format!("{task} · done · waiting for input"),
+                    agent.final_text.clone(),
+                    TranscriptActionState::Complete,
+                )),
                 SubagentStatus::Stopped => project(
                     "stopped".to_string(),
                     agent.final_text.clone(),
@@ -7721,21 +7750,19 @@ fn hydrated_subagent_action(agent: &SubagentSnapshot) -> Option<SubagentActionPr
             agent.final_text.clone(),
             TranscriptActionState::Stopped,
         )),
-        SubagentStatus::Ready => agent
-            .final_text
-            .as_ref()
-            .filter(|text| !text.trim().is_empty())
-            .map(|text| {
-                (
-                    "Agent".to_string(),
-                    format!("{} · report ready", agent.task_name),
-                    Some(text.clone()),
-                    TranscriptActionState::Complete,
-                )
-            }),
-        SubagentStatus::Starting | SubagentStatus::Running | SubagentStatus::WaitingForApproval => {
-            None
-        }
+        SubagentStatus::Ready => Some((
+            "Agent".to_string(),
+            format!("{} · done · waiting for input", agent.task_name),
+            agent.final_text.clone(),
+            TranscriptActionState::Complete,
+        )),
+        SubagentStatus::WaitingForApproval => Some((
+            "Agent".to_string(),
+            format!("{} · waiting for input", agent.task_name),
+            agent.detail.clone(),
+            TranscriptActionState::Waiting,
+        )),
+        SubagentStatus::Starting | SubagentStatus::Running => None,
     }
 }
 

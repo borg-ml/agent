@@ -2262,6 +2262,25 @@ fn active_goal_cache_key_advances_once_per_elapsed_minute() {
 }
 
 #[test]
+fn focused_child_goal_view_does_not_inherit_the_director_goal() {
+    let mut director = Transcript::default();
+    director.goal = Some(SessionGoal::new("Director work".to_string(), None));
+    let child = Transcript::default();
+    let child_id = Uuid::new_v4();
+
+    assert!(active_goal_for_view(Some(child_id), Some(&director), &child).is_none());
+    assert!(active_goal_for_view(None, Some(&director), &child).is_some());
+
+    let mut child_with_goal = Transcript::default();
+    child_with_goal.goal = Some(SessionGoal::new("Child work".to_string(), None));
+    assert_eq!(
+        active_goal_for_view(Some(child_id), Some(&director), &child_with_goal)
+            .map(|goal| goal.objective.as_str()),
+        Some("Child work")
+    );
+}
+
+#[test]
 fn actionable_inactive_goals_remain_in_the_status_line() {
     let mut transcript = Transcript::default();
     let mut goal = SessionGoal::new("Wait for operator input".to_string(), None);
@@ -3749,6 +3768,85 @@ fn subagent_activity_collapses_chatter_and_keeps_terminal_result() {
         } if label == "Agent"
             && detail == "inspect_ui · completed"
             && body == "Found the renderer issue.\nExtra detail"
+    ));
+}
+
+#[test]
+fn ready_subagent_status_always_notifies_the_director() {
+    let parent_id = Uuid::new_v4();
+    let child_id = Uuid::new_v4();
+    let now = Utc::now();
+    let mut agent = SubagentSnapshot {
+        session_id: child_id,
+        parent_session_id: parent_id,
+        task_name: "/root/peer".to_string(),
+        status: SubagentStatus::Running,
+        provider: CodingProvider::Claude,
+        model: Some("claude-test".to_string()),
+        effort: None,
+        cwd: PathBuf::from("/workspace"),
+        created_at: now,
+        updated_at: now,
+        detail: None,
+        final_text: None,
+        usage: borg_remote::SubagentUsage::default(),
+    };
+    let activity = |agent: &SubagentSnapshot, event| {
+        SessionEvent::new(
+            parent_id,
+            1,
+            SessionEventKind::SubagentActivity {
+                activity: SubagentActivityKind::Updated,
+                agent: agent.clone(),
+                event: Some(Box::new(event)),
+            },
+        )
+    };
+    let mut transcript = Transcript::default();
+    transcript.apply(&SessionEvent::new(
+        parent_id,
+        0,
+        SessionEventKind::SubagentActivity {
+            activity: SubagentActivityKind::Started,
+            agent: agent.clone(),
+            event: None,
+        },
+    ));
+
+    agent.status = SubagentStatus::Ready;
+    let ready = activity(
+        &agent,
+        SessionEvent::new(
+            child_id,
+            2,
+            SessionEventKind::StatusChanged {
+                status: SessionStatus::Ready,
+                detail: None,
+            },
+        ),
+    );
+    assert_eq!(
+        subagent_activity_summary(
+            SubagentActivityKind::Updated,
+            &agent,
+            match &ready.kind {
+                SessionEventKind::SubagentActivity { event, .. } => event.as_deref(),
+                _ => None,
+            },
+        )
+        .as_deref(),
+        Some("agent · /root/peer · done · waiting for input")
+    );
+    transcript.apply(&ready);
+
+    assert!(matches!(
+        &transcript.order[0],
+        TranscriptEntry::Action {
+            detail,
+            state: TranscriptActionState::Complete,
+            body: None,
+            ..
+        } if detail == "/root/peer · done · waiting for input"
     ));
 }
 
