@@ -602,9 +602,41 @@ for GPU distillation only. A full recovery-head fit regressed to checkpoint
 758/reset tick 1315. A zero-initialized 0.25-scale fit survived to tick 2648
 but regressed to checkpoint 771, while trust-region deltas fitted from v103 at
 scales ±0.01, ±0.05, ±0.1, and ±0.25 all reset no later than tick 1430 at
-checkpoint 778. Retain v103 as promotion authority. Version-7 recovery gates
-may overlap older phase-adapter gates for supervised experiments; the staged
-evolution initializer still constructs them in order.
+checkpoint 778. At this recovery-only bound, retain v103. Version-7 recovery
+gates may overlap older phase-adapter gates for supervised experiments; the
+staged evolution initializer still constructs them in order.
+
+At v103's demo-tick-1431 failure, the exact authentic UserCmd rollout in the
+same CPU Source-brush world is only about `1.8` Source units from the decoded
+packet position and `0.2` Source units/second from its velocity. The v103
+controller is thousands of units behind, and a fresh first-attempt comparison
+measured only `44%` movement-direction agreement and `3.70°` yaw MAE against
+authentic commands. This isolates the immediate failure to controller
+imitation/covariate shift rather than the BSP contact solver. The independent
+packet-anchor physics bound remains the authority for general physics claims.
+
+Set `first_segment_only: true` on `policy.train-native` to train only the
+first reset-safe native attempt and use that attempt's duration as
+`episode_ticks`. This excludes later reset-separated attempts and matches the
+native visualizer's authoritative first-attempt start. It is mutually
+exclusive with attempt holdout and full-episode corrective traces. With
+`state_memory: true`, the resulting authentic first-attempt examples may be
+used as a GPU-training teacher; that memory artifact is data, not the promoted
+controller.
+
+On Utopia, the 128-wide first-segment clone reset at demo tick 664/checkpoint
+374. A 512x512 ReLU clone reached `98.07%` offline movement agreement and
+`0.117°` yaw MAE but reset at tick 525/checkpoint 398. Four bounded authentic
+DAgger rounds labelled only visited states using a ±64-tick phase window and
+advanced the exact CPU rollout through checkpoint/reset pairs `437/533`,
+`535/571`, `628/723`, then `980/1024`. A fifth round regressed to `633/707`,
+so retain the weights-only artifact
+`utopia-user-native-controller-v113-first-segment-dagger4.json`. It is a
+512x512 version-4 weights-only controller with `98.86%` offline movement
+agreement, `0.141°` yaw MAE, no action schedule, no state memory, and an
+independently reproduced checkpoint-980/reset-1024 rollout. This supersedes
+v103 for authentic ordered route progress, but it has not completed the first
+attempt or passed state/spawn perturbation tests.
 
 ## Native policy visualization
 
