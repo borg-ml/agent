@@ -963,6 +963,26 @@ authentic-command window from ticks 850--1050 with a recovery gate at tick
 boundary is therefore not the missing signal; retain the v7002 gate timing and
 require a different closed-loop target rather than sliding this adapter again.
 
+A fresh route-relative 512x512 ReLU policy combined authentic first-attempt
+examples with four-times-weighted labels from v7002's actual visited states.
+Despite 99.42% offline movement agreement and 0.066-degree yaw MAE on ROCm, its
+full authoritative CPU rollout reset at absolute demo tick 573. This rejects
+route geometry as a replacement for v7002 at the current evidence bound.
+
+The playable runtime can extend a frozen native policy past its recorded
+episode with `SURF_POLICY_ROLLOUT_TICKS` and apply a diagnostic piecewise clock
+using `SURF_POLICY_PHASE_START_TICK` plus `SURF_POLICY_PHASE_RATE`; all three
+default to the original behavior. Unmodified v7002 remained active beyond its
+old 1,969-tick cutoff but hit a floor reset at policy tick 2119, about 1,572
+Source units from the nearest authentic state (episode tick 1908). A uniform
+0.93 clock regressed to episode reset tick 516, and a 0.83 clock starting at
+tick 1000 reset at tick 1249. Starting a 0.50 clock only at tick 1700 preserved
+the strong prefix and cut the final nearest-route miss to about 1,037 units at
+episode tick 1943, but it still hit the floor at policy tick 2119; rates 0.58
+and 0.40 tied or regressed that reset. Treat these as bounded playback
+counterfactuals, not controller promotions. Retain unchanged v7002 and its
+corrected same-tick command ordering.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
