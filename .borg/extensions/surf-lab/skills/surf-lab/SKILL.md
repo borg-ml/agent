@@ -948,6 +948,15 @@ keeping the current 19-feature policy and collision/order implementation; the
 remaining work needs a new closed-loop supervision signal, not more feature
 columns or a wider version of these adapters.
 
+Two final covariate-shift probes were run without changing the runtime
+features. Authentic labels were augmented with bounded position, velocity,
+and yaw perturbations in the 1,030--1,150 window and fitted only into the
+existing recovery adapter. Perturbing exact-route states reset at tick 1526;
+pairing the same labels with v7002's actual off-trajectory states (including
+36 clipped yaw targets) reset at tick 1476. Both were complete CPU-authority
+failures, so retain v7002 and do not promote local adapter fits from this
+supervision family.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
