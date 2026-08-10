@@ -441,6 +441,43 @@ at demo tick 1416 instead of 1415. V59 is now the honest best weights-only
 neural controller. The one-tick gain does not establish completion, physics
 parity, or spawn/state perturbation robustness.
 
+Authoritative terminal diagnostics localize v59's failure: at demo tick 1416
+(episode tick 1176), it enters `trigger_teleport` index 4, whose Source bounds
+are `[-3072,8192,-1536.0001]` to `[-1024,10016,1536.0001]`. Its pre-reset
+position is `[-2999.752,8317.142,710.779]` with velocity
+`[-355.326,-1470.838,314.413]`; neither the terminal tick nor the preceding
+eight ticks contains a solid contact. Treat this endpoint as a controller line
+loss, not a contact-order failure. Full `policy.compare-native` confirms the
+split: v59 is already wrong by more than one Source unit at demo tick 242 and
+diverges at tick 246, while 1,183 independent exact-command packet anchors
+have mean endpoint error `0.00377`, p99 `0.00249`, max `1.486`, no resets, and
+no errors over two units. The frozen neural controller has mean packet error
+`20.60` and 1,161 errors over two units. The current measured bottleneck is
+closed-loop control robustness, although these local packet bounds do not
+prove full-route physics parity.
+
+The GPU trainer can warm-start version 5/6 policies and freeze the entire base
+network while fitting only `primary`, `late`, or `both` gated adapters with
+`--train-phase-adapter`. `--adapter-update-scale` applies a signed `-1..=1`
+trust-region line search to the fitted delta; zero preserves all runtime
+weights exactly. Exported artifacts record the selected adapter and scale and
+discard stale evolution receipts. A live ROCm fit processed 26,723 weighted
+examples for 3,000 full-batch epochs in about 11 seconds on the installed AMD
+GPU; ordinary version-4 and dual-adapter version-6 exports both passed runtime
+inspection.
+
+Do not promote the current imitation-gradient probes. A global phase-bounded
+retrain regressed to checkpoint 614, `5.6518%` progress, and reset tick 714.
+Late-adapter positive trust scales `[0.05,0.1,0.25,0.5,1.0]` all retained
+checkpoint 778 but reset at `[1411,1408,1408,1408,1402]`; `-0.01` only tied
+v59's reset without improving progress or fitness. Primary-adapter positive
+scales `[0.001,0.01,0.05]` reset at `[1415,1407,1412]`, while negative scales
+`[-0.001,-0.005]` reset at `[1415,1414]`. V59 remains the champion. This
+bounded signed sweep rules out adapter-only supervised distillation along this
+teacher-gradient direction; the next controller approach must optimize
+closed-loop route reward or provide better off-trajectory supervision rather
+than widening the same fit.
+
 The first Utopia native-neural evolution probe is also negative evidence. On a
 tick-440 curriculum checkpoint, the strict 512-unit corridor moved v18's
 furthest authentic checkpoint from tick 344 to 413. A temporary wide-corridor
