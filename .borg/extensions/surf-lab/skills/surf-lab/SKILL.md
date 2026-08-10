@@ -1007,9 +1007,39 @@ route-distance progress. A second three-generation pass produced
 1133, 35.8219% progress, and reset at episode tick 993. Bounded recovery
 teachers starting at ticks 640 and 400 tied or regressed the seed, and are not
 training authorities. The clean branch is therefore real and materially
-improved, but still incomplete and below frozen v7002. Keep evolved2 as the
-clean search parent with an authentic-start promotion floor of reference tick
-1133; do not claim completion or visualize it as a top run yet.
+improved, but still incomplete and below frozen v7002. A one-generation
+256-wide scale ablation found that `0.0001` produced only a GPU false positive,
+while `0.00001` advanced the exact CPU route by one tick. Keep
+`utopia-user-native-clean-vnext-scale1e5.json` as the clean search parent: it
+reaches reference tick 1134, 35.8747% route-distance progress, and resets at
+episode tick 993. A subsequent 3x256 continuation at the same scale found no
+further gain. Do not claim completion or visualize it as a top run yet.
+
+The first genuinely closed-loop planner experiment around that clean failure
+separates useful teacher capacity from distillation failure. Progress-first
+GPU recovery from episode tick 900 tied reference tick 1133 and survived only
+to tick 1006; moving it to tick 800 with a 15% velocity guard regressed to
+reference tick 1112/reset tick 973. A future-state CPU planner starting at
+episode tick 800 and allowed authentic analog movement candidates did better:
+it reached reconstructed reference tick 1209 and reset at tick 1089, selecting
+authentic movement in 6 of 37 decisions. This remains a training-only teacher,
+not controller evidence. Full-model phase-free trust updates from 3% through
+0.001% all regressed, while a stable output-only 0.001% update reached only
+reference tick 1133. Reject that supervised gradient.
+
+Surf commits `684eacd` and `8ac659a` make this ablation reproducible without
+adding runtime clock machinery. Phase-free warm starts now require a
+phase-free initializer; zero-scale exports preserve every network tensor
+exactly, and output-only fitting leaves frozen layers byte-identical. Planner
+guidance can screen ordinary version-4 full-network mutations from the
+authentic start, trims a terminal reset/spawn observation from the guidance
+route, and still requires complete CPU Source-brush promotion. A 32-wide
+smoke, 3x256 production pass, and final 1x256 scale/recall check all failed to
+advance beyond reference tick 1134. The best guidance artifact changed only
+the next-point distance from 522.354 to 521.839 Source units at the same route
+and reset ticks. Treat the current planner-guidance objective as exhausted at
+these bounds and retain `scale1e5`, not the guidance artifact, as the clean
+route authority.
 
 ## Native policy visualization
 
