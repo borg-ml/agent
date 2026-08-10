@@ -415,6 +415,18 @@ seconds, one shared exact prefix took 0.3–1.3 seconds, and 16 complete CPU
 promotion reruns took 9–28 seconds. V58 is the current genuine-neural
 baseline; it does not complete Utopia and is not parity evidence.
 
+The ROCm neural rollout now assigns one 256-thread block per candidate: the
+block cooperatively evaluates both 512-wide neural layers while lane zero
+alone advances Source-brush physics. An exact repeated seed preserved the GPU
+route result and all eight CPU/GPU termination deltas. GPU suffix time fell
+from 7.52 to 0.50 seconds at width 32 and from 11.23 to 1.77 seconds at the
+desktop-safe width 256. Running the eight independent authentic-start CPU
+promotion worlds concurrently then reduced promotion time from 5.25 to 1.41
+seconds. A bounded 24-generation continuation consequently screened 6,144
+new phase-adapter candidates in about 91 measured seconds, but none advanced
+past checkpoint 778. Keep v58 as the honest best policy and treat additional
+mutation-only searching at focus tick 1000 as exhausted at these bounds.
+
 The first Utopia native-neural evolution probe is also negative evidence. On a
 tick-440 curriculum checkpoint, the strict 512-unit corridor moved v18's
 furthest authentic checkpoint from tick 344 to 413. A temporary wide-corridor
