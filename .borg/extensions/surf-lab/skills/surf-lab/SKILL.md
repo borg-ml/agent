@@ -413,7 +413,8 @@ finalists were typically 5–8 route ticks from CPU, although termination timing
 remained less faithful. The 256-wide suffix generations took roughly 7–30
 seconds, one shared exact prefix took 0.3–1.3 seconds, and 16 complete CPU
 promotion reruns took 9–28 seconds. V58 is the current genuine-neural
-baseline; it does not complete Utopia and is not parity evidence.
+pre-late-adapter baseline; it does not complete Utopia and is not parity
+evidence.
 
 The ROCm neural rollout now assigns one 256-thread block per candidate: the
 block cooperatively evaluates both 512-wide neural layers while lane zero
@@ -424,8 +425,21 @@ desktop-safe width 256. Running the eight independent authentic-start CPU
 promotion worlds concurrently then reduced promotion time from 5.25 to 1.41
 seconds. A bounded 24-generation continuation consequently screened 6,144
 new phase-adapter candidates in about 91 measured seconds, but none advanced
-past checkpoint 778. Keep v58 as the honest best policy and treat additional
+past checkpoint 778. Treat additional
 mutation-only searching at focus tick 1000 as exhausted at these bounds.
+
+Version 6 adds one independently gated late residual without altering the
+existing controller or primary adapter. CPU and ROCm apply it only from its own
+start tick, and a serialization contract covers both exact zero prefixes and
+ramps. A focus-1100 smoke matched the CPU route checkpoint for all eight GPU
+finalists and found a real one-tick survival gain. The subsequent desktop-safe
+24×256 production run screened 6,144 mutations; its persisted v59 controller
+is byte-identical to v58 apart from the version, evolution receipt, and new
+late-adapter fields, and its authoritative rollout is identical through
+episode tick 1099. It retains checkpoint 778 and `9.4438%` progress, then resets
+at demo tick 1416 instead of 1415. V59 is now the honest best weights-only
+neural controller. The one-tick gain does not establish completion, physics
+parity, or spawn/state perturbation robustness.
 
 The first Utopia native-neural evolution probe is also negative evidence. On a
 tick-440 curriculum checkpoint, the strict 512-unit corridor moved v18's
