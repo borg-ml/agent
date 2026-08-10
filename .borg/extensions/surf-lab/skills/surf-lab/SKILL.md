@@ -1041,6 +1041,17 @@ and reset ticks. Treat the current planner-guidance objective as exhausted at
 these bounds and retain `scale1e5`, not the guidance artifact, as the clean
 route authority.
 
+Surf commit `1d3e4a1` also lets the existing antithetic ES/CEM machinery target
+the ordinary six-output head during authentic-start planner-guided screening;
+the search mean is never persisted unless a complete CPU route rerun promotes
+it. An 8-wide smoke had full paired signal and retained a clean version-4
+artifact. Two 3x256 antithetic-ES passes at initial sigmas `0.0001` and
+`0.00001` then produced no CPU improvement over reference tick 1134/reset tick
+993. The smaller pass had 127 pairs per generation and nonzero success rates,
+but its search-mean guidance progress oscillated while every CPU promotion
+remained tied. Treat planner-guided base-output antithetic search as exhausted
+at these bounds too; it does not supersede `scale1e5`.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
