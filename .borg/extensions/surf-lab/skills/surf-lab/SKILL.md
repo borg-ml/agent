@@ -1082,6 +1082,47 @@ complete the map, and does not replace v7002. Continue from this candidate only
 when both full-start CPU survival/route progress and perturbed validation
 improve; keep regressed v3/v4/v5 artifacts as diagnostics only.
 
+Surf commit `2d5ab19` adds explicit PPO step backtracking and recomputes the
+actual post-scale KL before export. The rejected v5 direction was screened from
+1/1,024 through 3/4: its GPU-leading 1/128 step reached route index 322 over
+1,262 ticks, but exact CPU playback reset at tick 612 instead of v4tiny's 856.
+A lower-variance direction combined four independent 128-rollout ROCm batches
+(210,973 transitions). Its full step improved held-out perturbed GPU reward
+from 30.48 to 30.96 and furthest route index from 292 to 304, but reset at CPU
+tick 601; backtracked scales from 0.001 through 0.75 did not retain the
+deterministic GPU gain. Finally, 64 stochastic full-start rollouts collected in
+the exact CPU world produced 26,070 transitions at about 2,503 ticks/second.
+The full update reset at CPU tick 636. Scale 0.002 advanced the exact CPU
+collector's route index from 267 to 294 but shortened survival from 616 to 554
+ticks, and a fine search around it found no dual improvement. None of these is
+a promotion. Retain v4tiny and do not repeat these three PPO directions; a next
+update needs a different closed-loop objective or a tighter long-horizon GPU
+transfer bound, not more line-search scales.
+
+Surf commit `920a90a` tightens the local transfer bound by scaling positions,
+velocities, and route points into prototype units before the HIP route-tangent
+and dot-product feature math, matching CPU evaluation order. At the identical
+first state, maximum feature error fell from `4.77e-6` to `2.39e-7` and maximum
+policy-mean error fell from `4.00e-4` to `1.60e-5`; a 32-tick differential kept
+route indices and terminal flags equal with reward drift below `4.9e-7`.
+Long-horizon trajectories still decorrelate, so CPU promotion remains required.
+
+With that fix, a 256x128 randomized authentic-route batch collected 32,433
+transitions at about 25,062 candidate ticks/second. Mixing it with the 64-rollout
+exact-CPU full-start batch and backtracking one PPO update produced the new
+clean parent at
+`.borg/surf-lab/policies/utopia-user-native-ppo-route-aligned-mixed-v8step-0.125.json`
+(SHA-256 `ab968c782e77389dc3ef30521ef6fe81fce18a44bd4934a5415f5a77c18faf46`).
+Exact authentic-start CPU validation improved reset tick 856 to 950, route
+index 267 to 303, and executed ticks 616 to 710. Across 64 matched CPU state
+perturbations, mean survival improved from 397.59 to 407.09 ticks, mean episode
+reward from 27.97 to 31.01, and furthest route index from 269 to 290. A matched
+GPU perturbation batch improved reward but slightly regressed mean survival and
+furthest route, reinforcing the CPU authority. The artifact is one phase-free
+256x256 ReLU network with recent-action inputs and no clocks, schedules, memory,
+or adapters. It still resets, does not complete Utopia, and does not replace
+v7002; it does supersede v4tiny as the clean PPO training parent.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
