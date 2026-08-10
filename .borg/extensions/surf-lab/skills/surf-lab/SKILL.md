@@ -983,6 +983,34 @@ and 0.40 tied or regressed that reset. Treat these as bounded playback
 counterfactuals, not controller promotions. Retain unchanged v7002 and its
 corrected same-tick command ordering.
 
+The clean-controller branch now has a reproducible phase-free training path.
+Surf commits `9e72063` and `3a50b58` add `--disable-phase-features` and allow
+closed-loop-only DAgger data: the offline teacher may use the recorded tick to
+label a visited state, but columns 11--12 are zeroed before fitting and the
+export is forced to `phase_features=false`, `history_features=false`, a zero
+schedule offset, and no adapter payloads. Distilling v7002's two complete
+1,969-tick closed-loop traces plus one clean policy's visited states produced
+seed 3001 at
+`.borg/surf-lab/policies/utopia-user-native-clean-vnext-v7002-dagger2-seed3001.json`.
+It is a single 512x512 ReLU version-4 network with no action schedule, state
+memory, route table, phase/history input, or adapter weights. Its authentic-
+start CPU rollout reset at episode tick 742 and reached reference tick 878
+(23.5347% route-distance progress), so it is not a v7002 replacement.
+
+Full-network evolution can improve this clean artifact without reintroducing
+phase machinery. Three desktop-safe generations of 256 ROCm candidates with
+CPU Source-brush promotion produced
+`.borg/surf-lab/policies/utopia-user-native-clean-vnext-evolved1.json`: it
+reset at episode tick 992, reached reference tick 1132, and achieved 35.7690%
+route-distance progress. A second three-generation pass produced
+`utopia-user-native-clean-vnext-evolved2.json` but only reached reference tick
+1133, 35.8219% progress, and reset at episode tick 993. Bounded recovery
+teachers starting at ticks 640 and 400 tied or regressed the seed, and are not
+training authorities. The clean branch is therefore real and materially
+improved, but still incomplete and below frozen v7002. Keep evolved2 as the
+clean search parent with an authentic-start promotion floor of reference tick
+1133; do not claim completion or visualize it as a top run yet.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
