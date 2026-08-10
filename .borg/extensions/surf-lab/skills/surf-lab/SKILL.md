@@ -823,6 +823,18 @@ Source units from the authentic end. Localize any next correction to episode
 ticks 1050--1150; do not add geometry features or widen later adapters without
 evidence that this measured command drift requires them.
 
+Three network-traced matched-horizon recovery probes show that the existing
+local recovery objective is not a safe teacher for v7002. All used episode tick
+1050, a 12-tick horizon, three four-tick decisions, the desktop-safe 256-wide
+ROCm batch, and a 32-candidate exact CPU shortlist. Seeds 7003 and 7004 both
+regressed from the frozen controller's no-reset 91.8227% route result to
+58.1809% and reset at episode ticks 1136 and 1135. A third seed with the exact
+CPU velocity-error guard set to 0.1 selected more baseline decisions but still
+reset at episode tick 1137 with 58.3333% progress. Do not distill these traces,
+widen this search, or change the 19-feature observation schema based on them.
+Retain v7002 until a different bounded off-trajectory objective beats it in a
+complete authentic-start CPU rollout.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
