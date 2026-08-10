@@ -902,6 +902,22 @@ receipt. This exhausts the current endpoint-adapter/CEM family at the safe
 bound; a future improvement needs a new off-trajectory objective, not a wider
 batch or more endpoint mutations.
 
+The first bounded off-trajectory objective was tested before adding any new
+observation geometry. Authentic native UserCmds were aligned to the frozen
+v7002 controller's actual visited states (episode ticks 0--1968), converted by
+the same `native_command` mapping, and used as labels for small ROCm-trained
+adapters. A history-input-column-only probe reset at episode ticks 739--789.
+State-dependent recovery adapters trained on the full visited-state set or on
+the ramp-3 window (trust scales 0.01--0.1, gates starting at ticks 1040--1100)
+reset at ticks 1520--1557; phase-bias probes reset at ticks 1524--1557. The
+unchanged v7002 parent still runs all 1,969 ticks without a reset. The labels
+also required clipping 651 of 1,969 yaw targets to the runtime's +/-0.5-radian
+neural delta range, confirming that an off-trajectory replay command is not a
+safe one-step correction target once the controller has drifted. None of these
+artifacts is a promotion candidate. Do not add ramp normals, nearest-ramp
+features, or autoregressive history solely on the basis of teacher-forced
+agreement; require a complete authentic-start CPU improvement first.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
