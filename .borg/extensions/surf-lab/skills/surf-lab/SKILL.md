@@ -918,6 +918,19 @@ artifacts is a promotion candidate. Do not add ramp normals, nearest-ramp
 features, or autoregressive history solely on the basis of teacher-forced
 agreement; require a complete authentic-start CPU improvement first.
 
+A four-generation focused route-state search tested the next bounded objective
+without changing the observation schema. It resumed the exact v7002 state at
+episode tick 1100, screened 256 ROCm candidates per generation, exact-CPU
+screened a 256-tick suffix, and retained v7002 as the full-route promotion
+anchor. The parent stayed best in the complete 1,969-tick CPU rollout: no
+reset, reference tick 2083, and 91.8226% ordered progress. The GPU-leading
+resume-only center had a better short suffix score but reset at episode tick
+1814 when restarted authentically, reaching only reference tick 1705 and
+68.0914% progress. It was therefore not promoted. This exhausts the bounded
+phase-gated route-state family at the desktop-safe width; retain v7002 and
+require a genuinely new closed-loop objective or supervision source before
+adding geometry/history inputs or widening the search.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
