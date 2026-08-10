@@ -756,6 +756,22 @@ v131 as the current weights-only neural authority. It remains nonterminal and
 untested under spawn/state perturbations; the exact CPU world remains the sole
 promotion authority and no result here establishes completion or CS:S parity.
 
+When multiple adapters share one focus tick, focused evolution must select the
+newest valid adapter. V132 has primary and recovery gates at episode tick 1100;
+the repaired selector targets recovery there. A 32-wide receipt mutated 15
+hidden and 16 linear recovery candidates with zero primary mutations. Two
+subsequent 8x256 focused searches at `1e-6` and `1e-5` produced no full-route
+promotion beyond v132, exhausting that local no-reset family at those bounds.
+
+The full-scale three-teacher hidden-recovery fit reached checkpoint 1475 but
+reset at episode tick 1524. Treating it only as a higher-progress search
+lineage, a four-generation 256-wide recovery search with 512 exact CPU suffix
+ticks and `0.001` mutations reached checkpoint 1479 and 54.8565% progress. Two
+independent authentic-start CPU reruns reproduced both that checkpoint and the
+same reset tick. V133 is therefore the route-progress authority, while v132
+remains the no-reset full-span authority. Neither is a terminal completion or
+perturbation/CS:S parity result.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
