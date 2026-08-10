@@ -719,6 +719,25 @@ as the current weights-only neural route authority. It still has no terminal
 completion and has not passed bounded spawn/state perturbation tests, so it is
 not evidence of generalization or CS:S parity.
 
+A second matched-horizon pass from v128 reached checkpoint 2091 with no reset,
+essentially tying the v120 teacher rather than replacing it. Aggregating both
+teachers exposed the 6x19 linear recovery head as the next capacity limit: its
+trust-region fits and new primary-adapter fits did not retain both progress and
+full-span survival. Version 8 therefore adds a phase-gated 6x512 residual from
+the frozen second hidden layer while preserving every v128 weight. A zero
+residual reproduced v128's checkpoint, fitness, and no-reset rollout exactly.
+Training only those 3,072 residual weights on ROCm and applying a 22.5% update
+produced
+`utopia-user-native-controller-v130-hidden-recovery-dagger9.json`. Two
+independent authentic-start exact-CPU reruns both reached checkpoint 1464,
+54.0371% progress, and no reset over all 1969 ticks. V130 has no action
+schedule, state memory, or history features and supersedes v128 as the current
+weights-only neural authority. It remains nonterminal and untested under
+spawn/state perturbations. The approximate ROCm neural-rollout path explicitly
+rejects the new hidden residual until its HIP kernel implements that field;
+continue using GPU action-program recovery for proposals and exact CPU Source
+brush rollouts for promotion rather than silently omitting the residual.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
