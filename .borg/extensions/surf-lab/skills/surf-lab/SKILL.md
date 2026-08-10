@@ -1052,6 +1052,36 @@ but its search-mean guidance progress oscillated while every CPU promotion
 remained tied. Treat planner-guided base-output antithetic search as exhausted
 at these bounds too; it does not supersede `scale1e5`.
 
+Surf commit `ac2bafa` adds the clean on-policy path that supersedes further
+generic ES around this failure. `policy.collect-native-ppo` defaults to a
+desktop-bounded ROCm collector: up to 256 authentic or authentic-start
+rollouts run neural inference, censored-Gaussian action sampling, Source-brush
+physics, ordered-route reward, and transition capture in one HIP batch. The
+trajectory width remains capped at 256, while horizons may reach 2,048 ticks
+so a rollout can encounter its own failure. Only initial-state construction,
+compact JSONL transfer, bounded differential checks, and controller promotion
+remain on CPU. Set `backend: "cpu"` only for the exact reference collector.
+`tools/train_native_ppo_gpu.py` performs the clipped policy/value update on
+ROCm, uses the correct point masses for actions clipped at their runtime
+bounds, and rejects epochs that cross the KL limit. The exported controller is
+still one ordinary phase-free route-relative network with recent-action
+features and no replay clock, action schedule, state memory, or adapters.
+
+A zero-noise 32-tick differential matched route indices and all terminal flags;
+maximum reward drift was `2.6e-5`. A 256x128 production batch collected 32,244
+transitions in 1.278 seconds end to end (about 25,227 candidate ticks/second),
+roughly ten times the measured CPU collector. A 128-wide authentic-start batch
+with a 1,969-tick horizon collected 50,524 transitions in 1.978 seconds without
+increasing parallel width. Large PPO steps improved some randomized metrics
+but regressed the authoritative start and were rejected. One `1e-7` update is
+the current clean candidate at
+`.borg/surf-lab/policies/utopia-user-native-ppo-route-gpu-fullstart-v4tiny.json`:
+its exact CPU reset moved from absolute demo tick 727 to 856, while the bounded
+deterministic GPU route index moved from 233 to 286. It still resets, does not
+complete the map, and does not replace v7002. Continue from this candidate only
+when both full-start CPU survival/route progress and perturbed validation
+improve; keep regressed v3/v4/v5 artifacts as diagnostics only.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
