@@ -772,6 +772,32 @@ same reset tick. V133 is therefore the route-progress authority, while v132
 remains the no-reset full-span authority. Neither is a terminal completion or
 perturbation/CS:S parity result.
 
+Once a decoded PacketEntities trace exists, pass the same `network_trace` to
+every production `policy.evolve-native`, `policy.recover-native`, and
+`policy.compare-native` request. A run without it starts from a demo pose plus
+the configured velocity estimator and is assumption-dependent; it must not
+promote or supersede a traced controller. Also keep the two tick clocks
+explicit: adapter and GPU-focus ticks are episode-relative, while reported
+route-reference and reset ticks are absolute demo ticks. For this demo the
+first episode starts at demo tick 240.
+
+This provenance rule exposed a false late-search lineage: v201 appeared to
+reach reference tick 2084 without resetting from a ballistic inferred start,
+but all v179--v201 late variants reached only tick 1510 and reset at absolute
+demo tick 1596 (episode tick 1356) from the authoritative network state. The
+late adapters never activated in that real run. A traced, staged 256-wide GPU
+search then promoted recovery at episode tick 1100, terminal at 1200, final at
+1640, and completion at 1700. The resulting weights-only v7002 controller
+independently reaches reference tick 2083, runs all 1969 requested ticks with
+no reset, and has no action schedule or state memory. Its durable local artifact
+is `.borg/surf-lab/policies/utopia-user-native-controller-v7002-traced-completion1700.json`.
+It is not a completion: continuous `policy.compare-native` still ends about
+5,983 Source units from the authentic finish. The bounded physics authority is
+much tighter than the controller: across 590 independently reinjected packet
+intervals, exact native commands have maximum endpoint error 0.00432 Source
+units and no resets. Retain v7002 as the traced furthest-route neural authority,
+not as CS:S parity.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
