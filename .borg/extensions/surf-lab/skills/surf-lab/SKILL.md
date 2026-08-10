@@ -835,6 +835,20 @@ widen this search, or change the 19-feature observation schema based on them.
 Retain v7002 until a different bounded off-trajectory objective beats it in a
 complete authentic-start CPU rollout.
 
+Reducing the recovery-program amplitude did not make it a usable teacher for
+v7002. With the same traced start, 12-tick horizon, 4-tick controls, 256-wide
+ROCm screen, and 32-candidate CPU shortlist, a 4-degree/0.25-movement probe
+reached only 68.1402% progress and reset at absolute demo tick 1692; a
+2-degree/0.1-movement probe reached 62.7033% and reset at absolute tick 1523.
+Both are below the unchanged controller's 91.8227% no-reset result. A separate
+one-generation focused `policy.evolve-native` smoke at episode tick 1100
+evaluated 257 candidates with a 64-tick exact CPU focus screen and four full
+CPU promotion reruns. Its best result exactly tied v7002 (reference tick 2083,
+91.8226%, no reset), while GPU-leading candidates terminated substantially
+earlier on CPU. Do not promote amplitude variants or widen this local mutation
+family; a new teacher objective or off-trajectory data source is required
+before another controller change.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
