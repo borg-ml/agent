@@ -651,6 +651,21 @@ no action schedule or state memory. V118 supersedes v116, v113, and v103 for
 authentic ordered route progress, but it has not completed the first attempt
 or passed state/spawn perturbation tests.
 
+A 256-wide progress-first recovery pass from v118 reached checkpoint 1464 and
+reset tick 1902 at about 78,000 GPU candidate ticks/second; exact CPU shortlist
+throughput was about 2,380 ticks/second. Its 64 committed control decisions
+are a supervision bound, not a controller. Full-model trust-region fits of
+that trace did not beat v118. Instead, initialize a zero primary phase adapter
+with `--phase-adapter-start-tick`, `--phase-adapter-ramp-ticks`, and
+`--reset-phase-adapter`, then train only that adapter. The zero adapter exactly
+reproduced v118. With a tick-1100 start, 64-tick ramp, and 20% adapter update,
+the independently reproduced version-5 weights-only artifact
+`utopia-user-native-controller-v120-first-segment-phase-dagger7.json` reached
+checkpoint/reset `1450/1550` and 53.16% ordered route progress. It has no
+action schedule or state memory. Retain v120 as the current neural route
+authority; it remains short of first-attempt completion and perturbation
+validation.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
