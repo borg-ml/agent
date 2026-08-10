@@ -574,6 +574,38 @@ nonzero recovery weights and neither a schedule nor state memory. A subsequent
 current genuine-neural controller and do not describe the one-tick gain as
 completion, perturbation robustness, or CS:S parity.
 
+Use `policy.recover-native` to generate bounded off-trajectory supervision
+around a frozen weights-only native controller. It rolls that controller to a
+visited state, builds its closed-loop baseline horizon, screens short
+piecewise yaw and analog-movement residual programs in a 256-wide ROCm batch,
+then reruns a bounded shortlist in the exact CPU Source-brush world before
+committing a control block. Authentic commands and fixed-clock future poses
+are not candidate actions or the local score. Recovery ranking is
+lexicographic: authentic ordered route progress first, floor/reset avoidance
+second, then route-state error and survival. Short terminal horizons skip
+piecewise blocks outside the remaining action schedule.
+
+An early survival-first diagnostic screened 1,068,750 GPU candidate ticks at
+about 170,000 candidate ticks/second and extended reset from demo tick 1431 to
+1463, but fell from route checkpoint 778 to 774. A longer-horizon run remained
+alive through its 1500-tick bound at only checkpoint 772. These runs exposed
+the wrong reward ordering; they are useful corrective-data bounds, not
+controller promotions. With progress-first selection, starts from episode
+ticks 900 through 1160, four random seeds, and 2/4/8/16-tick control sweeps
+either regressed or tied v103 at checkpoint 778 and reset tick 1431. Observed
+256-wide throughput was roughly 130,000--208,000 GPU candidate ticks/second;
+exact CPU shortlist throughput remained roughly 2,400--2,900 ticks/second.
+
+The survival-first trace was converted to the 1,223-example state-memory
+teacher `utopia-user-native-controller-v105-gpu-recovery-memory-teacher.json`
+for GPU distillation only. A full recovery-head fit regressed to checkpoint
+758/reset tick 1315. A zero-initialized 0.25-scale fit survived to tick 2648
+but regressed to checkpoint 771, while trust-region deltas fitted from v103 at
+scales ±0.01, ±0.05, ±0.1, and ±0.25 all reset no later than tick 1430 at
+checkpoint 778. Retain v103 as promotion authority. Version-7 recovery gates
+may overlap older phase-adapter gates for supervised experiments; the staged
+evolution initializer still constructs them in order.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
