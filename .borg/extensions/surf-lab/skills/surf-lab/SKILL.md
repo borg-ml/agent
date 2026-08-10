@@ -890,6 +890,18 @@ by the same complete authentic-start CPU and in-game checks. Until that exists,
 keep v7002 and the corrected playback ordering unchanged; do not add ramp
 geometry inputs or claim parity from these ablations.
 
+A final bounded endpoint-adapter check also failed to move the authority. Three
+generations of antithetic CEM at the existing completion-adapter focus
+(episode tick 1700) screened eight ROCm candidates per generation and retained
+the parent in every exact route comparison. The GPU best stopped at reference
+tick 1882 while the parent also stopped at 1882, so the CPU promotion gate
+correctly skipped all non-novel candidates; the complete parent rerun remained
+reference tick 2083, 91.8226% progress, and no reset. The emitted diagnostic
+artifact has byte-identical weights to v7002 after removing only its evolution
+receipt. This exhausts the current endpoint-adapter/CEM family at the safe
+bound; a future improvement needs a new off-trajectory objective, not a wider
+batch or more endpoint mutations.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
