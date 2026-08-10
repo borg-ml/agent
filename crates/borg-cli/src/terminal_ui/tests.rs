@@ -218,6 +218,140 @@ fn live_late_user_completion_is_inserted_before_existing_turn_output() {
 }
 
 #[test]
+fn user_completion_after_interrupted_turn_stays_at_transcript_tail() {
+    let session_id = Uuid::new_v4();
+    let previous_user_id = Uuid::new_v4();
+    let previous_assistant_id = Uuid::new_v4();
+    let next_user_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::Message {
+            message_id: previous_user_id,
+            actor: EventActor::User,
+            text: "previous prompt".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: Some(PromptDelivery::Steer),
+        },
+    ));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::Message {
+            message_id: previous_assistant_id,
+            actor: EventActor::Assistant,
+            text: "interrupted response".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: None,
+        },
+    ));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        3,
+        SessionEventKind::TurnCompleted {
+            message_id: previous_user_id,
+            provider_session_id: None,
+            final_text: String::new(),
+            error: Some("turn interrupted".to_string()),
+        },
+    ));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        4,
+        SessionEventKind::Message {
+            message_id: next_user_id,
+            actor: EventActor::User,
+            text: "send after escape".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: Some(PromptDelivery::Steer),
+        },
+    ));
+
+    let actors = transcript
+        .order
+        .iter()
+        .filter_map(|entry| match entry {
+            TranscriptEntry::Message { actor, .. } => Some(*actor),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actors,
+        vec![EventActor::User, EventActor::Assistant, EventActor::User,]
+    );
+    assert_eq!(transcript.messages[&next_user_id], 2);
+}
+
+#[test]
+fn history_keeps_a_prompt_after_a_terminal_boundary_at_the_tail() {
+    let session_id = Uuid::new_v4();
+    let previous_user_id = Uuid::new_v4();
+    let next_user_id = Uuid::new_v4();
+    let events = vec![
+        SessionEvent::new(
+            session_id,
+            1,
+            SessionEventKind::Message {
+                message_id: previous_user_id,
+                actor: EventActor::User,
+                text: "previous prompt".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: Some(PromptDelivery::Steer),
+            },
+        ),
+        SessionEvent::new(
+            session_id,
+            2,
+            SessionEventKind::Message {
+                message_id: Uuid::new_v4(),
+                actor: EventActor::Assistant,
+                text: "interrupted response".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            },
+        ),
+        SessionEvent::new(
+            session_id,
+            3,
+            SessionEventKind::TurnCompleted {
+                message_id: previous_user_id,
+                provider_session_id: None,
+                final_text: String::new(),
+                error: Some("turn interrupted".to_string()),
+            },
+        ),
+        SessionEvent::new(
+            session_id,
+            4,
+            SessionEventKind::Message {
+                message_id: next_user_id,
+                actor: EventActor::User,
+                text: "send after escape".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: Some(PromptDelivery::Steer),
+            },
+        ),
+    ];
+
+    let history = transcript_history_in_display_order(&events);
+    assert_eq!(
+        history
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3, 4]
+    );
+}
+
+#[test]
 fn complete_user_messages_with_a_lifecycle_start_keep_event_order() {
     let session_id = Uuid::new_v4();
     let message_id = Uuid::new_v4();

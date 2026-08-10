@@ -1025,6 +1025,7 @@ impl Transcript {
                         && matches!(status, MessageStatus::Complete | MessageStatus::Failed)
                         && !queued
                         && event.sequence > 0
+                        && !self.live_turn_closed
                     {
                         self.late_user_message_insertion_index()
                     } else {

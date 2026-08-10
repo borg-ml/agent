@@ -6395,7 +6395,13 @@ fn transcript_history_in_display_order(events: &[SessionEvent]) -> Vec<SessionEv
         // assistant/tool output. Put that orphaned user boundary before the
         // visible turn output so a partial projection reads like the original
         // conversation instead of looking reversed.
-        if let Some(output_start) = turn.iter().position(transcript_turn_output) {
+        if turn.iter().any(transcript_turn_has_terminal_boundary) {
+            // A terminal boundary means this prompt was submitted after the
+            // previous turn ended. Keep it at the tail even when its own
+            // lifecycle start was not included in the projection.
+            ordered.append(&mut turn);
+            ordered.push(event.clone());
+        } else if let Some(output_start) = turn.iter().position(transcript_turn_output) {
             ordered.extend(turn.drain(..output_start));
             ordered.push(event.clone());
             ordered.append(&mut turn);
@@ -6418,6 +6424,20 @@ fn transcript_turn_output(event: &SessionEvent) -> bool {
         } | SessionEventKind::ReasoningDelta { .. }
             | SessionEventKind::ToolStarted { .. }
             | SessionEventKind::ToolCompleted { .. }
+    )
+}
+
+fn transcript_turn_has_terminal_boundary(event: &SessionEvent) -> bool {
+    matches!(
+        event.kind,
+        SessionEventKind::TurnCompleted { .. }
+            | SessionEventKind::StatusChanged {
+                status: SessionStatus::Ready
+                    | SessionStatus::Completed
+                    | SessionStatus::Failed
+                    | SessionStatus::Stopped,
+                ..
+            }
     )
 }
 
