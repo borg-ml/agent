@@ -666,6 +666,18 @@ action schedule or state memory. Retain v120 as the current neural route
 authority; it remains short of first-attempt completion and perturbation
 validation.
 
+Starting recovery at episode tick 1250 from v120 produced an 84-decision
+teacher that reached checkpoint 1475 and reset at demo tick 2156, 53 ticks
+before the first authentic attempt ends. The 256-wide screen ran at about
+86,000 GPU candidate ticks/second and the exact CPU shortlist at about 2,520
+ticks/second. A zero second phase adapter at tick 1250 reproduced v120
+exactly. Late-adapter fits using either nearest-authentic DAgger labels or the
+teacher's aligned next commands did not exceed checkpoint 1450 and reset no
+later than v120. `--action-rollout-trace` pairs each recovery command with its
+preceding visited state; use it only for bounded recovery teachers, while
+ordinary `--rollout-trace` inputs retain nearest-authentic labels. Retain v120
+after this non-promotion.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
