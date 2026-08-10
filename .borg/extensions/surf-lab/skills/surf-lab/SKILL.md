@@ -630,13 +630,18 @@ On Utopia, the 128-wide first-segment clone reset at demo tick 664/checkpoint
 DAgger rounds labelled only visited states using a ±64-tick phase window and
 advanced the exact CPU rollout through checkpoint/reset pairs `437/533`,
 `535/571`, `628/723`, then `980/1024`. A fifth round regressed to `633/707`,
-so retain the weights-only artifact
-`utopia-user-native-controller-v113-first-segment-dagger4.json`. It is a
-512x512 version-4 weights-only controller with `98.86%` offline movement
-agreement, `0.141°` yaw MAE, no action schedule, no state memory, and an
-independently reproduced checkpoint-980/reset-1024 rollout. This supersedes
-v103 for authentic ordered route progress, but it has not completed the first
-attempt or passed state/spawn perturbation tests.
+but a progress-first recovery teacher from v113 reached checkpoint 1215
+without resetting inside its 1000-tick supervision bound. Distilling that
+teacher together with the four successful visited-state rounds produced the
+512x512 ReLU v116 controller with `98.31%` offline movement agreement and
+`0.194°` yaw MAE. A bounded exact-CPU output-head mutation advanced it from
+checkpoint/reset `1340/1442` to `1343/1446`; an independent authentic-start
+rerun reproduced that result exactly. Retain the weights-only artifact
+`utopia-user-native-controller-v116-first-segment-recovery-dagger5.json`. It
+has no action schedule or state memory. A sixth round that appended v116's
+failure trace regressed to checkpoint/reset `726/753`, so do not promote it.
+V116 supersedes v113 and v103 for authentic ordered route progress, but it has
+not completed the first attempt or passed state/spawn perturbation tests.
 
 ## Native policy visualization
 
