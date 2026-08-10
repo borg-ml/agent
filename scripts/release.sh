@@ -188,10 +188,10 @@ prebumped_release_commit() {
 }
 
 run_release_checks() (
-  local repo_root test_tmp
-  repo_root="$(git rev-parse --show-toplevel)"
-  mkdir -p "$repo_root/target"
-  test_tmp="$(mktemp -d "$repo_root/target/borg-release-tests.XXXXXX")"
+  local test_tmp
+  # Keep the sandbox path short: borg-remote exposes Unix sockets below
+  # TMPDIR, whose platform limit is shorter than a repository-relative path.
+  test_tmp="$(mktemp -d /tmp/borg-release-tests.XXXXXX)"
   trap 'rm -rf -- "$test_tmp"' EXIT
   cargo fmt --all -- --check
   TMPDIR="$test_tmp" cargo test --workspace --locked
