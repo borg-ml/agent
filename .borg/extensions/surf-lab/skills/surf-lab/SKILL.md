@@ -1148,6 +1148,15 @@ survival. Keep all generated PPO variants as diagnostics and retain unchanged
 The pose-policy PPO path is now valid and well aligned, but needs a different
 closed-loop objective rather than another scale refinement of these directions.
 
+Surf commit `fdb9865` adds `--train-scope output`, freezing both hidden layers
+so PPO can update only the ordinary six-output head. This is still a single
+clean network, not an adapter. A 99,715-transition output-only update from
+`scale1e5` was screened from scale 0.001 through 0.032. The two smallest steps
+kept 993 CPU ticks but lost one route sample (893 instead of 894); larger steps
+reset around 733 ticks. This rejects excessive full-network degrees of freedom
+as the immediate cause for the failed directions. Do not promote any
+output-only variant; retain `scale1e5`.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
