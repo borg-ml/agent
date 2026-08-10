@@ -868,6 +868,28 @@ ablation should use visited-state/off-trajectory labels with history-aware
 trust-region training and full authentic-start CPU validation; explicit ramp
 geometry remains unsupported by the current failure evidence.
 
+The first history-aware off-trajectory probes did not meet that promotion bar.
+A 512-wide ReLU history policy fit directly from the state-memory teacher had
+excellent teacher-forced agreement (98.78% movement, 0.093 degrees yaw MAE),
+but its authentic-start closed-loop run reset at absolute demo tick 1916;
+packet policy-minus-exact error was mean 1.164, p99 9.921, with 94 of 590
+intervals above 2 Source units. Adding one rollout-trace DAgger pass made the
+result worse (reset at tick 597; mean 1.475, p99 12.441, 122 intervals over
+2). Trust-region scales of 0.1 and 0.01 also regressed, resetting at ticks 809
+and 503 respectively (means 2.139 and 1.233). None of these diagnostic
+artifacts was promoted, and v7002 remains the no-reset 91.8227% authority.
+
+The current focused search implementation also rejects this policy class:
+`policy.evolve-native` requires `history_features=false` whenever
+`gpu_focus_episode_tick` is nonzero, and its exact CPU focus screen has the
+same requirement. An attempted history-focused call therefore produced no
+artifact and the worker exited before returning a result; do not repeat it as
+if it were a valid search. Supporting a useful history-aware objective now
+requires an explicit state-dependent/off-trajectory implementation, followed
+by the same complete authentic-start CPU and in-game checks. Until that exists,
+keep v7002 and the corrected playback ordering unchanged; do not add ramp
+geometry inputs or claim parity from these ablations.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
