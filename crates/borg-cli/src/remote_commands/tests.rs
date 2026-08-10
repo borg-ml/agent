@@ -843,6 +843,7 @@ fn reinstalling_the_remote_host_restarts_it_on_the_new_binary() {
     );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn isolated_remote_host_service_is_fail_closed_and_sandboxed() {
     let config = HostConfig {
