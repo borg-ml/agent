@@ -813,6 +813,16 @@ matched all 1,969 headless state bits, did not reset, and accumulated at most
 5.67 Source units of floating-point position drift. This fixes the observed
 post-ramp-3 pirouette without changing the network or adding geometry features.
 
+After that playback fix, v7002's remaining headless error is ordinary controller
+drift rather than another ramp contact failure. Against the exact-command
+continuous trajectory, its first sustained yaw error over 10 degrees begins at
+episode tick 1052 (demo tick 1292), and its world-space wish direction remains
+over 25 degrees wrong from episode tick 1150 (demo tick 1390). It still runs the
+full span without resetting, but finishes nearest demo tick 2073 and about 5,983
+Source units from the authentic end. Localize any next correction to episode
+ticks 1050--1150; do not add geometry features or widen later adapters without
+evidence that this measured command drift requires them.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
