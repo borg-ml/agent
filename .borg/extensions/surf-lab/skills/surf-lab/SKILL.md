@@ -1589,6 +1589,47 @@ semantics and keep nominal advancement separate from perturbation recovery in
 both critic validation and promotion. The 704-wide stage-3 policy remains the
 clean authority.
 
+Surf commit `2bc35db` turns that probe into a persistent off-policy training
+loop. `policy.collect-native-ppo` now has an opt-in `route-time` reward: ordered
+route distance earns reward, every simulated tick pays a cost, and
+`stall_ticks` ends a no-progress trajectory instead of rewarding it for staying
+alive. `exploration_ticks` limits action noise to an initial control window and
+then returns control to the frozen actor for continuation scoring. CPU and ROCm
+share the same reward, stall, and continuation contract. An 8x64 route-time
+differential had identical rewards, route indices, and terminal decisions; a
+separate autocorrelated 8x64 continuation check had identical aggregate
+results, including three stall terminations.
+
+`tools/train_native_sac_gpu.py` now supports multi-step targets, persistent
+actor/critic/optimizer checkpoints, conservative TD3+BC and advantage-weighted
+actor objectives, and explicit matched-rollout actor eligibility. Critics may
+learn from the complete replay while the actor sees only trajectories proven
+better than their deterministic control. Checkpoint resume requires the input
+policy to reproduce the saved actor exactly. The deployed artifact remains one
+ordinary phase-free network; critics, normalization, replay, and optimizer
+state are training-only.
+
+Three compositor-safe 32x256 ROCm batches collected 19,500 route-time
+transitions in under one second per batch and covered authentic starts through
+route index 1710. Plain SAC and TD3+BC made large off-distribution actor moves
+and failed GPU validation. Persistent advantage-weighted regression kept the
+maximum prefix delta below `0.0048` and slightly improved matched local GPU
+reward, but exact full-start CPU playback reset at absolute tick 979. Do not
+promote it.
+
+The prefix-inactive 736-wide bank then held the first 1,100 CPU ticks exactly.
+Paired exact-CPU continuation scoring found only two noisy rollouts that
+improved both route and survival. Training only on those globally valid
+continuations still regressed the full-start GPU route, while broader matched
+training produced GPU gains that exact CPU rejected: route 1219 or 1217 versus
+the unchanged parent's 1222 at the same reset tick 1589. This closes the fourth
+absolute-pose bank under SAC, TD3+BC, unfiltered AWR, matched local AWR, and
+globally continued AWR. Retain
+`utopia-user-native-clean-capacity192-stage3-teacher-centered-v1.json` as the
+clean authority. The next architecture should use the already-verified
+`native_route_continuous_v3` path geometry and actor-visited collection rather
+than another absolute-pose suffix or scale sweep.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
