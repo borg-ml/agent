@@ -389,6 +389,7 @@ struct PooledCodexProcess {
     lines: tokio::io::Lines<BufReader<ChildStdout>>,
     stderr: Arc<Mutex<Vec<u8>>>,
     thread_id: String,
+    rollout_path: Option<PathBuf>,
     next_request_id: u64,
 }
 
@@ -1268,6 +1269,7 @@ async fn start_pooled_codex_process(
         .and_then(Value::as_str)
         .context("Codex app server did not return a thread id")?
         .to_string();
+    let rollout_path = codex_thread_rollout_path(&thread_response);
 
     Ok(StartedCodexProcess {
         process: PooledCodexProcess {
@@ -1276,6 +1278,7 @@ async fn start_pooled_codex_process(
             lines,
             stderr: stderr_buffer,
             thread_id,
+            rollout_path,
             next_request_id,
         },
         resumed,
@@ -1320,6 +1323,7 @@ async fn run_pooled_codex_turn(
     let mut turn_completed = false;
     let mut turn_status = None;
     let mut reasoning_state = CodexReasoningState::default();
+    let mut compaction_capture = CodexCompactionCapture::new(process.rollout_path.clone());
 
     loop {
         tokio::select! {
@@ -1344,7 +1348,7 @@ async fn run_pooled_codex_turn(
                     }
                     continue;
                 }
-                emit_provider_event(events, &value).await;
+                emit_provider_event(events, &value, &mut compaction_capture).await;
                 observe_codex_output_event(
                     events,
                     &value,
@@ -1545,6 +1549,7 @@ async fn run_codex_subscription_process(
         .and_then(Value::as_str)
         .context("Codex app server did not return a thread id")?
         .to_string();
+    let rollout_path = codex_thread_rollout_path(&thread_response);
 
     let turn_request_id = 3;
     write_codex_request(
@@ -1575,6 +1580,7 @@ async fn run_codex_subscription_process(
     let mut turn_completed = false;
     let mut turn_status = None;
     let mut reasoning_state = CodexReasoningState::default();
+    let mut compaction_capture = CodexCompactionCapture::new(rollout_path);
 
     loop {
         tokio::select! {
@@ -1603,7 +1609,7 @@ async fn run_codex_subscription_process(
                     }
                     continue;
                 }
-                emit_provider_event(&events, &value).await;
+                emit_provider_event(&events, &value, &mut compaction_capture).await;
                 observe_codex_output_event(
                     &events,
                     &value,
@@ -1876,6 +1882,9 @@ fn codex_thread_start_params(
         // visible progress/commentary between tool calls. Replacing them made
         // long Codex turns collapse to reasoning + tools with no narration.
         "developerInstructions": request.system_prompt,
+        // ContextCompaction only carries an id. Raw response items expose the
+        // generated local summary so Borg can checkpoint it before a crash.
+        "experimentalRawEvents": true,
     });
     if permission == LocalAgentPermission::Auto {
         params["approvalsReviewer"] = Value::String("auto_review".to_string());
@@ -1909,6 +1918,8 @@ fn codex_thread_resume_params(
         .as_object_mut()
         .expect("Codex thread parameters are always an object");
     object.remove("ephemeral");
+    // Codex currently exposes raw response events on thread/start only.
+    object.remove("experimentalRawEvents");
     object.insert("threadId".to_string(), Value::String(thread_id.to_string()));
     // Borg already owns and renders the durable transcript. Avoid returning a
     // potentially enormous duplicate turn array just to reopen the thread.
@@ -2103,14 +2114,131 @@ async fn receive_control(
     controls.as_mut()?.recv().await
 }
 
-async fn emit_provider_event(events: &mpsc::Sender<ChatStreamEvent>, value: &Value) {
+#[derive(Debug, Default)]
+struct CodexCompactionCapture {
+    item_id: Option<String>,
+    summary: String,
+    rollout_path: Option<PathBuf>,
+}
+
+impl CodexCompactionCapture {
+    fn new(rollout_path: Option<PathBuf>) -> Self {
+        Self {
+            rollout_path,
+            ..Self::default()
+        }
+    }
+
+    async fn observe(&mut self, value: &Value) -> Option<Value> {
+        let kind = codex_event_kind(value)?.replace('.', "/");
+        if kind == "item/started"
+            && codex_event_item(value).is_some_and(codex_item_is_context_compaction)
+        {
+            self.item_id = codex_event_item(value).map(codex_item_id);
+            self.summary.clear();
+            return None;
+        }
+        if kind == "rawResponseItem/completed" && self.item_id.is_some() {
+            if let Some(text) = codex_raw_assistant_message(value) {
+                if !self.summary.is_empty() {
+                    self.summary.push('\n');
+                }
+                self.summary.push_str(&text);
+            }
+            return None;
+        }
+        if kind != "item/completed" {
+            return None;
+        }
+        let item = codex_event_item(value)?;
+        if !codex_item_is_context_compaction(item)
+            || self.item_id.as_deref() != Some(codex_item_id(item).as_str())
+        {
+            return None;
+        }
+        let item_id = self.item_id.take()?;
+        let mut summary = std::mem::take(&mut self.summary).trim().to_string();
+        if summary.is_empty()
+            && let Some(path) = self.rollout_path.clone()
+        {
+            summary =
+                tokio::task::spawn_blocking(move || read_latest_codex_compaction_summary(&path))
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .flatten()
+                    .unwrap_or_default();
+        }
+        if summary.is_empty() {
+            tracing::warn!(
+                item_id,
+                "Codex completed context compaction without an observable summary"
+            );
+            return None;
+        }
+        Some(serde_json::json!({
+            "status": "completed",
+            "summary": summary,
+            "provider_item_id": item_id,
+        }))
+    }
+}
+
+fn read_latest_codex_compaction_summary(path: &Path) -> Result<Option<String>> {
+    use std::io::BufRead;
+
+    let reader = std::io::BufReader::new(
+        std::fs::File::open(path)
+            .with_context(|| format!("failed to open Codex rollout {}", path.display()))?,
+    );
+    let mut summary = None;
+    for line in reader.lines() {
+        let line = line?;
+        if !line.contains("\"type\":\"compacted\"") {
+            continue;
+        }
+        let value: Value = serde_json::from_str(&line)?;
+        if let Some(message) = value.pointer("/payload/message").and_then(Value::as_str) {
+            summary = Some(message.to_string());
+        }
+    }
+    Ok(summary)
+}
+
+fn codex_raw_assistant_message(value: &Value) -> Option<String> {
+    let item = value.pointer("/params/item")?;
+    if item.get("type").and_then(Value::as_str) != Some("message")
+        || item.get("role").and_then(Value::as_str) != Some("assistant")
+    {
+        return None;
+    }
+    let text = item
+        .get("content")?
+        .as_array()?
+        .iter()
+        .filter_map(|content| content.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("");
+    (!text.is_empty()).then_some(text)
+}
+
+async fn emit_provider_event(
+    events: &mpsc::Sender<ChatStreamEvent>,
+    value: &Value,
+    compaction: &mut CodexCompactionCapture,
+) {
     let raw_kind = codex_event_kind(value).unwrap_or("event");
-    let kind = codex_subscription_event_kind(value, raw_kind);
+    let compaction_checkpoint = compaction.observe(value).await;
+    let kind = compaction_checkpoint.as_ref().map_or_else(
+        || codex_subscription_event_kind(value, raw_kind),
+        |_| "context_compaction".to_string(),
+    );
+    let payload = compaction_checkpoint.unwrap_or_else(|| value.clone());
     let item = codex_event_item(value);
     events
         .send(ChatStreamEvent::ProviderEvent {
             kind,
-            payload: value.clone(),
+            payload,
             raw_payload: Some(value.clone()),
             stream_channel: Some(
                 item.and_then(|item| item.get("type"))
@@ -2405,6 +2533,12 @@ async fn observe_codex_output_event(
 
 fn codex_item_type(item: &Value) -> &str {
     item.get("type").and_then(Value::as_str).unwrap_or("")
+}
+
+fn codex_item_is_context_compaction(item: &Value) -> bool {
+    codex_item_type(item)
+        .replace(['_', '-'], "")
+        .eq_ignore_ascii_case("contextcompaction")
 }
 
 fn codex_item_id(item: &Value) -> String {
@@ -2781,6 +2915,15 @@ fn codex_event_item(value: &Value) -> Option<&Value> {
     value.get("item").or_else(|| value.pointer("/params/item"))
 }
 
+fn codex_thread_rollout_path(value: &Value) -> Option<PathBuf> {
+    value
+        .pointer("/result/thread/path")
+        .or_else(|| value.pointer("/thread/path"))
+        .and_then(Value::as_str)
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+}
+
 fn event_session_id(value: &Value) -> Option<String> {
     [
         "/session_id",
@@ -3107,6 +3250,10 @@ mod tests {
         assert_eq!(
             codex_config.get("developerInstructions"),
             Some(&Value::String("system".to_string()))
+        );
+        assert_eq!(
+            codex_config.get("experimentalRawEvents"),
+            Some(&Value::Bool(true))
         );
         assert!(codex_config.get("baseInstructions").is_none());
         let codex_auto_config = codex_thread_start_params(&request, LocalAgentPermission::Auto);
@@ -3636,6 +3783,7 @@ mod tests {
         assert_eq!(params.get("threadId"), Some(&Value::from("thread-1")));
         assert_eq!(params.get("excludeTurns"), Some(&Value::Bool(true)));
         assert!(params.get("ephemeral").is_none());
+        assert!(params.get("experimentalRawEvents").is_none());
         assert_eq!(
             params.get("developerInstructions"),
             Some(&Value::from("Borg policy"))
@@ -3660,6 +3808,73 @@ mod tests {
             codex_subscription_event_kind(&value, "item.completed"),
             "item/completed:command_execution"
         );
+    }
+
+    #[tokio::test]
+    async fn codex_compaction_summary_becomes_a_canonical_checkpoint() {
+        let mut capture = CodexCompactionCapture::default();
+        assert!(
+            capture
+                .observe(&serde_json::json!({
+                    "method": "item/started",
+                    "params": {"item": {"id": "compact-1", "type": "contextCompaction"}}
+                }))
+                .await
+                .is_none()
+        );
+        assert!(
+            capture
+                .observe(&serde_json::json!({
+                    "method": "rawResponseItem/completed",
+                    "params": {"item": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "durable summary"}]
+                    }}
+                }))
+                .await
+                .is_none()
+        );
+        let checkpoint = capture
+            .observe(&serde_json::json!({
+                "method": "item/completed",
+                "params": {"item": {"id": "compact-1", "type": "contextCompaction"}}
+            }))
+            .await
+            .expect("canonical compaction checkpoint");
+        assert_eq!(checkpoint["status"], "completed");
+        assert_eq!(checkpoint["summary"], "durable summary");
+        assert_eq!(checkpoint["provider_item_id"], "compact-1");
+    }
+
+    #[tokio::test]
+    async fn resumed_codex_compaction_reads_the_persisted_rollout_checkpoint() {
+        let directory = tempfile::tempdir().unwrap();
+        let rollout = directory.path().join("rollout.jsonl");
+        std::fs::write(
+            &rollout,
+            concat!(
+                "{\"timestamp\":\"before\",\"type\":\"compacted\",\"payload\":{\"message\":\"older summary\"}}\n",
+                "{\"timestamp\":\"after\",\"type\":\"compacted\",\"payload\":{\"message\":\"resumed summary\"}}\n"
+            ),
+        )
+        .unwrap();
+        let mut capture = CodexCompactionCapture::new(Some(rollout));
+        capture
+            .observe(&serde_json::json!({
+                "method": "item/started",
+                "params": {"item": {"id": "compact-2", "type": "contextCompaction"}}
+            }))
+            .await;
+        let checkpoint = capture
+            .observe(&serde_json::json!({
+                "method": "item/completed",
+                "params": {"item": {"id": "compact-2", "type": "contextCompaction"}}
+            }))
+            .await
+            .expect("rollout-backed compaction checkpoint");
+
+        assert_eq!(checkpoint["summary"], "resumed summary");
     }
 
     #[tokio::test]

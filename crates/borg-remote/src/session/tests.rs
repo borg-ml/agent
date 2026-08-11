@@ -7430,6 +7430,195 @@ async fn resumed_codex_checkpoint_avoids_large_replay_compaction_after_actor_res
 }
 
 #[tokio::test]
+async fn crash_resume_replays_native_compaction_without_subagent_inflation() {
+    let root = tempdir().unwrap();
+    let journal_path = root.path().join("session.lock");
+    let session_id = Uuid::new_v4();
+    let completed_id = Uuid::new_v4();
+    let interrupted_id = Uuid::new_v4();
+    let child_id = Uuid::new_v4();
+    let now = chrono::Utc::now();
+    let kinds = vec![
+        SessionEventKind::SessionStarted,
+        SessionEventKind::SessionConfigured {
+            cwd: root.path().to_path_buf(),
+            provider: CodingProvider::Codex,
+            model: Some("gpt-5.6-sol".to_string()),
+            effort: Some("xhigh".to_string()),
+            fast: false,
+            response_language: crate::ResponseLanguage::Auto,
+            permission_mode: PermissionMode::Manual,
+        },
+        SessionEventKind::Message {
+            message_id: completed_id,
+            actor: EventActor::User,
+            text: "old-user-context".repeat(30_000),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: Some(PromptDelivery::Queue),
+        },
+        SessionEventKind::TurnStarted {
+            message_id: completed_id,
+            provider: CodingProvider::Codex,
+            model: Some("gpt-5.6-sol".to_string()),
+            effort: Some("xhigh".to_string()),
+            fast: false,
+        },
+        SessionEventKind::Message {
+            message_id: Uuid::new_v4(),
+            actor: EventActor::Assistant,
+            text: "old-assistant-context".repeat(30_000),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: None,
+        },
+        SessionEventKind::TurnCompleted {
+            message_id: completed_id,
+            provider_session_id: Some("pre-compaction-thread".to_string()),
+            final_text: "done".to_string(),
+            error: None,
+        },
+        SessionEventKind::ProviderEvent {
+            provider: CodingProvider::Codex,
+            kind: "context_compaction".to_string(),
+            payload: json!({
+                "status": "completed",
+                "summary": "the exact compacted semantic checkpoint"
+            }),
+        },
+        SessionEventKind::SubagentActivity {
+            activity: SubagentActivityKind::Stopped,
+            agent: crate::SubagentSnapshot {
+                session_id: child_id,
+                parent_session_id: session_id,
+                task_name: "/root/historical_agent".to_string(),
+                status: crate::SubagentStatus::Stopped,
+                provider: CodingProvider::Codex,
+                model: Some("gpt-5.6-sol".to_string()),
+                effort: Some("xhigh".to_string()),
+                cwd: root.path().to_path_buf(),
+                created_at: now,
+                updated_at: now,
+                detail: Some("historical agent card".repeat(20_000)),
+                final_text: Some("historical agent output".repeat(20_000)),
+                usage: Default::default(),
+            },
+            event: None,
+        },
+        SessionEventKind::Message {
+            message_id: interrupted_id,
+            actor: EventActor::User,
+            text: "recover the active request".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::InProgress,
+            delivery: Some(PromptDelivery::Queue),
+        },
+        SessionEventKind::TurnStarted {
+            message_id: interrupted_id,
+            provider: CodingProvider::Codex,
+            model: Some("gpt-5.6-sol".to_string()),
+            effort: Some("xhigh".to_string()),
+            fast: false,
+        },
+        SessionEventKind::UsageUpdated {
+            provider_duration_ms: 1,
+            turn_id: Some(interrupted_id),
+            provider_context_reused: Some(true),
+            input_tokens: 99_000,
+            output_tokens: 1_000,
+            cached_input_tokens: 90_000,
+            cache_creation_input_tokens: 0,
+            total_tokens: 100_000,
+            cost_microusd: None,
+            cost_basis: String::new(),
+            cost_usd: None,
+            context_tokens: Some(100_000),
+            context_window_tokens: Some(258_400),
+        },
+        SessionEventKind::StatusChanged {
+            status: SessionStatus::Running,
+            detail: Some("provider active when host crashed".to_string()),
+        },
+    ];
+    let before_crash = kinds
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(index, kind)| SessionEvent::new(session_id, index as u64 + 1, kind))
+        .collect::<Vec<_>>();
+    let retained_before_crash = retained_conversation_context(&before_crash).unwrap();
+    assert!(!retained_before_crash.contains("old-user-context"));
+    assert!(!retained_before_crash.contains("historical agent"));
+
+    let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+        .await
+        .unwrap();
+    store.create_session(session_id).await.unwrap();
+    for event in before_crash {
+        store.append(event).await.unwrap();
+    }
+
+    let (command_tx, command_rx) = mpsc::channel(8);
+    let (event_tx, _event_rx) = mpsc::channel(64);
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let called = Arc::new(Notify::new());
+    let compaction_calls = Arc::new(AtomicUsize::new(0));
+    let executor = Arc::new(DurableResumeExecutor {
+        seen: Arc::clone(&seen),
+        called: Arc::clone(&called),
+        compaction_calls: Arc::clone(&compaction_calls),
+    });
+    let actor = tokio::spawn(async move {
+        run_agent_session_with_executor(
+            &journal_path,
+            session_id,
+            LaunchSession {
+                request_id: Uuid::new_v4(),
+                cwd: root.path().to_path_buf(),
+                provider: CodingProvider::Codex,
+                model: Some("gpt-5.6-sol".to_string()),
+                effort: Some("xhigh".to_string()),
+                fast: Some(false),
+                response_language: crate::ResponseLanguage::Auto,
+                permission_mode: PermissionMode::Manual,
+                name: None,
+                initial_prompt: None,
+                capabilities: Default::default(),
+                subagent_concurrency_limit: None,
+                extension_skill_roots: Vec::new(),
+                team_policy: None,
+            },
+            command_rx,
+            event_tx,
+            executor,
+        )
+        .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(5), called.notified())
+        .await
+        .expect("recovered turn starts without another compaction");
+    command_tx
+        .send(HostCommand::Stop { session_id })
+        .await
+        .unwrap();
+    actor.await.unwrap().unwrap();
+
+    assert_eq!(compaction_calls.load(Ordering::Acquire), 0);
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(
+        seen[0].0,
+        format_subscription_provider_prompt(
+            Some(&retained_before_crash),
+            EventActor::User,
+            "recover the active request"
+        )
+    );
+    assert_eq!(seen[0].1, None);
+}
+
+#[tokio::test]
 async fn acknowledged_codex_escape_does_not_compact_a_reusable_large_context() {
     let root = tempdir().unwrap();
     let journal_path = root.path().join("session.lock");
