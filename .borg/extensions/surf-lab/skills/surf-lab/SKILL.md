@@ -24,7 +24,8 @@ The environment exposes `start`, `step`, `observe`, `trace`, `log`, `branch`,
 `compare`, `native.inspect`, `native.sweep`, `native.audit`, `replay.audit`,
 `policy.train`, `policy.train-native`, `policy.inspect`, `policy.compare`,
 `policy.compare-native`, `policy.track`, `policy.correct`, `policy.evolve`,
-`policy.evolve-native`, `map.generate`, `map.inspect`, `map.preview`,
+`policy.evolve-native`, `policy.recover-native`, `policy.collect-native-ppo`,
+`map.generate`, `map.inspect`, `map.preview`,
 `map.route`, `map.export`, and `config`. Keep the returned session id in the persistent
 namespace. Use `step` with bounded batches, save the observations, branch at a
 specific tick, apply a counterfactual command to the branch, and compare the
@@ -1317,6 +1318,59 @@ continuous route projection plus an explicit local-sensitivity/contractive
 objective. Add ramp normals or recurrence only if that smooth controller still
 shows observation ambiguity; do not add clocks, schedules, lookup memory, or
 per-ramp adapters.
+
+Surf commit `b1e6e40` implements that minimal architecture change as feature
+schema `native_route_continuous_v3`. The controller now carries fractional
+progress on the demonstrated polyline and interpolates route position,
+tangent, and short/long lookahead geometry instead of snapping observations to
+integer samples. The tracker retains the v2 safety contract: forward-only,
+eight samples maximum per observation, admitted route arc no greater than four
+times physical displacement, no advance without movement, and no backward
+jump. CPU playback, focused-state capture, the PPO collector, and HIP all carry
+the fractional value explicitly. PPO transition rows contain both post-step
+`route_progress` and pre-action `observation_route_progress`.
+
+Keep controller geometry separate from scoring geometry on GPU. HIP now has a
+dedicated Source-unit copy of the artifact's `route_points` for neural features
+and controller progress; the authoritative native route remains the only
+reward/completion route. Using the scorer's points for both was a real transfer
+bug even when the two routes looked nominally identical. CPU and GPU stochastic
+collection also key the initial perturbation by `(seed, rollout)` and action
+noise by `(seed, rollout, exploration block)`, so batching order cannot change
+the experiment.
+
+The short-horizon transfer proof used 32 authentic starts with eight stochastic
+steps each. CPU and ROCm had zero route-index, reset, terminal, or completion
+mismatches. Maximum feature, mean, action, reward, and fractional-progress
+errors were `0.0003353`, `0.0004596`, `0.0004411`, `0.0001221`, and `0.00183`.
+A desktop-safe 256x32 authentic batch ran at about 25,600 candidate ticks per
+second; 256-wide policy-prefix batches measured about 22k--30k. Continue using
+ROCm for wide short-horizon collection/search, but require an exact full-start
+CPU rollout for promotion.
+
+The first bounded v3 sequence produced a real but incomplete gain. A fresh
+controller (`r1`) reached route sample 196 and reset after 271 episode ticks.
+Authentic plus policy-visited GPU supervision produced `r2`, route 392 and 457
+ticks. A 256-wide, 128-tick recovery teacher screened 1.64 million GPU candidate
+ticks and 105,216 exact CPU shortlist ticks, reaching route 433 over 471 ticks.
+Output-head-only distillation at a 10% trust step produced the current best
+artifact,
+`utopia-user-native-route-continuous-recovery-r4-output-s010.json`: exact CPU
+route sample 485 and reset after 500 episode ticks. It is one 256-wide,
+history-enabled, phase-free neural network with no action schedule, state
+memory, gated adapter, replay clock, or per-ramp branch. This is only about
+24.6% of the 1,969-sample route and is not map completion.
+
+Promote only when both exact-CPU ordered progress and survival improve. A
+second local recovery pass from that best artifact regressed to route 324/345
+ticks, and a PPO-only output update reset after 292 ticks. These failures show
+that the next bottleneck is long-horizon teacher credit and teacher-to-policy
+distribution shift: locally optimal receding-horizon commands can destroy the
+global line. Do not widen the same MPC/PPO search, add ramp-specific rules, or
+blame the ordinary floor reset without new evidence. Add ramp normals or
+recurrence only if a state-ambiguity audit of v3 finds conflicting actions;
+otherwise keep the single generalized network and build a globally non-myopic
+teacher or rollout objective around the verified v3 state contract.
 
 ## Native policy visualization
 
