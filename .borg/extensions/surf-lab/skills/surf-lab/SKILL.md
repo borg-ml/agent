@@ -1468,6 +1468,27 @@ but reset one tick earlier. Its trace is diagnostic supervision only, not a
 controller promotion; the stronger coherent `1232/+19` suffix bound remains
 the relevant teacher evidence.
 
+Surf commit `d002024` adds an opt-in common-random-number robustness objective
+to the exact CPU focus screen. Set `cpu_focus_perturbations` to an odd value
+above one and provide at least one of `cpu_focus_position_noise`,
+`cpu_focus_velocity_noise_fraction`, or `cpu_focus_yaw_noise_degrees`. Every
+candidate then receives the same nominal state and deterministic antithetic
+perturbation pairs, and candidates rank by their worst exact-CPU route progress
+and survival. The receipt counts every scenario tick. The prefix-inactivity
+proof and strict complete-start CPU promotion gate are unchanged; ROCm remains
+diagnostic.
+
+On this desktop, explicitly keep `gpu_population` at or below 32 for subsequent
+controller work and do not overlap ROCm search with rendering. A compositor
+failure previously coincided with a long 256-wide batch. The robust 8- and
+32-candidate checks used 0.60 and 1.07 seconds of GPU time, returned to 1% idle
+and 6% VRAM, and left the junction at 58--61 C. The 32-wide exact-CPU screen
+used three shared scenarios and found all candidates tied at route 1222; its
+search-only center improved a reset-penetration tie-break but reproduced the
+same full-start route and reset. It is not promoted. Keep
+`utopia-user-native-clean-capacity192-stage3-teacher-centered-v1.json` as the
+clean controller authority.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
