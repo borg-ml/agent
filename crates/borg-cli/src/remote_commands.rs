@@ -2189,13 +2189,11 @@ async fn run_local_agent_session(
                     {
                         Ok(()) => {
                             stale_local_owner = false;
-                            if let Some(terminal) = terminal.as_mut() {
-                                terminal.set_notice(
-                                    "Turn finished · restarting this session on the current Borg build"
-                                        .to_string(),
-                                );
-                                terminal_dirty = true;
-                            }
+                            // Re-enter the same durable session with the
+                            // existing terminal instead of tearing down the
+                            // screen and making an automatic build handoff
+                            // look like a user-requested resume.
+                            resume_session = Some(session_id);
                         }
                         Err(error) => {
                             tracing::warn!(%error, %session_id, "could not replace obsolete local session owner");

@@ -130,6 +130,40 @@ fn older_root_history_hides_agent_cards_and_preserves_authoritative_roster_state
 }
 
 #[test]
+fn bootstrap_subagent_recovery_updates_do_not_become_root_cards() {
+    let agent = SubagentSnapshot {
+        session_id: Uuid::new_v4(),
+        parent_session_id: Uuid::new_v4(),
+        task_name: "/root/recovered_worker".to_string(),
+        status: SubagentStatus::Ready,
+        provider: CodingProvider::Codex,
+        model: Some("gpt-test".to_string()),
+        effort: Some("high".to_string()),
+        cwd: PathBuf::from("/workspace"),
+        detail: Some("follow up to wake".to_string()),
+        final_text: Some("recovered report".to_string()),
+        usage: borg_remote::SubagentUsage::default(),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    let recovery = SessionEventKind::SubagentActivity {
+        activity: SubagentActivityKind::Completed,
+        agent,
+        event: None,
+    };
+
+    assert!(should_suppress_root_subagent_activity(true, &recovery));
+    assert!(!should_suppress_root_subagent_activity(false, &recovery));
+    assert!(!should_suppress_root_subagent_activity(
+        true,
+        &SessionEventKind::StatusChanged {
+            status: SessionStatus::Ready,
+            detail: None,
+        },
+    ));
+}
+
+#[test]
 fn fork_history_moves_a_late_user_completion_before_the_response() {
     let session_id = Uuid::new_v4();
     let message_id = Uuid::new_v4();

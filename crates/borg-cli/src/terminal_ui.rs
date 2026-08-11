@@ -635,6 +635,10 @@ pub struct BorgTerminal {
     child_statuses: HashMap<Uuid, SessionStatus>,
     child_active_since: HashMap<Uuid, DateTime<Utc>>,
     child_pending_approvals: HashSet<Uuid>,
+    /// Startup recovery can publish child-state corrections after the root
+    /// history has already been seeded. Keep those corrections in the roster
+    /// and child projections, but do not turn them into root transcript cards.
+    suppress_bootstrap_subagent_activity: bool,
     focused_child: Option<Uuid>,
     sidecar_focus_request: Option<String>,
     team_switcher_open: bool,
@@ -1567,6 +1571,7 @@ impl BorgTerminal {
             child_statuses: HashMap::new(),
             child_active_since: HashMap::new(),
             child_pending_approvals: HashSet::new(),
+            suppress_bootstrap_subagent_activity: true,
             focused_child: None,
             sidecar_focus_request: None,
             team_switcher_open: false,
@@ -1687,6 +1692,7 @@ impl BorgTerminal {
         self.child_statuses.clear();
         self.child_active_since.clear();
         self.child_pending_approvals.clear();
+        self.suppress_bootstrap_subagent_activity = true;
         self.focused_child = None;
         self.sidecar_focus_request = None;
         self.team_switcher_open = false;
@@ -2063,6 +2069,26 @@ impl BorgTerminal {
     }
 
     pub fn apply_session_event(&mut self, event: &SessionEvent) -> bool {
+        if !self.replaying_history
+            && matches!(
+                event.kind,
+                SessionEventKind::StatusChanged {
+                    status: SessionStatus::Ready
+                        | SessionStatus::Running
+                        | SessionStatus::WaitingForApproval,
+                    ..
+                }
+            )
+        {
+            // The first live lifecycle boundary ends startup recovery. Any
+            // child activity after it is a real update from this run and may
+            // appear as a root action card.
+            self.suppress_bootstrap_subagent_activity = false;
+        }
+        let suppress_root_subagent_activity = should_suppress_root_subagent_activity(
+            self.suppress_bootstrap_subagent_activity,
+            &event.kind,
+        );
         if let SessionEventKind::SubagentControl {
             outcome: borg_remote::SubagentControlOutcome::Accepted { agent },
             ..
@@ -2171,9 +2197,17 @@ impl BorgTerminal {
                 .as_deref_mut()
                 .unwrap_or(&mut self.transcript);
             let entries_before = transcript.order.len();
-            let changed =
-                focused_child_transcript_changed || session_event_changes_transcript(&event.kind);
-            let removed_entry = transcript.apply(event);
+            let changed = focused_child_transcript_changed
+                || (!suppress_root_subagent_activity
+                    && session_event_changes_transcript(&event.kind));
+            let removed_entry = if suppress_root_subagent_activity {
+                if let SessionEventKind::SubagentActivity { agent, .. } = &event.kind {
+                    transcript.upsert_subagent_snapshot(agent);
+                }
+                None
+            } else {
+                transcript.apply(event)
+            };
             (
                 removed_entry,
                 changed || transcript.order.len() != entries_before,
@@ -7535,6 +7569,13 @@ fn session_event_changes_transcript(kind: &SessionEventKind) -> bool {
         | SessionEventKind::TurnCompleted { .. }
         | SessionEventKind::Error { .. } => true,
     }
+}
+
+fn should_suppress_root_subagent_activity(
+    bootstrap_recovery_pending: bool,
+    kind: &SessionEventKind,
+) -> bool {
+    bootstrap_recovery_pending && matches!(kind, SessionEventKind::SubagentActivity { .. })
 }
 
 fn context_compaction_started(kind: &str, payload: &serde_json::Value) -> bool {
