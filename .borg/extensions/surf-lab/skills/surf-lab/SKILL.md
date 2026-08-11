@@ -1200,6 +1200,50 @@ CPU promotion at every screened scale from 0.001 through 0.032; the best scale
 reached route 278 over 663 ticks, below v8's route 303 over 710 ticks. Retain
 v8 as the route-relative PPO parent and do not promote these variants.
 
+Surf commit `6fcb383` adds temporally coherent exploration without changing a
+deployed policy. `exploration_hold_ticks` holds one sampled continuous-action
+residual for up to 64 suffix ticks in both the ROCm and CPU collectors. Values
+above one are explicitly rejected by the PPO trainer because the samples are
+correlated and their independent-action likelihood would be invalid. CPU and
+GPU use the same counter-based normal samples for held exploration, while the
+default one-tick CPU sampler retains its prior behavior.
+
+This resolved an important exploration failure around the clean `scale1e5`
+controller. From its exact episode-tick-800 state, an otherwise identical
+desktop-safe 256x256 one-tick-noise control reached only route index 884. With
+32-tick residuals, movement standard deviation 0.1, yaw standard deviation
+0.04, and pitch standard deviation 0.004, the top three trajectories instead
+reached route indices 960, 955, and 944; all three survived the complete
+256-tick suffix and 20 candidates exceeded the frozen parent's route-894
+ceiling. An exact CPU rerun reproduced those top route and survival results.
+Across all 256
+candidates, CPU/GPU reset classification was identical, route disagreement was
+at most one sample, and termination timing differed by at most six ticks. A
+separate nonzero-noise 8x64 differential matched every route index and terminal
+flag, with maximum reward error `4.65e-6`, feature error `2.39e-4`, and policy
+mean/action error `0.00224` after stochastic trajectory divergence.
+
+Do not promote a controller from that trajectory result alone. Full-network,
+output-only, and frozen-hidden ridge distillation of the three CPU-verified
+elites all failed complete authentic-start validation and the experimental
+distiller was removed. The closest full-network trust step (`3e-5`) retained
+993 ticks but reached route 893 instead of the unchanged parent's 894; other
+steps reset earlier. Even prefix-anchored output solves changed the sensitive
+early line and reset around ticks 731--755. Retain unchanged `scale1e5` as the
+clean authority. The held trajectories prove that useful closed-loop actions
+exist at the failure, but the next model needs clean state-localized capacity
+that preserves its prefix without a clock, gated adapter, schedule, or memory.
+
+A bounded feature microscope also argues against adding live ramp geometry at
+this point. Among the closest five percent of temporally nonlocal authentic
+states, route-relative features with previous-action context had no conflicting
+movement labels, while the phase-free pose-only representation had conflicts
+in about 51.5 percent. At the `scale1e5` failure, however, globally nearest
+route position advanced to index 944 while ordered progress remained at 894.
+Any next route-conditioned schema must avoid that off-route nearest-point phase
+leap; this is route-state indexing evidence, not evidence for ramp normals or
+another collision change.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
