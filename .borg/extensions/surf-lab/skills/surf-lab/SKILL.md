@@ -1244,6 +1244,28 @@ Any next route-conditioned schema must avoid that off-route nearest-point phase
 leap; this is route-state indexing evidence, not evidence for ramp normals or
 another collision change.
 
+Surf commit `dcfa6fd` records the bounded clean-capacity follow-up. A history-input-
+only fit enabled the four existing recent-action columns while freezing every
+other `scale1e5` tensor. Its exact zero-scale control reproduced route 894 and
+993 ticks, but its best nonzero CPU candidate reached only route 893 over 992
+ticks; larger steps reset earlier. A function-preserving expansion then embedded
+the complete 512-wide parent in one ordinary 768-wide version-4 ReLU network and
+initialized 256 new units at zero output. The deployed artifact still had no
+clock, adapter fields, schedule, state memory, or route table.
+
+That added capacity was trained on six CPU-verified coherent recoveries, the
+exact 800-tick parent prefix, and a bounded 8,192-state sample from the existing
+80,765-transition near-policy and 31,975-transition randomized-authentic ROCm
+collections. Full and scaled CPU rollouts did not promote: the mixed model's
+best scale (`0.01`) only tied route 894/993, and larger useful-scale candidates
+reset earlier. Restricting the teacher to the mutually consistent top three
+recoveries (routes 960, 955, and 944) also failed; scales `0.005`--`0.03`
+reached only routes 653--654 over 746--751 ticks. Retain unchanged `scale1e5`.
+The reproducible trainer is `tools/train_native_capacity_gpu.py`, but this
+supervised recovery-distillation objective is exhausted: the next capacity
+update needs direct closed-loop rollout optimization of state-dependent weights,
+not another imitation fit, scale sweep, or geometry feature.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
