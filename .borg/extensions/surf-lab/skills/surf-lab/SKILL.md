@@ -1157,6 +1157,33 @@ reset around 733 ticks. This rejects excessive full-network degrees of freedom
 as the immediate cause for the failed directions. Do not promote any
 output-only variant; retain `scale1e5`.
 
+Surf commits `aa155c6` and `e041651` add a distinct policy-visited PPO
+curriculum without changing the deployed controller. Set `start_source` to
+`policy-prefix` to run the frozen memoryless policy once from the authentic
+start, snapshot every requested episode tick with its actual ordered-route
+index, and send only the stochastic suffix batch to ROCm. The one-pass snapshot
+implementation reduced an identical 256x192 collection from 58.334 to 6.664
+seconds end to end (8.75x), with 5.902 seconds in GPU simulation. All 40,447
+transition rows remained byte-identical. A zero-noise 8x64 CPU/GPU differential
+from policy tick 850 matched rewards, route indices, and terminal flags; maximum
+feature and action/mean errors were `2.09e-7` and `1.37e-6`.
+
+That new distribution is valid and fast but its first bounded PPO direction
+did not promote. The 256-rollout batch reached route index 902 stochastically,
+yet full-network scales from 0.001 through 0.064 and output-only scales from
+0.001 through 0.032 all regressed the exact authentic-start CPU rollout. The
+best 0.001 steps reached route 893 over 992 ticks, versus the unchanged
+`scale1e5` baseline at route 894 over 993 ticks. A full-parent-trajectory
+rehearsal ablation also topped out at route 892 and was removed rather than
+retained as another unused training option. Keep `scale1e5` as the clean route
+authority and do not repeat this policy-prefix PPO direction or its scale
+search unchanged.
+
+Surf commit `6ef6eea` keeps the persistent MCP worker alive after an ordinary
+tool error. `tools/call` failures now return a JSON-RPC error instead of
+escaping `main` and closing stdout; an invalid PPO call followed by a valid
+`tools/list` request succeeded in the same release worker.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
