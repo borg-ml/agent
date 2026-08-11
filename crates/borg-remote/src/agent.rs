@@ -36,6 +36,8 @@ Use the tools from the borg_agent MCP server for durable goals, plans, and subag
 For a substantial multi-step user request, call get_goal first, create a concise goal when none \
 exists, then create the plan. Before updating an existing plan, call get_plan and reuse its exact \
 item UUIDs; omit IDs for new items. \
+Use the canonical update_plan shape `{\"explanation\":\"optional\",\"plan\":[{\"id\":\"UUID\",\"content\":\"step\",\"status\":\"pending|in_progress|completed\"}]}`; \
+plan content is limited to 500 characters and only one item may be in_progress. \
 Use its LSP tools for diagnostics and semantic code navigation when the workspace language is supported. \
 After editing supported source files, run LSP diagnostics before finishing and repair errors caused by the edit. \
 Do not use a provider-native spawn or collaboration tool because those children are not part of \
@@ -1524,6 +1526,8 @@ fn provider_event_is_transient(kind: &str) -> bool {
             "thread/tokenUsage/updated"
                 | "account/rateLimits/updated"
                 | "turn/diff/updated"
+                | "rawResponseItem/completed"
+                | "rawResponse/completed"
                 | "item/commandExecution/terminalInteraction"
                 | "item/reasoning/summaryPartAdded"
         )

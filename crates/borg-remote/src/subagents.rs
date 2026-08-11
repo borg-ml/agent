@@ -4336,64 +4336,32 @@ fn agent_tool_specs_with_capabilities_and_consultation_and_search(
                 "format": "uuid",
                 "description": "Existing item UUID copied exactly from get_plan. Omit for new items; never invent labels."
             },
-            "content": { "type": "string" },
-            "step": {
+            "content": {
                 "type": "string",
-                "description": "Compatibility alias for content; use content when possible."
-            },
-            "description": {
-                "type": "string",
-                "description": "Compatibility alias for content."
-            },
-            "title": {
-                "type": "string",
-                "description": "Compatibility alias for content."
-            },
-            "text": {
-                "type": "string",
-                "description": "Compatibility alias for content."
+                "minLength": 1,
+                "maxLength": crate::session::MAX_PLAN_ITEM_CONTENT_CHARS,
+                "description": "Concise plan step, at most 500 characters."
             },
             "status": {
                 "type": "string",
-                "enum": [
-                    "pending", "in_progress", "completed",
-                    "todo", "not_started", "not-started", "in-progress",
-                    "in progress", "inProgress", "active", "working",
-                    "complete", "done", "finished"
-                ]
+                "enum": ["pending", "in_progress", "completed"]
             }
         },
-        "required": ["status"],
-        "anyOf": [
-            { "required": ["content"] },
-            { "required": ["step"] },
-            { "required": ["description"] },
-            { "required": ["title"] },
-            { "required": ["text"] }
-        ],
+        "required": ["content", "status"],
         "additionalProperties": false
     });
     let update_plan_items_schema = json!({
         "type": "array",
+        "maxItems": crate::session::MAX_PLAN_ITEMS,
         "items": update_plan_item_schema
     });
     let update_plan_schema = json!({
         "type": "object",
         "properties": {
             "explanation": { "type": "string" },
-            "plan": update_plan_items_schema.clone(),
-            "steps": update_plan_items_schema.clone(),
-            "items": update_plan_items_schema.clone(),
-            "todos": update_plan_items_schema.clone(),
-            "todo_list": update_plan_items_schema
+            "plan": update_plan_items_schema
         },
-        "anyOf": [
-            { "required": ["plan"] },
-            { "required": ["steps"] },
-            { "required": ["items"] },
-            { "required": ["todos"] },
-            { "required": ["todo_list"] }
-        ],
+        "required": ["plan"],
         "additionalProperties": false
     });
     let mut specs = vec![
@@ -4577,7 +4545,7 @@ fn agent_tool_specs_with_capabilities_and_consultation_and_search(
         ),
         tool(
             "get_goal",
-            "Get the current durable goal, status, usage, and remaining token budget.",
+            "Get the current durable goal, status, usage, and remaining token budget. Call with {}.",
             json!({
                 "type": "object",
                 "properties": {},
@@ -4586,7 +4554,7 @@ fn agent_tool_specs_with_capabilities_and_consultation_and_search(
         ),
         tool(
             "create_goal",
-            "Create a durable goal for an explicit substantial multi-step user request when get_goal reports none.",
+            "Create a durable goal only when get_goal reports none. Exact call: {\"objective\":\"concise objective\"}. Add token_budget only when the user explicitly requests a token budget.",
             json!({
                 "type": "object",
                 "properties": {
@@ -4599,7 +4567,7 @@ fn agent_tool_specs_with_capabilities_and_consultation_and_search(
         ),
         tool(
             "update_goal",
-            "Mark the current goal complete, or blocked only after the same blocker prevents progress for three consecutive goal turns.",
+            "Mark the current goal complete with {\"status\":\"complete\"}, or blocked with {\"status\":\"blocked\"} only after the same blocker prevents progress for three consecutive goal turns.",
             json!({
                 "type": "object",
                 "properties": {
@@ -4611,7 +4579,7 @@ fn agent_tool_specs_with_capabilities_and_consultation_and_search(
         ),
         tool(
             "get_plan",
-            "Get the current durable task plan.",
+            "Get the current durable task plan. Call with {} before changing an existing plan.",
             json!({
                 "type": "object",
                 "properties": {},
@@ -4620,7 +4588,7 @@ fn agent_tool_specs_with_capabilities_and_consultation_and_search(
         ),
         tool(
             "update_plan",
-            "Replace the durable task plan. Call get_plan first when updating an existing plan, copy its exact UUIDs, and omit id for new items. Invalid non-UUID IDs are treated as omitted. Keep at most one item in progress.",
+            "Replace the durable task plan. Exact call: {\"explanation\":\"optional\",\"plan\":[{\"id\":\"UUID from get_plan\",\"content\":\"concise step\",\"status\":\"pending\"}]}. Call get_plan first, reuse exact UUIDs for existing items, and omit id for new items. Use at most 100 items, 500 characters per content, and one in_progress item.",
             update_plan_schema,
         ),
         tool(

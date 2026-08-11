@@ -2317,7 +2317,7 @@ fn every_execution_lane_exposes_the_same_borg_control_plane() {
 }
 
 #[test]
-fn update_plan_accepts_provider_friendly_step_aliases() {
+fn update_plan_accepts_legacy_aliases_but_advertises_the_canonical_contract() {
     let args: UpdatePlanArgs = serde_json::from_value(json!({
         "steps": [{"step": "Inspect the release path", "status": "done"}]
     }))
@@ -2331,10 +2331,23 @@ fn update_plan_accepts_provider_friendly_step_aliases() {
         .into_iter()
         .find(|tool| tool["name"] == "update_plan")
         .expect("update_plan tool spec");
-    assert!(
-        update_plan["inputSchema"]["properties"]["plan"]["items"]["properties"]["step"].is_object()
+    let schema = &update_plan["inputSchema"];
+    assert_eq!(schema["required"], json!(["plan"]));
+    assert_eq!(
+        schema["properties"]["plan"]["maxItems"],
+        crate::session::MAX_PLAN_ITEMS
     );
-    assert!(update_plan["inputSchema"]["properties"]["steps"].is_object());
+    assert_eq!(
+        schema["properties"]["plan"]["items"]["properties"]["content"]["maxLength"],
+        crate::session::MAX_PLAN_ITEM_CONTENT_CHARS
+    );
+    assert_eq!(
+        schema["properties"]["plan"]["items"]["required"],
+        json!(["content", "status"])
+    );
+    let description = update_plan["description"].as_str().unwrap();
+    assert!(description.contains("Exact call:"));
+    assert!(description.contains("500 characters"));
 }
 
 #[test]

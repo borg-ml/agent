@@ -5653,13 +5653,13 @@ fn reconcile_todos(current: &[PlanItem], updates: Vec<TodoItemUpdate>) -> Result
     validate_todos(items)
 }
 
-fn validate_todos(mut items: Vec<PlanItem>) -> Result<Vec<PlanItem>> {
-    const MAX_TODOS: usize = 100;
-    const MAX_CONTENT_CHARS: usize = 500;
+pub(crate) const MAX_PLAN_ITEMS: usize = 100;
+pub(crate) const MAX_PLAN_ITEM_CONTENT_CHARS: usize = 500;
 
+fn validate_todos(mut items: Vec<PlanItem>) -> Result<Vec<PlanItem>> {
     anyhow::ensure!(
-        items.len() <= MAX_TODOS,
-        "todo list may contain at most {MAX_TODOS} items"
+        items.len() <= MAX_PLAN_ITEMS,
+        "todo list may contain at most {MAX_PLAN_ITEMS} items"
     );
     let mut ids = std::collections::HashSet::with_capacity(items.len());
     let mut contents = std::collections::HashSet::with_capacity(items.len());
@@ -5668,8 +5668,8 @@ fn validate_todos(mut items: Vec<PlanItem>) -> Result<Vec<PlanItem>> {
         item.content = item.content.trim().to_string();
         anyhow::ensure!(!item.content.is_empty(), "todo content must not be empty");
         anyhow::ensure!(
-            item.content.chars().count() <= MAX_CONTENT_CHARS,
-            "todo content may contain at most {MAX_CONTENT_CHARS} characters"
+            item.content.chars().count() <= MAX_PLAN_ITEM_CONTENT_CHARS,
+            "todo content may contain at most {MAX_PLAN_ITEM_CONTENT_CHARS} characters"
         );
         anyhow::ensure!(ids.insert(item.id), "todo item IDs must be unique");
         anyhow::ensure!(
