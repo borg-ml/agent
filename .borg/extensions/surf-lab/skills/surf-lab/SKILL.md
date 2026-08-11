@@ -1266,6 +1266,58 @@ supervised recovery-distillation objective is exhausted: the next capacity
 update needs direct closed-loop rollout optimization of state-dependent weights,
 not another imitation fit, scale sweep, or geometry feature.
 
+The subsequent architecture audit rejected one more direct localized-output
+search before changing the observation contract. A zero-initialized residual
+suffix was active on only 16 of 800 authentic prefix states but on 37.49 units
+per sampled recovery state. A 2x64 ROCm direct search changed only that suffix;
+the best exact CPU rerun tied the parent at reference tick 1134/reset tick 993
+and improved only the secondary next-point distance. Do not treat its generic
+`improved` flag as route progress or promote the artifact.
+
+The clean route-state replacement uses feature schema
+`native_route_progress_v2`. `PolicyRuntime` owns a monotonic route belief
+separate from the permissive legacy route/completion scorer. It can advance at
+most eight samples per physical observation, its admitted route arc is capped
+at four times actual displacement, it cannot advance without movement, and it
+cannot move backward. CPU playback, authoritative evaluation, focused-state
+capture, and ROCm rollouts carry this policy index independently; never seed it
+from `RouteTracker.furthest_index`. That prior cross-wiring started some focused
+paths about one corridor/lookahead ahead and made prefix capture disagree with
+playback. PPO progress, tangent, and target shaping for v2 now use the same
+policy belief that produced the observation, while the legacy tracker remains
+completion/reporting evidence only.
+
+Use short ROCm horizons for this schema. Across 32 independently sampled
+authentic starts and 256 zero-noise eight-tick transitions, CPU/GPU route
+indices and terminal flags were identical; maximum reward, feature, and action
+errors were `1.65e-5`, `0.0041`, and `0.0041`. Long closed loops remain
+chaotically decorrelated and are not promotion evidence. Desktop-safe 256x8
+batches covered the full authentic route, the ramp-3 region, and genuine
+policy-prefix states at roughly 3.7k--9.8k end-to-end candidate ticks/second.
+
+The bounded training results are negative for PPO but informative for
+corrective supervision. The migrated v8 parent reaches v2 route index 279 and
+resets after 793 episode ticks (absolute demo tick 1033). One output-head PPO
+direction trained from 6,144 authentic, ramp-weighted, perturbed, and visited
+transitions regressed at every screened scale from `0.005` through `1.0`; even
+the smallest first-action change was about `1.7e-6`, yet its route branch
+diverged by tick 17. A route-matched warm-start robustness fit also regressed.
+Do not repeat that PPO direction or line search.
+
+PPO transition rows now include `observation_route_index`, the pre-action
+policy belief. `tools/train_native_corrective_gpu.py --ppo-rollout` uses it to
+label perturbed and closed-loop states with the authentic route-aligned command,
+including the current-state correction to yaw delta. This remains one
+weights-only, phase-free network. Aggregated DAgger improved exact CPU route
+progress from 279 to 319 and then 380, but survival fell to 676 and 588 ticks;
+the next generation collapsed into a no-reset route-23 stall. None is a
+promotion or visualization candidate. This closes blind DAgger iteration at
+the current discrete representation. The next architecture should use smooth
+continuous route projection plus an explicit local-sensitivity/contractive
+objective. Add ramp normals or recurrence only if that smooth controller still
+shows observation ambiguity; do not add clocks, schedules, lookup memory, or
+per-ramp adapters.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
