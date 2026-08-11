@@ -1344,7 +1344,7 @@ impl AgentTurnExecutor for EmptyThenSuccessExecutor {
     async fn execute(
         &self,
         turn: AgentTurn,
-        _events: mpsc::Sender<SessionEventKind>,
+        events: mpsc::Sender<SessionEventKind>,
         _controls: Option<mpsc::Receiver<AgentTurnControl>>,
     ) -> Result<AgentTurnResult> {
         self.prompts
@@ -1352,6 +1352,12 @@ impl AgentTurnExecutor for EmptyThenSuccessExecutor {
             .unwrap()
             .push((turn.prompt, turn.attachments));
         if self.calls.fetch_add(1, Ordering::AcqRel) == 0 {
+            events
+                .send(SessionEventKind::Error {
+                    message: "codex returned an empty response".to_string(),
+                })
+                .await
+                .unwrap();
             return Err(anyhow::anyhow!("codex returned an empty response"));
         }
         Ok(AgentTurnResult {
@@ -1408,6 +1414,7 @@ async fn empty_provider_response_retries_without_losing_user_prompt() {
 
     let mut transitions = Vec::new();
     let mut completed = 0;
+    let mut retry_error_was_rendered = false;
     while completed < 2 {
         let event = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
             .await
@@ -1422,6 +1429,13 @@ async fn empty_provider_response_retries_without_losing_user_prompt() {
             && *event_message_id == message_id
         {
             transitions.push((*status, *delivery));
+        }
+        if matches!(
+            &event.kind,
+            SessionEventKind::Error { message }
+                if message == "codex returned an empty response"
+        ) {
+            retry_error_was_rendered = true;
         }
         if matches!(
             event.kind,
@@ -1456,6 +1470,7 @@ async fn empty_provider_response_retries_without_losing_user_prompt() {
     }));
 
     assert_eq!(calls.load(Ordering::Acquire), 2);
+    assert!(!retry_error_was_rendered);
     assert_eq!(
         transitions,
         [

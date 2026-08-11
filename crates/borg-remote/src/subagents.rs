@@ -4328,6 +4328,74 @@ fn agent_tool_specs_with_capabilities_and_consultation_and_search(
     consultation_enabled: bool,
     web_search_enabled: bool,
 ) -> Vec<Value> {
+    let update_plan_item_schema = json!({
+        "type": "object",
+        "properties": {
+            "id": {
+                "type": "string",
+                "format": "uuid",
+                "description": "Existing item UUID copied exactly from get_plan. Omit for new items; never invent labels."
+            },
+            "content": { "type": "string" },
+            "step": {
+                "type": "string",
+                "description": "Compatibility alias for content; use content when possible."
+            },
+            "description": {
+                "type": "string",
+                "description": "Compatibility alias for content."
+            },
+            "title": {
+                "type": "string",
+                "description": "Compatibility alias for content."
+            },
+            "text": {
+                "type": "string",
+                "description": "Compatibility alias for content."
+            },
+            "status": {
+                "type": "string",
+                "enum": [
+                    "pending", "in_progress", "completed",
+                    "todo", "not_started", "not-started", "in-progress",
+                    "in progress", "inProgress", "active", "working",
+                    "complete", "done", "finished"
+                ]
+            }
+        },
+        "required": ["status"],
+        "anyOf": [
+            { "required": ["content"] },
+            { "required": ["step"] },
+            { "required": ["description"] },
+            { "required": ["title"] },
+            { "required": ["text"] }
+        ],
+        "additionalProperties": false
+    });
+    let update_plan_items_schema = json!({
+        "type": "array",
+        "items": update_plan_item_schema
+    });
+    let update_plan_schema = json!({
+        "type": "object",
+        "properties": {
+            "explanation": { "type": "string" },
+            "plan": update_plan_items_schema.clone(),
+            "steps": update_plan_items_schema.clone(),
+            "items": update_plan_items_schema.clone(),
+            "todos": update_plan_items_schema.clone(),
+            "todo_list": update_plan_items_schema
+        },
+        "anyOf": [
+            { "required": ["plan"] },
+            { "required": ["steps"] },
+            { "required": ["items"] },
+            { "required": ["todos"] },
+            { "required": ["todo_list"] }
+        ],
+        "additionalProperties": false
+    });
     let mut specs = vec![
         tool(
             "list_workflows",
@@ -4553,34 +4621,7 @@ fn agent_tool_specs_with_capabilities_and_consultation_and_search(
         tool(
             "update_plan",
             "Replace the durable task plan. Call get_plan first when updating an existing plan, copy its exact UUIDs, and omit id for new items. Invalid non-UUID IDs are treated as omitted. Keep at most one item in progress.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "explanation": { "type": "string" },
-                    "plan": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "id": {
-                                    "type": "string",
-                                    "format": "uuid",
-                                    "description": "Existing item UUID copied exactly from get_plan. Omit for new items; never invent labels."
-                                },
-                                "content": { "type": "string" },
-                                "status": {
-                                    "type": "string",
-                                    "enum": ["pending", "in_progress", "completed"]
-                                }
-                            },
-                            "required": ["content", "status"],
-                            "additionalProperties": false
-                        }
-                    }
-                },
-                "required": ["plan"],
-                "additionalProperties": false
-            }),
+            update_plan_schema,
         ),
         tool(
             "lsp_status",
@@ -5021,11 +5062,11 @@ struct UpdateGoalArgs {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct UpdatePlanArgs {
     #[serde(default)]
     #[allow(dead_code)]
     explanation: Option<String>,
+    #[serde(alias = "steps", alias = "items", alias = "todos", alias = "todo_list")]
     plan: Vec<TodoItemUpdate>,
 }
 

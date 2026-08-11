@@ -2066,28 +2066,69 @@ impl<'de> Deserialize<'de> for TodoItemUpdate {
     {
         #[derive(Deserialize)]
         struct Wire {
-            #[serde(default)]
+            #[serde(default, alias = "item_id")]
             id: Option<String>,
-            content: String,
-            status: PlanItemStatus,
+            #[serde(
+                default,
+                alias = "step",
+                alias = "description",
+                alias = "title",
+                alias = "text"
+            )]
+            content: Option<String>,
+            #[serde(default)]
+            status: Option<PlanItemStatus>,
         }
 
         let wire = Wire::deserialize(deserializer)?;
         Ok(Self {
             id: wire.id.and_then(|value| Uuid::parse_str(&value).ok()),
-            content: wire.content,
-            status: wire.status,
+            content: wire.content.unwrap_or_default(),
+            status: wire.status.unwrap_or(PlanItemStatus::Pending),
         })
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(export)]
 pub enum PlanItemStatus {
     Pending,
     InProgress,
     Completed,
+}
+
+impl<'de> Deserialize<'de> for PlanItemStatus {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        match value.trim().to_ascii_lowercase().as_str() {
+            "pending" | "todo" | "not_started" | "not-started" => Ok(Self::Pending),
+            "in_progress" | "in-progress" | "in progress" | "inprogress" | "active" | "working" => {
+                Ok(Self::InProgress)
+            }
+            "completed" | "complete" | "done" | "finished" => Ok(Self::Completed),
+            _ => Err(serde::de::Error::unknown_variant(
+                &value,
+                &[
+                    "pending",
+                    "in_progress",
+                    "completed",
+                    "todo",
+                    "not_started",
+                    "in-progress",
+                    "in progress",
+                    "active",
+                    "working",
+                    "complete",
+                    "done",
+                    "finished",
+                ],
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -2424,6 +2465,18 @@ mod tests {
 
         assert_eq!(update.id, None);
         assert_eq!(update.content, "Inventory the workspace");
+        assert_eq!(update.status, PlanItemStatus::InProgress);
+    }
+
+    #[test]
+    fn plan_update_accepts_common_provider_item_aliases() {
+        let update: TodoItemUpdate = serde_json::from_value(json!({
+            "step": "Run the release checks",
+            "status": "in-progress"
+        }))
+        .unwrap();
+
+        assert_eq!(update.content, "Run the release checks");
         assert_eq!(update.status, PlanItemStatus::InProgress);
     }
 

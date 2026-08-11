@@ -2347,6 +2347,7 @@ async fn run_agent_session_store_kernel(
         let mut provider_events_open = true;
         let mut interrupted = false;
         let mut turn_had_side_effects = false;
+        let mut retryable_provider_errors = Vec::new();
         let mut batch_pending_after_interrupt = false;
         let mut interrupt_deadline: Option<Pin<Box<Sleep>>> = None;
         let mut turn_phase = TurnPhase::AwaitingProvider;
@@ -2361,6 +2362,14 @@ async fn run_agent_session_store_kernel(
                     };
                     while let Ok(kind) = provider_events.try_recv() {
                         if is_executor_lifecycle_status(&kind) {
+                            continue;
+                        }
+                        if matches!(
+                            &kind,
+                            SessionEventKind::Error { message }
+                                if is_safe_automatic_retry_error(message)
+                        ) {
+                            retryable_provider_errors.push(kind);
                             continue;
                         }
                         turn_had_side_effects |= provider_event_has_side_effect(&kind);
@@ -2493,6 +2502,11 @@ async fn run_agent_session_store_kernel(
                                 && !turn_had_side_effects
                                 && is_safe_automatic_retry_error(&error)
                                 && automatic_retry_message_ids.insert(prompt.message_id);
+                            if !retry {
+                                for kind in retryable_provider_errors.drain(..) {
+                                    record(&mut journal, &events, session_id, kind).await?;
+                                }
+                            }
                             if autonomy_result_sender.is_some() {
                                 autonomy_result = Some(Err(anyhow::anyhow!(error.clone())));
                             }
@@ -2585,6 +2599,14 @@ async fn run_agent_session_store_kernel(
                                 tokio::time::Instant::now() + turn_phase.liveness_timeout()
                             );
                         }
+                        continue;
+                    }
+                    if matches!(
+                        &kind,
+                        SessionEventKind::Error { message }
+                            if is_safe_automatic_retry_error(message)
+                    ) {
+                        retryable_provider_errors.push(kind);
                         continue;
                     }
                     turn_had_side_effects |= provider_event_has_side_effect(&kind);

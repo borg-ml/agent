@@ -2317,6 +2317,27 @@ fn every_execution_lane_exposes_the_same_borg_control_plane() {
 }
 
 #[test]
+fn update_plan_accepts_provider_friendly_step_aliases() {
+    let args: UpdatePlanArgs = serde_json::from_value(json!({
+        "steps": [{"step": "Inspect the release path", "status": "done"}]
+    }))
+    .unwrap();
+
+    assert_eq!(args.plan.len(), 1);
+    assert_eq!(args.plan[0].content, "Inspect the release path");
+    assert_eq!(args.plan[0].status, crate::PlanItemStatus::Completed);
+
+    let update_plan = agent_tool_specs(CodingProvider::Codex)
+        .into_iter()
+        .find(|tool| tool["name"] == "update_plan")
+        .expect("update_plan tool spec");
+    assert!(
+        update_plan["inputSchema"]["properties"]["plan"]["items"]["properties"]["step"].is_object()
+    );
+    assert!(update_plan["inputSchema"]["properties"]["steps"].is_object());
+}
+
+#[test]
 fn persistent_peer_tool_is_root_only_and_not_recursive() {
     let root_names = agent_tool_specs_with_capabilities_and_consultation(
         CodingProvider::Codex,
