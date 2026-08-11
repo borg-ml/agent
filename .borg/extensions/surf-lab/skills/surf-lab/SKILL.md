@@ -1413,6 +1413,61 @@ against the global continuation objective with an explicit prefix-action trust
 constraint, not repeat behavior cloning, add per-ramp logic, or widen the same
 local search.
 
+Surf commits `34677d5`, `66a25b9`, `6c4c1eb`, and `4f73034` add the clean
+state-localized-capacity path. With `gpu_focus_episode_tick`,
+`gpu_output_hidden_start`, and a positive `cpu_focus_screen_ticks`,
+`policy.evolve-native` first proves every mutable output-suffix unit is exactly
+inactive on the complete CPU parent prefix, then ranks every candidate suffix
+in the exact CPU Source-brush world. ROCm remains a diagnostic proposal path.
+Full authentic-start promotion is strict: both ordered route progress and
+survival must improve. The ordinary version-4 ReLU artifact retains absolute
+pose/motion plus one previous action and has no phase feature, adapter, route
+table, action schedule, or state memory.
+
+Staging that capacity produced the strongest clean controller so far. A
+576-wide first stage advanced the old 512-wide route/tick pair `894/993` to
+`1164/1287` (`50.535%`). A 640-wide second stage, silent through episode tick
+999, reached `1214/1306` (`53.397%`). A 704-wide third stage, silent through
+tick 1049, reached `1222/1349` (`53.9207%`). Its artifact is
+`utopia-user-native-clean-capacity192-stage3-teacher-centered-v1.json`.
+Complete CPU rollouts reproduce those results. Global nearest-authentic route
+index is still unsafe at the failure: it is 1275 while ordered progress is
+1222, a 53-sample phase leap. Keep absolute pose/history and do not add nearest-
+route conditioning or ramp geometry from this evidence.
+
+A fourth 32-unit bank was rejected rather than promoted. Exact CPU coherent
+exploration from tick 1100 found three genuine joint suffix winners; the best
+reached route 1232 over 268 suffix ticks versus the parent's route 1222 over
+249. The bank was exactly silent through tick 1099 and active on about 98% of
+the relevant parent/recovery tail. Nevertheless, multi-elite and single-elite
+supervision, with and without post-focus zero rehearsal, two 256-candidate
+exact-CPU output-suffix searches, and a 32-point per-output closed-loop scale
+grid produced no complete-start gain on both axes. The three elites also gave
+different residuals at their shared start, up to 0.198 apart on one component.
+Adding 2, 4, or 8 previous actions did not reduce nonlocal recovery conflicts;
+the measured over-0.05 conflict fraction rose from about 46% with one previous
+action to 57% with eight. This does not support recurrence or a wider bank.
+Retain the 704-wide third stage as clean authority.
+
+`tools/train_native_capacity_gpu.py --output-step-scales MOVE_X MOVE_Y YAW
+PITCH` exports independently scaled continuous rows from the same trained
+prefix-safe bank. Tensor checks showed that only the requested suffix row
+changed. On the rejected fourth stage, a pitch-only 0.01 step survived 76 ticks
+longer but lost seven route samples; movement-x/yaw preserved the parent and
+side movement regressed it. No bounded combination retained that survival gain
+while improving route.
+
+Surf commit `b519160` therefore adds opt-in pitch proposals to
+`policy.recover-native` via `pitch_scale_degrees`. The default remains movement
+plus yaw only. Globally continued evaluation automatically reserves the parent
+and all first-block axis probes in the exact CPU shortlist (raising
+`cpu_top_k` to at least nine when pitch is enabled), because fixed-schedule GPU
+physics cannot score pitch's later neural-feedback effect. A measured 0.025--
+0.1 degree sweep selected one corrective block and advanced route 1222 to 1223,
+but reset one tick earlier. Its trace is diagnostic supervision only, not a
+controller promotion; the stronger coherent `1232/+19` suffix bound remains
+the relevant teacher evidence.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
