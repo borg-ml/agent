@@ -12,7 +12,7 @@ use crate::runtime::ProviderCallUsage;
 use crate::{ProviderAuthBundle, ProviderAuthProvider, ProviderChannel};
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -380,6 +380,7 @@ pub struct CodexSubscriptionPool {
 struct CodexSubscriptionPoolState {
     lifecycle_key: Option<String>,
     process: Option<PooledCodexProcess>,
+    billing_mode: ProviderBillingMode,
     _auth_home: Option<TempDir>,
 }
 
@@ -399,6 +400,29 @@ struct StartedCodexProcess {
 }
 
 impl CodexSubscriptionPool {
+    pub async fn compact(&self, expected_thread_id: &str) -> Result<ProviderCallUsage> {
+        let mut state = self.inner.lock().await;
+        let billing_mode = state.billing_mode;
+        let process = state
+            .process
+            .as_mut()
+            .context("Codex native compaction requires a live pooled thread")?;
+        anyhow::ensure!(
+            process.thread_id == expected_thread_id,
+            "Codex native compaction thread changed from {expected_thread_id} to {}",
+            process.thread_id
+        );
+        match tokio::time::timeout(
+            Duration::from_secs(300),
+            compact_pooled_codex_thread(process, billing_mode),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => bail!("Codex native compaction timed out after 300 seconds"),
+        }
+    }
+
     /// Close an idle app-server cleanly so its persisted rollout is available
     /// to the next Borg process. A bounded hard kill remains the final fallback
     /// for a provider that does not react to stdin shutdown.
@@ -1109,6 +1133,7 @@ async fn run_codex_subscription_process_pooled(
         &request,
         state._auth_home.as_ref(),
     );
+    state.billing_mode = billing_mode;
     if state.process.is_none() {
         let started =
             start_pooled_codex_process(&request, permission, state._auth_home.as_ref()).await?;
@@ -1142,6 +1167,66 @@ async fn run_codex_subscription_process_pooled(
         Ok(false) => Ok(()),
         Err(error) => Err(error),
     }
+}
+
+async fn compact_pooled_codex_thread(
+    process: &mut PooledCodexProcess,
+    billing_mode: ProviderBillingMode,
+) -> Result<ProviderCallUsage> {
+    let started_at = Instant::now();
+    let request_id = process.next_request_id;
+    process.next_request_id = process.next_request_id.saturating_add(1);
+    write_codex_request(
+        &mut process.stdin,
+        request_id,
+        "thread/compact/start",
+        serde_json::json!({"threadId": process.thread_id}),
+    )
+    .await?;
+
+    let mut usage = CodexTurnUsageAccumulator::default();
+    let mut request_accepted = false;
+    let mut compaction_completed = false;
+    loop {
+        let line = process
+            .lines
+            .next_line()
+            .await
+            .context("failed to read Codex native compaction output")?
+            .context("Codex app server closed during native compaction")?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value = serde_json::from_str::<Value>(&line)
+            .with_context(|| format!("invalid Codex native compaction JSON: {line}"))?;
+        if codex_response_id(&value) == Some(request_id) {
+            if value.get("error").is_some() {
+                bail!(
+                    "Codex native compaction request failed: {}",
+                    codex_rpc_error(&value)
+                );
+            }
+            request_accepted = true;
+            if compaction_completed {
+                break;
+            }
+            continue;
+        }
+        usage.observe(&value, billing_mode);
+        if codex_event_kind(&value) == Some("turn/completed") {
+            anyhow::ensure!(
+                !matches!(codex_turn_status(&value), Some("failed" | "cancelled")),
+                "Codex native compaction ended with status {}",
+                codex_turn_status(&value).unwrap_or("unknown")
+            );
+            compaction_completed = true;
+            if request_accepted {
+                break;
+            }
+        }
+    }
+
+    Ok(usage.finish(u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)))
 }
 
 async fn shutdown_pooled_codex_process(mut process: PooledCodexProcess) {
@@ -1314,7 +1399,7 @@ async fn run_pooled_codex_turn(
     let mut text = String::new();
     let mut final_text = None;
     let session_id = Some(process.thread_id.clone());
-    let mut usage = ProviderCallUsage::default();
+    let mut usage = CodexTurnUsageAccumulator::default();
     let mut pending_steers: HashMap<
         u64,
         tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
@@ -1357,9 +1442,7 @@ async fn run_pooled_codex_turn(
                     &mut final_text,
                 )
                 .await;
-                if let Some(event_usage) = event_usage_with_billing_mode(&value, billing_mode) {
-                    usage = event_usage;
-                }
+                usage.observe(&value, billing_mode);
                 if codex_event_kind(&value).is_some_and(|method| method == "turn/completed") {
                     turn_status = codex_turn_status(&value).map(str::to_string);
                     turn_completed = true;
@@ -1455,7 +1538,7 @@ async fn run_pooled_codex_turn(
         return Ok(false);
     }
     let final_text = codex_terminal_text(final_text, text, turn_status.as_deref())?;
-    usage.duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let usage = usage.finish(u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX));
     if events
         .send(ChatStreamEvent::Done {
             final_text,
@@ -1570,7 +1653,7 @@ async fn run_codex_subscription_process(
     let mut text = String::new();
     let mut final_text = None;
     let session_id = Some(thread_id.clone());
-    let mut usage = ProviderCallUsage::default();
+    let mut usage = CodexTurnUsageAccumulator::default();
     let mut next_request_id = 4_u64;
     let mut pending_steers: HashMap<
         u64,
@@ -1618,9 +1701,7 @@ async fn run_codex_subscription_process(
                     &mut final_text,
                 )
                 .await;
-                if let Some(event_usage) = event_usage_with_billing_mode(&value, billing_mode) {
-                    usage = event_usage;
-                }
+                usage.observe(&value, billing_mode);
                 if let Some(method) = codex_event_kind(&value)
                     && method == "turn/completed"
                 {
@@ -1746,7 +1827,7 @@ async fn run_codex_subscription_process(
 
     let final_text = codex_terminal_text(final_text, text, turn_status.as_deref())?;
 
-    usage.duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let usage = usage.finish(u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX));
     events
         .send(ChatStreamEvent::Done {
             final_text,
@@ -1942,7 +2023,6 @@ fn codex_turn_start_params(
             LocalAgentPermission::FullAccess => "never",
             LocalAgentPermission::Auto | LocalAgentPermission::Manual => "on-request",
         },
-        "summary": "detailed",
         "outputSchema": request.output_schema,
     });
     if permission == LocalAgentPermission::Auto {
@@ -2976,16 +3056,12 @@ fn event_usage_with_billing_mode(
         .or_else(|| usage.get("inputTokens"))
         .and_then(Value::as_u64)
         .unwrap_or_default();
-    // `codex exec --json` reports input_tokens as the whole input bucket and
-    // exposes cached and cache-write portions alongside it. App-server's
-    // TokenUsageBreakdown reports inputTokens as its own exclusive bucket.
-    let input_tokens = if app_server_usage {
-        reported_input_tokens
-    } else {
-        reported_input_tokens
-            .saturating_sub(cached_input_tokens)
-            .saturating_sub(cache_creation_input_tokens)
-    };
+    // Codex reports inputTokens as the complete input bucket on both exec and
+    // app-server routes. Borg stores uncached input separately from cache hits
+    // and cache writes so the three counters remain additive.
+    let input_tokens = reported_input_tokens
+        .saturating_sub(cached_input_tokens)
+        .saturating_sub(cache_creation_input_tokens);
     let output_tokens = usage
         .get("output_tokens")
         .or_else(|| usage.get("outputTokens"))
@@ -2996,15 +3072,11 @@ fn event_usage_with_billing_mode(
         .or_else(|| usage.get("totalTokens"))
         .and_then(Value::as_u64)
         .unwrap_or_default();
-    let prompt_tokens = if app_server_usage {
-        reported_input_tokens
-    } else {
-        reported_input_tokens.max(
-            input_tokens
-                .saturating_add(cached_input_tokens)
-                .saturating_add(cache_creation_input_tokens),
-        )
-    };
+    let prompt_tokens = reported_input_tokens.max(
+        input_tokens
+            .saturating_add(cached_input_tokens)
+            .saturating_add(cache_creation_input_tokens),
+    );
     let total_tokens = if reported_total_tokens > 0 {
         reported_total_tokens
     } else {
@@ -3043,6 +3115,93 @@ fn event_usage_with_billing_mode(
         cost_basis: usage_cost_basis(cost_microusd, billing_mode),
         ..ProviderCallUsage::default()
     })
+}
+
+#[derive(Default)]
+struct CodexTurnUsageAccumulator {
+    exact: ProviderCallUsage,
+    exact_response_ids: HashSet<String>,
+    thread_updates: ProviderCallUsage,
+    thread_total_snapshots: HashSet<String>,
+    fallback: Option<ProviderCallUsage>,
+    context_tokens: Option<u64>,
+    context_window_tokens: Option<u64>,
+    saw_exact_usage: bool,
+}
+
+impl CodexTurnUsageAccumulator {
+    fn observe(&mut self, value: &Value, billing_mode: ProviderBillingMode) {
+        let kind = codex_event_kind(value);
+        if kind == Some("rawResponse/completed") {
+            let Some(response_id) = value
+                .pointer("/params/responseId")
+                .or_else(|| value.pointer("/params/response_id"))
+                .and_then(Value::as_str)
+            else {
+                return;
+            };
+            if !self.exact_response_ids.insert(response_id.to_string()) {
+                return;
+            }
+            if let Some(usage) = event_usage_with_billing_mode(value, billing_mode) {
+                self.context_tokens = usage.context_tokens.or(self.context_tokens);
+                add_provider_usage(&mut self.exact, &usage);
+                self.saw_exact_usage = true;
+            }
+            return;
+        }
+
+        let Some(usage) = event_usage_with_billing_mode(value, billing_mode) else {
+            return;
+        };
+        if kind == Some("thread/tokenUsage/updated") {
+            self.context_tokens = usage.context_tokens.or(self.context_tokens);
+            self.context_window_tokens = usage.context_window_tokens.or(self.context_window_tokens);
+            if let Some(snapshot) = value
+                .pointer("/params/tokenUsage/total")
+                .or_else(|| value.pointer("/tokenUsage/total"))
+                .and_then(|total| serde_json::to_string(total).ok())
+                && self.thread_total_snapshots.insert(snapshot)
+            {
+                add_provider_usage(&mut self.thread_updates, &usage);
+            }
+        }
+        self.fallback = Some(usage);
+    }
+
+    fn finish(self, duration_ms: u64) -> ProviderCallUsage {
+        let mut usage = if self.saw_exact_usage {
+            self.exact
+        } else if !self.thread_total_snapshots.is_empty() {
+            self.thread_updates
+        } else {
+            self.fallback.unwrap_or_default()
+        };
+        usage.duration_ms = duration_ms;
+        usage.context_tokens = self.context_tokens.or(usage.context_tokens);
+        usage.context_window_tokens = self.context_window_tokens.or(usage.context_window_tokens);
+        usage
+    }
+}
+
+fn add_provider_usage(total: &mut ProviderCallUsage, usage: &ProviderCallUsage) {
+    total.input_tokens = total.input_tokens.saturating_add(usage.input_tokens);
+    total.cached_input_tokens = total
+        .cached_input_tokens
+        .saturating_add(usage.cached_input_tokens);
+    total.cache_creation_input_tokens = total
+        .cache_creation_input_tokens
+        .saturating_add(usage.cache_creation_input_tokens);
+    total.output_tokens = total.output_tokens.saturating_add(usage.output_tokens);
+    total.total_tokens = total.total_tokens.saturating_add(usage.total_tokens);
+    total.cost_microusd = match (total.cost_microusd, usage.cost_microusd) {
+        (Some(current), Some(additional)) => Some(current.saturating_add(additional)),
+        (None, Some(value)) => Some(value),
+        (current, None) => current,
+    };
+    if usage.cost_basis != crate::runtime::CostBasis::Unavailable {
+        total.cost_basis = usage.cost_basis;
+    }
 }
 
 fn usage_cost_basis(
@@ -3271,6 +3430,7 @@ mod tests {
             codex_auto_turn.get("approvalsReviewer"),
             Some(&Value::String("auto_review".to_string()))
         );
+        assert!(codex_auto_turn.get("summary").is_none());
         assert_eq!(
             codex_config
                 .get("config")
@@ -3504,10 +3664,119 @@ mod tests {
             ProviderBillingMode::Unknown,
         )
         .expect("Codex app-server usage");
-        assert_eq!(usage.input_tokens, 6_741);
+        assert_eq!(usage.input_tokens, 3);
         assert_eq!(usage.cache_creation_input_tokens, 6_738);
         assert_eq!(usage.total_tokens, 6_746);
         assert_eq!(usage.context_tokens, Some(6_746));
+        assert_eq!(usage.context_window_tokens, Some(258_400));
+    }
+
+    #[test]
+    fn codex_turn_usage_sums_each_exact_upstream_response_once() {
+        let mut usage = CodexTurnUsageAccumulator::default();
+        let raw = |response_id: &str, input, cached, cache_write, output, total| {
+            serde_json::json!({
+                "method": "rawResponse/completed",
+                "params": {
+                    "responseId": response_id,
+                    "usage": {
+                        "inputTokens": input,
+                        "cachedInputTokens": cached,
+                        "cacheWriteInputTokens": cache_write,
+                        "outputTokens": output,
+                        "totalTokens": total
+                    }
+                }
+            })
+        };
+        usage.observe(
+            &raw("response-1", 100, 80, 0, 5, 105),
+            ProviderBillingMode::Subscription,
+        );
+        usage.observe(
+            &raw("response-1", 100, 80, 0, 5, 105),
+            ProviderBillingMode::Subscription,
+        );
+        usage.observe(
+            &raw("response-2", 200, 150, 20, 10, 210),
+            ProviderBillingMode::Subscription,
+        );
+        usage.observe(
+            &serde_json::json!({
+                "method": "thread/tokenUsage/updated",
+                "params": {
+                    "tokenUsage": {
+                        "last": {
+                            "inputTokens": 90_000,
+                            "cachedInputTokens": 80_000,
+                            "cacheWriteInputTokens": 0,
+                            "outputTokens": 100,
+                            "totalTokens": 90_100
+                        },
+                        "modelContextWindow": 258_400
+                    }
+                }
+            }),
+            ProviderBillingMode::Subscription,
+        );
+
+        let usage = usage.finish(123);
+        assert_eq!(usage.input_tokens, 50);
+        assert_eq!(usage.cached_input_tokens, 230);
+        assert_eq!(usage.cache_creation_input_tokens, 20);
+        assert_eq!(usage.output_tokens, 15);
+        assert_eq!(usage.total_tokens, 315);
+        assert_eq!(usage.context_tokens, Some(90_100));
+        assert_eq!(usage.context_window_tokens, Some(258_400));
+        assert_eq!(usage.duration_ms, 123);
+    }
+
+    #[test]
+    fn resumed_codex_turn_sums_distinct_thread_usage_updates() {
+        let update = |total_input, last_input, last_cached, last_output| {
+            serde_json::json!({
+                "method": "thread/tokenUsage/updated",
+                "params": {
+                    "tokenUsage": {
+                        "total": {
+                            "inputTokens": total_input,
+                            "cachedInputTokens": 0,
+                            "cacheWriteInputTokens": 0,
+                            "outputTokens": 0,
+                            "totalTokens": total_input
+                        },
+                        "last": {
+                            "inputTokens": last_input,
+                            "cachedInputTokens": last_cached,
+                            "cacheWriteInputTokens": 0,
+                            "outputTokens": last_output,
+                            "totalTokens": last_input + last_output
+                        },
+                        "modelContextWindow": 258_400
+                    }
+                }
+            })
+        };
+        let mut usage = CodexTurnUsageAccumulator::default();
+        usage.observe(
+            &update(1_000, 100, 80, 5),
+            ProviderBillingMode::Subscription,
+        );
+        usage.observe(
+            &update(1_000, 100, 80, 5),
+            ProviderBillingMode::Subscription,
+        );
+        usage.observe(
+            &update(1_250, 250, 200, 10),
+            ProviderBillingMode::Subscription,
+        );
+
+        let usage = usage.finish(50);
+        assert_eq!(usage.input_tokens, 70);
+        assert_eq!(usage.cached_input_tokens, 280);
+        assert_eq!(usage.output_tokens, 15);
+        assert_eq!(usage.total_tokens, 365);
+        assert_eq!(usage.context_tokens, Some(260));
         assert_eq!(usage.context_window_tokens, Some(258_400));
     }
 

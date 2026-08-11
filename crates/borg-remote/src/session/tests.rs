@@ -4630,6 +4630,17 @@ async fn goal_state_is_recoverable_from_the_session_journal() {
     ));
 }
 
+#[test]
+fn automatic_goal_continuation_requires_remaining_explicit_budget() {
+    let unbudgeted = SessionGoal::new("one deliberate turn".to_string(), None);
+    assert!(!goal_allows_automatic_continuation(&unbudgeted));
+
+    let mut budgeted = SessionGoal::new("bounded continuation".to_string(), Some(100));
+    assert!(goal_allows_automatic_continuation(&budgeted));
+    budgeted.tokens_used = 100;
+    assert!(!goal_allows_automatic_continuation(&budgeted));
+}
+
 #[tokio::test]
 async fn model_can_mark_an_active_goal_blocked() {
     let root = tempdir().unwrap();
@@ -6711,6 +6722,34 @@ fn subscription_compaction_projection_has_a_hard_total_bound() {
     assert!(bounded.contains(COMPACTION_CONTEXT_ELISION));
 }
 
+#[test]
+fn deterministic_recovery_projection_fits_the_complete_provider_request() {
+    let session_id = Uuid::new_v4();
+    let events = vec![SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::Message {
+            message_id: Uuid::new_v4(),
+            actor: EventActor::User,
+            text: "x".repeat(SUBSCRIPTION_INPUT_BUDGET_CHARS * 2),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: None,
+        },
+    )];
+    let current_prompt = "continue safely";
+    let projection = retained_compaction_context_with_budget(
+        &events,
+        subscription_replay_context_budget(EventActor::User, current_prompt),
+    )
+    .unwrap();
+
+    assert!(
+        subscription_prompt_chars(Some(&projection), EventActor::User, current_prompt)
+            <= SUBSCRIPTION_INPUT_BUDGET_CHARS
+    );
+}
+
 #[tokio::test]
 async fn subscription_compaction_truncates_provider_summary_before_replay() {
     let root = tempdir().unwrap();
@@ -7057,6 +7096,45 @@ fn interrupted_user_prompt_is_preserved_after_context_compaction() {
 }
 
 #[test]
+fn provider_native_compaction_keeps_borg_recovery_history_lossless() {
+    use borg_provider::provider::ModelMessage;
+
+    let session_id = Uuid::new_v4();
+    let events = vec![
+        SessionEvent::new(
+            session_id,
+            1,
+            SessionEventKind::Message {
+                message_id: Uuid::new_v4(),
+                actor: EventActor::User,
+                text: "retain this requirement".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            },
+        ),
+        SessionEvent::new(
+            session_id,
+            2,
+            SessionEventKind::ProviderEvent {
+                provider: CodingProvider::Codex,
+                kind: "context_compaction".to_string(),
+                payload: json!({
+                    "status": "completed",
+                    "summary": "provider-only checkpoint",
+                    "provider_context_preserved": true,
+                }),
+            },
+        ),
+    ];
+
+    assert_eq!(
+        provider_neutral_conversation(&events).unwrap(),
+        vec![ModelMessage::user("retain this requirement")]
+    );
+}
+
+#[test]
 fn subscription_context_budget_detects_oversized_resumed_transcripts() {
     let context = format!(
         "{{\"role\":\"tool\",\"content\":\"{}\"}}",
@@ -7075,21 +7153,17 @@ fn reusable_subscription_context_does_not_compact_the_full_replay() {
         "x".repeat(SUBSCRIPTION_INPUT_BUDGET_CHARS)
     );
 
-    assert!(subscription_context_needs_compaction(
+    assert!(subscription_context_needs_projection(
         &context,
         EventActor::User,
         "continue",
         false,
-        None,
-        None,
     ));
-    assert!(!subscription_context_needs_compaction(
+    assert!(!subscription_context_needs_projection(
         &context,
         EventActor::User,
         "continue",
         true,
-        None,
-        None,
     ));
     assert!(
         subscription_prompt_chars(Some(&context), EventActor::User, "continue")
@@ -7102,34 +7176,22 @@ fn reusable_subscription_context_does_not_compact_the_full_replay() {
 }
 
 #[test]
-fn subscription_context_usage_cannot_bypass_the_character_limit() {
+fn recovery_projection_depends_on_replay_size_not_stale_context_usage() {
     let oversized_context = "x".repeat(SUBSCRIPTION_INPUT_BUDGET_CHARS * 4);
 
-    assert!(subscription_context_needs_compaction(
+    assert!(subscription_context_needs_projection(
         &oversized_context,
         EventActor::User,
         "continue",
         false,
-        Some(179_468),
-        Some(258_400),
     ));
 
     let context_within_input_limit = "x".repeat(SUBSCRIPTION_INPUT_BUDGET_CHARS / 2);
-    assert!(!subscription_context_needs_compaction(
+    assert!(!subscription_context_needs_projection(
         &context_within_input_limit,
         EventActor::User,
         "continue",
         false,
-        Some(179_468),
-        Some(258_400),
-    ));
-    assert!(subscription_context_needs_compaction(
-        &context_within_input_limit,
-        EventActor::User,
-        "continue",
-        false,
-        Some(245_450),
-        Some(258_400),
     ));
 }
 

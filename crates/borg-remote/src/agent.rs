@@ -221,6 +221,7 @@ pub trait AgentTurnExecutor: Send + Sync {
 
     async fn compact(
         &self,
+        _session_id: Uuid,
         _provider: CodingProvider,
         _provider_session_id: &str,
     ) -> Result<Option<ProviderCallUsage>> {
@@ -685,10 +686,37 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
 
     async fn compact(
         &self,
-        _provider: CodingProvider,
-        _provider_session_id: &str,
+        session_id: Uuid,
+        provider: CodingProvider,
+        provider_session_id: &str,
     ) -> Result<Option<ProviderCallUsage>> {
-        bail!("provider-session compaction is unavailable for subscription CLI sessions")
+        anyhow::ensure!(
+            provider == CodingProvider::Codex,
+            "provider-session compaction is unavailable for {provider:?}"
+        );
+        let pool = {
+            let slots = self.subscription_pools.slots.lock().await;
+            let slot = slots
+                .get(&session_id)
+                .context("Codex native compaction requires an active subscription pool")?;
+            anyhow::ensure!(
+                slot.provider == CodingProvider::Codex && slot.healthy,
+                "Codex native compaction requires a healthy reusable thread"
+            );
+            match &slot.pool {
+                SubscriptionPool::Codex(pool) => pool.clone(),
+                SubscriptionPool::Claude(_) => unreachable!("Codex slot contained Claude pool"),
+            }
+        };
+        match pool.compact(provider_session_id).await {
+            Ok(usage) => Ok(Some(usage)),
+            Err(error) => {
+                self.subscription_pools
+                    .mark(session_id, CodingProvider::Codex, false)
+                    .await;
+                Err(error)
+            }
+        }
     }
 
     async fn compact_native(
@@ -1395,14 +1423,6 @@ async fn run_borg_provider_turn(
         .await;
         return Err(error);
     }
-    send(
-        &events,
-        SessionEventKind::StatusChanged {
-            status: SessionStatus::Ready,
-            detail: None,
-        },
-    )
-    .await;
     if let Some((registry, _)) = pool_invocation.as_ref() {
         registry
             .mark(
@@ -1415,6 +1435,14 @@ async fn run_borg_provider_turn(
             )
             .await;
     }
+    send(
+        &events,
+        SessionEventKind::StatusChanged {
+            status: SessionStatus::Ready,
+            detail: None,
+        },
+    )
+    .await;
     Ok(AgentTurnResult {
         provider_session_id,
         final_text: if final_output.is_empty() {

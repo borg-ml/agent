@@ -180,6 +180,10 @@ impl SessionEventKind {
             self,
             Self::ProviderEvent { kind, payload, .. }
                 if kind == "context_compaction"
+                    && payload
+                        .get("provider_context_preserved")
+                        .and_then(serde_json::Value::as_bool)
+                        != Some(true)
                     && matches!(
                         payload.get("status").and_then(serde_json::Value::as_str),
                         None | Some("completed")
@@ -2977,6 +2981,7 @@ impl SqliteSessionStore {
                      and json_extract(event_json, '$.kind.kind') = 'context_compaction' \
                      and (json_extract(event_json, '$.kind.payload.status') = 'completed' \
                           or json_extract(event_json, '$.kind.payload.status') is null) \
+                     and coalesce(json_extract(event_json, '$.kind.payload.provider_context_preserved'), 0) != 1 \
                      order by sequence desc limit 1",
                 )
                 .bind(session_id.to_string())

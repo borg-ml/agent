@@ -1541,6 +1541,22 @@ async fn latest_completed_compaction_is_projected_through_a_fork() {
     ));
 }
 
+#[test]
+fn provider_native_compaction_is_not_a_durable_replay_boundary() {
+    let kind = SessionEventKind::ProviderEvent {
+        provider: CodingProvider::Codex,
+        kind: "context_compaction".to_string(),
+        payload: serde_json::json!({
+            "status": "completed",
+            "provider_context_preserved": true,
+        }),
+    };
+
+    assert!(!kind.is_completed_context_compaction());
+    assert_eq!(kind.persistence(), EventPersistence::Durable);
+    assert!(!kind.is_context_relevant());
+}
+
 #[tokio::test]
 async fn inherited_event_pages_match_the_full_projection_across_lineage_boundaries() {
     let (directory, store) = store().await;
