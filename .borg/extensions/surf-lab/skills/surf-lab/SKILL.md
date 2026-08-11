@@ -1542,6 +1542,53 @@ student's visited states by ordered progress and survival, followed by ordinary
 phase-free network fitting and complete-start CPU validation. This is a data
 and closed-loop objective correction, not another width or mutation sweep.
 
+Surf commit `35da440` adds a bounded TrackMania-style off-policy baseline and a
+per-tick-consistent exploration path. `tools/train_native_sac_gpu.py` trains
+twin critics and one ordinary phase-free actor from replay, holds out complete
+trajectories for return-ranking diagnostics, and can restrict actor gradients
+to continuous-action rows in a selected ordinary output suffix. The restriction
+is structural: all earlier columns, both button rows, every hidden tensor, and
+the output bias must remain bit-identical. A function-equivalent prefix policy
+is accepted only after exact output equality on every protected feature. The
+trainer aborts if a frozen parameter or protected-prefix output changes.
+
+The first calibration closed two unsafe update paths. A full 704-wide actor
+update changed protected-prefix outputs by only `1.36e-4` at worst but still
+regressed from reset tick 1349 to about 734, so soft behavior penalties are not
+a closed-loop trust region. The existing 736-wide zero-control expansion is
+bit-identical to the 704-wide parent on all 1,349 parent states; its final 32
+units are inactive through tick 1099 and all activate in the tail. On the old
+held-noise replay, a critic-only ROCm run took 2.10 seconds and reached held-out
+return rank correlations `0.938` over transitions and `0.737` at trajectory
+starts. A hard-suffix actor update kept protected-prefix and frozen-parameter
+deltas exactly zero, but exact CPU reset at absolute demo tick 1527 versus the
+parent's 1589. Reject that candidate.
+
+The high critic rank was confounded by the replay contract. Old exploration
+held one sampled residual for 32--64 ticks and also perturbed each initial
+position, velocity, and yaw. Its first action therefore identified a future
+control program and a different recovery state, while deployment recomputed an
+action every tick from the nominal state. Do not use held-noise diagnostics as
+ordinary one-step SAC actor data. The ROCm and CPU collectors now accept
+`exploration_autocorrelation`: a stationary AR(1) residual updated every tick,
+mutually exclusive with hold lengths above one. With identical seed, 256
+matched CPU/GPU transitions agreed on unclipped exploration residuals within
+`5.96e-8`, rewards within `1.20e-7`, and had zero route, reset, termination, or
+truncation disagreements.
+
+Keep smooth collection at compositor-safe width 32. Four sequential exact-state
+AR batches (128 total candidates, correlation half-life 32 ticks) reached best
+route indices 1213, 1213, 1211, and 1211 versus the parent's 1222; do not train
+or tune on that uniformly worse set. A causal replay also separated the old
+route-1232 elite: the identical perturbed state with zero action residuals
+reached 1217, proving that the held program genuinely recovered that displaced
+state, but the same program from the exact nominal parent state reached only
+1214. It is recovery evidence, not a nominal route improvement. Any continuing
+off-policy loop must collect from the current actor with matching per-tick
+semantics and keep nominal advancement separate from perturbation recovery in
+both critic validation and promotion. The 704-wide stage-3 policy remains the
+clean authority.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
