@@ -2397,16 +2397,20 @@ fn active_goal_cache_key_advances_once_per_elapsed_minute() {
 
 #[test]
 fn focused_child_goal_view_does_not_inherit_the_director_goal() {
-    let mut director = Transcript::default();
-    director.goal = Some(SessionGoal::new("Director work".to_string(), None));
+    let director = Transcript {
+        goal: Some(SessionGoal::new("Director work".to_string(), None)),
+        ..Default::default()
+    };
     let child = Transcript::default();
     let child_id = Uuid::new_v4();
 
     assert!(active_goal_for_view(Some(child_id), Some(&director), &child).is_none());
     assert!(active_goal_for_view(None, Some(&director), &child).is_some());
 
-    let mut child_with_goal = Transcript::default();
-    child_with_goal.goal = Some(SessionGoal::new("Child work".to_string(), None));
+    let child_with_goal = Transcript {
+        goal: Some(SessionGoal::new("Child work".to_string(), None)),
+        ..Default::default()
+    };
     assert_eq!(
         active_goal_for_view(Some(child_id), Some(&director), &child_with_goal)
             .map(|goal| goal.objective.as_str()),
