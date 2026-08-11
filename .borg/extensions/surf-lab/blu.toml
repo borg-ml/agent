@@ -4,7 +4,7 @@ id = "surf-lab"
 manifest_version = 1
 name = "Surf Lab"
 skill_roots = ["skills"]
-version = "0.3.47"
+version = "0.3.48"
 
 [mcp.lab]
 command = "${extension_dir}/surf-lab"

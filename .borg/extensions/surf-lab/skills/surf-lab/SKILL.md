@@ -1512,6 +1512,36 @@ more rollout budget on output-only or hidden-threshold searches. Revisit the
 end-to-end representation, data distribution, and learning objective that made
 the earlier controller successful before proposing another optimizer.
 
+Surf commit `ad6cd04` identifies why the earlier clean reproduction was not a
+faithful or valid distillation. The Python `policy_teacher_targets` evaluator
+omitted v7002's final and completion state-feedback branches. Those branches
+materially affect 329 states from episode tick 1639 onward, with a pre-clipping
+output difference as large as 2.60. The repaired evaluator matches commands
+emitted by the Rust runtime over 1,967 states to maximum movement error
+`6.20e-6`, maximum yaw error `5.78e-5` degrees, maximum pitch error `1.20e-7`,
+and zero jump or duck disagreements. Corrective exports now also retain analog
+movement RMSE/max/over-0.05 and maximum yaw error; the old
+`movement_accuracy` measured signs only and hid magnitude error.
+
+Faithful labels alone are not enough because v7002 is not an off-trajectory
+expert. On its own trajectory, the old clean seed already differs by over 0.05
+movement on 11% of the first 400 states despite its reported 98.94% movement-
+sign accuracy. A compositor-safe 250-epoch fine-tune took 0.89 seconds of GPU
+time and improved same-dataset movement RMSE from 0.165 to 0.066 and yaw MAE
+from 0.458 to 0.316 degrees, yet its exact CPU rollout regressed from episode
+reset tick 742 to 432. A new CPU-only `diagnostic_switch_policy` handoff then
+proved the teacher mismatch directly: clean seed to v7002 at tick 400 reset at
+545, and the stronger stage-3 controller to v7002 at tick 800 reset at 1033,
+versus unchanged reset ticks 742 and 1349. The handoff is explicitly clocked,
+diagnostic, nonexportable, and nonpromotable.
+
+Do not use v7002 actions as DAgger labels on clean-controller states. Its 91.8%
+result depends on its own phase-gated state distribution. The next clean
+training method needs a true exact-CPU receding-horizon expert that labels the
+student's visited states by ordered progress and survival, followed by ordinary
+phase-free network fitting and complete-start CPU validation. This is a data
+and closed-loop objective correction, not another width or mutation sweep.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
