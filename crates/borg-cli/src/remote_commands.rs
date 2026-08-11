@@ -1292,10 +1292,17 @@ async fn run_local_agent_session(
     };
     let has_initial_prompt = initial_prompt.is_some();
     let interactive = can_prompt;
-    let mut history = if can_prompt && !fallback_terminal {
-        recent_tui_history(store.as_ref(), session_id, session_state.latest_sequence).await?
+    let (mut history, mut history_page_before_sequence) = if can_prompt && !fallback_terminal {
+        let bootstrap =
+            recent_tui_history(store.as_ref(), session_id, session_state.latest_sequence).await?;
+        (bootstrap.events, bootstrap.page_before)
     } else {
-        store.read(session_id).await?
+        let history = store.read(session_id).await?;
+        let page_before = history
+            .first()
+            .map(|event| event.sequence)
+            .unwrap_or_else(|| session_state.latest_sequence.saturating_add(1));
+        (history, page_before)
     };
     let pending_prompt_events = if can_prompt && !fallback_terminal && resuming {
         store.recovery(session_id).await?.queue_events
@@ -1613,7 +1620,7 @@ async fn run_local_agent_session(
     // unrelated session/team hydration work.
     let mut history_page_task: Option<tokio::task::JoinHandle<Result<Vec<SessionEvent>>>> =
         (resuming && terminal.is_some() && !history_start_reached).then(|| {
-            let before = history_page_before(&history, session_state.latest_sequence);
+            let before = history_page_before_sequence;
             let history_store = Arc::clone(&store);
             tokio::spawn(async move {
                 older_tui_history(history_store.as_ref(), session_id, before).await
@@ -1755,9 +1762,16 @@ async fn run_local_agent_session(
                         history_start_reached = true;
                     }
                     Ok(Ok(older)) => {
-                        history.splice(0..0, older);
-                        history_start_reached =
-                            history.first().is_none_or(|event| event.sequence <= 1);
+                        if let Some(before) = older
+                            .iter()
+                            .map(|event| event.sequence)
+                            .filter(|sequence| *sequence > 0)
+                            .min()
+                        {
+                            history_page_before_sequence = before;
+                        }
+                        merge_tui_history_page(&mut history, older);
+                        history_start_reached = history_page_before_sequence <= 1;
                         if let Some(terminal) = terminal.as_mut() {
                             terminal.replace_history(&history);
                             terminal.seed_session_state(delivered_projection.state());
@@ -1809,10 +1823,7 @@ async fn run_local_agent_session(
                 if history_requested && !history_start_reached {
                     terminal.set_history_page_loading(true);
                     if history_page_task.is_none() {
-                        let before = history_page_before(
-                            &history,
-                            delivered_projection.state().latest_sequence,
-                        );
+                        let before = history_page_before_sequence;
                         let history_store = Arc::clone(&store);
                         history_page_task = Some(tokio::spawn(async move {
                             older_tui_history(history_store.as_ref(), session_id, before).await
@@ -3042,7 +3053,7 @@ async fn run_local_agent_session(
                                 .recent_user_messages(session_id, RICH_TUI_PROMPT_HISTORY_LIMIT)
                                 .await?;
                             restored.seed_composer_history(&composer_history);
-                            restored.seed_history(&latest);
+                            restored.seed_history(&latest.events);
                             let (_, agents, histories) = load_subagent_thread_state(
                                 store.as_ref(),
                                 &sessions_dir,
@@ -4083,7 +4094,7 @@ async fn run_local_agent_session(
                                             )
                                             .await?;
                                         restored.seed_composer_history(&composer_history);
-                                        restored.seed_history(&latest);
+                                        restored.seed_history(&latest.events);
                                         let (_, agents, histories) =
                                             load_subagent_thread_state(
                                                 store.as_ref(),
@@ -4140,7 +4151,7 @@ async fn run_local_agent_session(
                                             )
                                             .await?;
                                         restored.seed_composer_history(&composer_history);
-                                        restored.seed_history(&latest);
+                                        restored.seed_history(&latest.events);
                                         let (_, agents, histories) =
                                             load_subagent_thread_state(
                                                 store.as_ref(),
@@ -4977,7 +4988,7 @@ async fn recent_tui_history(
     store: &dyn SessionStore,
     session_id: Uuid,
     latest_sequence: u64,
-) -> Result<Vec<SessionEvent>> {
+) -> Result<ResumeBootstrapHistory> {
     let checkpoint = store
         .latest_completed_context_compaction(session_id)
         .await?;
@@ -4988,21 +4999,39 @@ async fn recent_tui_history(
             RICH_TUI_HISTORY_BOOTSTRAP_SCAN_LIMIT,
         )
         .await?;
-    let mut selected = select_resume_bootstrap_history(scanned);
+    let selection = select_resume_bootstrap_history(scanned);
+    let mut selected = selection.events;
     if let Some(checkpoint) = checkpoint
         && !selected.iter().any(|event| event.id == checkpoint.id)
     {
         let index = selected.partition_point(|event| event.sequence < checkpoint.sequence);
         selected.insert(index, checkpoint);
     }
-    Ok(selected)
+    Ok(ResumeBootstrapHistory {
+        events: selected,
+        page_before: selection
+            .page_before
+            .unwrap_or_else(|| latest_sequence.saturating_add(1)),
+    })
 }
 
 fn recent_tui_history_after(latest_sequence: u64) -> u64 {
     latest_sequence.saturating_sub(RICH_TUI_HISTORY_BOOTSTRAP_SCAN_LIMIT as u64)
 }
 
-fn select_resume_bootstrap_history(events: Vec<SessionEvent>) -> Vec<SessionEvent> {
+#[derive(Debug)]
+struct ResumeBootstrapHistory {
+    events: Vec<SessionEvent>,
+    page_before: u64,
+}
+
+#[derive(Debug)]
+struct ResumeBootstrapSelection {
+    events: Vec<SessionEvent>,
+    page_before: Option<u64>,
+}
+
+fn select_resume_bootstrap_history(events: Vec<SessionEvent>) -> ResumeBootstrapSelection {
     // Queued input is a pending-work projection, not conversation history.
     // Replaying it into the first frame made an old queue entry look like a
     // fresh prompt and could also wake it during resume recovery.
@@ -5024,9 +5053,18 @@ fn select_resume_bootstrap_history(events: Vec<SessionEvent>) -> Vec<SessionEven
         })
         .collect::<Vec<_>>();
     if events.len() <= RICH_TUI_HISTORY_EVENT_LIMIT {
-        return trim_resume_bootstrap_to_user_boundary(events);
+        let events = trim_resume_bootstrap_to_user_boundary(events);
+        return ResumeBootstrapSelection {
+            page_before: events
+                .iter()
+                .map(|event| event.sequence)
+                .filter(|sequence| *sequence > 0)
+                .min(),
+            events,
+        };
     }
     let floor = events.len() - RICH_TUI_HISTORY_EVENT_LIMIT;
+    let page_before = events.get(floor).map(|event| event.sequence);
     let message_indices = events
         .iter()
         .enumerate()
@@ -5060,7 +5098,10 @@ fn select_resume_bootstrap_history(events: Vec<SessionEvent>) -> Vec<SessionEven
             (index >= floor || retained_messages.contains(&index)).then_some(event)
         })
         .collect();
-    trim_resume_bootstrap_to_user_boundary(selected)
+    ResumeBootstrapSelection {
+        events: trim_resume_bootstrap_to_user_boundary(selected),
+        page_before,
+    }
 }
 
 fn trim_resume_bootstrap_to_user_boundary(events: Vec<SessionEvent>) -> Vec<SessionEvent> {
@@ -5079,11 +5120,22 @@ fn trim_resume_bootstrap_to_user_boundary(events: Vec<SessionEvent>) -> Vec<Sess
     events.into_iter().skip(first_user).collect()
 }
 
-fn history_page_before(events: &[SessionEvent], latest_sequence: u64) -> u64 {
-    events
-        .first()
-        .map(|event| event.sequence)
-        .unwrap_or_else(|| latest_sequence.saturating_add(1))
+fn merge_tui_history_page(history: &mut Vec<SessionEvent>, older: Vec<SessionEvent>) {
+    let mut seen_ids = HashSet::new();
+    let mut seen_sequences = HashSet::new();
+    let mut merged = Vec::with_capacity(history.len() + older.len());
+    for event in older.into_iter().chain(std::mem::take(history)) {
+        let unseen = if event.sequence > 0 {
+            seen_sequences.insert(event.sequence)
+        } else {
+            seen_ids.insert(event.id)
+        };
+        if unseen {
+            merged.push(event);
+        }
+    }
+    merged.sort_by_key(|event| (event.sequence == 0, event.sequence));
+    *history = merged;
 }
 
 async fn older_tui_history(

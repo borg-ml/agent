@@ -235,6 +235,36 @@ fn older_history_pages_end_immediately_before_the_loaded_tail() {
 }
 
 #[test]
+fn older_history_pages_merge_around_a_checkpoint_without_duplicate_rows() {
+    let session_id = Uuid::new_v4();
+    let checkpoint = SessionEvent::new(
+        session_id,
+        3,
+        SessionEventKind::ProviderEvent {
+            provider: CodingProvider::Codex,
+            kind: "context_compaction".to_string(),
+            payload: serde_json::json!({
+                "status": "completed",
+                "summary": "durable resume summary"
+            }),
+        },
+    );
+    let middle = SessionEvent::new(session_id, 50, SessionEventKind::ReasoningCompleted);
+    let tail = SessionEvent::new(session_id, 100, SessionEventKind::ReasoningCompleted);
+    let mut history = vec![checkpoint, tail.clone()];
+
+    merge_tui_history_page(&mut history, vec![middle, tail]);
+
+    assert_eq!(
+        history
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>(),
+        vec![3, 50, 100]
+    );
+}
+
+#[test]
 fn first_resume_scan_is_bounded_before_history_is_selected() {
     assert_eq!(recent_tui_history_after(10), 0);
     assert_eq!(recent_tui_history_after(100), 0);
@@ -302,9 +332,9 @@ fn first_resume_frame_keeps_real_recent_conversation_before_lazy_pages() {
     );
 
     let selected = select_resume_bootstrap_history(events);
-    assert_eq!(selected.first().unwrap().sequence, 21);
-    assert_eq!(selected.len(), RICH_TUI_HISTORY_EVENT_LIMIT + 1);
-    assert!(selected.iter().any(|event| matches!(
+    assert_eq!(selected.events.first().unwrap().sequence, 21);
+    assert_eq!(selected.events.len(), RICH_TUI_HISTORY_EVENT_LIMIT + 1);
+    assert!(selected.events.iter().any(|event| matches!(
         &event.kind,
         SessionEventKind::Message { text, .. } if text == "meaningful resume context"
     )));
@@ -396,15 +426,24 @@ async fn first_resume_frame_splices_in_the_latest_completed_compaction() {
         .await
         .unwrap();
 
-    assert!(history[0].kind.is_completed_context_compaction());
+    assert!(history.page_before > history.events[0].sequence);
+    assert!(history.page_before < history.events.last().unwrap().sequence);
+    let older = older_tui_history(&store, session_id, history.page_before)
+        .await
+        .unwrap();
+    assert!(older.iter().any(|event| {
+        event.sequence > history.events[0].sequence && event.sequence < history.page_before
+    }));
+    assert!(history.events[0].kind.is_completed_context_compaction());
     assert!(matches!(
-        &history[0].kind,
+        &history.events[0].kind,
         SessionEventKind::ProviderEvent { payload, .. }
             if payload.get("summary").and_then(serde_json::Value::as_str)
                 == Some("durable resume summary")
     ));
     assert_eq!(
         history
+            .events
             .iter()
             .filter(|event| matches!(
                 &event.kind,
@@ -414,7 +453,7 @@ async fn first_resume_frame_splices_in_the_latest_completed_compaction() {
             .count(),
         1
     );
-    assert!(history.iter().any(|event| matches!(
+    assert!(history.events.iter().any(|event| matches!(
         &event.kind,
         SessionEventKind::Message { text, .. } if text == "current request"
     )));
@@ -497,19 +536,19 @@ fn first_resume_frame_drops_orphaned_output_and_queued_input() {
     );
 
     let selected = select_resume_bootstrap_history(events);
-    assert!(selected.iter().any(|event| matches!(
+    assert!(selected.events.iter().any(|event| matches!(
         &event.kind,
         SessionEventKind::Message { text, .. } if text == "current user request"
     )));
-    assert!(selected.iter().any(|event| matches!(
+    assert!(selected.events.iter().any(|event| matches!(
         &event.kind,
         SessionEventKind::Message { text, .. } if text == "current response"
     )));
-    assert!(!selected.iter().any(|event| matches!(
+    assert!(!selected.events.iter().any(|event| matches!(
         &event.kind,
         SessionEventKind::Message { text, .. } if text == "orphaned old response"
     )));
-    assert!(!selected.iter().any(|event| matches!(
+    assert!(!selected.events.iter().any(|event| matches!(
         &event.kind,
         SessionEventKind::Message {
             status: MessageStatus::Queued,
@@ -517,7 +556,7 @@ fn first_resume_frame_drops_orphaned_output_and_queued_input() {
         }
     )));
     assert_eq!(
-        selected.iter().find_map(|event| match &event.kind {
+        selected.events.iter().find_map(|event| match &event.kind {
             SessionEventKind::Message {
                 actor: EventActor::User,
                 text,
