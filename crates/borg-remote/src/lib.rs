@@ -62,6 +62,7 @@ pub use local_control::{
     LocalSessionControlServer, local_session_owner_uses_current_binary, run_attached_session,
     send_local_session_command, session_control_presence_socket_path, session_control_socket_path,
 };
+pub(crate) use lsp::LspPathPolicy;
 pub use lsp::LspService;
 pub use orchestration::*;
 pub(crate) use plugin_store::SqlitePluginStore;
@@ -69,6 +70,7 @@ pub use runtime_protocol::{
     AGENT_RUNTIME_PROTOCOL, AGENT_RUNTIME_PROTOCOL_VERSION, AgentRuntimeCommandEnvelope,
     AgentRuntimeEventEnvelope, AgentRuntimeSnapshot,
 };
+pub(crate) use session::run_agent_session_with_store_and_writer_and_lsp_policy;
 pub use session::{
     SessionConsultationTools, SessionGoalTools, SessionTodoTools, run_agent_session,
     run_agent_session_with_executor, run_agent_session_with_executor_and_writer,

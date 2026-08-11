@@ -22,16 +22,18 @@ use crate::{
     AgentRuntimeCommandEnvelope, AgentRuntimeEventEnvelope, AgentTurnExecutor, Audience,
     CodingProvider, HostCapabilities, HostCommand, HostCommandEnvelope, HostExecutionProfile,
     HostHeartbeat, HostResourceLimits, HostShellCommandOutcome, HostShellCommandRequest,
-    HostShellCommandResponse, LaunchSession, OpenTerminalOutcome, OpenTerminalRequest,
-    OpenTerminalResponse, Participant, ParticipantKind, PermissionMode, ProviderAuthMethod,
-    ProviderCapability, REMOTE_PROTOCOL_VERSION, RemoteHost, RemoteHostIdentity, RuntimeMcpContext,
-    SessionEvent, SessionLiveEvent, SessionPayloadRef, SessionStore, SessionWriterLease,
-    SqliteSessionStore, SqliteWorkspaceStore, WorkspaceAttachment, WorkspaceCommandErrorCode,
-    WorkspaceCommandOutcome, WorkspaceCommandRequest, WorkspaceCommandResponse, WorkspaceEventKind,
+    HostShellCommandResponse, LaunchSession, LspPathPolicy, OpenTerminalOutcome,
+    OpenTerminalRequest, OpenTerminalResponse, Participant, ParticipantKind, PermissionMode,
+    ProviderAuthMethod, ProviderCapability, REMOTE_PROTOCOL_VERSION, RemoteHost,
+    RemoteHostIdentity, RuntimeMcpContext, SessionEvent, SessionLiveEvent, SessionPayloadRef,
+    SessionStore, SessionWriterLease, SqliteSessionStore, SqliteWorkspaceStore,
+    WorkspaceAttachment, WorkspaceCommandErrorCode, WorkspaceCommandOutcome,
+    WorkspaceCommandRequest, WorkspaceCommandResponse, WorkspaceEventKind,
     WorkspaceFilesystemErrorCode, WorkspaceFilesystemOutcome, WorkspaceFilesystemRequest,
     WorkspaceFilesystemResponse, WorkspaceRole, WorkspaceStore,
     execute_host_shell_command_with_limits, execute_workspace_command_with_limits,
-    execute_workspace_filesystem_with_limits, run_agent_session_with_store_and_writer,
+    execute_workspace_filesystem_with_limits,
+    run_agent_session_with_store_and_writer_and_lsp_policy,
 };
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -2631,8 +2633,12 @@ async fn run_session(
     let actor_session_root = session_root.clone();
     let actor_store = Arc::clone(&sqlite_store);
     let executor = executor_factory(&config, &launch)?;
+    let lsp_policy = match config.execution_profile {
+        HostExecutionProfile::IsolatedHosted => LspPathPolicy::session_workspace(),
+        HostExecutionProfile::TrustedUser => LspPathPolicy::authorized_roots(config.roots.clone()),
+    };
     let actor = tokio::spawn(async move {
-        run_agent_session_with_store_and_writer(
+        run_agent_session_with_store_and_writer_and_lsp_policy(
             &actor_session_root,
             session_id,
             launch,
@@ -2641,6 +2647,7 @@ async fn run_session(
             executor,
             actor_store,
             writer,
+            lsp_policy,
         )
         .await
     });

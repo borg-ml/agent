@@ -4602,27 +4602,27 @@ fn agent_tool_specs_with_capabilities_and_consultation_and_search(
         ),
         tool(
             "lsp_diagnostics",
-            "Read current language-server diagnostics for a workspace source file. Starts the matching server lazily.",
+            "Read current language-server diagnostics for a source file. Trusted sessions may use an absolute path in another local project; starts the matching server lazily.",
             lsp_path_schema(),
         ),
         tool(
             "lsp_hover",
-            "Read language-server hover/type information at a one-based source position.",
+            "Read language-server hover/type information at a one-based source position. Trusted sessions may use an absolute path in another local project.",
             lsp_position_schema(),
         ),
         tool(
             "lsp_definition",
-            "Find the definition at a one-based source position.",
+            "Find the definition at a one-based source position. Trusted sessions may use an absolute path in another local project.",
             lsp_position_schema(),
         ),
         tool(
             "lsp_references",
-            "Find references, including the declaration, at a one-based source position.",
+            "Find references, including the declaration, at a one-based source position. Trusted sessions may use an absolute path in another local project.",
             lsp_position_schema(),
         ),
         tool(
             "lsp_document_symbols",
-            "List language-server symbols in a workspace source file.",
+            "List language-server symbols in a source file. Trusted sessions may use an absolute path in another local project.",
             lsp_path_schema(),
         ),
         tool(
@@ -5406,7 +5406,11 @@ fn lsp_path_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "path": { "type": "string", "minLength": 1 }
+            "path": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Session-relative or absolute source path; trusted sessions may target another local project."
+            }
         },
         "required": ["path"],
         "additionalProperties": false
@@ -5417,7 +5421,11 @@ fn lsp_position_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "path": { "type": "string", "minLength": 1 },
+            "path": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Session-relative or absolute source path; trusted sessions may target another local project."
+            },
             "line": { "type": "integer", "minimum": 1 },
             "character": { "type": "integer", "minimum": 1 }
         },

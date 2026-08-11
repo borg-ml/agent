@@ -814,6 +814,34 @@ pub async fn run_agent_session_with_store_and_writer(
     store: Arc<dyn SessionStore>,
     _writer: SessionWriterLease,
 ) -> Result<()> {
+    run_agent_session_with_store_and_writer_and_lsp_policy(
+        session_root,
+        session_id,
+        launch,
+        commands,
+        events,
+        executor,
+        store,
+        _writer,
+        crate::LspPathPolicy::unrestricted(),
+    )
+    .await
+}
+
+/// Run a session with an explicit LSP path policy. Local callers use the
+/// trusted unrestricted default; enrolled hosts provide their own boundary.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_agent_session_with_store_and_writer_and_lsp_policy(
+    session_root: &Path,
+    session_id: Uuid,
+    launch: LaunchSession,
+    commands: mpsc::Receiver<HostCommand>,
+    events: mpsc::Sender<SessionEvent>,
+    executor: Arc<dyn AgentTurnExecutor>,
+    store: Arc<dyn SessionStore>,
+    _writer: SessionWriterLease,
+    lsp_policy: crate::LspPathPolicy,
+) -> Result<()> {
     anyhow::ensure!(
         !launch.fast.unwrap_or(false) || launch.provider.supports_fast(),
         "fast mode is not supported by the {:?} transport",
@@ -827,6 +855,7 @@ pub async fn run_agent_session_with_store_and_writer(
         events,
         executor,
         store,
+        lsp_policy,
         None,
         Vec::new(),
     )
@@ -860,6 +889,7 @@ pub async fn run_agent_session_with_store_writer_and_peers(
         events,
         executor,
         store,
+        crate::LspPathPolicy::unrestricted(),
         None,
         initial_peers,
     )
@@ -891,6 +921,7 @@ pub(crate) async fn run_agent_session_with_store_and_writer_and_team(
         events,
         executor,
         store,
+        crate::LspPathPolicy::unrestricted(),
         Some(team),
         Vec::new(),
     )
@@ -929,6 +960,7 @@ async fn run_agent_session_kernel(
         events,
         executor,
         runtime_store,
+        crate::LspPathPolicy::unrestricted(),
         None,
         Vec::new(),
     )
@@ -946,6 +978,7 @@ async fn run_agent_session_store_kernel(
     events: mpsc::Sender<SessionEvent>,
     executor: Arc<dyn AgentTurnExecutor>,
     store: Arc<dyn SessionStore>,
+    lsp_policy: crate::LspPathPolicy,
     shared_team: Option<SubagentCoordinator>,
     initial_peers: Vec<crate::SpawnSubagent>,
 ) -> Result<()> {
@@ -1224,7 +1257,7 @@ async fn run_agent_session_store_kernel(
         goal_tools.clone(),
         todo_tools.clone(),
         subagents.clone(),
-        crate::LspService::new(&launch.cwd),
+        crate::LspService::with_path_policy(&launch.cwd, lsp_policy),
         launch.provider,
         session_id,
         launch.capabilities.subagents,

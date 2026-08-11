@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -16,7 +16,60 @@ const MAX_LSP_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 #[derive(Clone)]
 pub struct LspService {
     root: PathBuf,
-    clients: std::sync::Arc<Mutex<HashMap<&'static str, LspClient>>>,
+    path_policy: LspPathPolicy,
+    clients: std::sync::Arc<Mutex<HashMap<LspClientKey, LspClient>>>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum LspPathPolicy {
+    /// Local trusted sessions already have the host's normal filesystem
+    /// access, so LSP should not impose a narrower artificial boundary.
+    Unrestricted,
+    /// Isolated hosts keep LSP inside the attached session workspace.
+    SessionWorkspace,
+    /// Trusted enrolled hosts may inspect any path inside their enrolled
+    /// roots, matching the host's other workspace tools.
+    AuthorizedRoots(Vec<PathBuf>),
+}
+
+impl LspPathPolicy {
+    pub(crate) fn unrestricted() -> Self {
+        Self::Unrestricted
+    }
+
+    pub(crate) fn session_workspace() -> Self {
+        Self::SessionWorkspace
+    }
+
+    pub(crate) fn authorized_roots(roots: Vec<PathBuf>) -> Self {
+        Self::AuthorizedRoots(roots)
+    }
+
+    fn allows(&self, path: &Path, session_root: &Path) -> bool {
+        match self {
+            Self::Unrestricted => true,
+            Self::SessionWorkspace => path.starts_with(session_root),
+            Self::AuthorizedRoots(roots) => roots.iter().any(|root| path.starts_with(root)),
+        }
+    }
+
+    fn scope_root(&self, path: &Path, session_root: &Path) -> Option<PathBuf> {
+        match self {
+            Self::Unrestricted => None,
+            Self::SessionWorkspace => Some(session_root.to_path_buf()),
+            Self::AuthorizedRoots(roots) => roots
+                .iter()
+                .filter(|root| path.starts_with(root))
+                .max_by_key(|root| root.components().count())
+                .cloned(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct LspClientKey {
+    server_id: &'static str,
+    workspace_root: PathBuf,
 }
 
 struct ServerSpec {
@@ -38,18 +91,35 @@ struct LspClient {
 
 impl LspService {
     pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self::with_path_policy(root, LspPathPolicy::unrestricted())
+    }
+
+    pub(crate) fn with_path_policy(root: impl Into<PathBuf>, path_policy: LspPathPolicy) -> Self {
         Self {
             root: root.into(),
+            path_policy,
             clients: std::sync::Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     pub async fn status(&self) -> Value {
         let clients = self.clients.lock().await;
-        let active = clients.keys().copied().collect::<Vec<_>>();
+        let mut active = clients
+            .keys()
+            .map(|key| key.server_id)
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        active.sort_unstable();
+        let mut active_workspaces = clients
+            .keys()
+            .map(|key| json!({ "server": key.server_id, "root": key.workspace_root }))
+            .collect::<Vec<_>>();
+        active_workspaces.sort_by_key(|workspace| workspace.to_string());
         json!({
             "root": self.root,
             "active_servers": active,
+            "active_workspaces": active_workspaces,
             "supported_servers": supported_server_status()
         })
     }
@@ -59,9 +129,9 @@ impl LspService {
     }
 
     pub async fn diagnostics(&self, path: &Path) -> Result<Value> {
-        let (path, uri, spec) = self.resolve_document(path).await?;
+        let (path, uri, spec, workspace_root) = self.resolve_document(path).await?;
         let mut clients = self.clients.lock().await;
-        let client = ensure_client(&mut clients, spec, &self.root).await?;
+        let client = ensure_client(&mut clients, spec, &workspace_root).await?;
         client.open_document(&path, &uri, spec.language_id).await?;
         match client
             .request(
@@ -109,21 +179,30 @@ impl LspService {
         if clients.is_empty() {
             bail!("no language server is active; inspect a supported source file first");
         }
+        let mut server_counts = HashMap::new();
+        for key in clients.keys() {
+            *server_counts.entry(key.server_id).or_insert(0usize) += 1;
+        }
         let mut results = serde_json::Map::new();
-        for (id, client) in clients.iter_mut() {
+        for (key, client) in clients.iter_mut() {
             let value = client
                 .request("workspace/symbol", json!({ "query": query }))
                 .await
-                .with_context(|| format!("{id} workspace symbol request failed"))?;
-            results.insert((*id).to_string(), value);
+                .with_context(|| {
+                    format!(
+                        "{} workspace symbol request failed",
+                        workspace_label(key, server_counts[key.server_id])
+                    )
+                })?;
+            results.insert(workspace_label(key, server_counts[key.server_id]), value);
         }
         Ok(Value::Object(results))
     }
 
     async fn document_request(&self, path: &Path, method: &str, extra: Value) -> Result<Value> {
-        let (path, uri, spec) = self.resolve_document(path).await?;
+        let (path, uri, spec, workspace_root) = self.resolve_document(path).await?;
         let mut clients = self.clients.lock().await;
-        let client = ensure_client(&mut clients, spec, &self.root).await?;
+        let client = ensure_client(&mut clients, spec, &workspace_root).await?;
         client.open_document(&path, &uri, spec.language_id).await?;
         let mut params = extra.as_object().cloned().unwrap_or_default();
         params.insert("textDocument".to_string(), json!({ "uri": uri }));
@@ -138,9 +217,9 @@ impl LspService {
         character: u32,
         extra: Value,
     ) -> Result<Value> {
-        let (path, uri, spec) = self.resolve_document(path).await?;
+        let (path, uri, spec, workspace_root) = self.resolve_document(path).await?;
         let mut clients = self.clients.lock().await;
-        let client = ensure_client(&mut clients, spec, &self.root).await?;
+        let client = ensure_client(&mut clients, spec, &workspace_root).await?;
         client.open_document(&path, &uri, spec.language_id).await?;
         let mut params = extra.as_object().cloned().unwrap_or_default();
         params.insert("textDocument".to_string(), json!({ "uri": uri }));
@@ -157,7 +236,7 @@ impl LspService {
     async fn resolve_document(
         &self,
         requested: &Path,
-    ) -> Result<(PathBuf, String, &'static ServerSpec)> {
+    ) -> Result<(PathBuf, String, &'static ServerSpec, PathBuf)> {
         let joined = if requested.is_absolute() {
             requested.to_path_buf()
         } else {
@@ -169,8 +248,8 @@ impl LspService {
         let root = tokio::fs::canonicalize(&self.root)
             .await
             .with_context(|| format!("cannot resolve workspace root {}", self.root.display()))?;
-        if !path.starts_with(&root) {
-            bail!("LSP path must stay inside the session workspace");
+        if !self.path_policy.allows(&path, &root) {
+            bail!("LSP path must stay inside an authorized workspace root");
         }
         let spec = spec_for_path(&path).ok_or_else(|| {
             anyhow::anyhow!(
@@ -183,7 +262,15 @@ impl LspService {
         let uri = Url::from_file_path(&path)
             .map_err(|_| anyhow::anyhow!("cannot convert {} to a file URI", path.display()))?
             .to_string();
-        Ok((path, uri, spec))
+        let scope_root = self.path_policy.scope_root(&path, &root);
+        let fallback_root = if path.starts_with(&root) {
+            root.clone()
+        } else {
+            path.parent().unwrap_or(&path).to_path_buf()
+        };
+        let workspace_root =
+            discover_project_root(&path, scope_root.as_deref(), fallback_root).await;
+        Ok((path, uri, spec, workspace_root))
     }
 }
 
@@ -404,14 +491,70 @@ impl LspClient {
 }
 
 async fn ensure_client<'a>(
-    clients: &'a mut HashMap<&'static str, LspClient>,
+    clients: &'a mut HashMap<LspClientKey, LspClient>,
     spec: &'static ServerSpec,
     root: &Path,
 ) -> Result<&'a mut LspClient> {
-    if !clients.contains_key(spec.id) {
-        clients.insert(spec.id, LspClient::start(spec, root).await?);
+    let key = LspClientKey {
+        server_id: spec.id,
+        workspace_root: root.to_path_buf(),
+    };
+    if !clients.contains_key(&key) {
+        clients.insert(key.clone(), LspClient::start(spec, root).await?);
     }
-    Ok(clients.get_mut(spec.id).expect("inserted LSP client"))
+    Ok(clients.get_mut(&key).expect("inserted LSP client"))
+}
+
+fn workspace_label(key: &LspClientKey, server_count: usize) -> String {
+    if server_count == 1 {
+        key.server_id.to_string()
+    } else {
+        format!("{}@{}", key.server_id, key.workspace_root.display())
+    }
+}
+
+async fn discover_project_root(path: &Path, boundary: Option<&Path>, fallback: PathBuf) -> PathBuf {
+    let mut current = path.parent().unwrap_or(path).to_path_buf();
+    loop {
+        if has_project_marker(&current).await {
+            return current;
+        }
+        if boundary.is_some_and(|boundary| current == boundary) {
+            break;
+        }
+        let Some(parent) = current.parent() else {
+            break;
+        };
+        if parent == current {
+            break;
+        }
+        current = parent.to_path_buf();
+    }
+    boundary.map(Path::to_path_buf).unwrap_or(fallback)
+}
+
+async fn has_project_marker(path: &Path) -> bool {
+    const PROJECT_MARKERS: &[&str] = &[
+        ".git",
+        "Cargo.toml",
+        "package.json",
+        "pyproject.toml",
+        "go.mod",
+        "CMakeLists.txt",
+        "pom.xml",
+        "build.gradle",
+        "build.gradle.kts",
+        "Package.swift",
+        "Gemfile",
+        "composer.json",
+        ".luarc.json",
+    ];
+    for marker in PROJECT_MARKERS {
+        if tokio::fs::metadata(path.join(marker)).await.is_ok() {
+            return true;
+        }
+    }
+    false
 }
 
 fn spec_for_path(path: &Path) -> Option<&'static ServerSpec> {
@@ -605,6 +748,62 @@ mod tests {
         ] {
             assert!(languages.contains(&language), "missing {language}");
         }
+    }
+
+    #[tokio::test]
+    async fn trusted_lsp_resolves_external_files_against_their_project_root() {
+        let session_root = tempfile::tempdir().expect("session workspace");
+        let external_project = tempfile::tempdir().expect("external project");
+        let source_dir = external_project.path().join("src/bin");
+        tokio::fs::create_dir_all(&source_dir)
+            .await
+            .expect("create source directory");
+        tokio::fs::write(
+            external_project.path().join("Cargo.toml"),
+            "[package]\nname = \"surf\"\nversion = \"0.1.0\"\n",
+        )
+        .await
+        .expect("write project marker");
+        let source = source_dir.join("surf_lab.rs");
+        tokio::fs::write(&source, "fn main() {}\n")
+            .await
+            .expect("write source file");
+
+        let service = LspService::new(session_root.path());
+        let (resolved, _, spec, project_root) = service
+            .resolve_document(&source)
+            .await
+            .expect("trusted LSP accepts an external source file");
+
+        assert_eq!(resolved, tokio::fs::canonicalize(&source).await.unwrap());
+        assert_eq!(spec.id, "rust-analyzer");
+        assert_eq!(
+            project_root,
+            tokio::fs::canonicalize(external_project.path())
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn restricted_lsp_keeps_external_files_outside_the_session_workspace() {
+        let session_root = tempfile::tempdir().expect("session workspace");
+        let external_project = tempfile::tempdir().expect("external project");
+        let source = external_project.path().join("main.rs");
+        tokio::fs::write(&source, "fn main() {}\n")
+            .await
+            .expect("write source file");
+
+        let service =
+            LspService::with_path_policy(session_root.path(), LspPathPolicy::session_workspace());
+        let error = match service.resolve_document(&source).await {
+            Ok(_) => panic!("restricted LSP must reject an external source file"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.to_string(),
+            "LSP path must stay inside an authorized workspace root"
+        );
     }
 
     #[tokio::test]
