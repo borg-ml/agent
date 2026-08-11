@@ -1662,9 +1662,27 @@ suffix ticks versus the parent at 638/258. Softly anchoring the first 500
 actions while fitting that suffix still regressed the complete GPU start to
 476/495, so do not promote it or line-search the same fit. Retain the route-638
 actor. Future continuation needs exact prefix preservation inside one ordinary
-network, or a new globally validated actor update; GPU remains the broad
-collector and exact CPU remains the teacher/promotion authority whenever
-long-horizon ranks separate.
+network, or a new globally validated actor update.
+
+Surf commit `38e22bd` removes the underlying host/GPU split for both supported
+clean policy schemas. `native_pose_v1` and `native_route_continuous_v3` now use
+the same owned C++/HIP-compatible implementation for movement, Source-brush
+collision, triggers, ordered-route state, continuous controller-route state,
+feature extraction, yaw history, ReLU inference, and action decoding. Route-v3
+points remain in their artifact's prototype units instead of being converted
+to Source units and back, and route-only length/normalization uses the same
+deterministic arithmetic on both targets.
+
+The installed-Utopia regression runs ordinary mutated policies through all
+1,969 ticks on both backends and requires exact equality for route progress,
+reset timing, first action, final position, and final velocity. Both clean
+schemas pass. For these schemas, ROCm is therefore the training and selection
+backend rather than a proposal engine awaiting a separate CPU-physics verdict.
+Host reruns remain useful as parity audits and playable-game integration tests,
+and promotion still requires better complete-start progress and survival,
+bounded perturbation robustness, natural completion, and in-game reproduction.
+Any future schema or core change must re-establish this full-rollout equality
+before production training uses it.
 
 ## Native policy visualization
 
