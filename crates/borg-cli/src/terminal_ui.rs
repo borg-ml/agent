@@ -5136,6 +5136,24 @@ impl BorgTerminal {
                 self.effort_status_hovered,
                 effort_status_color,
             );
+            let permission_status_start =
+                status_spans.iter().map(|span| span.width()).sum::<usize>();
+            // The separator is rendered unstyled, so the hover target is the
+            // value alone.
+            let permission_status_start = permission_status_start.saturating_add(
+                usize::from(permission_status.is_some()) * STATUS_SEPARATOR.width(),
+            );
+            let permission_status_width = permission_status.as_ref().map(|value| value.width());
+            let permission_status_color = permission_status
+                .as_deref()
+                .map(permission_status_color)
+                .unwrap_or(Color::Gray);
+            push_interactive_status_segment(
+                &mut status_spans,
+                permission_status,
+                self.permission_status_hovered,
+                permission_status_color,
+            );
             let context_status_start = status_spans.iter().map(|span| span.width()).sum::<usize>();
             let context_status_start =
                 context_status_start.saturating_add(STATUS_SEPARATOR.width());
@@ -5159,24 +5177,6 @@ impl BorgTerminal {
                 fast_status,
                 self.fast_status_hovered,
                 Color::LightYellow,
-            );
-            let permission_status_start =
-                status_spans.iter().map(|span| span.width()).sum::<usize>();
-            // The separator is rendered unstyled, so the hover target is the
-            // value alone.
-            let permission_status_start = permission_status_start.saturating_add(
-                usize::from(permission_status.is_some()) * STATUS_SEPARATOR.width(),
-            );
-            let permission_status_width = permission_status.as_ref().map(|value| value.width());
-            let permission_status_color = permission_status
-                .as_deref()
-                .map(permission_status_color)
-                .unwrap_or(Color::Gray);
-            push_interactive_status_segment(
-                &mut status_spans,
-                permission_status,
-                self.permission_status_hovered,
-                permission_status_color,
             );
             let todo_status_start = status_spans.iter().map(|span| span.width()).sum::<usize>();
             // The separator is rendered unstyled, so the hover target is the
