@@ -224,6 +224,9 @@ mkdir -p "$fake_bin"
       }
     ' Cargo.lock >"$lock_tmp"
     mv "$lock_tmp" Cargo.lock
+    if [[ -n "${FAKE_CARGO_TOUCH_FILE:-}" ]]; then
+      printf '%s\n' "generated drift" >"$FAKE_CARGO_TOUCH_FILE"
+    fi
 FAKE_CARGO
   echo '    ;;'
   echo '  fmt)'
@@ -248,6 +251,19 @@ run_release() {
     cd "$fixture"
     PATH="$fake_bin:$PATH" FAKE_CARGO_LOG="$cargo_log" \
       ./scripts/release.sh "$@"
+  )
+}
+
+run_release_with_touch() {
+  local fixture="$1"
+  local touch_file="$2"
+  shift 2
+  local cargo_log="$test_root/$(basename "$fixture")-fake-cargo.log"
+  : >"$cargo_log"
+  (
+    cd "$fixture"
+    PATH="$fake_bin:$PATH" FAKE_CARGO_LOG="$cargo_log" \
+      FAKE_CARGO_TOUCH_FILE="$touch_file" ./scripts/release.sh "$@"
   )
 }
 
@@ -301,6 +317,22 @@ assert_equal "2.0.0" "$(fixture_version "$success_fixture")" \
   "explicit release version"
 git -C "$success_fixture" rev-parse --verify 'refs/tags/v2.0.0^{commit}' \
   >/dev/null || fail "explicit release tag is missing"
+
+tolerant_fixture="$(make_fixture tolerant)"
+echo "generated baseline" >"$tolerant_fixture/generated.txt"
+git -C "$tolerant_fixture" add generated.txt
+git -C "$tolerant_fixture" commit --quiet -m "Add generated status fixture"
+git -C "$tolerant_fixture" push --quiet origin main
+run_release_with_touch "$tolerant_fixture" "$tolerant_fixture/generated.txt"
+assert_equal "1.2.4" "$(fixture_version "$tolerant_fixture")" \
+  "release with generated drift"
+assert_equal "generated drift" "$(<"$tolerant_fixture/generated.txt")" \
+  "preserved generated drift"
+assert_equal $'Cargo.lock\nCargo.toml' \
+  "$(git -C "$tolerant_fixture" diff-tree --no-commit-id --name-only -r HEAD | sort)" \
+  "release commit scope"
+[[ -n "$(git -C "$tolerant_fixture" status --porcelain -- generated.txt)" ]] ||
+  fail "release discarded generated drift"
 
 interrupted_fixture="$(make_fixture interrupted)"
 sed -i 's/1\.2\.3/1.2.4/g' \
@@ -371,13 +403,11 @@ if git -C "$rollback_fixture" rev-parse --verify 'refs/tags/v1.2.4^{commit}' \
 fi
 
 dirty_fixture="$(make_fixture dirty)"
-touch "$dirty_fixture/uncommitted"
-if run_release "$dirty_fixture" >/dev/null 2>&1; then
-  fail "release accepted a dirty worktree"
-fi
-if git --git-dir="$test_root/dirty-origin.git" rev-parse \
-  'refs/tags/v1.2.4^{commit}' >/dev/null 2>&1; then
-  fail "dirty-worktree release published a tag"
-fi
+echo "unrelated work" >"$dirty_fixture/uncommitted"
+run_release "$dirty_fixture"
+assert_equal "1.2.4" "$(fixture_version "$dirty_fixture")" \
+  "release with pre-existing unrelated work"
+[[ -n "$(git -C "$dirty_fixture" status --porcelain -- uncommitted)" ]] ||
+  fail "release discarded pre-existing unrelated work"
 
 echo "Release tooling regression tests passed."

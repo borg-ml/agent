@@ -195,7 +195,7 @@ run_release_checks() (
   trap 'rm -rf -- "$test_tmp"' EXIT
   cargo fmt --all -- --check
   TMPDIR="$test_tmp" cargo test --workspace --locked
-  git diff --check
+  git diff --check -- Cargo.toml Cargo.lock
 )
 
 mode="release"
@@ -254,8 +254,13 @@ fi
 remote="${BORG_RELEASE_REMOTE:-origin}"
 branch="${BORG_RELEASE_BRANCH:-main}"
 
-[[ -z "$(git status --porcelain --untracked-files=all)" ]] ||
-  die "working tree must be clean"
+worktree_status="$(git status --porcelain --untracked-files=all)"
+release_file_status="$(git status --porcelain --untracked-files=all -- Cargo.toml Cargo.lock)"
+[[ -z "$release_file_status" ]] ||
+  die "Cargo.toml and Cargo.lock must be clean before release"
+if [[ -n "$worktree_status" ]]; then
+  echo "release: continuing with unrelated worktree changes; only Cargo.toml and Cargo.lock will be committed" >&2
+fi
 [[ "$(git branch --show-current)" == "$branch" ]] ||
   die "release must run from branch '$branch'"
 git remote get-url "$remote" >/dev/null 2>&1 ||
@@ -378,13 +383,7 @@ replace_workspace_version "$current_version" "$target_version"
 # Refresh workspace package versions in Cargo.lock before enforcing --locked.
 cargo check --workspace --all-targets
 
-mapfile -t changed_files < <(git diff --name-only)
-for changed_file in "${changed_files[@]}"; do
-  case "$changed_file" in
-    Cargo.toml | Cargo.lock) ;;
-    *) die "version update unexpectedly changed $changed_file" ;;
-  esac
-done
+mapfile -t changed_files < <(git diff --name-only -- Cargo.toml Cargo.lock)
 [[ " ${changed_files[*]} " == *" Cargo.toml "* ]] ||
   die "Cargo.toml was not updated"
 [[ " ${changed_files[*]} " == *" Cargo.lock "* ]] ||
@@ -395,8 +394,10 @@ done
 
 run_release_checks
 
-git add Cargo.toml Cargo.lock
-git commit -m "Release Borg CLI $target_version"
+# Commit only the release files. Other staged or concurrently generated work
+# must remain in the user's working tree and must never hitchhike into a
+# release commit.
+git commit --only Cargo.toml Cargo.lock -m "Release Borg CLI $target_version"
 committed=1
 git tag -a "$tag" -m "Borg CLI $target_version"
 
