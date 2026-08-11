@@ -1703,14 +1703,29 @@ all 2,600 requested ticks. A route-1936 coherent action teacher produced a
 route-1858 resetting DAgger student; four 256-wide unified ARS generations
 then promoted a no-reset route-1799 controller, and four more reached route
 1801 (`89.2595%`). A fresh route-1902 action teacher produced a route-1876
-resetting student. Anchored ARS promoted its 672-wide descendant to route 1802
-(`89.3203%`) with no reset over 2,600 ticks. The final GPU selection and host
-audit agreed exactly in every promotion. Retain
-`utopia-user-native-route-continuous-capacity384-route1902-dagger1-anchored-direct-s1e3-g4-p256-v1.json`
-as the strict clean route authority. The 544-wide route-1801 controller remains
-the faster training parent when the one-sample gain does not justify the wider
-network. Neither controller reaches the terminal trigger, so neither is map
+resetting student, whose 672-wide descendant reached route 1802 (`89.3203%`)
+without resetting. A playable audit exposed that one-sample result as a false
+leader: it reached its last sample 324 ticks later than route 1801, reduced
+fitness from `0.82048` to `0.79728`, increased terminal velocity error from
+`4475.83` to `6119.84`, and slowed from about 2,477 Source units/second at
+episode tick 1700 to 169 at its final progress tick and 61 at tick 2600.
+Retain
+`utopia-user-native-route-continuous-capacity256-dagger2-anchored-direct-s1e3-g8-p256-v2.json`
+as the strict clean authority. The route-1802 artifact is a wider search center
+only. Neither controller reaches the terminal trigger, so neither is map
 completion or parity evidence.
+
+Surf commits `75cd6da` and `8dc3a2e` correct that objective. Unfinished
+promotion now requires strict ordered-route advancement without regressing
+2,600-tick survival, route pace (`progress_tick - furthest_index`), or
+continuation fitness. Optional common antithetic start perturbations rank by
+their worst route, survival, pace, and fitness, and require the same strict
+improvement. The default one-scenario path retains the original population
+without duplicating every policy tensor; robustness expansion occurs only when
+explicitly requested. A 4-candidate/3-scenario smoke rejected route 1802,
+retained route 1801, and had exact final GPU/host route, pace, fitness, timing,
+and terminal-error parity. The full ROCm suite and installed-Utopia parity test
+pass.
 
 For the unified headless route lineage, 256 candidates are productive when no
 renderer is active: the 544-wide controller sustained about 31.7k--33.0k
@@ -1719,6 +1734,86 @@ sustained about 21.6k--22.8k. Do not overlap ROCm training with the playable
 renderer. The older 32-candidate cap remains appropriate for legacy focus
 screens that run substantial host work per candidate, not for this full GPU
 population path.
+
+Surf commits `2698c9a` and `8506e8c` make the next clean-capacity experiment
+reproducible. A wider resetting search center now falls back to its own
+architecture-compatible seed until that lineage passes the strict promotion
+gate; resetting it directly to a narrower authority had sliced prefix samples
+at the wrong width. DAgger can also align a student's actual visited states
+monotonically to a coherent teacher by continuous route progress plus bounded
+route-relative physical-state distance instead of using invalid absolute-tick
+labels. Both changes retain the same ordinary phase-free network and shared
+GPU/host movement core.
+
+That state-aligned supervision fixes the observed late slowdown but not the
+next landing. A 672-wide student reached route 1881 (`94.20%`) with pace lag
+142, and movement/yaw row ablations reached route 1887 (`94.58%`), but all
+reset around absolute demo ticks 2314--2338. Movement-only and single-axis variants
+also reset, ruling out the prior survival-biased slowdown as the remaining
+failure. Exact GPU/host selection parity held and the strict anchor retained
+route 1801.
+
+From the fast controller's actual episode-tick-1900 state, a 256-wide coherent
+action search found a route-1944 trajectory, but it also reset and is a teacher
+only. A prefix-silent 128-unit bank fitted to that trajectory produced a 10%
+trust variant at route 1904 (`95.75%`) and delayed reset to absolute demo tick
+2385. Separating
+its learned rows reached at most route 1905 (`95.82%`); forward, lateral, yaw,
+and combined movement variants all still reset. A second state-aligned round
+stayed in the same resetting basin. Do not promote or visualize these
+trajectories. Retain the route-1801 no-reset controller as the strict clean
+authority until a fast candidate also survives the full 2,600-tick audit.
+
+The playable route-1905 audit hit teleport trigger 56 at policy tick 2121,
+position `[-2668.72,2086.80,7962.08]` and velocity
+`[45.27,-1920.24,41.28]`. Adding the first-attempt demo offset of 240 gives
+absolute tick 2361, exactly matching the headless reset receipt. This verifies
+playable/headless reset parity for the fastest diagnostic candidate; it does
+not make that candidate promotable.
+
+The nominal route-1905 count was also physically misleading. At its final
+progress sample the controller was free-falling at about 2,398 Source
+units/second and merely passed 509 units from a later reference point, just
+inside the 512-unit corridor. At 256- and 128-unit corridors both that
+candidate and route 1801 fall back to the same earlier route region, so a
+narrower corridor is not a usable fix. Surf commit `d664f9a` instead ranks
+prefix-constrained optimization and globally continued recovery by full-span
+survival before route progress, makes the zero-update ARS center an explicit
+backtracking option, removes the small-mutation learning-rate floor, and
+preserves the continuous policy runtime's previous route position across
+focused suffixes. The latter state was required for exact sequential recovery:
+without it, locally selected continuations compounded into route 1683--1734;
+with it, the controlled recovery audit reproduced route 1801 exactly with no
+reset through 2,600 ticks.
+
+After that parity repair, a bounded 256-program late recovery search starting
+at episode tick 1850 produced a genuine route-1803 no-reset teacher trace at
+`.borg/surf-lab/episodes/policy-native-gpu-recovery-35511cd9-111d-4b3f-b5b8-f5a39f032e92.jsonl`.
+A wider yaw, pitch, and movement search reached only route 1802. Route 1803 is
+valid state-aligned supervision, not a learned controller or a new authority;
+retain route 1801 until an ordinary NN independently exceeds it and passes the
+same full-span host/GPU audit.
+
+Surf commit `09b9f44` fixes the remaining prefix-search lock. The old
+`gpu_route_prefix_ticks` path constrained early actions but still scored every
+perturbation from spawn, so tiny pre-branch divergence could erase the late
+continuation signal before the requested branch. Prefix-constrained ARS now
+captures the frozen controller's full physical, route, and action-history
+state at the requested tick, learns from paired continuations that share that
+exact state, and separately reruns every possible promotion from the authentic
+start through the full horizon. The stored controller remains one ordinary
+phase-free network; the branch exists only inside training evaluation.
+
+Equal-survival branch scores now use bounded ordered progress, route pace, and
+continuation fitness while keeping each extra survival tick lexicographically
+dominant. A tick-1400 smoke captured route 1375 and evaluated a 1,200-tick
+continuation without altering the promotion gate. Perturbations of `1e-3` and
+`1e-5` were too unstable from spawn; at `1e-6`, a bounded 2-generation,
+256-candidate validation retained full 2,600-tick survival and exact final
+host/GPU selection parity but did not improve route 1801, its 162-tick pace
+lag, or fitness. Do not promote the resulting search artifact. Retain
+`utopia-user-native-route-continuous-capacity256-dagger2-anchored-direct-s1e3-g8-p256-v2.json`
+as the strict authority.
 
 ## Native policy visualization
 
