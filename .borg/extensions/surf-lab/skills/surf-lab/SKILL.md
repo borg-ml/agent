@@ -1684,6 +1684,42 @@ bounded perturbation robustness, natural completion, and in-game reproduction.
 Any future schema or core change must re-establish this full-rollout equality
 before production training uses it.
 
+Surf commits `4049b96` and `d434b82` extend the unified route-training loop
+without changing the deployed controller contract. An explicitly requested
+`policy.evolve-native` rollout may now continue for up to 5,000 ticks beyond
+the recorded demonstration episode, using the final route state only for
+post-episode trajectory statistics. Policy-prefix collection can start in the
+same extended range. Unified route ARS may retain a separate strict promotion
+anchor, so a high-progress resetting student can seed search without replacing
+a lower-progress no-reset controller. The capacity trainer can relabel a
+candidate's actual visited states with a coherent teacher trajectory, verifies
+its NumPy parent inference against runtime means, and requires every DAgger
+rollout to begin immediately after the protected prefix. The export remains
+one ordinary phase-free, history-enabled ReLU network.
+
+This closed-loop DAgger plus anchored-ARS cycle produced the strongest clean
+controllers so far. The prior 544-wide authority reached route 1757 and ran
+all 2,600 requested ticks. A route-1936 coherent action teacher produced a
+route-1858 resetting DAgger student; four 256-wide unified ARS generations
+then promoted a no-reset route-1799 controller, and four more reached route
+1801 (`89.2595%`). A fresh route-1902 action teacher produced a route-1876
+resetting student. Anchored ARS promoted its 672-wide descendant to route 1802
+(`89.3203%`) with no reset over 2,600 ticks. The final GPU selection and host
+audit agreed exactly in every promotion. Retain
+`utopia-user-native-route-continuous-capacity384-route1902-dagger1-anchored-direct-s1e3-g4-p256-v1.json`
+as the strict clean route authority. The 544-wide route-1801 controller remains
+the faster training parent when the one-sample gain does not justify the wider
+network. Neither controller reaches the terminal trigger, so neither is map
+completion or parity evidence.
+
+For the unified headless route lineage, 256 candidates are productive when no
+renderer is active: the 544-wide controller sustained about 31.7k--33.0k
+candidate ticks/second over 2,600-tick rollouts, while the 672-wide controller
+sustained about 21.6k--22.8k. Do not overlap ROCm training with the playable
+renderer. The older 32-candidate cap remains appropriate for legacy focus
+screens that run substantial host work per candidate, not for this full GPU
+population path.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
