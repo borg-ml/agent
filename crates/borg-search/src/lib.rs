@@ -4,11 +4,13 @@
 //! format or credential. Backends are deliberately bounded: search is
 //! discovery and provenance, not an unbounded page-fetching runtime.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
+use futures::future::join_all;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use url::Url;
@@ -27,16 +29,20 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(20);
 #[serde(rename_all = "lowercase")]
 pub enum SearchBackend {
     Exa,
+    Firecrawl,
     Parallel,
     Brave,
+    Federated,
 }
 
 impl SearchBackend {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Exa => "exa",
+            Self::Firecrawl => "firecrawl",
             Self::Parallel => "parallel",
             Self::Brave => "brave",
+            Self::Federated => "federated",
         }
     }
 }
@@ -47,13 +53,14 @@ impl fmt::Display for SearchBackend {
     }
 }
 
-/// The configured backend selection. Auto prefers Exa, then Parallel, then
-/// Brave, using only providers with a configured credential.
+/// The configured backend selection. Auto queries every configured backend in
+/// parallel, then merges the normalized results in stable provider order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SearchBackendChoice {
     #[default]
     Auto,
     Exa,
+    Firecrawl,
     Parallel,
     Brave,
 }
@@ -63,10 +70,11 @@ impl SearchBackendChoice {
         match value.trim().to_ascii_lowercase().as_str() {
             "" | "auto" => Ok(Self::Auto),
             "exa" => Ok(Self::Exa),
+            "firecrawl" => Ok(Self::Firecrawl),
             "parallel" => Ok(Self::Parallel),
             "brave" => Ok(Self::Brave),
             other => bail!(
-                "unsupported BORG_SEARCH_BACKEND {other}; expected auto, exa, parallel, or brave"
+                "unsupported BORG_SEARCH_BACKEND {other}; expected auto, exa, firecrawl, parallel, or brave"
             ),
         }
     }
@@ -76,6 +84,7 @@ impl SearchBackendChoice {
 pub struct SearchConfig {
     pub backend: SearchBackendChoice,
     pub exa_api_key: Option<String>,
+    pub firecrawl_api_key: Option<String>,
     pub parallel_api_key: Option<String>,
     pub brave_api_key: Option<String>,
     pub timeout: Duration,
@@ -86,6 +95,7 @@ impl Default for SearchConfig {
         Self {
             backend: SearchBackendChoice::Auto,
             exa_api_key: None,
+            firecrawl_api_key: None,
             parallel_api_key: None,
             brave_api_key: None,
             timeout: DEFAULT_TIMEOUT,
@@ -101,6 +111,10 @@ impl fmt::Debug for SearchConfig {
             .field(
                 "exa_api_key",
                 &self.exa_api_key.as_ref().map(|_| "[configured]"),
+            )
+            .field(
+                "firecrawl_api_key",
+                &self.firecrawl_api_key.as_ref().map(|_| "[configured]"),
             )
             .field(
                 "parallel_api_key",
@@ -133,6 +147,11 @@ impl SearchConfig {
         Ok(Self {
             backend,
             exa_api_key: first_env(&["EXA_API_KEY", "BORG_EXA_API_KEY"]),
+            firecrawl_api_key: first_env(&[
+                "FIRECRAWL_API_KEY",
+                "FIRECRAWL_KEY",
+                "BORG_FIRECRAWL_API_KEY",
+            ]),
             parallel_api_key: first_env(&["PARALLEL_API_KEY", "BORG_PARALLEL_API_KEY"]),
             brave_api_key: first_env(&[
                 "BRAVE_SEARCH_API_KEY",
@@ -146,8 +165,10 @@ impl SearchConfig {
     fn key_for(&self, backend: SearchBackend) -> Option<&str> {
         match backend {
             SearchBackend::Exa => self.exa_api_key.as_deref(),
+            SearchBackend::Firecrawl => self.firecrawl_api_key.as_deref(),
             SearchBackend::Parallel => self.parallel_api_key.as_deref(),
             SearchBackend::Brave => self.brave_api_key.as_deref(),
+            SearchBackend::Federated => None,
         }
         .filter(|key| !key.trim().is_empty())
     }
@@ -231,6 +252,10 @@ pub struct SearchResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
     pub results: Vec<SearchResult>,
+    /// The concrete backends contributing to a federated response. A single
+    /// backend response leaves this empty for backwards-compatible output.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub backends: Vec<SearchBackend>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
 }
@@ -275,14 +300,9 @@ impl SearchService {
     pub fn from_env() -> Result<Option<Self>> {
         let config = SearchConfig::from_env()?;
         let configured = match config.backend {
-            SearchBackendChoice::Auto => [
-                SearchBackend::Exa,
-                SearchBackend::Parallel,
-                SearchBackend::Brave,
-            ]
-            .into_iter()
-            .any(|backend| config.key_for(backend).is_some()),
+            SearchBackendChoice::Auto => !configured_backends(&config).is_empty(),
             SearchBackendChoice::Exa => config.key_for(SearchBackend::Exa).is_some(),
+            SearchBackendChoice::Firecrawl => config.key_for(SearchBackend::Firecrawl).is_some(),
             SearchBackendChoice::Parallel => config.key_for(SearchBackend::Parallel).is_some(),
             SearchBackendChoice::Brave => config.key_for(SearchBackend::Brave).is_some(),
         };
@@ -291,17 +311,15 @@ impl SearchService {
 
     pub fn configured_backend(&self) -> Option<SearchBackend> {
         match self.config.backend {
-            SearchBackendChoice::Auto => [
-                SearchBackend::Exa,
-                SearchBackend::Parallel,
-                SearchBackend::Brave,
-            ]
-            .into_iter()
-            .find(|backend| self.config.key_for(*backend).is_some()),
+            SearchBackendChoice::Auto => configured_backends(&self.config).into_iter().next(),
             SearchBackendChoice::Exa => self
                 .config
                 .key_for(SearchBackend::Exa)
                 .map(|_| SearchBackend::Exa),
+            SearchBackendChoice::Firecrawl => self
+                .config
+                .key_for(SearchBackend::Firecrawl)
+                .map(|_| SearchBackend::Firecrawl),
             SearchBackendChoice::Parallel => self
                 .config
                 .key_for(SearchBackend::Parallel)
@@ -324,8 +342,10 @@ impl SearchService {
             .with_context(|| format!("the selected {backend} backend has no configured API key"))?;
         match backend {
             SearchBackend::Exa => self.search_exa(key, request).await,
+            SearchBackend::Firecrawl => self.search_firecrawl(key, request).await,
             SearchBackend::Parallel => self.search_parallel(key, request).await,
             SearchBackend::Brave => self.search_brave(key, request).await,
+            SearchBackend::Federated => bail!("federated is not a direct search backend"),
         }
     }
 
@@ -358,7 +378,47 @@ impl SearchService {
                 .and_then(Value::as_str)
                 .map(str::to_string),
             results: normalize_results(request, parse_exa_results(&payload)),
+            backends: Vec::new(),
             warnings: Vec::new(),
+        })
+    }
+
+    async fn search_firecrawl(&self, key: &str, request: &SearchRequest) -> Result<SearchResponse> {
+        let mut body = json!({
+            "query": request.query.trim(),
+            "limit": request.max_results,
+            "sources": ["web"],
+            "highlights": true
+        });
+        if !request.include_domains.is_empty() {
+            body["includeDomains"] = json!(request.include_domains);
+        }
+        if !request.exclude_domains.is_empty() {
+            body["excludeDomains"] = json!(request.exclude_domains);
+        }
+        let response = self
+            .client
+            .post("https://api.firecrawl.dev/v2/search")
+            .bearer_auth(key)
+            .json(&body)
+            .send()
+            .await
+            .context("Firecrawl web search request failed")?;
+        let payload = response_json(response, "Firecrawl web search").await?;
+        Ok(SearchResponse {
+            backend: SearchBackend::Firecrawl,
+            query: request.query.trim().to_string(),
+            request_id: payload
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            results: normalize_results(request, parse_firecrawl_results(&payload)),
+            backends: Vec::new(),
+            warnings: payload
+                .get("warning")
+                .and_then(Value::as_str)
+                .map(|warning| vec![warning.to_string()])
+                .unwrap_or_default(),
         })
     }
 
@@ -388,6 +448,7 @@ impl SearchService {
                 .and_then(Value::as_str)
                 .map(str::to_string),
             results: normalize_results(request, parse_parallel_results(&payload)),
+            backends: Vec::new(),
             warnings: payload
                 .get("warnings")
                 .and_then(Value::as_array)
@@ -419,6 +480,7 @@ impl SearchService {
             query: request.query.trim().to_string(),
             request_id: None,
             results: normalize_results(request, parse_brave_results(&payload)),
+            backends: Vec::new(),
             warnings: Vec::new(),
         })
     }
@@ -428,11 +490,127 @@ impl SearchService {
 impl WebSearchProvider for SearchService {
     async fn search(&self, request: SearchRequest) -> Result<SearchResponse> {
         request.validate()?;
-        let backend = self.configured_backend().context(
-            "web search is unavailable: configure EXA_API_KEY, PARALLEL_API_KEY, or BRAVE_SEARCH_API_KEY",
-        )?;
-        self.search_with_backend(backend, &request).await
+        match self.config.backend {
+            SearchBackendChoice::Auto => {
+                let backends = configured_backends(&self.config);
+                ensure!(
+                    !backends.is_empty(),
+                    "web search is unavailable: configure EXA_API_KEY, FIRECRAWL_API_KEY, PARALLEL_API_KEY, or BRAVE_SEARCH_API_KEY"
+                );
+                self.search_auto(&backends, &request).await
+            }
+            SearchBackendChoice::Exa => {
+                self.search_with_backend(SearchBackend::Exa, &request).await
+            }
+            SearchBackendChoice::Firecrawl => {
+                self.search_with_backend(SearchBackend::Firecrawl, &request)
+                    .await
+            }
+            SearchBackendChoice::Parallel => {
+                self.search_with_backend(SearchBackend::Parallel, &request)
+                    .await
+            }
+            SearchBackendChoice::Brave => {
+                self.search_with_backend(SearchBackend::Brave, &request)
+                    .await
+            }
+        }
     }
+}
+
+impl SearchService {
+    async fn search_auto(
+        &self,
+        backends: &[SearchBackend],
+        request: &SearchRequest,
+    ) -> Result<SearchResponse> {
+        if backends.len() == 1 {
+            return self.search_with_backend(backends[0], request).await;
+        }
+        let outcomes = join_all(backends.iter().copied().map(|backend| async move {
+            let result = self.search_with_backend(backend, request).await;
+            (backend, result)
+        }))
+        .await;
+        merge_search_outcomes(request, outcomes)
+    }
+}
+
+fn configured_backends(config: &SearchConfig) -> Vec<SearchBackend> {
+    [
+        SearchBackend::Exa,
+        SearchBackend::Firecrawl,
+        SearchBackend::Parallel,
+        SearchBackend::Brave,
+    ]
+    .into_iter()
+    .filter(|backend| config.key_for(*backend).is_some())
+    .collect()
+}
+
+fn merge_search_outcomes(
+    request: &SearchRequest,
+    outcomes: Vec<(SearchBackend, Result<SearchResponse>)>,
+) -> Result<SearchResponse> {
+    let mut responses = Vec::new();
+    let mut warnings = Vec::new();
+    let mut failures = Vec::new();
+    for (backend, outcome) in outcomes {
+        match outcome {
+            Ok(response) => {
+                warnings.extend(
+                    response
+                        .warnings
+                        .iter()
+                        .map(|warning| format!("{backend}: {warning}")),
+                );
+                responses.push((backend, response));
+            }
+            Err(error) => failures.push(format!("{backend}: {error:#}")),
+        }
+    }
+    if responses.is_empty() {
+        bail!(
+            "all configured web-search backends failed: {}",
+            failures.join("; ")
+        );
+    }
+    warnings.extend(
+        failures
+            .into_iter()
+            .map(|failure| format!("search failed: {failure}")),
+    );
+
+    let mut seen_urls = HashSet::new();
+    let mut results = Vec::new();
+    let mut backends = Vec::with_capacity(responses.len());
+    for (backend, response) in responses {
+        backends.push(backend);
+        for result in response.results {
+            if seen_urls.insert(result_key(&result.url)) {
+                results.push(result);
+            }
+        }
+    }
+    results.truncate(request.max_results);
+    Ok(SearchResponse {
+        backend: SearchBackend::Federated,
+        query: request.query.trim().to_string(),
+        request_id: None,
+        results,
+        backends,
+        warnings,
+    })
+}
+
+fn result_key(raw_url: &str) -> String {
+    let Ok(mut url) = Url::parse(raw_url) else {
+        return raw_url.trim_end_matches('/').to_string();
+    };
+    url.set_fragment(None);
+    let path = url.path().trim_end_matches('/').to_string();
+    url.set_path(if path.is_empty() { "/" } else { &path });
+    url.to_string()
 }
 
 async fn response_json(response: reqwest::Response, label: &str) -> Result<Value> {
@@ -488,6 +666,43 @@ fn parse_exa_results(payload: &Value) -> Vec<SearchResult> {
                             .get("publishedDate")
                             .and_then(Value::as_str)
                             .map(str::to_string),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn parse_firecrawl_results(payload: &Value) -> Vec<SearchResult> {
+    payload
+        .pointer("/data/web")
+        .and_then(Value::as_array)
+        .map(|results| {
+            results
+                .iter()
+                .filter_map(|result| {
+                    let metadata = result.get("metadata");
+                    Some(SearchResult {
+                        title: result
+                            .get("title")
+                            .or_else(|| metadata.and_then(|value| value.get("title")))?
+                            .as_str()?
+                            .to_string(),
+                        url: result
+                            .get("url")
+                            .or_else(|| metadata.and_then(|value| value.get("sourceURL")))?
+                            .as_str()?
+                            .to_string(),
+                        snippet: first_text(result, &["description", "markdown", "text"]),
+                        published_at: ["publishedDate", "published_at", "date"]
+                            .into_iter()
+                            .find_map(|field| {
+                                result
+                                    .get(field)
+                                    .or_else(|| metadata.and_then(|value| value.get(field)))
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string)
+                            }),
                     })
                 })
                 .collect()
@@ -614,9 +829,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn auto_selection_prefers_exa_then_parallel_then_brave() {
+    fn auto_selection_prefers_exa_and_reports_all_configured_backends() {
         let config = SearchConfig {
             exa_api_key: Some("exa".to_string()),
+            firecrawl_api_key: Some("firecrawl".to_string()),
             parallel_api_key: Some("parallel".to_string()),
             brave_api_key: Some("brave".to_string()),
             ..SearchConfig::default()
@@ -624,6 +840,15 @@ mod tests {
         assert_eq!(config.key_for(SearchBackend::Exa), Some("exa"));
         let service = SearchService::new(config).expect("service");
         assert_eq!(service.configured_backend(), Some(SearchBackend::Exa));
+        assert_eq!(
+            configured_backends(&service.config),
+            vec![
+                SearchBackend::Exa,
+                SearchBackend::Firecrawl,
+                SearchBackend::Parallel,
+                SearchBackend::Brave
+            ]
+        );
     }
 
     #[test]
@@ -700,6 +925,127 @@ mod tests {
     }
 
     #[test]
+    fn firecrawl_payload_mapping_reads_web_results_and_metadata() {
+        let payload = json!({
+            "id": "firecrawl-search",
+            "data": {
+                "web": [{
+                    "title": "Firecrawl docs",
+                    "url": "https://docs.firecrawl.dev/",
+                    "description": "Firecrawl description",
+                    "metadata": {"publishedDate": "2026-08-05"}
+                }, {
+                    "url": "https://missing-title.example/"
+                }]
+            }
+        });
+        let results = parse_firecrawl_results(&payload);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "Firecrawl docs");
+        assert_eq!(results[0].snippet, "Firecrawl description");
+        assert_eq!(results[0].published_at.as_deref(), Some("2026-08-05"));
+    }
+
+    #[test]
+    fn federated_merge_is_stable_deduplicated_and_preserves_partial_failures() {
+        let request = SearchRequest {
+            query: "borg search".to_string(),
+            max_results: 3,
+            include_domains: Vec::new(),
+            exclude_domains: Vec::new(),
+        };
+        let response = merge_search_outcomes(
+            &request,
+            vec![
+                (
+                    SearchBackend::Exa,
+                    Ok(SearchResponse {
+                        backend: SearchBackend::Exa,
+                        query: request.query.clone(),
+                        request_id: Some("exa-id".to_string()),
+                        results: vec![
+                            SearchResult {
+                                title: "first".to_string(),
+                                url: "https://example.com/one".to_string(),
+                                snippet: "one".to_string(),
+                                published_at: None,
+                            },
+                            SearchResult {
+                                title: "duplicate".to_string(),
+                                url: "https://example.com/two".to_string(),
+                                snippet: "two".to_string(),
+                                published_at: None,
+                            },
+                        ],
+                        backends: Vec::new(),
+                        warnings: Vec::new(),
+                    }),
+                ),
+                (
+                    SearchBackend::Firecrawl,
+                    Ok(SearchResponse {
+                        backend: SearchBackend::Firecrawl,
+                        query: request.query.clone(),
+                        request_id: Some("firecrawl-id".to_string()),
+                        results: vec![
+                            SearchResult {
+                                title: "same URL".to_string(),
+                                url: "https://example.com/two/".to_string(),
+                                snippet: "newer".to_string(),
+                                published_at: None,
+                            },
+                            SearchResult {
+                                title: "third".to_string(),
+                                url: "https://example.com/three".to_string(),
+                                snippet: "three".to_string(),
+                                published_at: None,
+                            },
+                        ],
+                        backends: Vec::new(),
+                        warnings: vec!["provider warning".to_string()],
+                    }),
+                ),
+                (
+                    SearchBackend::Parallel,
+                    Err(anyhow::anyhow!("provider unavailable")),
+                ),
+            ],
+        )
+        .expect("partial federation succeeds");
+
+        assert_eq!(response.backend, SearchBackend::Federated);
+        assert_eq!(
+            response.backends,
+            vec![SearchBackend::Exa, SearchBackend::Firecrawl]
+        );
+        assert_eq!(
+            response
+                .results
+                .iter()
+                .map(|result| result.url.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "https://example.com/one",
+                "https://example.com/two",
+                "https://example.com/three"
+            ]
+        );
+        assert!(
+            response
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("provider warning"))
+        );
+        assert!(
+            response
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("parallel"))
+        );
+    }
+
+    #[test]
     fn brave_payload_mapping_reads_nested_web_results() {
         let payload = json!({
             "web": {
@@ -735,6 +1081,10 @@ mod tests {
         assert_eq!(
             SearchBackendChoice::parse("exa").unwrap(),
             SearchBackendChoice::Exa
+        );
+        assert_eq!(
+            SearchBackendChoice::parse("firecrawl").unwrap(),
+            SearchBackendChoice::Firecrawl
         );
         assert_eq!(
             SearchBackendChoice::parse("parallel").unwrap(),

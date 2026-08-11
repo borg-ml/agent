@@ -4704,7 +4704,7 @@ fn agent_tool_specs_with_capabilities_and_consultation_and_search(
 fn web_search_tool_spec() -> Value {
     tool(
         "web_search",
-        "Search the public web through Borg's configured provider. Results include the selected backend, source URLs, snippets, and publication metadata; use the URLs as provenance and do not treat snippets as authoritative page contents.",
+        "Search the public web through Borg's host-configured providers. Auto mode may query Exa, Firecrawl, Parallel, and Brave concurrently and return a deduplicated federated result; credentials never belong in tool input. Results include source URLs, snippets, and publication metadata; use URLs as provenance and do not treat snippets as authoritative page contents.",
         json!({
             "type": "object",
             "properties": {

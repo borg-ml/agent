@@ -610,6 +610,7 @@ version = "0.1.58"
 dependencies = [
  "anyhow",
  "async-trait",
+ "futures",
  "reqwest",
  "serde",
  "serde_json",

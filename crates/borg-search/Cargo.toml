@@ -1,6 +1,6 @@
 [package]
 name = "borg-search"
-description = "Provider-neutral, bounded web search contracts and Exa, Parallel, and Brave backends"
+description = "Provider-neutral, bounded web search contracts and Exa, Firecrawl, Parallel, and Brave backends"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,6 +13,7 @@ publish = false
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+futures.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

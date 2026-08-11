@@ -35,8 +35,9 @@ Automatic updates and their check interval are configurable.
   OpenAI-compatible providers;
 - a standalone `borg-core` contract crate with no provider SDK, HTTP, MCP, or
   subprocess dependency;
-- one provider-neutral `web_search` tool with selectable Exa, Parallel, and
-  Brave backends (see [`docs/web-search.md`](docs/web-search.md));
+- one provider-neutral `web_search` tool with selectable Exa, Firecrawl,
+  Parallel, and Brave backends, with parallel federated auto search
+  (see [`docs/web-search.md`](docs/web-search.md));
 - a native harness with bounded file tools, background
   processes, LSP, goals, plans, subagents, MCP, project guidance, and skills;
 - Blu live extensions with dependency-aware skill, MCP, and bounded executable
@@ -239,8 +240,8 @@ decisions, reviews, references, and provenance records.
   channel contracts;
 - `borg-provider`: model gateways and optional Codex/Claude subscription
   adapters built on those contracts;
-- `borg-search`: bounded provider-neutral web search and Exa, Parallel, and
-  Brave adapters;
+- `borg-search`: bounded provider-neutral web search and Exa, Firecrawl,
+  Parallel, and Brave adapters;
 - `borg-remote`: session protocol, store, actor, host and local tools; and
 - `borg`: public CLI commands and terminal UI.
 
