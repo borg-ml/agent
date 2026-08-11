@@ -268,53 +268,6 @@ impl Transcript {
         self.subagents.insert(agent.session_id, agent.status);
         self.subagent_snapshots
             .insert(agent.session_id, agent.clone());
-        if let Some((label, detail, body, state)) = hydrated_subagent_action(agent) {
-            let time = canonical_local_time(agent.updated_at.with_timezone(&Local));
-            if let Some(index) = self.subagent_entries.get(&agent.session_id).copied() {
-                match self.order.get_mut(index) {
-                    Some(TranscriptEntry::Action {
-                        label: existing_label,
-                        detail: existing_detail,
-                        body: existing_body,
-                        time: existing_time,
-                        state: existing_state,
-                        expanded,
-                        ..
-                    }) => {
-                        *existing_label = label;
-                        *existing_detail = detail;
-                        *existing_body = body;
-                        *existing_time = time;
-                        *existing_state = state;
-                        if existing_body.is_none() {
-                            *expanded = false;
-                        }
-                    }
-                    // Keep old in-memory fixtures and sessions readable if a
-                    // reconnect updates a row created by an older binary.
-                    Some(TranscriptEntry::Activity {
-                        text: existing,
-                        time: existing_time,
-                    }) => {
-                        *existing = format_action_text(&label, &detail, body.as_deref());
-                        *existing_time = time;
-                    }
-                    _ => {}
-                }
-            } else {
-                self.subagent_entries
-                    .insert(agent.session_id, self.order.len());
-                self.order.push(TranscriptEntry::Action {
-                    kind: TranscriptActionKind::Agent,
-                    label,
-                    detail,
-                    body,
-                    time,
-                    state,
-                    expanded: false,
-                });
-            }
-        }
     }
 
     fn project_optimistic_message(&mut self, event: &SessionEvent) {

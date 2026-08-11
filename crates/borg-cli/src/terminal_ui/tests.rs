@@ -75,7 +75,7 @@ fn root_history_page_cannot_replace_a_focused_child_transcript() {
 }
 
 #[test]
-fn older_root_history_cannot_regress_an_authoritatively_stopped_child() {
+fn older_root_history_hides_agent_cards_and_preserves_authoritative_roster_state() {
     let root = Uuid::new_v4();
     let child = Uuid::new_v4();
     let now = Utc::now();
@@ -120,6 +120,7 @@ fn older_root_history_cannot_regress_an_authoritatively_stopped_child() {
         &[stale_parent_event],
     ));
 
+    assert!(displayed.order.is_empty());
     assert_eq!(displayed.active_subagent_count(), 0);
     assert_eq!(displayed.subagents[&child], SubagentStatus::Stopped);
     assert_eq!(

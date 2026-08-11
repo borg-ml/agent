@@ -6383,6 +6383,12 @@ fn transcript_history_in_display_order(events: &[SessionEvent]) -> Vec<SessionEv
     let mut turn = Vec::new();
 
     for event in events {
+        // Agent lifecycle has its own roster and child-transcript recovery.
+        // Replaying it into the root transcript makes old cards appear only
+        // after reconnect even though they were not part of the live view.
+        if matches!(event.kind, SessionEventKind::SubagentActivity { .. }) {
+            continue;
+        }
         let is_terminal_user_message = matches!(
             event.kind,
             SessionEventKind::Message {
@@ -7773,45 +7779,6 @@ fn subagent_action_projection(
                 ),
             },
         },
-    }
-}
-
-fn hydrated_subagent_action(agent: &SubagentSnapshot) -> Option<SubagentActionProjection> {
-    match agent.status {
-        SubagentStatus::Failed => Some((
-            "Agent".to_string(),
-            format!(
-                "{} · failed{}",
-                agent.task_name,
-                agent
-                    .detail
-                    .as_deref()
-                    .filter(|detail| !detail.trim().is_empty())
-                    .map(|detail| format!(" · {}", compact_text(detail, 120)))
-                    .unwrap_or_default()
-            ),
-            agent.detail.clone(),
-            TranscriptActionState::Failed,
-        )),
-        SubagentStatus::Stopped => Some((
-            "Agent".to_string(),
-            format!("{} · stopped", agent.task_name),
-            agent.final_text.clone(),
-            TranscriptActionState::Stopped,
-        )),
-        SubagentStatus::Ready => Some((
-            "Agent".to_string(),
-            format!("{} · done · waiting for input", agent.task_name),
-            agent.final_text.clone(),
-            TranscriptActionState::Complete,
-        )),
-        SubagentStatus::WaitingForApproval => Some((
-            "Agent".to_string(),
-            format!("{} · waiting for input", agent.task_name),
-            agent.detail.clone(),
-            TranscriptActionState::Waiting,
-        )),
-        SubagentStatus::Starting | SubagentStatus::Running => None,
     }
 }
 
