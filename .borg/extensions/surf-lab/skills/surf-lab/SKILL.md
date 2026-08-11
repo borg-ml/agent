@@ -1372,6 +1372,47 @@ recurrence only if a state-ambiguity audit of v3 finds conflicting actions;
 otherwise keep the single generalized network and build a globally non-myopic
 teacher or rollout objective around the verified v3 state contract.
 
+A GPU nearest-neighbor ambiguity audit supports that decision. It compared all
+1,969 authentic states with a route-stratified sample of 7,826 stochastic
+policy-visited states, excluding neighbors within 64 route samples. Among the
+closest one percent of temporally nonlocal v3 observations there were zero
+movement, yaw-over-five-degrees, jump, or duck conflicts. In the route-350--550
+failure window, the closest five percent also had zero conflicts. Conflicts
+appear only at materially larger feature distances. This is evidence against
+adding ramp normals or recurrence for the current failure; it does not claim
+that such inputs can never help elsewhere.
+
+Surf commit `0b5d0d8` adds globally continued recovery scoring. Set
+`cpu_continuation_ticks` on `policy.recover-native` to make ROCm screen the
+wide local action-program set, then have exact CPU ranking commit only the
+candidate's first control block and run the unchanged neural policy for the
+remaining evaluation span. Global ordered progress and survival outrank local
+route-state error. The parent and first-block axis probes are always retained
+in the exact shortlist before GPU-ranked candidates. Zero keeps the original
+local-horizon behavior.
+
+The first global probe started the r4 controller at episode tick 400, used a
+256-wide/128-tick ROCm screen, eight-tick commits, and 16 exact CPU
+continuations. It screened 5,987,517 GPU candidate ticks in 41.82 seconds
+(about 143k/s) and 879,421 authoritative CPU ticks in 360.08 seconds (about
+2,442/s). The teacher reached route sample 1,427 (72.51%) and ran the full
+1,969-tick span without a reset, compared with the frozen network's route
+485/reset around tick 500. This is a strong global control bound, not a trained
+controller or completion: progress stalled at 1,427 and the final state was
+17,681 Source units from the reference. Clip recovery supervision before the
+stall; never promote or visualize the teacher as if it were the network.
+
+Ordinary distillation of that clipped teacher is also bounded and closed. With
+r4 as parent, output-head trust scales `0.01`, `0.005`, `0.002`, and `0.001`
+reached exact-CPU route/tick pairs 472/496, 380/464, 479/512, and 481/501. A
+full-network `0.001` update reached 481/500. None improved both r4's 485/500,
+so r4 remains the controller. The global teacher proves useful action sequences
+exist; the remaining problem is transferring them without moving the sensitive
+prefix. The next method should optimize one generalized network directly
+against the global continuation objective with an explicit prefix-action trust
+constraint, not repeat behavior cloning, add per-ramp logic, or widen the same
+local search.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
