@@ -2266,6 +2266,165 @@ async fn all_queued_prompts_can_be_recalled_at_the_turn_completion_boundary() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn recalled_queue_prompt_is_not_started_after_the_pre_turn_handoff() {
+    let root = tempdir().unwrap();
+    let journal_path = root.path().join("session.lock");
+    let session_id = Uuid::new_v4();
+    let queued_message_id = Uuid::new_v4();
+    let session_db_path = root.path().join("sessions.sqlite3");
+    let (command_tx, command_rx) = mpsc::channel(8);
+    let (event_tx, mut event_rx) = mpsc::channel::<SessionEvent>(64);
+    let turns = Arc::new(Mutex::new(Vec::new()));
+    let first_started = Arc::new(Notify::new());
+    let release_first = Arc::new(Notify::new());
+    let queued_ready = Arc::new(Notify::new());
+    let handoff_ready = Arc::new(Notify::new());
+    let release_handoff = Arc::new(Notify::new());
+    let recalled_seen = Arc::new(Notify::new());
+    let cwd = root.path().to_path_buf();
+    let executor = Arc::new(BoundaryQueueExecutor {
+        turns: Arc::clone(&turns),
+        first_started: Arc::clone(&first_started),
+        release_first: Arc::clone(&release_first),
+    });
+    let collector = tokio::spawn({
+        let queued_ready = Arc::clone(&queued_ready);
+        let handoff_ready = Arc::clone(&handoff_ready);
+        let release_handoff = Arc::clone(&release_handoff);
+        let recalled_seen = Arc::clone(&recalled_seen);
+        async move {
+            while let Some(event) = event_rx.recv().await {
+                match &event.kind {
+                    SessionEventKind::Message {
+                        message_id,
+                        status: MessageStatus::Queued,
+                        ..
+                    } if *message_id == queued_message_id => queued_ready.notify_one(),
+                    SessionEventKind::Message {
+                        message_id,
+                        status: MessageStatus::InProgress,
+                        ..
+                    } if *message_id == queued_message_id => {
+                        handoff_ready.notify_one();
+                        release_handoff.notified().await;
+                    }
+                    SessionEventKind::PromptRecalled { message_id, .. }
+                        if *message_id == queued_message_id =>
+                    {
+                        recalled_seen.notify_one()
+                    }
+                    _ => {}
+                }
+            }
+        }
+    });
+    let actor = tokio::spawn(async move {
+        run_agent_session_with_executor(
+            &journal_path,
+            session_id,
+            LaunchSession {
+                request_id: Uuid::new_v4(),
+                cwd,
+                provider: CodingProvider::Codex,
+                model: None,
+                effort: None,
+                fast: Some(false),
+                response_language: crate::ResponseLanguage::Auto,
+                permission_mode: PermissionMode::Manual,
+                name: None,
+                initial_prompt: None,
+                capabilities: Default::default(),
+                subagent_concurrency_limit: None,
+                extension_skill_roots: Vec::new(),
+                team_policy: None,
+            },
+            command_rx,
+            event_tx,
+            executor,
+        )
+        .await
+    });
+
+    command_tx
+        .send(HostCommand::Prompt {
+            session_id,
+            message_id: Uuid::new_v4(),
+            text: "first".to_string(),
+            attachments: Vec::new(),
+            output_schema: None,
+            delivery: PromptDelivery::Steer,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), first_started.notified())
+        .await
+        .expect("first turn starts");
+    command_tx
+        .send(HostCommand::Prompt {
+            session_id,
+            message_id: queued_message_id,
+            text: "recall during handoff".to_string(),
+            attachments: Vec::new(),
+            output_schema: None,
+            delivery: PromptDelivery::Queue,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), queued_ready.notified())
+        .await
+        .expect("queued prompt is durable before the turn ends");
+    release_first.notify_one();
+
+    tokio::time::timeout(Duration::from_secs(1), handoff_ready.notified())
+        .await
+        .expect("queued prompt reaches the pre-turn handoff");
+    command_tx
+        .send(HostCommand::RecallQueuedPrompt {
+            session_id,
+            message_id: Some(queued_message_id),
+        })
+        .await
+        .unwrap();
+    release_handoff.notify_one();
+    tokio::time::timeout(Duration::from_secs(1), recalled_seen.notified())
+        .await
+        .expect("recall is durable before provider admission");
+
+    command_tx
+        .send(HostCommand::Stop { session_id })
+        .await
+        .unwrap();
+    actor.await.unwrap().unwrap();
+    collector.await.unwrap();
+
+    assert_eq!(turns.lock().unwrap().len(), 1);
+    let store = SqliteSessionStore::open(session_db_path).await.unwrap();
+    assert_eq!(
+        store
+            .action(session_id, queued_message_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        crate::SessionActionState::Cancelled
+    );
+    assert!(
+        !store
+            .read(session_id)
+            .await
+            .unwrap()
+            .iter()
+            .any(|event| matches!(
+                event.kind,
+                SessionEventKind::TurnStarted {
+                    message_id,
+                    ..
+                } if message_id == queued_message_id
+            ))
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn multiple_queue_mode_prompts_drain_fifo_after_a_natural_turn_boundary() {
     let root = tempdir().unwrap();
     let journal_path = root.path().join("session.lock");

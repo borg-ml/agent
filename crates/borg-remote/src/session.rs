@@ -1894,6 +1894,20 @@ async fn run_agent_session_store_kernel(
             )
             .await?;
         }
+        if recall_queued_prompt_before_provider_admission(
+            &mut journal,
+            &events,
+            session_id,
+            &mut pending,
+            &mut commands,
+            &mut deferred_commands,
+            &mut team_message_ids,
+            &prompt,
+        )
+        .await?
+        {
+            continue;
+        }
 
         if launch.provider.uses_native_harness() {
             let state = journal.state(session_id).await?;
@@ -2231,6 +2245,20 @@ async fn run_agent_session_store_kernel(
             subscription_context_reusable = false;
             continue;
         }
+        if recall_queued_prompt_before_provider_admission(
+            &mut journal,
+            &events,
+            session_id,
+            &mut pending,
+            &mut commands,
+            &mut deferred_commands,
+            &mut team_message_ids,
+            &prompt,
+        )
+        .await?
+        {
+            continue;
+        }
         record(
             &mut journal,
             &events,
@@ -2331,6 +2359,20 @@ async fn run_agent_session_store_kernel(
                 &launch.capabilities.provider_capabilities,
             ),
         };
+        if recall_queued_prompt_before_provider_admission(
+            &mut journal,
+            &events,
+            session_id,
+            &mut pending,
+            &mut commands,
+            &mut deferred_commands,
+            &mut team_message_ids,
+            &prompt,
+        )
+        .await?
+        {
+            continue;
+        }
         let turn_executor = Arc::clone(&executor);
         let mut running = tokio::spawn(async move {
             turn_executor
@@ -4856,15 +4898,7 @@ fn recall_visible_queued_prompts(
     if let Some(message_id) = message_id {
         return pending
             .iter()
-            .rposition(|prompt| {
-                prompt.visible
-                    && prompt.delivery == PromptDelivery::Queue
-                    && (prompt.message_id == message_id
-                        || prompt
-                            .batch
-                            .iter()
-                            .any(|entry| entry.message_id == message_id))
-            })
+            .rposition(|prompt| queued_prompt_matches_recall(prompt, Some(message_id)))
             .and_then(|index| pending.remove(index))
             .into_iter()
             .collect();
@@ -4881,6 +4915,18 @@ fn recall_visible_queued_prompts(
     }
     *pending = retained;
     recalled
+}
+
+fn queued_prompt_matches_recall(prompt: &QueuedPrompt, message_id: Option<Uuid>) -> bool {
+    prompt.visible
+        && prompt.delivery == PromptDelivery::Queue
+        && message_id.is_none_or(|message_id| {
+            prompt.message_id == message_id
+                || prompt
+                    .batch
+                    .iter()
+                    .any(|entry| entry.message_id == message_id)
+        })
 }
 
 async fn record_recalled_prompt(
@@ -5058,6 +5104,121 @@ async fn next_host_command(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn queue_pending_prompt(
+    journal: &mut RuntimeSessionStore,
+    events: &mpsc::Sender<SessionEvent>,
+    session_id: Uuid,
+    pending: &mut VecDeque<QueuedPrompt>,
+    team_message_ids: &mut HashSet<Uuid>,
+    message_id: Uuid,
+    text: String,
+    attachments: Vec<PathBuf>,
+    output_schema: Option<Value>,
+) -> Result<()> {
+    if journal.contains_message(session_id, message_id).await? {
+        return Ok(());
+    }
+    let actor = if team_message_ids.remove(&message_id) {
+        EventActor::System
+    } else {
+        EventActor::User
+    };
+    let prompt = QueuedPrompt {
+        message_id,
+        text,
+        actor,
+        attachments,
+        output_schema,
+        delivery: PromptDelivery::Queue,
+        visible: true,
+        interrupt_batch: actor == EventActor::User,
+        batch: Vec::new(),
+    };
+    record_prompt_status(
+        journal,
+        events,
+        session_id,
+        &prompt,
+        MessageStatus::Queued,
+        PromptDelivery::Queue,
+    )
+    .await?;
+    pending.push_back(prompt);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn recall_queued_prompt_before_provider_admission(
+    journal: &mut RuntimeSessionStore,
+    events: &mpsc::Sender<SessionEvent>,
+    session_id: Uuid,
+    pending: &mut VecDeque<QueuedPrompt>,
+    commands: &mut mpsc::Receiver<HostCommand>,
+    deferred: &mut VecDeque<HostCommand>,
+    team_message_ids: &mut HashSet<Uuid>,
+    current: &QueuedPrompt,
+) -> Result<bool> {
+    // The prompt has left `pending`, but the provider has not received it until
+    // the executor task is spawned. Check recall input around each awaited
+    // setup boundary so the provider cannot receive a withdrawn queue entry.
+    tokio::task::yield_now().await;
+    let mut ready = std::mem::take(deferred);
+    while let Ok(command) = commands.try_recv() {
+        ready.push_back(command);
+    }
+
+    let mut recalled_current = false;
+    while let Some(command) = ready.pop_front() {
+        match command {
+            HostCommand::Prompt {
+                session_id: command_session_id,
+                message_id,
+                text,
+                attachments,
+                output_schema,
+                delivery: PromptDelivery::Queue,
+            } if command_session_id == session_id => {
+                queue_pending_prompt(
+                    journal,
+                    events,
+                    session_id,
+                    pending,
+                    team_message_ids,
+                    message_id,
+                    text,
+                    attachments,
+                    output_schema,
+                )
+                .await?;
+            }
+            HostCommand::RecallQueuedPrompt {
+                session_id: command_session_id,
+                message_id,
+            } if command_session_id == session_id => {
+                let recalled = recall_visible_queued_prompts(pending, message_id);
+                let recalls_current = queued_prompt_matches_recall(current, message_id);
+                if recalled.is_empty() && !recalls_current {
+                    deferred.push_back(HostCommand::RecallQueuedPrompt {
+                        session_id: command_session_id,
+                        message_id,
+                    });
+                    continue;
+                }
+                for recalled in recalled {
+                    record_recalled_prompt(journal, events, session_id, &recalled).await?;
+                }
+                if recalls_current && !recalled_current {
+                    record_recalled_prompt(journal, events, session_id, current).await?;
+                    recalled_current = true;
+                }
+            }
+            command => deferred.push_back(command),
+        }
+    }
+    Ok(recalled_current)
+}
+
 fn defer_root_inbox_behind_current_command(
     deferred: &mut VecDeque<HostCommand>,
     session_id: Uuid,
@@ -5112,52 +5273,25 @@ async fn collect_input_at_turn_boundary(
                 output_schema,
                 ..
             } if command_session_id == session_id => {
-                if journal.contains_message(session_id, message_id).await? {
-                    continue;
-                }
-                let actor = if team_message_ids.remove(&message_id) {
-                    EventActor::System
-                } else {
-                    EventActor::User
-                };
-                let prompt = QueuedPrompt {
-                    message_id,
-                    text,
-                    actor,
-                    attachments,
-                    output_schema,
-                    delivery: PromptDelivery::Queue,
-                    visible: true,
-                    interrupt_batch: actor == EventActor::User,
-                    batch: Vec::new(),
-                };
-                record_prompt_status(
+                queue_pending_prompt(
                     journal,
                     events,
                     session_id,
-                    &prompt,
-                    MessageStatus::Queued,
-                    PromptDelivery::Queue,
+                    pending,
+                    team_message_ids,
+                    message_id,
+                    text,
+                    attachments,
+                    output_schema,
                 )
                 .await?;
-                pending.push_back(prompt);
             }
             HostCommand::RecallQueuedPrompt {
                 session_id: command_session_id,
                 message_id,
             } if command_session_id == session_id => {
                 for recalled in recall_visible_queued_prompts(pending, message_id) {
-                    record(
-                        journal,
-                        events,
-                        session_id,
-                        SessionEventKind::PromptRecalled {
-                            message_id: recalled.message_id,
-                            text: recalled.text,
-                            attachments: recalled.attachments,
-                        },
-                    )
-                    .await?;
+                    record_recalled_prompt(journal, events, session_id, &recalled).await?;
                 }
             }
             HostCommand::Interrupt {
