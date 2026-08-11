@@ -1489,6 +1489,29 @@ same full-start route and reset. It is not promoted. Keep
 `utopia-user-native-clean-capacity192-stage3-teacher-centered-v1.json` as the
 clean controller authority.
 
+Surf commit `982728f` adds a final constrained localization diagnostic:
+`gpu_hidden_bias_suffix_start` selects an ordinary second-hidden suffix, proves
+every selected ReLU is inactive over the exact CPU prefix, and permits only
+downward bias mutations. Those mutations cannot wake a prefix unit or alter any
+other tensor. A positive exact CPU route-survival screen ranks the entire
+population, while ROCm remains diagnostic and complete authentic-start CPU
+route-plus-survival gains remain the only promotion path.
+
+This hidden-threshold family is also bounded and closed. Exact CPU coherent
+action noise from episode tick 1200 produced no route or survival improvement
+over the unchanged parent in 32 matched states. Uniform downward shifts of the
+11 fourth-bank biases by 0.025, 0.05, 0.1, 0.2, 0.35, and 0.5 reached full-start
+route/reset pairs 1216/1425, 1216/1427, 1220/1347, 1213/1305, 1222/1349, and
+1222/1349; none improved both clean-authority axes. The compositor-safe
+downward-only search then used populations 8 and 32. The 32-wide GPU suffix
+took 1.00 seconds, returned to 1% idle and 6% VRAM at 59 C junction, and
+generated route variation from 1213 to 1222. Its three-scenario exact CPU rank
+disagreed with the ROCm order (Kendall tau about -0.36), did not update the
+search center, and retained the unchanged 1222/1349 authority. Do not spend
+more rollout budget on output-only or hidden-threshold searches. Revisit the
+end-to-end representation, data distribution, and learning objective that made
+the earlier controller successful before proposing another optimizer.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
