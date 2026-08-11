@@ -1909,7 +1909,7 @@ impl Transcript {
             .iter()
             .filter(|item| item.status != PlanItemStatus::Completed)
             .count();
-        (open > 0).then(|| format!("{open} open to-do{}", if open == 1 { "" } else { "s" }))
+        (open > 0).then(|| format!("{open} to-do{}", if open == 1 { "" } else { "s" }))
     }
 
     #[cfg(test)]

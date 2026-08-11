@@ -4317,6 +4317,9 @@ impl BorgTerminal {
             effort_status_hovered: self.effort_status_hovered,
             permission_status_hovered: self.permission_status_hovered,
         });
+        let hover_notice_hint = transcript_interaction_hint
+            .or(interaction_hint)
+            .filter(|_| !showing_slash_suggestions && notice.is_some());
         let primary_controls_display = if showing_transcript_interaction_hint {
             transcript_interaction_hint
                 .expect("transcript interaction hint is present")
@@ -4340,7 +4343,12 @@ impl BorgTerminal {
             Style::default().fg(Color::DarkGray)
         };
         let controls = slash_suggestions.unwrap_or_else(|| {
-            if let Some(notice) = notice {
+            if let Some(hint) = hover_notice_hint {
+                vec![Line::from(Span::styled(
+                    hint,
+                    Style::default().fg(Color::Yellow),
+                ))]
+            } else if let Some(notice) = notice {
                 if copy_notice_active {
                     vec![copy_notice_line(notice)]
                 } else {
@@ -5078,32 +5086,6 @@ impl BorgTerminal {
                         }),
                 ));
             }
-            let todo_status_start = status_spans.iter().map(|span| span.width()).sum::<usize>();
-            // The separator is rendered unstyled, so the hover target is the
-            // value alone.
-            let todo_status_start = todo_status_start
-                .saturating_add(usize::from(todo_status.is_some()) * STATUS_SEPARATOR.width());
-            let todo_status_width = todo_status.as_ref().map(|value| value.width());
-            if let Some(todo_status) = todo_status.clone() {
-                status_spans.push(Span::styled(
-                    STATUS_SEPARATOR,
-                    Style::default().fg(Color::Gray),
-                ));
-                status_spans.push(Span::styled(
-                    todo_status,
-                    Style::default()
-                        .fg(if self.todo_status_hovered {
-                            Color::White
-                        } else {
-                            Color::LightGreen
-                        })
-                        .add_modifier(if self.todo_status_hovered {
-                            Modifier::BOLD | Modifier::UNDERLINED
-                        } else {
-                            Modifier::empty()
-                        }),
-                ));
-            }
             let model_status_start = status_spans.iter().map(|span| span.width()).sum::<usize>();
             // The separator is rendered unstyled, so the hover target is the
             // value alone.
@@ -5174,6 +5156,32 @@ impl BorgTerminal {
                 self.permission_status_hovered,
                 permission_status_color,
             );
+            let todo_status_start = status_spans.iter().map(|span| span.width()).sum::<usize>();
+            // The separator is rendered unstyled, so the hover target is the
+            // value alone.
+            let todo_status_start = todo_status_start
+                .saturating_add(usize::from(todo_status.is_some()) * STATUS_SEPARATOR.width());
+            let todo_status_width = todo_status.as_ref().map(|value| value.width());
+            if let Some(todo_status) = todo_status.clone() {
+                status_spans.push(Span::styled(
+                    STATUS_SEPARATOR,
+                    Style::default().fg(Color::Gray),
+                ));
+                status_spans.push(Span::styled(
+                    todo_status,
+                    Style::default()
+                        .fg(if self.todo_status_hovered {
+                            Color::White
+                        } else {
+                            Color::LightGreen
+                        })
+                        .add_modifier(if self.todo_status_hovered {
+                            Modifier::BOLD | Modifier::UNDERLINED
+                        } else {
+                            Modifier::empty()
+                        }),
+                ));
+            }
             let status_line = Line::from(status_spans);
             let alignment_offset = if is_launch_screen {
                 status_area.width.saturating_sub(status_line.width() as u16) / 2
@@ -5470,8 +5478,7 @@ impl BorgTerminal {
                 );
             }
             if !is_launch_screen {
-                let footer_metadata = showing_primary_controls
-                    .then(|| footer_metadata_text("", &cwd_status, usize::MAX))
+                let footer_metadata = Some(footer_metadata_text("", &cwd_status, usize::MAX))
                     .filter(|value| !value.is_empty());
                 let desired_metadata_width = footer_metadata
                     .as_ref()

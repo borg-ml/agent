@@ -2487,7 +2487,16 @@ fn todo_status_counts_open_items_and_tooltip_matches_plan_order_and_clipping() {
         ..Transcript::default()
     };
 
-    assert_eq!(transcript.todo_status().as_deref(), Some("4 open to-dos"));
+    assert_eq!(transcript.todo_status().as_deref(), Some("4 to-dos"));
+    let single_todo = Transcript {
+        todos: vec![PlanItem {
+            id: Uuid::new_v4(),
+            content: "Check the singular label".to_string(),
+            status: PlanItemStatus::Pending,
+        }],
+        ..Transcript::default()
+    };
+    assert_eq!(single_todo.todo_status().as_deref(), Some("1 to-do"));
     let rows = transcript.todo_tooltip_rows(false);
     assert_eq!(rows.len(), MAX_COLLAPSED_PLAN_ITEMS + 1);
     assert!(rows[0].starts_with("●  "));
