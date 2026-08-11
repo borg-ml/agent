@@ -5546,6 +5546,81 @@ fn queue_projection_preserves_fifo_and_discards_bypassed_stale_entries() {
 }
 
 #[test]
+fn resume_pending_prompt_projection_replays_queue_events() {
+    let session_id = Uuid::new_v4();
+    let first = Uuid::new_v4();
+    let second = Uuid::new_v4();
+    let message = |sequence: u64, message_id: Uuid, text: &str, status: MessageStatus| {
+        SessionEvent::new(
+            session_id,
+            sequence,
+            SessionEventKind::Message {
+                message_id,
+                actor: EventActor::User,
+                text: text.to_string(),
+                attachments: Vec::new(),
+                status,
+                delivery: Some(PromptDelivery::Queue),
+            },
+        )
+    };
+
+    let pending = pending_prompt_projection_from_events(&[
+        message(1, first, "first", MessageStatus::Queued),
+        message(2, second, "second", MessageStatus::Queued),
+        message(3, first, "first", MessageStatus::Complete),
+    ]);
+
+    assert_eq!(
+        pending,
+        vec![PendingPromptProjection {
+            message_id: second,
+            text: "second".to_string(),
+            delivery: PromptDelivery::Queue,
+        }]
+    );
+}
+
+#[test]
+fn child_history_hydration_keeps_unsettled_optimistic_prompt() {
+    let session_id = Uuid::new_v4();
+    let pending_id = Uuid::new_v4();
+    let queued_history = SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::Message {
+            message_id: pending_id,
+            actor: EventActor::User,
+            text: "pending".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Queued,
+            delivery: Some(PromptDelivery::Queue),
+        },
+    );
+    let optimistic = vec![PendingPromptProjection {
+        message_id: pending_id,
+        text: "pending".to_string(),
+        delivery: PromptDelivery::Queue,
+    }];
+    let mut pending = Vec::new();
+
+    restore_optimistic_pending_prompts(&mut pending, &[queued_history], optimistic);
+
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].message_id, pending_id);
+}
+
+#[test]
+fn pending_prompt_recall_treats_whitespace_only_composer_as_empty() {
+    let queued = PendingPromptProjection {
+        message_id: Uuid::new_v4(),
+        text: "pending".to_string(),
+        delivery: PromptDelivery::Queue,
+    };
+    assert!(has_recallable_queued_prompts(" \n", &[queued]));
+}
+
+#[test]
 fn one_queued_prompt_allocates_a_content_row_below_its_border() {
     let prompts = [PendingPromptProjection {
         message_id: Uuid::new_v4(),

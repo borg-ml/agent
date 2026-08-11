@@ -1297,6 +1297,11 @@ async fn run_local_agent_session(
     } else {
         store.read(session_id).await?
     };
+    let pending_prompt_events = if can_prompt && !fallback_terminal && resuming {
+        store.recovery(session_id).await?.queue_events
+    } else {
+        Vec::new()
+    };
     if can_prompt && !fallback_terminal {
         // Durable history is the transcript source of truth, while the latest
         // coalesced message/reasoning rows are the live tail of an in-flight
@@ -1535,6 +1540,7 @@ async fn run_local_agent_session(
         resume_display_state(session_state.clone(), session_access, resuming);
     if let Some(terminal) = terminal.as_mut() {
         terminal.seed_history(&history);
+        terminal.seed_pending_prompt_events(&pending_prompt_events);
         terminal.seed_team_roster(&team_snapshots);
         terminal.seed_session_state(&display_session_state);
         if let Some(notice) = startup_update_notice.as_deref() {

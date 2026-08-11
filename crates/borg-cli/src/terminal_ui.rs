@@ -1838,6 +1838,20 @@ impl BorgTerminal {
         self.replaying_history = false;
     }
 
+    /// Restore pending input from the durable queue projection separately from
+    /// transcript history. Resume deliberately omits queued messages from the
+    /// transcript bootstrap so they cannot be mistaken for new conversation.
+    pub fn seed_pending_prompt_events(&mut self, events: &[SessionEvent]) {
+        for pending in pending_prompt_projection_from_events(events) {
+            push_queued_prompt(
+                &mut self.queued_prompts,
+                pending.message_id,
+                pending.text,
+                pending.delivery,
+            );
+        }
+    }
+
     /// Seed durable composer recall independently from the bounded transcript
     /// window. This keeps Up-arrow history stable across resumes even when the
     /// visible tail is aggressively lazy-loaded.
@@ -2351,7 +2365,10 @@ impl BorgTerminal {
         let mut transcript = fresh_transcript_like(previous);
         transcript.show_director_context_boundary();
         transcript.reserve_history(events.len());
-        self.child_queued_prompts.remove(&child_id);
+        let optimistic_pending = self
+            .child_queued_prompts
+            .remove(&child_id)
+            .unwrap_or_default();
         self.child_pending_approvals.remove(&child_id);
         for event in &events {
             if let SessionEventKind::StatusChanged { status, .. } = event.kind {
@@ -2378,6 +2395,11 @@ impl BorgTerminal {
             }
             transcript.apply(event);
         }
+        restore_optimistic_pending_prompts(
+            self.child_queued_prompts.entry(child_id).or_default(),
+            &events,
+            optimistic_pending,
+        );
         if self.focused_child == Some(child_id) {
             self.transcript = transcript;
             self.text_selection = None;
@@ -7979,6 +8001,54 @@ fn update_queued_prompts(
     }
 }
 
+fn pending_prompt_projection_from_events(events: &[SessionEvent]) -> Vec<PendingPromptProjection> {
+    let mut queued_prompts = Vec::new();
+    for event in events {
+        update_queued_prompts(&mut queued_prompts, &event.kind);
+    }
+    queued_prompts
+}
+
+fn restore_optimistic_pending_prompts(
+    queued_prompts: &mut Vec<PendingPromptProjection>,
+    events: &[SessionEvent],
+    optimistic_pending: Vec<PendingPromptProjection>,
+) {
+    for pending in optimistic_pending {
+        if !events
+            .iter()
+            .any(|event| pending_prompt_projection_settled_by(event, pending.message_id))
+        {
+            push_queued_prompt(
+                queued_prompts,
+                pending.message_id,
+                pending.text,
+                pending.delivery,
+            );
+        }
+    }
+}
+
+fn pending_prompt_projection_settled_by(event: &SessionEvent, message_id: Uuid) -> bool {
+    match &event.kind {
+        SessionEventKind::TurnStarted {
+            message_id: event_message_id,
+            ..
+        }
+        | SessionEventKind::PromptRecalled {
+            message_id: event_message_id,
+            ..
+        } => *event_message_id == message_id,
+        SessionEventKind::Message {
+            message_id: event_message_id,
+            actor: EventActor::User,
+            status: MessageStatus::Complete | MessageStatus::Failed,
+            ..
+        } => *event_message_id == message_id,
+        _ => false,
+    }
+}
+
 fn push_queued_prompt(
     queued_prompts: &mut Vec<PendingPromptProjection>,
     message_id: Uuid,
@@ -8004,7 +8074,7 @@ fn has_recallable_queued_prompts(
     composer_text: &str,
     queued_prompts: &[PendingPromptProjection],
 ) -> bool {
-    composer_text.is_empty()
+    composer_text.trim().is_empty()
         && queued_prompts
             .iter()
             .any(|prompt| prompt.delivery == PromptDelivery::Queue)
@@ -8014,7 +8084,7 @@ fn has_pending_steer_prompts(
     composer_text: &str,
     queued_prompts: &[PendingPromptProjection],
 ) -> bool {
-    composer_text.is_empty()
+    composer_text.trim().is_empty()
         && queued_prompts
             .iter()
             .any(|prompt| prompt.delivery == PromptDelivery::Steer)
