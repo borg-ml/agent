@@ -1184,6 +1184,22 @@ tool error. `tools/call` failures now return a JSON-RPC error instead of
 escaping `main` and closing stdout; an invalid PPO call followed by a valid
 `tools/list` request succeeded in the same release worker.
 
+Surf commit `528c7f2` extends policy-prefix snapshots to history-enabled
+route-relative policies. Exact CPU prefixes now preserve the previous analog
+movement, yaw delta, and jump state across both CPU and GPU handoff rather than
+silently zeroing them. At v8 episode tick 500, the first route-policy suffix
+state had nonzero history (`movement=[1,-1]`, normalized yaw delta `0.2998`,
+jump held); GPU/CPU first-state feature and mean errors were `5.96e-8` and
+`1.14e-5`. A zero-noise 8x64 differential matched route and terminal results.
+
+A 256x192 v8 policy-prefix batch then collected 40,366 transitions in 1.776
+seconds end to end (about 22,734 candidate ticks/second; 1.299 seconds GPU
+simulation) and found stochastic continuations to route index 316 versus the
+parent's deterministic 303. The resulting PPO direction still failed exact
+CPU promotion at every screened scale from 0.001 through 0.032; the best scale
+reached route 278 over 663 ticks, below v8's route 303 over 710 ticks. Retain
+v8 as the route-relative PPO parent and do not promote these variants.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
