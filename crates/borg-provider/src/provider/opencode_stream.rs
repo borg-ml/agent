@@ -261,8 +261,14 @@ fn opencode_run_args(
     if let Some(effort) = effort {
         args.extend(["--variant".to_string(), effort.to_string()]);
     }
-    if permission == LocalAgentPermission::FullAccess {
-        args.push("--dangerously-skip-permissions".to_string());
+    match permission {
+        LocalAgentPermission::FullAccess => {
+            args.push("--dangerously-skip-permissions".to_string());
+        }
+        LocalAgentPermission::Auto => {
+            args.push("--auto".to_string());
+        }
+        LocalAgentPermission::Manual => {}
     }
     args
 }
@@ -398,6 +404,9 @@ mod tests {
                 .iter()
                 .any(|arg| arg == "--dangerously-skip-permissions")
         );
+
+        let automatic = opencode_run_args(None, "openai/gpt-5.6", None, LocalAgentPermission::Auto);
+        assert!(automatic.iter().any(|arg| arg == "--auto"));
     }
 
     #[test]

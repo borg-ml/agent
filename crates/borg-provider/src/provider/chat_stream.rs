@@ -1877,6 +1877,9 @@ fn codex_thread_start_params(
         // long Codex turns collapse to reasoning + tools with no narration.
         "developerInstructions": request.system_prompt,
     });
+    if permission == LocalAgentPermission::Auto {
+        params["approvalsReviewer"] = Value::String("auto_review".to_string());
+    }
     let mut config = serde_json::Map::new();
     if !request.mcp_external_servers.is_empty()
         && let Some(mcp_config) =
@@ -1915,18 +1918,26 @@ fn codex_thread_resume_params(
 
 fn codex_turn_start_params(
     request: &ChatStreamRequest,
-    _permission: LocalAgentPermission,
+    permission: LocalAgentPermission,
     thread_id: &str,
 ) -> Value {
-    serde_json::json!({
+    let mut params = serde_json::json!({
         "threadId": thread_id,
         "input": codex_user_input(&request.prompt, &request.attachments),
         "model": request.model,
         "cwd": request.working_directory.as_ref().map(|path| path.to_string_lossy().into_owned()),
         "effort": request.effort,
+        "approvalPolicy": match permission {
+            LocalAgentPermission::FullAccess => "never",
+            LocalAgentPermission::Auto | LocalAgentPermission::Manual => "on-request",
+        },
         "summary": "detailed",
         "outputSchema": request.output_schema,
-    })
+    });
+    if permission == LocalAgentPermission::Auto {
+        params["approvalsReviewer"] = Value::String("auto_review".to_string());
+    }
+    params
 }
 
 fn codex_turn_steer_params(
@@ -3032,6 +3043,12 @@ mod tests {
                 "session-1",
             ]
         );
+        let auto_args = claude_command_args(&request, LocalAgentPermission::Auto, None);
+        assert!(
+            auto_args
+                .windows(2)
+                .any(|args| args[0] == "--permission-mode" && args[1] == "auto")
+        );
     }
 
     #[test]
@@ -3092,6 +3109,21 @@ mod tests {
             Some(&Value::String("system".to_string()))
         );
         assert!(codex_config.get("baseInstructions").is_none());
+        let codex_auto_config = codex_thread_start_params(&request, LocalAgentPermission::Auto);
+        assert_eq!(
+            codex_auto_config.get("approvalPolicy"),
+            Some(&Value::String("on-request".to_string()))
+        );
+        assert_eq!(
+            codex_auto_config.get("approvalsReviewer"),
+            Some(&Value::String("auto_review".to_string()))
+        );
+        let codex_auto_turn =
+            codex_turn_start_params(&request, LocalAgentPermission::Auto, "thread-1");
+        assert_eq!(
+            codex_auto_turn.get("approvalsReviewer"),
+            Some(&Value::String("auto_review".to_string()))
+        );
         assert_eq!(
             codex_config
                 .get("config")
