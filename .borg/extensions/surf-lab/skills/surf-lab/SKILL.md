@@ -1630,6 +1630,42 @@ clean authority. The next architecture should use the already-verified
 `native_route_continuous_v3` path geometry and actor-visited collection rather
 than another absolute-pose suffix or scale sweep.
 
+Surf commit `84a9423` applies that correction to the existing continuous-route
+actor. The off-policy trainer accepts `native_route_continuous_v3`, can freeze
+the hidden representation while fitting the ordinary output layer, can limit
+actor labels to matched elite rollouts and their actual exploration window,
+and retains all replay for critic fitting. The export is still one ordinary
+phase-free, history-enabled network with no schedule, state memory, adapter, or
+per-ramp branch.
+
+Use fixed action persistence for exploration rather than per-tick AR noise when
+collecting this lineage. With a 16-tick hold, one compositor-safe 32-wide GPU
+batch from the authentic start found route 694 over 727 ticks, compared with
+the frozen route actor's GPU 380/466. Long-horizon GPU ranking was not a safe
+teacher: the matched exact-CPU batch selected a different rollout at route
+688/728. Distilling only that exact rollout's first 512 exploratory ticks into
+the ordinary output layer produced
+`utopia-user-native-route-continuous-r4-elitebc-output-cpufullstart8-r1.json`.
+Two independent exact-CPU starts both reproduced route 638 over 759 ticks;
+ROCm reached route 639 over 774 ticks. The prior route-v3 controller reached
+only about route 481/501 in the same collector contract. Across 16 matched
+small CPU state perturbations, the new actor improved mean route by 12.625,
+mean survival by 3.1875 ticks, and mean route-time reward by 6.60, although it
+regressed several individual cases. It is the route-v3 training parent, not a
+completion or robustness claim, and it remains below the 704-wide absolute-
+pose clean authority at route 1222.
+
+The next focused collection bound is also explicit. From the new actor's exact
+episode-tick-500 state, a 32-wide 16-tick-held GPU screen proposed route 722;
+the exact CPU replay reproduced the leading candidate at route 723 over 264
+suffix ticks versus the parent at 638/258. Softly anchoring the first 500
+actions while fitting that suffix still regressed the complete GPU start to
+476/495, so do not promote it or line-search the same fit. Retain the route-638
+actor. Future continuation needs exact prefix preservation inside one ordinary
+network, or a new globally validated actor update; GPU remains the broad
+collector and exact CPU remains the teacher/promotion authority whenever
+long-horizon ranks separate.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
