@@ -250,6 +250,14 @@ impl PersistentRuntimeWorker {
 
         let result = {
             let mut process = self.process.lock().await;
+            let process_exited = if let Some(process) = process.as_mut() {
+                process.child.try_wait()?.is_some()
+            } else {
+                false
+            };
+            if process_exited {
+                *process = None;
+            }
             let should_recover_namespace =
                 process.is_none() && self.metadata.lock().await.namespace_recovery_pending;
             let checkpoint_state = if should_recover_namespace {
@@ -1371,6 +1379,41 @@ mod tests {
             .await
             .expect("Python retrieval adapter test execution");
         assert_eq!(tested.value["passed"], true);
+        runtime.stop().await;
+    }
+
+    #[tokio::test]
+    async fn python_worker_restarts_after_managed_process_termination() {
+        if !python_available().await {
+            return;
+        }
+        let root = tempdir().expect("temporary runtime root");
+        let runtime = PersistentRuntimeWorker::new(root.path().to_path_buf());
+        let first = runtime
+            .execute("answer = 41\nanswer", None, Arc::new(TestHost))
+            .await
+            .expect("first Python execution");
+        assert_eq!(first.value, json!(41));
+
+        {
+            let mut process = runtime.process.lock().await;
+            let process = process.as_mut().expect("Python process was started");
+            process
+                .child
+                .start_kill()
+                .expect("terminate managed Python process");
+            process
+                .child
+                .wait()
+                .await
+                .expect("wait for managed Python process");
+        }
+
+        let restarted = runtime
+            .execute("answer = 42\nanswer", None, Arc::new(TestHost))
+            .await
+            .expect("runtime should respawn a terminated Python process");
+        assert_eq!(restarted.value, json!(42));
         runtime.stop().await;
     }
 
