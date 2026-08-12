@@ -2645,10 +2645,35 @@ losses, and 226 ties with mean delta +0.496; the route-1945-or-better count
 improves from 20 to 21. This is robust neural progress and shared-core parity,
 not terminal completion or playable-game completion parity.
 
+Surf commits `6d7ff55` and `eff4ccd` add a conditioned truncated-least-squares
+solve for state-local residual output weights and a training-only continuous
+CEM search over explicit held residual programs. The latter uses the existing
+ROCm shared-core evaluator and ranks completion, survival, ordered progress,
+then worst normalized finish-gate error. It does not add any deployed runtime
+mechanism. From the unchanged s8432 policy state at tick 1920, eight CEM
+generations found one completing two-block teacher trajectory: rollout 133
+finished after 82 suffix ticks with position/velocity errors 56.28/63.56.
+
+Distilling its first 64 actions through the conditioned local residual solve
+produced
+`utopia-geometric-continuous-localresidual-g6late-lstsq1e4-terminal-t1920-cem8-r133-protected8-s8439.json`,
+one ordinary stateless 64--1280--1280--6 ReLU actor. The corrective fit has
+runtime-action RMSE `4.08e-6`, maximum error `2.90e-5`, and maximum added
+output weight 0.621. From spawn, the unchanged actor completes the shared-core
+CPU route gate at tick 2002 without reset, at 56.28/63.53 terminal error; the
+deterministic ROCm rollout matches the complete result exactly. This is the
+first autonomous feed-forward NN to satisfy the headless completion gate.
+It is not yet the robust or playable-game leader: paired perturbation
+promotion remains outstanding, and the first 2,048-tick playable audit looped
+without touching/logging the terminal teleport trigger. Keep s8412 as the
+strict robustness authority until those checks pass.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
-`native-demo:`. It loads the demo named in the artifact, requires
+`native-demo:`. `SURF_POLICY` selects a native `LearnedPolicy`, while
+`SURF_VALUE_POLICY` selects a geometric `ValuePolicy`. The viewer loads the
+demo named in the artifact, requires
 `SURF_NATIVE_NETWORK_TRACE` for an authoritative initial state, uses the same
 native-to-policy feature transform as headless validation, and runs the full
 artifact episode across interpolation-only supervision boundaries. A floor or
@@ -2669,6 +2694,12 @@ SURF_POLICY='/absolute/path/to/native-policy.json' \
 SURF_NATIVE_NETWORK_TRACE='/absolute/path/to/decoded-packet-entities.jsonl' \
 cargo run --release --bin surf
 ```
+
+Set `SURF_POLICY_ROLLOUT_TICKS` when a validated continuation intentionally
+extends beyond the artifact's training-frame count. Surf commit `2a43a75`
+keeps playback camera yaw/pitch separate from controller yaw/pitch: click the
+window to capture the mouse, look freely without changing NN inputs or
+actions, and press Escape to release it.
 
 Use `SURF_WINDOW_MODE=hidden` for a renderer smoke test. A natural loop reload
 after the reported full `rollout_ticks` proves the episode completed without
