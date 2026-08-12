@@ -2049,12 +2049,16 @@ complete-start scenarios at full-network sigma `0.001`. The larger run had real
 paired signal (`1.95247` RMS), but 13 of 16 directions were pinned to the same
 worst failure at tick 266; the other three gained only a few worst-case survival
 ticks while destroying nominal progress. Every accumulated-update backtrack
-through scale `0.0009765625` regressed matched scenarios, so scale zero was
-selected. The unchanged route-1801 authority survived all 2,600 nominal ticks,
-and its final GPU/host route, progress, timing, and terminal errors matched
-exactly. Do not promote either diagnostic artifact or repeat this worst-case
-full-network sigma/seed search unchanged; the result identifies a worst-scenario
-plateau and globally sensitive trust step, not a controller gain.
+through scale `0.0009765625` regressed matched scenarios. An identical temporary
+diagnostic extended the line through `9.536743e-7`; every nonzero step still
+collapsed nominal progress to route 1098 or earlier and regressed six to nine
+matched starts, so only scale zero was admissible. The deeper line-search change
+was removed instead of adding permanent cost. The unchanged route-1801
+authority survived all 2,600 nominal ticks, and its final GPU/host route,
+progress, timing, and terminal errors matched exactly. Do not promote any of
+these diagnostic artifacts or repeat this worst-case full-network sigma/seed
+search unchanged; the result identifies a worst-scenario plateau and globally
+sensitive trust step, not a controller gain.
 
 ## Native policy visualization
 
