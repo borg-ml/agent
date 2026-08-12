@@ -1841,6 +1841,14 @@ search evidence only, and retain
 `utopia-user-native-route-continuous-capacity256-dagger2-anchored-direct-s1e3-g8-p256-v2.json`
 as the strict controller authority.
 
+The second exact commitment point at episode tick 1200 was also tested rather
+than assumed away. Its `288..544` suffix remained exactly inactive over the
+prefix and all 64 branch suffixes matched their complete-start rollouts. A
+`sigma=1` probe was over-scaled by a hidden-activation spike near tick 1550; a
+profile-calibrated `sigma=0.25` probe retained 29 full-span survivors, but the
+best reached only route 1682 and the fastest resetting candidate only route
+1786. This earlier branch does not justify a wide generation.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
