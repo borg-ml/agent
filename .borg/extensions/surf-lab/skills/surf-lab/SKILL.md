@@ -1815,6 +1815,32 @@ lag, or fitness. Do not promote the resulting search artifact. Retain
 `utopia-user-native-route-continuous-capacity256-dagger2-anchored-direct-s1e3-g8-p256-v2.json`
 as the strict authority.
 
+An activation audit of that 544-wide authority found an ordinary second-hidden
+bank at indices `352..544` that is exactly inactive through episode tick 1699,
+then activates for roughly 240 ticks before the route-1801 stall. This permits
+output-suffix ARS to preserve every earlier action exactly without a clock,
+gate, adapter, or deployed branch. A calibrated tick-1700 probe at `sigma=1`
+produced useful route/survival variation, but it also exposed a continuation
+bug: one candidate was scored as surviving the full 900-tick branch while its
+complete-start rollout reset only 405 ticks after the same branch point.
+
+Surf commit `38b0cac` fixes that false continuation by carrying the continuous
+policy tracker's previous route position and the pending duck transition
+through the ROCm neural initial-state ABI. Structurally exact dormant-bank
+searches now enforce that every branch candidate reproduces its complete-start
+suffix exactly in survival, route progress, and terminal physical state. The
+post-fix 64-candidate replay had eight survivors in both views and zero
+disagreements; the corrected 256-candidate validation checked all 256 suffixes
+exactly and retained GPU/host selection parity.
+
+That corrected wide search still did not produce a promotable network. Its
+best full-span survivor reached route 1797, while its fastest candidate reached
+route 1907 but reset at episode tick 2122. The emitted artifact is tensor-for-
+tensor identical to the route-1801 authority. Keep the route-1907 result as
+search evidence only, and retain
+`utopia-user-native-route-continuous-capacity256-dagger2-anchored-direct-s1e3-g8-p256-v2.json`
+as the strict controller authority.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
