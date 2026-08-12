@@ -2105,6 +2105,30 @@ Do not rebuild a local-stability ensemble, training lineage, or associated
 scale/generation sweep: it is smoother than the hard-min objective but remains
 causally disconnected from robust spawn behavior.
 
+The possibility that total divergence merely penalized desirable along-route
+acceleration was also tested directly. The saved 32-anchor probe was
+reconstructed from the continuous route points and the first six policy
+features, reproducing the original total-expansion statistics exactly. Each
+perturbed sample was then phase-resynchronized to the nearest nominal position
+within plus or minus 32 ticks, and position/velocity error was projected onto
+the two axes transverse to the matched route tangent. Transverse expansion did
+not contract: its median was `42.0940`, p75 `807.835`, p90 `1128.685`, and
+maximum `3959.33`; 23 of 32 exceeded 10x. The median absolute normalized
+terminal transverse error was `0.14193` and p90 `4.61521`.
+
+One predeclared density check collected 80 matched 128-tick policy-prefix
+rollouts over episode ticks 0--1963 with the same bounded 0.5-Source-unit
+position perturbation. After the same phase quotient, median transverse
+expansion was `16.8208`, p90 `1116.36`, and 49 of 80 exceeded 10x; three
+perturbed continuations reset inside 128 ticks. Instability was not one early
+zero-margin segment: every 200-route-sample bin after route 200 contained at
+least half its samples above 10x, with additional broad high-expansion regions
+through routes 600--1199 and 1400--1754. The first above-10x sample was already
+route 44. Treat this as rejection of orbital/transverse local stability, not as
+a reason to weight individual ramps. The authority is not a robust stabilizing
+feedback law even after quotienting phase, so no local contraction objective
+or anchor-resampling variant is justified for this lineage.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
