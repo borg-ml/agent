@@ -259,20 +259,20 @@ Set `native_yaw_correction: true` only for a full-episode bounded corrective
 probe after phase tracking is exhausted. `policy.compare-native` evaluates a
 small yaw-offset set around the authentic UserCmds in a separate authoritative
 CPU world, retains zero yaw as a candidate, and reports the result under
-`closed_loop.yaw_corrected_native_commands`. A reset counts as terminal only
-when its pre-teleport position and velocity are both within the configured
-authentic end-state radii and it occurs within the end slack. The defaults are
-64 Source units, 64 Source units/second, and 2 ticks. Every earlier floor or
-teleport reset remains a failure.
+`closed_loop.yaw_corrected_native_commands`. Its historical demonstration-end
+diagnostic accepted a reset only when pre-teleport position and velocity were
+within the configured partial-POV end-state radii and end slack. Those defaults
+were 64 Source units, 64 Source units/second, and 2 ticks. This is not a map
+completion test; every earlier floor or teleport reset remains a failure.
 
 On Utopia, a 32-tick horizon with 8-tick control blocks and yaw candidates
-`[-8,-4,-2,0,2,4,8]` completed at demo tick 4195. Its pre-teleport position
-error was `22.52` Source units; 121 of 495 decisions used a nonzero yaw and the
-search evaluated 110,404 candidate ticks. This proves a small bounded control
-correction can carry the authoritative Surf Lab world through the full route.
-It still uses the authentic commands and future position/velocity targets, so
-treat it as corrective-label generation—not as schedule-free controller
-parity. Distill the corrections and rerun without future-state access.
+`[-8,-4,-2,0,2,4,8]` reached the partial demo's final reset at tick 4195. Its
+pre-teleport position error was `22.52` Source units; 121 of 495 decisions used
+a nonzero yaw and the search evaluated 110,404 candidate ticks. This proves a
+small bounded control correction can reproduce that recorded partial route,
+not that it completes Utopia. It still uses authentic commands and future
+position/velocity targets, so treat it as corrective-label generation—not as
+schedule-free controller parity.
 
 On the calibrated Utopia user demo, exact commands across 1,183 independent
 packet intervals and 3,942 simulated server ticks produced mean endpoint error
@@ -292,8 +292,8 @@ Fitting the Utopia MPC corrections into the existing 128-wide neural head did
 not materially improve the continuous route, whether the authentic and
 corrective examples were combined or the corrective labels were used alone.
 The corrective-only nearest-state v6 controller instead reproduced the MPC
-trajectory in an independent continuous rollout: it completed at demo tick
-4195 with no failure reset and `22.52` Source-unit terminal position error.
+trajectory in an independent continuous rollout: it reached the partial demo's
+final reset at tick 4195 with `22.52` Source-unit end-position error.
 Its artifact contains 3,955 state-memory samples and zero scheduled actions;
 runtime prediction reads only the current simulated state. This demonstrates
 that the corrected trajectory can be distilled out of the future-state MPC,
@@ -2668,33 +2668,39 @@ promotion remains outstanding, and the first 2,048-tick playable audit looped
 without touching/logging the terminal teleport trigger. Keep s8412 as the
 strict robustness authority until those checks pass.
 
-Surf commit `3389b48` closes that evaluation ambiguity with an opt-in
-`natural_completion` mode for geometric CPU comparison and ROCm collection.
-The old route-state gate remains available as a diagnostic, but natural mode
-continues through it and accepts completion only when the current player hull
-touches a teleport trigger while position and velocity are both within the
-same 64/64 finish bounds used by the playable viewer. Under this stricter CPU
-audit, s8439 passes the route gate at tick 2002, then hits nonterminal teleport
-trigger 57 at tick 2134 and fails. A 2,300-tick playable run reproduces the
-same tick, trigger index, position `[-1617.2341,1074.2770,4338.1099]`, and
+Surf commit `3389b48` introduced an opt-in historical `natural_completion`
+mode for geometric CPU comparison and ROCm collection. That first version used
+the partial-POV endpoint and a 64/64 position/velocity gate; both assumptions
+are superseded below. It nevertheless established that s8439 hits nonterminal
+teleport trigger 57 at tick 2134 and fails. A 2,300-tick playable run reproduces
+the same tick, trigger index, position `[-1617.2341,1074.2770,4338.1099]`, and
 velocity `[100.7057,-1618.4058,268.1823]`. This is exact playable/shared-core
-failure parity, not completion parity. The natural ROCm path compiles and has
-a trigger/no-trigger contract test; run that test and the next search only
-after the renderer is closed.
+failure parity, not completion parity.
 
-Surf commit `1f1181c` fixes a deeper endpoint error discovered by the playable
-audit. The 1,969-point geometric route ends at the first interpolation-safe
-supervision boundary (demo tick 2208), while the same authentic run continues
-through three more supervision segments and reaches its terminal teleport at
-demo tick 4195. Natural CPU comparison and playable finish detection now share
-that final pre-teleport reference; natural ROCm collection rejects any policy
-whose embedded route does not span the full run. Therefore s8439 was never a
-map-completion candidate, even under a trigger-aware interpretation. A CPU-only
-diagnostic that preserved its exact first 1,969 route points and appended the
-complete training-only teacher suffix avoided trigger 57, survived 4,760 ticks,
-and reached route index 2,114 of 3,955 (`53.64%`) without resetting. This is
-evidence to rebuild training on the complete route before changing the actor to
-a recurrent architecture; the scaffold is not a trained or promotable policy.
+Surf commit `1f1181c` exposed a deeper endpoint error, but its interpretation
+of the native demo's final reset as map completion was subsequently disproved.
+The user's POV is a partial, failed route and demo tick 4195 is not Utopia's
+finish. Never use a supervision boundary or the final demo pose as a natural
+completion reference.
+
+The independent completed KSF replay is the route and timing authority. Its
+zone bookmarks place the official timer start at replay tick 310 and finish at
+tick 3868 (53.37 seconds); the finish teleport occurs after pre-teleport tick
+3878. A spawn-valid route therefore contains replay frames 0 through 3878, not
+only the already-moving timed span. The user's POV remains the native analog
+command and bounded physics-comparison authority. Exact KSF commands drift in
+the shared native core, so the KSF command stream is not itself physics-parity
+evidence.
+
+Natural completion now requires the independently observed finish trigger and
+position proximity. It intentionally has no terminal-velocity gate: a faster
+valid line must not be rejected for differing from the demonstrator's exit
+velocity. Candidate ranking is lexicographic: completion, earlier completion,
+survival, farther ordered route distance, and earlier attainment of equal
+progress. The demonstrator supplies a route and useful technique, not a pace
+ceiling. The first spawn-valid 64--512--512--6 KSF-route actor reset at tick 469;
+a protected local-residual iteration moved that to tick 512. Both are training
+experiments and remain below the existing clean controller authority.
 
 ## Native policy visualization
 
@@ -2705,12 +2711,12 @@ demo named in the artifact, requires
 `SURF_NATIVE_NETWORK_TRACE` for an authoritative initial state, uses the same
 native-to-policy feature transform as headless validation, and runs the full
 artifact episode across interpolation-only supervision boundaries. A floor or
-nonterminal teleport-trigger contact is logged as a failure and immediately
-restarts from the authoritative initial state. A terminal trigger within 64
-Source units and 64 Source units/second of the authentic finish is logged as
-completion before restarting. It does not copy a replay action schedule into
-the controller. Always select the playable binary explicitly because this
-crate also contains `surf_lab`:
+teleport-trigger contact is logged and the controller restarts from the
+authoritative initial state. The viewer no longer invents a finish gate from
+the partial native demo's endpoint; completion promotion requires an
+independently completed route/finish reference. It does not copy a replay
+action schedule into the controller. Always select the playable binary
+explicitly because this crate also contains `surf_lab`:
 
 ```bash
 cd /absolute/path/to/surf
