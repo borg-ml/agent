@@ -2158,6 +2158,37 @@ route gave tanh route/reset `200/628` versus ReLU `260/555`. Tanh traded some
 progress for survival and neither approached the route-1801 authority, so no
 new activation integration or activation sweep is justified by this bound.
 
+An off-policy critic audit also failed to recover usable first-action credit
+from the route-1801 authority at fixed episode tick 1700. Four 32-rollout
+batches that perturbed 256 successive actions gave held-out Spearman rank
+correlation `0.93799` across transition returns but only `0.07143` across
+trajectory-start returns. Four corrected batches perturbed exactly the first
+action and then resumed the frozen parent: 119 of 124 nonbaseline actions later
+reset, none improved both ordered progress and continuation duration, and the
+critic correlations were `0.94390` for transitions versus `-0.13087` for the
+trajectory starts. No actor update was run and the route-1801 controller was
+unchanged. The route-time scalar can also rank a faster reset above a longer
+continuation, so do not reopen this continuous critic or advantage-weighted
+actor path without a new, independently validated credit-assignment contract.
+
+Shrinking the complete-start robustness disturbances to 1% of the prior audit
+radius did not uncover an ARS direction either. With nine fixed scenarios,
+position noise `0.02` Source units, velocity noise `0.0003`, yaw noise `0.02`
+degrees, eight full-network candidates, `sigma=1e-6`, and one predeclared
+generation, the unchanged authority's worst scenario was already route 241 at
+283 ticks. Every nonzero center trial regressed matched starts and the strict
+hard-min line selected scale zero.
+
+A training-only weakest-half mean was implemented just long enough for the
+matched-seed control. It raised its scalar from `354.1878` to `354.3877` and
+selected `1/1024` of the update, but that center collapsed nominal behavior
+from route 1801/all 2,600 ticks to route 712/reset at tick 731. The statistic
+had excluded the now-better nominal scenario from its weakest half. Strict
+promotion correctly rejected the center, retained exact GPU/host selection
+parity, and exported the unchanged authority. The experimental option and its
+test were removed. Do not replace robust hard-min training with an unconstrained
+lower-tail average or continue this radius, scale, or generation sweep.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
