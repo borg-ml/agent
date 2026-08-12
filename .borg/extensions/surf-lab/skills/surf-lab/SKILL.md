@@ -1912,6 +1912,13 @@ closed-loop sensitivity rather than exporter metadata drift. Do not promote
 any suffix-fit artifact; retain route 1900 as the nominal leader and route 1801
 as the strict perturbation authority.
 
+A final targeted closed-loop use of the route-1901 trace was also negative. A
+one-generation, 256-candidate antithetic output-head search at `sigma=1e-6`
+screened against that guidance while retaining complete-start promotion. None
+of 258 evaluated policies exceeded route 1900; the emitted artifact is tensor-
+for-tensor identical to the input controller. Do not continue this guidance
+path as an unbounded scale or generation sweep.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
