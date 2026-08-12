@@ -1961,6 +1961,49 @@ ordinary phase-free NN, and complete authentic-start plus perturbation
 rollouts remain the only promotion gate. Route 1900 is still only the nominal
 leader; route 1801 remains the bounded-perturbation authority.
 
+That state-feedback formulation was subsequently tested and rejected rather
+than left as speculation. A bounded global-continuation relabeler produced
+deterministic state-dependent first-action targets around the route-1900
+policy's own visited states: 61 of 75 labels changed over the broad
+route-1700--1940 window, and 63 of 80 changed over the dense causal
+route-1876--1940 window. Output-suffix students nevertheless reset and
+regressed to route 1658--1849. The experimental collector and trainer code was
+removed. Keep only the discovered antithetic-state fix: the negative member
+must mirror the continuous policy tracker's previous route position instead
+of inheriting the positive member's position.
+
+Surf route ARS now has an opt-in, training-only policy archive through
+`gpu_route_search_centers`. It retains at most eight ordinary full-policy
+lineages that are not Pareto-dominated by the current authority in survival,
+ordered progress, and continuation fitness; among those, it preserves the
+survival/progress/fitness extremes and fills by novelty in normalized
+progress, survival, and pace. The least-visited retained lineage supplies the
+next generation. This is optimizer state only: it adds no deployed input,
+clock, phase, memory, ramp rule, adapter, or second controller, and strict
+complete-start promotion still exports one stateless NN. A no-prefix smoke
+confirmed that dominated early-reset lineages are discarded rather than kept
+for diversity.
+
+The same audit found and fixed a genuine GPU/host objective mismatch. ROCm
+already tracked the best combined terminal position/velocity approach over a
+trajectory, but `RolloutResult` exposed only final state, so GPU route fitness
+reconstructed terminal error from the last tick while the host used the best
+approach. The rollout ABI now carries the route tracker's best position,
+velocity, and combined terminal errors directly. The installed-demo ignored
+release test verifies shared-core full-rollout parity including those values.
+
+With the corrected objective, a final four-generation, 64-wide, four-center
+prefix-constrained run produced a genuine nominal route-1901 controller. It
+survived all 2,600 ticks, improved pace lag from 142 to 140 and fitness from
+`0.8842321` to `0.8855021`, reproduced every one of 256 branch continuations
+from its exact prefix, and matched GPU/host final selection exactly. It is not
+promoted: under the fixed five-state position/velocity/yaw audit its worst
+case survived 280 ticks to route 226, while the route-1801 perturbation
+authority survived 279 ticks to route 227. Do not call route 1901 robust or a
+new authority, and do not turn this result into another open-ended seed or
+scale sweep. Route 1900 remains the durable nominal leader and route 1801 the
+strict perturbation authority.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
