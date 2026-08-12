@@ -2004,6 +2004,19 @@ new authority, and do not turn this result into another open-ended seed or
 scale sweep. Route 1900 remains the durable nominal leader and route 1801 the
 strict perturbation authority.
 
+Robust multi-center search now ranks and filters its training-only archive by
+each lineage's worst perturbation outcome and the matching robust authority;
+nominal search continues to use nominal outcomes. A four-generation, 64-wide,
+four-center run on perturbation seed 77134 improved that seed's worst case from
+266 ticks/route 176 to 282 ticks/route 218 while preserving nominal route 1901,
+all 2,600 ticks, pace lag 140, fitness `0.8855137`, and exact GPU/host parity.
+This was seed-specific rather than a robust promotion. On the held-out seed
+77133, the candidate survived 280 ticks to route 226, versus 279 ticks to route
+227 for the existing authority, so it failed the strict survival-and-progress
+gate and was rejected. Do not promote or visualize it, and do not continue a
+seed sweep. Route 1900 remains the nominal leader and route 1801 remains the
+bounded-perturbation authority.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
