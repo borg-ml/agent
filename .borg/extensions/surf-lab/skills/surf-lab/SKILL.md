@@ -2574,9 +2574,32 @@ the route-and-survival promotion gate. The exact fit collapsed to route
 471/580 because its rank-60 feature matrix required output weights as large as
 27.8 and was unstable off the sampled path. Do not present any of these
 perturbed or fitted routes as the leader, and do not repeat that installation
-branch. The next useful labels must be on-policy corrective feedback from
-states the controller actually visits, with full-start promotion remaining
-decisive.
+branch.
+
+Surf commit `8e8c513` implements the successful on-policy form. From the
+unchanged `s8368` state at episode tick 1200, a 256-rollout two-block residual
+probe found one intervention that survived all 769 remaining ticks and reached
+route 1664, versus the frozen suffix's route 1332/reset after 170 ticks. That
+intervention is only a causal teacher. The general local-residual distiller
+adds ordinary block-diagonal ReLU capacity, trains it on the 64 corrective
+states with runtime-clamp-aware loss, and forces every output-connected new
+unit below `-1e-4` preactivation on 2,011 protected prefix, fallback, and
+corrected-continuation states. The exported artifact remains one stateless
+64--640--640--6 feed-forward actor; there is no runtime gate, clock, route
+lookup, action schedule, adapter, or intervention.
+
+The resulting unchanged policy
+`utopia-geometric-continuous-exact-s8368-localresidual-t1200-r120-s8381.json`
+is the current clean memoryless leader. Its first 1,200 ticks are byte-identical
+to `s8368`, after which it reaches route 1561 and resets at tick 1585: strict
+gains of +229 route and +215 survival. CPU and ROCm have no feature or raw
+output mismatch across the entire 1,585-tick run. On the same 256 perturbations
+used for the parent audit, median route improves 1329 to 1405, median survival
+1374 to 1582, full-horizon cases rise 63 to 65, and maximum route rises 1896 to
+1940. It improves both route and survival in 156 paired cases and regresses
+both in 41. This is a genuine generalized-network gain, but it does not
+complete the map and therefore has no completion or playable-game parity
+claim.
 
 ## Native policy visualization
 
