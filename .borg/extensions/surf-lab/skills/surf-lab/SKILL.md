@@ -2129,6 +2129,35 @@ a reason to weight individual ramps. The authority is not a robust stabilizing
 feedback law even after quotienting phase, so no local contraction objective
 or anchor-resampling variant is justified for this lineage.
 
+A subsequent teacher audit closed three superficially different escapes from
+that result. The removed route-1900 state-feedback collector had reported 63
+of 80 nonbaseline selections, but only 38 changed the first action; 25 selected
+programs began in a later control block. Eight selected labels also regressed
+either authoritative survival or ordered progress. Across its 32 antithetic
+state pairs, median common-mode action residual was `0.13562` versus median
+odd residual `0.06861`, so the hard argmax labels were not a smooth local
+feedback field.
+
+One bounded trainer projected only pairs where both states strictly improved
+survival and progress onto their odd component. Seventeen of 32 pairs were
+admissible, 11 carried nonzero feedback, and the resulting 22 examples had
+maximum target residual `0.26471`. Fitting only the existing `352..544`
+output suffix moved the old direct-label regression toward the parent, but the
+full fit still reached only route 1862/reset tick 2060 and one predeclared 10%
+trust step reached route 1895/reset tick 2116. Both fail the route-1900
+parent's full 2,600-tick survival. The experimental trainer path was removed;
+do not rebuild the projection as another label-weight or trust-scale sweep.
+
+The complete 3,955-state MPC memory trajectory is also not a usable route
+demonstration. A fresh 544x544 phase-free continuous-route ReLU student fit it
+to movement RMSE `0.01456` and yaw MAE `0.17784` degrees, yet advanced only
+104 samples on its own 3,955-point route, never reached the terminal trigger,
+and ended about 25,211 Source units from the authentic finish after 5,000
+ticks. Finally, a matched activation ablation on the authentic 1,969-state
+route gave tanh route/reset `200/628` versus ReLU `260/555`. Tanh traded some
+progress for survival and neither approached the route-1801 authority, so no
+new activation integration or activation sweep is justified by this bound.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
