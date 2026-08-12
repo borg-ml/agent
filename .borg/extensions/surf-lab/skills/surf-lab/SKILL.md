@@ -2486,6 +2486,32 @@ The diagnostic source was removed. Once the policy's line and velocity differ,
 demonstration actions are not interchangeable by progress alone; any future
 teacher must optimize future state from the actually visited state.
 
+Surf commit `4459402` evaluates the remaining held-exploration credit path.
+The PPO trainer now evaluates one sampled-action likelihood and full suffix
+return at each held-residual block start, excludes deterministic baseline and
+post-exploration rows, and rejects unmodeled AR(1) likelihoods. This is an
+explicit block training surrogate; the exported controller still recomputes
+the same ordinary memoryless network every tick. From the exact nominal
+`scale1e5` episode-tick-800 state with all state perturbations disabled, 256
+32-tick-residual rollouts found a route-976 leader that survived all 256 suffix
+ticks, versus the frozen baseline's route 893/reset after 193 suffix ticks.
+The exact CPU collector reproduced every aggregate and leader result from the
+ROCm batch, providing real nominal control signal rather than displaced-state
+recovery evidence.
+
+That signal still could not cross the complete-start gate through the shared
+output head. An eight-epoch block update at scale `0.1` had late-state KL only
+`2.25e-5` and changed parent-prefix continuous outputs by at most `5.69e-4`,
+yet reset at route 640/743 ticks. One evidence-based `0.001` backtrack had KL
+`3.59e-11` and an approximately `5.7e-6` maximum prefix action change, but
+reset even earlier at route 634/733 ticks. Reject both artifacts and retain
+unchanged `scale1e5`. Held exploration discovers valid future control, but
+neither ordinary per-tick PPO, elite regression, nor block-level credit can
+install it through this globally shared head without leaving the brittle early
+attractor. Do not line-search this direction again; the next update needs a
+structural prefix-preservation or stable feedback mechanism that remains one
+phase-free deployed network.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
