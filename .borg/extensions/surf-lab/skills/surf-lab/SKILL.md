@@ -2017,6 +2017,22 @@ gate and was rejected. Do not promote or visualize it, and do not continue a
 seed sweep. Route 1900 remains the nominal leader and route 1801 remains the
 bounded-perturbation authority.
 
+Surf commits `a320a0b` and `c2479d5` close a stricter robustness loophole.
+Robust route promotion now requires scenario-by-scenario non-regression against
+the authority, not merely a better aggregate worst case, and may train on
+several fixed common-random-number antithetic batches with the nominal start
+deduplicated. Expanded robust rollouts are launched in at most 256 GPU blocks,
+rounded down to whole scenario groups; this preserves result order and avoids
+the GPU hang seen when 64 policies and nine starts were launched as one
+576-block kernel.
+
+The nine-scenario smoke showed that the nominal route-1901 controller regresses
+six matched perturbation starts even though its aggregate worst result looks
+better. A single chunked four-generation, 64-wide run then screened 256 network
+candidates on the same nine starts, retained exact GPU/host selection parity,
+and found no strict improvement over route 1801. Keep route 1801 as the robust
+authority and do not turn this result into a perturbation-seed or scale sweep.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
