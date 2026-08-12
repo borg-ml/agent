@@ -2278,6 +2278,30 @@ clean committed tree. Do not reopen route-wide full-network mean-arc ARS as an
 anchor-count, sigma, or generation sweep; route 1801 remains the strict clean
 authority and no NN completes Utopia.
 
+A bounded action-space reachability audit then tested whether the broad
+lower-tail deficit was merely a locally wrong NN action. Sixteen anchors were
+selected evenly by route order from the bottom quartile of the existing 512
+authentic broad-radius rollouts. From each unchanged injected state, 256
+policy-anchored programs changed only the first three 16-tick blocks of a
+128-tick suffix: yaw by at most 4 degrees, either analog movement component by
+at most `0.25`, or jump/duck state. Every program was rerun by the scalar shared
+Source core and ranked by survival, then the same controller-owned normalized
+arc used in collection. The frozen baseline reproduced the archived values
+within `1.34e-8`; each selected result also matched the GPU route index, reset
+status, and executed ticks exactly.
+
+The bounded best improved all 16 anchors and rescued both baseline resets, but
+did not restore authentic pace. Mean normalized arc rose from `0.15875` to
+`0.33135` and median from `0.11427` to `0.29531`; only 3 of 16 reached `0.5`,
+1 reached `0.8`, and none reached `1.0`. Twelve of 16 winners used a jump or
+duck change. Thus useful local residuals exist, including binary controls, but
+the broad slow-tail states are mostly beyond a short bounded correction that
+can regain the unperturbed demonstration's pace. Do not treat normalized arc
+`1.0` as an attainable per-anchor target under the full 32-Source-unit,
+20%-velocity, 20-degree-yaw injection radius, or interpret this as a reason for
+another output-head fit. The diagnostic trained or promoted nothing, its
+temporary source was removed, and route 1801 remains the authority.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
