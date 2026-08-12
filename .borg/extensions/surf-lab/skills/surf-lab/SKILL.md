@@ -2329,14 +2329,18 @@ and `0.794` degrees; among the tracked lower quartile they were `0.394` and
 `1.479` degrees. The weights therefore use the hidden tracker materially.
 
 A fresh paired exact-CPU rollout tested the causal effect without retraining.
-The tracked control reproduced 466/512 survivors, mean normalized arc
-`0.65974`, median `0.76925`, p25 `0.38370`, p90 `1.04049`, and 234/512 at least
-`0.8`. Stateless global projection improved those aggregates to 469/512,
-`0.69307`, `0.81561`, `0.41563`, `1.06472`, and 272/512. It improved 304 paired
-starts, regressed 206, rescued 13 resets, and introduced 10; among the original
-worst 128 starts it improved 85 and raised mean arc from `0.14299` to
-`0.21914`. This is evidence that accumulated route lag hurts broad recovery,
-not evidence that the existing weights are stateless-compatible.
+The first analysis incorrectly treated controller-owned projection increments
+as the promotion metric; because globally nearest projection can jump forward,
+its apparent mean arc of `0.69307` was optimistic. Rescoring both 512-rollout
+batches with the external ordered-route authority gives the tracked control
+466/512 survivors, mean normalized arc `0.65974`, median `0.76925`, p25
+`0.38370`, p90 `1.04049`, and 234/512 at least `0.8`. Stateless projection gives
+469/512 survivors, mean `0.64624`, median `0.73451`, p25 `0.36056`, p90
+`1.04615`, and 230/512 at least `0.8`. Paired mean and median changes are
+`-0.01350` and `-0.01147`: 158 starts improve, 354 regress, 13 resets are
+rescued, and 10 are introduced. Among the tracked worst 128 starts, stateless
+mean rises from `0.14299` to `0.18564`, but only 37 improve while 91 regress.
+The small survival gain is real; broad authoritative route pace regresses.
 
 The complete-start gate rejects stateless projection as a drop-in change. Over
 1,968 ticks it reached route 1820 rather than 1801 and survived, but over the
@@ -2350,6 +2354,40 @@ with a separately versioned stateless route observation and retrain it from the
 authentic commands; do not silently reinterpret existing
 `native_route_continuous_v3` artifacts or promote the farther-but-resetting
 unchanged-weight rollout.
+
+Surf commit `db36848` implements that permanent contract as
+`native_route_stateless_v4`. It computes globally nearest continuous polyline
+projection solely from the current observation in the shared Rust, C++, and
+HIP feature cores; carries no route history in `PolicyRuntime`; and keeps
+external ordered-route scoring authoritative. The corrective and PPO trainers
+admit the schema explicitly. A behavioral invariant confirms that identical
+current observations produce identical progress and features regardless of
+prior runtime state. The full ROCm test suite passes (132 tests passed, 7
+ignored), the release worker builds, and focused Python static checks pass.
+
+A fresh 544x544 ReLU student trained from all 1,969 authentic usable commands
+reached only route 113 and reset at absolute tick 526 after 285 trajectory
+ticks. One stateless DAgger relabel pass improved this to route 179, reset tick
+714, and 473 trajectory ticks; a second pass reached route 195 but regressed to
+290 ticks, and one predeclared `0.1` update scale also regressed, so neither was
+promoted. The first-pass artifact has exact CPU/GPU agreement for its nominal
+474 transitions and 8x64 standard perturbations. On 32x128 perturbations,
+3,999/4,096 transition keys match through termination; 31/32 rollouts remain
+effectively exact, while one tiny step-47 floating-point drift compounds into a
+different chaotic trajectory. This is bounded shared-core parity, not broad
+trajectory identity.
+
+A separately labeled migration candidate copies the route-1801 network tensors
+byte-for-byte into `native_route_stateless_v4` (tensor SHA-256
+`ca6ffbfe34f02717abcf8844c6436333b127cd09a4927d66a93dbae3b13195c8`). It is
+the strongest strict-contract stateless candidate so far, but still fails the
+complete-start gate at route 1853/reset tick 2329 after 2,088 trajectory ticks.
+A one-generation, four-candidate unified ROCm audit at sigma `1e-6` found no
+promotable update. Its final host audit exactly matches GPU at 2,089 executed
+episode ticks, furthest reference tick 2093, progress tick 2022, and zero
+terminal position/velocity error deltas. Preserve the stateful route-1801
+artifact as the strict perturbation benchmark, but do not call either stateless
+candidate complete or robust.
 
 ## Native policy visualization
 
