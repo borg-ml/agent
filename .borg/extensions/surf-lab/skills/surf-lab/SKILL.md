@@ -2302,6 +2302,19 @@ can regain the unperturbed demonstration's pace. Do not treat normalized arc
 another output-head fit. The diagnostic trained or promoted nothing, its
 temporary source was removed, and route 1801 remains the authority.
 
+The binary-control count is not causal evidence by itself. The diagnostic
+family put jump or duck mutations in 160 of 256 programs (`62.5%`), so seeing
+one in 12 of 16 winners has one-sided chance probability about `0.223`. A
+nominal 1,968-tick output audit also found zero jump and zero duck activations;
+their minimum margins from the `0.5` runtime threshold were `0.40442` and
+`0.44263`. This is faithful to the source rather than a missing learned class:
+all 3,953 usable commands across the authentic reset-safe segments contain
+zero jump and zero duck labels. Surf commit `e74346b` adds those reusable class-
+coverage counts to `native.inspect`. Do not add binary mutations to the native
+recovery generator or run a matched binary search solely from the 12-of-16
+statistic; the observed flags are off-demonstration recovery actions under
+artificial state injection, not evidence for the nominal completion failure.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
