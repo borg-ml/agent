@@ -1849,6 +1849,38 @@ profile-calibrated `sigma=0.25` probe retained 29 full-span survivors, but the
 best reached only route 1682 and the fastest resetting candidate only route
 1786. This earlier branch does not justify a wide generation.
 
+Surf commits `e7945f0` and `47d84ba` then made promising branch directions
+usable without weakening promotion. Direction-specific scale backtracking
+retries a bounded set of coherent frontier directions down to a zero-safe
+update, and the training center may follow a complete-start candidate beyond
+the authority even when that candidate is not yet promotable. Exact searches
+from ticks 1700 and 1200 showed that merely shrinking the previously promising
+directions did not recover survival, but a three-generation 64-wide search from
+tick 1700 produced the first genuine nominal improvement: route 1900 with all
+2,600 ticks survived, pace lag 142, and fitness `0.8842321`. GPU and host
+shared-core rollouts matched exactly, and a hidden playable audit reached the natural
+rollout boundary. Visually it carries the transfer and strikes the front of the
+next ramp; this is a geometric near miss, not the earlier free-fall corridor
+artifact. The nominal artifact is
+`utopia-user-native-route-continuous-capacity256-true-branch1700-suffix352-s1-p64-survival-frontier-center-g3-v1.json`.
+
+Do not call route 1900 robust or complete. Under the bounded five-scenario
+position, velocity, and yaw audit, its worst case reached route 213 for 281
+ticks versus route 214 for 282 ticks from the old route-1801 authority. A
+robust-aware repair search found no acceptable replacement. Route 1900 is the
+verified nominal/playable leader; route 1801 remains the strict perturbation
+authority until robustness improves.
+
+Surf commit `47e8594` preserves a farther full-survival training center instead
+of letting a later resetting endpoint overwrite it, and permits prefix-
+conditioned route ARS to emit that center as an explicitly resume-only artifact.
+The resulting route-1903 checkpoint survives all 2,600 ticks but regresses to
+pace lag 153 and fitness `0.8825033`, so it is not promoted. A bounded local
+repair at `sigma=0.1` sampled resetting trajectories as far as route 2180 but
+found no candidate that advanced beyond route 1900 while preserving its pace,
+fitness, and survival. Retain route 1903 only as a search center and avoid blind
+additional sweeps of this branch.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
