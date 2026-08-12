@@ -1919,6 +1919,48 @@ of 258 evaluated policies exceeded route 1900; the emitted artifact is tensor-
 for-tensor identical to the input controller. Do not continue this guidance
 path as an unbounded scale or generation sweep.
 
+The follow-up audit rejected automatic backward-restart ranking before it was
+made into another optimizer. The same 32 ordinary full-network antithetic
+directions were evaluated from the authentic start and from four geometric
+lookbacks behind the route-1900 center's own last-progress tick. Paired
+advantage correlations back to the authentic start were `0.0183`, `0.00049`,
+`0.2833`, and `-0.3841`, with sign agreement `53.1%`, `59.4%`, `59.4%`, and
+`34.4%`. Local branch gains therefore do not reliably select spawn gains. The
+diagnostic source was removed after this decision; do not build multi-anchor
+ranking or run a scale sweep from this result.
+
+Two function-preservation alternatives also failed without producing neural
+progress. Mixing all parent runtime actions with the 32 genuine correction
+actions reached low supervised loss but reset from spawn at tick 699. A
+training-only 64-unit ordinary ReLU capacity fit was then forced exactly
+inactive through the state preceding the correction. Its first deployable fit
+reached only route 1891 and reset at tick 2339; projecting the exact inactivity
+constraint after every optimizer step found no unit that could remain inactive
+on the complete prefix and activate on the correction/tail. Both experimental
+trainer edits were removed. Do not tune weights, margins, widths, or epochs on
+these formulations.
+
+The apparent conflict is not a Python/runtime feature mismatch. On 1,969 exact
+route-1900 states, the Python continuous-route features match the shared
+runtime after the two intentionally incomplete startup-history rows with
+maximum error `6.71e-7` and no row above `1e-3`. A map-general representation
+probe confirmed high local action aliasing around the corrective states, but
+replacing the four demonstration-index yaw-lookahead fields offline with
+policy-velocity-time future lateral/elevation channels did not reduce it:
+10-neighbor movement disagreement changed from `72.5%` to `74.0%`, and mean
+k-neighbor movement error from `0.1492` to `0.1512`. Do not add that route
+schema or pay the CPU/ROCm integration cost.
+
+The remaining clean direction is state-feedback data, not another branch
+score, parameter trust scale, capacity graft, or Utopia-specific sensor. Build
+the next training batch by relabeling a perturbed neighborhood of the policy's
+own earlier visited states with bounded receding-horizon teacher actions,
+replacing conflicting parent labels in that causal neighborhood rather than
+adding one clock-like corrective block. The deployed authority remains one
+ordinary phase-free NN, and complete authentic-start plus perturbation
+rollouts remain the only promotion gate. Route 1900 is still only the nominal
+leader; route 1801 remains the bounded-perturbation authority.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
