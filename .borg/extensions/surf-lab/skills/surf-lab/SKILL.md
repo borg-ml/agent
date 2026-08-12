@@ -2682,6 +2682,20 @@ failure parity, not completion parity. The natural ROCm path compiles and has
 a trigger/no-trigger contract test; run that test and the next search only
 after the renderer is closed.
 
+Surf commit `1f1181c` fixes a deeper endpoint error discovered by the playable
+audit. The 1,969-point geometric route ends at the first interpolation-safe
+supervision boundary (demo tick 2208), while the same authentic run continues
+through three more supervision segments and reaches its terminal teleport at
+demo tick 4195. Natural CPU comparison and playable finish detection now share
+that final pre-teleport reference; natural ROCm collection rejects any policy
+whose embedded route does not span the full run. Therefore s8439 was never a
+map-completion candidate, even under a trigger-aware interpretation. A CPU-only
+diagnostic that preserved its exact first 1,969 route points and appended the
+complete training-only teacher suffix avoided trigger 57, survived 4,760 ticks,
+and reached route index 2,114 of 3,955 (`53.64%`) without resetting. This is
+evidence to rebuild training on the complete route before changing the actor to
+a recurrent architecture; the scaffold is not a trained or promotable policy.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
