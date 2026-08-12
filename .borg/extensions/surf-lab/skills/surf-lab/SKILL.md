@@ -2543,10 +2543,40 @@ Continuous inference, action decoding, BSP observation, and Source movement
 now run through one shared C++/HIP core. An exact full-start audit found every
 one of the 64 features and all six raw outputs bit-identical between CPU and
 ROCm for all 1,161 executed ticks; both reset at route 1123. Retain
-`utopia-geometric-continuous-authentic-s8355.json` as the current strict
+`utopia-geometric-continuous-authentic-s8355.json` as the initial strict
 memoryless architecture authority, not as a completion. Future robustness and
 closed-loop optimization should operate on this geometric actor rather than
 returning to the pose-only or 324-way discrete heads.
+
+Surf commit `c6f49e7` removes the remaining command-label quantization from
+that path. Continuous authentic GPU rollouts now preserve native analog
+movement, yaw delta, pitch, jump, and duck while retaining policy-state
+features. Exact authentic actions complete all 1,969 simulated ticks and reach
+route 1968, versus route 1904 for their quantized form. Training a new actor
+from scratch on the lower-loss labels still collapsed at route 103, confirming
+that offline fit alone does not solve covariate shift. A single output-head
+epoch initialized from `s8355`, however, produced the unchanged policy
+`utopia-geometric-continuous-authentic-exact-anchored-output-s8368.json`. It
+reaches route 1332 and resets after 1,370 ticks: a strict +209 route and +209
+survival improvement. CPU and ROCm traces are bit-identical in every feature
+and raw output for the entire run. This is the current clean memoryless leader,
+but it does not complete the map. A second identical epoch regressed and is
+rejected.
+
+Across 256 small full-start perturbations of `s8368`, the median route was
+1329, the maximum route was 1896, and 63 rollouts survived the full horizon;
+none completed. A separate 64-tick held-residual batch found a route-1939
+full-horizon trajectory, 29 route samples short of the reference, but that is
+training-only action intervention rather than an autonomous policy. Global
+PPO, an approximately fitted state-local capacity bank, exact least-squares
+imitation of the lucky trajectory, and PPO restricted to that bank all failed
+the route-and-survival promotion gate. The exact fit collapsed to route
+471/580 because its rank-60 feature matrix required output weights as large as
+27.8 and was unstable off the sampled path. Do not present any of these
+perturbed or fitted routes as the leader, and do not repeat that installation
+branch. The next useful labels must be on-policy corrective feedback from
+states the controller actually visits, with full-start promotion remaining
+decisive.
 
 ## Native policy visualization
 
