@@ -2476,6 +2476,16 @@ The source was removed after the result. Therefore do not add a factorized
 runtime head or widen the discrete branch: restore the stronger fully
 phase/history-free continuous controller as the active architecture baseline.
 
+Progress-aligned demonstration relabeling is also closed for this discrete
+parent. A temporary exact-CPU diagnostic preserved the frozen policy until
+episode ticks 400, 500, 588, 650, 700, 719, or 750, then quantized the authentic
+command at the controller's externally scored ordered-route index. The best
+handoffs reached routes 619--620 and tied at most 836 survival ticks, below the
+parent's route 621/836; using route alignment from spawn stalled at route 102.
+The diagnostic source was removed. Once the policy's line and velocity differ,
+demonstration actions are not interchangeable by progress alone; any future
+teacher must optimize future state from the actually visited state.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
