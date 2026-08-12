@@ -2601,6 +2601,50 @@ both in 41. This is a genuine generalized-network gain, but it does not
 complete the map and therefore has no completion or playable-game parity
 claim.
 
+A second protected local residual at episode tick 1400 produced the ordinary
+64--768--768--6 actor
+`utopia-geometric-continuous-localresidual-g2-t1400-r128-s8387.json`. It
+survives the complete 1,969-tick nominal horizon and reaches route 1945; an
+extended 2,048-tick rollout reaches the final ordered route sample 1968 without
+resetting, but misses the terminal state at 101.98 Source units of position
+error and 111.31 units/second of velocity error. It was the next clean leader,
+not a completion.
+
+Surf commit `2d59140` corrects the terminal velocity reference used by route
+scoring. At an interpolation-only terminal tick, the old fallback divided a
+held sparse pose displacement by one tick and created an approximately doubled
+vertical velocity. The scorer now uses the latest authoritative decoded
+network state at or before the requested tick. Under this corrected target,
+exact authentic commands themselves end 91.52 Source units from the terminal
+position and therefore miss the strict 64/64 completion gate in the bounded
+Surf Lab reconstruction; do not optimize against or cite the older terminal
+error receipts.
+
+Surf commit `de04cac` lets the local-residual distiller include unmodified
+full-start parent-policy perturbation trajectories in its exact inactive-state
+set. This closes a real robustness hole: a nominally prefix-inactive capacity
+bank could previously activate early on nearby states. The unprotected s8402
+candidate improved the clean terminal approach but regressed broad robustness
+and is rejected. Protecting eight bounded trajectories plus the one observed
+survival counterexample yielded
+`utopia-geometric-continuous-localresidual-g3p2-terminal-t1800-r58-protected9-s8412.json`,
+one stateless 64--896--896--6 ReLU actor with 73 output-connected new units and
+no runtime gate, phase, memory, schedule, or intervention.
+
+The unchanged s8412 actor is the current clean leader. At 1,969 ticks it
+survives and reaches route 1946, one sample beyond s8387. At 2,048 ticks it
+reaches route 1968 without resetting, with terminal position/velocity errors
+98.66/110.80, but still does not complete. CPU and ROCm finish all 2,048 ticks
+at the bit-identical position `[-1724.4895, 2602.6252, 4362.2510]` and velocity
+`[359.8335, -392.7907, -783.9741]`; their derived velocity-error norm differs
+only by `7.6e-6` from reduction order. Across the original 256 perturbations,
+there are no paired survival losses, median route and survival are unchanged,
+and route outcomes are 21 wins, 8 losses, and 227 ties with mean delta +0.918.
+On a held-out 256-start seed there are again no survival losses, 24 wins, 6
+losses, and 226 ties with mean delta +0.496; the route-1945-or-better count
+improves from 20 to 21. This is robust neural progress and shared-core parity,
+not terminal completion or playable-game completion parity.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
