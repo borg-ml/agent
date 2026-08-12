@@ -2189,6 +2189,49 @@ parity, and exported the unchanged authority. The experimental option and its
 test were removed. Do not replace robust hard-min training with an unconstrained
 lower-tail average or continue this radius, scale, or generation sweep.
 
+A separate route-wide local-capacity audit rejects the stronger claim that the
+route-1801 authority is only a measure-zero replay trajectory. Two independent
+256-rollout batches sampled authentic anchors uniformly over episode ticks
+0--1840, applied position perturbations bounded by 32 Source units, velocity
+perturbations bounded by 20%, and yaw perturbations bounded by 20 degrees, then
+ran the frozen policy for 128 ticks. It survived 466 of 512 rollouts (`91.02%`).
+Monotonic Source-unit arc distance normalized by the authentic 128-tick arc had
+median `0.77115`, mean `0.66001`, p25 `0.38396`, and p90 `1.04099`; 235 of 512
+reached at least `0.8`, including 234 without reset. This is genuine broad
+local competence, but its lower tail is far below what repeated full-route
+composition requires. Do not use this evidence to justify a random narrow-net
+restart.
+
+The deficit was localized rather than uniform. Across 16 equal route-time
+bins, the weakest survival regions were ticks 1150--1264 (`71.88%`),
+1495--1609 (`77.50%`), and 1035--1149 (`78.05%`); ticks 1495--1609 also had
+median normalized arc only `0.42932`. Several other bins survived 100% with
+median arc as high as `0.96550`. A route-wide mean normalized-arc objective is
+therefore the remaining optimizer-level discriminator: it rewards speed
+directly and truncates on reset, unlike the rejected contraction objective.
+Only if that matched task underfits should contact-normal or generic hull-sweep
+features be integrated as a representation test; do not weight named Utopia
+regions or add per-ramp logic.
+
+Surf commit `2a14ca1` fixes a CPU/GPU audit bug exposed by these anchors. The
+GPU initialized continuous-route displacement history from the injected state,
+while the CPU `policy.collect-native-ppo` path left it empty and consumed the
+first post-step position as history. Initial features, outputs, and actions
+were identical, but the resulting one-sample route split changed the second
+action and compounded into reset mismatches. The CPU collector now initializes
+the same route position before its first suffix tick, and the installed-data
+parity test protects an authentic empty-history anchor.
+
+After the fix, a matched 32-anchor, 128-tick audit at the standard bounded
+radius (2 Source units, 3% velocity, 2 degrees yaw) produced the same 3,947
+transition keys, route progress, network outputs, actions, rollout lengths,
+and three resets on CPU and GPU. Maximum feature delta was `9.31e-10` and
+maximum reward delta `1.22e-4`. At the much larger 32-unit/20%/20-degree
+capacity radius, all 4,096 transition keys, route progress, and reset outcomes
+still matched; maximum feature/output/action delta was `0.0022765` and maximum
+reward delta `2.44e-4`. Treat the standard radius as exact shared-core parity
+and the larger radius as bounded diagnostic agreement.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
