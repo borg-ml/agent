@@ -2668,6 +2668,20 @@ promotion remains outstanding, and the first 2,048-tick playable audit looped
 without touching/logging the terminal teleport trigger. Keep s8412 as the
 strict robustness authority until those checks pass.
 
+Surf commit `3389b48` closes that evaluation ambiguity with an opt-in
+`natural_completion` mode for geometric CPU comparison and ROCm collection.
+The old route-state gate remains available as a diagnostic, but natural mode
+continues through it and accepts completion only when the current player hull
+touches a teleport trigger while position and velocity are both within the
+same 64/64 finish bounds used by the playable viewer. Under this stricter CPU
+audit, s8439 passes the route gate at tick 2002, then hits nonterminal teleport
+trigger 57 at tick 2134 and fails. A 2,300-tick playable run reproduces the
+same tick, trigger index, position `[-1617.2341,1074.2770,4338.1099]`, and
+velocity `[100.7057,-1618.4058,268.1823]`. This is exact playable/shared-core
+failure parity, not completion parity. The natural ROCm path compiles and has
+a trigger/no-trigger contract test; run that test and the next search only
+after the renderer is closed.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
