@@ -2033,6 +2033,29 @@ candidates on the same nine starts, retained exact GPU/host selection parity,
 and found no strict improvement over route 1801. Keep route 1801 as the robust
 authority and do not turn this result into a perturbation-seed or scale sweep.
 
+Surf commit `52bf420` enables the same robust contract for ordinary full-network
+ARS without a prefix. Every antithetic direction now starts at the authentic
+spawn, mutates all core weight matrices, sees the identical fixed
+common-random-number scenario set, and is scored for the full requested rollout
+horizon. Promotion still requires nominal improvement, scenario-by-scenario
+non-regression, strict worst-case improvement, and exact final GPU/host parity;
+the exported controller remains one phase-free feed-forward network. The first
+smoke caught an inherited progress-based 2,155-tick curriculum horizon before
+the result was used; the corrected receipt reports route-index-zero starts and
+the full 2,600-tick horizon.
+
+One corrected eight-candidate smoke and one 32-candidate generation used nine
+complete-start scenarios at full-network sigma `0.001`. The larger run had real
+paired signal (`1.95247` RMS), but 13 of 16 directions were pinned to the same
+worst failure at tick 266; the other three gained only a few worst-case survival
+ticks while destroying nominal progress. Every accumulated-update backtrack
+through scale `0.0009765625` regressed matched scenarios, so scale zero was
+selected. The unchanged route-1801 authority survived all 2,600 nominal ticks,
+and its final GPU/host route, progress, timing, and terminal errors matched
+exactly. Do not promote either diagnostic artifact or repeat this worst-case
+full-network sigma/seed search unchanged; the result identifies a worst-scenario
+plateau and globally sensitive trust step, not a controller gain.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
