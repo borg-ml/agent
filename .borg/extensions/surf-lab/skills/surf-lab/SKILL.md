@@ -2431,6 +2431,51 @@ on-policy relabel batch also regressed to route 178/268 ticks. Do not repeat
 these teacher-cloning or contractive-weight variants without a new feedback
 objective.
 
+The subsequent discrete action-value branch remains one genuinely memoryless
+feed-forward controller, but did not surpass the continuous clean authority.
+It uses a 64-feature stateless route/BSP observation, a 324-action Cartesian
+movement/yaw/button output, and the shared CPU/HIP Source core. A distributional
+value baseline reset at route 590 after 695 ticks. Exact convex output-neuron
+constraints then installed four verified recovery blocks while preserving each
+complete prefix and frozen continuation, reaching route 621 after 836 ticks
+with exact CPU/GPU agreement. This proves that an ordinary shared network can
+represent useful closed-loop corrections without runtime phases or adapters;
+it does not establish completion or beat the route-1134 fully memoryless
+continuous controller.
+
+Bounded searches close that local discrete lineage. At fixed parent anchors
+588 and 719, exhaustive base-8 enumeration evaluated all 4,096 four-block,
+16-tick policy-ranked programs. The earlier anchor had eight exact ties and
+the later anchor had 173; neither space contained a strict route-plus-survival
+gain. Near-policy categorical sampling at a calibrated temperature of `0.01`
+tested 256 one-tick-control trajectories per anchor. All 256 late-anchor
+rollouts tied; 227 earlier-anchor rollouts tied and 29 regressed. No strict
+winner existed. Surf commits `b3ecce0` and `3816008` make both finite probes
+reproducible and persist summary-only rollout outcomes without changing the
+deployed controller.
+
+The training-only IQL critic also fails as a controller. Exporting its target-Q
+network through the same runtime selected almost exclusively neutral action 40,
+stalled at route 103 for the full episode, and did not reproduce demonstrated
+control. A 10x actor learning-rate probe did cross argmax boundaries, but its
+first update changed 57 actions on the parent's own fixed states, including
+episode ticks 14, 15, 87, and 369. Closed loop gained only two route samples
+while losing 14 survival ticks; later updates collapsed to routes 389--484.
+Applying only its proposed tick-588--651 actions after an exact parent prefix
+tied route 621 and reset three ticks earlier. Surf commit `1d7bc18` retains the
+critic export diagnostic. Do not repeat this IQL/AWR direction without an
+explicit conservative support constraint and a critic that passes greedy
+closed-loop control.
+
+A temporary factorized action-regression head tested whether flat 324-class
+sparsity was the bottleneck. It learned shared movement/yaw geometry, attaining
+98.9% validation yaw accuracy within one adjacent bin, and compiled exactly
+back into ordinary 324 runtime logits. Across all 40 checkpoints, however, the
+best exact full-start rollout reached route 495/516 ticks, below route 621.
+The source was removed after the result. Therefore do not add a factorized
+runtime head or widen the discrete branch: restore the stronger fully
+phase/history-free continuous controller as the active architecture baseline.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
