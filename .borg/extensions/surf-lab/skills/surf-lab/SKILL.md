@@ -2410,6 +2410,27 @@ benchmark, but retain `utopia-user-native-clean-vnext-scale1e5.json` at
 reference tick 1134/reset episode tick 993 as the fully phase/history-free
 controller authority. None completes or is robust.
 
+Two high-signal memoryless teachers failed to close that gap. First, an exact
+1,969-tick rollout of the near-complete phase-gated v7002 teacher was relabeled
+with its actual actions rather than authentic clock-aligned commands. Its
+stateless projection was smooth (no forward or backward jump over eight route
+samples), but a fresh history-free 544x544 action-only clone reached only route
+167/reset tick 549 after 308 ticks. This closes pure behavior cloning from a
+strong nominal teacher; the missing signal is state-feedback robustness, not a
+route-crossing ambiguity in that trace.
+
+Second, a single globally continued recovery search began from the fresh
+memoryless student's episode tick 200. A 256-wide, 128-tick ROCm proposal set
+with exact CPU continuation chose 67 nonbaseline eight-tick decisions and
+advanced the training teacher from route 286/362 ticks to route 295/837 ticks
+before reset. The teacher is a causal control bound, not a deployed policy, and
+still stalls far short of completion. Action-only distillation of its 835
+aligned visited-state labels regressed to route 149 despite running 455 ticks.
+A separate predeclared `5e-4` contractive weight on the first deterministic
+on-policy relabel batch also regressed to route 178/268 ticks. Do not repeat
+these teacher-cloning or contractive-weight variants without a new feedback
+objective.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
