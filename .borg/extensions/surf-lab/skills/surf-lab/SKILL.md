@@ -2257,6 +2257,27 @@ generation and a larger fixed holdout used only for periodic trend auditing;
 do not let a training center replace route 1801 unless it independently
 re-earns the unchanged complete-start and perturbation promotion contract.
 
+That accumulating formulation was then implemented and bounded. It resampled
+128 stratified broad-radius anchors each generation, accumulated ordinary
+full-network antithetic updates without a per-generation accept gate, and used
+one fixed 512-anchor set only for trend audits. A five-generation `sigma=1e-6`
+smoke left fixed-holdout mean normalized arc essentially unchanged at
+`0.7742773` to `0.7742785` (standard error about `0.0157`) while resets changed
+39 to 40. The separate training center collapsed to route 696/reset tick 723;
+the frozen route-1801 authority was untouched.
+
+Signal calibration explains the flat audit and closes the longer run. Across
+four common antithetic directions, the fraction of 128 anchors whose plus/minus
+arc differed by more than `0.01` without a reset flip averaged only `24.02%`,
+`26.56%`, and `33.20%` at sigmas `1e-6`, `1e-5`, and `1e-4`. The corresponding
+one-generation fixed-holdout deltas were `-0.00038`, `+0.00033`, and `-0.00306`;
+mean reset-flip fractions stayed below `2.4%`. The predeclared continuous-
+response threshold was 50%, so no 40-generation production run was started.
+The experimental source was removed and the release worker rebuilt from the
+clean committed tree. Do not reopen route-wide full-network mean-arc ARS as an
+anchor-count, sigma, or generation sweep; route 1801 remains the strict clean
+authority and no NN completes Utopia.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
