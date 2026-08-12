@@ -2232,6 +2232,31 @@ still matched; maximum feature/output/action delta was `0.0022765` and maximum
 reward delta `2.44e-4`. Treat the standard radius as exact shared-core parity
 and the larger radius as bounded diagnostic agreement.
 
+A one-generation route-wide mean-arc gate then tested the proposed optimizer
+signal without changing the deployed controller. Eight full-network
+antithetic candidates at `sigma=1e-6` shared 64 stratified authentic anchors;
+an accumulated update was backtracked on those anchors and 64 independently
+resampled anchors. Every state used the broad 32-Source-unit, 20%-velocity,
+20-degree-yaw perturbation radius and a 128-tick continuation. Paired mean-
+normalized-arc RMS was `0.005343`. The unchanged center scored `0.68828` with
+6 resets on the training anchors and `0.76818` with 10 resets on holdout. The
+full update raised training mean to `0.69784` but added one reset and reduced
+holdout mean to `0.76193`; the half update reached `0.69390`/7 resets and
+`0.77005`/10 resets. No nonzero scale strictly improved both independent means
+without adding resets. Every nonzero complete-start trial reset at route 1088
+or earlier, while scale zero retained route 1801 through all 2,600 ticks with
+exact GPU/host selection parity. No controller was promoted and the diagnostic
+source was removed.
+
+This closes a noisy per-generation accept gate, not all route-wide mean-arc
+training. The two 64-anchor baseline means differ by about `0.08`, consistent
+with the broad outcome variance already measured over 512 anchors, and one
+reset flip changes a 64-anchor mean materially. If this objective continues,
+use a separate accumulating training lineage with anchors resampled each
+generation and a larger fixed holdout used only for periodic trend auditing;
+do not let a training center replace route 1801 unless it independently
+re-earns the unchanged complete-start and perturbation promotion contract.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
