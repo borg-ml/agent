@@ -1881,6 +1881,37 @@ found no candidate that advanced beyond route 1900 while preserving its pace,
 fitness, and survival. Retain route 1903 only as a search center and avoid blind
 additional sweeps of this branch.
 
+An exact contact microscope confirms why route 1900 looks close in the playable
+game. At policy tick 2044 it strikes Source brush 3401, plane 5890, with normal
+`[0,0.3420,0.9397]`; speed drops from about 2,533 to 512 Source units/second in
+one tick. The authentic run does not touch that brush. Its next surf chain
+starts on brush 3398 and continues through brushes 3402, 3405, and 3408 at
+roughly 3,190--3,209 units/second. The miss is therefore a real wrong-surface
+commitment rather than route-corridor scoring or CPU/GPU collision drift.
+
+Bounded recovery localized the commitment before the visible impact. Starting
+at episode tick 1980 could not exceed route 1900. Starting at tick 1900 found an
+exact CPU-evaluated 48-tick program at tick 1916 that reached route 1901 and
+survived the full 2,600 ticks, but ordinary receding replanning later overwrote
+that valid branch and reset. Surf commit `2bd03f2` adds a training-only
+single-global-intervention mode: it advances through baseline decisions,
+commits the first globally evaluated nonbaseline program, then resumes the
+frozen NN. Replaying seed 77131 reproduced route 1901 with one intervention and
+no reset. This trace is corrective supervision only, not NN progress or a
+deployable controller.
+
+Surf commit `ce7bd4f` lets the corrective GPU trainer update only hidden-output
+columns at or after an explicit suffix index while preserving the earlier
+columns and output bias bit-for-bit in the exported artifact. Fitting the
+route-1901 intervention into the 544-wide controller's `352..544` bank did not
+distill the gain. Full, 10%, 3%, 1%, and 0.1% update scales all regressed to
+route 1866--1896 and reset between ticks 2302 and 2388. An exact zero-update
+export retained every model tensor and reproduced route 1900, all 2,600 ticks,
+pace lag 142, and fitness `0.8842321`, proving the failures are genuine
+closed-loop sensitivity rather than exporter metadata drift. Do not promote
+any suffix-fit artifact; retain route 1900 as the nominal leader and route 1801
+as the strict perturbation authority.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
