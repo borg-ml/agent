@@ -2359,10 +2359,12 @@ Surf commit `db36848` implements that permanent contract as
 `native_route_stateless_v4`. It computes globally nearest continuous polyline
 projection solely from the current observation in the shared Rust, C++, and
 HIP feature cores; carries no route history in `PolicyRuntime`; and keeps
-external ordered-route scoring authoritative. The corrective and PPO trainers
+external ordered-route scoring authoritative. The schema still permits the
+existing optional previous-command feature columns, so a policy is fully
+memoryless only when `history_features=false`. The corrective and PPO trainers
 admit the schema explicitly. A behavioral invariant confirms that identical
-current observations produce identical progress and features regardless of
-prior runtime state. The full ROCm test suite passes (132 tests passed, 7
+current observations produce identical route progress regardless of prior
+route-runtime state. The full ROCm test suite passes (132 tests passed, 7
 ignored), the release worker builds, and focused Python static checks pass.
 
 A fresh 544x544 ReLU student trained from all 1,969 authentic usable commands
@@ -2370,7 +2372,9 @@ reached only route 113 and reset at absolute tick 526 after 285 trajectory
 ticks. One stateless DAgger relabel pass improved this to route 179, reset tick
 714, and 473 trajectory ticks; a second pass reached route 195 but regressed to
 290 ticks, and one predeclared `0.1` update scale also regressed, so neither was
-promoted. The first-pass artifact has exact CPU/GPU agreement for its nominal
+promoted. These three artifacts retain previous-command features and therefore
+test route-memory removal, not the stricter no-memory contract. The first-pass
+artifact has exact CPU/GPU agreement for its nominal
 474 transitions and 8x64 standard perturbations. On 32x128 perturbations,
 3,999/4,096 transition keys match through termination; 31/32 rollouts remain
 effectively exact, while one tiny step-47 floating-point drift compounds into a
@@ -2379,15 +2383,32 @@ trajectory identity.
 
 A separately labeled migration candidate copies the route-1801 network tensors
 byte-for-byte into `native_route_stateless_v4` (tensor SHA-256
-`ca6ffbfe34f02717abcf8844c6436333b127cd09a4927d66a93dbae3b13195c8`). It is
-the strongest strict-contract stateless candidate so far, but still fails the
-complete-start gate at route 1853/reset tick 2329 after 2,088 trajectory ticks.
+`ca6ffbfe34f02717abcf8844c6436333b127cd09a4927d66a93dbae3b13195c8`). It
+retains previous-command features and therefore is not a strict no-memory
+candidate; it also fails the complete-start gate at route 1853/reset tick 2329
+after 2,088 trajectory ticks.
 A one-generation, four-candidate unified ROCm audit at sigma `1e-6` found no
 promotable update. Its final host audit exactly matches GPU at 2,089 executed
 episode ticks, furthest reference tick 2093, progress tick 2022, and zero
-terminal position/velocity error deltas. Preserve the stateful route-1801
-artifact as the strict perturbation benchmark, but do not call either stateless
-candidate complete or robust.
+terminal position/velocity error deltas. Every nonzero backtracking scale
+collapsed to route 698--1151; even the smallest scale, about `2.5e-11` in
+parameter space, reached only route 858. Do not tune this discontinuous ARS
+direction.
+
+The full memoryless audit then zeroed previous-command features as well as
+route memory. Surf commit `a359a05` fixes a corrective-trainer export bug where
+`--disable-history-features` zeroed warm-start training rows but silently
+restored the initializer's history metadata. A fresh history-free 544x544
+student reaches route 286/reset tick 603 after 362 trajectory ticks, better
+than its history-enabled authentic clone but still weak. One deterministic
+on-policy relabel pass regresses to route 181/reset tick 518 after 277 ticks.
+With byte-identical migrated route-1801 tensors, disabling command history
+reaches only route 236 and eventually resets at tick 1559 after 1,318 ticks.
+Thus previous-command history is materially causal for the route-1853 result.
+Preserve the history-enabled route-1801 artifact as the strict perturbation
+benchmark, but retain `utopia-user-native-clean-vnext-scale1e5.json` at
+reference tick 1134/reset episode tick 993 as the fully phase/history-free
+controller authority. None completes or is robust.
 
 ## Native policy visualization
 
