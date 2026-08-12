@@ -2060,6 +2060,51 @@ these diagnostic artifacts or repeat this worst-case full-network sigma/seed
 search unchanged; the result identifies a worst-scenario plateau and globally
 sensitive trust step, not a controller gain.
 
+A smaller full-network scale does not reveal a hidden robust gradient. Reusing
+the same 32 directions, nine complete-start scenarios, and seed at sigma
+`1e-6` pinned every robust score to tick 266/route 176. Individual nominal
+endpoints reset after 714--991 ticks at routes 653--921, while the accumulated
+artifact was tensor-for-tensor identical to route 1801 apart from receipt
+metadata. This closes scale reduction for that full-start objective rather
+than motivating a sweep.
+
+A matched-state contraction probe then tested whether the failure was a small
+number of discrete action thresholds. From 32 policy-prefix states spread over
+episode ticks 0--1800, the route-1801 authority ran 128 ticks from the nominal
+state and from per-axis position perturbations bounded by 0.5 Source units.
+On route-relative position and velocity features, 28 of 32 perturbations
+expanded, 22 exceeded 10x, and 12 exceeded 100x; the median terminal expansion
+was `29.0466`, p75 `526.504`, p90 `949.826`, and the maximum `1634.635`.
+No rollout reset within the probe. No paired jump or duck action flipped, and
+the minimum nominal margins from their 0.5 thresholds were `0.47281` and
+`0.44263`. The authority is broadly non-contracting; jump/duck output scaling
+is not the immediate cause.
+
+A fixed route-stratified stability objective was implemented only long enough
+to test whether that non-contraction supplied a better training geometry. It
+used 16 authority states from episode ticks 0--1963, 192-tick continuations,
+and one nominal plus four antithetic perturbations per state. An equal blend of
+mean and lower-quartile route-relative continuation score, penalized by
+terminal position/velocity divergence, produced dense full-network signal:
+the 32-candidate paired RMS was `0.258126`. Across endpoints its correlations
+with nominal survival and route were only `0.2386` and `0.2636`; paired
+advantage correlations were `0.4061` and `0.2425`, with sign agreement only
+9/16 and 7/16. Its paired correlation with strict perturbed-start survival was
+`-0.6408`.
+
+A training-only lineage was allowed to cross full-start regressions while the
+unchanged nominal plus nine-scenario gate remained the sole deployment
+authority. Over one bounded eight-generation, eight-candidate run, stability
+improved from `-0.91162` to `-0.59424`, plateaued for four generations, and
+ended at `-0.58304`. The training center simultaneously collapsed from route
+1801/all 2,600 ticks to route 393/459 ticks, recovered only to route 541/687
+ticks, and ended at route 476/700 ticks while still regressing four of nine
+matched starts. No generation promoted, and the unchanged route-1801 policy
+retained exact final GPU/host parity. The experimental source was removed.
+Do not rebuild a local-stability ensemble, training lineage, or associated
+scale/generation sweep: it is smoother than the hard-min objective but remains
+causally disconnected from robust spawn behavior.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
