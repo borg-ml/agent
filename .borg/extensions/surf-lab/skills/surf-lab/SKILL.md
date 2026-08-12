@@ -2512,6 +2512,42 @@ attractor. Do not line-search this direction again; the next update needs a
 structural prefix-preservation or stable feedback mechanism that remains one
 phase-free deployed network.
 
+Surf commit `651271d` tests literal prefix preservation rather than another
+step-size sweep. A 128-unit localized capacity bank was provably inactive for
+every visited state through episode tick 799, active throughout the remaining
+tail, and had zero output weights; its complete 993-tick CPU rollout was
+byte-identical to `scale1e5` in features, actions, and states. Two held-block
+macro-PPO generations then changed only that bank and preserved the prefix
+exactly, but both tied route 893/993. Regressing the five best suffix programs
+survived longer while regressing to route 857/1051; fitting the literal best
+single program reached route 895 but reset four ticks earlier at 989. Reject
+those artifacts. Prefix interference caused the earlier global-head collapse,
+but removing it did not make suffix imitation or PPO yield a strict
+route-and-survival gain.
+
+Surf commits `75481e4` and `d6f9ee0` establish the stronger architecture
+baseline. The controller observes the complete stateless 64-feature Markov
+geometry vector already used by the value lineage: route-relative pose and
+velocity, grounded/duck/jump/contact latches, twelve forward route samples,
+and ten live BSP sensors. A plain 64--512--512--6 ReLU actor emits analog
+movement, yaw delta, pitch, jump, and duck directly. It contains no phase,
+history, recurrent state, monotonic route belief, action schedule, adapter, or
+runtime branch. Training on 1,969 authentic quantized native POV commands
+produced movement RMSE `0.07576`, yaw MAE `0.16425` degrees, and held-out
+movement RMSE `0.10243`.
+
+The unchanged actor reaches route 1123 and resets after 1,161 full-start ticks,
+well above the discrete memoryless route-621/836 lineage and the clean
+pose-only route-893/993 controller, but it still does not complete the map.
+Continuous inference, action decoding, BSP observation, and Source movement
+now run through one shared C++/HIP core. An exact full-start audit found every
+one of the 64 features and all six raw outputs bit-identical between CPU and
+ROCm for all 1,161 executed ticks; both reset at route 1123. Retain
+`utopia-geometric-continuous-authentic-s8355.json` as the current strict
+memoryless architecture authority, not as a completion. Future robustness and
+closed-loop optimization should operate on this geometric actor rather than
+returning to the pose-only or 324-way discrete heads.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
