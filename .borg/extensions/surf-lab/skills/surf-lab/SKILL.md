@@ -2315,6 +2315,42 @@ recovery generator or run a matched binary search solely from the 12-of-16
 statistic; the observed flags are off-demonstration recovery actions under
 artificial state injection, not evidence for the nominal completion failure.
 
+An observation-contract audit then found that `native_route_continuous_v3` is
+not actually memoryless: `PolicyRuntime` carries a monotonic ordered-route
+tracker between calls and exposes that remembered progress to the otherwise
+feed-forward network. An offline reconstruction matched stored route-relative
+features within `3.85e-6` and network logits within `7.75e-5`. On the nominal
+1,968-tick trace, globally nearest stateless polyline projection differed from
+the tracked coordinate by only `0.01445` route samples on average and at most
+`3.4636`, but swapping only that feature caused isolated movement deltas up to
+`0.7548` and yaw deltas up to `6.9` degrees. Across the 512 broad authentic
+anchors, median maximum per-rollout movement and yaw differences were `0.214`
+and `0.794` degrees; among the tracked lower quartile they were `0.394` and
+`1.479` degrees. The weights therefore use the hidden tracker materially.
+
+A fresh paired exact-CPU rollout tested the causal effect without retraining.
+The tracked control reproduced 466/512 survivors, mean normalized arc
+`0.65974`, median `0.76925`, p25 `0.38370`, p90 `1.04049`, and 234/512 at least
+`0.8`. Stateless global projection improved those aggregates to 469/512,
+`0.69307`, `0.81561`, `0.41563`, `1.06472`, and 272/512. It improved 304 paired
+starts, regressed 206, rescued 13 resets, and introduced 10; among the original
+worst 128 starts it improved 85 and raised mean arc from `0.14299` to
+`0.21914`. This is evidence that accumulated route lag hurts broad recovery,
+not evidence that the existing weights are stateless-compatible.
+
+The complete-start gate rejects stateless projection as a drop-in change. Over
+1,968 ticks it reached route 1820 rather than 1801 and survived, but over the
+authoritative 2,600-tick horizon it reached route 1853 and then reset at
+absolute demo tick 2329 after 2,088 executed ticks; the tracked controller
+reached route 1801 and survived all 2,600. The temporary environment switch
+used for this diagnostic was removed and the clean release worker rebuilt.
+Consequently the route-1801 artifact remains useful training evidence but does
+not satisfy a strict deployed no-runtime-memory controller contract. Continue
+with a separately versioned stateless route observation and retrain it from the
+authentic commands; do not silently reinterpret existing
+`native_route_continuous_v3` artifacts or promote the farther-but-resetting
+unchanged-weight rollout.
+
 ## Native policy visualization
 
 The playable `surf` binary can attach a policy whose source starts with
