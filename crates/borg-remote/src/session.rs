@@ -1359,24 +1359,6 @@ async fn run_agent_session_store_kernel(
             // queued input that was submitted together.
             coalesce_queued_prompts(&mut pending);
         }
-        if pending.is_empty()
-            && goal.as_ref().is_some_and(|goal| {
-                goal.status == GoalStatus::Active && !goal_allows_automatic_continuation(goal)
-            })
-        {
-            pause_active_goal(
-                &mut journal,
-                &events,
-                session_id,
-                &mut goal,
-                &mut goal_active_since,
-            )
-            .await?;
-            next_ready_detail = Some(
-                "Goal paused after one turn because automatic continuation requires an explicit token budget"
-                    .to_string(),
-            );
-        }
         let goal_is_active = goal
             .as_ref()
             .is_some_and(|goal| goal.status == GoalStatus::Active);
@@ -1753,7 +1735,36 @@ async fn run_agent_session_store_kernel(
                                     "Codex native compaction requires a provider thread",
                                 )?;
                                 let usage = executor
-                                    .compact(session_id, launch.provider, provider_session_id)
+                                    .compact(AgentTurn {
+                                        session_id,
+                                        message_id: Uuid::new_v4(),
+                                        context_generation: journal
+                                            .state(session_id)
+                                            .await?
+                                            .context_generation,
+                                        provider: launch.provider,
+                                        provider_session_id: Some(provider_session_id.to_string()),
+                                        cwd: launch.cwd.clone(),
+                                        prompt_delta: String::new(),
+                                        prompt: String::new(),
+                                        attachments: Vec::new(),
+                                        output_schema: None,
+                                        model: launch.model.clone(),
+                                        effort: launch.effort.clone(),
+                                        fast: launch.fast,
+                                        response_language: launch.response_language,
+                                        permission_mode: launch.permission_mode,
+                                        conversation: Vec::new(),
+                                        agent_mcp_server: agent_mcp_server.clone(),
+                                        agent_tools: dispatcher.clone(),
+                                        external_mcp_servers: runtime_mcp_servers.clone(),
+                                        runtime_mcp_context: runtime_mcp_context.clone(),
+                                        extension_skill_roots: launch.extension_skill_roots.clone(),
+                                        extension_workflows: Vec::new(),
+                                        system_prompt_appendix: crate::provider_capabilities_prompt(
+                                            &launch.capabilities.provider_capabilities,
+                                        ),
+                                    })
                                     .await?
                                     .unwrap_or_default();
                                 Ok(Some(crate::AgentCompaction {
@@ -3791,11 +3802,7 @@ fn native_conversation(
     for event in events {
         match &event.kind {
             SessionEventKind::ProviderEvent { kind, payload, .. }
-                if kind == "context_compaction"
-                    && payload
-                        .get("provider_context_preserved")
-                        .and_then(Value::as_bool)
-                        != Some(true) =>
+                if kind == "context_compaction" && compaction_restarts_replay(payload) =>
             {
                 let mut unresolved_prompts = std::mem::take(&mut failed_prompts);
                 unresolved_prompts.extend(pending_generic.drain(..).filter(is_context_prompt));
@@ -3958,6 +3965,17 @@ fn native_conversation(
     // tail is also appended after a later compaction summary above.
     conversation.extend(pending_generic.into_iter().filter(is_context_prompt));
     Ok(conversation)
+}
+
+fn compaction_restarts_replay(payload: &Value) -> bool {
+    payload
+        .get("provider_context_preserved")
+        .and_then(Value::as_bool)
+        != Some(true)
+        || payload
+            .get("provider_recovery_checkpoint")
+            .and_then(Value::as_bool)
+            == Some(true)
 }
 
 fn is_context_prompt(message: &borg_provider::provider::ModelMessage) -> bool {
@@ -4261,11 +4279,7 @@ fn provider_neutral_conversation(
     for event in events {
         match &event.kind {
             SessionEventKind::ProviderEvent { kind, payload, .. }
-                if kind == "context_compaction"
-                    && payload
-                        .get("provider_context_preserved")
-                        .and_then(Value::as_bool)
-                        != Some(true) =>
+                if kind == "context_compaction" && compaction_restarts_replay(payload) =>
             {
                 conversation.clear();
                 if let Some(summary) = payload.get("summary").and_then(Value::as_str) {
@@ -6348,7 +6362,7 @@ fn continuation_prompt(goal: &SessionGoal) -> String {
     let continuation_policy = if goal.token_budget.is_some() {
         "Automatic continuation remains enabled until the explicit token budget is exhausted."
     } else {
-        "This is the goal's single unbudgeted continuation turn; it will pause at the next idle boundary."
+        "Automatic continuation remains enabled until the goal is complete, blocked, usage-limited, or stopped by the user."
     };
     format!(
         "Continue working toward the active session goal.\n\n\
@@ -6365,10 +6379,9 @@ Only mark the goal complete when every requirement is achieved and verified. Mar
 
 fn goal_allows_automatic_continuation(goal: &SessionGoal) -> bool {
     goal.status == GoalStatus::Active
-        && goal.token_budget.is_some()
         && goal
             .remaining_tokens()
-            .is_some_and(|remaining| remaining > 0)
+            .is_none_or(|remaining| remaining > 0)
 }
 
 fn objective_updated_prompt(goal: &SessionGoal) -> String {

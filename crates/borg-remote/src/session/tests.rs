@@ -4631,9 +4631,9 @@ async fn goal_state_is_recoverable_from_the_session_journal() {
 }
 
 #[test]
-fn automatic_goal_continuation_requires_remaining_explicit_budget() {
-    let unbudgeted = SessionGoal::new("one deliberate turn".to_string(), None);
-    assert!(!goal_allows_automatic_continuation(&unbudgeted));
+fn automatic_goal_continuation_supports_unbudgeted_goals() {
+    let unbudgeted = SessionGoal::new("work continuously".to_string(), None);
+    assert!(goal_allows_automatic_continuation(&unbudgeted));
 
     let mut budgeted = SessionGoal::new("bounded continuation".to_string(), Some(100));
     assert!(goal_allows_automatic_continuation(&budgeted));
@@ -7131,6 +7131,53 @@ fn provider_native_compaction_keeps_borg_recovery_history_lossless() {
     assert_eq!(
         provider_neutral_conversation(&events).unwrap(),
         vec![ModelMessage::user("retain this requirement")]
+    );
+}
+
+#[test]
+fn provider_native_recovery_checkpoint_restarts_cold_replay() {
+    use borg_provider::provider::ModelMessage;
+
+    let session_id = Uuid::new_v4();
+    let message = |sequence: u64, text: &str| {
+        SessionEvent::new(
+            session_id,
+            sequence,
+            SessionEventKind::Message {
+                message_id: Uuid::new_v4(),
+                actor: EventActor::User,
+                text: text.to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            },
+        )
+    };
+    let events = vec![
+        message(1, "old context retained in the durable journal"),
+        SessionEvent::new(
+            session_id,
+            2,
+            SessionEventKind::ProviderEvent {
+                provider: CodingProvider::Codex,
+                kind: "context_compaction".to_string(),
+                payload: json!({
+                    "status": "completed",
+                    "summary": "provider recovery summary",
+                    "provider_context_preserved": true,
+                    "provider_recovery_checkpoint": true,
+                }),
+            },
+        ),
+        message(3, "new context after compaction"),
+    ];
+
+    assert_eq!(
+        provider_neutral_conversation(&events).unwrap(),
+        vec![
+            ModelMessage::user("Previous conversation summary:\n\nprovider recovery summary"),
+            ModelMessage::user("new context after compaction"),
+        ]
     );
 }
 

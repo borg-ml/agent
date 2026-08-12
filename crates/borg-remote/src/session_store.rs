@@ -191,6 +191,22 @@ impl SessionEventKind {
         )
     }
 
+    pub fn is_completed_provider_recovery_checkpoint(&self) -> bool {
+        matches!(
+            self,
+            Self::ProviderEvent { kind, payload, .. }
+                if kind == "context_compaction"
+                    && payload
+                        .get("provider_recovery_checkpoint")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
+                    && matches!(
+                        payload.get("status").and_then(serde_json::Value::as_str),
+                        None | Some("completed")
+                    )
+        )
+    }
+
     pub fn persistence(&self) -> EventPersistence {
         match self {
             Self::ProviderEvent { provider, kind, .. }
@@ -286,7 +302,11 @@ impl SessionEventKind {
             // structure in its session entries; Borg needs this metadata in
             // the recovered context slice for cross-provider replay.
             Self::TurnStarted { .. } | Self::TurnCompleted { .. } | Self::ContextCleared => true,
-            kind if kind.is_completed_context_compaction() => true,
+            kind if kind.is_completed_context_compaction()
+                || kind.is_completed_provider_recovery_checkpoint() =>
+            {
+                true
+            }
             Self::ProviderEvent { provider, kind, .. } if provider.uses_native_harness() => {
                 matches!(
                     kind.as_str(),

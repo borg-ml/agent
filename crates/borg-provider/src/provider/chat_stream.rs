@@ -400,13 +400,50 @@ struct StartedCodexProcess {
 }
 
 impl CodexSubscriptionPool {
-    pub async fn compact(&self, expected_thread_id: &str) -> Result<ProviderCallUsage> {
+    pub async fn compact(
+        &self,
+        mut request: ChatStreamRequest,
+        permission: LocalAgentPermission,
+        expected_thread_id: &str,
+    ) -> Result<ProviderCallUsage> {
+        anyhow::ensure!(
+            !expected_thread_id.trim().is_empty(),
+            "Codex native compaction requires a provider thread"
+        );
+        let lifecycle_key = request
+            .lifecycle_key
+            .clone()
+            .unwrap_or_else(|| "borg-codex-subscription".to_string());
         let mut state = self.inner.lock().await;
+        if state.lifecycle_key.as_deref() != Some(lifecycle_key.as_str()) {
+            if let Some(process) = state.process.take() {
+                shutdown_pooled_codex_process(process).await;
+            }
+            state.lifecycle_key = Some(lifecycle_key);
+            state._auth_home = restore_auth_home(request.provider_auth.as_ref())?;
+        }
+        let billing_mode = provider_billing_mode(
+            SubscriptionProvider::Codex,
+            &request,
+            state._auth_home.as_ref(),
+        );
+        state.billing_mode = billing_mode;
+        if state.process.is_none() {
+            request.session_id = Some(expected_thread_id.to_string());
+            request.resume_unavailable_prompt = None;
+            let started =
+                start_pooled_codex_process(&request, permission, state._auth_home.as_ref()).await?;
+            anyhow::ensure!(
+                started.resumed,
+                "Codex native compaction could not resume thread {expected_thread_id}"
+            );
+            state.process = Some(started.process);
+        }
         let billing_mode = state.billing_mode;
         let process = state
             .process
             .as_mut()
-            .context("Codex native compaction requires a live pooled thread")?;
+            .context("Codex native compaction could not initialize a pooled thread")?;
         anyhow::ensure!(
             process.thread_id == expected_thread_id,
             "Codex native compaction thread changed from {expected_thread_id} to {}",
@@ -1408,7 +1445,7 @@ async fn run_pooled_codex_turn(
     let mut turn_completed = false;
     let mut turn_status = None;
     let mut reasoning_state = CodexReasoningState::default();
-    let mut compaction_capture = CodexCompactionCapture::new(process.rollout_path.clone());
+    let mut compaction_capture = CodexCompactionCapture::new(process.rollout_path.clone(), true);
 
     loop {
         tokio::select! {
@@ -1663,7 +1700,7 @@ async fn run_codex_subscription_process(
     let mut turn_completed = false;
     let mut turn_status = None;
     let mut reasoning_state = CodexReasoningState::default();
-    let mut compaction_capture = CodexCompactionCapture::new(rollout_path);
+    let mut compaction_capture = CodexCompactionCapture::new(rollout_path, false);
 
     loop {
         tokio::select! {
@@ -2199,12 +2236,14 @@ struct CodexCompactionCapture {
     item_id: Option<String>,
     summary: String,
     rollout_path: Option<PathBuf>,
+    provider_context_preserved: bool,
 }
 
 impl CodexCompactionCapture {
-    fn new(rollout_path: Option<PathBuf>) -> Self {
+    fn new(rollout_path: Option<PathBuf>, provider_context_preserved: bool) -> Self {
         Self {
             rollout_path,
+            provider_context_preserved,
             ..Self::default()
         }
     }
@@ -2260,6 +2299,8 @@ impl CodexCompactionCapture {
             "status": "completed",
             "summary": summary,
             "provider_item_id": item_id,
+            "provider_context_preserved": self.provider_context_preserved,
+            "provider_recovery_checkpoint": true,
         }))
     }
 }
@@ -4081,7 +4122,7 @@ mod tests {
 
     #[tokio::test]
     async fn codex_compaction_summary_becomes_a_canonical_checkpoint() {
-        let mut capture = CodexCompactionCapture::default();
+        let mut capture = CodexCompactionCapture::new(None, true);
         assert!(
             capture
                 .observe(&serde_json::json!({
@@ -4114,6 +4155,8 @@ mod tests {
         assert_eq!(checkpoint["status"], "completed");
         assert_eq!(checkpoint["summary"], "durable summary");
         assert_eq!(checkpoint["provider_item_id"], "compact-1");
+        assert_eq!(checkpoint["provider_context_preserved"], true);
+        assert_eq!(checkpoint["provider_recovery_checkpoint"], true);
     }
 
     #[tokio::test]
@@ -4128,7 +4171,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let mut capture = CodexCompactionCapture::new(Some(rollout));
+        let mut capture = CodexCompactionCapture::new(Some(rollout), true);
         capture
             .observe(&serde_json::json!({
                 "method": "item/started",

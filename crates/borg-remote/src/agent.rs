@@ -219,12 +219,7 @@ pub trait AgentTurnExecutor: Send + Sync {
         anyhow::bail!("model consultation is not supported by this executor")
     }
 
-    async fn compact(
-        &self,
-        _session_id: Uuid,
-        _provider: CodingProvider,
-        _provider_session_id: &str,
-    ) -> Result<Option<ProviderCallUsage>> {
+    async fn compact(&self, _turn: AgentTurn) -> Result<Option<ProviderCallUsage>> {
         anyhow::bail!("manual context compaction is not supported by this provider")
     }
 
@@ -575,6 +570,35 @@ impl LocalAgentTurnExecutor {
             }
         }
     }
+
+    async fn prepare_local_turn(&self, turn: &mut AgentTurn) -> Result<()> {
+        self.refresh_runtime_extensions().await;
+        let runtime_extensions = self
+            .runtime_extensions
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        turn.agent_tools
+            .configure_runtime_mcp_extensions(runtime_extensions.external_mcp_servers.clone())
+            .await?;
+        turn.system_prompt_appendix
+            .push_str(&turn.agent_tools.harness_prompt_appendix().await?);
+        turn.external_mcp_servers
+            .extend(runtime_extensions.external_mcp_servers);
+        turn.extension_skill_roots
+            .extend(runtime_extensions.skill_roots);
+        turn.extension_workflows
+            .extend(runtime_extensions.workflows);
+        if !turn.extension_skill_roots.is_empty() {
+            turn.system_prompt_appendix.push_str(
+                &crate::native_context::extension_skill_prompt_appendix(
+                    turn.extension_skill_roots.clone(),
+                )
+                .await?,
+            );
+        }
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
@@ -606,31 +630,7 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
         events: mpsc::Sender<SessionEventKind>,
         controls: Option<mpsc::Receiver<AgentTurnControl>>,
     ) -> Result<AgentTurnResult> {
-        self.refresh_runtime_extensions().await;
-        let runtime_extensions = self
-            .runtime_extensions
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
-        turn.agent_tools
-            .configure_runtime_mcp_extensions(runtime_extensions.external_mcp_servers.clone())
-            .await?;
-        turn.system_prompt_appendix
-            .push_str(&turn.agent_tools.harness_prompt_appendix().await?);
-        turn.external_mcp_servers
-            .extend(runtime_extensions.external_mcp_servers);
-        turn.extension_skill_roots
-            .extend(runtime_extensions.skill_roots);
-        turn.extension_workflows
-            .extend(runtime_extensions.workflows);
-        if !turn.extension_skill_roots.is_empty() {
-            turn.system_prompt_appendix.push_str(
-                &crate::native_context::extension_skill_prompt_appendix(
-                    turn.extension_skill_roots.clone(),
-                )
-                .await?,
-            );
-        }
+        self.prepare_local_turn(&mut turn).await?;
         if turn.provider.uses_native_harness() {
             return self.native_harness.run(turn, events, controls).await;
         }
@@ -684,35 +684,56 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
         )
     }
 
-    async fn compact(
-        &self,
-        session_id: Uuid,
-        provider: CodingProvider,
-        provider_session_id: &str,
-    ) -> Result<Option<ProviderCallUsage>> {
+    async fn compact(&self, mut turn: AgentTurn) -> Result<Option<ProviderCallUsage>> {
         anyhow::ensure!(
-            provider == CodingProvider::Codex,
-            "provider-session compaction is unavailable for {provider:?}"
+            turn.provider == CodingProvider::Codex,
+            "provider-session compaction is unavailable for {:?}",
+            turn.provider
         );
-        let pool = {
-            let slots = self.subscription_pools.slots.lock().await;
-            let slot = slots
-                .get(&session_id)
-                .context("Codex native compaction requires an active subscription pool")?;
-            anyhow::ensure!(
-                slot.provider == CodingProvider::Codex && slot.healthy,
-                "Codex native compaction requires a healthy reusable thread"
-            );
-            match &slot.pool {
-                SubscriptionPool::Codex(pool) => pool.clone(),
-                SubscriptionPool::Claude(_) => unreachable!("Codex slot contained Claude pool"),
-            }
+        let provider_session_id = turn
+            .provider_session_id
+            .clone()
+            .context("Codex native compaction requires a provider thread")?;
+        self.prepare_local_turn(&mut turn).await?;
+        let permission = local_permission(turn.permission_mode);
+        let mut request = direct_chat_stream_request(&turn, true);
+        let lifecycle_key = subscription_lifecycle_key(&turn, &request, turn.permission_mode);
+        let prepared = self
+            .subscription_pools
+            .prepare(
+                turn.session_id,
+                SubscriptionTurnInput {
+                    context_generation: turn.context_generation,
+                    provider: turn.provider,
+                    provider_session_id: Some(provider_session_id.clone()),
+                    prompt: String::new(),
+                    prompt_delta: String::new(),
+                    lifecycle_key,
+                },
+            )
+            .await;
+        request.prompt = prepared.prompt.clone();
+        request.lifecycle_key = Some(prepared.lifecycle_key.clone());
+        request.session_id = prepared.resume_session_id.clone();
+        request.resume_unavailable_prompt = prepared.resume_unavailable_prompt.clone();
+        request.persist_session = Some(true);
+        let pool = match prepared.pool {
+            SubscriptionPool::Codex(pool) => pool,
+            SubscriptionPool::Claude(_) => unreachable!("Codex slot contained Claude pool"),
         };
-        match pool.compact(provider_session_id).await {
-            Ok(usage) => Ok(Some(usage)),
+        match pool
+            .compact(request, permission, &provider_session_id)
+            .await
+        {
+            Ok(usage) => {
+                self.subscription_pools
+                    .mark(turn.session_id, CodingProvider::Codex, true)
+                    .await;
+                Ok(Some(usage))
+            }
             Err(error) => {
                 self.subscription_pools
-                    .mark(session_id, CodingProvider::Codex, false)
+                    .mark(turn.session_id, CodingProvider::Codex, false)
                     .await;
                 Err(error)
             }
@@ -874,6 +895,49 @@ struct BorgProviderTurnRuntime {
     subscription_pools: Option<Arc<SubscriptionPoolRegistry>>,
 }
 
+fn direct_chat_stream_request(turn: &AgentTurn, tools_enabled: bool) -> ChatStreamRequest {
+    let response_language_instruction = turn.response_language.instruction();
+    let mcp_external_servers = if tools_enabled {
+        let mut servers = turn.external_mcp_servers.clone();
+        servers.push(turn.agent_mcp_server.clone());
+        servers
+    } else {
+        Vec::new()
+    };
+    ChatStreamRequest {
+        prompt: turn.prompt.clone(),
+        lifecycle_key: None,
+        owner_session_id: Some(turn.session_id.to_string()),
+        client_user_message_id: Some(turn.message_id.to_string()),
+        attachments: turn.attachments.clone(),
+        model: turn.model.clone(),
+        effort: turn.effort.clone(),
+        fast: turn.fast.unwrap_or(false),
+        system_prompt: match response_language_instruction {
+            Some(instruction) => format!("{CODING_SYSTEM_PROMPT}\n\n{instruction}"),
+            None => CODING_SYSTEM_PROMPT.to_string(),
+        } + if turn.system_prompt_appendix.is_empty() {
+            ""
+        } else {
+            "\n\n"
+        } + &turn.system_prompt_appendix,
+        output_schema: turn.output_schema.clone(),
+        mcp_owner_id: turn.runtime_mcp_context.owner_id.clone(),
+        mcp_allowed_scopes: turn.runtime_mcp_context.allowed_scopes.clone(),
+        mcp_user_id: turn.runtime_mcp_context.user_id.clone(),
+        mcp_external_servers,
+        mcp_api_token: turn.runtime_mcp_context.api_token.clone(),
+        provider_auth: None,
+        git_credentials: Vec::new(),
+        working_directory: Some(turn.cwd.clone()),
+        session_id: None,
+        provider_channel: ProviderChannel::Direct,
+        persist_session: Some(false),
+        web_search_allowed: true,
+        resume_unavailable_prompt: None,
+    }
+}
+
 async fn run_borg_provider_turn(
     turn: AgentTurn,
     events: mpsc::Sender<SessionEventKind>,
@@ -931,48 +995,7 @@ async fn run_borg_provider_turn(
             }
             request
         }
-        None => {
-            let runtime_mcp_context = turn.runtime_mcp_context.clone();
-            let mcp_external_servers = if tools_enabled {
-                let mut servers = turn.external_mcp_servers;
-                servers.push(turn.agent_mcp_server);
-                servers
-            } else {
-                Vec::new()
-            };
-            ChatStreamRequest {
-                prompt: turn.prompt.clone(),
-                lifecycle_key: None,
-                owner_session_id: Some(turn.session_id.to_string()),
-                client_user_message_id: Some(turn.message_id.to_string()),
-                attachments: turn.attachments,
-                model: turn.model.clone(),
-                effort: turn.effort.clone(),
-                fast: turn.fast.unwrap_or(false),
-                system_prompt: match response_language_instruction {
-                    Some(instruction) => format!("{CODING_SYSTEM_PROMPT}\n\n{instruction}"),
-                    None => CODING_SYSTEM_PROMPT.to_string(),
-                } + if turn.system_prompt_appendix.is_empty() {
-                    ""
-                } else {
-                    "\n\n"
-                } + &turn.system_prompt_appendix,
-                output_schema: turn.output_schema,
-                mcp_owner_id: runtime_mcp_context.owner_id,
-                mcp_allowed_scopes: runtime_mcp_context.allowed_scopes,
-                mcp_user_id: runtime_mcp_context.user_id,
-                mcp_external_servers,
-                mcp_api_token: runtime_mcp_context.api_token,
-                provider_auth: None,
-                git_credentials: Vec::new(),
-                working_directory: Some(turn.cwd.clone()),
-                session_id: None,
-                provider_channel: ProviderChannel::Direct,
-                persist_session: Some(false),
-                web_search_allowed: true,
-                resume_unavailable_prompt: None,
-            }
-        }
+        None => direct_chat_stream_request(&turn, tools_enabled),
     };
     let permission = local_permission(turn.permission_mode);
     let pool_invocation = if local

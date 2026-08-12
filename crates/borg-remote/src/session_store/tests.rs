@@ -1557,6 +1557,25 @@ fn provider_native_compaction_is_not_a_durable_replay_boundary() {
     assert!(!kind.is_context_relevant());
 }
 
+#[test]
+fn provider_native_recovery_checkpoint_is_context_without_rotating_generation() {
+    let kind = SessionEventKind::ProviderEvent {
+        provider: CodingProvider::Codex,
+        kind: "context_compaction".to_string(),
+        payload: serde_json::json!({
+            "status": "completed",
+            "summary": "provider recovery summary",
+            "provider_context_preserved": true,
+            "provider_recovery_checkpoint": true,
+        }),
+    };
+
+    assert!(!kind.is_completed_context_compaction());
+    assert!(kind.is_completed_provider_recovery_checkpoint());
+    assert_eq!(kind.persistence(), EventPersistence::Durable);
+    assert!(kind.is_context_relevant());
+}
+
 #[tokio::test]
 async fn inherited_event_pages_match_the_full_projection_across_lineage_boundaries() {
     let (directory, store) = store().await;
