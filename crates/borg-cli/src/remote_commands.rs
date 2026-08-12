@@ -976,14 +976,26 @@ async fn stop_stale_local_owner_and_acquire(
     if let Some(writer) = SessionWriterLease::try_acquire(lock_path)? {
         return Ok(writer);
     }
-    send_local_session_command(
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    if let Err(error) = send_local_session_command(
         control_socket_path,
         session_id,
         HostCommand::Stop { session_id },
     )
     .await
-    .context("failed to ask the obsolete local session owner to stop")?;
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    {
+        let control_endpoint_gone = !control_socket_path.exists()
+            && error
+                .root_cause()
+                .downcast_ref::<io::Error>()
+                .is_some_and(|error| error.kind() == io::ErrorKind::NotFound);
+        if !control_endpoint_gone {
+            return Err(error).context("failed to ask the obsolete local session owner to stop");
+        }
+        // The owner can remove its control socket just before its process
+        // releases the writer lease. Keep polling the authoritative lock
+        // instead of turning that handoff race into a failed resume.
+    }
     loop {
         if let Some(writer) = SessionWriterLease::try_acquire(lock_path)? {
             return Ok(writer);

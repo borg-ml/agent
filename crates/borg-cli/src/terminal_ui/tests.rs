@@ -982,6 +982,16 @@ fn keybinding_help_is_action_first_and_uses_configuration() {
     assert!(help.contains("send"));
     assert!(help.find("send").unwrap() < help.find("ctrl+s").unwrap());
     assert!(help.contains("queue next turn"));
+
+    let wide_help = keybinding_lines(&keymap, 86);
+    assert!(wide_help.iter().all(|line| line.width() <= 86));
+    assert!(wide_help.iter().any(|line| {
+        line.spans.iter().any(|span| {
+            span.content == "ctrl+s"
+                && span.style.fg == Some(BORG_ORANGE_HOVER)
+                && span.style.add_modifier.contains(Modifier::BOLD)
+        })
+    }));
 }
 
 #[test]

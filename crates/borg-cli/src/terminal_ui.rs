@@ -52,7 +52,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph};
 use ratatui::{TerminalOptions, Viewport};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -5602,10 +5602,10 @@ impl BorgTerminal {
                 && (self.keybindings_open || self.keybindings_hovered)
                 && let Some(hint_area) = next_keybindings_hint_area.or(self.keybindings_hint_area)
             {
-                let tooltip_width = area.width.min(82);
+                let tooltip_width = area.width.min(90);
                 let tooltip_lines = keybinding_lines(
                     &self.keymap,
-                    tooltip_width.saturating_sub(2).max(1) as usize,
+                    tooltip_width.saturating_sub(4).max(1) as usize,
                 );
                 let tooltip_height = (tooltip_lines.len() as u16)
                     .saturating_add(2)
@@ -5622,19 +5622,20 @@ impl BorgTerminal {
                 frame.render_widget(Clear, tooltip);
                 frame.render_widget(
                     Paragraph::new(tooltip_lines)
-                        .style(Style::default().fg(Color::Gray).bg(COMMAND_PANEL_BG))
+                        .style(Style::default().fg(Color::White).bg(COMMAND_PANEL_BG))
                         .block(
                             Block::default()
                                 .borders(Borders::ALL)
+                                .padding(Padding::horizontal(1))
                                 .border_style(Style::default().fg(BORG_ORANGE))
                                 .title(Span::styled(
                                     format!(
-                                        " Keybindings · close {} or {} ",
+                                        " Keybindings  ·  close {} or {} ",
                                         self.keymap.label(KeyAction::Keybindings),
                                         self.keymap.label(KeyAction::Interrupt)
                                     ),
                                     Style::default()
-                                        .fg(Color::White)
+                                        .fg(BORG_ORANGE_HOVER)
                                         .add_modifier(Modifier::BOLD),
                                 )),
                         ),
@@ -9062,26 +9063,75 @@ fn keybinding_reference(keymap: &KeyMap) -> Vec<(&'static str, String)> {
 
 fn keybinding_lines(keymap: &KeyMap, width: usize) -> Vec<Line<'static>> {
     let bindings = keybinding_reference(keymap);
-    let binding = |(action, key): &(&str, String)| format!("{action:<26} {key}");
-    let mut lines = Vec::new();
+    let action_style = Style::default().fg(Color::White);
+    let key_style = Style::default()
+        .fg(BORG_ORANGE_HOVER)
+        .add_modifier(Modifier::BOLD);
+    let separator_style = Style::default().fg(Color::DarkGray);
+
     if width >= 76 {
-        for pair in bindings.chunks(2) {
-            let left = binding(&pair[0]);
-            let text = pair.get(1).map_or(left.clone(), |right| {
-                format!(" {left:<43} {}", binding(right))
-            });
-            lines.push(Line::from(text));
-        }
-    } else {
-        for binding_pair in &bindings {
-            lines.extend(
-                wrap_display(&format!(" {}", binding(binding_pair)), width.max(1))
-                    .into_iter()
-                    .map(Line::from),
-            );
+        let action_width = |column: usize| {
+            bindings
+                .iter()
+                .skip(column)
+                .step_by(2)
+                .map(|(action, _)| action.width())
+                .max()
+                .unwrap_or(0)
+        };
+        let left_action_width = action_width(0);
+        let right_action_width = action_width(1);
+        let key_width = |column: usize| {
+            bindings
+                .iter()
+                .skip(column)
+                .step_by(2)
+                .map(|(_, key)| key.width())
+                .max()
+                .unwrap_or(0)
+        };
+        let left_width = left_action_width + 1 + key_width(0);
+        let right_width = right_action_width + 1 + key_width(1);
+
+        if left_width + 3 + right_width <= width {
+            let mut lines = Vec::new();
+            for pair in bindings.chunks(2) {
+                let left = &pair[0];
+                let right = pair.get(1);
+                let mut spans =
+                    vec![
+                        Span::styled(left.0.to_string(), action_style),
+                        Span::raw(" ".repeat(left_action_width.saturating_sub(left.0.width()))),
+                        Span::raw(" "),
+                        Span::styled(left.1.clone(), key_style),
+                        Span::raw(" ".repeat(
+                            left_width.saturating_sub(left_action_width + 1 + left.1.width()),
+                        )),
+                    ];
+                if let Some(right) = right {
+                    spans.extend([
+                        Span::styled(" │ ", separator_style),
+                        Span::styled(right.0.to_string(), action_style),
+                        Span::raw(" ".repeat(right_action_width.saturating_sub(right.0.width()))),
+                        Span::raw(" "),
+                        Span::styled(right.1.clone(), key_style),
+                    ]);
+                }
+                lines.push(Line::from(spans));
+            }
+            return lines;
         }
     }
-    lines
+
+    bindings
+        .iter()
+        .flat_map(|binding| {
+            let label = format!("{} {}", binding.0, binding.1);
+            wrap_display(&label, width.max(1))
+                .into_iter()
+                .map(|line| Line::from(vec![Span::styled(line, action_style)]))
+        })
+        .collect()
 }
 
 fn slash_suggestion_lines(value: &str, selected: usize) -> Vec<Line<'static>> {

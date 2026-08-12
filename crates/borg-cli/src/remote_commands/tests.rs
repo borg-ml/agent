@@ -1352,6 +1352,27 @@ async fn obsolete_owner_handoff_uses_a_free_lease_when_its_socket_is_gone() {
     drop(replacement);
 }
 
+#[tokio::test]
+#[cfg(unix)]
+async fn obsolete_owner_handoff_waits_for_a_lease_after_its_socket_disappears() {
+    let root = short_socket_tempdir();
+    let session_id = Uuid::new_v4();
+    let journal_path = root.path().join(format!("{session_id}.lock"));
+    let socket_path = session_control_socket_path(root.path(), session_id);
+    let writer = SessionWriterLease::try_acquire(&journal_path)
+        .unwrap()
+        .unwrap();
+
+    let handoff = tokio::spawn(async move {
+        stop_stale_local_owner_and_acquire(&journal_path, &socket_path, session_id).await
+    });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    drop(writer);
+
+    let replacement = handoff.await.unwrap().unwrap();
+    drop(replacement);
+}
+
 #[test]
 fn active_session_survives_terminal_hangup_but_idle_session_stops() {
     assert!(should_detach_on_terminal_hangup(
