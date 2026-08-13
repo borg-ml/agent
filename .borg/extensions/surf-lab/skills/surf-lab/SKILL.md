@@ -2847,6 +2847,36 @@ only within that state against its parent, then train from those causal
 baseline-relative advantages. Held-out starts and the exact nominal spawn
 remain decisive promotion gates.
 
+Surf commit `8bf614a` implements that paired contract. The collector lays out
+one deterministic parent lane per scenario followed by equally many action
+variants, repeats the exact initial state within each group, reserves scenario
+zero for the unperturbed start, and records the scenario/variant identity on
+every transition and outcome. Bit-identical step-zero features and actor
+outputs were verified for every lane in 8- and 32-scenario batches. The trainer
+ranks only within each scenario, refuses perturbed data without its matching
+baseline, refuses batches with no genuinely positive program, and can optimize
+a smooth worst-case of per-scenario surrogate gains instead of their average.
+
+This fixes causal credit assignment but does not yet produce a promotable
+controller. In the 32-scenario seed-8513 batch, 27 scenarios had an explored
+winner and the best action program reached route 704. A small pooled update
+reached nominal route 698/reset 741, but on 32 held-out seed-8506 starts it was
+better/equal/worse on 19/1/12 and reduced mean route from `563.63` to `562.53`.
+The smooth worst-case update also reached nominal route 698/reset 740 and
+improved the held-out distribution to 22/2/8, mean route `574.63`, and 29
+resets instead of 30, but eight regressions still violate paired promotion.
+Combining 64 paired training scenarios then regressed the nominal route to
+671. Reject all three policies and retain the route-693 parent.
+
+The next optimizer must use the exact closed-loop simulator as an acceptance
+constraint, not assume that an offline PPO surrogate preserves an attractor.
+Paired collection and per-scenario ranks remain useful proposal gradients, but
+candidate installation must be evaluated on the common nominal and perturbed
+states before any update is accepted, with fresh held-out states reserved for
+promotion. Do not respond by adding recurrence, a route phase, another local
+bank, or a learning-rate sweep: none addresses the demonstrated surrogate-to-
+closed-loop mismatch.
+
 Use `SURF_WINDOW_MODE=hidden` for a renderer smoke test. A natural loop reload
 after the reported full `rollout_ticks` proves the episode completed without
 an earlier floor/teleport restart; it does not prove the learned path matches
