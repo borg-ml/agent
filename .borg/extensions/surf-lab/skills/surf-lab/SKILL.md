@@ -2999,6 +2999,19 @@ next optimize exact closed-loop outcomes directly inside a prefix-protected,
 low-dimensional residual subspace. These results do not justify recurrence,
 phase state, a clock, or another deployed controller mechanism.
 
+Surf commit `9807846` also makes localized output-CEM use that same
+distributional contract internally when explicitly requested. A compact
+function-preserving expansion retained only the 17 units proven inactive on
+all 64,169 protected prefix examples, leaving 68 trainable output weights.
+Strict pointwise CEM over 20 scenarios found a nearly inert candidate; unseen
+seed 8570 was 8/115/5 with zero mean-route change and a negative survival
+bound. Distributional CEM over 35 scenarios then selected the unchanged parent
+in its first generation and never displaced it. Do not tune its CEM sigma or
+population: direct outcome optimization confirms this protected residual basis
+has no useful robust second-repair direction. The next experiment should use
+the overall route-1801 lineage rather than further extending the weaker KSF
+line.
+
 Use `SURF_WINDOW_MODE=hidden` for a renderer smoke test. A natural loop reload
 after the reported full `rollout_ticks` proves the episode completed without
 an earlier floor/teleport restart; it does not prove the learned path matches
