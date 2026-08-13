@@ -6849,6 +6849,25 @@ fn transcript_scroll_anchor_tracks_content_growth_and_collapse() {
     assert_eq!(preserve_scroll_anchor(2, 24, 20), 0);
 }
 
+#[test]
+fn returning_to_the_tail_discards_a_stale_growth_anchor() {
+    assert_eq!(
+        resolve_pending_scroll_anchor(false, 7, Some(20), 24),
+        11,
+        "detached view preserves its content anchor"
+    );
+    assert_eq!(
+        resolve_pending_scroll_anchor(true, 0, Some(20), 24),
+        0,
+        "the live tail wins when wheel motion reaches the bottom"
+    );
+    assert_eq!(
+        resolve_pending_scroll_anchor(false, 7, None, 24),
+        7,
+        "without a pending anchor, scrolling remains unchanged"
+    );
+}
+
 fn tall_expanded_diff_transcript() -> Transcript {
     let mut transcript = Transcript::default();
     for index in 0..20 {

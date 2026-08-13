@@ -4251,9 +4251,17 @@ impl BorgTerminal {
         // jump before the user has actually submitted anything.
         let is_launch_screen = transcript.is_empty() && queued_prompts.is_empty();
         let transcript_height = transcript.len();
-        if let Some(previous_height) = self.pending_scroll_anchor_height.take() {
-            self.scroll_from_bottom =
-                preserve_scroll_anchor(self.scroll_from_bottom, previous_height, transcript_height);
+        self.scroll_from_bottom = resolve_pending_scroll_anchor(
+            self.transcript.follow_tail,
+            self.scroll_from_bottom,
+            self.pending_scroll_anchor_height.take(),
+            transcript_height,
+        );
+        if self.transcript.follow_tail {
+            // A viewport that returned to the live tail no longer has a
+            // detached-content anchor to preserve. This can happen between
+            // the event and render arms while wheel motion is animating.
+            self.pending_transcript_anchor = None;
         }
         self.rendered_transcript_height = transcript_height;
         let modal_picker_open = matches!(
@@ -5804,6 +5812,9 @@ impl BorgTerminal {
         self.scroll_from_bottom = restored_scroll_from_bottom
             .unwrap_or(self.scroll_from_bottom)
             .min(next_scroll_max);
+        if self.scroll_from_bottom == 0 {
+            self.transcript.follow_tail = true;
+        }
         Ok(())
     }
 
@@ -8739,6 +8750,20 @@ fn preserve_scroll_anchor(
     } else {
         scroll_from_bottom.saturating_sub(previous_height - next_height)
     }
+}
+
+fn resolve_pending_scroll_anchor(
+    follow_tail: bool,
+    scroll_from_bottom: usize,
+    previous_height: Option<usize>,
+    next_height: usize,
+) -> usize {
+    if follow_tail {
+        return 0;
+    }
+    previous_height.map_or(scroll_from_bottom, |previous_height| {
+        preserve_scroll_anchor(scroll_from_bottom, previous_height, next_height)
+    })
 }
 
 fn should_preserve_transcript_viewport(follow_tail: bool) -> bool {
