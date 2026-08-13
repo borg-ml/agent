@@ -3144,8 +3144,36 @@ The full `s8684` search used spawn, route 900, and route 1050, capturing
 per-anchor gates. The exported controller-core hash exactly matches the
 unchanged `s8660` parent and its full-start outcome remains route 1113 at tick
 947, reset tick 1002. Do not tune this protected 14-unit output subspace
-further. `s8632` remains the current clean authority; no network completes the
-map or has playable-game completion parity.
+further.
+
+Surf commits `6573f44` and `e50b392` replace the fixed-tick correction
+distribution rather than tuning that dead basis. Paired exploration can now
+start from independently perturbed parent states that actually reached a
+requested ordered-route index, preserving each state's real episode tick.
+The residual trainer validates that route-start receipt and may protect
+ordinary added ReLU capacity by an earlier ordered-route boundary. This is
+training-only state selection; the deployed actor receives no route index,
+clock, gate, or memory.
+
+At route 1050, a fresh clean-parent search found a nonbaseline route gain in
+15 of 16 reached-state scenarios, with mean gain `+32.75` route samples and a
+maximum of `+77`. A new 128-unit bank was trained against those states, then
+compacted to eight units that are strictly inactive across 85,387 states at
+or before route 900. It was exported with zero output weights, so the parent
+function remained exact. Route-anchored output CEM over its 32 ordinary
+weights adopted generation 2. The resulting clean actor `s8695` reaches route
+1189 at tick 1039 and resets at tick 1112, versus route 1113/tick 947/reset
+1002 for `s8632`. Exact CPU and GPU runs match in route, timing, final position
+`[14048.416016,6716.543945,-3167.836914]`, and final velocity
+`[1335.701050,-1650.806641,-1758.063110]`.
+
+On 64 fresh matched native starts, `s8695` raises mean route
+`959.83 -> 966.61` and mean survival `817.69 -> 830.27`; paired 95% lower
+bounds are `+0.337` route and `+1.214` survival, with unchanged lower
+quartiles. It is 11/33/20 better/equal/worse, so this is a statistically
+accepted distributional gain, not pointwise perturbation dominance. `s8695`
+is the current clean authority. It still does not complete the map and has not
+established playable-game completion parity.
 
 Use `SURF_WINDOW_MODE=hidden` for a renderer smoke test. A natural loop reload
 after the reported full `rollout_ticks` proves the episode completed without
