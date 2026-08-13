@@ -3012,6 +3012,49 @@ has no useful robust second-repair direction. The next experiment should use
 the overall route-1801 lineage rather than further extending the weaker KSF
 line.
 
+Surf commit `d6ce10c` makes that cross-lineage experiment honest. Value
+collection now separates the completed `route_replay`, which defines ordered
+progress and the real finish, from `initial_reference`, which independently
+chooses either the replay start or the authentic native-game start. It can
+also run a training-only `policy-teacher` live on the exact CPU world and log
+the resulting actions against the clean 64-feature geometric observations
+used by the student; `episode-trace` provides a deterministic alignment
+control. Neither mode changes the deployed actor.
+
+From the native game start, the old route-1801 controller reaches KSF route
+1138 and survives all 1,969 requested ticks, ending at position
+`[-2121.2947,4442.3301,10949.3818]` and velocity
+`[-38.3513,-430.6876,-2162.0073]`. Live feedback execution and independently
+recorded episode commands produced identical hashes for all 1,969 actions,
+clean features, route indices, reset flags, final pose, and final velocity.
+This validates command alignment and cross-architecture DAgger collection.
+It does not establish completion or speed superiority: progress stopped at
+tick 950, far short of the completed KSF route, and the policy consumes action
+history, so it is a training teacher rather than an admissible final
+memoryless actor.
+
+The two lineages occupy materially different closed-loop state
+distributions. The unchanged s8541-equivalent geometric actor reaches route
+720/reset 752 from the canonical KSF start but route 564/reset 879 from the
+native start. Conversely, the route-1801 teacher resets within 95 suffix ticks
+when injected at the geometric actor's canonical tick-650 state, and within
+191 suffix ticks at its native-start tick-650 state. A fresh 17-unit capacity
+fit to the complete native teacher trace left the student's native trajectory
+bit-identical and only changed canonical evaluation to route 721/reset 756;
+the new units did not activate on the student's attractor. A joint global
+output-head fit moved native progress to route 728 but reset at tick 600 and
+regressed canonical evaluation to route 468/reset 435. Reject both policies.
+
+Do not respond with another supervised weighting, prefix length, ridge scale,
+or output-head fit. The irreducible next optimizer must compare each unchanged
+feed-forward candidate by exact closed-loop outcomes across both canonical KSF
+and native-game starts, plus bounded perturbations. Rank natural completion
+and earlier completion first, then farther and earlier ordered progress, with
+survival decisive only for equal progress; preserve distributional robustness
+and require final CPU/GPU and playable-game reproduction. The completed KSF
+run is a finish and pace authority, while native teachers supply authentic
+control technique without imposing the user's slower pace.
+
 Use `SURF_WINDOW_MODE=hidden` for a renderer smoke test. A natural loop reload
 after the reported full `rollout_ticks` proves the episode completed without
 an earlier floor/teleport restart; it does not prove the learned path matches
