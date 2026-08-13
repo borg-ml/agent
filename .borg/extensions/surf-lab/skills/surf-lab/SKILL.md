@@ -2923,6 +2923,49 @@ This closes further PPO/action-surrogate tuning for this lineage. Keep the
 route-693 parent as the geometric training authority and move proposal search
 into an exact closed-loop, low-dimensional policy-update space.
 
+The pointwise Pareto gate was then audited rather than treated as doctrine.
+One-unit spawn perturbations already send the unchanged parent across roughly
+route 500--700 basins, so arbitrarily small policy changes can swap individual
+outcomes without changing their distribution. A fresh 128-scenario audit of
+the previously strongest robust-PPO proposal was exactly 64 better/64 worse;
+its paired route mean changed by only `+0.03` with a 95% interval of about
+`[-5.6,+5.2]`. It is still rejected. This confirms that PPO did not hide a
+real aggregate improvement, but also shows why zero paired losses is too
+strong to serve as the sole robustness definition.
+
+Surf commit `33898c7` implements the successful feedback target. For each
+paired perturbed state, it selects the exact best complete action-program
+outcome including the deterministic parent, then fits those winning visited
+actions into the parent's already isolated 128-unit capacity suffix with a
+runtime-clamp-aware ridge solve. The base actor and both hidden transforms stay
+frozen. The exported policy is still the same single stateless
+64--1024--1024--6 ReLU actor; there is no runtime branch, phase, memory, or
+action schedule.
+
+The resulting policy
+`.borg/surf-lab/policies/utopia-ksf-wr-parent-s8480-focus600-pairedwinner-ridge-s8541.json`
+is the new KSF-line robust training authority. Exact nominal CPU and GPU both
+reach route 720 and reset at tick 752, versus route 693/tick 713. On unseen
+128-start seed 8542 it is better/worse on 105/23, raises mean route
+`554.13 -> 596.02`, lower-quartile route `517.00 -> 555.12`, mean survival
+`694.69 -> 749.21`, and lower-quartile survival `565.59 -> 646.62`; resets fall
+123 to 116 and full-horizon survivals rise 5 to 12. Paired 95% lower bounds are
+`+32.5` route and `+41.9` survival. Independent seed 8544 confirms 98/2/28,
+mean route `558.96 -> 591.85`, lower-quartile route `517.31 -> 546.22`, mean
+survival `690.48 -> 752.82`, lower-quartile survival `565.62 -> 638.78`, resets
+116 to 104, and full-horizon survivals 12 to 25. It does not complete and does
+not supersede the overall route-1801 progress leader.
+
+Surf commit `94c2122` records both robustness contracts. Pointwise
+scenario-wise nonregression remains visible as the strict diagnostic.
+Distributional acceptance requires at least 32 common starts, a nonregressing
+nominal run, positive 95% paired lower bounds for both ordered route and
+survival, nonworse lower quartiles, no extra resets, and no lost completions.
+The s8541 actor passes this contract on two independent 128-start populations;
+the earlier PPO, Pareto, and output-CEM candidates do not. Continue from s8541
+with new paired closed-loop data near its actual failure rather than tuning the
+ridge, PPO, KL, or CEM scales.
+
 Use `SURF_WINDOW_MODE=hidden` for a renderer smoke test. A natural loop reload
 after the reported full `rollout_ticks` proves the episode completed without
 an earlier floor/teleport restart; it does not prove the learned path matches
