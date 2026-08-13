@@ -2696,11 +2696,35 @@ Natural completion now requires the independently observed finish trigger and
 position proximity. It intentionally has no terminal-velocity gate: a faster
 valid line must not be rejected for differing from the demonstrator's exit
 velocity. Candidate ranking is lexicographic: completion, earlier completion,
-survival, farther ordered route distance, and earlier attainment of equal
-progress. The demonstrator supplies a route and useful technique, not a pace
+farther ordered route distance, earlier attainment of equal progress, and then
+longer survival/reset state for an equal-progress tie. Paired robust promotion
+is stricter: no scenario may lose ordered progress or survival time, and equal
+progress may not be reached later. This ordering prevents a stalled controller
+from outranking a faster, farther trajectory merely because it avoided a reset
+trigger. The demonstrator supplies a route and useful technique, not a pace
 ceiling. The first spawn-valid 64--512--512--6 KSF-route actor reset at tick 469;
 a protected local-residual iteration moved that to tick 512. Both are training
 experiments and remain below the existing clean controller authority.
+
+Surf commits `e27fb09` and `fa6fdfd` added direct closed-loop optimization of a
+localized output-weight suffix and watchdog-safe full-trajectory evaluation.
+Each GPU lane evaluates a different ordinary feed-forward output head through
+the shared Source core; exported candidates contain only the resulting frozen
+network weights. A parity test proves candidate-specific lanes match ordinary
+single-policy GPU inference, and a second test proves chunked physical/latch
+continuation matches the same one-shot rollout exactly. `e27fb09` also fixed an
+out-of-bounds continuous-policy GPU upload that copied storage for 324 discrete
+outputs even though the actor has six.
+
+The KSF-line robust parent reached route 693 and reset at tick 713. Local
+output-weight search produced nominal route 712/reset 756, but its independent
+perturbation gate regressed, so it was not promoted. Full spawn-trajectory
+search then produced route 707/reset 760 with exact CPU/GPU final state; a
+fresh five-scenario gate regressed route 568 to 514 and route 527 to 522. That
+candidate is also rejected. After correcting the progress-first/Pareto
+contract, a five-scenario full-trajectory search retained the route-693 parent
+exactly. No KSF-line actor completes the map, and the older route-1801 policy
+remains the overall strict clean leader.
 
 ## Native policy visualization
 
