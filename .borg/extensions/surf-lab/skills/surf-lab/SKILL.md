@@ -3107,6 +3107,26 @@ the late localized basis and evaluated jointly from spawn and the late anchor.
 Surf commit `8113845` ensures later incumbent-only generations do not overwrite
 the recorded evidence for the generation that actually adopted new weights.
 
+That direct late optimization did not promote a successor. A compact
+single-trajectory basis produced `s8650`, which reached nominal route 1171 and
+matched exactly on CPU and GPU, but a fresh 64-start comparison was only
+32/6/26 better/equal/worse. Its mean route rose slightly while its lower
+quartile fell `784.81 -> 734.06`; the paired route-gain lower bound was
+`-32.58` and the survival lower bound was `-47.23`. Reject `s8650`.
+
+A stronger protection test collected 100,136 parent prefix states from 128
+perturbed native starts and 1,024 late correction examples from 32 independent
+paired searches. Fourteen added units were strictly inactive on every
+protected state and preserved the parent exactly. Direct closed-loop output
+CEM over those units produced `s8662`, but on 64 fresh starts 63 trajectories
+were unchanged and the sole changed trajectory was worse; route gain was
+exactly zero and the progress and survival lower bounds were negative. Reject
+`s8662`. Together these results close fixed-tick late-basis repair rather than
+inviting a parameter sweep. The next training distribution must select
+anchors by reached ordered-route state, because perturbed actors occupy
+unrelated route states at the same episode tick. This remains training-only;
+the deployed actor stays one ordinary phase-free feed-forward network.
+
 Use `SURF_WINDOW_MODE=hidden` for a renderer smoke test. A natural loop reload
 after the reported full `rollout_ticks` proves the episode completed without
 an earlier floor/teleport restart; it does not prove the learned path matches
