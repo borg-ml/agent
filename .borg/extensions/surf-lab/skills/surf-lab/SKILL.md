@@ -2899,6 +2899,30 @@ promotion. Do not respond by adding recurrence, a route phase, another local
 bank, or a learning-rate sweep: none addresses the demonstrated surrogate-to-
 closed-loop mismatch.
 
+Surf commit `8a1f88b` adds one final general test of the action surrogate. The
+trainer can form one loss gradient per paired scenario, solve for an
+approximately minimum-norm convex combination, verify that its update direction
+has nonnegative first-order gain for every scenario, and calibrate the single
+proposal to a declared KL trust region. The exported artifact remains the same
+ordinary feed-forward actor. From the route-693 parent, all 32 seed-8513
+scenario surrogates improved at KL `1e-6`, yet a fresh 32-scenario exact screen
+was better/worse on 16/16 starts. From the rejected-but-broader s8516 training
+center, Pareto and smooth robust second-generation proposals were only 8/24 and
+10/22. Reject them all.
+
+A final causally focused collection began from the unchanged parent's exact
+policy-prefix state at tick 600. Its action programs reached route 731 versus
+the local parent near 693 and supplied 480 positive decisions, so the failure
+was not lack of local signal. The common-descent proposal improved all 32
+offline scenario surrogates, but the fresh complete-start seed-8532 gate was
+better/worse on 18/14 and rejected it. The durable collection and gate are
+`.borg/surf-lab/native-states/utopia-ksf-wr-parent-s8480-focus600-paired32x8-held16-s8530-v1.jsonl`
+and
+`.borg/surf-lab/native-states/utopia-ksf-wr-parent-vs-focus600-paretograd-s8531-paired32-s8532-v1.jsonl`.
+This closes further PPO/action-surrogate tuning for this lineage. Keep the
+route-693 parent as the geometric training authority and move proposal search
+into an exact closed-loop, low-dimensional policy-update space.
+
 Use `SURF_WINDOW_MODE=hidden` for a renderer smoke test. A natural loop reload
 after the reported full `rollout_ticks` proves the episode completed without
 an earlier floor/teleport restart; it does not prove the learned path matches
