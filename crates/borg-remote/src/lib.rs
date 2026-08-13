@@ -55,9 +55,10 @@ pub use command::{
 };
 pub use contract::*;
 pub use extension_api::{
-    EXTENSION_API_VERSION, ExtensionApiCommand, ExtensionApiHook, ExtensionApiRegistry,
-    ExtensionApiScope, ExtensionApiSnapshot, ExtensionApiTool, ExtensionApiTransform,
-    ExtensionEffectClass, effect_class_from_name,
+    EXTENSION_API_VERSION, EXTENSION_HOOK_EVENTS, ExtensionApiCommand, ExtensionApiHook,
+    ExtensionApiRegistry, ExtensionApiScope, ExtensionApiSnapshot, ExtensionApiTool,
+    ExtensionApiTransform, ExtensionEffectClass, MAX_HOOK_ARGUMENT_BYTES, bounded_hook_arguments,
+    effect_class_from_name,
 };
 pub use filesystem::{execute_workspace_filesystem, execute_workspace_filesystem_with_limits};
 pub use host::{

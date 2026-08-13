@@ -66,6 +66,7 @@ version = 1
 
 [api.transforms.concise]
 append_system_prompt = "Prefer concise release notes."
+append_context = "Keep the release checklist in view."
 
 [api.hooks.after_turn]
 event = "turn_completed"
@@ -83,12 +84,22 @@ workflow = "review"
 description = "Run the durable review command"
 ```
 
-The supported hook events are `turn_started` and `turn_completed`. Tool and
-command registrations are exposed through the same provider-neutral dispatcher
-and execute only workflows in the immutable turn snapshot. Their JSON object
-is available as a JSON string inside Blu through `borg_workflow_arguments(call_id)`. Workflow
-start, host-call, and terminal records remain in the session journal, so a
-retry replays a completed effect instead of invoking an opaque live callback.
+The supported hook events are `turn_started`, `turn_completed`,
+`tool_execute_before`, `tool_execute_after`, `command_execute_before`,
+`command_execute_after`, and `before_compaction`. Turn and lifecycle payloads
+are bounded JSON objects; the workflow reads them through
+`borg_workflow_arguments(call_id)`. `append_context` is a typed, replay-safe
+context addition, while arbitrary message-list mutation is intentionally not
+part of v1 because it would change canonical replay and provider cache
+identity. Tool and command registrations are exposed through the same
+provider-neutral dispatcher and execute only workflows in the immutable turn
+snapshot. Workflow start, host-call, and terminal records remain in the
+session journal, so a retry replays a completed effect instead of invoking an
+opaque live callback.
+
+Extension commands are available from the TUI command palette and can also be
+typed directly as `/ext:<extension-id>:<command>`. Add a JSON object after the
+command for structured arguments, or plain text for `{ "arguments": "..." }`.
 
 ## Commands
 

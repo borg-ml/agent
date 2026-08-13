@@ -135,6 +135,33 @@ fn director_command_extracts_text_without_matching_longer_commands() {
 }
 
 #[test]
+fn extension_commands_accept_objects_and_wrap_text_arguments() {
+    let commands = vec![borg_remote::ExtensionApiCommand {
+        extension_id: "docs".to_string(),
+        name: "review".to_string(),
+        scope: borg_remote::ExtensionApiScope::Project,
+        workflow: "review".to_string(),
+        description: "Review the change".to_string(),
+        effect: borg_remote::ExtensionEffectClass::Idempotent,
+    }];
+
+    assert_eq!(
+        extension_command_request("/ext:docs:review {\"kind\":\"quick\"}", &commands).unwrap(),
+        Some((
+            "extcmd__docs__review".to_string(),
+            serde_json::json!({"kind": "quick"}),
+        ))
+    );
+    assert_eq!(
+        extension_command_request("/ext:docs:review inspect staged", &commands)
+            .unwrap()
+            .map(|(_, arguments)| arguments),
+        Some(serde_json::json!({"arguments": "inspect staged"}))
+    );
+    assert!(extension_command_request("/ext:docs:review {not-json}", &commands).is_err());
+}
+
+#[test]
 fn terminal_admission_is_released_by_a_terminal_failed_prompt() {
     let message_id = Uuid::new_v4();
     assert_eq!(

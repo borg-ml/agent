@@ -15,6 +15,17 @@ const MAX_REGISTRATIONS: usize = 256;
 const MAX_NAME_BYTES: usize = 128;
 const MAX_DESCRIPTION_BYTES: usize = 4 * 1024;
 const MAX_TRANSFORM_BYTES: usize = 16 * 1024;
+pub const MAX_HOOK_ARGUMENT_BYTES: usize = 64 * 1024;
+
+pub const EXTENSION_HOOK_EVENTS: &[&str] = &[
+    "turn_started",
+    "turn_completed",
+    "tool_execute_before",
+    "tool_execute_after",
+    "command_execute_before",
+    "command_execute_after",
+    "before_compaction",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -38,6 +49,8 @@ pub struct ExtensionApiTransform {
     pub name: String,
     pub scope: ExtensionApiScope,
     pub append_system_prompt: String,
+    #[serde(default)]
+    pub append_context: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -106,13 +119,31 @@ impl ExtensionApiSnapshot {
                 transform.extension_id,
                 transform.name
             );
+            ensure!(
+                !transform.append_system_prompt.contains('\0'),
+                "extension transform {}:{} contains NUL",
+                transform.extension_id,
+                transform.name
+            );
+            ensure!(
+                transform.append_context.len() <= MAX_TRANSFORM_BYTES,
+                "extension context transform {}:{} is too large",
+                transform.extension_id,
+                transform.name
+            );
+            ensure!(
+                !transform.append_context.contains('\0'),
+                "extension context transform {}:{} contains NUL",
+                transform.extension_id,
+                transform.name
+            );
         }
         for hook in &self.hooks {
             validate_name(&hook.extension_id, "extension id")?;
             validate_name(&hook.name, "hook name")?;
             validate_name(&hook.event, "hook event")?;
             ensure!(
-                matches!(hook.event.as_str(), "turn_started" | "turn_completed"),
+                EXTENSION_HOOK_EVENTS.contains(&hook.event.as_str()),
                 "unsupported extension hook event {}",
                 hook.event
             );
@@ -163,6 +194,21 @@ impl ExtensionApiSnapshot {
                     transform.extension_id,
                     transform.name,
                     transform.append_system_prompt.trim()
+                )
+            })
+            .collect()
+    }
+
+    pub fn context_appendix(&self) -> String {
+        self.transforms
+            .iter()
+            .filter(|transform| !transform.append_context.trim().is_empty())
+            .map(|transform| {
+                format!(
+                    "\n\n[Extension context {}:{}]\n{}",
+                    transform.extension_id,
+                    transform.name,
+                    transform.append_context.trim()
                 )
             })
             .collect()
@@ -224,6 +270,24 @@ impl ExtensionApiSnapshot {
             })
             .collect()
     }
+
+    pub fn command_user_name(command: &ExtensionApiCommand) -> String {
+        format!("/ext:{}:{}", command.extension_id, command.name)
+    }
+}
+
+pub fn bounded_hook_arguments(value: &Value) -> Value {
+    let Ok(serialized) = serde_json::to_vec(value) else {
+        return json!({"truncated": true, "reason": "not-json"});
+    };
+    if serialized.len() <= MAX_HOOK_ARGUMENT_BYTES {
+        return value.clone();
+    }
+    json!({
+        "truncated": true,
+        "bytes": serialized.len(),
+        "limit": MAX_HOOK_ARGUMENT_BYTES,
+    })
 }
 
 fn validate_name(value: &str, label: &str) -> Result<()> {
@@ -322,6 +386,7 @@ mod tests {
             name: "prompt".to_string(),
             scope: ExtensionApiScope::Project,
             append_system_prompt: "x".repeat(MAX_TRANSFORM_BYTES + 1),
+            append_context: String::new(),
         });
         assert!(snapshot.validate().is_err());
     }
@@ -334,11 +399,36 @@ mod tests {
             name: "prompt".to_string(),
             scope: ExtensionApiScope::Project,
             append_system_prompt: "Use the project glossary.".to_string(),
+            append_context: "Include the project glossary in context.".to_string(),
         });
         snapshot.validate().unwrap();
         assert_eq!(
             snapshot.prompt_appendix(),
             "\n\n[Extension transform one:prompt]\nUse the project glossary."
         );
+        assert_eq!(
+            snapshot.context_appendix(),
+            "\n\n[Extension context one:prompt]\nInclude the project glossary in context."
+        );
+    }
+
+    #[test]
+    fn lifecycle_event_and_hook_payload_limits_are_explicit() {
+        let mut snapshot = empty_snapshot("catalog-1");
+        snapshot.hooks.push(ExtensionApiHook {
+            extension_id: "one".to_string(),
+            name: "compact".to_string(),
+            scope: ExtensionApiScope::Project,
+            event: "before_compaction".to_string(),
+            workflow: "compact".to_string(),
+            effect: ExtensionEffectClass::Idempotent,
+        });
+        snapshot.validate().unwrap();
+
+        let bounded = bounded_hook_arguments(&json!({
+            "text": "x".repeat(MAX_HOOK_ARGUMENT_BYTES)
+        }));
+        assert_eq!(bounded["truncated"], true);
+        assert_eq!(bounded["limit"], MAX_HOOK_ARGUMENT_BYTES);
     }
 }

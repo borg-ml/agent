@@ -533,6 +533,7 @@ pub enum ParticipantCommandKind {
     RespondToProviderInteraction,
     Goal,
     Todo,
+    ExtensionCommand,
     Subagent,
     Interrupt,
     Compact,
@@ -975,6 +976,15 @@ pub enum HostCommand {
         session_id: Uuid,
         action: TodoAction,
     },
+    /// Execute a validated workflow-backed extension command from the
+    /// user-facing command path. Arguments stay structured and host-local;
+    /// the session actor applies the active immutable extension snapshot.
+    ExtensionCommand {
+        session_id: Uuid,
+        invocation_id: Uuid,
+        command: String,
+        arguments: Value,
+    },
     Subagent {
         session_id: Uuid,
         action: SubagentAction,
@@ -1022,6 +1032,7 @@ impl HostCommand {
             | Self::RespondToProviderInteraction { session_id, .. }
             | Self::Goal { session_id, .. }
             | Self::Todo { session_id, .. }
+            | Self::ExtensionCommand { session_id, .. }
             | Self::Subagent { session_id, .. }
             | Self::Interrupt { session_id }
             | Self::Compact { session_id }

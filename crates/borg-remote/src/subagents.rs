@@ -862,12 +862,191 @@ impl AgentToolDispatcher {
             .await
     }
 
+    pub(crate) async fn call_without_extension_hooks(
+        &self,
+        name: &str,
+        arguments: Value,
+        workflow_approved: bool,
+        workflow_cancel: Option<CancellationToken>,
+    ) -> Result<Value> {
+        self.call_with_workflow_control_unhooked(
+            name,
+            arguments,
+            workflow_approved,
+            workflow_cancel,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn call_extension_command(
+        &self,
+        name: &str,
+        arguments: Value,
+        invocation_id: Uuid,
+        workflow_approved: bool,
+        workflow_cancel: Option<CancellationToken>,
+    ) -> Result<Value> {
+        anyhow::ensure!(
+            self.extension_api_snapshot().command(name).is_some(),
+            "unknown extension command {name}"
+        );
+        self.call_with_workflow_control_and_invocation(
+            name,
+            arguments,
+            workflow_approved,
+            workflow_cancel,
+            Some(invocation_id),
+        )
+        .await
+    }
+
     pub(crate) async fn call_with_workflow_control(
         &self,
         name: &str,
         arguments: Value,
         workflow_approved: bool,
         workflow_cancel: Option<CancellationToken>,
+    ) -> Result<Value> {
+        self.call_with_workflow_control_and_invocation(
+            name,
+            arguments,
+            workflow_approved,
+            workflow_cancel,
+            None,
+        )
+        .await
+    }
+
+    async fn call_with_workflow_control_and_invocation(
+        &self,
+        name: &str,
+        arguments: Value,
+        workflow_approved: bool,
+        workflow_cancel: Option<CancellationToken>,
+        explicit_invocation_id: Option<Uuid>,
+    ) -> Result<Value> {
+        let is_command = self.extension_api_snapshot().command(name).is_some();
+        let event_prefix = if is_command { "command" } else { "tool" };
+        let serialized = serde_json::to_vec(&arguments)?;
+        let invocation_id = explicit_invocation_id.unwrap_or_else(|| {
+            Uuid::new_v5(
+                &self.actor_session_id,
+                &[
+                    event_prefix.as_bytes(),
+                    b"\0",
+                    name.as_bytes(),
+                    b"\0",
+                    &serialized,
+                ]
+                .concat(),
+            )
+        });
+        let hook_arguments = crate::bounded_hook_arguments(&arguments);
+        let before_event = format!("{event_prefix}_execute_before");
+        self.run_extension_hooks(
+            &before_event,
+            invocation_id,
+            json!({
+                "event": before_event.as_str(),
+                "session_id": self.actor_session_id,
+                "call_id": invocation_id,
+                "tool": (!is_command).then_some(name),
+                "command": is_command.then_some(name),
+                "arguments": hook_arguments.clone(),
+            }),
+        )
+        .await?;
+        let result = self
+            .call_with_workflow_control_unhooked(
+                name,
+                arguments,
+                workflow_approved,
+                workflow_cancel,
+                explicit_invocation_id,
+            )
+            .await;
+        let after_event = format!("{event_prefix}_execute_after");
+        let after_arguments = match &result {
+            Ok(output) => json!({
+                "event": after_event.as_str(),
+                "session_id": self.actor_session_id,
+                "call_id": invocation_id,
+                "tool": (!is_command).then_some(name),
+                "command": is_command.then_some(name),
+                "arguments": hook_arguments,
+                "result": crate::bounded_hook_arguments(output),
+            }),
+            Err(error) => json!({
+                "event": after_event.as_str(),
+                "session_id": self.actor_session_id,
+                "call_id": invocation_id,
+                "tool": (!is_command).then_some(name),
+                "command": is_command.then_some(name),
+                "arguments": hook_arguments,
+                "error": error.to_string(),
+            }),
+        };
+        if let Err(error) = self
+            .run_extension_hooks(&after_event, invocation_id, after_arguments)
+            .await
+        {
+            tracing::warn!(%error, event = %after_event, name, "extension lifecycle hook failed");
+        }
+        result
+    }
+
+    pub(crate) async fn run_extension_hooks(
+        &self,
+        event: &str,
+        invocation_id: Uuid,
+        arguments: Value,
+    ) -> Result<()> {
+        let snapshot = self.extension_api_snapshot();
+        let Some(context) = self.blu_workflows.as_ref() else {
+            anyhow::ensure!(
+                !snapshot.hooks.iter().any(|hook| hook.event == event),
+                "extension hooks are unavailable for this session"
+            );
+            return Ok(());
+        };
+        let arguments = crate::bounded_hook_arguments(&arguments);
+        for hook in snapshot.hooks.iter().filter(|hook| hook.event == event) {
+            let workflow = (context.snapshot)()
+                .into_iter()
+                .find(|workflow| {
+                    workflow.extension_id == hook.extension_id && workflow.name == hook.workflow
+                })
+                .with_context(|| {
+                    format!(
+                        "extension hook {}:{} references missing workflow {}:{}",
+                        hook.extension_id, hook.name, hook.extension_id, hook.workflow
+                    )
+                })?;
+            let workflow_id = Uuid::new_v5(
+                &invocation_id,
+                format!("extension-hook:{event}:{}:{}", hook.extension_id, hook.name).as_bytes(),
+            );
+            self.run_workflow_definition_with_arguments(
+                context,
+                workflow,
+                workflow_id,
+                arguments.clone(),
+                false,
+                None,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn call_with_workflow_control_unhooked(
+        &self,
+        name: &str,
+        arguments: Value,
+        workflow_approved: bool,
+        workflow_cancel: Option<CancellationToken>,
+        explicit_invocation_id: Option<Uuid>,
     ) -> Result<Value> {
         if let Some(tool) = self.extension_api_snapshot().tool(name).cloned() {
             let context = self
@@ -919,10 +1098,12 @@ impl AgentToolDispatcher {
                     )
                 })?;
             let serialized = serde_json::to_vec(&arguments)?;
-            let workflow_id = Uuid::new_v5(
-                &self.actor_session_id,
-                &[name.as_bytes(), b"\0", &serialized].concat(),
-            );
+            let workflow_id = explicit_invocation_id.unwrap_or_else(|| {
+                Uuid::new_v5(
+                    &self.actor_session_id,
+                    &[name.as_bytes(), b"\0", &serialized].concat(),
+                )
+            });
             return self
                 .run_workflow_definition_with_arguments(
                     context,

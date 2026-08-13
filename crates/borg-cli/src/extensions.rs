@@ -89,6 +89,7 @@ impl ExtensionCatalog {
                         name: name.clone(),
                         scope: transform.scope,
                         append_system_prompt: transform.append_system_prompt.clone(),
+                        append_context: transform.append_context.clone(),
                     }
                 }));
             snapshot
@@ -250,7 +251,10 @@ pub(crate) struct ApiManifest {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ApiTransform {
+    #[serde(default)]
     pub append_system_prompt: String,
+    #[serde(default)]
+    pub append_context: String,
     #[serde(default = "project_scope")]
     pub scope: borg_remote::ExtensionApiScope,
 }
@@ -875,6 +879,16 @@ fn validate_candidate_declarations(candidate: &mut Candidate, manifest: &Manifes
             "extension {} transform {name} contains NUL",
             manifest.id
         );
+        ensure!(
+            transform.append_context.len() <= 16 * 1024,
+            "extension {} context transform {name} is too large",
+            manifest.id
+        );
+        ensure!(
+            !transform.append_context.contains('\0'),
+            "extension {} context transform {name} contains NUL",
+            manifest.id
+        );
     }
     for (name, hook) in &manifest.api.hooks {
         ensure!(valid_id(name), "invalid extension hook name {name}");
@@ -884,7 +898,7 @@ fn validate_candidate_declarations(candidate: &mut Candidate, manifest: &Manifes
             manifest.id
         );
         ensure!(
-            matches!(hook.event.as_str(), "turn_started" | "turn_completed"),
+            borg_remote::EXTENSION_HOOK_EVENTS.contains(&hook.event.as_str()),
             "extension {} hook {name} uses unsupported event {}",
             manifest.id,
             hook.event
@@ -2088,6 +2102,7 @@ entrypoint = "workflows/review.blu"
 version = 1
 [api.transforms.concise]
 append_system_prompt = "Use concise notes."
+append_context = "Keep the release checklist in view."
 [api.hooks.after_turn]
 event = "turn_completed"
 workflow = "review"
@@ -2119,6 +2134,10 @@ description = "Run review"
         let snapshot = catalog.api_snapshot();
         assert_eq!(snapshot.api_version, borg_remote::EXTENSION_API_VERSION);
         assert_eq!(snapshot.transforms.len(), 1);
+        assert_eq!(
+            snapshot.transforms[0].append_context,
+            "Keep the release checklist in view."
+        );
         assert_eq!(snapshot.hooks[0].event, "turn_completed");
         assert_eq!(snapshot.tools[0].wire_name, "ext__api__review");
         assert_eq!(snapshot.commands[0].name, "review");

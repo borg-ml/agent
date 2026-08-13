@@ -1543,6 +1543,7 @@ async fn run_local_agent_session(
                 &agent_config.keybindings,
             )?;
             terminal.set_configured_model_entries(agent_config.configured_model_entries());
+            terminal.set_extension_commands(extension_catalog.api_snapshot().commands);
             Some(terminal)
         } else {
             match BorgTerminal::enter(
@@ -1573,6 +1574,7 @@ async fn run_local_agent_session(
         resume_display_state(session_state.clone(), session_access, resuming);
     if let Some(terminal) = terminal.as_mut() {
         terminal.set_configured_model_entries(agent_config.configured_model_entries());
+        terminal.set_extension_commands(extension_catalog.api_snapshot().commands);
         terminal.seed_history(&history);
         terminal.seed_pending_prompt_events(&pending_prompt_events);
         terminal.seed_team_roster(&team_snapshots);
@@ -1907,6 +1909,9 @@ async fn run_local_agent_session(
                                 terminal.set_configured_model_entries(
                                     agent_config.configured_model_entries(),
                                 );
+                                terminal.set_extension_commands(
+                                    extension_catalog.api_snapshot().commands,
+                                );
                             }
                             // Force the Blu snapshot to include updated base
                             // MCP servers, capability gates, and trust policy.
@@ -1974,6 +1979,9 @@ async fn run_local_agent_session(
                             );
                             extension_catalog = next_catalog;
                             if let Some(terminal) = terminal.as_mut() {
+                                terminal.set_extension_commands(
+                                    extension_catalog.api_snapshot().commands,
+                                );
                                 terminal.set_notice(
                                     "Blu reloaded · extensions apply at the next turn boundary"
                                         .to_string(),
@@ -3088,6 +3096,7 @@ async fn run_local_agent_session(
                                 &agent_config.keybindings,
                             )?;
                             restored.set_configured_model_entries(agent_config.configured_model_entries());
+                            restored.set_extension_commands(extension_catalog.api_snapshot().commands);
                             let composer_history = store
                                 .recent_user_messages(session_id, RICH_TUI_PROMPT_HISTORY_LIMIT)
                                 .await?;
@@ -3624,6 +3633,45 @@ async fn run_local_agent_session(
                         let expanded = agent_config.expand_command(text.trim());
                         let expanded = normalize_consultation_command(&expanded);
                         let line = expanded.trim();
+                        match extension_command_request(
+                            line,
+                            &extension_catalog.api_snapshot().commands,
+                        ) {
+                            Ok(Some((command, arguments))) if attachments.is_empty() => {
+                                let invocation_id = Uuid::new_v4();
+                                let notice = format!("Running {line}");
+                                if session_command_tx
+                                    .send(HostCommand::ExtensionCommand {
+                                        session_id,
+                                        invocation_id,
+                                        command,
+                                        arguments,
+                                    })
+                                    .await
+                                    .is_ok()
+                                {
+                                    terminal.as_mut().expect("terminal").set_notice(notice);
+                                } else {
+                                    terminal
+                                        .as_mut()
+                                        .expect("terminal")
+                                        .set_notice("Extension command could not reach the session actor");
+                                }
+                                continue;
+                            }
+                            Ok(Some(_)) => {
+                                terminal
+                                    .as_mut()
+                                    .expect("terminal")
+                                    .set_notice("Extension commands do not accept attachments");
+                                continue;
+                            }
+                            Err(error) => {
+                                terminal.as_mut().expect("terminal").set_notice(error.to_string());
+                                continue;
+                            }
+                            Ok(None) => {}
+                        }
                         if line == "/model" && attachments.is_empty() {
                             terminal.as_mut().expect("terminal").open_model_picker();
                         } else if line == "/effort" && attachments.is_empty() {
@@ -4127,6 +4175,7 @@ async fn run_local_agent_session(
                                             &agent_config.keybindings,
                                         )?;
                                         restored.set_configured_model_entries(agent_config.configured_model_entries());
+                                        restored.set_extension_commands(extension_catalog.api_snapshot().commands);
                                         let composer_history = store
                                             .recent_user_messages(
                                                 session_id,
@@ -4185,6 +4234,7 @@ async fn run_local_agent_session(
                                             &agent_config.keybindings,
                                         )?;
                                         restored.set_configured_model_entries(agent_config.configured_model_entries());
+                                        restored.set_extension_commands(extension_catalog.api_snapshot().commands);
                                         let composer_history = store
                                             .recent_user_messages(
                                                 session_id,
@@ -5792,6 +5842,44 @@ fn director_prompt_command(line: &str) -> Option<Result<String>> {
     }
 }
 
+fn extension_command_request(
+    line: &str,
+    commands: &[borg_remote::ExtensionApiCommand],
+) -> Result<Option<(String, serde_json::Value)>> {
+    let Some(rest) = line.strip_prefix("/ext:") else {
+        return Ok(None);
+    };
+    let (qualified, argument_text) = rest
+        .split_once(char::is_whitespace)
+        .map_or((rest, ""), |(qualified, arguments)| {
+            (qualified, arguments.trim())
+        });
+    let (extension_id, name) = qualified
+        .split_once(':')
+        .context("usage: /ext:EXTENSION:COMMAND [JSON_OBJECT|TEXT]")?;
+    let command = commands
+        .iter()
+        .find(|command| command.extension_id == extension_id && command.name == name)
+        .with_context(|| format!("extension command /ext:{extension_id}:{name} is not active"))?;
+    let arguments = if argument_text.is_empty() {
+        serde_json::json!({})
+    } else if argument_text.starts_with('{') {
+        let value: serde_json::Value = serde_json::from_str(argument_text)
+            .context("extension command arguments must be valid JSON")?;
+        anyhow::ensure!(
+            value.is_object(),
+            "extension command arguments must be a JSON object"
+        );
+        value
+    } else {
+        serde_json::json!({"arguments": argument_text})
+    };
+    Ok(Some((
+        borg_remote::ExtensionApiSnapshot::command_wire_name(command),
+        arguments,
+    )))
+}
+
 fn director_prompt_delivery(
     active: bool,
     provider: CodingProvider,
@@ -6390,6 +6478,7 @@ fn remote_command_name(command: &HostCommand) -> &'static str {
         HostCommand::RespondToProviderInteraction { .. } => "provider interaction response",
         HostCommand::Goal { .. } => "goal",
         HostCommand::Todo { .. } => "todo",
+        HostCommand::ExtensionCommand { .. } => "extension command",
         HostCommand::Subagent { .. } => "subagent",
         HostCommand::Interrupt { .. } => "interrupt",
         HostCommand::Compact { .. } => "compact",

@@ -147,6 +147,10 @@ impl NativeHarness {
             "typed, lexical, or regex evidence from the lossless journal when compacted context is insufficient. Use `history_index` or `borg.history_index(...)` to page the full normalized log and build a task-specific retrieval or BorgSearch adapter; use `borg.semantic_search(...)` when the scoped Web BorgSearch MCP service is the right candidate retriever; persist mature adapters with `create_retrieval_adapter`, test them with `borg.test_retrieval_adapter(...)`, and resolve every index hit back through canonical history. ",
         );
         system_prompt.push_str(&runtime.context.prompt_appendix());
+        if !turn.system_prompt_appendix.is_empty() {
+            system_prompt.push_str("\n\n");
+            system_prompt.push_str(&turn.system_prompt_appendix);
+        }
         if let Some(instruction) = turn.response_language.instruction() {
             system_prompt.push_str("\n\n");
             system_prompt.push_str(instruction);

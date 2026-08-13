@@ -1004,7 +1004,9 @@ impl HostBridge {
                     .clone()
                     .context("Borg agent tools are unavailable")?;
                 self.journal.call(call_id, operation, request, || {
-                    self.block_on(dispatcher.call(&name, arguments))
+                    self.block_on(
+                        dispatcher.call_without_extension_hooks(&name, arguments, false, None),
+                    )
                 })?
             }
             "history" => {

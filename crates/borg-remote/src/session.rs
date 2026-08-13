@@ -967,6 +967,59 @@ async fn run_agent_session_kernel(
     .await
 }
 
+async fn run_before_compaction_hook(
+    journal: &mut RuntimeSessionStore,
+    events: &mpsc::Sender<SessionEvent>,
+    session_id: Uuid,
+    dispatcher: &crate::AgentToolDispatcher,
+    provider: CodingProvider,
+    model: Option<&str>,
+    mode: &str,
+    trigger: Option<&str>,
+) -> Result<()> {
+    let state = journal.state(session_id).await?;
+    let invocation_id = Uuid::new_v5(
+        &session_id,
+        format!("extension-hook:before_compaction:{}", state.latest_sequence).as_bytes(),
+    );
+    if let Err(error) = dispatcher
+        .run_extension_hooks(
+            "before_compaction",
+            invocation_id,
+            serde_json::json!({
+                "event": "before_compaction",
+                "session_id": session_id,
+                "provider": provider,
+                "model": model,
+                "mode": mode,
+                "trigger": trigger,
+                "context_generation": state.context_generation,
+                "context_tokens": state.usage.context_tokens,
+                "context_window_tokens": state.usage.context_window_tokens,
+                "journal_sequence": state.latest_sequence,
+            }),
+        )
+        .await
+    {
+        tracing::warn!(%error, %session_id, "extension before_compaction hook failed");
+        record(
+            journal,
+            events,
+            session_id,
+            SessionEventKind::ProviderEvent {
+                provider,
+                kind: "extension_hook_failed".to_string(),
+                payload: serde_json::json!({
+                    "event": "before_compaction",
+                    "error": error.to_string(),
+                }),
+            },
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 // This is the single assembly boundary for the session actor's channels and
 // durable services; keeping the inputs explicit makes ownership unambiguous.
 #[allow(clippy::too_many_arguments)]
@@ -1586,6 +1639,62 @@ async fn run_agent_session_store_kernel(
                         });
                     }
                     Some(HostCommand::RecallQueuedPrompt { .. }) => {}
+                    Some(HostCommand::ExtensionCommand {
+                        session_id: command_session_id,
+                        invocation_id,
+                        command,
+                        arguments,
+                    }) if command_session_id == session_id => {
+                        if let Some(extension_api) = executor.extension_api_snapshot() {
+                            dispatcher.configure_extension_api(extension_api)?;
+                        }
+                        record(
+                            &mut journal,
+                            &events,
+                            session_id,
+                            SessionEventKind::ToolStarted {
+                                tool_call_id: invocation_id.to_string(),
+                                name: command.clone(),
+                                input: arguments.clone(),
+                                input_ref: None,
+                            },
+                        )
+                        .await?;
+                        let result = dispatcher
+                            .call_extension_command(
+                                &command,
+                                arguments.clone(),
+                                invocation_id,
+                                false,
+                                None,
+                            )
+                            .await;
+                        let (output, is_error) = match result {
+                            Ok(value) => (
+                                serde_json::to_string(&value)?
+                                    .chars()
+                                    .take(64 * 1024)
+                                    .collect(),
+                                false,
+                            ),
+                            Err(error) => (error.to_string(), true),
+                        };
+                        record(
+                            &mut journal,
+                            &events,
+                            session_id,
+                            SessionEventKind::ToolCompleted {
+                                tool_call_id: invocation_id.to_string(),
+                                output,
+                                output_ref: None,
+                                is_error,
+                                input: Some(arguments),
+                                input_ref: None,
+                            },
+                        )
+                        .await?;
+                        continue;
+                    }
                     Some(HostCommand::Configure { action, .. }) => {
                         match apply_session_config(
                             &mut journal,
@@ -1680,6 +1789,9 @@ async fn run_agent_session_store_kernel(
                     Some(HostCommand::Compact {
                         session_id: command_session_id,
                     }) if command_session_id == session_id => {
+                        if let Some(extension_api) = executor.extension_api_snapshot() {
+                            dispatcher.configure_extension_api(extension_api)?;
+                        }
                         let provider_context_compaction = launch.provider == CodingProvider::Codex
                             && subscription_context_reusable
                             && provider_session_id.is_some()
@@ -1706,6 +1818,17 @@ async fn run_agent_session_store_kernel(
                                     "summary": "Compacting context…",
                                 }),
                             },
+                        )
+                        .await?;
+                        run_before_compaction_hook(
+                            &mut journal,
+                            &events,
+                            session_id,
+                            &dispatcher,
+                            launch.provider,
+                            launch.model.as_deref(),
+                            "manual",
+                            Some("user"),
                         )
                         .await?;
                         let result: Result<Option<crate::AgentCompaction>> = async {
@@ -2036,6 +2159,17 @@ async fn run_agent_session_store_kernel(
                             "trigger": "context_threshold",
                         }),
                     },
+                )
+                .await?;
+                run_before_compaction_hook(
+                    &mut journal,
+                    &events,
+                    session_id,
+                    &dispatcher,
+                    launch.provider,
+                    launch.model.as_deref(),
+                    "automatic",
+                    Some("context_threshold"),
                 )
                 .await?;
                 let result = async {
@@ -3120,6 +3254,9 @@ async fn run_agent_session_store_kernel(
                                 )
                                 .await?;
                             }
+                        }
+                        command @ HostCommand::ExtensionCommand { .. } => {
+                            deferred_commands.push_back(command);
                         }
                         HostCommand::Configure { action, .. } => {
                             match apply_session_config(

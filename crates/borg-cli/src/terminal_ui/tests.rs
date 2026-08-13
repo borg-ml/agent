@@ -2913,7 +2913,7 @@ fn focused_transcript_configuration_switches_cwd_metadata() {
 #[test]
 fn command_palette_keybinding_columns_keep_a_space_before_chords() {
     let keymap = KeyMap::from_config(&KeybindingConfig::default()).expect("default keymap");
-    let scroll = command_palette_options(&keymap)
+    let scroll = command_palette_options(&keymap, &[])
         .into_iter()
         .find(|option| option.label.starts_with("scroll transcript"))
         .expect("scroll keybinding row");
@@ -4275,7 +4275,7 @@ fn the_command_palette_filters_across_commands_and_keybindings() {
     let mut picker = Picker {
         kind: PickerKind::Commands,
         title: "Commands and keybindings",
-        options: command_palette_options(&keymap),
+        options: command_palette_options(&keymap, &[]),
         selected: 0,
         query: Some(String::new()),
         viewport_offset: Cell::new(0),

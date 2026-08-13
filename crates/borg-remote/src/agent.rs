@@ -646,7 +646,23 @@ impl LocalAgentTurnExecutor {
         }
         turn.system_prompt_appendix
             .push_str(&runtime_extensions.api.prompt_appendix());
-        self.run_extension_hooks(turn, "turn_started").await?;
+        turn.system_prompt_appendix
+            .push_str(&runtime_extensions.api.context_appendix());
+        self.run_extension_hooks(
+            turn,
+            "turn_started",
+            serde_json::json!({
+                "event": "turn_started",
+                "session_id": turn.session_id,
+                "message_id": turn.message_id,
+                "context_generation": turn.context_generation,
+                "provider": turn.provider,
+                "model": turn.model.clone(),
+                "prompt_delta": turn.prompt_delta.chars().take(16_384).collect::<String>(),
+                "attachments": turn.attachments.clone(),
+            }),
+        )
+        .await?;
         turn.system_prompt_appendix
             .push_str(&turn.agent_tools.harness_prompt_appendix().await?);
         turn.external_mcp_servers
@@ -666,32 +682,35 @@ impl LocalAgentTurnExecutor {
         Ok(())
     }
 
-    async fn run_extension_hooks(&self, turn: &AgentTurn, event: &str) -> Result<()> {
-        for hook in turn
-            .extension_api
-            .hooks
-            .iter()
-            .filter(|hook| hook.event == event)
-        {
-            let workflow_id = Uuid::new_v5(
-                &turn.message_id,
-                format!("extension-hook:{event}:{}:{}", hook.extension_id, hook.name).as_bytes(),
-            );
-            turn.agent_tools
-                .call_with_workflow_control(
-                    "run_workflow",
-                    serde_json::json!({
-                        "extension_id": hook.extension_id,
-                        "name": hook.workflow,
-                        "workflow_id": workflow_id,
-                    }),
-                    false,
-                    None,
-                )
-                .await?;
-        }
-        Ok(())
+    async fn run_extension_hooks(
+        &self,
+        turn: &AgentTurn,
+        event: &str,
+        arguments: Value,
+    ) -> Result<()> {
+        turn.agent_tools
+            .run_extension_hooks(event, turn.message_id, arguments)
+            .await
     }
+}
+
+fn completed_hook_arguments(turn: &AgentTurn, result: &Result<AgentTurnResult>) -> Value {
+    let outcome = match result {
+        Ok(result) => serde_json::json!({
+            "provider_session_id": result.provider_session_id,
+            "final_text": result.final_text.chars().take(16_384).collect::<String>(),
+        }),
+        Err(error) => serde_json::json!({"error": error.to_string()}),
+    };
+    serde_json::json!({
+        "event": "turn_completed",
+        "session_id": turn.session_id,
+        "message_id": turn.message_id,
+        "context_generation": turn.context_generation,
+        "provider": turn.provider,
+        "model": turn.model,
+        "result": outcome,
+    })
 }
 
 #[async_trait::async_trait]
@@ -739,7 +758,14 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
                 .native_harness
                 .run(turn.clone(), events, controls)
                 .await;
-            if let Err(error) = self.run_extension_hooks(&turn, "turn_completed").await {
+            if let Err(error) = self
+                .run_extension_hooks(
+                    &turn,
+                    "turn_completed",
+                    completed_hook_arguments(&turn, &result),
+                )
+                .await
+            {
                 tracing::warn!(%error, "extension turn_completed hook failed");
             }
             return result;
@@ -765,7 +791,11 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
             | CodingProvider::OpenAiCompatible => unreachable!("native provider handled above"),
         };
         if let Err(error) = self
-            .run_extension_hooks(&completed_hook_turn, "turn_completed")
+            .run_extension_hooks(
+                &completed_hook_turn,
+                "turn_completed",
+                completed_hook_arguments(&completed_hook_turn, &result),
+            )
             .await
         {
             tracing::warn!(%error, "extension turn_completed hook failed");

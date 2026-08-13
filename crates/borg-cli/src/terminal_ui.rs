@@ -651,6 +651,7 @@ pub struct BorgTerminal {
     keymap: KeyMap,
     cwd: PathBuf,
     configured_model_entries: Vec<borg_provider::DynamicModelEntry>,
+    extension_commands: Vec<borg_remote::ExtensionApiCommand>,
     git_status_cache: GitStatusCache,
     status: SessionStatus,
     /// Highest durable root sequence incorporated into this projection.
@@ -1604,6 +1605,7 @@ impl BorgTerminal {
             keymap,
             cwd,
             configured_model_entries: Vec::new(),
+            extension_commands: Vec::new(),
             git_status_cache: GitStatusCache::default(),
             status: SessionStatus::Starting,
             session_state_sequence: 0,
@@ -1723,6 +1725,7 @@ impl BorgTerminal {
         self.back_to_director_hovered = false;
         self.composer = Composer::default();
         self.cwd = cwd;
+        self.extension_commands.clear();
         self.git_status_cache = GitStatusCache::default();
         self.status = SessionStatus::Starting;
         self.session_state_sequence = 0;
@@ -2630,6 +2633,10 @@ impl BorgTerminal {
         self.configured_model_entries = entries;
     }
 
+    pub fn set_extension_commands(&mut self, commands: Vec<borg_remote::ExtensionApiCommand>) {
+        self.extension_commands = commands;
+    }
+
     pub fn open_model_picker(&mut self) {
         let provider = self
             .transcript
@@ -2851,7 +2858,7 @@ impl BorgTerminal {
         self.picker = Some(Picker {
             kind: PickerKind::Commands,
             title: "Commands and keybindings",
-            options: command_palette_options(&self.keymap),
+            options: command_palette_options(&self.keymap, &self.extension_commands),
             selected: 0,
             query: Some(String::new()),
             viewport_offset: Cell::new(0),
@@ -4096,6 +4103,11 @@ impl BorgTerminal {
             let command = picker.selected_value();
             // Keybinding rows carry no command; selecting one just dismisses.
             if command.is_empty() {
+                return Ok(UiAction::None);
+            }
+            if command.starts_with("/ext:") {
+                self.composer.restore(format!("{command} "), Vec::new());
+                self.notice = Some(format!("{command} · add JSON or text arguments, then send"));
                 return Ok(UiAction::None);
             }
             if slash_command_needs_argument(&command) {
@@ -8986,12 +8998,26 @@ fn slash_command_needs_argument(command: &str) -> bool {
 
 /// Every row of the unified palette: the slash commands, then the keybindings
 /// as reference rows that insert nothing.
-fn command_palette_options(keymap: &KeyMap) -> Vec<PickerOption> {
-    let mut options = Vec::with_capacity(SLASH_COMMANDS.len() + 12);
+fn command_palette_options(
+    keymap: &KeyMap,
+    extension_commands: &[borg_remote::ExtensionApiCommand],
+) -> Vec<PickerOption> {
+    let mut options = Vec::with_capacity(SLASH_COMMANDS.len() + extension_commands.len() + 12);
     for (index, (command, help)) in SLASH_COMMANDS.iter().enumerate() {
         let mut option = PickerOption::new(format!("{command:<16}{help}"), *command);
         if index == 0 {
             option.section = Some("Commands".to_string());
+        }
+        options.push(option);
+    }
+    for (index, command) in extension_commands.iter().enumerate() {
+        let user_name = borg_remote::ExtensionApiSnapshot::command_user_name(command);
+        let mut option = PickerOption::new(
+            format!("{user_name:<24}{}", command.description.trim()),
+            user_name,
+        );
+        if index == 0 {
+            option.section = Some("Extension commands".to_string());
         }
         options.push(option);
     }

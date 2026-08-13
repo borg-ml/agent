@@ -184,6 +184,7 @@ version = 1
 
 [api.transforms.concise]
 append_system_prompt = "Prefer concise release notes."
+append_context = "Keep the release checklist in view."
 
 [api.hooks.after_turn]
 event = "turn_completed"
@@ -202,9 +203,14 @@ description = "Run the durable review command"
 ```
 
 Tool and command invocations expose their validated JSON object to Blu as a
-JSON string from `borg_workflow_arguments(call_id)`. Transforms and hooks are captured with the
-turn snapshot; workflow calls use durable IDs and replay rather than opaque
-live callbacks.
+JSON string from `borg_workflow_arguments(call_id)`. Supported lifecycle hooks
+cover turn start/completion, tool and command before/after execution, and
+pre-compaction. `/ext:<extension-id>:<command>` is available in the TUI
+palette and as a direct command. `append_context` is a typed replay-safe
+context addition; arbitrary message-list mutation is deliberately excluded so
+canonical replay and provider cache identity remain stable. Transforms and
+hooks are captured with the turn snapshot; workflow calls use durable IDs and
+replay rather than opaque live callbacks.
 
 Local session history can be branched and moved without editing the SQLite
 journal in place:

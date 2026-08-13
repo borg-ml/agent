@@ -57,13 +57,15 @@ entrypoint = "workflows/review.blu"
 description = "Review the current change"
 
 # Versioned declarative registrations resolve only to the workflow snapshot.
-# Tools and commands can read their JSON object with
-# borg_workflow_arguments(call_id); hooks are limited to turn boundaries.
+# Tools, commands, and lifecycle hooks can read their bounded JSON object with
+# borg_workflow_arguments(call_id). Supported hook events include turn start/
+# completion, tool/command before and after execution, and before_compaction.
 [api]
 version = 1
 
 [api.transforms.concise]
 append_system_prompt = "Prefer concise release notes."
+append_context = "Keep the release checklist in view."
 
 [api.hooks.after_turn]
 event = "turn_completed"
