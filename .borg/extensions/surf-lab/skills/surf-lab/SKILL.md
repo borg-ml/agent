@@ -3055,6 +3055,58 @@ and require final CPU/GPU and playable-game reproduction. The completed KSF
 run is a finish and pace authority, while native teachers supply authentic
 control technique without imposing the user's slower pace.
 
+Surf commits `fee294c`, `8c91f58`, and `e3ecc43` replace that artificial
+cross-start requirement with deployment-relevant evaluation. GPU collection
+can draw common-random-number populations from a real initial-state
+distribution, and CPU `policy.compare-native-value` can independently use the
+authentic native start while retaining the completed KSF route and finish.
+Unfinished actors now rank by farther ordered progress and then earlier
+attainment; survival and reset state break only equal-progress ties.
+Distributional promotion likewise accepts a completed-run gain or a positive
+95% lower bound on paired route gain, with pace considered only when route is
+tied and survival only when both route and pace are tied. This prevents a slow
+or stalled actor from winning by merely staying alive.
+
+The full-representation joint actor `s8598` exposed why replay-start
+nonregression was the wrong authority. From native spawn it reached route 866
+instead of the prior actor's route 564, and on 128 unseen native starts it was
+route-better on all 128, raising mean progress `509.04 -> 853.20` and the
+lower quartile `421.78 -> 741.13`; the paired route-gain lower bound was
+`+323.18`. A fresh 32-start population confirmed 32/0/0 better/equal/worse and
+a `+317.34` lower bound. Its simultaneous regression from the artificial KSF
+replay start was therefore an irrelevant basin conflict, not a deployment
+failure. Clean native and KSF observations remain separated: the closest
+normalized cross-trajectory feature distance is about 1.012, with none below
+1.0, so this evidence still does not justify recurrence or a phase clock.
+
+The successful next step used search only as a training expert. A 16-tick
+spawn action intervention from `s8598` found route 1167, and per-state paired
+exploration found route-improving continuations in 23 of 32 scenarios.
+Supervised local fits `s8623` and `s8629` failed held-out starts and are
+rejected. Instead, eight second-layer ReLU units localized to those states
+were embedded with zero output, preserving the parent exactly, and only their
+32 ordinary output weights were optimized by exact complete closed-loop
+rollouts. The resulting phase-free actor `s8632` reaches route 1113 at tick
+947 and resets at tick 1002. CPU and GPU produce the identical final position
+`[11672.328125,6718.7607421875,695.7462768554688]` and velocity
+`[2239.301758,-1612.183716,276.535919]`.
+
+On 64 fresh matched native starts, `s8632` is 45/0/19
+better/equal/worse than `s8598`, raises mean route `855.48 -> 955.41` and the
+lower quartile `751.63 -> 767.50`, and has a paired route-gain lower bound of
+`+64.45`. Mean survival rises `758.28 -> 821.52`, its lower quartile rises
+`544.75 -> 572.25`, and the survival-gain lower bound is `+17.85`. It is the
+current clean native-spawn authority, but it does not complete the map and has
+not established playable-game parity.
+
+A supervised tick-900 residual `s8644` reached nominal route 1216, but its
+fresh 64-start route-gain lower bound was `-61.89`; reject it despite improved
+nominal progress and average survival. The correct next test is the same
+direct closed-loop output-weight optimization that produced `s8632`, now in
+the late localized basis and evaluated jointly from spawn and the late anchor.
+Surf commit `8113845` ensures later incumbent-only generations do not overwrite
+the recorded evidence for the generation that actually adopted new weights.
+
 Use `SURF_WINDOW_MODE=hidden` for a renderer smoke test. A natural loop reload
 after the reported full `rollout_ticks` proves the episode completed without
 an earlier floor/teleport restart; it does not prove the learned path matches
