@@ -3127,6 +3127,26 @@ anchors by reached ordered-route state, because perturbed actors occupy
 unrelated route states at the same episode tick. This remains training-only;
 the deployed actor stays one ordinary phase-free feed-forward network.
 
+Surf commit `e77c358` implements that route-state test in continuous output
+CEM. The unchanged parent is first run from matched perturbed native starts;
+each suffix anchor captures only states that actually reached its requested
+ordered-route index, preserving the real episode/progress time. Candidate
+adoption requires a statistically accepted pooled gain plus nonregression at
+every anchor, so a late improvement cannot trade away spawn or earlier-route
+robustness. Anchor selection remains training-only and does not add an input or
+runtime branch to the actor.
+
+The reachability audit confirmed the timing confound: route 900 was reached at
+episode ticks 672--704, route 1000 at 776--832, and route 1050 at 832--904.
+The full `s8684` search used spawn, route 900, and route 1050, capturing
+35/23/23 scenarios respectively. Across four 32-candidate generations and
+5,206,309 simulated transitions, no candidate cleared the aggregate and
+per-anchor gates. The exported controller-core hash exactly matches the
+unchanged `s8660` parent and its full-start outcome remains route 1113 at tick
+947, reset tick 1002. Do not tune this protected 14-unit output subspace
+further. `s8632` remains the current clean authority; no network completes the
+map or has playable-game completion parity.
+
 Use `SURF_WINDOW_MODE=hidden` for a renderer smoke test. A natural loop reload
 after the reported full `rollout_ticks` proves the episode completed without
 an earlier floor/teleport restart; it does not prove the learned path matches
