@@ -68,9 +68,13 @@ impl Default for NativeHarness {
 impl NativeHarness {
     pub(crate) fn with_settings(settings: &super::agent::LocalAgentSettings) -> Self {
         Self {
+            model_client: Arc::new(CompatibleModelClient {
+                gateway: None,
+                configured_model_gateways: settings.configured_model_gateways.clone(),
+            }),
             reviewer_model: settings.approval_reviewer_model.clone(),
             reviewer_effort: settings.approval_reviewer_effort.clone(),
-            ..Self::default()
+            process_manager: crate::native_process::ProcessManager::default(),
         }
     }
 
@@ -81,6 +85,7 @@ impl NativeHarness {
         Self {
             model_client: Arc::new(CompatibleModelClient {
                 gateway: Some(model_gateway),
+                configured_model_gateways: settings.configured_model_gateways.clone(),
             }),
             ..Self::with_settings(settings)
         }
@@ -677,6 +682,7 @@ trait NativeModelClient: Send + Sync {
 #[derive(Debug, Clone, Default)]
 struct CompatibleModelClient {
     gateway: Option<ModelGateway>,
+    configured_model_gateways: std::collections::BTreeMap<String, ModelGateway>,
 }
 
 #[async_trait]
@@ -689,6 +695,10 @@ impl NativeModelClient for CompatibleModelClient {
         request: ModelTurnRequest,
         progress: Option<mpsc::UnboundedSender<ProviderProgress>>,
     ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
+        let configured_gateway = (provider == crate::CodingProvider::OpenAiCompatible)
+            .then(|| self.configured_model_gateways.get(model))
+            .flatten();
+        let gateway = configured_gateway.or(self.gateway.as_ref());
         let profile = match provider {
             crate::CodingProvider::Kimi => OpenAiCompatibleProfile::Kimi,
             crate::CodingProvider::OpenRouter => OpenAiCompatibleProfile::OpenRouter,
@@ -715,12 +725,15 @@ impl NativeModelClient for CompatibleModelClient {
                 });
             }
         };
+        let wire_model = gateway
+            .and_then(|gateway| gateway.model.as_deref())
+            .unwrap_or(model);
         OpenAiCompatibleProvider {
-            model: model.to_string(),
+            model: wire_model.to_string(),
             effort: effort.map(str::to_string),
             system_prompt: "",
         }
-        .model_turn_via_profile(request, progress, self.gateway.as_ref(), profile)
+        .model_turn_via_profile(request, progress, gateway, profile)
         .await
     }
 }

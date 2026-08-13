@@ -375,6 +375,7 @@ fn blu_host_executor_factory() -> HostExecutorFactory {
         let local_settings = LocalAgentSettings {
             approval_reviewer_model: agent_config.approvals.reviewer_model.clone(),
             approval_reviewer_effort: agent_config.approvals.reviewer_effort.clone(),
+            configured_model_gateways: agent_config.configured_model_gateways(),
         };
         let reload_cwd = launch.cwd.clone();
         let reload = move || {
@@ -398,13 +399,13 @@ fn blu_host_executor_factory() -> HostExecutorFactory {
         };
         let executor = if launch.provider == CodingProvider::Kimi {
             LocalAgentTurnExecutor::with_model_gateway_and_settings(
-                borg_provider::provider::ModelGateway {
-                    endpoint: format!(
+                borg_provider::provider::ModelGateway::new(
+                    format!(
                         "{}/api/remote/host/kimi/chat/completions",
                         host.server.trim_end_matches('/')
                     ),
-                    bearer_token: host.host_token.clone(),
-                },
+                    host.host_token.clone(),
+                ),
                 local_settings,
             )
         } else {
@@ -1139,7 +1140,15 @@ async fn run_local_agent_session(
                 .context("current project directory does not exist")?,
         ),
     };
-    let requested_provider = args.provider.into();
+    let requested_provider = if args
+        .model
+        .as_deref()
+        .is_some_and(|model| agent_config.has_configured_model(model))
+    {
+        CodingProvider::OpenAiCompatible
+    } else {
+        args.provider.into()
+    };
     let requested_model = args.model.clone().or_else(|| match requested_provider {
         CodingProvider::Codex => Some(borg_provider::codex_product_model().to_string()),
         CodingProvider::Kimi => Some(borg_provider::kimi_product_model().to_string()),
@@ -1228,6 +1237,7 @@ async fn run_local_agent_session(
     let local_settings = LocalAgentSettings {
         approval_reviewer_model: agent_config.approvals.reviewer_model.clone(),
         approval_reviewer_effort: agent_config.approvals.reviewer_effort.clone(),
+        configured_model_gateways: agent_config.configured_model_gateways(),
     };
     let (mut extension_catalog, extension_servers, extension_workflows) =
         crate::extensions::discover(
@@ -1529,6 +1539,7 @@ async fn run_local_agent_session(
                 cwd.clone(),
                 &agent_config.keybindings,
             )?;
+            terminal.set_configured_model_entries(agent_config.configured_model_entries());
             Some(terminal)
         } else {
             match BorgTerminal::enter(
@@ -1558,6 +1569,7 @@ async fn run_local_agent_session(
     let display_session_state =
         resume_display_state(session_state.clone(), session_access, resuming);
     if let Some(terminal) = terminal.as_mut() {
+        terminal.set_configured_model_entries(agent_config.configured_model_entries());
         terminal.seed_history(&history);
         terminal.seed_pending_prompt_events(&pending_prompt_events);
         terminal.seed_team_roster(&team_snapshots);
@@ -2983,8 +2995,13 @@ async fn run_local_agent_session(
                             .as_ref()
                             .and_then(BorgTerminal::session_provider)
                             .unwrap_or(provider);
-                        let target = CodingProvider::for_model(&model).unwrap_or(active);
-                        if !provider_credentials_present(target) {
+                        let configured = agent_config.has_configured_model(&model);
+                        let target = if configured {
+                            CodingProvider::OpenAiCompatible
+                        } else {
+                            CodingProvider::for_model(&model).unwrap_or(active)
+                        };
+                        if !configured && !provider_credentials_present(target) {
                             terminal
                                 .as_mut()
                                 .expect("terminal")
@@ -3061,6 +3078,7 @@ async fn run_local_agent_session(
                                 cwd.clone(),
                                 &agent_config.keybindings,
                             )?;
+                            restored.set_configured_model_entries(agent_config.configured_model_entries());
                             let composer_history = store
                                 .recent_user_messages(session_id, RICH_TUI_PROMPT_HISTORY_LIMIT)
                                 .await?;
@@ -4099,6 +4117,7 @@ async fn run_local_agent_session(
                                             cwd.clone(),
                                             &agent_config.keybindings,
                                         )?;
+                                        restored.set_configured_model_entries(agent_config.configured_model_entries());
                                         let composer_history = store
                                             .recent_user_messages(
                                                 session_id,
@@ -4156,6 +4175,7 @@ async fn run_local_agent_session(
                                             cwd.clone(),
                                             &agent_config.keybindings,
                                         )?;
+                                        restored.set_configured_model_entries(agent_config.configured_model_entries());
                                         let composer_history = store
                                             .recent_user_messages(
                                                 session_id,

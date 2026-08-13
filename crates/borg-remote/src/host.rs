@@ -1178,10 +1178,10 @@ fn default_host_executor_factory() -> HostExecutorFactory {
     Arc::new(|config, launch| {
         let executor = if launch.provider == CodingProvider::Kimi {
             crate::LocalAgentTurnExecutor::with_model_gateway(
-                borg_provider::provider::ModelGateway {
-                    endpoint: endpoint(&config.server, "/api/remote/host/kimi/chat/completions"),
-                    bearer_token: config.host_token.clone(),
-                },
+                borg_provider::provider::ModelGateway::new(
+                    endpoint(&config.server, "/api/remote/host/kimi/chat/completions"),
+                    config.host_token.clone(),
+                ),
             )
         } else {
             crate::LocalAgentTurnExecutor::default()

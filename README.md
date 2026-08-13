@@ -56,8 +56,12 @@ typed Rust.
 Copy [`configs/agent.example.toml`](configs/agent.example.toml) to
 `$XDG_CONFIG_HOME/borg/agent.toml` (normally
 `~/.config/borg/agent.toml`). The typed config supports slash-command aliases,
-keybindings, provider-neutral stdio MCP servers, and the model/effort used by
-native Auto approval review. Optional multiplayer, subagent, autonomous-team,
+keybindings, provider-neutral stdio MCP servers, named OpenAI-compatible
+providers, and the model/effort used by native Auto approval review. Named
+routes are selected with a qualified `provider/model` reference (for example
+`groq/openai/gpt-oss-120b`); the provider sends only the model suffix to the
+upstream endpoint, and `api_key_env` keeps credentials out of durable session
+state. Optional multiplayer, subagent, autonomous-team,
 shared-work, presence, cloud/web relay, and telemetry capabilities can be
 disabled independently; parent capability disablement cascades to dependent
 features. Run `borg capabilities` (or `borg capabilities --json`) to inspect

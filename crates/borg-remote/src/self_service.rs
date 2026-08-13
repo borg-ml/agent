@@ -25,6 +25,7 @@ const SETTINGS_SECTIONS: &[&str] = &[
     "mcp",
     "approvals",
     "updates",
+    "providers",
 ];
 
 #[derive(Debug, Clone)]
@@ -151,7 +152,7 @@ impl SelfServiceContext {
             "hot_reload": ["commands.aliases", "keybindings"],
             "next_turn_reload": ["extensions", "mcp"],
             "restart_required": [
-                "capabilities", "team", "approvals", "updates"
+                "capabilities", "team", "approvals", "updates", "providers"
             ]
         }))
     }
@@ -2298,6 +2299,98 @@ fn validate_settings_shape(root: &toml::Value) -> Result<()> {
             );
         }
     }
+    if let Some(providers) = root.get("providers") {
+        let Some(providers) = providers.as_table() else {
+            bail!("providers must be a table");
+        };
+        for (provider_id, provider) in providers {
+            let Some(provider) = provider.as_table() else {
+                bail!("providers.{provider_id} must be a table");
+            };
+            check_table_keys(
+                provider,
+                &[
+                    "protocol",
+                    "name",
+                    "base_url",
+                    "api_key_env",
+                    "api_key",
+                    "headers",
+                    "models",
+                ],
+                &format!("providers.{provider_id}"),
+            )?;
+            for key in ["protocol", "name", "base_url", "api_key_env", "api_key"] {
+                if let Some(value) = provider.get(key) {
+                    ensure!(
+                        value
+                            .as_str()
+                            .is_some_and(|value| !value.contains(['\0', '\r', '\n'])),
+                        "providers.{provider_id}.{key} must be a valid string"
+                    );
+                }
+            }
+            let models = provider
+                .get("models")
+                .context("providers entries must declare models")?;
+            let Some(models) = models.as_table() else {
+                bail!("providers.{provider_id}.models must be a table");
+            };
+            ensure!(
+                !models.is_empty(),
+                "providers.{provider_id}.models must not be empty"
+            );
+            for (model_id, model) in models {
+                let Some(model) = model.as_table() else {
+                    bail!("providers.{provider_id}.models.{model_id} must be a table");
+                };
+                check_table_keys(
+                    model,
+                    &[
+                        "name",
+                        "context_window_tokens",
+                        "max_output_tokens",
+                        "variants",
+                        "body",
+                    ],
+                    &format!("providers.{provider_id}.models.{model_id}"),
+                )?;
+                for key in ["context_window_tokens", "max_output_tokens"] {
+                    if let Some(value) = model.get(key) {
+                        ensure!(
+                            value.as_integer().is_some_and(|value| value > 0),
+                            "providers.{provider_id}.models.{model_id}.{key} must be positive"
+                        );
+                    }
+                }
+                if let Some(variants) = model.get("variants") {
+                    let Some(variants) = variants.as_table() else {
+                        bail!("providers.{provider_id}.models.{model_id}.variants must be a table");
+                    };
+                    for (variant_id, variant) in variants {
+                        let Some(variant) = variant.as_table() else {
+                            bail!(
+                                "providers.{provider_id}.models.{model_id}.variants.{variant_id} must be a table"
+                            );
+                        };
+                        check_table_keys(
+                            variant,
+                            &["body"],
+                            &format!(
+                                "providers.{provider_id}.models.{model_id}.variants.{variant_id}"
+                            ),
+                        )?;
+                        if let Some(body) = variant.get("body") {
+                            ensure!(body.is_table(), "configured variant body must be a table");
+                        }
+                    }
+                }
+                if let Some(body) = model.get("body") {
+                    ensure!(body.is_table(), "configured model body must be a table");
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -2305,6 +2398,14 @@ fn check_keys(value: &toml::Value, allowed: &[&str], section: &str) -> Result<()
     let Some(table) = value.as_table() else {
         bail!("settings section `{section}` must be a table");
     };
+    check_table_keys(table, allowed, section)
+}
+
+fn check_table_keys(
+    table: &toml::map::Map<String, toml::Value>,
+    allowed: &[&str],
+    section: &str,
+) -> Result<()> {
     for key in table.keys() {
         ensure!(
             allowed.contains(&key.as_str()),
@@ -2354,6 +2455,7 @@ fn redact_toml(value: toml::Value) -> toml::Value {
                 .into_iter()
                 .map(|(key, value)| {
                     let sensitive = key.eq_ignore_ascii_case("env")
+                        || key.eq_ignore_ascii_case("headers")
                         || key.to_ascii_lowercase().contains("token")
                         || key.to_ascii_lowercase().contains("secret")
                         || key.to_ascii_lowercase().contains("password")

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
@@ -465,6 +465,9 @@ fn subscription_lifecycle_key(
 pub struct LocalAgentSettings {
     pub approval_reviewer_model: Option<String>,
     pub approval_reviewer_effort: Option<String>,
+    /// Host-local snapshot of named OpenAI-compatible routes. Secrets stay in
+    /// memory and are never part of LaunchSession or durable events.
+    pub configured_model_gateways: BTreeMap<String, borg_provider::provider::ModelGateway>,
 }
 
 impl LocalAgentTurnExecutor {

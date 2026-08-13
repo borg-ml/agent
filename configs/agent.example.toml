@@ -51,6 +51,25 @@ quick = "/fast on"
 normal = "/fast off"
 deep = "/effort xhigh"
 
+# Named OpenAI-compatible routes use an OpenCode-style provider/model alias.
+# Select one with:
+#   borg agent --provider open-ai-compatible --model groq/openai/gpt-oss-120b
+# Keep API keys in the environment; api_key_env wins over an inline api_key.
+#
+# [providers.groq]
+# name = "Groq"
+# base_url = "https://api.groq.com/openai/v1"
+# api_key_env = "GROQ_API_KEY"
+# headers = { }
+#
+# [providers.groq.models."openai/gpt-oss-120b"]
+# name = "GPT-OSS 120B"
+# context_window_tokens = 131072
+# max_output_tokens = 32768
+#
+# [providers.groq.models."openai/gpt-oss-120b".variants.high]
+# body = { reasoning_effort = "high" }
+
 # Actions can have one or more key chords. Supported modifiers are ctrl, alt,
 # and shift. Omitted actions keep their defaults.
 [keybindings]

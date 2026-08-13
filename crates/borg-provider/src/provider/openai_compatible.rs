@@ -32,6 +32,37 @@ struct OpenRouterModelLimits {
 pub struct ModelGateway {
     pub endpoint: String,
     pub bearer_token: String,
+    /// Optional upstream model id when the gateway is addressed by a Borg
+    /// `provider/model` alias.
+    pub model: Option<String>,
+    /// Human-readable provider identity used in traces and diagnostics.
+    pub label: Option<String>,
+    /// Additional headers for a configured endpoint. Values are never shown
+    /// in the gateway's debug representation.
+    pub headers: BTreeMap<String, String>,
+    /// Provider-owned request fields. Core conversation/tool fields are
+    /// protected by the request builder below.
+    pub body: Map<String, Value>,
+    /// Variant-specific request fields, keyed by the selected effort name.
+    pub variant_bodies: BTreeMap<String, Map<String, Value>>,
+    pub context_window_tokens: Option<u64>,
+    pub max_output_tokens: Option<u64>,
+}
+
+impl ModelGateway {
+    pub fn new(endpoint: impl Into<String>, bearer_token: impl Into<String>) -> Self {
+        Self {
+            endpoint: endpoint.into(),
+            bearer_token: bearer_token.into(),
+            model: None,
+            label: None,
+            headers: BTreeMap::new(),
+            body: Map::new(),
+            variant_bodies: BTreeMap::new(),
+            context_window_tokens: None,
+            max_output_tokens: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +110,16 @@ impl std::fmt::Debug for ModelGateway {
             .debug_struct("ModelGateway")
             .field("endpoint", &self.endpoint)
             .field("bearer_token", &"[redacted]")
+            .field("model", &self.model)
+            .field("label", &self.label)
+            .field("header_names", &self.headers.keys().collect::<Vec<_>>())
+            .field("body_fields", &self.body.keys().collect::<Vec<_>>())
+            .field(
+                "variant_names",
+                &self.variant_bodies.keys().collect::<Vec<_>>(),
+            )
+            .field("context_window_tokens", &self.context_window_tokens)
+            .field("max_output_tokens", &self.max_output_tokens)
             .finish()
     }
 }
@@ -159,14 +200,19 @@ impl OpenAiCompatibleProvider {
         let endpoint = gateway
             .map(|gateway| gateway.endpoint.clone())
             .unwrap_or_else(|| profile.endpoint());
-        let provider_label = profile.label();
+        let provider_label = gateway
+            .and_then(|gateway| gateway.label.as_deref())
+            .unwrap_or_else(|| profile.label());
+        let request_model = gateway
+            .and_then(|gateway| gateway.model.as_deref())
+            .unwrap_or(&self.model);
         let mut trace = ProviderAttemptTrace {
             invocation: ProviderInvocation {
                 provider_label: provider_label.to_string(),
                 executable: endpoint.clone(),
-                args: vec![self.model.clone()],
+                args: vec![request_model.to_string()],
                 cwd: None,
-                model: Some(self.model.clone()),
+                model: Some(request_model.to_string()),
                 effort: self.effort.clone(),
             },
             exit_status: None,
@@ -174,7 +220,9 @@ impl OpenAiCompatibleProvider {
             stderr: String::new(),
         };
         let api_key = gateway
-            .map(|gateway| gateway.bearer_token.clone())
+            .and_then(|gateway| {
+                (!gateway.bearer_token.trim().is_empty()).then(|| gateway.bearer_token.clone())
+            })
             .or_else(|| profile.api_key());
         if api_key.is_none() && profile != OpenAiCompatibleProfile::Generic {
             return Err(ProviderCallError {
@@ -198,7 +246,7 @@ impl OpenAiCompatibleProvider {
             .map(model_message_wire_value)
             .collect::<Vec<_>>();
         let mut body = json!({
-            "model": self.model,
+            "model": request_model,
             "messages": wire_messages,
             "stream": true,
             "stream_options": { "include_usage": true },
@@ -254,6 +302,19 @@ impl OpenAiCompatibleProvider {
                     let body_object = body.as_object_mut().expect("request body is an object");
                     body_object.extend(extra);
                 }
+            }
+        }
+        if let Some(gateway) = gateway {
+            merge_gateway_body(&mut body, &gateway.body);
+            if let Some(effort) = self.effort.as_deref()
+                && let Some(variant) = gateway.variant_bodies.get(effort)
+            {
+                merge_gateway_body(&mut body, variant);
+            }
+            if body.get("max_tokens").is_none()
+                && let Some(max_output_tokens) = gateway.max_output_tokens
+            {
+                body["max_tokens"] = json!(max_output_tokens);
             }
         }
         if !request.tools.is_empty() {
@@ -312,6 +373,11 @@ impl OpenAiCompatibleProvider {
             let mut request = client.post(&endpoint).json(&body);
             if let Some(api_key) = api_key.as_deref() {
                 request = request.bearer_auth(api_key);
+            }
+            if let Some(gateway) = gateway {
+                for (name, value) in &gateway.headers {
+                    request = request.header(name, value);
+                }
             }
             if profile == OpenAiCompatibleProfile::OpenRouter {
                 request = request
@@ -422,6 +488,15 @@ impl OpenAiCompatibleProvider {
             // and auto-compaction never engages, which strands long local
             // sessions at the context wall instead of compacting them.
             apply_generic_context_window(&mut usage);
+            if let Some(context_window_tokens) = gateway
+                .and_then(|gateway| gateway.context_window_tokens)
+                .filter(|tokens| *tokens > 0)
+            {
+                usage.context_tokens = Some(usage.context_tokens.unwrap_or_else(|| {
+                    usage.input_tokens.saturating_add(usage.cached_input_tokens)
+                }));
+                usage.context_window_tokens = Some(context_window_tokens);
+            }
         }
         if profile == OpenAiCompatibleProfile::OpenRouter {
             usage.context_tokens =
@@ -598,6 +673,28 @@ impl OpenAiCompatibleProvider {
             trace,
             session_id: None,
         })
+    }
+}
+
+const PROTECTED_GATEWAY_FIELDS: [&str; 8] = [
+    "model",
+    "messages",
+    "stream",
+    "stream_options",
+    "tools",
+    "tool_choice",
+    "response_format",
+    "provider",
+];
+
+fn merge_gateway_body(body: &mut Value, extras: &Map<String, Value>) {
+    let Some(target) = body.as_object_mut() else {
+        return;
+    };
+    for (key, value) in extras {
+        if !PROTECTED_GATEWAY_FIELDS.contains(&key.as_str()) {
+            target.insert(key.clone(), value.clone());
+        }
     }
 }
 
@@ -1140,6 +1237,34 @@ mod tests {
             "data:image/png;base64,aW1hZ2U="
         );
     }
+
+    #[test]
+    fn configured_gateway_body_cannot_replace_core_request_fields() {
+        let mut body = json!({
+            "model": "qualified/model",
+            "messages": [],
+            "stream": true,
+            "temperature": 0.2
+        });
+        merge_gateway_body(
+            &mut body,
+            &serde_json::json!({
+                "model": "attacker/model",
+                "messages": ["replace"],
+                "stream": false,
+                "temperature": 0.7,
+                "reasoning_effort": "high"
+            })
+            .as_object()
+            .expect("object"),
+        );
+        assert_eq!(body["model"], "qualified/model");
+        assert_eq!(body["messages"], json!([]));
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["temperature"], 0.7);
+        assert_eq!(body["reasoning_effort"], "high");
+    }
+
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     static OPENROUTER_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());

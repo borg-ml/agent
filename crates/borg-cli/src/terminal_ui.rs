@@ -650,6 +650,7 @@ pub struct BorgTerminal {
     attachment_store: AttachmentStore,
     keymap: KeyMap,
     cwd: PathBuf,
+    configured_model_entries: Vec<borg_provider::DynamicModelEntry>,
     git_status_cache: GitStatusCache,
     status: SessionStatus,
     /// Highest durable root sequence incorporated into this projection.
@@ -1341,6 +1342,7 @@ fn pad_display(value: &str, width: usize) -> String {
 /// just the session's current one — picking a model from another provider
 /// repoints the live session at that provider. Fixed catalogs use the
 /// canonical provider order; an open-ended current provider remains above them.
+#[cfg(test)]
 fn model_picker_options(
     provider: Option<CodingProvider>,
     current: Option<&str>,
@@ -1355,12 +1357,30 @@ fn model_picker_options(
     model_picker_options_with_discovered(provider, current, &discovered)
 }
 
+#[cfg(test)]
 fn model_picker_options_with_discovered(
     provider: Option<CodingProvider>,
     current: Option<&str>,
     discovered: &[borg_provider::DynamicModelEntry],
 ) -> Vec<PickerOption> {
+    model_picker_options_with_configured(provider, current, discovered, &[])
+}
+
+fn model_picker_options_with_configured(
+    provider: Option<CodingProvider>,
+    current: Option<&str>,
+    discovered: &[borg_provider::DynamicModelEntry],
+    configured: &[borg_provider::DynamicModelEntry],
+) -> Vec<PickerOption> {
     let mut options = Vec::new();
+    for (index, model) in configured.iter().cloned().enumerate() {
+        let mut option = PickerOption::new(model.label, model.id);
+        option.preview = model.detail;
+        if index == 0 {
+            option.section = Some("Configured providers".to_string());
+        }
+        options.push(option);
+    }
     let push_catalog = |options: &mut Vec<PickerOption>, target: CodingProvider| {
         let Some(catalog) = target.model_catalog() else {
             return;
@@ -1583,6 +1603,7 @@ impl BorgTerminal {
             attachment_store,
             keymap,
             cwd,
+            configured_model_entries: Vec::new(),
             git_status_cache: GitStatusCache::default(),
             status: SessionStatus::Starting,
             session_state_sequence: 0,
@@ -2605,6 +2626,10 @@ impl BorgTerminal {
         self.transcript_render_cache = None;
     }
 
+    pub fn set_configured_model_entries(&mut self, entries: Vec<borg_provider::DynamicModelEntry>) {
+        self.configured_model_entries = entries;
+    }
+
     pub fn open_model_picker(&mut self) {
         let provider = self
             .transcript
@@ -2616,7 +2641,12 @@ impl BorgTerminal {
             .config
             .as_ref()
             .and_then(|config| config.model.clone());
-        let options = model_picker_options(provider, current.as_deref());
+        let options = model_picker_options_with_configured(
+            provider,
+            current.as_deref(),
+            &[],
+            &self.configured_model_entries,
+        );
         let selected = current
             .as_deref()
             .and_then(|current| options.iter().position(|option| option.value == current))

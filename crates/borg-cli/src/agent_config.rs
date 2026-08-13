@@ -18,6 +18,72 @@ pub(crate) struct AgentConfig {
     pub(crate) approvals: ApprovalConfig,
     pub(crate) updates: UpdateConfig,
     pub(crate) local: LocalProviderConfig,
+    /// Named OpenAI-compatible routes. The durable session keeps the generic
+    /// native provider kind and records the stable `provider/model` alias.
+    pub(crate) providers: BTreeMap<String, ConfiguredProvider>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct ConfiguredProvider {
+    /// Currently `openai-compatible`; the field makes the config forward
+    /// compatible with future provider protocols without hiding semantics.
+    pub(crate) protocol: String,
+    pub(crate) name: Option<String>,
+    /// Base URL or a complete `/chat/completions` URL.
+    pub(crate) base_url: String,
+    /// Prefer an environment reference for secrets. `api_key` is supported
+    /// for local-only setups but is never copied into durable session state.
+    pub(crate) api_key_env: Option<String>,
+    pub(crate) api_key: Option<String>,
+    pub(crate) headers: BTreeMap<String, String>,
+    pub(crate) models: BTreeMap<String, ConfiguredModel>,
+}
+
+impl Default for ConfiguredProvider {
+    fn default() -> Self {
+        Self {
+            protocol: "openai-compatible".to_string(),
+            name: None,
+            base_url: String::new(),
+            api_key_env: None,
+            api_key: None,
+            headers: BTreeMap::new(),
+            models: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct ConfiguredModel {
+    pub(crate) name: Option<String>,
+    pub(crate) context_window_tokens: Option<u64>,
+    pub(crate) max_output_tokens: Option<u64>,
+    /// Variant names normally match Borg effort values (`low`, `high`, ...).
+    pub(crate) variants: BTreeMap<String, ConfiguredModelVariant>,
+    /// Extra request fields for this model, such as `temperature` or a vendor
+    /// routing object. Core conversation/tool fields are protected by the
+    /// provider adapter.
+    pub(crate) body: BTreeMap<String, toml::Value>,
+}
+
+impl Default for ConfiguredModel {
+    fn default() -> Self {
+        Self {
+            name: None,
+            context_window_tokens: None,
+            max_output_tokens: None,
+            variants: BTreeMap::new(),
+            body: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct ConfiguredModelVariant {
+    pub(crate) body: BTreeMap<String, toml::Value>,
 }
 
 /// Declarative setup for a locally hosted OpenAI-compatible server
@@ -329,6 +395,116 @@ impl AgentConfig {
         Ok(config)
     }
 
+    pub(crate) fn has_configured_model(&self, alias: &str) -> bool {
+        self.providers.iter().any(|(provider_id, provider)| {
+            provider.models.keys().any(|model_id| {
+                format_configured_model_alias(provider_id, model_id) == alias.trim()
+            })
+        })
+    }
+
+    pub(crate) fn configured_model_gateways(
+        &self,
+    ) -> BTreeMap<String, borg_provider::provider::ModelGateway> {
+        self.providers
+            .iter()
+            .flat_map(|(provider_id, provider)| {
+                let token = provider
+                    .api_key_env
+                    .as_deref()
+                    .and_then(|name| std::env::var(name).ok())
+                    .or_else(|| provider.api_key.clone())
+                    .unwrap_or_default();
+                let endpoint = chat_completions_endpoint(&provider.base_url);
+                provider.models.iter().map(move |(model_id, model)| {
+                    let body = model
+                        .body
+                        .iter()
+                        .map(|(key, value)| {
+                            (
+                                key.clone(),
+                                serde_json::to_value(value)
+                                    .expect("validated TOML values are JSON-compatible"),
+                            )
+                        })
+                        .collect();
+                    let variant_bodies = model
+                        .variants
+                        .iter()
+                        .map(|(name, variant)| {
+                            let body = variant
+                                .body
+                                .iter()
+                                .map(|(key, value)| {
+                                    (
+                                        key.clone(),
+                                        serde_json::to_value(value)
+                                            .expect("validated TOML values are JSON-compatible"),
+                                    )
+                                })
+                                .collect();
+                            (name.clone(), body)
+                        })
+                        .collect();
+                    let alias = format_configured_model_alias(provider_id, model_id);
+                    let label = provider
+                        .name
+                        .as_deref()
+                        .filter(|name| !name.trim().is_empty())
+                        .unwrap_or(provider_id)
+                        .to_string();
+                    (
+                        alias,
+                        borg_provider::provider::ModelGateway {
+                            endpoint: endpoint.clone(),
+                            bearer_token: token.clone(),
+                            model: Some(model_id.clone()),
+                            label: Some(label),
+                            headers: provider.headers.clone(),
+                            body,
+                            variant_bodies,
+                            context_window_tokens: model.context_window_tokens,
+                            max_output_tokens: model.max_output_tokens,
+                        },
+                    )
+                })
+            })
+            .collect()
+    }
+
+    pub(crate) fn configured_model_entries(&self) -> Vec<borg_provider::DynamicModelEntry> {
+        self.providers
+            .iter()
+            .flat_map(|(provider_id, provider)| {
+                provider.models.iter().map(move |(model_id, model)| {
+                    let alias = format_configured_model_alias(provider_id, model_id);
+                    let provider_label = provider
+                        .name
+                        .as_deref()
+                        .filter(|name| !name.trim().is_empty())
+                        .unwrap_or(provider_id);
+                    let model_label = model
+                        .name
+                        .as_deref()
+                        .filter(|name| !name.trim().is_empty())
+                        .unwrap_or(model_id);
+                    let mut details = Vec::new();
+                    if let Some(context) = model.context_window_tokens {
+                        details.push(format!("{context} context"));
+                    }
+                    if !model.variants.is_empty() {
+                        details.push(format!("{} variants", model.variants.len()));
+                    }
+                    borg_provider::DynamicModelEntry {
+                        id: alias,
+                        label: format!("{provider_label} · {model_label}"),
+                        detail: (!details.is_empty()).then(|| details.join(" · ")),
+                    }
+                })
+            })
+            .collect()
+    }
+
     fn validate(&self) -> Result<()> {
         if let Some(worker_concurrency) = self.team.worker_concurrency {
             anyhow::ensure!(
@@ -418,6 +594,117 @@ impl AgentConfig {
                 !effort.trim().is_empty(),
                 "reviewer_effort must not be empty"
             );
+        }
+        for (provider_id, provider) in &self.providers {
+            anyhow::ensure!(
+                !is_reserved_provider_id(provider_id),
+                "provider id is reserved for a built-in Borg route"
+            );
+            anyhow::ensure!(
+                !provider.models.is_empty(),
+                "configured provider must declare at least one model"
+            );
+            anyhow::ensure!(
+                valid_alias(provider_id),
+                "provider id `{provider_id}` must contain only ASCII letters, digits, `-`, or `_`"
+            );
+            anyhow::ensure!(
+                matches!(
+                    provider.protocol.trim().to_ascii_lowercase().as_str(),
+                    "openai-compatible" | "openai_compatible"
+                ),
+                "provider `{provider_id}` uses unsupported protocol `{}`",
+                provider.protocol
+            );
+            let base_url = provider.base_url.trim();
+            anyhow::ensure!(
+                base_url.starts_with("http://") || base_url.starts_with("https://"),
+                "provider `{provider_id}` base_url must start with http:// or https://"
+            );
+            anyhow::ensure!(
+                !base_url.contains(['\0', '\r', '\n']),
+                "provider `{provider_id}` base_url contains invalid characters"
+            );
+            if let Some(name) = &provider.name {
+                anyhow::ensure!(
+                    !name.trim().is_empty(),
+                    "provider `{provider_id}` name must not be empty"
+                );
+            }
+            if let Some(api_key_env) = &provider.api_key_env {
+                anyhow::ensure!(
+                    valid_env_name(api_key_env),
+                    "provider `{provider_id}` api_key_env is invalid"
+                );
+            }
+            anyhow::ensure!(
+                provider.headers.iter().all(|(key, value)| {
+                    !key.trim().is_empty()
+                        && !key.contains(['\0', '\r', '\n'])
+                        && !value.contains(['\0', '\r', '\n'])
+                }),
+                "provider `{provider_id}` has an invalid header"
+            );
+            for (model_id, model) in &provider.models {
+                anyhow::ensure!(
+                    model_id.trim() == model_id,
+                    "configured model ids cannot have leading or trailing whitespace"
+                );
+                anyhow::ensure!(
+                    !model_id.trim().is_empty(),
+                    "provider `{provider_id}` has an empty model id"
+                );
+                anyhow::ensure!(
+                    !model_id.contains(['\0', '\r', '\n']),
+                    "provider `{provider_id}` model `{model_id}` contains invalid characters"
+                );
+                if let Some(name) = &model.name {
+                    anyhow::ensure!(
+                        !name.trim().is_empty(),
+                        "provider `{provider_id}` model `{model_id}` name must not be empty"
+                    );
+                }
+                if let Some(context) = model.context_window_tokens {
+                    anyhow::ensure!(
+                        context > 0,
+                        "provider `{provider_id}` model `{model_id}` context_window_tokens must be positive"
+                    );
+                }
+                if let Some(max_output) = model.max_output_tokens {
+                    anyhow::ensure!(
+                        max_output > 0,
+                        "provider `{provider_id}` model `{model_id}` max_output_tokens must be positive"
+                    );
+                }
+                for (key, value) in &model.body {
+                    anyhow::ensure!(
+                        !key.contains(['\0', '\r', '\n']),
+                        "configured body field contains invalid characters"
+                    );
+                    anyhow::ensure!(
+                        serde_json::to_value(value).is_ok(),
+                        "configured body field is not JSON-compatible"
+                    );
+                }
+                for variant in model.variants.values() {
+                    for (key, value) in &variant.body {
+                        anyhow::ensure!(
+                            !key.contains(['\0', '\r', '\n']),
+                            "configured variant body field contains invalid characters"
+                        );
+                        anyhow::ensure!(
+                            serde_json::to_value(value).is_ok(),
+                            "configured variant body field is not JSON-compatible"
+                        );
+                    }
+                }
+                for variant in model.variants.keys() {
+                    anyhow::ensure!(
+                        !variant.trim().is_empty(),
+                        "provider `{provider_id}` model `{model_id}` has an empty variant name"
+                    );
+                }
+            }
         }
         anyhow::ensure!(
             (1..=24 * 30).contains(&self.updates.check_interval_hours),
@@ -673,6 +960,44 @@ fn valid_alias(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn valid_env_name(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        && value.as_bytes()[0].is_ascii_alphabetic()
+}
+
+fn is_reserved_provider_id(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "codex"
+            | "claude"
+            | "opencode"
+            | "open-code"
+            | "kimi"
+            | "openrouter"
+            | "open-router"
+            | "openai-compatible"
+            | "openai_compatible"
+            | "open-ai-compatible"
+            | "open-ai_compatible"
+    )
+}
+
+fn format_configured_model_alias(provider_id: &str, model_id: &str) -> String {
+    format!("{provider_id}/{model_id}")
+}
+
+fn chat_completions_endpoint(base_url: &str) -> String {
+    let trimmed = base_url.trim_end_matches('/');
+    if trimmed.ends_with("/chat/completions") {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/chat/completions")
+    }
 }
 
 fn valid_allowed_tool(value: &str) -> bool {
@@ -1048,5 +1373,92 @@ reasoning_format = "deepseek"
         assert_eq!(servers[0].command, "docs-mcp");
         assert_eq!(servers[0].args, ["--stdio"]);
         assert_eq!(servers[0].allowed_tools, ["search"]);
+    }
+
+    #[test]
+    fn configured_provider_models_keep_qualified_alias_and_raw_wire_id() {
+        let config: AgentConfig = toml::from_str(
+            r#"
+            [providers.groq]
+            name = "Groq"
+            base_url = "https://api.groq.com/openai/v1"
+            api_key_env = "GROQ_API_KEY"
+
+            [providers.groq.models."openai/gpt-oss-120b"]
+            name = "GPT-OSS 120B"
+            context_window_tokens = 131072
+            max_output_tokens = 32768
+
+            [providers.groq.models."openai/gpt-oss-120b".variants.high]
+            body = { reasoning_effort = "high" }
+            "#,
+        )
+        .expect("configured provider parses");
+        config.validate().expect("configured provider is valid");
+
+        let alias = "groq/openai/gpt-oss-120b";
+        assert!(config.has_configured_model(alias));
+        let entries = config.configured_model_entries();
+        assert_eq!(entries[0].id, alias);
+        assert!(entries[0].label.contains("GPT-OSS 120B"));
+        let gateway = config
+            .configured_model_gateways()
+            .remove(alias)
+            .expect("gateway");
+        assert_eq!(
+            gateway.endpoint,
+            "https://api.groq.com/openai/v1/chat/completions"
+        );
+        assert_eq!(gateway.model.as_deref(), Some("openai/gpt-oss-120b"));
+        assert_eq!(gateway.context_window_tokens, Some(131072));
+        assert_eq!(gateway.max_output_tokens, Some(32768));
+        assert_eq!(gateway.variant_bodies["high"]["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn configured_provider_environment_key_overrides_inline_key() {
+        let _lock = LOCAL_ENV_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap();
+        let previous = std::env::var_os("BORG_TEST_PROVIDER_KEY");
+        // SAFETY: this test holds the process-local environment lock.
+        unsafe { std::env::set_var("BORG_TEST_PROVIDER_KEY", "environment-key") };
+        let config: AgentConfig = toml::from_str(
+            r#"
+            [providers.example]
+            base_url = "http://127.0.0.1:9000/v1"
+            api_key = "inline-key"
+            api_key_env = "BORG_TEST_PROVIDER_KEY"
+            [providers.example.models.demo]
+            "#,
+        )
+        .expect("configured provider parses");
+        config.validate().expect("configured provider is valid");
+        let gateway = config
+            .configured_model_gateways()
+            .remove("example/demo")
+            .expect("gateway");
+        assert_eq!(gateway.bearer_token, "environment-key");
+        // SAFETY: restore the process-local environment snapshot.
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("BORG_TEST_PROVIDER_KEY", value),
+                None => std::env::remove_var("BORG_TEST_PROVIDER_KEY"),
+            }
+        }
+    }
+
+    #[test]
+    fn built_in_provider_ids_are_reserved_for_named_routes() {
+        let config: AgentConfig = toml::from_str(
+            r#"
+            [providers.openrouter]
+            base_url = "https://example.test/v1"
+            [providers.openrouter.models.auto]
+            "#,
+        )
+        .expect("configured provider parses");
+        assert!(config.validate().is_err());
     }
 }
