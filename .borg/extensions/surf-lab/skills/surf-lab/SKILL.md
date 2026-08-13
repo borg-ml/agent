@@ -2966,6 +2966,39 @@ the earlier PPO, Pareto, and output-CEM candidates do not. Continue from s8541
 with new paired closed-loop data near its actual failure rather than tuning the
 ridge, PPO, KL, or CEM scales.
 
+Second-generation supervision near s8541's tick-752 failure did not promote a
+new actor. The focused 32-scenario, eight-variant batch at tick 650 contains a
+real route-751 training branch, but that branch is not autonomous-policy
+evidence. Reusing the active 128-unit suffix regressed nominal route 720 to
+704. Surf commit `dd819a7` can constrain a ridge update to the exact activation
+nullspace of a deterministic parent prefix: protecting 650 ticks still ended
+at route 719, while protecting all 752 parent ticks preserved nominal route
+but produced 36/34/58 better/equal/worse starts, lowered mean route by 5.13,
+and added 12 resets. Keep all of these policies rejected.
+
+Surf commits `821d590` and `32ff2ee` support function-preserving fresh capacity
+growth and joint state-local fitting from exact paired rollout winners. This
+remains one ordinary feed-forward actor: the old 64--1024--1024--6 network is
+embedded unchanged in a 64--1152--1152--6 network and the new block starts
+with zero output weights. A nominal-winner fit reached autonomous route 728
+and survived 900 ticks, but its unseen 128-start gate was 24/32/72 and reduced
+mean route by 29.28. Joint fitting of all 32 winners reached nominal route 723
+and improved held-out mean route by 6.40, but regressed the lower quartile,
+added six resets, and had negative paired 95% lower bounds. A 0.25 conservative
+residual regressed nominal route to 719.
+
+The multi-anchor representation safeguard then protected 63,519 states from
+128 perturbed parent prefixes through tick 650, in addition to the nominal
+prefix. Specialized localization found 17 residual units that remain strictly
+inactive on all 64,169 protected examples. The candidate preserved route 720
+but reached it four ticks later; on unseen seed 8563 it was 11/106/11 with
+unchanged lower quartiles, one fewer reset, and slightly negative paired route
+and survival lower bounds. It is rejected. This closes supervised action
+distillation for the second repair. Preserve s8541 as KSF-line authority and
+next optimize exact closed-loop outcomes directly inside a prefix-protected,
+low-dimensional residual subspace. These results do not justify recurrence,
+phase state, a clock, or another deployed controller mechanism.
+
 Use `SURF_WINDOW_MODE=hidden` for a renderer smoke test. A natural loop reload
 after the reported full `rollout_ticks` proves the episode completed without
 an earlier floor/teleport restart; it does not prove the learned path matches
