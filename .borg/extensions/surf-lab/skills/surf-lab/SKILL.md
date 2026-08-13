@@ -3212,6 +3212,26 @@ localized capacity, route-filtered decisions, and a validated output-suffix
 gradient mask. Do not update the historical output head or treat every action
 inside a winning random program as expert supervision.
 
+Surf commit `a4e45c5` makes the stronger nonlinear version of that safety
+contract reproducible. PPO can update only a fresh localized capacity block:
+historical rows, cross-block weights, output columns, and the output bias are
+gradient-masked, while fresh second-layer biases are reprojected after every
+epoch so the block stays strictly inactive on all anchors through a protected
+route boundary. The route-1100 run preserved 101,210 protected states and the
+route-900 run preserved 87,328; both retained the exact nominal route
+1212/tick 1065.
+
+Neither safe update transferred. With protection through route 900, the
+capacity-only PPO candidate was 12/47/5 on the first 64 held-out starts. A
+fresh 128-start confirmation was 21/78/29 and changed mean route
+`987.258 -> 987.242`, with paired route-gain lower bound `-0.475`. Reject it.
+The useful later-route actions found from completed-KSF checkpoints therefore
+do not by themselves identify corrections on the clean controller's own
+visitation distribution. Do not sweep KSF anchor boundaries or PPO epochs.
+Collect policy-reached states before the observed failure and give candidate
+actions enough closed-loop continuation to receive causal route credit, while
+retaining the same exact protected-capacity and full-start promotion gates.
+
 Use `SURF_WINDOW_MODE=hidden` for a renderer smoke test. A natural loop reload
 after the reported full `rollout_ticks` proves the episode completed without
 an earlier floor/teleport restart; it does not prove the learned path matches
