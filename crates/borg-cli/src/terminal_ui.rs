@@ -4643,6 +4643,17 @@ impl BorgTerminal {
                     chunks[4],
                 )
             };
+            if !is_launch_screen && let Some(todo_status) = todo_status.as_ref() {
+                let metadata_width =
+                    footer_metadata_text(todo_status, &cwd_status, usize::MAX).width() as u16;
+                let visible_metadata_width = metadata_width.min(footer_area.width);
+                next_todo_status_area = Some(Rect {
+                    x: footer_area.right().saturating_sub(visible_metadata_width),
+                    y: footer_area.y,
+                    width: (todo_status.width() as u16).min(visible_metadata_width),
+                    height: 1,
+                });
+            }
             if !is_launch_screen {
                 frame.render_widget(
                     Block::default().style(Style::default().bg(COMMAND_PANEL_BG)),
@@ -5213,32 +5224,6 @@ impl BorgTerminal {
                     Color::Gray
                 },
             );
-            let todo_status_start = status_spans.iter().map(|span| span.width()).sum::<usize>();
-            // The separator is rendered unstyled, so the hover target is the
-            // value alone.
-            let todo_status_start = todo_status_start
-                .saturating_add(usize::from(todo_status.is_some()) * STATUS_SEPARATOR.width());
-            let todo_status_width = todo_status.as_ref().map(|value| value.width());
-            if let Some(todo_status) = todo_status.clone() {
-                status_spans.push(Span::styled(
-                    STATUS_SEPARATOR,
-                    Style::default().fg(Color::Gray),
-                ));
-                status_spans.push(Span::styled(
-                    todo_status,
-                    Style::default()
-                        .fg(if self.todo_status_hovered {
-                            Color::White
-                        } else {
-                            Color::LightGreen
-                        })
-                        .add_modifier(if self.todo_status_hovered {
-                            Modifier::BOLD | Modifier::UNDERLINED
-                        } else {
-                            Modifier::empty()
-                        }),
-                ));
-            }
             let status_line = Line::from(status_spans);
             let alignment_offset = if is_launch_screen {
                 status_area.width.saturating_sub(status_line.width() as u16) / 2
@@ -5266,17 +5251,6 @@ impl BorgTerminal {
                         .saturating_add(goal_status_start as u16),
                     y: status_area.y,
                     width: (goal_status_width as u16).min(status_area.width),
-                    height: 1,
-                });
-            }
-            if let Some(todo_status_width) = todo_status_width {
-                next_todo_status_area = Some(Rect {
-                    x: status_area
-                        .x
-                        .saturating_add(alignment_offset)
-                        .saturating_add(todo_status_start as u16),
-                    y: status_area.y,
-                    width: (todo_status_width as u16).min(status_area.width),
                     height: 1,
                 });
             }
@@ -5462,15 +5436,15 @@ impl BorgTerminal {
                             .map(move |line| (line, style))
                     })
                     .collect::<Vec<_>>();
+                let todo_anchor = next_todo_status_area.unwrap_or(status_area);
                 let tooltip_height = (tooltip_lines.len() as u16)
                     .saturating_add(2)
-                    .min(status_area.y.saturating_sub(area.y).max(1));
+                    .min(todo_anchor.y.saturating_sub(area.y).max(1));
                 let tooltip = Rect {
-                    x: next_todo_status_area
-                        .map(|todo_area| todo_area.x)
-                        .unwrap_or(status_area.x)
+                    x: todo_anchor
+                        .x
                         .min(area.right().saturating_sub(tooltip_width)),
-                    y: status_area.y.saturating_sub(tooltip_height),
+                    y: todo_anchor.y.saturating_sub(tooltip_height),
                     width: tooltip_width,
                     height: tooltip_height,
                 };
@@ -5535,8 +5509,12 @@ impl BorgTerminal {
                 );
             }
             if !is_launch_screen {
-                let footer_metadata = Some(footer_metadata_text("", &cwd_status, usize::MAX))
-                    .filter(|value| !value.is_empty());
+                let footer_metadata = Some(footer_metadata_text(
+                    todo_status.as_deref().unwrap_or(""),
+                    &cwd_status,
+                    usize::MAX,
+                ))
+                .filter(|value| !value.is_empty());
                 let desired_metadata_width = footer_metadata
                     .as_ref()
                     .map(|value| value.width() as u16)
@@ -5555,15 +5533,20 @@ impl BorgTerminal {
                     controls_area,
                 );
                 if footer_metadata.is_some() && metadata_width > 0 {
-                    frame.render_widget(
-                        Paragraph::new(footer_metadata_line(
-                            "",
+                    let metadata_line = if let Some(todo_status) = todo_status.as_deref() {
+                        footer_todo_metadata_line(
+                            todo_status,
                             &cwd_status,
-                            false,
+                            self.todo_status_hovered,
                             metadata_width as usize,
-                        ))
-                        .alignment(Alignment::Right)
-                        .style(Style::default().bg(COMMAND_PANEL_BG)),
+                        )
+                    } else {
+                        footer_metadata_line("", &cwd_status, false, metadata_width as usize)
+                    };
+                    frame.render_widget(
+                        Paragraph::new(metadata_line)
+                            .alignment(Alignment::Right)
+                            .style(Style::default().bg(COMMAND_PANEL_BG)),
                         Rect {
                             x: footer_area.right().saturating_sub(metadata_width),
                             width: metadata_width,
@@ -9330,6 +9313,34 @@ fn footer_metadata_line(
     };
     Line::from(vec![
         Span::styled(context.to_string(), Style::default().fg(context_color)),
+        Span::styled(STATUS_SEPARATOR, Style::default().fg(Color::Gray)),
+        Span::styled(cwd.to_string(), Style::default().fg(Color::Gray)),
+    ])
+}
+
+fn footer_todo_metadata_line(
+    todo_status: &str,
+    cwd_status: &str,
+    hovered: bool,
+    max_width: usize,
+) -> Line<'static> {
+    let metadata = footer_metadata_text(todo_status, cwd_status, max_width);
+    let todo_style = Style::default()
+        .fg(if hovered {
+            Color::White
+        } else {
+            Color::LightGreen
+        })
+        .add_modifier(if hovered {
+            Modifier::BOLD | Modifier::UNDERLINED
+        } else {
+            Modifier::empty()
+        });
+    let Some((todo, cwd)) = metadata.split_once(STATUS_SEPARATOR) else {
+        return Line::from(Span::styled(metadata, todo_style));
+    };
+    Line::from(vec![
+        Span::styled(todo.to_string(), todo_style),
         Span::styled(STATUS_SEPARATOR, Style::default().fg(Color::Gray)),
         Span::styled(cwd.to_string(), Style::default().fg(Color::Gray)),
     ])

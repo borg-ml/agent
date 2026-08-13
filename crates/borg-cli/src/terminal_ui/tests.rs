@@ -2823,6 +2823,27 @@ fn footer_metadata_highlights_only_imminent_compaction() {
 }
 
 #[test]
+fn footer_todo_metadata_keeps_the_todo_segment_interactive() {
+    let line = footer_todo_metadata_line("2 to-dos", "~/borg-cli · git:main", false, usize::MAX);
+
+    assert_eq!(line.spans[0].content, "2 to-dos");
+    assert_eq!(line.spans[0].style.fg, Some(Color::LightGreen));
+    assert_eq!(line.spans[1].content, STATUS_SEPARATOR);
+    assert_eq!(line.spans[2].content, "~/borg-cli · git:main ");
+    assert_eq!(line.spans[2].style.fg, Some(Color::Gray));
+
+    let hovered = footer_todo_metadata_line("2 to-dos", "~/borg-cli", true, usize::MAX);
+    assert_eq!(hovered.spans[0].style.fg, Some(Color::White));
+    assert!(hovered.spans[0].style.add_modifier.contains(Modifier::BOLD));
+    assert!(
+        hovered.spans[0]
+            .style
+            .add_modifier
+            .contains(Modifier::UNDERLINED)
+    );
+}
+
+#[test]
 fn copy_notice_is_rendered_as_a_high_contrast_badge() {
     let line = copy_notice_line("✓ Copied last response".to_string());
 
