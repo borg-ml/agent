@@ -3192,6 +3192,26 @@ survival is subordinate because route is statistically farther. `s8706` is
 the current clean authority. It still does not complete the map and has not
 established playable-game completion parity.
 
+Route-wide training starts can sample the completed KSF route directly while
+remaining training-only. A 32-scenario, eight-variant probe over the full
+route simulated 28,608 transitions in about four seconds. Eighteen scenarios
+improved lexicographically, 17 reached a farther route sample, mean route gain
+was `+16`, and the maximum was `+98`. This closes the data-throughput problem:
+later-map exploration no longer needs sequential full-start repair rounds.
+
+The conversion objective remains unresolved. Whole-network winner regression
+destroyed the spawn attractor, and a fresh square actor reached only route
+1169. A 37-unit route-wide residual bank was strictly inactive on protected
+states through route 1100, but direct winner imitation reached route 1195 and
+failed its fresh gate (12/34/18 better/equal/worse; route lower bound
+`-13.78`). Return-ranked PPO restricted to exactly those 37 zero-output suffix
+columns preserved the nominal route 1212/tick 1065, but also failed its fresh
+gate (13/36/15; route lower bound `-4.45`). These policies are rejected;
+`s8706` remains authoritative. The reusable contract now supports route-wide
+localized capacity, route-filtered decisions, and a validated output-suffix
+gradient mask. Do not update the historical output head or treat every action
+inside a winning random program as expert supervision.
+
 Use `SURF_WINDOW_MODE=hidden` for a renderer smoke test. A natural loop reload
 after the reported full `rollout_ticks` proves the episode completed without
 an earlier floor/teleport restart; it does not prove the learned path matches
