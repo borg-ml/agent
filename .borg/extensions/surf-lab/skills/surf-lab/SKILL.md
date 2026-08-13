@@ -3172,7 +3172,24 @@ On 64 fresh matched native starts, `s8695` raises mean route
 bounds are `+0.337` route and `+1.214` survival, with unchanged lower
 quartiles. It is 11/33/20 better/equal/worse, so this is a statistically
 accepted distributional gain, not pointwise perturbation dominance. `s8695`
-is the current clean authority. It still does not complete the map and has not
+was the first reached-route successor.
+
+The same general step at route 1150 found a smaller but consistent corrective
+signal: 14 of 16 reached-state scenarios improved, with mean gain `+6.44` and
+maximum gain `+20` route samples. Eleven new ordinary units cover all 512
+winner examples while remaining strictly inactive over 98,238 states through
+route 1050. Route-anchored output CEM over their 44 weights adopted generation
+1. The resulting `s8706` reaches route 1212 at tick 1065 and resets at tick
+1112. Exact CPU and GPU runs match in route, timing, final position
+`[12945.017578,6716.543945,-3819.944824]`, and final velocity
+`[513.321472,-1650.806641,-2142.732422]`.
+
+On 64 fresh matched native starts, `s8706` is 27/30/7 better/equal/worse than
+its function-identical zero-output parent, raises mean route
+`981.70 -> 983.78`, and has a paired route-gain lower bound of `+0.565`.
+Survival mean falls `861.47 -> 859.34` and its lower bound is negative, but
+survival is subordinate because route is statistically farther. `s8706` is
+the current clean authority. It still does not complete the map and has not
 established playable-game completion parity.
 
 Use `SURF_WINDOW_MODE=hidden` for a renderer smoke test. A natural loop reload
