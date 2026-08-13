@@ -2868,6 +2868,28 @@ resets instead of 30, but eight regressions still violate paired promotion.
 Combining 64 paired training scenarios then regressed the nominal route to
 671. Reject all three policies and retain the route-693 parent.
 
+Surf commit `0f00ef6` closes the remaining proposal/acceptance split. The
+shared ROCm value rollout can now interleave every tensor of several complete
+geometric actors and evaluate each actor on the same ordered set of nominal and
+perturbed starts in one launch. Weight selection is independent of per-rollout
+activation storage, so several scenarios can safely share one candidate
+network. A live two-policy/two-state contract matched every raw output against
+independent shared-core inference exactly. The candidate batch reports paired
+better/equal/worse counts and accepts only scenario-wise nonregression with at
+least one strict route/survival/pace gain. This is training-time evaluation;
+every candidate remains one ordinary phase-free feed-forward artifact.
+
+The first full-network screen evaluated the unchanged route-693 parent and all
+three recent PPO proposals on 32 common full-start scenarios. The pooled
+32-scenario update was better/worse on 16/16 starts, the smooth robust update
+on 22/10, and the combined-64 update on 17/15; none satisfied scenario-wise
+nonregression. The durable batch is
+`.borg/surf-lab/native-states/utopia-ksf-wr-ppo-candidates-paired32-s8523-v1.jsonl`.
+Reject all three candidates and retain the route-693 parent. Subsequent
+gradient or off-policy proposals should pass through this exact closed-loop
+gate before held-out promotion; do not infer attractor preservation from
+surrogate loss or distributional averages.
+
 The next optimizer must use the exact closed-loop simulator as an acceptance
 constraint, not assume that an offline PPO surrogate preserves an attractor.
 Paired collection and per-scenario ranks remain useful proposal gradients, but
