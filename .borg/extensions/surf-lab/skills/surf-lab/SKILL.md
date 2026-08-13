@@ -2828,6 +2828,25 @@ averages incompatible closed-loop futures; the next step needs a directly
 validated long-horizon policy objective, not corrective-trace weighting,
 another trust scale, or recurrence by default.
 
+Surf commit `0510395` corrects the geometric held-action PPO objective before
+using it as that long-horizon test. Non-completing outcomes now rank farther
+ordered route before reset or survival, and equal progress ranks the earlier
+attainment tick first. Advantages are centered on the deterministic parent
+rollout rather than the sampled population mean, so merely being less bad than
+another perturbation is not positive evidence. The trainer requires a parent
+baseline and rejects state-perturbed batches because the current collector
+does not yet pair alternative actions on the identical perturbed state.
+
+The first corrected nominal batch supplied no positive action program: the
+route-693/reset-713 parent beat all 63 held-residual explorations. A deliberately
+small output-head update from the 504 negative decisions regressed to route
+564/reset 684 and is rejected. Do not tune that update. The next high-signal
+experiment is paired common-random-number collection: for each identical
+bounded state, run the deterministic parent and several action programs, rank
+only within that state against its parent, then train from those causal
+baseline-relative advantages. Held-out starts and the exact nominal spawn
+remain decisive promotion gates.
+
 Use `SURF_WINDOW_MODE=hidden` for a renderer smoke test. A natural loop reload
 after the reported full `rollout_ticks` proves the episode completed without
 an earlier floor/teleport restart; it does not prove the learned path matches
