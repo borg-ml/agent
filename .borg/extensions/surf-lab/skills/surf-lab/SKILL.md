@@ -2759,6 +2759,52 @@ keeps playback camera yaw/pitch separate from controller yaw/pitch: click the
 window to capture the mouse, look freely without changing NN inputs or
 actions, and press Escape to release it.
 
+The completed-KSF geometric actor audit does not support recurrence as the
+current bottleneck. Its 64 inputs contain route-local pose and velocity,
+relative view, contact and movement latches, speed, twelve forward route
+previews, and ten live BSP sensors. Exact duplicate observations in the
+completed authentic rollout occur only during the stationary pre-run wait.
+After movement starts, none of 3,683 temporally nonlocal rows is within 0.5
+standardized feature distance. The closest conflicting action pairs are about
+0.524 and 0.564 apart and remain distinguishable through route previews,
+relative yaw, and speed. Ignore arbitrary demonstration wait timing; do not add
+memory or a clock without a future audit that shows genuinely aliased moving
+states.
+
+A common-random-number spawn audit separates expert reachability from policy
+installation. The route-693 geometric parent fell to routes 528, 339, 639, and
+647 on four bounded seed-8493 perturbations. Training-only action CEM recovered
+those states to routes 706, 686, 709, and 705, with resets at ticks 852, 781,
+754, and 793. Useful feedback therefore exists near each failure. It does not
+fit as one safe localized patch: a smooth joint residual with protected-action
+RMSE `7.76e-5` still moved the nominal closed loop from route 693 to 645, while
+hard prefix-inactive units preserved the nominal run exactly but traded gains
+between the four scenarios. Direct CEM over the compact 108 output weights
+likewise improved individual seeds but found no jointly feasible update across
+two independent perturbation batches.
+
+Surf commit `d9014e0` makes that negative result reproducible. Continuous
+action CEM can select one shared deterministic perturbation and emits every
+final rollout by replaying its actual best program. Continuous output-weight
+CEM can jointly rank up to four independent scenario seeds. The local-residual
+trainer accepts several replayed CEM teachers, can learn specialized units that
+cover subsets of corrective states, and can export only eligible second-layer
+units. These are training-only mechanisms; they add no deployed state or
+branch. Treat the local residual-bank family as exhausted for this lineage:
+smooth updates leave the brittle nominal attractor, and exact preservation
+prevents a smooth jointly robust correction.
+
+The next controller experiment should train robustness jointly rather than
+freeze one nominal trajectory and stack another bank. Keep one ordinary
+phase-free feed-forward geometric actor, collect common-random-number full
+rollouts plus actor-visited failure states, use bounded action search only as an
+off-policy expert, aggregate those states across scenarios, and update the
+actor against the whole distribution. Selection remains lexicographic:
+natural finish, earlier finish, farther ordered route, earlier attainment of
+equal progress, then survival for an equal-progress tie. Complete-start and
+held-out perturbation rollouts remain the promotion authority. Reconsider
+memory only if the moving-state ambiguity audit changes.
+
 Use `SURF_WINDOW_MODE=hidden` for a renderer smoke test. A natural loop reload
 after the reported full `rollout_ticks` proves the episode completed without
 an earlier floor/teleport restart; it does not prove the learned path matches
