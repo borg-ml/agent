@@ -4191,10 +4191,10 @@ impl BorgTerminal {
         let terminal_size = self.terminal.size()?;
         let content_width = terminal_content_width(terminal_size.width);
         let tool_run_viewport_height = tool_run_viewport_height(terminal_size.height as usize);
-        // Reserve the transcript's scrollbar gutter before wrapping. Rendering
-        // at full width and then narrowing the widget clips the final cells
-        // instead of moving the wrap point.
-        let transcript_width = content_width.saturating_sub(3).max(1) as usize;
+        // Render the transcript at the full width. The scrollbar is an overlay
+        // that only appears once the transcript actually overflows, so it does
+        // not reserve an unused gutter on the initial view.
+        let transcript_width = content_width.max(1) as usize;
         let goal_tick = self.transcript.active_goal_cache_tick();
         let tool_spinner_tick = self.transcript.tool_spinner_cache_tick();
         let local_date = Local::now().date_naive();
@@ -4658,14 +4658,7 @@ impl BorgTerminal {
                 let scroll_max = transcript_height.saturating_sub(transcript_area.height as usize);
                 next_scroll_max = scroll_max;
                 let scroll = scroll_max.saturating_sub(scroll_from_bottom.min(scroll_max));
-                let content_area = if transcript_area.width > 4 {
-                    Rect {
-                        width: transcript_area.width - 3,
-                        ..transcript_area
-                    }
-                } else {
-                    transcript_area
-                };
+                let content_area = transcript_area;
                 next_transcript_viewport_area = Some(content_area);
                 let scrollbar_area = if scroll_max > 0 && transcript_area.width > 4 {
                     Some(Rect {
@@ -5170,6 +5163,16 @@ impl BorgTerminal {
                 self.effort_status_hovered,
                 effort_status_color,
             );
+            let fast_status_start = status_spans.iter().map(|span| span.width()).sum::<usize>();
+            let fast_status_start = fast_status_start
+                .saturating_add(usize::from(fast_status.is_some()) * STATUS_SEPARATOR.width());
+            let fast_status_width = fast_status.as_ref().map(|value| value.width());
+            push_interactive_status_segment(
+                &mut status_spans,
+                fast_status,
+                self.fast_status_hovered,
+                Color::LightYellow,
+            );
             let permission_status_start =
                 status_spans.iter().map(|span| span.width()).sum::<usize>();
             // The separator is rendered unstyled, so the hover target is the
@@ -5201,16 +5204,6 @@ impl BorgTerminal {
                 } else {
                     Color::Gray
                 },
-            );
-            let fast_status_start = status_spans.iter().map(|span| span.width()).sum::<usize>();
-            let fast_status_start = fast_status_start
-                .saturating_add(usize::from(fast_status.is_some()) * STATUS_SEPARATOR.width());
-            let fast_status_width = fast_status.as_ref().map(|value| value.width());
-            push_interactive_status_segment(
-                &mut status_spans,
-                fast_status,
-                self.fast_status_hovered,
-                Color::LightYellow,
             );
             let todo_status_start = status_spans.iter().map(|span| span.width()).sum::<usize>();
             // The separator is rendered unstyled, so the hover target is the
