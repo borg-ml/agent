@@ -96,6 +96,9 @@ pub struct AgentTurn {
     /// skill roots and MCP servers. Blu remains the compatibility default;
     /// external runtimes are supervised by the host.
     pub extension_workflows: Vec<BluWorkflowDefinition>,
+    /// Declarative extension API captured with the workflow snapshot. It is
+    /// never read from the live catalog while a turn is running.
+    pub extension_api: crate::ExtensionApiSnapshot,
     /// Trusted runtime context appended to the provider system prompt.
     pub system_prompt_appendix: String,
 }
@@ -205,6 +208,10 @@ pub trait AgentTurnExecutor: Send + Sync {
         None
     }
 
+    fn extension_api_snapshot(&self) -> Option<crate::ExtensionApiSnapshot> {
+        None
+    }
+
     /// Return the optional provider-neutral web-search capability for this
     /// execution host. The session actor injects it into the shared Borg tool
     /// dispatcher so native and subscription lanes see the same contract.
@@ -280,6 +287,7 @@ type RuntimeExtensionLoader = Arc<
             Vec<borg_provider::mcp::ExternalMcpServer>,
             Vec<PathBuf>,
             Vec<BluWorkflowDefinition>,
+            crate::ExtensionApiSnapshot,
         )> + Send
         + Sync,
 >;
@@ -289,6 +297,7 @@ struct RuntimeExtensions {
     external_mcp_servers: Vec<borg_provider::mcp::ExternalMcpServer>,
     skill_roots: Vec<PathBuf>,
     workflows: Vec<BluWorkflowDefinition>,
+    api: crate::ExtensionApiSnapshot,
 }
 
 #[derive(Default)]
@@ -527,11 +536,43 @@ impl LocalAgentTurnExecutor {
         self
     }
 
+    pub fn with_extension_api(self, api: crate::ExtensionApiSnapshot) -> Self {
+        self.runtime_extensions
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .api = api;
+        self
+    }
+
     pub fn replace_runtime_extensions(
         &self,
         servers: Vec<borg_provider::mcp::ExternalMcpServer>,
         skill_roots: Vec<PathBuf>,
         workflows: Vec<BluWorkflowDefinition>,
+    ) {
+        let api = self
+            .runtime_extensions
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .api
+            .clone();
+        *self
+            .runtime_extensions
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = RuntimeExtensions {
+            external_mcp_servers: servers,
+            skill_roots,
+            workflows,
+            api,
+        };
+    }
+
+    pub fn replace_runtime_extensions_with_api(
+        &self,
+        servers: Vec<borg_provider::mcp::ExternalMcpServer>,
+        skill_roots: Vec<PathBuf>,
+        workflows: Vec<BluWorkflowDefinition>,
+        api: crate::ExtensionApiSnapshot,
     ) {
         *self
             .runtime_extensions
@@ -540,6 +581,7 @@ impl LocalAgentTurnExecutor {
             external_mcp_servers: servers,
             skill_roots,
             workflows,
+            api,
         };
     }
 
@@ -549,6 +591,7 @@ impl LocalAgentTurnExecutor {
                 Vec<borg_provider::mcp::ExternalMcpServer>,
                 Vec<PathBuf>,
                 Vec<BluWorkflowDefinition>,
+                crate::ExtensionApiSnapshot,
             )> + Send
             + Sync
             + 'static,
@@ -562,8 +605,8 @@ impl LocalAgentTurnExecutor {
             return;
         };
         match tokio::task::spawn_blocking(move || loader()).await {
-            Ok(Ok((servers, roots, workflows))) => {
-                self.replace_runtime_extensions(servers, roots, workflows)
+            Ok(Ok((servers, roots, workflows, api))) => {
+                self.replace_runtime_extensions_with_api(servers, roots, workflows, api)
             }
             Ok(Err(error)) => {
                 tracing::warn!(%error, "kept last-known-good runtime extension snapshot");
@@ -584,6 +627,26 @@ impl LocalAgentTurnExecutor {
         turn.agent_tools
             .configure_runtime_mcp_extensions(runtime_extensions.external_mcp_servers.clone())
             .await?;
+        turn.agent_tools
+            .configure_extension_workflows(runtime_extensions.workflows.clone());
+        turn.agent_tools
+            .configure_extension_api(runtime_extensions.api.clone())?;
+        turn.extension_api = runtime_extensions.api.clone();
+        for wire_name in runtime_extensions.api.tool_wires() {
+            let wire_name = format!("mcp__borg_agent__{wire_name}");
+            if !turn.agent_mcp_server.allowed_tools.contains(&wire_name) {
+                turn.agent_mcp_server.allowed_tools.push(wire_name);
+            }
+        }
+        for wire_name in runtime_extensions.api.command_wires() {
+            let wire_name = format!("mcp__borg_agent__{wire_name}");
+            if !turn.agent_mcp_server.allowed_tools.contains(&wire_name) {
+                turn.agent_mcp_server.allowed_tools.push(wire_name);
+            }
+        }
+        turn.system_prompt_appendix
+            .push_str(&runtime_extensions.api.prompt_appendix());
+        self.run_extension_hooks(turn, "turn_started").await?;
         turn.system_prompt_appendix
             .push_str(&turn.agent_tools.harness_prompt_appendix().await?);
         turn.external_mcp_servers
@@ -599,6 +662,33 @@ impl LocalAgentTurnExecutor {
                 )
                 .await?,
             );
+        }
+        Ok(())
+    }
+
+    async fn run_extension_hooks(&self, turn: &AgentTurn, event: &str) -> Result<()> {
+        for hook in turn
+            .extension_api
+            .hooks
+            .iter()
+            .filter(|hook| hook.event == event)
+        {
+            let workflow_id = Uuid::new_v5(
+                &turn.message_id,
+                format!("extension-hook:{event}:{}:{}", hook.extension_id, hook.name).as_bytes(),
+            );
+            turn.agent_tools
+                .call_with_workflow_control(
+                    "run_workflow",
+                    serde_json::json!({
+                        "extension_id": hook.extension_id,
+                        "name": hook.workflow,
+                        "workflow_id": workflow_id,
+                    }),
+                    false,
+                    None,
+                )
+                .await?;
         }
         Ok(())
     }
@@ -627,6 +717,16 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
         }))
     }
 
+    fn extension_api_snapshot(&self) -> Option<crate::ExtensionApiSnapshot> {
+        Some(
+            self.runtime_extensions
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .api
+                .clone(),
+        )
+    }
+
     async fn execute(
         &self,
         mut turn: AgentTurn,
@@ -635,9 +735,17 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
     ) -> Result<AgentTurnResult> {
         self.prepare_local_turn(&mut turn).await?;
         if turn.provider.uses_native_harness() {
-            return self.native_harness.run(turn, events, controls).await;
+            let result = self
+                .native_harness
+                .run(turn.clone(), events, controls)
+                .await;
+            if let Err(error) = self.run_extension_hooks(&turn, "turn_completed").await {
+                tracing::warn!(%error, "extension turn_completed hook failed");
+            }
+            return result;
         }
-        match turn.provider {
+        let completed_hook_turn = turn.clone();
+        let result = match turn.provider {
             CodingProvider::Codex | CodingProvider::Claude | CodingProvider::OpenCode => {
                 run_borg_provider_turn(
                     turn,
@@ -655,7 +763,14 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
             CodingProvider::Kimi
             | CodingProvider::OpenRouter
             | CodingProvider::OpenAiCompatible => unreachable!("native provider handled above"),
+        };
+        if let Err(error) = self
+            .run_extension_hooks(&completed_hook_turn, "turn_completed")
+            .await
+        {
+            tracing::warn!(%error, "extension turn_completed hook failed");
         }
+        result
     }
 
     async fn consult(&self, request: ConsultationRequest) -> Result<ConsultationResult> {
@@ -1817,6 +1932,7 @@ mod tests {
                         command: None,
                         args: Vec::new(),
                     }],
+                    crate::ExtensionApiSnapshot::default(),
                 ))
             });
 

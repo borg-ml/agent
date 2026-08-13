@@ -145,12 +145,14 @@ the user explicitly sets [extensions].allow_project_mcp = true; skill-only and
 workflow-only project packages do not need MCP trust. Packages may declare
 semantic-version dependencies, Borg/capability requirements, typed settings,
 skill roots, namespaced stdio MCP servers, and bounded Blu/Lua/Luau
-workflows. Invalid packages are isolated and reported by borg extensions
+workflows. They may also register replay-safe API transforms, turn hooks,
+model-facing tools, and commands; those declarations resolve only to the
+validated workflow snapshot and are journaled by Borg. Invalid packages are isolated and reported by borg extensions
 doctor instead of preventing Borg from starting.
 
 Running local sessions watch the effective catalog, and enrolled Remote hosts
 revalidate it at each turn boundary. A validated change swaps skills, MCP
-definitions, and workflow source atomically for the next turn; an in-flight
+definitions, API registrations, and workflow source atomically for the next turn; an in-flight
 turn keeps the immutable snapshot it started with. Invalid changes retain the
 last-known-good runtime and show a TUI notice or host warning. Blu does not
 execute install or lifecycle hooks. See [Blu extensions](docs/blu-extensions.md) and the
@@ -173,6 +175,54 @@ state with `borg.harness`; those entries are injected into later turns.
 `.borg/skills/<id>/SKILL.md`; the live list/read tools see it immediately, and
 the native skill context rescans it at the start of the next native turn
 without a restart.
+
+The API manifest is intentionally declarative and versioned:
+
+```toml
+[api]
+version = 1
+
+[api.transforms.concise]
+append_system_prompt = "Prefer concise release notes."
+
+[api.hooks.after_turn]
+event = "turn_completed"
+workflow = "review"
+effect = "idempotent"
+
+[api.tools.review]
+workflow = "review"
+description = "Run the durable review workflow"
+input_schema = { type = "object" }
+effect = "at_most_once"
+
+[api.commands.review]
+workflow = "review"
+description = "Run the durable review command"
+```
+
+Tool and command invocations expose their validated JSON object to Blu as a
+JSON string from `borg_workflow_arguments(call_id)`. Transforms and hooks are captured with the
+turn snapshot; workflow calls use durable IDs and replay rather than opaque
+live callbacks.
+
+Local session history can be branched and moved without editing the SQLite
+journal in place:
+
+```sh
+borg session tree
+borg session undo SESSION_ID
+borg session fork SESSION_ID --before SEQUENCE
+borg session export SESSION_ID --output conversation.json
+borg session import conversation.json
+```
+
+`borg session export` is a conversation archive, not a provider-process or
+tool-side-effect checkpoint. For bounded, opt-in local file rollback use
+`borg session snapshot --output workspace.json` and
+`borg session restore workspace.json`; snapshots exclude `.git`, `.borg`,
+symlinks, and anything beyond their file/byte caps, and restore keeps extra
+files unless `--prune` is explicitly supplied.
 
 ### Durable Blu workflows
 
@@ -205,6 +255,7 @@ borg_checkpoint(call_id, job_uuid, checkpoint_key, kind, state_json, evidence_js
 borg_plugin_store(call_id, request_json)
 borg_exec(call_id, command, workdir, yield_time_ms, timeout_ms, max_output_tokens)
 borg_assert_exec_success(call_id, snapshot_json)
+borg_workflow_arguments(call_id)
 ```
 
 Every workflow and host call has durable start/request and terminal records.

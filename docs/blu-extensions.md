@@ -30,6 +30,8 @@ installation, and every declared skill root must remain inside the package.
 - namespaced stdio MCP servers with per-server tool allowlists; and
 - bounded executable workflows declared with [workflows.<name>] and an
   in-package relative entrypoint; and
+- versioned declarative API transforms, turn hooks, workflow-backed tools,
+  and commands; and
 - `${config.name}`, `${env.NAME}`, and `${extension_dir}` interpolation.
 
 See [`configs/extension.example.toml`](../configs/extension.example.toml).
@@ -53,6 +55,40 @@ previous runtime and points the user to `borg extensions doctor`.
 For enrolled hosts, the host-side catalog is authoritative: serialized skill
 paths from a controller are discarded at the host boundary and cannot grant
 access to an inactive or untrusted package.
+
+## Extension API v1
+
+An extension can expose declarative registrations alongside its workflows:
+
+```toml
+[api]
+version = 1
+
+[api.transforms.concise]
+append_system_prompt = "Prefer concise release notes."
+
+[api.hooks.after_turn]
+event = "turn_completed"
+workflow = "review"
+effect = "idempotent"
+
+[api.tools.review]
+workflow = "review"
+description = "Run the durable review workflow"
+input_schema = { type = "object" }
+effect = "at_most_once"
+
+[api.commands.review]
+workflow = "review"
+description = "Run the durable review command"
+```
+
+The supported hook events are `turn_started` and `turn_completed`. Tool and
+command registrations are exposed through the same provider-neutral dispatcher
+and execute only workflows in the immutable turn snapshot. Their JSON object
+is available as a JSON string inside Blu through `borg_workflow_arguments(call_id)`. Workflow
+start, host-call, and terminal records remain in the session journal, so a
+retry replays a completed effect instead of invoking an opaque live callback.
 
 ## Commands
 

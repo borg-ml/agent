@@ -1273,6 +1273,9 @@ async fn run_agent_session_store_kernel(
         web_search,
     )
     .with_resource_limits(launch.capabilities.resource_limits.clone());
+    if let Some(extension_api) = executor.extension_api_snapshot() {
+        dispatcher.configure_extension_api(extension_api)?;
+    }
     dispatcher
         .configure_runtime_mcp(runtime_mcp_servers.clone())
         .await?;
@@ -1761,6 +1764,7 @@ async fn run_agent_session_store_kernel(
                                         runtime_mcp_context: runtime_mcp_context.clone(),
                                         extension_skill_roots: launch.extension_skill_roots.clone(),
                                         extension_workflows: Vec::new(),
+                                        extension_api: crate::ExtensionApiSnapshot::default(),
                                         system_prompt_appendix: crate::provider_capabilities_prompt(
                                             &launch.capabilities.provider_capabilities,
                                         ),
@@ -2359,6 +2363,7 @@ async fn run_agent_session_store_kernel(
             runtime_mcp_context: runtime_mcp_context.clone(),
             extension_skill_roots: launch.extension_skill_roots.clone(),
             extension_workflows: Vec::new(),
+            extension_api: crate::ExtensionApiSnapshot::default(),
             system_prompt_appendix: crate::provider_capabilities_prompt(
                 &launch.capabilities.provider_capabilities,
             ),
@@ -4167,6 +4172,7 @@ async fn compact_subscription_context_for_budget(
                 .unwrap_or_default(),
             extension_skill_roots: Vec::new(),
             extension_workflows: Vec::new(),
+            extension_api: crate::ExtensionApiSnapshot::default(),
             system_prompt_appendix: format!(
                 "{RETAINED_COMPACTION_SYSTEM_PROMPT}\n\n{}",
                 crate::provider_capabilities_prompt(&launch.capabilities.provider_capabilities)

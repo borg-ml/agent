@@ -67,6 +67,84 @@ impl ExtensionCatalog {
             .collect()
     }
 
+    pub(crate) fn api_snapshot(&self) -> borg_remote::ExtensionApiSnapshot {
+        let mut snapshot = borg_remote::ExtensionApiSnapshot {
+            api_version: borg_remote::EXTENSION_API_VERSION,
+            catalog_revision: self.revision.clone(),
+            ..Default::default()
+        };
+        for id in &self.load_order {
+            let Some(extension) = self.extensions.iter().find(|extension| &extension.id == id)
+            else {
+                continue;
+            };
+            if !extension.active {
+                continue;
+            }
+            snapshot
+                .transforms
+                .extend(extension.api.transforms.iter().map(|(name, transform)| {
+                    borg_remote::ExtensionApiTransform {
+                        extension_id: extension.id.clone(),
+                        name: name.clone(),
+                        scope: transform.scope,
+                        append_system_prompt: transform.append_system_prompt.clone(),
+                    }
+                }));
+            snapshot
+                .hooks
+                .extend(extension.api.hooks.iter().map(|(name, hook)| {
+                    borg_remote::ExtensionApiHook {
+                        extension_id: extension.id.clone(),
+                        name: name.clone(),
+                        scope: hook.scope,
+                        event: hook.event.clone(),
+                        workflow: hook.workflow.clone(),
+                        effect: borg_remote::effect_class_from_name(&hook.effect)
+                            .unwrap_or(borg_remote::ExtensionEffectClass::Idempotent),
+                    }
+                }));
+            snapshot
+                .tools
+                .extend(extension.api.tools.iter().map(|(name, tool)| {
+                    borg_remote::ExtensionApiTool {
+                        extension_id: extension.id.clone(),
+                        name: name.clone(),
+                        wire_name: format!("ext__{}__{}", extension.id, name),
+                        scope: tool.scope,
+                        workflow: tool.workflow.clone(),
+                        description: tool.description.clone(),
+                        input_schema: toml_value_to_json(&tool.input_schema),
+                        effect: borg_remote::effect_class_from_name(&tool.effect)
+                            .unwrap_or(borg_remote::ExtensionEffectClass::Idempotent),
+                    }
+                }));
+            snapshot
+                .commands
+                .extend(extension.api.commands.iter().map(|(name, command)| {
+                    borg_remote::ExtensionApiCommand {
+                        extension_id: extension.id.clone(),
+                        name: name.clone(),
+                        scope: command.scope,
+                        workflow: command.workflow.clone(),
+                        description: command.description.clone(),
+                        effect: borg_remote::effect_class_from_name(&command.effect)
+                            .unwrap_or(borg_remote::ExtensionEffectClass::Idempotent),
+                    }
+                }));
+        }
+        if let Err(error) = snapshot.validate() {
+            tracing::warn!(%error, "invalid extension API snapshot; keeping an empty API");
+            borg_remote::ExtensionApiSnapshot {
+                api_version: borg_remote::EXTENSION_API_VERSION,
+                catalog_revision: self.revision.clone(),
+                ..Default::default()
+            }
+        } else {
+            snapshot
+        }
+    }
+
     pub(crate) fn extension(&self, id: &str) -> Option<&EffectiveExtension> {
         self.extensions.iter().find(|extension| extension.id == id)
     }
@@ -122,6 +200,7 @@ pub(crate) struct EffectiveExtension {
     pub servers: Vec<String>,
     pub workflow_names: Vec<String>,
     pub workflow_runtimes: BTreeMap<String, String>,
+    pub api: ApiManifest,
     #[serde(skip_serializing)]
     pub workflows: Vec<borg_remote::BluWorkflowDefinition>,
     /// Secret settings are always redacted from catalog output.
@@ -154,6 +233,76 @@ struct Manifest {
     mcp: BTreeMap<String, Server>,
     #[serde(default)]
     workflows: BTreeMap<String, Workflow>,
+    #[serde(default)]
+    api: ApiManifest,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct ApiManifest {
+    pub version: u32,
+    pub transforms: BTreeMap<String, ApiTransform>,
+    pub hooks: BTreeMap<String, ApiHook>,
+    pub tools: BTreeMap<String, ApiTool>,
+    pub commands: BTreeMap<String, ApiCommand>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ApiTransform {
+    pub append_system_prompt: String,
+    #[serde(default = "project_scope")]
+    pub scope: borg_remote::ExtensionApiScope,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ApiHook {
+    pub event: String,
+    pub workflow: String,
+    #[serde(default = "idempotent_effect")]
+    pub effect: String,
+    #[serde(default = "project_scope")]
+    pub scope: borg_remote::ExtensionApiScope,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ApiTool {
+    pub workflow: String,
+    pub description: String,
+    #[serde(default = "object_schema")]
+    pub input_schema: toml::Value,
+    #[serde(default = "idempotent_effect")]
+    pub effect: String,
+    #[serde(default = "project_scope")]
+    pub scope: borg_remote::ExtensionApiScope,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ApiCommand {
+    pub workflow: String,
+    pub description: String,
+    #[serde(default = "idempotent_effect")]
+    pub effect: String,
+    #[serde(default = "project_scope")]
+    pub scope: borg_remote::ExtensionApiScope,
+}
+
+fn project_scope() -> borg_remote::ExtensionApiScope {
+    borg_remote::ExtensionApiScope::Project
+}
+
+fn idempotent_effect() -> String {
+    "idempotent".to_string()
+}
+
+fn object_schema() -> toml::Value {
+    toml::Value::Table(toml::map::Map::from_iter([(
+        "type".to_string(),
+        toml::Value::String("object".to_string()),
+    )]))
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -708,6 +857,81 @@ fn validate_candidate_declarations(candidate: &mut Candidate, manifest: &Manifes
                 args: workflow.args.clone(),
             });
     }
+    ensure!(
+        manifest.api.version == 0 || manifest.api.version == borg_remote::EXTENSION_API_VERSION,
+        "extension {} uses unsupported API version {}",
+        manifest.id,
+        manifest.api.version
+    );
+    for (name, transform) in &manifest.api.transforms {
+        ensure!(valid_id(name), "invalid extension transform name {name}");
+        ensure!(
+            transform.append_system_prompt.len() <= 16 * 1024,
+            "extension {} transform {name} is too large",
+            manifest.id
+        );
+        ensure!(
+            !transform.append_system_prompt.contains('\0'),
+            "extension {} transform {name} contains NUL",
+            manifest.id
+        );
+    }
+    for (name, hook) in &manifest.api.hooks {
+        ensure!(valid_id(name), "invalid extension hook name {name}");
+        ensure!(
+            valid_id(&hook.event),
+            "extension {} hook {name} has an invalid event",
+            manifest.id
+        );
+        ensure!(
+            matches!(hook.event.as_str(), "turn_started" | "turn_completed"),
+            "extension {} hook {name} uses unsupported event {}",
+            manifest.id,
+            hook.event
+        );
+        ensure!(
+            manifest.workflows.contains_key(&hook.workflow),
+            "extension {} hook {name} references missing workflow {}",
+            manifest.id,
+            hook.workflow
+        );
+        borg_remote::effect_class_from_name(&hook.effect)?;
+    }
+    for (name, tool) in &manifest.api.tools {
+        ensure!(valid_id(name), "invalid extension tool name {name}");
+        ensure!(
+            manifest.workflows.contains_key(&tool.workflow),
+            "extension {} tool {name} references missing workflow {}",
+            manifest.id,
+            tool.workflow
+        );
+        ensure!(
+            tool.description.len() <= 4 * 1024 && !tool.description.trim().is_empty(),
+            "extension {} tool {name} needs a bounded description",
+            manifest.id
+        );
+        ensure!(
+            tool.input_schema.as_table().is_some(),
+            "extension {} tool {name} input_schema must be a TOML table",
+            manifest.id
+        );
+        borg_remote::effect_class_from_name(&tool.effect)?;
+    }
+    for (name, command) in &manifest.api.commands {
+        ensure!(valid_id(name), "invalid extension command name {name}");
+        ensure!(
+            manifest.workflows.contains_key(&command.workflow),
+            "extension {} command {name} references missing workflow {}",
+            manifest.id,
+            command.workflow
+        );
+        ensure!(
+            command.description.len() <= 4 * 1024 && !command.description.trim().is_empty(),
+            "extension {} command {name} needs a bounded description",
+            manifest.id
+        );
+        borg_remote::effect_class_from_name(&command.effect)?;
+    }
     for (name, server) in &manifest.mcp {
         ensure!(valid_id(name), "invalid MCP server name `{name}`");
         ensure!(
@@ -882,6 +1106,25 @@ fn config_value_string(value: &toml::Value) -> String {
     }
 }
 
+fn toml_value_to_json(value: &toml::Value) -> serde_json::Value {
+    match value {
+        toml::Value::String(value) => serde_json::Value::String(value.clone()),
+        toml::Value::Integer(value) => serde_json::json!(value),
+        toml::Value::Float(value) => serde_json::json!(value),
+        toml::Value::Boolean(value) => serde_json::json!(value),
+        toml::Value::Datetime(value) => serde_json::Value::String(value.to_string()),
+        toml::Value::Array(values) => {
+            serde_json::Value::Array(values.iter().map(toml_value_to_json).collect())
+        }
+        toml::Value::Table(table) => serde_json::Value::Object(
+            table
+                .iter()
+                .map(|(key, value)| (key.clone(), toml_value_to_json(value)))
+                .collect(),
+        ),
+    }
+}
+
 fn resolve_dependencies(candidates: &mut [Candidate]) {
     let versions = candidates
         .iter()
@@ -1053,6 +1296,7 @@ fn effective(candidate: Candidate) -> EffectiveExtension {
             .iter()
             .map(|(name, workflow)| (name.clone(), workflow.runtime.label().to_string()))
             .collect(),
+        api: candidate.manifest.api,
         workflows: candidate.workflows,
         settings,
     }
@@ -1821,6 +2065,64 @@ description = "Review the current change"
             "borg_emit(\"audit\", \"extension.review\", \"{}\")"
         );
         assert_eq!(workflows[0].runtime, borg_remote::WorkflowRuntime::Blu);
+    }
+
+    #[test]
+    fn api_manifest_becomes_a_validated_provider_neutral_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        let package = root.path().join("api");
+        fs::create_dir_all(package.join("skills")).unwrap();
+        fs::create_dir_all(package.join("workflows")).unwrap();
+        fs::write(
+            package.join("blu.toml"),
+            r#"
+manifest_version = 1
+id = "api"
+version = "1.0.0"
+skill_roots = ["skills"]
+
+[workflows.review]
+entrypoint = "workflows/review.blu"
+
+[api]
+version = 1
+[api.transforms.concise]
+append_system_prompt = "Use concise notes."
+[api.hooks.after_turn]
+event = "turn_completed"
+workflow = "review"
+[api.tools.review]
+workflow = "review"
+description = "Review the change"
+input_schema = { type = "object" }
+[api.commands.review]
+workflow = "review"
+description = "Run review"
+"#,
+        )
+        .unwrap();
+        fs::write(
+            package.join("workflows/review.blu"),
+            "return borg_workflow_arguments(1)",
+        )
+        .unwrap();
+        let (catalog, _, _) = discover_in_dirs(
+            None,
+            Some(root.path().to_path_buf()),
+            None,
+            None,
+            &CapabilityConfig::default(),
+            false,
+        )
+        .unwrap();
+        assert!(!catalog.has_errors(), "{:#?}", catalog.diagnostics);
+        let snapshot = catalog.api_snapshot();
+        assert_eq!(snapshot.api_version, borg_remote::EXTENSION_API_VERSION);
+        assert_eq!(snapshot.transforms.len(), 1);
+        assert_eq!(snapshot.hooks[0].event, "turn_completed");
+        assert_eq!(snapshot.tools[0].wire_name, "ext__api__review");
+        assert_eq!(snapshot.commands[0].name, "review");
+        assert_eq!(snapshot.command_wires(), ["extcmd__api__review"]);
     }
 
     #[test]

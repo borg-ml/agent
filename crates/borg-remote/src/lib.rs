@@ -11,6 +11,7 @@ mod autonomy;
 mod blu_workflow;
 mod command;
 mod contract;
+mod extension_api;
 mod filesystem;
 mod harness;
 mod host;
@@ -35,6 +36,7 @@ mod session_store;
 mod subagents;
 mod tool_presentation;
 mod workspace;
+mod workspace_snapshot;
 
 pub use agent::{
     AgentCompaction, AgentTurn, AgentTurnControl, AgentTurnExecutor, AgentTurnResult,
@@ -52,6 +54,11 @@ pub use command::{
     execute_workspace_command_with_limits,
 };
 pub use contract::*;
+pub use extension_api::{
+    EXTENSION_API_VERSION, ExtensionApiCommand, ExtensionApiHook, ExtensionApiRegistry,
+    ExtensionApiScope, ExtensionApiSnapshot, ExtensionApiTool, ExtensionApiTransform,
+    ExtensionEffectClass, effect_class_from_name,
+};
 pub use filesystem::{execute_workspace_filesystem, execute_workspace_filesystem_with_limits};
 pub use host::{
     HostConfig, HostExecutorFactory, default_host_config_path, enroll_host, login_provider,
@@ -111,4 +118,8 @@ pub use workspace::{
     WorkspaceMessage, WorkspaceMessageBody, WorkspaceMessageReceipt, WorkspaceReference,
     WorkspaceReviewRequest, WorkspaceRole, WorkspaceRosterEntry, WorkspaceStore,
     local_human_participant_id,
+};
+pub use workspace_snapshot::{
+    DEFAULT_MAX_SNAPSHOT_BYTES, DEFAULT_MAX_SNAPSHOT_FILES, MAX_SNAPSHOT_FILE_BYTES,
+    WORKSPACE_SNAPSHOT_VERSION, WorkspaceRestoreReport, WorkspaceSnapshot, WorkspaceSnapshotFile,
 };

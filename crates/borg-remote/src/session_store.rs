@@ -5044,6 +5044,7 @@ impl SessionStore for SqliteSessionStore {
             .await?;
         let state = parent_state.for_fork(inherited_event_count);
         let now = Utc::now().to_rfc3339();
+        let mut transaction = self.begin_write().await?;
         sqlx::query(
             "insert into sessions \
              (id, parent_session_id, parent_cut_sequence, inherited_event_count, next_sequence, \
@@ -5058,13 +5059,13 @@ impl SessionStore for SqliteSessionStore {
         .bind(serde_json::to_string(&state)?)
         .bind(&now)
         .bind(&now)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
         let parent_workspace: Option<String> = sqlx::query_scalar(
             "select workspace_id from session_workspace_bindings where session_id=?",
         )
         .bind(parent_session_id.to_string())
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *transaction)
         .await?;
         sqlx::query(
             "insert into session_workspace_bindings \
@@ -5074,8 +5075,9 @@ impl SessionStore for SqliteSessionStore {
         .bind(parent_workspace.unwrap_or_else(|| parent_session_id.to_string()))
         .bind(session_id.to_string())
         .bind(Utc::now().to_rfc3339())
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
+        transaction.commit().await?;
         Ok(SessionStoreFork {
             session_id,
             parent_session_id,

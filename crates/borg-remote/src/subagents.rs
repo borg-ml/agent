@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 #[cfg(unix)]
 use std::{fs::Permissions, os::unix::fs::PermissionsExt};
@@ -162,6 +162,8 @@ pub struct AgentToolDispatcher {
     autonomy: Option<crate::SqliteAutonomyStore>,
     provider_capabilities: Vec<crate::ProviderCapability>,
     blu_workflows: Option<BluWorkflowToolContext>,
+    extension_workflows: Arc<RwLock<Vec<crate::BluWorkflowDefinition>>>,
+    extension_api: Arc<RwLock<crate::ExtensionApiSnapshot>>,
     runtime_root: PathBuf,
     runtime_permission: crate::PermissionMode,
     resource_limits: Option<HostResourceLimits>,
@@ -243,6 +245,7 @@ pub struct AgentToolServer {
     consultation_enabled: bool,
     shared_work_enabled: bool,
     web_search_enabled: bool,
+    extension_tool_names: Vec<String>,
     team_policy: Option<crate::TeamPolicy>,
     cancel: CancellationToken,
 }
@@ -310,6 +313,7 @@ impl AgentToolServer {
         let consultation_enabled = dispatcher.consultation_enabled();
         let shared_work_enabled = dispatcher.shared_work.is_some();
         let web_search_enabled = dispatcher.web_search.is_some();
+        let extension_tool_names = dispatcher.extension_tool_names();
         let team_policy = dispatcher.team_policy.clone();
         tokio::spawn(async move {
             loop {
@@ -330,6 +334,7 @@ impl AgentToolServer {
             consultation_enabled,
             shared_work_enabled,
             web_search_enabled,
+            extension_tool_names,
             team_policy,
             cancel,
         })
@@ -355,6 +360,7 @@ impl AgentToolServer {
         let consultation_enabled = dispatcher.consultation_enabled();
         let shared_work_enabled = dispatcher.shared_work.is_some();
         let web_search_enabled = dispatcher.web_search.is_some();
+        let extension_tool_names = dispatcher.extension_tool_names();
         let team_policy = dispatcher.team_policy.clone();
         tokio::spawn(async move {
             loop {
@@ -381,6 +387,7 @@ impl AgentToolServer {
             consultation_enabled,
             shared_work_enabled,
             web_search_enabled,
+            extension_tool_names,
             team_policy,
             cancel,
         })
@@ -434,6 +441,7 @@ impl AgentToolServer {
                     .as_str()
                     .map(|name| format!("mcp__borg_agent__{name}"))
             })
+            .chain(self.extension_tool_names.iter().cloned())
             .collect(),
         })
     }
@@ -632,13 +640,25 @@ impl AgentToolDispatcher {
             .is_none_or(|team| team.is_root_session(actor_session_id));
         let runtime_root = cwd.clone();
         let runtime_processes = workflow_processes.clone();
+        let extension_workflows = Arc::new(RwLock::new(
+            workflow_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot())
+                .unwrap_or_default(),
+        ));
+        let workflow_state = Arc::clone(&extension_workflows);
         let blu_workflows = workflow_snapshot
             .zip(autonomy.clone())
-            .map(|(snapshot, autonomy)| BluWorkflowToolContext {
+            .map(|(_snapshot, autonomy)| BluWorkflowToolContext {
                 session_id: actor_session_id,
                 root: cwd.clone(),
                 permission,
-                snapshot,
+                snapshot: Arc::new(move || {
+                    workflow_state
+                        .read()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone()
+                }),
                 processes: workflow_processes,
                 store: autonomy.session_store(),
                 autonomy,
@@ -659,6 +679,8 @@ impl AgentToolDispatcher {
             autonomy,
             provider_capabilities,
             blu_workflows,
+            extension_workflows,
+            extension_api: Arc::new(RwLock::new(crate::ExtensionApiSnapshot::default())),
             runtime_root,
             runtime_permission: permission,
             resource_limits: None,
@@ -769,7 +791,49 @@ impl AgentToolDispatcher {
         if self.autonomy.is_some() {
             specs.extend(autonomy_tool_specs());
         }
+        let extension_api = self.extension_api_snapshot();
+        specs.extend(extension_api.tool_specs());
+        specs.extend(extension_api.command_specs());
         specs
+    }
+
+    pub(crate) fn configure_extension_workflows(
+        &self,
+        workflows: Vec<crate::BluWorkflowDefinition>,
+    ) {
+        *self
+            .extension_workflows
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = workflows;
+    }
+
+    pub(crate) fn configure_extension_api(
+        &self,
+        snapshot: crate::ExtensionApiSnapshot,
+    ) -> Result<()> {
+        snapshot.validate()?;
+        *self
+            .extension_api
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = snapshot;
+        Ok(())
+    }
+
+    fn extension_api_snapshot(&self) -> crate::ExtensionApiSnapshot {
+        self.extension_api
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn extension_tool_names(&self) -> Vec<String> {
+        let snapshot = self.extension_api_snapshot();
+        snapshot
+            .tool_wires()
+            .into_iter()
+            .chain(snapshot.command_wires())
+            .map(|wire| format!("mcp__borg_agent__{wire}"))
+            .collect()
     }
 
     pub(crate) fn session_store(&self) -> Option<crate::SqliteSessionStore> {
@@ -805,6 +869,71 @@ impl AgentToolDispatcher {
         workflow_approved: bool,
         workflow_cancel: Option<CancellationToken>,
     ) -> Result<Value> {
+        if let Some(tool) = self.extension_api_snapshot().tool(name).cloned() {
+            let context = self
+                .blu_workflows
+                .as_ref()
+                .context("extension workflow tools are unavailable for this session")?;
+            let workflow = (context.snapshot)()
+                .into_iter()
+                .find(|workflow| {
+                    workflow.extension_id == tool.extension_id && workflow.name == tool.workflow
+                })
+                .with_context(|| {
+                    format!(
+                        "extension tool {} references missing workflow {}:{}",
+                        tool.wire_name, tool.extension_id, tool.workflow
+                    )
+                })?;
+            let serialized = serde_json::to_vec(&arguments)?;
+            let workflow_id = Uuid::new_v5(
+                &self.actor_session_id,
+                &[tool.wire_name.as_bytes(), b"\0", &serialized].concat(),
+            );
+            return self
+                .run_workflow_definition_with_arguments(
+                    context,
+                    workflow,
+                    workflow_id,
+                    arguments,
+                    workflow_approved,
+                    workflow_cancel,
+                )
+                .await;
+        }
+        if let Some(command) = self.extension_api_snapshot().command(name).cloned() {
+            let context = self
+                .blu_workflows
+                .as_ref()
+                .context("extension command workflows are unavailable for this session")?;
+            let workflow = (context.snapshot)()
+                .into_iter()
+                .find(|workflow| {
+                    workflow.extension_id == command.extension_id
+                        && workflow.name == command.workflow
+                })
+                .with_context(|| {
+                    format!(
+                        "extension command {} references missing workflow {}:{}",
+                        command.name, command.extension_id, command.workflow
+                    )
+                })?;
+            let serialized = serde_json::to_vec(&arguments)?;
+            let workflow_id = Uuid::new_v5(
+                &self.actor_session_id,
+                &[name.as_bytes(), b"\0", &serialized].concat(),
+            );
+            return self
+                .run_workflow_definition_with_arguments(
+                    context,
+                    workflow,
+                    workflow_id,
+                    arguments,
+                    workflow_approved,
+                    workflow_cancel,
+                )
+                .await;
+        }
         match name {
             "list_workflows" | "list_blu_workflows" => {
                 let _: NoArgs = serde_json::from_value(arguments)?;
@@ -1065,6 +1194,26 @@ impl AgentToolDispatcher {
         workflow_approved: bool,
         workflow_cancel: Option<CancellationToken>,
     ) -> Result<Value> {
+        self.run_workflow_definition_with_arguments(
+            context,
+            workflow,
+            workflow_id,
+            Value::Object(Default::default()),
+            workflow_approved,
+            workflow_cancel,
+        )
+        .await
+    }
+
+    async fn run_workflow_definition_with_arguments(
+        &self,
+        context: &BluWorkflowToolContext,
+        workflow: crate::BluWorkflowDefinition,
+        workflow_id: Uuid,
+        invocation_arguments: Value,
+        workflow_approved: bool,
+        workflow_cancel: Option<CancellationToken>,
+    ) -> Result<Value> {
         let permission = if workflow_approved {
             crate::PermissionMode::FullAccess
         } else {
@@ -1079,7 +1228,8 @@ impl AgentToolDispatcher {
             context.root.clone(),
             permission,
         )
-        .with_extension_id(workflow.extension_id.clone());
+        .with_extension_id(workflow.extension_id.clone())
+        .with_invocation_arguments(invocation_arguments);
         let cancel = workflow_cancel.unwrap_or_default();
         if workflow.runtime == crate::WorkflowRuntime::Blu {
             let profile = crate::blu_workflow::embedded_source_profile(&workflow.entrypoint);

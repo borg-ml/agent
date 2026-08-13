@@ -92,6 +92,7 @@ pub(crate) struct BluWorkflowRunner {
     processes: ProcessManager,
     root: PathBuf,
     permission: PermissionMode,
+    invocation_arguments: Value,
 }
 
 impl BluWorkflowRunner {
@@ -114,11 +115,17 @@ impl BluWorkflowRunner {
             processes,
             root,
             permission,
+            invocation_arguments: json!({}),
         }
     }
 
     pub(crate) fn with_extension_id(mut self, extension_id: impl Into<String>) -> Self {
         self.extension_id = Some(extension_id.into());
+        self
+    }
+
+    pub(crate) fn with_invocation_arguments(mut self, arguments: Value) -> Self {
+        self.invocation_arguments = arguments;
         self
     }
 
@@ -256,6 +263,7 @@ impl BluWorkflowRunner {
             autonomy: self.autonomy.clone(),
             dispatcher: self.dispatcher.clone(),
             processes: self.processes.clone(),
+            invocation_arguments: self.invocation_arguments.clone(),
         };
         let source = request.source.clone();
         let name = request.name.clone();
@@ -963,6 +971,7 @@ struct HostBridge {
     autonomy: SqliteAutonomyStore,
     dispatcher: Option<AgentToolDispatcher>,
     processes: ProcessManager,
+    invocation_arguments: Value,
 }
 
 impl HostBridge {
@@ -972,6 +981,9 @@ impl HostBridge {
         let response = match operation {
             "workflow_id" => self.journal.call(call_id, operation, json!({}), || {
                 Ok(json!(self.journal.workflow_id.to_string()))
+            })?,
+            "workflow_arguments" => self.journal.call(call_id, operation, json!({}), || {
+                Ok(self.invocation_arguments.clone())
             })?,
             "emit" => {
                 self.require_full_access(operation)?;
@@ -1254,6 +1266,11 @@ fn execute_blu_source(
     }
     for (name, operation, bridge) in [
         ("borg_workflow_id", "workflow_id", bridge.clone()),
+        (
+            "borg_workflow_arguments",
+            "workflow_arguments",
+            bridge.clone(),
+        ),
         ("borg_emit", "emit", bridge.clone()),
         ("borg_tool", "tool", bridge.clone()),
         ("borg_history", "history", bridge.clone()),
@@ -1470,6 +1487,21 @@ mod tests {
         assert!(first.success, "{first:?}");
         assert_eq!(first.values, vec![json!(request.workflow_id.to_string())]);
         assert_eq!(first, runner.run(request).await.expect("replay"));
+    }
+
+    #[tokio::test]
+    async fn workflow_invocation_arguments_are_journaled_and_available_to_blu() {
+        let runner = runner(PermissionMode::Manual)
+            .await
+            .with_invocation_arguments(json!({"query": "release"}));
+        let request = BluWorkflowRequest {
+            workflow_id: Uuid::new_v4(),
+            name: "arguments".to_string(),
+            source: "return borg_workflow_arguments(1)".to_string(),
+        };
+        let result = runner.run(request).await.expect("run");
+        assert!(result.success, "{result:?}");
+        assert_eq!(result.values, vec![json!(r#"{"query":"release"}"#)]);
     }
 
     #[tokio::test]

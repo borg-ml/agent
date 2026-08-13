@@ -6,6 +6,7 @@ mod collab;
 mod editor_preferences;
 mod extensions;
 mod remote_commands;
+mod session_commands;
 mod sleep_inhibitor;
 mod terminal_ui;
 mod updater;
@@ -40,6 +41,7 @@ async fn main() -> Result<()> {
         Command::Capabilities(args) => print_capabilities(args),
         Command::Extensions(args) => print_extensions(args),
         Command::Workspaces(args) => print_local_workspaces(args.json).await,
+        Command::Session { command } => session_commands::run(command).await,
         Command::Acp(args) => acp::run(args).await,
         Command::Collab { command } => collab::run(command).await,
         Command::Doctor { json } => doctor(json).await,

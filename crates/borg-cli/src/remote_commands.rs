@@ -395,6 +395,7 @@ fn blu_host_executor_factory() -> HostExecutorFactory {
                 servers,
                 catalog.active_skill_roots(),
                 catalog.active_workflows(),
+                catalog.api_snapshot(),
             ))
         };
         let executor = if launch.provider == CodingProvider::Kimi {
@@ -414,6 +415,7 @@ fn blu_host_executor_factory() -> HostExecutorFactory {
         .with_external_mcp_servers(servers)
         .with_extension_skill_roots(roots)
         .with_extension_workflows(extension_workflows)
+        .with_extension_api(catalog.api_snapshot())
         .with_runtime_extension_loader(reload);
         Ok(Arc::new(executor) as Arc<dyn AgentTurnExecutor>)
     })
@@ -1255,7 +1257,8 @@ async fn run_local_agent_session(
             servers
         })
         .with_extension_skill_roots(extension_skill_roots)
-        .with_extension_workflows(extension_workflows);
+        .with_extension_workflows(extension_workflows)
+        .with_extension_api(extension_catalog.api_snapshot());
     let live_extension_executor = local_executor.clone();
     let executor: Arc<dyn AgentTurnExecutor> = Arc::new(local_executor);
     let lifecycle_executor = Arc::clone(&executor);
@@ -1900,6 +1903,11 @@ async fn run_local_agent_session(
                         Ok(next) => {
                             let keybindings_changed = next.keybindings != agent_config.keybindings;
                             agent_config = next;
+                            if let Some(terminal) = terminal.as_mut() {
+                                terminal.set_configured_model_entries(
+                                    agent_config.configured_model_entries(),
+                                );
+                            }
                             // Force the Blu snapshot to include updated base
                             // MCP servers, capability gates, and trust policy.
                             observed_extension_revision.clear();
@@ -1958,10 +1966,11 @@ async fn run_local_agent_session(
                             last_blu_discovery_error = None;
                             let mut servers = agent_config.external_mcp_servers();
                             servers.extend(next_extension_servers);
-                            live_extension_executor.replace_runtime_extensions(
+                            live_extension_executor.replace_runtime_extensions_with_api(
                                 servers,
                                 next_catalog.active_skill_roots(),
                                 next_extension_workflows,
+                                next_catalog.api_snapshot(),
                             );
                             extension_catalog = next_catalog;
                             if let Some(terminal) = terminal.as_mut() {

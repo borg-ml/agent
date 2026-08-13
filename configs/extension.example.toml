@@ -56,6 +56,30 @@ allowed_tools = ["search", "read"]
 entrypoint = "workflows/review.blu"
 description = "Review the current change"
 
+# Versioned declarative registrations resolve only to the workflow snapshot.
+# Tools and commands can read their JSON object with
+# borg_workflow_arguments(call_id); hooks are limited to turn boundaries.
+[api]
+version = 1
+
+[api.transforms.concise]
+append_system_prompt = "Prefer concise release notes."
+
+[api.hooks.after_turn]
+event = "turn_completed"
+workflow = "review"
+effect = "idempotent"
+
+[api.tools.review]
+workflow = "review"
+description = "Run the durable review workflow"
+input_schema = { type = "object" }
+effect = "at_most_once"
+
+[api.commands.review]
+workflow = "review"
+description = "Run the durable review command"
+
 # Blu also accepts .lua and .luau entrypoints; .luau selects Luau semantics
 # inside the embedded Blu engine.
 # [workflows.lua_review]

@@ -39,6 +39,11 @@ pub(crate) enum Command {
     Extensions(ExtensionsArgs),
     /// List local multiplayer workspaces available to this OS user.
     Workspaces(WorkspacesArgs),
+    /// Inspect, branch, export, and restore local durable sessions.
+    Session {
+        #[command(subcommand)]
+        command: SessionCommand,
+    },
     /// Serve Borg as an Agent Client Protocol agent over stdio.
     Acp(AcpArgs),
     /// Share or join an end-to-end encrypted live session.
@@ -53,6 +58,71 @@ pub(crate) enum Command {
     },
     #[command(name = "__agent-mcp", hide = true)]
     AgentMcp,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum SessionCommand {
+    /// Show the local session tree or one session's ancestry.
+    Tree {
+        session: Option<Uuid>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Create a child branch before a durable event sequence.
+    Fork {
+        session: Uuid,
+        #[arg(long)]
+        before: u64,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Undo the latest completed user prompt by creating a child branch.
+    Undo {
+        session: Uuid,
+        #[arg(long)]
+        before: Option<u64>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Re-branch from the full parent of an undo/fork child.
+    Redo {
+        session: Uuid,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Export a portable, conversation-only JSON archive.
+    Export {
+        session: Option<Uuid>,
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Import a conversation archive as a new local session.
+    Import {
+        input: PathBuf,
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Capture a bounded workspace snapshot for later restore.
+    Snapshot {
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        #[arg(short, long)]
+        output: PathBuf,
+    },
+    /// Restore a bounded workspace snapshot; keep extra files unless pruned.
+    Restore {
+        input: PathBuf,
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        #[arg(long)]
+        prune: bool,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -331,6 +401,28 @@ mod tests {
             panic!("workspaces command must not launch an agent");
         };
         assert!(args.json);
+    }
+
+    #[test]
+    fn session_branch_and_snapshot_commands_have_explicit_targets() {
+        let session = "22222222-2222-2222-2222-222222222222";
+        let command = Cli::try_parse_from(["borg", "session", "undo", session, "--json"])
+            .expect("session undo parses")
+            .command_or_agent();
+        assert!(matches!(
+            command,
+            Command::Session {
+                command: SessionCommand::Undo {
+                    json: true,
+                    before: None,
+                    ..
+                }
+            }
+        ));
+        assert!(
+            Cli::try_parse_from(["borg", "session", "snapshot", "--output", "workspace.json",])
+                .is_ok()
+        );
     }
 
     #[test]
