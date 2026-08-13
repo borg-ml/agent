@@ -2805,6 +2805,29 @@ equal progress, then survival for an equal-progress tie. Complete-start and
 held-out perturbation rollouts remain the promotion authority. Reconsider
 memory only if the moving-state ambiguity audit changes.
 
+Surf commit `6a4cd16` runs the first matched test of that idea and also fixes
+the geometric actor trainer's target contract. Continuous movement, yaw, and
+pitch targets are compared after the same runtime clamps as deployment, while
+jump and duck targets are canonicalized by their runtime threshold. Replayed
+CEM teachers contribute only their actual controlled exploration window; the
+frozen parent's later continuation is not mislabeled as expert supervision.
+The trainer can now aggregate several such causal traces into a fresh ordinary
+actor.
+
+The resulting behavior-cloning direction is negative. With one 1,024-wide
+seed and the same 1,000-epoch recipe, authentic KSF commands alone produced
+route 609/reset tick 553. Adding four 128-tick spawn-recovery programs produced
+route 415/reset tick 961: it survived longer by slowing and lost substantial
+ordered progress. On 32 matched held-out starts, the authentic-only control had
+17 resets, maximum route 626, and mean episode reward `-0.50304`; the joint
+actor had 20 resets, maximum route 628, and mean reward `-0.59958`. Including
+the full post-intervention parent tails was worse still at nominal route
+469/reset 434 and held-out mean reward `-0.64691`. Reject every generated
+actor. Multi-state data is necessary but naive joint action regression still
+averages incompatible closed-loop futures; the next step needs a directly
+validated long-horizon policy objective, not corrective-trace weighting,
+another trust scale, or recurrence by default.
+
 Use `SURF_WINDOW_MODE=hidden` for a renderer smoke test. A natural loop reload
 after the reported full `rollout_ticks` proves the episode completed without
 an earlier floor/teleport restart; it does not prove the learned path matches
