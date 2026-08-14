@@ -51,6 +51,13 @@ pub(crate) enum ActiveMessageBehavior {
     Queue,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DictationIconStyle {
+    NerdFont,
+    Emoji,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct InteractionPreferences {
@@ -73,6 +80,7 @@ pub(crate) struct PresentationPreferences {
     pub(crate) refresh_rate_fps: u16,
     pub(crate) auto_expand_edits: bool,
     pub(crate) auto_expand_tools: bool,
+    pub(crate) dictation_icon: Option<DictationIconStyle>,
 }
 
 impl Default for PresentationPreferences {
@@ -81,6 +89,7 @@ impl Default for PresentationPreferences {
             refresh_rate_fps: DEFAULT_REFRESH_RATE_FPS,
             auto_expand_edits: true,
             auto_expand_tools: false,
+            dictation_icon: None,
         }
     }
 }
@@ -240,6 +249,7 @@ mod tests {
                 refresh_rate_fps: 144,
                 auto_expand_edits: false,
                 auto_expand_tools: true,
+                dictation_icon: Some(DictationIconStyle::NerdFont),
             },
         };
 
@@ -249,6 +259,7 @@ mod tests {
         let source = fs::read_to_string(path).unwrap();
         assert!(source.contains("assistant_label = \"cLaNkEr\""));
         assert!(source.contains("assistant_message_color = \"#e6edf3\""));
+        assert!(source.contains("dictation_icon = \"nerd_font\""));
     }
 
     #[test]

@@ -36,11 +36,11 @@ use uuid::Uuid;
 use crate::agent_config::AgentConfig;
 use crate::cli::{LocalAgentCliArgs, RemoteCommand};
 use crate::dictation::{LocalDictationConfig, LocalDictationRecorder};
-use crate::editor_preferences::{ActiveMessageBehavior, EditorPreferences};
+use crate::editor_preferences::{ActiveMessageBehavior, DictationIconStyle, EditorPreferences};
 use crate::sleep_inhibitor::SleepInhibitor;
 use crate::terminal_ui::{
     BorgTerminal, DictationState, ProviderAuthChoice, ResumeSessionOption, TerminalInputEvent,
-    UiAction, discard_pending_terminal_input,
+    UiAction, dictation_icon_style_for_preference, discard_pending_terminal_input,
 };
 
 #[path = "local_server.rs"]
@@ -1603,6 +1603,14 @@ async fn run_local_agent_session(
                 },
             ));
         }
+        let icon =
+            dictation_icon_style_for_preference(editor_preferences.presentation.dictation_icon);
+        terminal.set_dictation_icon(icon);
+        if editor_preferences.presentation.dictation_icon.is_none() {
+            editor_preferences.presentation.dictation_icon = Some(icon);
+            editor_preferences.save()?;
+            terminal.open_dictation_icon_picker();
+        }
         terminal.set_auto_expand_edits(editor_preferences.presentation.auto_expand_edits);
         terminal.set_auto_expand_tools(editor_preferences.presentation.auto_expand_tools);
         terminal.set_transcript_labels(
@@ -2523,6 +2531,26 @@ async fn run_local_agent_session(
                     println!("\n{}\n", lsp_support_summary());
                     continue;
                 }
+                if line == "/icons" {
+                    println!("\n  Microphone icon: choose /icons nerd or /icons emoji.\n");
+                    continue;
+                }
+                if let Some(value) = line.strip_prefix("/icons ") {
+                    if let Some(style) = parse_dictation_icon_style(value) {
+                        editor_preferences.presentation.dictation_icon = Some(style);
+                        editor_preferences.save()?;
+                        println!(
+                            "\n  Microphone icon: {}.\n",
+                            match style {
+                                DictationIconStyle::NerdFont => "Nerd Font 󰍬",
+                                DictationIconStyle::Emoji => "emoji 🎤",
+                            }
+                        );
+                    } else {
+                        eprintln!("\n  Choose /icons nerd or /icons emoji.\n");
+                    }
+                    continue;
+                }
                 if matches!(
                     line,
                     "/settings" | "/followups" | "/refresh" | "/sleep"
@@ -3122,6 +3150,9 @@ async fn run_local_agent_session(
                                 cwd.clone(),
                                 &agent_config.keybindings,
                             )?;
+                            restored.set_dictation_icon(dictation_icon_style_for_preference(
+                                editor_preferences.presentation.dictation_icon,
+                            ));
                             restored.set_configured_model_entries(agent_config.configured_model_entries());
                             restored.set_extension_commands(extension_catalog.api_snapshot().commands);
                             let composer_history = store
@@ -3255,6 +3286,19 @@ async fn run_local_agent_session(
                         terminal.set_notice(format!(
                             "Auto-expand other tool details: {}",
                             if enabled { "on" } else { "off" }
+                        ));
+                    }
+                    UiAction::SetDictationIcon(style) => {
+                        editor_preferences.presentation.dictation_icon = Some(style);
+                        editor_preferences.save()?;
+                        let terminal = terminal.as_mut().expect("terminal");
+                        terminal.set_dictation_icon(style);
+                        terminal.set_notice(format!(
+                            "Microphone icon: {}",
+                            match style {
+                                DictationIconStyle::NerdFont => "Nerd Font 󰍬",
+                                DictationIconStyle::Emoji => "emoji 🎤",
+                            }
                         ));
                     }
                     UiAction::ToggleDictation => {
@@ -3763,6 +3807,31 @@ async fn run_local_agent_session(
                                 .as_mut()
                                 .expect("terminal")
                                 .open_auto_expand_tools_picker();
+                        } else if line == "/icons" && attachments.is_empty() {
+                            terminal
+                                .as_mut()
+                                .expect("terminal")
+                                .open_dictation_icon_picker();
+                        } else if let Some(value) = line.strip_prefix("/icons ")
+                            && attachments.is_empty()
+                        {
+                            if let Some(style) = parse_dictation_icon_style(value) {
+                                editor_preferences.presentation.dictation_icon = Some(style);
+                                editor_preferences.save()?;
+                                let terminal = terminal.as_mut().expect("terminal");
+                                terminal.set_dictation_icon(style);
+                                terminal.set_notice(format!(
+                                    "Microphone icon: {}",
+                                    match style {
+                                        DictationIconStyle::NerdFont => "Nerd Font 󰍬",
+                                        DictationIconStyle::Emoji => "emoji 🎤",
+                                    }
+                                ));
+                            } else {
+                                terminal.as_mut().expect("terminal").set_notice(
+                                    "Choose /icons nerd or /icons emoji",
+                                );
+                            }
                         } else if line == "/followups" && attachments.is_empty() {
                             terminal
                                 .as_mut()
@@ -4129,7 +4198,7 @@ async fn run_local_agent_session(
                                     .expect("terminal")
                                     .show_info(
                                         "Commands",
-                                        "/settings · /model · /effort · /extensions · /followups · /refresh · /sleep · /usage · /clear · /compact · /resume · /goal · /todo · /login · /collab · /remote · /quit",
+                                        "/settings · /model · /effort · /extensions · /followups · /refresh · /sleep · /icons · /usage · /clear · /compact · /resume · /goal · /todo · /login · /collab · /remote · /quit",
                                     ),
                                 "/collab" | "/collab view" if attachments.is_empty() => {
                                     if collab_child.is_some() {
@@ -4234,6 +4303,9 @@ async fn run_local_agent_session(
                                             cwd.clone(),
                                             &agent_config.keybindings,
                                         )?;
+                                        restored.set_dictation_icon(dictation_icon_style_for_preference(
+                                            editor_preferences.presentation.dictation_icon,
+                                        ));
                                         restored.set_configured_model_entries(agent_config.configured_model_entries());
                                         restored.set_extension_commands(extension_catalog.api_snapshot().commands);
                                         let composer_history = store
@@ -4293,6 +4365,9 @@ async fn run_local_agent_session(
                                             cwd.clone(),
                                             &agent_config.keybindings,
                                         )?;
+                                        restored.set_dictation_icon(dictation_icon_style_for_preference(
+                                            editor_preferences.presentation.dictation_icon,
+                                        ));
                                         restored.set_configured_model_entries(agent_config.configured_model_entries());
                                         restored.set_extension_commands(extension_catalog.api_snapshot().commands);
                                         let composer_history = store
@@ -5573,6 +5648,14 @@ fn parse_on_off(value: &str) -> Option<bool> {
     }
 }
 
+fn parse_dictation_icon_style(value: &str) -> Option<DictationIconStyle> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "nerd" | "nerd_font" => Some(DictationIconStyle::NerdFont),
+        "emoji" => Some(DictationIconStyle::Emoji),
+        _ => None,
+    }
+}
+
 fn set_transcript_label(
     preferences: &mut EditorPreferences,
     user_label: bool,
@@ -6053,6 +6136,7 @@ fn print_agent_help() {
   /sleep            keep the machine awake during active turns
   /colors           show transcript colours
   /color TARGET HEX set a transcript colour
+  /icons            choose the dictation icon (nerd or emoji)
   /usage            show real Codex weekly limit and session tokens
   /clear            clear the conversation context
   /compact          compact the current provider context

@@ -93,10 +93,13 @@ to `false` when a laptop should suspend on lid close.
 
 ### Local dictation
 
-The terminal composer has a clickable `mic` control on its right edge. Use the
-`dictate` keybinding (`Alt+V` by default) or `/dictate` to start recording; use
-it again to stop and insert the transcription into the composer. Audio is sent
-only to the local OpenAI-compatible transcription endpoint at
+The terminal composer has a clickable microphone control on its right edge. On
+first use, Borg shows both `󰍬` and `🎤` so you can choose the one that renders
+correctly; the choice is saved in `editor.toml`. Use `/icons` to change it later.
+`BORG_TUI_NERD_FONT=1` or `0` can override the saved choice for a session. Use
+the `dictate` keybinding (`Alt+V` by default) or `/dictate` to start recording;
+use it again to stop and insert the transcription into the composer. Audio is
+sent only to the local OpenAI-compatible endpoint at
 `http://127.0.0.1:5092` by default. Borg does not fall back to a cloud speech
 service.
 

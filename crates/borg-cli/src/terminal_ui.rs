@@ -19,7 +19,7 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::editor_preferences::{TranscriptPreferences, parse_hex_color};
+use crate::editor_preferences::{DictationIconStyle, TranscriptPreferences, parse_hex_color};
 use anyhow::{Context, Result};
 use attachments::{AttachmentStore, PasteOutcome};
 use borg_remote::{
@@ -106,6 +106,8 @@ const TOOL_RUN_CHROME_HEIGHT: usize = 2;
 const MIN_SCROLLBAR_THUMB_ROWS: u16 = 5;
 const LARGE_PASTE_CHAR_THRESHOLD: usize = 1000;
 const DICTATION_BUTTON_WIDTH: u16 = 6;
+const DICTATION_EMOJI_ICON: &str = "🎤";
+const DICTATION_NERD_FONT_ICON: &str = "󰍬";
 const SELECTION_AUTOSCROLL_LINES_PER_FRAME: usize = 2;
 type RowRange = (usize, usize, usize);
 type ToolRunRowRange = (usize, usize, usize, usize, bool);
@@ -435,6 +437,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/sleep", "keep the machine awake during active turns"),
     ("/expand-edits", "auto-expand edit diffs"),
     ("/expand-tools", "auto-expand other tool details"),
+    ("/icons", "choose the dictation icon"),
     ("/colors", "view configurable transcript colours"),
     ("/color", "set a transcript colour"),
     ("/usage", "view real Codex weekly limit and session usage"),
@@ -486,6 +489,34 @@ fn rich_terminal_supported(term: Option<&str>, borg_tui: Option<&str>) -> bool {
     !term.is_some_and(|value| matches!(value.trim(), "" | "dumb" | "unknown"))
 }
 
+pub(crate) fn dictation_icon_style_for_preference(
+    preference: Option<DictationIconStyle>,
+) -> DictationIconStyle {
+    dictation_icon_from_environment()
+        .or(preference)
+        .unwrap_or(DictationIconStyle::Emoji)
+}
+
+fn dictation_icon_from_environment() -> Option<DictationIconStyle> {
+    match std::env::var("BORG_TUI_NERD_FONT")
+        .ok()?
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "1" | "true" | "yes" | "on" => Some(DictationIconStyle::NerdFont),
+        "0" | "false" | "no" | "off" => Some(DictationIconStyle::Emoji),
+        _ => None,
+    }
+}
+
+fn dictation_icon(style: DictationIconStyle) -> &'static str {
+    match style {
+        DictationIconStyle::NerdFont => DICTATION_NERD_FONT_ICON,
+        DictationIconStyle::Emoji => DICTATION_EMOJI_ICON,
+    }
+}
+
 #[derive(Debug)]
 pub enum UiAction {
     None,
@@ -533,6 +564,7 @@ pub enum UiAction {
     SetSteerActive(bool),
     SetAutoExpandEdits(bool),
     SetAutoExpandTools(bool),
+    SetDictationIcon(DictationIconStyle),
     ToggleDictation,
     LoadPayloads(Vec<SessionPayloadRef>),
     Interrupt {
@@ -692,6 +724,7 @@ pub struct BorgTerminal {
     dictation_button_area: Option<Rect>,
     dictation_button_hovered: bool,
     dictation_state: DictationState,
+    dictation_icon: DictationIconStyle,
     tool_hit_areas: Vec<(Rect, usize)>,
     tool_run_hit_areas: Vec<(Rect, usize, usize)>,
     tool_run_header_hit_areas: Vec<(Rect, usize)>,
@@ -893,6 +926,7 @@ enum PickerKind {
     ActiveMessages,
     AutoExpandEdits,
     AutoExpandTools,
+    DictationIcon,
     Rewind,
     MessageActions,
     Commands,
@@ -1648,6 +1682,7 @@ impl BorgTerminal {
             dictation_button_area: None,
             dictation_button_hovered: false,
             dictation_state: DictationState::Idle,
+            dictation_icon: dictation_icon_style_for_preference(None),
             tool_hit_areas: Vec::new(),
             tool_run_hit_areas: Vec::new(),
             tool_run_header_hit_areas: Vec::new(),
@@ -2763,6 +2798,7 @@ impl BorgTerminal {
             "Keep machine awake".to_string(),
             "Auto-expand edits".to_string(),
             "Auto-expand tools".to_string(),
+            "Microphone icon".to_string(),
             "Transcript colours".to_string(),
             format!("User label · {user_label}"),
             format!("Assistant label · {assistant_label}"),
@@ -2778,6 +2814,7 @@ impl BorgTerminal {
             "/sleep",
             "/expand-edits",
             "/expand-tools",
+            "/icons",
             "/colors",
             "/user-label",
             "/assistant-label",
@@ -2981,6 +3018,29 @@ impl BorgTerminal {
         ));
     }
 
+    pub fn open_dictation_icon_picker(&mut self) {
+        let options = vec![
+            PickerOption::new(
+                format!("Nerd Font {}", DICTATION_NERD_FONT_ICON),
+                "nerd_font",
+            ),
+            PickerOption::new(format!("Emoji {}", DICTATION_EMOJI_ICON), "emoji"),
+        ];
+        let selected = match self.dictation_icon {
+            DictationIconStyle::NerdFont => 0,
+            DictationIconStyle::Emoji => 1,
+        };
+        self.picker = Some(Picker {
+            kind: PickerKind::DictationIcon,
+            title: "Choose microphone icon",
+            options,
+            selected,
+            query: None,
+            viewport_offset: Cell::new(0),
+        });
+        self.notice = Some("Choose the preview that renders correctly in this terminal".into());
+    }
+
     pub fn set_auto_expand_edits(&mut self, enabled: bool) {
         if !enabled {
             self.capture_transcript_anchor_for_collapse();
@@ -2995,6 +3055,11 @@ impl BorgTerminal {
         }
         self.transcript.set_auto_expand_tools(enabled);
         self.transcript_render_cache = None;
+    }
+
+    pub fn set_dictation_icon(&mut self, style: DictationIconStyle) {
+        self.dictation_icon = style;
+        self.event_redraw_needed = true;
     }
 
     pub fn set_transcript_labels(&mut self, user: String, assistant: String) {
@@ -4239,6 +4304,11 @@ impl BorgTerminal {
             PickerKind::AutoExpandTools => {
                 UiAction::SetAutoExpandTools(picker.selected_value() == "On")
             }
+            PickerKind::DictationIcon => match picker.selected_value().as_str() {
+                "nerd_font" => UiAction::SetDictationIcon(DictationIconStyle::NerdFont),
+                "emoji" => UiAction::SetDictationIcon(DictationIconStyle::Emoji),
+                _ => UiAction::None,
+            },
             PickerKind::Goal => {
                 let value = picker.selected_value();
                 match value.as_str() {
@@ -5156,7 +5226,7 @@ impl BorgTerminal {
                     height: 1,
                 };
                 let (label, color) = match dictation_state {
-                    DictationState::Idle => (" mic  ", BORG_ORANGE),
+                    DictationState::Idle => (dictation_icon(self.dictation_icon), BORG_ORANGE),
                     DictationState::Recording => (" stop ", Color::LightRed),
                     DictationState::Transcribing => (" ...  ", Color::Yellow),
                 };
