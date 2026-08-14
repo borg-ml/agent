@@ -580,6 +580,7 @@ pub enum UiAction {
 pub(crate) enum DictationState {
     #[default]
     Idle,
+    Installing,
     Recording,
     Transcribing,
 }
@@ -5227,6 +5228,7 @@ impl BorgTerminal {
                 };
                 let (label, color) = match dictation_state {
                     DictationState::Idle => (dictation_icon(self.dictation_icon), BORG_ORANGE),
+                    DictationState::Installing => (" ...  ", Color::Yellow),
                     DictationState::Recording => (" stop ", Color::LightRed),
                     DictationState::Transcribing => (" ...  ", Color::Yellow),
                 };

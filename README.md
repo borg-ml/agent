@@ -109,6 +109,15 @@ input arguments can set `BORG_CLI_DICTATION_RECORD_COMMAND` to a shell-style
 argument string containing an `{output}` placeholder. Borg parses that string
 into an executable and arguments and never runs it through a shell.
 
+When the default endpoint is unavailable, the first dictation click downloads a
+checksum-verified, quantized Parakeet TDT 0.6B V2 runtime and model into Borg's
+user cache, starts the local server, and then begins recording. The download is
+about 609 MiB and happens only once per cache. Set
+`BORG_CLI_DICTATION_AUTO_SETUP=0` to keep the existing externally-managed
+service behavior; explicit `BORG_CLI_DICTATION_BASE_URL`, model, or API-key
+settings also bypass automatic setup. The downloaded runtime is MIT-licensed;
+the converted Parakeet weights are CC-BY-4.0 licensed.
+
 Automated CLI/terminal checks should use `borg agent --ephemeral --local-only`.
 That creates a temporary session store and removes it when the process exits,
 so health checks do not pollute the user's resume history or Remote workspace.

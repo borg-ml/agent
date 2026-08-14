@@ -35,7 +35,9 @@ use uuid::Uuid;
 
 use crate::agent_config::AgentConfig;
 use crate::cli::{LocalAgentCliArgs, RemoteCommand};
-use crate::dictation::{LocalDictationConfig, LocalDictationRecorder};
+use crate::dictation::{
+    LocalDictationBackend, LocalDictationConfig, LocalDictationRecorder, ensure_backend,
+};
 use crate::editor_preferences::{ActiveMessageBehavior, DictationIconStyle, EditorPreferences};
 use crate::sleep_inhibitor::SleepInhibitor;
 use crate::terminal_ui::{
@@ -1719,6 +1721,9 @@ async fn run_local_agent_session(
     let mut sleep_inhibitor = SleepInhibitor::new(prevent_sleep);
     let mut dictation_recorder: Option<LocalDictationRecorder> = None;
     let mut dictation_task: Option<tokio::task::JoinHandle<Result<String>>> = None;
+    let mut dictation_setup_task: Option<tokio::task::JoinHandle<Result<LocalDictationBackend>>> =
+        None;
+    let mut dictation_backend: Option<LocalDictationBackend> = None;
     sleep_inhibitor.set_turn_active(matches!(
         status,
         SessionStatus::Starting | SessionStatus::Running | SessionStatus::WaitingForApproval
@@ -1740,6 +1745,48 @@ async fn run_local_agent_session(
     let mut session_event_stream_open = true;
     loop {
         tokio::select! {
+            result = async {
+                dictation_setup_task
+                    .as_mut()
+                    .expect("dictation setup branch is guarded")
+                    .await
+            }, if dictation_setup_task.is_some() => {
+                dictation_setup_task = None;
+                match result {
+                    Ok(Ok(backend)) => {
+                        let config = backend.config();
+                        dictation_backend = Some(backend);
+                        match LocalDictationRecorder::start(&config) {
+                            Ok(recorder) => {
+                                dictation_recorder = Some(recorder);
+                                let terminal = terminal.as_mut().expect("terminal");
+                                terminal.set_dictation_state(DictationState::Recording);
+                                terminal.set_notice(
+                                    "Recording locally · click stop or use the dictate keybinding"
+                                        .to_string(),
+                                );
+                            }
+                            Err(error) => terminal
+                                .as_mut()
+                                .expect("terminal")
+                                .set_notice(format!("Could not start dictation: {error:#}")),
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        if let Some(terminal) = terminal.as_mut() {
+                            terminal.set_dictation_state(DictationState::Idle);
+                            terminal.set_notice(format!("Could not prepare dictation: {error:#}"));
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(terminal) = terminal.as_mut() {
+                            terminal.set_dictation_state(DictationState::Idle);
+                            terminal.set_notice(format!("Dictation setup task failed: {error}"));
+                        }
+                    }
+                }
+                terminal_dirty = true;
+            }
             result = async {
                 dictation_task
                     .as_mut()
@@ -3329,22 +3376,42 @@ async fn run_local_agent_session(
                         ));
                     }
                     UiAction::ToggleDictation => {
-                        if dictation_task.is_some() {
+                        if dictation_task.is_some() || dictation_setup_task.is_some() {
                             terminal
                                 .as_mut()
                                 .expect("terminal")
-                                .set_notice("Dictation is still transcribing".to_string());
+                                .set_notice("Dictation is still preparing or transcribing".to_string());
                         } else if let Some(recorder) = dictation_recorder.take() {
                             terminal
                                 .as_mut()
                                 .expect("terminal")
                                 .set_dictation_state(DictationState::Transcribing);
-                            let config = dictation_config.clone();
+                            let config = dictation_backend
+                                .as_ref()
+                                .map(LocalDictationBackend::config)
+                                .unwrap_or_else(|| dictation_config.clone());
                             dictation_task = Some(tokio::spawn(async move {
                                 recorder.finish_and_transcribe(config).await
                             }));
+                        } else if dictation_backend.is_none() && dictation_config.requires_setup() {
+                            terminal
+                                .as_mut()
+                                .expect("terminal")
+                                .set_dictation_state(DictationState::Installing);
+                            terminal.as_mut().expect("terminal").set_notice(
+                                "Preparing Parakeet V2 · may download about 609 MiB on first use"
+                                    .to_string(),
+                            );
+                            let config = dictation_config.clone();
+                            dictation_setup_task = Some(tokio::spawn(async move {
+                                ensure_backend(config).await
+                            }));
                         } else {
-                            match LocalDictationRecorder::start(&dictation_config) {
+                            let config = dictation_backend
+                                .as_ref()
+                                .map(LocalDictationBackend::config)
+                                .unwrap_or_else(|| dictation_config.clone());
+                            match LocalDictationRecorder::start(&config) {
                                 Ok(recorder) => {
                                     dictation_recorder = Some(recorder);
                                     let terminal = terminal.as_mut().expect("terminal");
@@ -4645,6 +4712,10 @@ async fn run_local_agent_session(
     if let Some(task) = dictation_task.take() {
         task.abort();
     }
+    if let Some(task) = dictation_setup_task.take() {
+        task.abort();
+    }
+    drop(dictation_backend);
     if let Some(terminal) = terminal.as_mut() {
         terminal.set_dictation_state(DictationState::Idle);
     }
