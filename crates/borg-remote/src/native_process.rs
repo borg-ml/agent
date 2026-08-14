@@ -75,7 +75,7 @@ struct HeadTailBuffer {
 }
 
 #[derive(Debug, Serialize)]
-pub(crate) struct ProcessSnapshot {
+pub struct ProcessSnapshot {
     pub session_id: Uuid,
     pub running: bool,
     pub exit_code: Option<i32>,

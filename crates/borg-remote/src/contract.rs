@@ -255,6 +255,20 @@ pub enum PermissionMode {
     Manual,
 }
 
+/// How a native harness presents its tools to the model.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum ToolMode {
+    /// Expose the ordinary one-call-per-tool catalog.
+    Native,
+    /// Expose one `run_code` tool with the generated Borg SDK in the prompt.
+    Code,
+    /// Expose both ordinary tools and `run_code`.
+    #[default]
+    Both,
+}
+
 impl<'de> Deserialize<'de> for PermissionMode {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where

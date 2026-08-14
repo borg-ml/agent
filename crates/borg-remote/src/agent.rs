@@ -21,7 +21,7 @@ use uuid::Uuid;
 
 use crate::{
     CodingProvider, EventActor, MessageStatus, PermissionMode, ResponseLanguage, SessionEventKind,
-    SessionStatus, WorkflowRuntime, native_harness::NativeHarness,
+    SessionStatus, ToolMode, WorkflowRuntime, native_harness::NativeHarness,
 };
 
 pub(crate) const CODING_SYSTEM_PROMPT: &str = "\
@@ -475,6 +475,8 @@ fn subscription_lifecycle_key(
 pub struct LocalAgentSettings {
     pub approval_reviewer_model: Option<String>,
     pub approval_reviewer_effort: Option<String>,
+    /// Presentation mode for the native harness tool catalog.
+    pub tool_mode: ToolMode,
     /// Host-local snapshot of named OpenAI-compatible routes. Secrets stay in
     /// memory and are never part of LaunchSession or durable events.
     pub configured_model_gateways: BTreeMap<String, borg_provider::provider::ModelGateway>,
@@ -500,6 +502,13 @@ impl LocalAgentTurnExecutor {
             native_harness: NativeHarness::with_model_gateway(gateway, &settings),
             ..Self::default()
         }
+    }
+
+    /// Use a different execution world for native tools and persistent
+    /// runtimes while preserving the model-facing Borg tool contract.
+    pub fn with_execution_provider(mut self, provider: Arc<dyn crate::ExecutionProvider>) -> Self {
+        self.native_harness = self.native_harness.with_execution_provider(provider);
+        self
     }
 
     pub fn with_web_search_provider(

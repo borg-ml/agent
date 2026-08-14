@@ -592,6 +592,9 @@ class Borg:
         arguments.update(kwargs)
         return self.call("exec_command", arguments)
 
+    def list(self, path=".", limit=200):
+        return self.call("list_files", {"path": path, "limit": limit})
+
     def read(self, path, **kwargs):
         arguments = {"path": path}
         arguments.update(kwargs)
@@ -676,6 +679,11 @@ class Borg:
         arguments = {"path": path, "content": content}
         arguments.update(kwargs)
         return self.call("write_file", arguments)
+
+    def edit(self, path, old_text, new_text, **kwargs):
+        arguments = {"path": path, "old_text": old_text, "new_text": new_text}
+        arguments.update(kwargs)
+        return self.call("edit_file", arguments)
 
     def tool(self, name, arguments=None):
         return self.call("borg_tool", {"name": name, "arguments": {} if arguments is None else arguments})
@@ -1014,6 +1022,7 @@ function hostCall(operation, arguments_) {
 const borg = {
   call: hostCall,
   exec: (command, options = {}) => hostCall("exec_command", {cmd: command, ...options}),
+  list: (path = ".", limit = 200) => hostCall("list_files", {path, limit}),
   read: (path, options = {}) => hostCall("read_file", {path, ...options}),
   search: (pattern, options = {}) => hostCall("search_files", {pattern, ...options}),
   history: (text, options = {}) => hostCall("history", {
@@ -1047,6 +1056,7 @@ const borg = {
   checkpoint: (key, state) => hostCall("runtime_checkpoint", {key, state}),
   restore: (key) => hostCall("runtime_restore", key === undefined ? {} : {key}),
   write: (path, content, options = {}) => hostCall("write_file", {path, content, ...options}),
+  edit: (path, oldText, newText, options = {}) => hostCall("edit_file", {path, old_text: oldText, new_text: newText, ...options}),
   tool: (name, arguments_ = {}) => hostCall("borg_tool", {name, arguments: arguments_}),
   mcp_tools: () => hostCall("mcp_tools", {}),
   mcp: (name, arguments_ = {}) => hostCall("mcp_call", {name, arguments: arguments_}),

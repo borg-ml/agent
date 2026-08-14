@@ -11,6 +11,7 @@ mod autonomy;
 mod blu_workflow;
 mod command;
 mod contract;
+mod execution;
 mod extension_api;
 mod filesystem;
 mod harness;
@@ -54,6 +55,10 @@ pub use command::{
     execute_workspace_command_with_limits,
 };
 pub use contract::*;
+pub use execution::{
+    ExecutionCommandRequest, ExecutionProvider, ExecutionReadRequest, ExecutionSearchRequest,
+    ExecutionStdinRequest, LocalExecutionProvider,
+};
 pub use extension_api::{
     EXTENSION_API_VERSION, EXTENSION_HOOK_EVENTS, ExtensionApiCommand, ExtensionApiHook,
     ExtensionApiRegistry, ExtensionApiScope, ExtensionApiSnapshot, ExtensionApiTool,
@@ -72,6 +77,7 @@ pub use local_control::{
 };
 pub(crate) use lsp::LspPathPolicy;
 pub use lsp::LspService;
+pub use native_process::ProcessSnapshot;
 pub use orchestration::*;
 pub(crate) use plugin_store::SqlitePluginStore;
 pub use runtime_protocol::{

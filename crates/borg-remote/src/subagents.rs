@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 #[cfg(unix)]
@@ -31,7 +32,7 @@ use crate::{
     TodoItemUpdate, WorkDependency, WorkReview, WorkspaceArtifact, WorkspaceDecision,
     WorkspaceEvent, WorkspaceEventKind, WorkspaceFilesystemOperation, WorkspaceFilesystemOutcome,
     WorkspaceFilesystemRequest, WorkspaceMessageReceipt, WorkspaceReference,
-    WorkspaceReviewRequest, WorkspaceStore, execute_workspace_filesystem_with_limits,
+    WorkspaceReviewRequest, WorkspaceStore,
 };
 
 pub const DEFAULT_MAX_SUBAGENTS: usize = 16;
@@ -40,6 +41,7 @@ const RUNTIME_DEFAULT_FILE_BYTES: u64 = 256 * 1024;
 const RUNTIME_MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const RUNTIME_DEFAULT_COMMAND_TIMEOUT_MS: u64 = 120_000;
 const RUNTIME_MAX_COMMAND_TIMEOUT_MS: u64 = 30 * 60 * 1000;
+const MAX_RUNTIME_HOST_CALLS: usize = 128;
 const PERSISTENT_PEER_CONSULTATION_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -168,7 +170,7 @@ pub struct AgentToolDispatcher {
     runtime_root: PathBuf,
     runtime_permission: crate::PermissionMode,
     resource_limits: Option<HostResourceLimits>,
-    runtime_processes: crate::native_process::ProcessManager,
+    execution_provider: Arc<RwLock<Arc<dyn crate::ExecutionProvider>>>,
     persistent_runtimes: PersistentRuntimeRegistry,
     runtime_mcp: Arc<Mutex<RuntimeMcpState>>,
     harness_lock: Arc<Mutex<()>>,
@@ -640,7 +642,9 @@ impl AgentToolDispatcher {
             .as_ref()
             .is_none_or(|team| team.is_root_session(actor_session_id));
         let runtime_root = cwd.clone();
-        let runtime_processes = workflow_processes.clone();
+        let execution_provider: Arc<dyn crate::ExecutionProvider> = Arc::new(
+            crate::LocalExecutionProvider::with_process_manager(workflow_processes.clone()),
+        );
         let extension_workflows = Arc::new(RwLock::new(
             workflow_snapshot
                 .as_ref()
@@ -685,7 +689,7 @@ impl AgentToolDispatcher {
             runtime_root,
             runtime_permission: permission,
             resource_limits: None,
-            runtime_processes,
+            execution_provider: Arc::new(RwLock::new(execution_provider)),
             persistent_runtimes: PersistentRuntimeRegistry::default(),
             runtime_mcp: Arc::new(Mutex::new(RuntimeMcpState::default())),
             harness_lock: Arc::new(Mutex::new(())),
@@ -696,6 +700,20 @@ impl AgentToolDispatcher {
     pub(crate) fn with_resource_limits(mut self, limits: Option<HostResourceLimits>) -> Self {
         self.resource_limits = limits;
         self
+    }
+
+    pub(crate) fn configure_execution_provider(&self, provider: Arc<dyn crate::ExecutionProvider>) {
+        *self
+            .execution_provider
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = provider;
+    }
+
+    pub(crate) fn execution_provider(&self) -> Arc<dyn crate::ExecutionProvider> {
+        self.execution_provider
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// Configure the external MCP grant for the session without starting any
@@ -1507,7 +1525,8 @@ impl AgentToolDispatcher {
             allow_effects: self.runtime_permission == crate::PermissionMode::FullAccess
                 || workflow_approved,
             dispatcher: self.clone(),
-            processes: self.runtime_processes.clone(),
+            execution_provider: self.execution_provider(),
+            host_calls: Arc::new(AtomicUsize::new(0)),
             session_store: self.session_store(),
             runtime_worker_id: runtime_worker.worker_id(),
         });
@@ -1555,7 +1574,8 @@ struct DispatcherRuntimeHost {
     root: PathBuf,
     allow_effects: bool,
     dispatcher: AgentToolDispatcher,
-    processes: crate::native_process::ProcessManager,
+    execution_provider: Arc<dyn crate::ExecutionProvider>,
+    host_calls: Arc<AtomicUsize>,
     session_store: Option<crate::SqliteSessionStore>,
     runtime_worker_id: Uuid,
 }
@@ -1574,18 +1594,20 @@ impl DispatcherRuntimeHost {
             self.ensure_effects()?;
         }
         let limits = self.dispatcher.resource_limits.clone().unwrap_or_default();
-        let response = execute_workspace_filesystem_with_limits(
-            std::slice::from_ref(&self.root),
-            WorkspaceFilesystemRequest {
-                request_id: Uuid::new_v4(),
-                workspace_id: self.session_id,
-                root_path: self.root.clone(),
-                timeout_ms: 30_000,
-                operation,
-            },
-            &limits,
-        )
-        .await;
+        let response = self
+            .execution_provider
+            .filesystem(
+                std::slice::from_ref(&self.root),
+                WorkspaceFilesystemRequest {
+                    request_id: Uuid::new_v4(),
+                    workspace_id: self.session_id,
+                    root_path: self.root.clone(),
+                    timeout_ms: 30_000,
+                    operation,
+                },
+                &limits,
+            )
+            .await;
         match response.outcome {
             WorkspaceFilesystemOutcome::Success { output } => Ok(serde_json::to_value(output)?),
             WorkspaceFilesystemOutcome::Failure {
@@ -1595,21 +1617,66 @@ impl DispatcherRuntimeHost {
             } => bail!("{code:?}: {message} (retryable={retryable})"),
         }
     }
+
+    async fn edit_file(&self, args: RuntimeEditFileArgs) -> Result<Value> {
+        if args.old_text.is_empty() {
+            bail!("edit_file old_text must not be empty");
+        }
+        let read = self
+            .filesystem(WorkspaceFilesystemOperation::ReadText {
+                path: PathBuf::from(&args.path),
+                max_bytes: RUNTIME_MAX_FILE_BYTES,
+            })
+            .await?;
+        let current = read
+            .get("text")
+            .and_then(Value::as_str)
+            .context("workspace read did not return text")?;
+        let matches = current.matches(&args.old_text).count();
+        ensure!(
+            matches > 0,
+            "edit_file old_text was not found in {}",
+            args.path
+        );
+        ensure!(
+            matches == 1 || args.replace_all.unwrap_or(false),
+            "edit_file old_text matched {matches} locations in {}; set replace_all=true or provide more context",
+            args.path
+        );
+        let updated = if args.replace_all.unwrap_or(false) {
+            current.replace(&args.old_text, &args.new_text)
+        } else {
+            current.replacen(&args.old_text, &args.new_text, 1)
+        };
+        self.filesystem(WorkspaceFilesystemOperation::WriteText {
+            path: PathBuf::from(args.path),
+            text: updated,
+            overwrite: true,
+            create_parent_dirs: false,
+        })
+        .await
+    }
 }
 
 #[async_trait::async_trait]
 impl RuntimeHost for DispatcherRuntimeHost {
     async fn call(&self, operation: &str, arguments: Value) -> Result<Value> {
+        let call_number = self.host_calls.fetch_add(1, Ordering::Relaxed) + 1;
+        ensure!(
+            call_number <= MAX_RUNTIME_HOST_CALLS,
+            "persistent runtime exceeded the per-execution limit of {MAX_RUNTIME_HOST_CALLS} host calls"
+        );
         match operation {
             "read_file" => {
                 let args: RuntimeReadFileArgs = serde_json::from_value(arguments)?;
-                Ok(serde_json::to_value(
-                    crate::native_io::read_text_range(
-                        self.root.clone(),
-                        PathBuf::from(args.path),
-                        args.offset_line.unwrap_or(1),
-                        args.limit_lines.unwrap_or(2_000),
-                        args.max_bytes
+                self.execution_provider
+                    .read_file(crate::ExecutionReadRequest {
+                        root: self.root.clone(),
+                        path: PathBuf::from(args.path),
+                        offset_line: args.offset_line.unwrap_or(1),
+                        limit_lines: args.limit_lines.unwrap_or(2_000),
+                        max_bytes: args
+                            .max_bytes
                             .unwrap_or(RUNTIME_DEFAULT_FILE_BYTES)
                             .min(
                                 self.dispatcher
@@ -1618,25 +1685,24 @@ impl RuntimeHost for DispatcherRuntimeHost {
                                     .map(|limits| limits.max_file_transfer_bytes)
                                     .unwrap_or(RUNTIME_MAX_FILE_BYTES),
                             )
-                            .clamp(1, RUNTIME_MAX_FILE_BYTES) as usize,
-                    )
-                    .await?,
-                )?)
+                            .clamp(1, RUNTIME_MAX_FILE_BYTES)
+                            as usize,
+                    })
+                    .await
             }
             "search_files" => {
                 let args: RuntimeSearchFilesArgs = serde_json::from_value(arguments)?;
-                Ok(serde_json::to_value(
-                    crate::native_io::search_text(
-                        self.root.clone(),
-                        PathBuf::from(args.path.unwrap_or_else(|| ".".to_string())),
-                        args.pattern,
-                        args.literal.unwrap_or(false),
-                        args.case_sensitive.unwrap_or(true),
-                        args.offset.unwrap_or(0),
-                        args.limit.unwrap_or(200),
-                    )
-                    .await?,
-                )?)
+                self.execution_provider
+                    .search_files(crate::ExecutionSearchRequest {
+                        root: self.root.clone(),
+                        path: PathBuf::from(args.path.unwrap_or_else(|| ".".to_string())),
+                        pattern: args.pattern,
+                        literal: args.literal.unwrap_or(false),
+                        case_sensitive: args.case_sensitive.unwrap_or(true),
+                        offset: args.offset.unwrap_or(0),
+                        limit: args.limit.unwrap_or(200),
+                    })
+                    .await
             }
             "list_files" => {
                 let args: RuntimeListFilesArgs = serde_json::from_value(arguments)?;
@@ -1670,35 +1736,68 @@ impl RuntimeHost for DispatcherRuntimeHost {
                     .map(|limits| limits.max_workspace_command_timeout_ms)
                     .unwrap_or(RUNTIME_MAX_COMMAND_TIMEOUT_MS);
                 Ok(serde_json::to_value(
-                    self.processes
-                        .exec(
-                            self.session_id,
-                            &self.root,
-                            args.cmd,
-                            args.workdir.as_deref(),
-                            args.yield_time_ms,
-                            args.max_output_tokens
+                    self.execution_provider
+                        .command(crate::ExecutionCommandRequest {
+                            owner_session_id: self.session_id,
+                            root: self.root.clone(),
+                            command: args.cmd,
+                            workdir: args.workdir,
+                            yield_time_ms: args.yield_time_ms,
+                            max_output_tokens: args
+                                .max_output_tokens
                                 .map(|tokens| {
                                     output_token_limit
                                         .map(|limit| tokens.min(limit))
                                         .unwrap_or(tokens)
                                 })
                                 .or(output_token_limit),
-                            args.timeout_ms
+                            timeout_ms: args
+                                .timeout_ms
                                 .unwrap_or(RUNTIME_DEFAULT_COMMAND_TIMEOUT_MS)
                                 .min(timeout_limit)
                                 .clamp(1, RUNTIME_MAX_COMMAND_TIMEOUT_MS),
-                            self.session_store.clone(),
-                        )
+                            journal: self.session_store.clone(),
+                        })
                         .await?,
                 )?)
+            }
+            "write_stdin" => {
+                let args: RuntimeWriteStdinArgs = serde_json::from_value(arguments)?;
+                Ok(serde_json::to_value(
+                    self.execution_provider
+                        .write_stdin(crate::ExecutionStdinRequest {
+                            owner_session_id: self.session_id,
+                            process_id: args.session_id,
+                            chars: args.chars,
+                            terminate: args.terminate.unwrap_or(false),
+                            yield_time_ms: args.yield_time_ms,
+                            max_output_tokens: args.max_output_tokens,
+                        })
+                        .await?,
+                )?)
+            }
+            "edit_file" => {
+                let args: RuntimeEditFileArgs = serde_json::from_value(arguments)?;
+                self.edit_file(args).await
             }
             "borg_tool" => {
                 let args: RuntimeBorgToolArgs = serde_json::from_value(arguments)?;
                 ensure!(
-                    args.name != "runtime_exec",
-                    "nested runtime_exec calls are not supported"
+                    !matches!(args.name.as_str(), "runtime_exec" | "run_code"),
+                    "nested runtime code calls are not supported"
                 );
+                if matches!(
+                    args.name.as_str(),
+                    "list_files"
+                        | "read_file"
+                        | "search_files"
+                        | "write_file"
+                        | "edit_file"
+                        | "exec_command"
+                        | "write_stdin"
+                ) {
+                    return self.call(&args.name, args.arguments).await;
+                }
                 if matches!(
                     args.name.as_str(),
                     "run_workflow" | "run_blu_workflow" | "run_blu_extension"
@@ -5279,6 +5378,25 @@ struct RuntimeExecCommandArgs {
     yield_time_ms: Option<u64>,
     max_output_tokens: Option<usize>,
     timeout_ms: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeWriteStdinArgs {
+    session_id: Uuid,
+    chars: Option<String>,
+    yield_time_ms: Option<u64>,
+    max_output_tokens: Option<usize>,
+    terminate: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeEditFileArgs {
+    path: String,
+    old_text: String,
+    new_text: String,
+    replace_all: Option<bool>,
 }
 
 #[derive(Deserialize)]

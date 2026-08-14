@@ -21,9 +21,11 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
-    AgentTurn, AgentTurnControl, AgentTurnResult, ApprovalDecision, EventActor, MessageStatus,
-    PermissionMode, SessionEventKind, SessionStatus, WorkspaceFilesystemOperation,
-    WorkspaceFilesystemOutcome, WorkspaceFilesystemRequest, execute_workspace_filesystem,
+    AgentTurn, AgentTurnControl, AgentTurnResult, ApprovalDecision, EventActor,
+    ExecutionCommandRequest, ExecutionProvider, ExecutionReadRequest, ExecutionSearchRequest,
+    ExecutionStdinRequest, HostResourceLimits, MessageStatus, PermissionMode, SessionEventKind,
+    SessionStatus, ToolMode, WorkspaceFilesystemOperation, WorkspaceFilesystemOutcome,
+    WorkspaceFilesystemRequest,
 };
 
 const MAX_TOOL_ROUNDS: usize = 32;
@@ -37,9 +39,11 @@ const MAX_COMMAND_TIMEOUT_MS: u64 = 30 * 60 * 1000;
 #[derive(Clone)]
 pub(crate) struct NativeHarness {
     model_client: Arc<dyn NativeModelClient>,
-    process_manager: crate::native_process::ProcessManager,
+    execution_provider: Arc<dyn ExecutionProvider>,
+    workflow_process_manager: crate::native_process::ProcessManager,
     reviewer_model: Option<String>,
     reviewer_effort: Option<String>,
+    tool_mode: ToolMode,
 }
 
 impl std::fmt::Debug for NativeHarness {
@@ -47,9 +51,11 @@ impl std::fmt::Debug for NativeHarness {
         formatter
             .debug_struct("NativeHarness")
             .field("model_client", &"[provider adapter]")
-            .field("process_manager", &"[session-owned processes]")
+            .field("execution_provider", &"[provider]")
+            .field("workflow_process_manager", &"[session-owned processes]")
             .field("reviewer_model", &self.reviewer_model)
             .field("reviewer_effort", &self.reviewer_effort)
+            .field("tool_mode", &self.tool_mode)
             .finish()
     }
 }
@@ -58,9 +64,11 @@ impl Default for NativeHarness {
     fn default() -> Self {
         Self {
             model_client: Arc::new(CompatibleModelClient::default()),
-            process_manager: crate::native_process::ProcessManager::default(),
+            execution_provider: Arc::new(crate::LocalExecutionProvider::new()),
+            workflow_process_manager: crate::native_process::ProcessManager::default(),
             reviewer_model: None,
             reviewer_effort: None,
+            tool_mode: ToolMode::Both,
         }
     }
 }
@@ -74,7 +82,9 @@ impl NativeHarness {
             }),
             reviewer_model: settings.approval_reviewer_model.clone(),
             reviewer_effort: settings.approval_reviewer_effort.clone(),
-            process_manager: crate::native_process::ProcessManager::default(),
+            execution_provider: Arc::new(crate::LocalExecutionProvider::new()),
+            workflow_process_manager: crate::native_process::ProcessManager::default(),
+            tool_mode: settings.tool_mode,
         }
     }
 
@@ -89,6 +99,11 @@ impl NativeHarness {
             }),
             ..Self::with_settings(settings)
         }
+    }
+
+    pub(crate) fn with_execution_provider(mut self, provider: Arc<dyn ExecutionProvider>) -> Self {
+        self.execution_provider = provider;
+        self
     }
 
     pub(crate) async fn run(
@@ -110,6 +125,8 @@ impl NativeHarness {
             .model
             .clone()
             .context("native provider sessions require an explicit model")?;
+        turn.agent_tools
+            .configure_execution_provider(self.execution_provider.clone());
         let session_store = turn.agent_tools.session_store();
         let runtime = NativeToolRuntime::start(NativeToolRuntimeConfig {
             session_id: turn.session_id,
@@ -118,24 +135,28 @@ impl NativeHarness {
             agent_tools: turn.agent_tools.clone(),
             external_mcp_servers: turn.external_mcp_servers.clone(),
             extension_skill_roots: turn.extension_skill_roots.clone(),
-            processes: self.process_manager.clone(),
+            execution_provider: turn.agent_tools.execution_provider(),
             session_store,
+            tool_mode: self.tool_mode,
+            workflow_process_manager: self.workflow_process_manager.clone(),
         })
         .await?;
         let tools = runtime.tool_definitions()?;
         let mut messages = Vec::with_capacity(turn.conversation.len().saturating_add(3));
         let mut system_prompt = super::agent::CODING_SYSTEM_PROMPT.to_string();
+        match self.tool_mode {
+            ToolMode::Native => system_prompt.push_str(
+                "\n\nUse `runtime_exec` for loops, filtering, transformations, and persistent programmatic work. It is trusted user-authority execution, not a security sandbox. ",
+            ),
+            ToolMode::Code => system_prompt.push_str(
+                "\n\nUse `run_code` for loops, filtering, transformations, and batches of Borg calls. It is trusted user-authority execution, not a security sandbox. ",
+            ),
+            ToolMode::Both => system_prompt.push_str(
+                "\n\nUse `run_code` for loops, filtering, transformations, and batches of Borg calls; use `runtime_exec` when you specifically need its persistent namespace. Both are trusted user-authority execution, not security sandboxes. ",
+            ),
+        }
         system_prompt.push_str(
-            "\n\nThe `runtime_exec` tool is a persistent Python/Bun control environment for this session; ",
-        );
-        system_prompt.push_str(
-            "set runtime to `javascript` or `typescript` when the optional Bun environment is more useful. Use it for programmatic inspection, transformations, reusable helper functions, ",
-        );
-        system_prompt.push_str(
-            "and retaining structured working state across turns; use its `borg` bridge for ",
-        );
-        system_prompt.push_str(
-            "host operations. It is trusted user-authority execution, not a security sandbox. ",
+            "The runtime's `borg` bridge exposes bounded filesystem, process, history, MCP, workflow, and collaboration operations. ",
         );
         system_prompt.push_str(
             "Inside the persistent runtime, `borg.environment(extension_id, server)` discovers and calls the extension's long-lived MCP environment, `await borg.rlm(task)` admits a subagent and returns a handle, and `borg.harness` manages bounded prompt, memory, skill, and subagent entries that are injected into later turns. ",
@@ -146,6 +167,9 @@ impl NativeHarness {
         system_prompt.push_str(
             "typed, lexical, or regex evidence from the lossless journal when compacted context is insufficient. Use `history_index` or `borg.history_index(...)` to page the full normalized log and build a task-specific retrieval or BorgSearch adapter; use `borg.semantic_search(...)` when the scoped Web BorgSearch MCP service is the right candidate retriever; persist mature adapters with `create_retrieval_adapter`, test them with `borg.test_retrieval_adapter(...)`, and resolve every index hit back through canonical history. ",
         );
+        if matches!(self.tool_mode, ToolMode::Code | ToolMode::Both) {
+            system_prompt.push_str(&code_mode_prompt(&runtime.code_mode_catalog()?));
+        }
         system_prompt.push_str(&runtime.context.prompt_appendix());
         if !turn.system_prompt_appendix.is_empty() {
             system_prompt.push_str("\n\n");
@@ -574,7 +598,10 @@ impl NativeHarness {
     }
 
     pub(crate) async fn stop_session(&self, session_id: Uuid) {
-        self.process_manager.terminate_session(session_id).await;
+        self.execution_provider.terminate_session(session_id).await;
+        self.workflow_process_manager
+            .terminate_session(session_id)
+            .await;
     }
 
     pub(crate) async fn compact(
@@ -749,8 +776,10 @@ struct NativeToolRuntimeConfig {
     agent_tools: crate::AgentToolDispatcher,
     external_mcp_servers: Vec<borg_provider::mcp::ExternalMcpServer>,
     extension_skill_roots: Vec<PathBuf>,
-    processes: crate::native_process::ProcessManager,
+    execution_provider: Arc<dyn ExecutionProvider>,
     session_store: Option<crate::SqliteSessionStore>,
+    tool_mode: ToolMode,
+    workflow_process_manager: crate::native_process::ProcessManager,
 }
 
 struct NativeToolRuntime {
@@ -759,9 +788,11 @@ struct NativeToolRuntime {
     permission: PermissionMode,
     agent_tools: crate::AgentToolDispatcher,
     mcp: crate::native_mcp::NativeMcpRuntime,
-    processes: crate::native_process::ProcessManager,
+    execution_provider: Arc<dyn ExecutionProvider>,
+    workflow_process_manager: crate::native_process::ProcessManager,
     session_store: Option<crate::SqliteSessionStore>,
     context: crate::native_context::NativeContext,
+    tool_mode: ToolMode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -774,7 +805,11 @@ impl NativeToolRuntime {
     async fn start(config: NativeToolRuntimeConfig) -> Result<Self> {
         if let Some(store) = config.session_store.as_ref() {
             config
-                .processes
+                .execution_provider
+                .recover_session(config.session_id, store.clone())
+                .await?;
+            config
+                .workflow_process_manager
                 .recover_session(config.session_id, store.clone())
                 .await?;
         }
@@ -789,13 +824,27 @@ impl NativeToolRuntime {
             permission: config.permission,
             agent_tools: config.agent_tools,
             mcp: crate::native_mcp::NativeMcpRuntime::start(config.external_mcp_servers).await?,
-            processes: config.processes,
+            execution_provider: config.execution_provider,
+            workflow_process_manager: config.workflow_process_manager,
             session_store: config.session_store,
             context,
+            tool_mode: config.tool_mode,
         })
     }
 
     fn tool_definitions(&self) -> Result<Vec<ModelToolDefinition>> {
+        let mut definitions = self.code_mode_catalog()?;
+        if matches!(self.tool_mode, ToolMode::Code) {
+            return Ok(vec![run_code_tool_definition()?]);
+        }
+        if matches!(self.tool_mode, ToolMode::Both) {
+            definitions.push(run_code_tool_definition()?);
+        }
+        validate_tool_definitions(&definitions)?;
+        Ok(definitions)
+    }
+
+    fn code_mode_catalog(&self) -> Result<Vec<ModelToolDefinition>> {
         let mut specs = builtin_tool_specs();
         if self.context.has_skills() {
             specs.push(self.context.skill_tool_spec());
@@ -806,12 +855,7 @@ impl NativeToolRuntime {
             .map(|spec| ModelToolDefinition::from_mcp_spec(&spec).map_err(anyhow::Error::msg))
             .collect::<Result<Vec<_>>>()?;
         definitions.extend_from_slice(self.mcp.definitions());
-        let mut names = HashSet::with_capacity(definitions.len());
-        for definition in &definitions {
-            if !names.insert(definition.name.as_str()) {
-                bail!("duplicate native harness tool name `{}`", definition.name);
-            }
-        }
+        validate_tool_definitions(&definitions)?;
         Ok(definitions)
     }
 
@@ -837,33 +881,32 @@ impl NativeToolRuntime {
             }
             "read_file" => {
                 let args: ReadFileArgs = serde_json::from_value(arguments)?;
-                Ok(serde_json::to_value(
-                    crate::native_io::read_text_range(
-                        self.root.clone(),
-                        PathBuf::from(args.path),
-                        args.offset_line.unwrap_or(1),
-                        args.limit_lines.unwrap_or(2_000),
-                        args.max_bytes
+                self.execution_provider
+                    .read_file(ExecutionReadRequest {
+                        root: self.root.clone(),
+                        path: PathBuf::from(args.path),
+                        offset_line: args.offset_line.unwrap_or(1),
+                        limit_lines: args.limit_lines.unwrap_or(2_000),
+                        max_bytes: args
+                            .max_bytes
                             .unwrap_or(DEFAULT_FILE_BYTES)
                             .clamp(1, MAX_FILE_BYTES) as usize,
-                    )
-                    .await?,
-                )?)
+                    })
+                    .await
             }
             "search_files" => {
                 let args: SearchFilesArgs = serde_json::from_value(arguments)?;
-                Ok(serde_json::to_value(
-                    crate::native_io::search_text(
-                        self.root.clone(),
-                        PathBuf::from(args.path.unwrap_or_else(|| ".".to_string())),
-                        args.pattern,
-                        args.literal.unwrap_or(false),
-                        args.case_sensitive.unwrap_or(true),
-                        args.offset.unwrap_or(0),
-                        args.limit.unwrap_or(200),
-                    )
-                    .await?,
-                )?)
+                self.execution_provider
+                    .search_files(ExecutionSearchRequest {
+                        root: self.root.clone(),
+                        path: PathBuf::from(args.path.unwrap_or_else(|| ".".to_string())),
+                        pattern: args.pattern,
+                        literal: args.literal.unwrap_or(false),
+                        case_sensitive: args.case_sensitive.unwrap_or(true),
+                        offset: args.offset.unwrap_or(0),
+                        limit: args.limit.unwrap_or(200),
+                    })
+                    .await
             }
             "write_file" => {
                 let args: WriteFileArgs = serde_json::from_value(arguments)?;
@@ -882,36 +925,52 @@ impl NativeToolRuntime {
             "exec_command" => {
                 let args: ExecCommandArgs = serde_json::from_value(arguments)?;
                 Ok(serde_json::to_value(
-                    self.processes
-                        .exec(
-                            self.session_id,
-                            &self.root,
-                            args.cmd,
-                            args.workdir.as_deref(),
-                            args.yield_time_ms,
-                            args.max_output_tokens,
-                            args.timeout_ms
+                    self.execution_provider
+                        .command(ExecutionCommandRequest {
+                            owner_session_id: self.session_id,
+                            root: self.root.clone(),
+                            command: args.cmd,
+                            workdir: args.workdir,
+                            yield_time_ms: args.yield_time_ms,
+                            max_output_tokens: args.max_output_tokens,
+                            timeout_ms: args
+                                .timeout_ms
                                 .unwrap_or(DEFAULT_COMMAND_TIMEOUT_MS)
                                 .clamp(1, MAX_COMMAND_TIMEOUT_MS),
-                            self.session_store.clone(),
-                        )
+                            journal: self.session_store.clone(),
+                        })
                         .await?,
                 )?)
             }
             "write_stdin" => {
                 let args: WriteStdinArgs = serde_json::from_value(arguments)?;
                 Ok(serde_json::to_value(
-                    self.processes
-                        .write_stdin(
-                            self.session_id,
-                            args.session_id,
-                            args.chars.as_deref(),
-                            args.terminate.unwrap_or(false),
-                            args.yield_time_ms,
-                            args.max_output_tokens,
-                        )
+                    self.execution_provider
+                        .write_stdin(ExecutionStdinRequest {
+                            owner_session_id: self.session_id,
+                            process_id: args.session_id,
+                            chars: args.chars,
+                            terminate: args.terminate.unwrap_or(false),
+                            yield_time_ms: args.yield_time_ms,
+                            max_output_tokens: args.max_output_tokens,
+                        })
                         .await?,
                 )?)
+            }
+            "run_code" => {
+                let args: RunCodeArgs = serde_json::from_value(arguments)?;
+                self.agent_tools
+                    .call_with_workflow_control(
+                        "runtime_exec",
+                        json!({
+                            "runtime": args.runtime,
+                            "code": args.code,
+                            "timeout_ms": args.timeout_ms,
+                        }),
+                        workflow_approved,
+                        cancellation,
+                    )
+                    .await
             }
             "run_blu_workflow" => {
                 let args: RunBluWorkflowArgs = serde_json::from_value(arguments)?;
@@ -962,7 +1021,7 @@ impl NativeToolRuntime {
             store,
             autonomy,
             Some(self.agent_tools.clone()),
-            self.processes.clone(),
+            self.workflow_process_manager.clone(),
             self.root.clone(),
             permission,
         );
@@ -981,17 +1040,20 @@ impl NativeToolRuntime {
     }
 
     async fn filesystem(&self, operation: WorkspaceFilesystemOperation) -> Result<Value> {
-        let response = execute_workspace_filesystem(
-            std::slice::from_ref(&self.root),
-            WorkspaceFilesystemRequest {
-                request_id: Uuid::new_v4(),
-                workspace_id: self.session_id,
-                root_path: self.root.clone(),
-                timeout_ms: 30_000,
-                operation,
-            },
-        )
-        .await;
+        let response = self
+            .execution_provider
+            .filesystem(
+                std::slice::from_ref(&self.root),
+                WorkspaceFilesystemRequest {
+                    request_id: Uuid::new_v4(),
+                    workspace_id: self.session_id,
+                    root_path: self.root.clone(),
+                    timeout_ms: 30_000,
+                    operation,
+                },
+                &HostResourceLimits::default(),
+            )
+            .await;
         match response.outcome {
             WorkspaceFilesystemOutcome::Success { output } => Ok(serde_json::to_value(output)?),
             WorkspaceFilesystemOutcome::Failure {
@@ -1307,6 +1369,7 @@ async fn execute_tool(
     let external_mcp = runtime.mcp.contains(&tool_call.function.name);
     if (tool_call.function.name == "exec_command"
         || tool_call.function.name == "runtime_exec"
+        || tool_call.function.name == "run_code"
         || matches!(
             tool_call.function.name.as_str(),
             "run_workflow" | "run_blu_workflow" | "run_blu_extension"
@@ -1325,7 +1388,10 @@ async fn execute_tool(
             ("Run command", command.to_string())
         } else {
             (
-                if tool_call.function.name == "runtime_exec" {
+                if matches!(
+                    tool_call.function.name.as_str(),
+                    "runtime_exec" | "run_code"
+                ) {
                     "Use persistent runtime"
                 } else {
                     "Use workflow or external tool"
@@ -1403,12 +1469,12 @@ async fn execute_tool(
 
     let workflow_approved = matches!(
         tool_call.function.name.as_str(),
-        "run_workflow" | "run_blu_workflow" | "run_blu_extension" | "runtime_exec"
+        "run_workflow" | "run_blu_workflow" | "run_blu_extension" | "runtime_exec" | "run_code"
     ) && runtime.permission != PermissionMode::FullAccess;
     let call_cancel = (external_mcp
         || matches!(
             tool_call.function.name.as_str(),
-            "run_workflow" | "run_blu_workflow" | "run_blu_extension" | "runtime_exec"
+            "run_workflow" | "run_blu_workflow" | "run_blu_extension" | "runtime_exec" | "run_code"
         ))
     .then(CancellationToken::new);
     let call = runtime.call(
@@ -1961,6 +2027,73 @@ fn builtin_tool_specs() -> Vec<Value> {
     ]
 }
 
+fn run_code_tool_definition() -> Result<ModelToolDefinition> {
+    ModelToolDefinition::new(
+        "run_code",
+        "Run Python, JavaScript, or TypeScript against the generated Borg SDK. Use this for loops, filtering, transformations, or batches of tool calls.",
+        json!({
+            "type": "object",
+            "properties": {
+                "runtime": {
+                    "type": "string",
+                    "enum": ["python", "javascript", "typescript"],
+                    "default": "python"
+                },
+                "code": { "type": "string", "minLength": 1, "maxLength": 524288 },
+                "timeout_ms": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": MAX_COMMAND_TIMEOUT_MS
+                }
+            },
+            "required": ["code"],
+            "additionalProperties": false
+        }),
+    )
+    .map_err(anyhow::Error::msg)
+}
+
+fn validate_tool_definitions(definitions: &[ModelToolDefinition]) -> Result<()> {
+    let mut names = HashSet::with_capacity(definitions.len());
+    for definition in definitions {
+        if !names.insert(definition.name.as_str()) {
+            bail!("duplicate native harness tool name `{}`", definition.name);
+        }
+    }
+    Ok(())
+}
+
+fn code_mode_prompt(catalog: &[ModelToolDefinition]) -> String {
+    let mut prompt = String::from(concat!(
+        "\n\nCode Mode SDK (generated from this session's tool catalog):\n",
+        "- `run_code` accepts Python, JavaScript, or TypeScript.\n",
+        "- Python calls are synchronous: `borg.tool(name, arguments)`; JavaScript/TypeScript calls are async: `await borg.tool(name, arguments)`.\n",
+        "- `borg.read`, `borg.search`, `borg.list`, `borg.write`, `borg.edit`, `borg.exec`, and `borg.tool` are bounded host calls. `borg.mcp` reaches configured MCP tools.\n",
+        "- Keep intermediate data inside the runtime and return only the compact conclusion or selected records. The runtime namespace persists across calls.\n",
+        "Available tool names and schemas:\n",
+    ));
+    for definition in catalog {
+        if definition.name == "runtime_exec" {
+            continue;
+        }
+        let schema =
+            serde_json::to_string(&definition.input_schema).unwrap_or_else(|_| "{}".into());
+        prompt.push_str(&format!(
+            "- `{}`: {}; schema={}\n",
+            definition.name,
+            bounded_text(definition.description.clone(), 240),
+            schema
+        ));
+        if prompt.len() >= 48 * 1024 {
+            prompt.push_str(
+                "- (remaining tool schemas omitted; use borg.mcp_tools() or the native tool catalog when needed)\n",
+            );
+            break;
+        }
+    }
+    prompt
+}
+
 fn tool(name: &str, description: &str, input_schema: Value) -> Value {
     json!({ "name": name, "description": description, "inputSchema": input_schema })
 }
@@ -2028,6 +2161,14 @@ struct WriteStdinArgs {
     yield_time_ms: Option<u64>,
     max_output_tokens: Option<usize>,
     terminate: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunCodeArgs {
+    runtime: Option<String>,
+    code: String,
+    timeout_ms: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -2173,6 +2314,38 @@ mod tests {
             parse_tool_arguments(&call).unwrap_err(),
             "tool arguments must be a JSON object"
         );
+    }
+
+    #[test]
+    fn code_mode_has_one_bounded_dispatch_tool() {
+        let definition = run_code_tool_definition().expect("run_code schema is valid");
+        assert_eq!(definition.name, "run_code");
+        assert_eq!(
+            definition.input_schema["properties"]["code"]["type"],
+            "string"
+        );
+        assert_eq!(
+            definition.input_schema["properties"]["runtime"]["enum"],
+            json!(["python", "javascript", "typescript"])
+        );
+    }
+
+    #[test]
+    fn code_mode_catalog_prompt_is_generated_from_visible_tools() {
+        let catalog = vec![
+            ModelToolDefinition::new("read_file", "Read a file", json!({"type": "object"}))
+                .unwrap(),
+            ModelToolDefinition::new(
+                "runtime_exec",
+                "Low-level runtime",
+                json!({"type": "object"}),
+            )
+            .unwrap(),
+        ];
+        let prompt = code_mode_prompt(&catalog);
+        assert!(prompt.contains("`read_file`"));
+        assert!(prompt.contains("\"type\":\"object\""));
+        assert!(!prompt.contains("`runtime_exec`"));
     }
 
     #[test]

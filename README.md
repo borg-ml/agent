@@ -39,7 +39,8 @@ Automatic updates and their check interval are configurable.
   Parallel, and Brave backends, with parallel federated auto search
   (see [`docs/web-search.md`](docs/web-search.md));
 - a native harness with bounded file tools, background
-  processes, LSP, goals, plans, subagents, MCP, project guidance, and skills;
+  processes, LSP, goals, plans, subagents, MCP, project guidance, skills, and
+  optional Code Mode for programmatic tool dispatch;
 - Blu live extensions with dependency-aware skill, MCP, and bounded executable
   workflow packages, typed settings, atomic install/update, and turn-boundary hot reload, plus
   configurable slash aliases and keybindings;
@@ -66,6 +67,10 @@ shared-work, presence, cloud/web relay, and telemetry capabilities can be
 disabled independently; parent capability disablement cascades to dependent
 features. Run `borg capabilities` (or `borg capabilities --json`) to inspect
 the effective runtime.
+
+Native tool presentation is configured with `[capabilities].tool_mode`: `native`
+keeps one-call-per-tool schemas, `code` exposes a single `run_code` tool with a
+generated Borg SDK, and `both` (the default) exposes both surfaces.
 
 Manual and autonomous teams allow 16 concurrently live child agents by
 default. Set `[team].worker_concurrency` to a smaller positive integer to fit
@@ -182,7 +187,7 @@ scope-local JSONL audit record.
 Settings writes are atomic; slash aliases and keybindings reload in a running
 TUI, while Blu skills, MCP servers, and executable workflows reload at the next
 turn boundary.
-Persistent `runtime_exec` sessions can call an active package through
+Persistent `runtime_exec` and `run_code` sessions can call an active package through
 `borg.environment(...)`, admit RLM-style child handles with `await borg.rlm(...)`,
 and maintain bounded local/global prompt, memory, skill, and subagent harness
 state with `borg.harness`; those entries are injected into later turns.

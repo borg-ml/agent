@@ -660,7 +660,8 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text
         root: directory.path().to_path_buf(),
         allow_effects: false,
         dispatcher: dispatcher.clone(),
-        processes: crate::native_process::ProcessManager::default(),
+        execution_provider: Arc::new(crate::LocalExecutionProvider::new()),
+        host_calls: Arc::new(AtomicUsize::new(0)),
         session_store: None,
         runtime_worker_id: runtime.worker_id(),
     });

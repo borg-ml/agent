@@ -217,6 +217,9 @@ pub(crate) struct CapabilityConfig {
     pub(crate) cloud_sync: bool,
     pub(crate) web_relay: bool,
     pub(crate) telemetry: bool,
+    /// Native-harness tool presentation. `both` preserves the legacy catalog
+    /// while adding programmatic dispatch.
+    pub(crate) tool_mode: borg_remote::ToolMode,
 }
 
 impl Default for CapabilityConfig {
@@ -230,6 +233,7 @@ impl Default for CapabilityConfig {
             cloud_sync: true,
             web_relay: true,
             telemetry: false,
+            tool_mode: borg_remote::ToolMode::Both,
         }
     }
 }
@@ -1213,6 +1217,20 @@ reasoning_format = "deepseek"
         assert!(config.capabilities.autonomous_team);
         assert!(!config.capabilities.telemetry);
         assert!(!config.extensions.allow_project_mcp);
+        assert_eq!(config.capabilities.tool_mode, borg_remote::ToolMode::Both);
+    }
+
+    #[test]
+    fn native_tool_mode_is_configurable_without_changing_other_capabilities() {
+        let config: AgentConfig = toml::from_str(
+            r#"
+            [capabilities]
+            tool_mode = "code"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.capabilities.tool_mode, borg_remote::ToolMode::Code);
+        assert!(config.capabilities.subagents);
     }
 
     #[test]
