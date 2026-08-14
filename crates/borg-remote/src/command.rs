@@ -508,7 +508,10 @@ mod tests {
                 request_id: Uuid::new_v4(),
                 cwd: root.path().to_path_buf(),
                 command: command.to_string(),
-                timeout_ms: 1_000,
+                // Login-shell startup can exceed one second on saturated CI
+                // runners. This test covers multiline execution, not the
+                // timeout boundary.
+                timeout_ms: 10_000,
                 output_max_bytes: 1_024,
             },
             &HostResourceLimits::default(),
