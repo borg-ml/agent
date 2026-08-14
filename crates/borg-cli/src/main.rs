@@ -3,6 +3,7 @@ mod agent_config;
 mod agent_mcp;
 mod cli;
 mod collab;
+mod dictation;
 mod editor_preferences;
 mod extensions;
 mod remote_commands;

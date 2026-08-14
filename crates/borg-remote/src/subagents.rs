@@ -67,6 +67,7 @@ pub struct SubagentUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub total_tokens: u64,
+    pub context_tokens: Option<u64>,
     pub cost_microusd: Option<u64>,
 }
 
@@ -5939,6 +5940,7 @@ async fn update_from_session_event(
             input_tokens,
             output_tokens,
             total_tokens,
+            context_tokens,
             cost_microusd,
             ..
         } => {
@@ -5957,12 +5959,18 @@ async fn update_from_session_event(
                 .usage
                 .total_tokens
                 .saturating_add(*total_tokens);
+            if context_tokens.is_some() {
+                entry.snapshot.usage.context_tokens = *context_tokens;
+            }
             entry.snapshot.usage.cost_microusd =
                 match (entry.snapshot.usage.cost_microusd, cost_microusd) {
                     (Some(current), Some(additional)) => Some(current.saturating_add(*additional)),
                     (None, Some(value)) => Some(*value),
                     (current, None) => current,
                 };
+        }
+        SessionEventKind::ContextWindowUpdated { context_tokens, .. } => {
+            entry.snapshot.usage.context_tokens = Some(*context_tokens);
         }
         _ => {}
     }
@@ -5989,6 +5997,7 @@ fn project_child_state(snapshot: &mut SubagentSnapshot, state: &crate::SessionSt
         input_tokens: state.usage.input_tokens,
         output_tokens: state.usage.output_tokens,
         total_tokens: state.usage.total_tokens,
+        context_tokens: state.usage.context_tokens,
         cost_microusd: state.usage.cost_microusd,
     };
 }

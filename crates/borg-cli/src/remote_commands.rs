@@ -35,11 +35,12 @@ use uuid::Uuid;
 
 use crate::agent_config::AgentConfig;
 use crate::cli::{LocalAgentCliArgs, RemoteCommand};
+use crate::dictation::{LocalDictationConfig, LocalDictationRecorder};
 use crate::editor_preferences::{ActiveMessageBehavior, EditorPreferences};
 use crate::sleep_inhibitor::SleepInhibitor;
 use crate::terminal_ui::{
-    BorgTerminal, ProviderAuthChoice, ResumeSessionOption, TerminalInputEvent, UiAction,
-    discard_pending_terminal_input,
+    BorgTerminal, DictationState, ProviderAuthChoice, ResumeSessionOption, TerminalInputEvent,
+    UiAction, discard_pending_terminal_input,
 };
 
 #[path = "local_server.rs"]
@@ -1021,6 +1022,7 @@ async fn run_local_agent_session(
 ) -> Result<Option<(Uuid, Option<(String, Vec<PathBuf>)>, Option<BorgTerminal>)>> {
     let mut agent_config = AgentConfig::load(args.config.as_deref())?;
     let _local_provider_env = agent_config.apply_local_provider_env();
+    let dictation_config = LocalDictationConfig::from_env();
     let agent_config_path = AgentConfig::path(args.config.as_deref());
     let mut agent_config_signature = agent_config_file_signature(agent_config_path.as_deref());
     let mut editor_preferences = EditorPreferences::load()?;
@@ -1693,13 +1695,15 @@ async fn run_local_agent_session(
     let mut terminal_dirty = false;
     let mut tui_fps = tui_refresh_rate(u64::from(editor_preferences.presentation.refresh_rate_fps));
     let mut prevent_sleep = editor_preferences.interaction.prevent_sleep;
-    let mut steer_active_codex =
+    let mut steer_active_turn =
         editor_preferences.interaction.active_messages == ActiveMessageBehavior::Steer;
     let mut resume_session = None;
     let mut rewind_prompt = None;
     let mut pending_revert_sequence = None;
     let mut revert_fork_task: Option<RevertForkTask> = None;
     let mut sleep_inhibitor = SleepInhibitor::new(prevent_sleep);
+    let mut dictation_recorder: Option<LocalDictationRecorder> = None;
+    let mut dictation_task: Option<tokio::task::JoinHandle<Result<String>>> = None;
     sleep_inhibitor.set_turn_active(matches!(
         status,
         SessionStatus::Starting | SessionStatus::Running | SessionStatus::WaitingForApproval
@@ -1721,6 +1725,27 @@ async fn run_local_agent_session(
     let mut session_event_stream_open = true;
     loop {
         tokio::select! {
+            result = async {
+                dictation_task
+                    .as_mut()
+                    .expect("dictation completion branch is guarded")
+                    .await
+            }, if dictation_task.is_some() => {
+                dictation_task = None;
+                if let Some(terminal) = terminal.as_mut() {
+                    terminal.set_dictation_state(DictationState::Idle);
+                    match result {
+                        Ok(Ok(text)) => terminal.insert_dictation(&text),
+                        Ok(Err(error)) => {
+                            terminal.set_notice(format!("Dictation failed: {error:#}"));
+                        }
+                        Err(error) => {
+                            terminal.set_notice(format!("Dictation task failed: {error}"));
+                        }
+                    }
+                    terminal_dirty = true;
+                }
+            }
             composer_history_result = async {
                 composer_history_task
                     .as_mut()
@@ -2505,7 +2530,7 @@ async fn run_local_agent_session(
                         current_model.as_deref().unwrap_or("provider default"),
                         current_effort.as_deref().unwrap_or("provider default"),
                         if current_fast { "on" } else { "off" },
-                        if steer_active_codex {
+                        if steer_active_turn {
                             "steer current turn"
                         } else {
                             "queue next turn"
@@ -2530,12 +2555,12 @@ async fn run_local_agent_session(
                 if let Some(value) = line.strip_prefix("/followups ") {
                     match value.trim() {
                         "steer" => {
-                            steer_active_codex = true;
+                            steer_active_turn = true;
                             editor_preferences.interaction.active_messages =
                                 ActiveMessageBehavior::Steer;
                         }
                         "queue" => {
-                            steer_active_codex = false;
+                            steer_active_turn = false;
                             editor_preferences.interaction.active_messages =
                                 ActiveMessageBehavior::Queue;
                         }
@@ -2546,8 +2571,8 @@ async fn run_local_agent_session(
                     }
                     editor_preferences.save()?;
                     println!(
-                        "\n  Messages sent while Codex works: {}.\n",
-                        if steer_active_codex {
+                        "\n  Messages sent while Borg works: {}.\n",
+                        if steer_active_turn {
                             "steer current turn"
                         } else {
                             "queue next turn"
@@ -2683,7 +2708,7 @@ async fn run_local_agent_session(
                             let delivery = director_prompt_delivery(
                                 active,
                                 provider,
-                                steer_active_codex,
+                                steer_active_turn,
                             );
                             let message_id = Uuid::new_v4();
                             if session_command_tx
@@ -2717,7 +2742,7 @@ async fn run_local_agent_session(
                                 running_input(
                                     line,
                                     provider,
-                                    steer_active_codex,
+                                    steer_active_turn,
                                 )
                                 .0
                             } else {
@@ -2791,7 +2816,7 @@ async fn run_local_agent_session(
                             running_input(
                                 line,
                                 provider,
-                                steer_active_codex,
+                                steer_active_turn,
                             )
                         } else {
                             idle_input(line)
@@ -3194,7 +3219,7 @@ async fn run_local_agent_session(
                         ));
                     }
                     UiAction::SetSteerActive(enabled) => {
-                        steer_active_codex = enabled;
+                        steer_active_turn = enabled;
                         editor_preferences.interaction.active_messages = if enabled {
                             ActiveMessageBehavior::Steer
                         } else {
@@ -3202,7 +3227,7 @@ async fn run_local_agent_session(
                         };
                         editor_preferences.save()?;
                         terminal.as_mut().expect("terminal").set_notice(format!(
-                            "Messages sent while Codex works: {}",
+                            "Messages sent while Borg works: {}",
                             if enabled {
                                 "steer current turn"
                             } else {
@@ -3229,6 +3254,39 @@ async fn run_local_agent_session(
                             "Auto-expand other tool details: {}",
                             if enabled { "on" } else { "off" }
                         ));
+                    }
+                    UiAction::ToggleDictation => {
+                        if dictation_task.is_some() {
+                            terminal
+                                .as_mut()
+                                .expect("terminal")
+                                .set_notice("Dictation is still transcribing".to_string());
+                        } else if let Some(recorder) = dictation_recorder.take() {
+                            terminal
+                                .as_mut()
+                                .expect("terminal")
+                                .set_dictation_state(DictationState::Transcribing);
+                            let config = dictation_config.clone();
+                            dictation_task = Some(tokio::spawn(async move {
+                                recorder.finish_and_transcribe(config).await
+                            }));
+                        } else {
+                            match LocalDictationRecorder::start(&dictation_config) {
+                                Ok(recorder) => {
+                                    dictation_recorder = Some(recorder);
+                                    let terminal = terminal.as_mut().expect("terminal");
+                                    terminal.set_dictation_state(DictationState::Recording);
+                                    terminal.set_notice(
+                                        "Recording locally · click stop or use the dictate keybinding"
+                                            .to_string(),
+                                    );
+                                }
+                                Err(error) => terminal
+                                    .as_mut()
+                                    .expect("terminal")
+                                    .set_notice(format!("Could not start dictation: {error:#}")),
+                            }
+                        }
                     }
                     UiAction::LoadPayloads(payloads) => {
                         for payload in payloads {
@@ -3449,7 +3507,7 @@ async fn run_local_agent_session(
                                     let delivery = director_prompt_delivery(
                                         active,
                                         provider,
-                                        steer_active_codex,
+                                        steer_active_turn,
                                     );
                                     let message_id = Uuid::new_v4();
                                     if active {
@@ -3549,7 +3607,7 @@ async fn run_local_agent_session(
                                 .and_then(BorgTerminal::session_provider)
                                 .unwrap_or(provider);
                             let delivery =
-                                default_active_delivery(active_provider, steer_active_codex);
+                                default_active_delivery(active_provider, steer_active_turn);
                             terminal
                                 .as_mut()
                                 .expect("terminal")
@@ -3707,7 +3765,7 @@ async fn run_local_agent_session(
                             terminal
                                 .as_mut()
                                 .expect("terminal")
-                                .open_active_messages_picker(steer_active_codex);
+                                .open_active_messages_picker(steer_active_turn);
                         } else if line == "/settings" && attachments.is_empty() {
                             terminal
                                 .as_mut()
@@ -3961,21 +4019,21 @@ async fn run_local_agent_session(
                         {
                             match value.trim() {
                                 "steer" => {
-                                    steer_active_codex = true;
+                                    steer_active_turn = true;
                                     editor_preferences.interaction.active_messages =
                                         ActiveMessageBehavior::Steer;
                                     editor_preferences.save()?;
                                     terminal.as_mut().expect("terminal").set_notice(
-                                        "Messages sent while Codex works: steer current turn",
+                                        "Messages sent while Borg works: steer current turn",
                                     );
                                 }
                                 "queue" => {
-                                    steer_active_codex = false;
+                                    steer_active_turn = false;
                                     editor_preferences.interaction.active_messages =
                                         ActiveMessageBehavior::Queue;
                                     editor_preferences.save()?;
                                     terminal.as_mut().expect("terminal").set_notice(
-                                        "Messages sent while Codex works: queue next turn",
+                                        "Messages sent while Borg works: queue next turn",
                                     );
                                 }
                                 _ => terminal.as_mut().expect("terminal").set_notice(
@@ -4307,7 +4365,7 @@ async fn run_local_agent_session(
                                         running_input(
                                             &text,
                                             active_provider,
-                                            steer_active_codex,
+                                            steer_active_turn,
                                         )
                                     } else {
                                         idle_input(&text)
@@ -4478,6 +4536,13 @@ async fn run_local_agent_session(
                     .ok();
             }
         }
+    }
+    drop(dictation_recorder);
+    if let Some(task) = dictation_task.take() {
+        task.abort();
+    }
+    if let Some(terminal) = terminal.as_mut() {
+        terminal.set_dictation_state(DictationState::Idle);
     }
     let tui_was_active = crash_context.tui_active.load(Ordering::Acquire);
     let preserve_terminal = resume_session.is_some() && !user_requested_exit && terminal.is_some();
@@ -5395,6 +5460,7 @@ fn reconcile_subagent_snapshot(agent: &mut SubagentSnapshot, state: &SessionStat
     agent.usage.input_tokens = state.usage.input_tokens;
     agent.usage.output_tokens = state.usage.output_tokens;
     agent.usage.total_tokens = state.usage.total_tokens;
+    agent.usage.context_tokens = state.usage.context_tokens;
     agent.usage.cost_microusd = state.usage.cost_microusd;
 }
 

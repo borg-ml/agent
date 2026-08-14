@@ -885,10 +885,8 @@ struct HoldingSteerExecutor {
 }
 
 struct CommittingSteerExecutor {
-    provider: CodingProvider,
     turn_started: Arc<Notify>,
     steer_accepted: Arc<Notify>,
-    release_commit: Arc<Notify>,
 }
 
 struct BoundaryRetrySteerExecutor {
@@ -1151,45 +1149,15 @@ impl AgentTurnExecutor for CommittingSteerExecutor {
     async fn execute(
         &self,
         _turn: AgentTurn,
-        events: mpsc::Sender<SessionEventKind>,
+        _events: mpsc::Sender<SessionEventKind>,
         controls: Option<mpsc::Receiver<AgentTurnControl>>,
     ) -> Result<AgentTurnResult> {
         self.turn_started.notify_one();
         let mut controls = controls.expect("active turn has controls");
-        if let Some(AgentTurnControl::Steer {
-            message_id, ack, ..
-        }) = controls.recv().await
-        {
+        if let Some(AgentTurnControl::Steer { admission, ack, .. }) = controls.recv().await {
+            assert!(admission.accept());
             let _ = ack.send(Ok(()));
             self.steer_accepted.notify_one();
-            self.release_commit.notified().await;
-            let (kind, payload) = match self.provider {
-                CodingProvider::Codex => (
-                    "item/completed:userMessage".to_string(),
-                    json!({
-                        "item_type": "userMessage",
-                        "client_id": message_id.to_string(),
-                    }),
-                ),
-                CodingProvider::Claude => (
-                    "claude.command_lifecycle".to_string(),
-                    json!({
-                        "type": "command_lifecycle",
-                        "command_uuid": Uuid::new_v4().to_string(),
-                        "state": "started",
-                        "client_user_message_id": message_id.to_string(),
-                    }),
-                ),
-                provider => panic!("unsupported committing steer provider: {provider:?}"),
-            };
-            events
-                .send(SessionEventKind::ProviderEvent {
-                    provider: self.provider,
-                    kind,
-                    payload,
-                })
-                .await
-                .unwrap();
         }
         while !matches!(
             controls.recv().await,
@@ -1241,24 +1209,11 @@ impl AgentTurnExecutor for BoundaryRetrySteerExecutor {
             .await
             .unwrap();
 
-        let Some(AgentTurnControl::Steer {
-            message_id, ack, ..
-        }) = controls.recv().await
-        else {
+        let Some(AgentTurnControl::Steer { admission, ack, .. }) = controls.recv().await else {
             panic!("boundary retry");
         };
+        assert!(admission.accept());
         let _ = ack.send(Ok(()));
-        events
-            .send(SessionEventKind::ProviderEvent {
-                provider: CodingProvider::Codex,
-                kind: "item/completed:userMessage".to_string(),
-                payload: json!({
-                    "item_type": "userMessage",
-                    "client_id": message_id.to_string(),
-                }),
-            })
-            .await
-            .unwrap();
         self.retry_accepted.notify_one();
 
         while !matches!(
@@ -2876,7 +2831,7 @@ async fn rejected_multimodal_steer_falls_back_to_the_front_of_the_fifo() {
 }
 
 #[tokio::test]
-async fn accepted_codex_steer_stays_pending_until_the_user_message_commits() {
+async fn accepted_codex_steer_leaves_pending_at_provider_admission() {
     let root = tempdir().unwrap();
     let journal_path = root.path().join("session.lock");
     let session_id = Uuid::new_v4();
@@ -2885,12 +2840,9 @@ async fn accepted_codex_steer_stays_pending_until_the_user_message_commits() {
     let (event_tx, mut event_rx) = mpsc::channel(64);
     let turn_started = Arc::new(Notify::new());
     let steer_accepted = Arc::new(Notify::new());
-    let release_commit = Arc::new(Notify::new());
     let executor = Arc::new(CommittingSteerExecutor {
-        provider: CodingProvider::Codex,
         turn_started: Arc::clone(&turn_started),
         steer_accepted: Arc::clone(&steer_accepted),
-        release_commit: Arc::clone(&release_commit),
     });
     let actor = tokio::spawn(async move {
         run_agent_session_with_executor(
@@ -2949,7 +2901,11 @@ async fn accepted_codex_steer_stays_pending_until_the_user_message_commits() {
         .expect("provider accepts steer transport");
 
     let mut transitions = Vec::new();
-    while let Ok(event) = event_rx.try_recv() {
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+            .await
+            .expect("admitted steer status arrives")
+            .expect("session remains open");
         if let SessionEventKind::Message {
             message_id,
             status,
@@ -2959,32 +2915,19 @@ async fn accepted_codex_steer_stays_pending_until_the_user_message_commits() {
             && message_id == followup_id
         {
             transitions.push((status, delivery));
+            if status == MessageStatus::Complete {
+                break;
+            }
         }
     }
     assert_eq!(
         transitions,
-        [(MessageStatus::Queued, PromptDelivery::Steer)],
-        "transport acknowledgement must not hide an uncommitted steer"
+        [
+            (MessageStatus::Queued, PromptDelivery::Steer),
+            (MessageStatus::Complete, PromptDelivery::Steer),
+        ],
+        "provider admission must move the steer from pending input to a message"
     );
-
-    release_commit.notify_one();
-    loop {
-        let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
-            .await
-            .expect("committed steer event arrives")
-            .expect("session remains open");
-        if matches!(
-            event.kind,
-            SessionEventKind::Message {
-                message_id,
-                status: MessageStatus::Complete,
-                delivery: Some(PromptDelivery::Steer),
-                ..
-            } if message_id == followup_id
-        ) {
-            break;
-        }
-    }
 
     command_tx
         .send(HostCommand::Interrupt { session_id })
@@ -2998,7 +2941,7 @@ async fn accepted_codex_steer_stays_pending_until_the_user_message_commits() {
 }
 
 #[tokio::test]
-async fn accepted_claude_steer_stays_pending_until_the_user_message_commits() {
+async fn accepted_claude_steer_leaves_pending_at_provider_admission() {
     let root = tempdir().unwrap();
     let journal_path = root.path().join("session.lock");
     let session_id = Uuid::new_v4();
@@ -3007,12 +2950,9 @@ async fn accepted_claude_steer_stays_pending_until_the_user_message_commits() {
     let (event_tx, mut event_rx) = mpsc::channel(64);
     let turn_started = Arc::new(Notify::new());
     let steer_accepted = Arc::new(Notify::new());
-    let release_commit = Arc::new(Notify::new());
     let executor = Arc::new(CommittingSteerExecutor {
-        provider: CodingProvider::Claude,
         turn_started: Arc::clone(&turn_started),
         steer_accepted: Arc::clone(&steer_accepted),
-        release_commit: Arc::clone(&release_commit),
     });
     let actor = tokio::spawn(async move {
         run_agent_session_with_executor(
@@ -3071,7 +3011,11 @@ async fn accepted_claude_steer_stays_pending_until_the_user_message_commits() {
         .expect("Claude accepts steer transport");
 
     let mut transitions = Vec::new();
-    while let Ok(event) = event_rx.try_recv() {
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+            .await
+            .expect("admitted Claude steer status arrives")
+            .expect("session remains open");
         if let SessionEventKind::Message {
             message_id,
             status,
@@ -3081,32 +3025,19 @@ async fn accepted_claude_steer_stays_pending_until_the_user_message_commits() {
             && message_id == followup_id
         {
             transitions.push((status, delivery));
+            if status == MessageStatus::Complete {
+                break;
+            }
         }
     }
     assert_eq!(
         transitions,
-        [(MessageStatus::Queued, PromptDelivery::Steer)],
-        "Claude transport acknowledgement must not hide an uncommitted steer"
+        [
+            (MessageStatus::Queued, PromptDelivery::Steer),
+            (MessageStatus::Complete, PromptDelivery::Steer),
+        ],
+        "Claude provider admission must move the steer from pending input to a message"
     );
-
-    release_commit.notify_one();
-    loop {
-        let event = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
-            .await
-            .expect("Claude committed steer event arrives")
-            .expect("session remains open");
-        if matches!(
-            event.kind,
-            SessionEventKind::Message {
-                message_id,
-                status: MessageStatus::Complete,
-                delivery: Some(PromptDelivery::Steer),
-                ..
-            } if message_id == followup_id
-        ) {
-            break;
-        }
-    }
 
     command_tx
         .send(HostCommand::Interrupt { session_id })
@@ -4751,26 +4682,6 @@ fn todo_list_rejects_multiple_in_progress_items() {
 }
 
 #[test]
-fn codex_app_server_user_message_client_id_commits_a_steer() {
-    let message_id = Uuid::new_v4();
-    let event = SessionEventKind::ProviderEvent {
-        provider: CodingProvider::Codex,
-        kind: "item/completed:userMessage".to_string(),
-        payload: json!({
-            "method": "item/completed",
-            "params": {
-                "item": {
-                    "type": "userMessage",
-                    "clientId": message_id.to_string()
-                }
-            }
-        }),
-    };
-
-    assert_eq!(committed_codex_user_message_id(&event), Some(message_id));
-}
-
-#[test]
 fn recalling_prompts_targets_the_exact_queue_entry_and_skips_steers() {
     let first_visible_id = Uuid::new_v4();
     let internal_id = Uuid::new_v4();
@@ -4851,50 +4762,56 @@ fn recalling_prompts_targets_the_exact_queue_entry_and_skips_steers() {
     assert_eq!(pending[1].message_id, steer_id);
 }
 
-/// ↑ on an empty composer must give back exactly the pending work the
-/// provider has not committed. Both an in-flight and transport-accepted
-/// steer are still recallable; only the provider's committed user-message
-/// event makes it owned by the active turn.
+/// ↑ on an empty composer must give back exactly the work whose provider
+/// admission is still unclaimed. Once provider admission wins, recall cannot
+/// claim or remove the steer.
 #[test]
 fn only_an_uncommitted_steer_is_withdrawable_from_the_active_turn() {
     let rejected_id = Uuid::new_v4();
     let awaiting_id = Uuid::new_v4();
     let accepted_id = Uuid::new_v4();
-    let steer = |message_id: Uuid, state: PendingSteerState| PendingSteer {
-        prompt: QueuedPrompt {
-            message_id,
-            text: "steer".to_string(),
-            actor: EventActor::User,
-            attachments: Vec::new(),
-            output_schema: None,
-            delivery: PromptDelivery::Steer,
-            visible: true,
-            interrupt_batch: true,
-            batch: Vec::new(),
-        },
-        state,
-        attempt_boundary: 0,
-    };
+    let steer =
+        |message_id: Uuid, state: PendingSteerState, admission: SteerAdmission| PendingSteer {
+            prompt: QueuedPrompt {
+                message_id,
+                text: "steer".to_string(),
+                actor: EventActor::User,
+                attachments: Vec::new(),
+                output_schema: None,
+                delivery: PromptDelivery::Steer,
+                visible: true,
+                interrupt_batch: true,
+                batch: Vec::new(),
+            },
+            admission,
+            state,
+            attempt_boundary: 0,
+        };
+    let accepted = SteerAdmission::pending();
+    assert!(accepted.accept());
     let mut pending_steers = VecDeque::from([
-        steer(awaiting_id, PendingSteerState::AwaitingAcknowledgement),
+        steer(
+            awaiting_id,
+            PendingSteerState::AwaitingAcknowledgement,
+            SteerAdmission::pending(),
+        ),
         steer(
             rejected_id,
             PendingSteerState::RetryAtBoundary {
                 error: "provider refused the steer".to_string(),
             },
+            SteerAdmission::pending(),
         ),
-        steer(accepted_id, PendingSteerState::Accepted),
+        steer(
+            accepted_id,
+            PendingSteerState::AwaitingAcknowledgement,
+            accepted,
+        ),
     ]);
 
     let recalled = recall_withdrawable_steers(&mut pending_steers, Some(accepted_id));
-    assert_eq!(
-        recalled
-            .iter()
-            .map(|prompt| prompt.message_id)
-            .collect::<Vec<_>>(),
-        [accepted_id]
-    );
-    assert_eq!(pending_steers.len(), 2);
+    assert!(recalled.is_empty());
+    assert_eq!(pending_steers.len(), 3);
 
     let recalled = recall_withdrawable_steers(&mut pending_steers, None);
     assert_eq!(
@@ -4904,7 +4821,8 @@ fn only_an_uncommitted_steer_is_withdrawable_from_the_active_turn() {
             .collect::<Vec<_>>(),
         [awaiting_id, rejected_id]
     );
-    assert!(pending_steers.is_empty());
+    assert_eq!(pending_steers.len(), 1);
+    assert_eq!(pending_steers[0].prompt.message_id, accepted_id);
 }
 
 #[test]
@@ -5375,42 +5293,6 @@ fn active_provider_steer_uses_turn_control_across_provider_lanes() {
             PromptDelivery::Queue
         ));
     }
-}
-
-#[test]
-fn claude_steer_commits_only_on_correlated_command_start() {
-    let message_id = Uuid::new_v4();
-    let provider_event = |payload| SessionEventKind::ProviderEvent {
-        provider: CodingProvider::Claude,
-        kind: "claude.command_lifecycle".to_string(),
-        payload,
-    };
-
-    assert_eq!(
-        committed_claude_user_message_id(&provider_event(json!({
-            "state": "queued",
-            "client_user_message_id": message_id,
-        }))),
-        None
-    );
-    assert_eq!(
-        committed_claude_user_message_id(&SessionEventKind::ProviderEvent {
-            provider: CodingProvider::Claude,
-            kind: "claude.user".to_string(),
-            payload: json!({
-                "type": "user",
-                "content_block_types": ["text"],
-            }),
-        }),
-        None
-    );
-    assert_eq!(
-        committed_claude_user_message_id(&provider_event(json!({
-            "state": "started",
-            "client_user_message_id": message_id.to_string(),
-        }))),
-        Some(message_id)
-    );
 }
 
 #[test]

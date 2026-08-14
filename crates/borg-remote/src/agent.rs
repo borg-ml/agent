@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use borg_provider::provider::{
     ChatApprovalDecision, ChatStreamControl, ChatStreamEvent, ChatStreamRequest,
-    ClaudeSubscriptionPool, CodexSubscriptionPool, LocalAgentPermission,
+    ClaudeSubscriptionPool, CodexSubscriptionPool, LocalAgentPermission, SteerAdmission,
     run_claude_chat_stream_with_control, run_claude_local_chat_stream,
     run_claude_local_chat_stream_pooled, run_codex_chat_stream_with_control,
     run_codex_local_chat_stream, run_codex_local_chat_stream_pooled,
@@ -161,6 +161,7 @@ pub enum AgentTurnControl {
         message_id: Uuid,
         text: String,
         attachments: Vec<PathBuf>,
+        admission: SteerAdmission,
         ack: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
     },
     Approval {
@@ -1817,6 +1818,7 @@ fn map_controls(
                         message_id,
                         text,
                         attachments,
+                        admission,
                         ack,
                     } => {
                         match tx
@@ -1824,6 +1826,7 @@ fn map_controls(
                                 client_user_message_id: Some(message_id.to_string()),
                                 text,
                                 attachments,
+                                admission,
                                 ack,
                             })
                             .await
@@ -2068,18 +2071,23 @@ mod tests {
         let mut provider_controls =
             map_controls(Some(control_rx), Arc::clone(&interrupted)).expect("mapped controls");
         let (ack, acknowledgement) = tokio::sync::oneshot::channel();
+        let admission = SteerAdmission::pending();
 
         control_tx
             .send(AgentTurnControl::Steer {
                 message_id: Uuid::new_v4(),
                 text: "additional context".to_string(),
                 attachments: Vec::new(),
+                admission,
                 ack,
             })
             .await
             .unwrap();
         let provider_ack = match provider_controls.recv().await {
-            Some(ChatStreamControl::Steer { ack, .. }) => ack,
+            Some(ChatStreamControl::Steer { admission, ack, .. }) => {
+                assert!(admission.accept());
+                ack
+            }
             other => panic!("expected provider steer, got {other:?}"),
         };
 

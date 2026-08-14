@@ -41,6 +41,7 @@ pub(super) struct CacheUsage<'a> {
     pub input_tokens: u64,
     pub cached_input_tokens: u64,
     pub cache_creation_input_tokens: u64,
+    pub context_tokens: Option<u64>,
     pub cost_microusd: Option<u64>,
     pub cost_basis: &'a str,
     pub provider_context_reused: Option<bool>,
@@ -54,6 +55,7 @@ pub(super) struct CacheDiagnostics {
 
 struct PromptSnapshot {
     prompt_tokens: u64,
+    reusable_context_tokens: u64,
     at: DateTime<Utc>,
     signature: CacheSignature,
     cache_telemetry_available: bool,
@@ -184,6 +186,13 @@ impl CacheDiagnostics {
         }
         self.previous = Some(PromptSnapshot {
             prompt_tokens,
+            // A provider turn can contain several model/tool-loop calls. Its
+            // processed-token total grows once per call and can be many times
+            // larger than the context that a cold request would resend.
+            reusable_context_tokens: usage
+                .context_tokens
+                .filter(|tokens| *tokens > 0)
+                .unwrap_or(prompt_tokens),
             at,
             signature,
             cache_telemetry_available,
@@ -203,7 +212,7 @@ impl CacheDiagnostics {
         if previous.signature.provider != signature.provider {
             return Some(warning_status(
                 "cache cold · provider changed",
-                previous.prompt_tokens,
+                previous.reusable_context_tokens,
             ));
         }
         let model_changed = previous.signature.model != signature.model;
@@ -217,7 +226,7 @@ impl CacheDiagnostics {
             };
             return Some(warning_status(
                 format!("cache cold · {changed}"),
-                previous.prompt_tokens,
+                previous.reusable_context_tokens,
             ));
         }
 
@@ -227,7 +236,7 @@ impl CacheDiagnostics {
         {
             return Some(warning_status(
                 format!("cache may be cold · {} idle", format_duration(idle)),
-                previous.prompt_tokens,
+                previous.reusable_context_tokens,
             ));
         }
 
@@ -490,6 +499,7 @@ mod tests {
             input_tokens: input,
             cached_input_tokens: cached,
             cache_creation_input_tokens: cache_creation,
+            context_tokens: None,
             cost_microusd: None,
             cost_basis: "unavailable",
             provider_context_reused,
@@ -650,6 +660,22 @@ mod tests {
     }
 
     #[test]
+    fn cold_cache_guidance_uses_current_context_not_cumulative_provider_work() {
+        let mut diagnostics = CacheDiagnostics::default();
+        let at = Utc::now();
+        let mut processed = usage_with_cache_creation(410_000, 390_000, 0);
+        processed.context_tokens = Some(100_000);
+        diagnostics.observe(at, signature("gpt-5.6-sol", "high"), processed);
+
+        let status = diagnostics
+            .status(at, &signature("gpt-5.6-sol", "low"))
+            .expect("cold cache status");
+        let guidance = status.cold_cache_guidance();
+        assert!(guidance.contains("100.0k tokens"), "{guidance}");
+        assert!(!guidance.contains("800.0k tokens"), "{guidance}");
+    }
+
+    #[test]
     fn model_and_effort_changes_take_precedence_over_idle() {
         let mut diagnostics = CacheDiagnostics::default();
         let at = Utc::now();
@@ -751,6 +777,7 @@ mod tests {
                     input_tokens: 100_000,
                     cached_input_tokens: 0,
                     cache_creation_input_tokens: 0,
+                    context_tokens: None,
                     cost_microusd: Some(1_100_000),
                     cost_basis: "subscription_equivalent",
                     provider_context_reused: Some(false),
@@ -776,6 +803,7 @@ mod tests {
                 input_tokens: 1_000,
                 cached_input_tokens: 99_000,
                 cache_creation_input_tokens: 0,
+                context_tokens: None,
                 cost_microusd: None,
                 cost_basis: "unavailable",
                 provider_context_reused: Some(true),
@@ -790,6 +818,7 @@ mod tests {
                     input_tokens: 101_000,
                     cached_input_tokens: 0,
                     cache_creation_input_tokens: 0,
+                    context_tokens: None,
                     cost_microusd: None,
                     cost_basis: "unavailable",
                     provider_context_reused: Some(false),

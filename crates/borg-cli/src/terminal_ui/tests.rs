@@ -786,6 +786,7 @@ fn hover_redraw_gate_ignores_motion_inside_one_target() {
         scrollbar_hovered: false,
         jump_to_bottom_hovered: false,
         keybindings_hovered: false,
+        dictation_button_hovered: false,
     };
     let running = HoverState {
         status_hovered: true,
@@ -982,6 +983,8 @@ fn keybinding_help_is_action_first_and_uses_configuration() {
     assert!(help.contains("send"));
     assert!(help.find("send").unwrap() < help.find("ctrl+s").unwrap());
     assert!(help.contains("queue next turn"));
+    assert!(help.contains("start/stop dictation"));
+    assert!(help.contains("alt+v"));
 
     let wide_help = keybinding_lines(&keymap, 86);
     assert!(wide_help.iter().all(|line| line.width() <= 86));
@@ -3668,6 +3671,19 @@ fn agents_status_label_counts_only_working_children() {
 }
 
 #[test]
+fn subagent_selector_prefers_current_context_over_cumulative_provider_work() {
+    let usage = borg_remote::SubagentUsage {
+        total_tokens: 800_000,
+        context_tokens: Some(100_000),
+        ..Default::default()
+    };
+
+    let label = format_subagent_usage(&usage);
+    assert!(label.contains("100.0k ctx"), "{label}");
+    assert!(!label.contains("800.0k"), "{label}");
+}
+
+#[test]
 fn persistent_peers_follow_ordinary_agent_visibility() {
     let now = chrono::Utc::now();
     let mut peer = SubagentSnapshot {
@@ -4883,6 +4899,7 @@ fn optimistic_idle_submission_immediately_hides_cold_cache_guidance() {
             input_tokens: 1_000,
             cached_input_tokens: 99_000,
             cache_creation_input_tokens: 0,
+            context_tokens: None,
             cost_microusd: None,
             cost_basis: "unavailable",
             provider_context_reused: None,
@@ -6684,6 +6701,39 @@ fn long_tool_runs_show_eight_lines_and_scroll_independently() {
 }
 
 #[test]
+fn actions_accordion_hides_expand_hint_when_all_rows_already_fit() {
+    let mut transcript = Transcript::default();
+    for index in 0..9 {
+        transcript.order.push(TranscriptEntry::Tool {
+            source_name: "Run".to_string(),
+            name: "Run".to_string(),
+            detail: format!("call-{index}"),
+            code_view: None,
+            output_view: None,
+            payload_refs: Vec::new(),
+            time: "12:00".to_string(),
+            started_at: Utc::now(),
+            completed_at: Some(Utc::now()),
+            complete: true,
+            error: false,
+            user_interrupted: false,
+            backgrounded: false,
+            expanded: false,
+        });
+    }
+
+    let rendered = transcript
+        .render_with_tool_run_viewport(100, 9, None, None, None)
+        .0
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("actions · 9"), "{rendered}");
+    assert!(!rendered.contains("click to expand"), "{rendered}");
+}
+
+#[test]
 fn expanded_tool_run_shows_every_action_and_collapses_again() {
     let mut transcript = Transcript::default();
     for index in 0..20 {
@@ -6736,14 +6786,14 @@ fn expanded_tool_run_shows_every_action_and_collapses_again() {
 
 #[test]
 fn sticky_tool_run_header_row_covers_only_overflowing_boxes() {
-    let rows = vec![(0, 2, 10, 0), (12, 14, 30, 4)];
+    let rows = vec![(0, 2, 10, 0, false), (12, 14, 30, 4, true)];
 
     assert_eq!(sticky_tool_run_header_row(&rows, 0), None);
     assert_eq!(sticky_tool_run_header_row(&rows, 2), None);
-    assert_eq!(sticky_tool_run_header_row(&rows, 3), Some((0, 2)));
-    assert_eq!(sticky_tool_run_header_row(&rows, 9), Some((0, 2)));
+    assert_eq!(sticky_tool_run_header_row(&rows, 3), Some((0, 2, false)));
+    assert_eq!(sticky_tool_run_header_row(&rows, 9), Some((0, 2, false)));
     assert_eq!(sticky_tool_run_header_row(&rows, 10), None);
-    assert_eq!(sticky_tool_run_header_row(&rows, 20), Some((12, 14)));
+    assert_eq!(sticky_tool_run_header_row(&rows, 20), Some((12, 14, true)));
     assert_eq!(sticky_tool_run_header_row(&rows, 30), None);
 }
 

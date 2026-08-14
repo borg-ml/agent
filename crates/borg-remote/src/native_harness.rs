@@ -1163,9 +1163,14 @@ async fn call_model_streaming(
                 Some(AgentTurnControl::Steer {
                     text,
                     attachments,
+                    admission,
                     ack,
                     ..
                 }) => {
+                    if !admission.accept() {
+                        let _ = ack.send(Err("steer was recalled before delivery".to_string()));
+                        continue;
+                    }
                     let _ = ack.send(Ok(()));
                     return Ok(NativeModelOutcome::Steered(NativeSteer {
                         text,
@@ -1434,9 +1439,14 @@ async fn execute_tool(
                 Some(AgentTurnControl::Steer {
                     text,
                     attachments,
+                    admission,
                     ack,
                     ..
                 }) => {
+                    if !admission.accept() {
+                        let _ = ack.send(Err("steer was recalled before delivery".to_string()));
+                        continue;
+                    }
                     if let Some(cancel) = &call_cancel {
                         cancel.cancel();
                     }

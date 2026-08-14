@@ -840,6 +840,7 @@ impl Transcript {
                             input_tokens: *input_tokens,
                             cached_input_tokens: *cached_input_tokens,
                             cache_creation_input_tokens: *cache_creation_input_tokens,
+                            context_tokens: *context_tokens,
                             cost_microusd: *cost_microusd,
                             cost_basis,
                             provider_context_reused: *provider_context_reused,
@@ -2755,7 +2756,9 @@ impl Transcript {
                         let content_start = header_row + 1;
                         let content_end = lines.len();
                         let total_lines = content_end.saturating_sub(content_start);
-                        let viewport_height = if self.tool_run_expanded(window.start) {
+                        let expandable = total_lines > tool_run_viewport_height;
+                        let expanded = expandable && self.tool_run_expanded(window.start);
+                        let viewport_height = if expanded {
                             total_lines
                         } else {
                             tool_run_viewport_height
@@ -2785,7 +2788,9 @@ impl Transcript {
 
                         lines.truncate(content_start);
                         lines.extend(visible_lines);
-                        let action_hint = if self.tool_run_expanded(window.start) {
+                        let action_hint = if !expandable {
+                            ""
+                        } else if expanded {
                             if offset > 0 {
                                 " · click to collapse · ↑ scroll"
                             } else {
@@ -2880,7 +2885,13 @@ impl Transcript {
                                 }
                             }
                         }
-                        tool_run_rows.push((window.start, header_row, lines.len(), max_offset));
+                        tool_run_rows.push((
+                            window.start,
+                            header_row,
+                            lines.len(),
+                            max_offset,
+                            expandable,
+                        ));
                     }
                 }
             }

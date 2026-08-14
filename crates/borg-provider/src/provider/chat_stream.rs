@@ -16,6 +16,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -264,6 +265,7 @@ pub enum ChatStreamControl {
         client_user_message_id: Option<String>,
         text: String,
         attachments: Vec<PathBuf>,
+        admission: SteerAdmission,
         ack: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
     },
     Approval {
@@ -275,6 +277,48 @@ pub enum ChatStreamControl {
         response: Value,
     },
     Interrupt,
+}
+
+const STEER_PENDING: u8 = 0;
+const STEER_ACCEPTED: u8 = 1;
+const STEER_RECALLED: u8 = 2;
+
+/// Atomic ownership handoff for an active-turn steer. The session may recall
+/// the prompt while it is pending; a provider claims it immediately before
+/// the first irreversible delivery action. Exactly one side can win.
+#[derive(Clone, Debug)]
+pub struct SteerAdmission(Arc<AtomicU8>);
+
+impl SteerAdmission {
+    pub fn pending() -> Self {
+        Self(Arc::new(AtomicU8::new(STEER_PENDING)))
+    }
+
+    pub fn accept(&self) -> bool {
+        self.0
+            .compare_exchange(
+                STEER_PENDING,
+                STEER_ACCEPTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    pub fn recall(&self) -> bool {
+        self.0
+            .compare_exchange(
+                STEER_PENDING,
+                STEER_RECALLED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    pub fn is_accepted(&self) -> bool {
+        self.0.load(Ordering::Acquire) == STEER_ACCEPTED
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -812,19 +856,46 @@ async fn relay_claude_runtime(
             let steer_correlation = Arc::clone(&steer_correlation);
             let forwarder = tokio::spawn(async move {
                 while let Some(control) = controls.recv().await {
-                    let client_user_message_id =
-                        claude_steer_client_message_id(&control).map(str::to_owned);
-                    if let Some(client_user_message_id) = client_user_message_id.as_deref() {
-                        register_claude_steer(
-                            &steer_correlation,
-                            client_user_message_id.to_string(),
-                        );
-                    }
-                    if sender.send(map_claude_control(control)).await.is_err() {
-                        if let Some(client_user_message_id) = client_user_message_id.as_deref() {
-                            unregister_claude_steer(&steer_correlation, client_user_message_id);
+                    match control {
+                        ChatStreamControl::Steer {
+                            client_user_message_id,
+                            text,
+                            attachments,
+                            admission,
+                            ack,
+                        } => {
+                            let permit = match sender.reserve().await {
+                                Ok(permit) => permit,
+                                Err(_) => {
+                                    let _ = ack.send(Err(
+                                        "Claude turn ended before the steer was delivered"
+                                            .to_string(),
+                                    ));
+                                    break;
+                                }
+                            };
+                            if !admission.accept() {
+                                let _ =
+                                    ack.send(Err("steer was recalled before delivery".to_string()));
+                                continue;
+                            }
+                            if let Some(message_id) = client_user_message_id.as_deref() {
+                                register_claude_steer(&steer_correlation, message_id.to_string());
+                            }
+                            let (native_ack, _native_acknowledgement) =
+                                tokio::sync::oneshot::channel();
+                            permit.send(claude_agents::ChatStreamControl::Steer {
+                                text,
+                                attachments,
+                                ack: native_ack,
+                            });
+                            let _ = ack.send(Ok(()));
                         }
-                        break;
+                        control => {
+                            if sender.send(map_claude_control(control)).await.is_err() {
+                                break;
+                            }
+                        }
                     }
                 }
             });
@@ -898,16 +969,6 @@ async fn relay_claude_runtime(
     Ok(())
 }
 
-fn claude_steer_client_message_id(control: &ChatStreamControl) -> Option<&str> {
-    match control {
-        ChatStreamControl::Steer {
-            client_user_message_id,
-            ..
-        } => client_user_message_id.as_deref(),
-        _ => None,
-    }
-}
-
 fn register_claude_steer(correlation: &StdMutex<ClaudeSteerCorrelation>, message_id: String) {
     let mut correlation = correlation
         .lock()
@@ -915,31 +976,11 @@ fn register_claude_steer(correlation: &StdMutex<ClaudeSteerCorrelation>, message
     correlation.pending.push_back(message_id);
 }
 
-fn unregister_claude_steer(correlation: &StdMutex<ClaudeSteerCorrelation>, message_id: &str) {
-    let mut correlation = correlation
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(index) = correlation
-        .pending
-        .iter()
-        .rposition(|pending| pending == message_id)
-    {
-        correlation.pending.remove(index);
-    }
-}
-
 fn map_claude_control(control: ChatStreamControl) -> claude_agents::ChatStreamControl {
     match control {
-        ChatStreamControl::Steer {
-            client_user_message_id: _,
-            text,
-            attachments,
-            ack,
-        } => claude_agents::ChatStreamControl::Steer {
-            text,
-            attachments,
-            ack,
-        },
+        ChatStreamControl::Steer { .. } => {
+            unreachable!("Claude steers require an atomic admission handoff")
+        }
         ChatStreamControl::Approval {
             approval_id,
             decision,
@@ -1437,10 +1478,6 @@ async fn run_pooled_codex_turn(
     let mut final_text = None;
     let session_id = Some(process.thread_id.clone());
     let mut usage = CodexTurnUsageAccumulator::default();
-    let mut pending_steers: HashMap<
-        u64,
-        tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
-    > = HashMap::new();
     let mut pending_approvals = HashMap::new();
     let mut turn_completed = false;
     let mut turn_status = None;
@@ -1461,13 +1498,7 @@ async fn run_pooled_codex_turn(
                     continue;
                 }
                 let value = serde_json::from_str::<Value>(&line).unwrap_or_else(|_| Value::String(line.clone()));
-                if let Some(response_id) = codex_response_id(&value) {
-                    if let Some(ack) = pending_steers.remove(&response_id) {
-                        let result = value.get("error")
-                            .map(codex_rpc_error)
-                            .map_or(Ok(()), Err);
-                        let _ = ack.send(result);
-                    }
+                if codex_response_id(&value).is_some() {
                     continue;
                 }
                 emit_provider_event(events, &value, &mut compaction_capture).await;
@@ -1528,10 +1559,18 @@ async fn run_pooled_codex_turn(
                         client_user_message_id,
                         text: steer_text,
                         attachments,
+                        admission,
                         ack,
                     } => {
+                        if !admission.accept() {
+                            let _ = ack.send(Err(
+                                "steer was recalled before delivery".to_string(),
+                            ));
+                            continue;
+                        }
                         let request_id = process.next_request_id;
                         process.next_request_id = process.next_request_id.saturating_add(1);
+                        let _ = ack.send(Ok(()));
                         write_codex_request(
                             &mut process.stdin,
                             request_id,
@@ -1544,7 +1583,6 @@ async fn run_pooled_codex_turn(
                                 client_user_message_id.as_deref(),
                             ),
                         ).await?;
-                        pending_steers.insert(request_id, ack);
                     }
                     ChatStreamControl::Approval { approval_id, decision } => {
                         if let Some(rpc_id) = pending_approvals.remove(&approval_id) {
@@ -1566,11 +1604,6 @@ async fn run_pooled_codex_turn(
         }
     }
 
-    for (_, ack) in pending_steers {
-        let _ = ack.send(Err(
-            "Codex turn completed before the steer was delivered".to_string()
-        ));
-    }
     if !turn_completed {
         return Ok(false);
     }
@@ -1692,10 +1725,6 @@ async fn run_codex_subscription_process(
     let session_id = Some(thread_id.clone());
     let mut usage = CodexTurnUsageAccumulator::default();
     let mut next_request_id = 4_u64;
-    let mut pending_steers: HashMap<
-        u64,
-        tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
-    > = HashMap::new();
     let mut pending_approvals = HashMap::new();
     let mut turn_completed = false;
     let mut turn_status = None;
@@ -1720,13 +1749,7 @@ async fn run_codex_subscription_process(
                     continue;
                 }
                 let value = serde_json::from_str::<Value>(&line).unwrap_or_else(|_| Value::String(line.clone()));
-                if let Some(response_id) = codex_response_id(&value) {
-                    if let Some(ack) = pending_steers.remove(&response_id) {
-                        let result = value.get("error")
-                            .map(codex_rpc_error)
-                            .map_or(Ok(()), Err);
-                        let _ = ack.send(result);
-                    }
+                if codex_response_id(&value).is_some() {
                     continue;
                 }
                 emit_provider_event(&events, &value, &mut compaction_capture).await;
@@ -1788,10 +1811,18 @@ async fn run_codex_subscription_process(
                         client_user_message_id,
                         text: steer_text,
                         attachments,
+                        admission,
                         ack,
                     } => {
+                        if !admission.accept() {
+                            let _ = ack.send(Err(
+                                "steer was recalled before delivery".to_string(),
+                            ));
+                            continue;
+                        }
                         let request_id = next_request_id;
                         next_request_id += 1;
+                        let _ = ack.send(Ok(()));
                         write_codex_request(
                             &mut stdin,
                             request_id,
@@ -1804,7 +1835,6 @@ async fn run_codex_subscription_process(
                                 client_user_message_id.as_deref(),
                             ),
                         ).await?;
-                        pending_steers.insert(request_id, ack);
                     }
                     ChatStreamControl::Approval { approval_id, decision } => {
                         if let Some(rpc_id) = pending_approvals.remove(&approval_id) {
@@ -1826,11 +1856,6 @@ async fn run_codex_subscription_process(
         }
     }
 
-    for (_, ack) in pending_steers {
-        let _ = ack.send(Err(
-            "Codex turn completed before the steer was delivered".to_string()
-        ));
-    }
     child.start_kill().ok();
     let status = tokio::time::timeout(Duration::from_secs(3), child.wait())
         .await
@@ -3341,6 +3366,19 @@ impl SubscriptionProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn steer_admission_has_exactly_one_winner() {
+        let recalled = SteerAdmission::pending();
+        assert!(recalled.recall());
+        assert!(!recalled.accept());
+        assert!(!recalled.is_accepted());
+
+        let accepted = SteerAdmission::pending();
+        assert!(accepted.accept());
+        assert!(!accepted.recall());
+        assert!(accepted.is_accepted());
+    }
 
     #[test]
     fn claude_command_preserves_subscription_flags() {

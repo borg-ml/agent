@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use borg_provider::provider::SteerAdmission;
 use chrono::Utc;
 use serde_json::Value;
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
@@ -201,13 +202,13 @@ impl QueuedPrompt {
 
 struct PendingSteer {
     prompt: QueuedPrompt,
+    admission: SteerAdmission,
     state: PendingSteerState,
     attempt_boundary: u64,
 }
 
 enum PendingSteerState {
     AwaitingAcknowledgement,
-    Accepted,
     RetryAtBoundary { error: String },
 }
 
@@ -2575,22 +2576,6 @@ async fn run_agent_session_store_kernel(
                         track_approval(&kind, &mut pending_approval);
                         track_provider_interaction(&kind, &mut pending_provider_interaction);
                         let usage = goal_token_usage(&kind);
-                        commit_codex_steer(
-                            &mut journal,
-                            &events,
-                            session_id,
-                            &mut pending_steers,
-                            &kind,
-                        )
-                        .await?;
-                        commit_claude_steer(
-                            &mut journal,
-                            &events,
-                            session_id,
-                            &mut pending_steers,
-                            &kind,
-                        )
-                        .await?;
                         if context_usage_observation(&kind) {
                             provider_context_usage_valid = true;
                         }
@@ -2822,22 +2807,6 @@ async fn run_agent_session_store_kernel(
                     track_approval(&kind, &mut pending_approval);
                     track_provider_interaction(&kind, &mut pending_provider_interaction);
                     let usage = goal_token_usage(&kind);
-                    commit_codex_steer(
-                        &mut journal,
-                        &events,
-                        session_id,
-                        &mut pending_steers,
-                        &kind,
-                    )
-                    .await?;
-                    commit_claude_steer(
-                        &mut journal,
-                        &events,
-                        session_id,
-                        &mut pending_steers,
-                        &kind,
-                    )
-                    .await?;
                     if context_usage_observation(&kind) {
                         provider_context_usage_valid = true;
                     }
@@ -3039,35 +3008,25 @@ async fn run_agent_session_store_kernel(
                     else {
                         continue;
                     };
-                    match acknowledgement {
-                        Ok(())
-                            if !matches!(
-                                launch.provider,
-                                CodingProvider::Codex | CodingProvider::Claude
-                            ) =>
+                    if pending_steers[index].admission.is_accepted() {
+                        let steer = pending_steers
+                            .remove(index)
+                            .expect("matching pending steer index exists");
+                        record_prompt_status(
+                            &mut journal,
+                            &events,
+                            session_id,
+                            &steer.prompt,
+                            MessageStatus::Complete,
+                            PromptDelivery::Steer,
+                        )
+                        .await?;
+                    } else {
+                        let error = acknowledgement.err().unwrap_or_else(|| {
+                            "provider acknowledged the steer without accepting admission"
+                                .to_string()
+                        });
                         {
-                            let steer = pending_steers
-                                .remove(index)
-                                .expect("matching pending steer index exists");
-                            record_prompt_status(
-                                &mut journal,
-                                &events,
-                                session_id,
-                                &steer.prompt,
-                                MessageStatus::Complete,
-                                PromptDelivery::Steer,
-                            )
-                            .await?;
-                        }
-                        Ok(()) => {
-                            // A transport acknowledgement only says the
-                            // provider accepted the control message. Codex
-                            // and Claude both expose a later user-message
-                            // boundary; keep the steer in the pending-input
-                            // projection until that boundary is observed.
-                            pending_steers[index].state = PendingSteerState::Accepted;
-                        }
-                        Err(error) => {
                             tracing::warn!(
                                 %message_id,
                                 %error,
@@ -3178,13 +3137,21 @@ async fn run_agent_session_store_kernel(
                                 PromptDelivery::Steer,
                             )
                             .await?;
+                            let admission = SteerAdmission::pending();
                             let sent = if context_compaction_in_progress {
                                 false
                             } else {
-                                dispatch_steer(&control_tx, &steer_result_tx, &prompt).await
+                                dispatch_steer(
+                                    &control_tx,
+                                    &steer_result_tx,
+                                    &prompt,
+                                    admission.clone(),
+                                )
+                                .await
                             };
                             pending_steers.push_back(PendingSteer {
                                 prompt,
+                                admission,
                                 state: if sent {
                                     PendingSteerState::AwaitingAcknowledgement
                                 } else {
@@ -3372,6 +3339,7 @@ async fn run_agent_session_store_kernel(
                                             message_id: Uuid::new_v4(),
                                             text,
                                             attachments: Vec::new(),
+                                            admission: SteerAdmission::pending(),
                                             ack,
                                         })
                                         .await
@@ -5094,14 +5062,10 @@ async fn record_recalled_prompt(
     Ok(())
 }
 
-/// Withdraw steers that have not crossed the provider's user-message commit
-/// boundary.
-///
-/// A transport acknowledgement only means that the provider accepted the
-/// control request. Codex emits a separate `item/completed:userMessage` event
-/// when the steer becomes part of the provider conversation. Until that event,
-/// the prompt remains visible and recallable. A rejected one remains
-/// withdrawable while it waits for retry at the next boundary.
+/// Withdraw steers only while their provider admission is still unclaimed.
+/// The atomic compare-and-swap is the ownership boundary: either recall wins
+/// and delivery must skip the prompt, or the provider wins and the prompt is
+/// already irrevocable.
 fn recall_withdrawable_steers(
     pending_steers: &mut VecDeque<PendingSteer>,
     message_id: Option<Uuid>,
@@ -5111,11 +5075,10 @@ fn recall_withdrawable_steers(
     while let Some(steer) = pending_steers.pop_front() {
         let recallable = matches!(
             steer.state,
-            PendingSteerState::AwaitingAcknowledgement
-                | PendingSteerState::Accepted
-                | PendingSteerState::RetryAtBoundary { .. }
+            PendingSteerState::AwaitingAcknowledgement | PendingSteerState::RetryAtBoundary { .. }
         ) && steer.prompt.visible
-            && message_id.is_none_or(|target| target == steer.prompt.message_id);
+            && message_id.is_none_or(|target| target == steer.prompt.message_id)
+            && steer.admission.recall();
         if recallable {
             recalled.push(steer.prompt);
         } else {
@@ -5520,6 +5483,7 @@ async fn dispatch_steer(
     control_tx: &mpsc::Sender<AgentTurnControl>,
     steer_result_tx: &mpsc::Sender<(Uuid, std::result::Result<(), String>)>,
     prompt: &QueuedPrompt,
+    admission: SteerAdmission,
 ) -> bool {
     let (ack, result) = oneshot::channel();
     if control_tx
@@ -5527,6 +5491,7 @@ async fn dispatch_steer(
             message_id: prompt.message_id,
             text: prompt.text.clone(),
             attachments: prompt.attachments.clone(),
+            admission,
             ack,
         })
         .await
@@ -5561,7 +5526,16 @@ async fn retry_pending_steers(
             previous_error = %error,
             "retrying active-turn steer at provider boundary"
         );
-        if dispatch_steer(control_tx, steer_result_tx, &steer.prompt).await {
+        let admission = SteerAdmission::pending();
+        if dispatch_steer(
+            control_tx,
+            steer_result_tx,
+            &steer.prompt,
+            admission.clone(),
+        )
+        .await
+        {
+            steer.admission = admission;
             steer.state = PendingSteerState::AwaitingAcknowledgement;
             steer.attempt_boundary = boundary_generation;
         }
@@ -5597,116 +5571,6 @@ async fn record_prompt_status(
     Ok(())
 }
 
-fn committed_codex_user_message_id(kind: &SessionEventKind) -> Option<Uuid> {
-    let SessionEventKind::ProviderEvent {
-        provider: CodingProvider::Codex,
-        kind,
-        payload,
-    } = kind
-    else {
-        return None;
-    };
-    (kind == "item/completed:userMessage")
-        .then(|| {
-            payload
-                .get("client_id")
-                .or_else(|| payload.get("clientId"))
-                .or_else(|| payload.pointer("/params/item/clientId"))
-                .or_else(|| payload.pointer("/params/item/client_id"))
-                .and_then(Value::as_str)
-        })
-        .flatten()
-        .and_then(|client_id| Uuid::parse_str(client_id).ok())
-}
-
-async fn commit_codex_steer(
-    journal: &mut RuntimeSessionStore,
-    events: &mpsc::Sender<SessionEvent>,
-    session_id: Uuid,
-    pending_steers: &mut VecDeque<PendingSteer>,
-    kind: &SessionEventKind,
-) -> Result<()> {
-    let Some(message_id) = committed_codex_user_message_id(kind) else {
-        return Ok(());
-    };
-    let Some(index) = pending_steers.iter().position(|steer| {
-        steer.prompt.message_id == message_id && steer.prompt.delivery == PromptDelivery::Steer
-    }) else {
-        return Ok(());
-    };
-    let steer = pending_steers
-        .remove(index)
-        .expect("matching pending steer index exists");
-    record_prompt_status(
-        journal,
-        events,
-        session_id,
-        &steer.prompt,
-        MessageStatus::Complete,
-        PromptDelivery::Steer,
-    )
-    .await
-}
-
-/// Claude reports each submitted command through a lifecycle event. A
-/// transport acknowledgement only means that Borg wrote the steer to the
-/// native runtime; `state=started` is the first provider boundary that proves
-/// Claude accepted it for execution. The provider adapter correlates that
-/// lifecycle event with the original Borg message id.
-async fn commit_claude_steer(
-    journal: &mut RuntimeSessionStore,
-    events: &mpsc::Sender<SessionEvent>,
-    session_id: Uuid,
-    pending_steers: &mut VecDeque<PendingSteer>,
-    kind: &SessionEventKind,
-) -> Result<()> {
-    let Some(message_id) = committed_claude_user_message_id(kind) else {
-        return Ok(());
-    };
-    let Some(index) = pending_steers.iter().position(|steer| {
-        steer.prompt.delivery == PromptDelivery::Steer
-            && steer.prompt.message_id == message_id
-            && matches!(
-                steer.state,
-                PendingSteerState::AwaitingAcknowledgement | PendingSteerState::Accepted
-            )
-    }) else {
-        return Ok(());
-    };
-    let steer = pending_steers
-        .remove(index)
-        .expect("matching pending Claude steer index exists");
-    record_prompt_status(
-        journal,
-        events,
-        session_id,
-        &steer.prompt,
-        MessageStatus::Complete,
-        PromptDelivery::Steer,
-    )
-    .await
-}
-
-fn committed_claude_user_message_id(kind: &SessionEventKind) -> Option<Uuid> {
-    let SessionEventKind::ProviderEvent {
-        provider: CodingProvider::Claude,
-        kind,
-        payload,
-    } = kind
-    else {
-        return None;
-    };
-    if kind != "claude.command_lifecycle"
-        || payload.get("state").and_then(Value::as_str) != Some("started")
-    {
-        return None;
-    }
-    payload
-        .get("client_user_message_id")
-        .and_then(Value::as_str)
-        .and_then(|id| Uuid::parse_str(id).ok())
-}
-
 async fn promote_uncommitted_steers(
     journal: &mut RuntimeSessionStore,
     events: &mpsc::Sender<SessionEvent>,
@@ -5715,10 +5579,22 @@ async fn promote_uncommitted_steers(
     pending_steers: &mut VecDeque<PendingSteer>,
     _after_interrupt: bool,
 ) -> Result<()> {
-    let mut promoted = pending_steers
-        .drain(..)
-        .map(|steer| steer.prompt)
-        .collect::<Vec<_>>();
+    let mut promoted = Vec::new();
+    while let Some(steer) = pending_steers.pop_front() {
+        if steer.admission.is_accepted() {
+            record_prompt_status(
+                journal,
+                events,
+                session_id,
+                &steer.prompt,
+                MessageStatus::Complete,
+                PromptDelivery::Steer,
+            )
+            .await?;
+        } else {
+            promoted.push(steer.prompt);
+        }
+    }
     for prompt in &mut promoted {
         if prompt.delivery == PromptDelivery::Steer {
             record_prompt_status(

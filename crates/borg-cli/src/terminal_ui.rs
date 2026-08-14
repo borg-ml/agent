@@ -105,9 +105,10 @@ const MAX_TOOL_RUN_VIEWPORT_HEIGHT: usize = 30;
 const TOOL_RUN_CHROME_HEIGHT: usize = 2;
 const MIN_SCROLLBAR_THUMB_ROWS: u16 = 5;
 const LARGE_PASTE_CHAR_THRESHOLD: usize = 1000;
+const DICTATION_BUTTON_WIDTH: u16 = 6;
 const SELECTION_AUTOSCROLL_LINES_PER_FRAME: usize = 2;
 type RowRange = (usize, usize, usize);
-type ToolRunRowRange = (usize, usize, usize, usize);
+type ToolRunRowRange = (usize, usize, usize, usize, bool);
 /// The visible slice of one selectable transcript entry.
 ///
 /// `body_start` is the entry-relative row shown at `start`. Nested action
@@ -198,6 +199,7 @@ enum KeyAction {
     ClearOrExit,
     Exit,
     AttachImage,
+    Dictate,
     Copy,
     ScrollUp,
     ScrollDown,
@@ -224,6 +226,7 @@ struct KeyMap {
     clear_or_exit: Vec<KeyChord>,
     exit: Vec<KeyChord>,
     attach_image: Vec<KeyChord>,
+    dictate: Vec<KeyChord>,
     copy: Vec<KeyChord>,
     scroll_up: Vec<KeyChord>,
     scroll_down: Vec<KeyChord>,
@@ -244,6 +247,7 @@ impl KeyMap {
             clear_or_exit: parse_key_chords(&config.clear_or_exit)?,
             exit: parse_key_chords(&config.exit)?,
             attach_image: parse_key_chords(&config.attach_image)?,
+            dictate: parse_key_chords(&config.dictate)?,
             copy: parse_key_chords(&config.copy)?,
             scroll_up: parse_key_chords(&config.scroll_up)?,
             scroll_down: parse_key_chords(&config.scroll_down)?,
@@ -264,6 +268,7 @@ impl KeyMap {
             KeyAction::ClearOrExit => &self.clear_or_exit,
             KeyAction::Exit => &self.exit,
             KeyAction::AttachImage => &self.attach_image,
+            KeyAction::Dictate => &self.dictate,
             KeyAction::Copy => &self.copy,
             KeyAction::ScrollUp => &self.scroll_up,
             KeyAction::ScrollDown => &self.scroll_down,
@@ -439,8 +444,9 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/goal", "view or update the durable goal"),
     ("/todo", "view or update the durable todo list"),
     ("/todos", "alias for /todo"),
+    ("/dictate", "start or stop local dictation"),
     ("/queue", "run after the current turn"),
-    ("/steer", "steer the current Codex turn"),
+    ("/steer", "steer the current turn"),
     ("/interrupt", "interrupt the current turn"),
     ("/stop", "alias for /interrupt"),
     ("/login", "reconnect the current provider"),
@@ -527,6 +533,7 @@ pub enum UiAction {
     SetSteerActive(bool),
     SetAutoExpandEdits(bool),
     SetAutoExpandTools(bool),
+    ToggleDictation,
     LoadPayloads(Vec<SessionPayloadRef>),
     Interrupt {
         target: Option<Uuid>,
@@ -535,6 +542,14 @@ pub enum UiAction {
     /// parent shell now. It must not be converted into a background handoff.
     ForceQuit,
     Quit,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum DictationState {
+    #[default]
+    Idle,
+    Recording,
+    Transcribing,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -674,6 +689,9 @@ pub struct BorgTerminal {
     jump_to_bottom_hovered: bool,
     keybindings_hint_area: Option<Rect>,
     keybindings_hovered: bool,
+    dictation_button_area: Option<Rect>,
+    dictation_button_hovered: bool,
+    dictation_state: DictationState,
     tool_hit_areas: Vec<(Rect, usize)>,
     tool_run_hit_areas: Vec<(Rect, usize, usize)>,
     tool_run_header_hit_areas: Vec<(Rect, usize)>,
@@ -764,6 +782,7 @@ struct HoverState {
     scrollbar_hovered: bool,
     jump_to_bottom_hovered: bool,
     keybindings_hovered: bool,
+    dictation_button_hovered: bool,
 }
 
 impl BorgTerminal {
@@ -791,6 +810,7 @@ impl BorgTerminal {
             scrollbar_hovered: self.scrollbar_hovered,
             jump_to_bottom_hovered: self.jump_to_bottom_hovered,
             keybindings_hovered: self.keybindings_hovered,
+            dictation_button_hovered: self.dictation_button_hovered,
         }
     }
 }
@@ -1625,6 +1645,9 @@ impl BorgTerminal {
             jump_to_bottom_hovered: false,
             keybindings_hint_area: None,
             keybindings_hovered: false,
+            dictation_button_area: None,
+            dictation_button_hovered: false,
+            dictation_state: DictationState::Idle,
             tool_hit_areas: Vec::new(),
             tool_run_hit_areas: Vec::new(),
             tool_run_header_hit_areas: Vec::new(),
@@ -1745,6 +1768,9 @@ impl BorgTerminal {
         self.jump_to_bottom_hovered = false;
         self.keybindings_hint_area = None;
         self.keybindings_hovered = false;
+        self.dictation_button_area = None;
+        self.dictation_button_hovered = false;
+        self.dictation_state = DictationState::Idle;
         self.tool_hit_areas.clear();
         self.tool_run_hit_areas.clear();
         self.tool_run_header_hit_areas.clear();
@@ -1972,6 +1998,28 @@ impl BorgTerminal {
 
     pub fn restore_composer(&mut self, text: String, attachments: Vec<PathBuf>) {
         self.composer.restore(text, attachments);
+    }
+
+    pub fn insert_dictation(&mut self, text: &str) {
+        if !self.composer.text.is_empty()
+            && !self
+                .composer
+                .text
+                .chars()
+                .last()
+                .is_some_and(char::is_whitespace)
+            && !text.chars().next().is_some_and(char::is_whitespace)
+        {
+            self.composer.insert(" ");
+        }
+        self.composer.insert(text);
+        self.slash_selection = 0;
+        self.notice = Some("Dictation added to composer".to_string());
+    }
+
+    pub fn set_dictation_state(&mut self, state: DictationState) {
+        self.dictation_state = state;
+        self.event_redraw_needed = true;
     }
 
     pub fn composer_draft(&self) -> Option<(String, Vec<PathBuf>)> {
@@ -2569,6 +2617,7 @@ impl BorgTerminal {
         self.scrollbar_hovered = false;
         self.jump_to_bottom_hovered = false;
         self.keybindings_hovered = false;
+        self.dictation_button_hovered = false;
     }
 
     pub fn set_notice(&mut self, notice: impl Into<String>) {
@@ -2896,7 +2945,7 @@ impl BorgTerminal {
     pub fn open_active_messages_picker(&mut self, steer_active: bool) {
         self.picker = Some(Picker::new(
             PickerKind::ActiveMessages,
-            "Messages sent while Codex is working",
+            "Messages sent while Borg is working",
             ["Steer current turn", "Queue next turn"],
             Some(if steer_active {
                 "Steer current turn"
@@ -3198,6 +3247,9 @@ impl BorgTerminal {
                 self.keybindings_hovered = self
                     .keybindings_hint_area
                     .is_some_and(|area| area.contains(pointer));
+                self.dictation_button_hovered = self
+                    .dictation_button_area
+                    .is_some_and(|area| area.contains(pointer));
                 if background_hover_suppressed {
                     self.clear_background_hover();
                 }
@@ -3244,6 +3296,9 @@ impl BorgTerminal {
                     return Ok(UiAction::None);
                 }
                 if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                    if self.dictation_button_hovered {
+                        return Ok(UiAction::ToggleDictation);
+                    }
                     if self.picker.is_none()
                         && !self.keybindings_open
                         && let Some((_, child_id)) =
@@ -4495,6 +4550,7 @@ impl BorgTerminal {
         };
         let composer_text_width = composer_area_width
             .saturating_sub(if is_launch_screen { 5 } else { 4 })
+            .saturating_sub(DICTATION_BUTTON_WIDTH)
             .max(1) as usize;
         let (composer_display_text, composer_display_cursor) =
             if pending_provider_interaction_secret {
@@ -4603,6 +4659,9 @@ impl BorgTerminal {
         let mut next_team_roster_hit_areas = Vec::new();
         let mut next_back_to_director_area = None;
         let mut next_keybindings_hint_area = None;
+        let mut next_dictation_button_area = None;
+        let dictation_state = self.dictation_state;
+        let dictation_button_hovered = self.dictation_button_hovered;
         let pending_transcript_anchor = self.pending_transcript_anchor.take();
         let mut restored_scroll_from_bottom = None;
         let cursor_visible = cursor_blink_visible(self.cursor_blink_started_at.elapsed());
@@ -4734,8 +4793,9 @@ impl BorgTerminal {
                 let show_history_loader = self.history_page_loading;
                 let visible_height = content_area.height as usize;
                 let sticky_tool_run_header =
-                    sticky_tool_run_header_row(tool_run_rows, scroll_start)
-                        .map(|(index, row)| (index, transcript[row].clone()));
+                    sticky_tool_run_header_row(tool_run_rows, scroll_start).map(
+                        |(index, row, expandable)| (index, transcript[row].clone(), expandable),
+                    );
                 let sticky_index = tool_rows.partition_point(|(_, start, _)| *start < scroll_start);
                 let sticky_tool_header = if sticky_tool_run_header.is_some() {
                     None
@@ -4772,11 +4832,11 @@ impl BorgTerminal {
                     ));
                 }
                 let visible_end = scroll_start.saturating_add(visible_height);
-                for (start_index, start, end, max_offset) in tool_run_rows
+                for (start_index, start, end, max_offset, expandable) in tool_run_rows
                     .iter()
-                    .filter(|(_, start, end, _)| *end > scroll_start && *start < visible_end)
+                    .filter(|(_, start, end, _, _)| *end > scroll_start && *start < visible_end)
                 {
-                    if self.hovered_tool_run_header == Some(*start_index) {
+                    if *expandable && self.hovered_tool_run_header == Some(*start_index) {
                         apply_viewport_background(
                             &mut visible_transcript,
                             *start,
@@ -4791,15 +4851,17 @@ impl BorgTerminal {
                         *start_index,
                         *max_offset,
                     ));
-                    next_tool_run_header_hit_areas.push((
-                        viewport_hit_area(
-                            content_area,
-                            scroll_start,
-                            *start,
-                            start.saturating_add(1),
-                        ),
-                        *start_index,
-                    ));
+                    if *expandable {
+                        next_tool_run_header_hit_areas.push((
+                            viewport_hit_area(
+                                content_area,
+                                scroll_start,
+                                *start,
+                                start.saturating_add(1),
+                            ),
+                            *start_index,
+                        ));
+                    }
                 }
                 for (index, start, end) in
                     visible_row_ranges(message_rows, scroll_start, visible_height)
@@ -4885,11 +4947,13 @@ impl BorgTerminal {
                         ));
                     }
                 }
-                if !show_history_loader && let Some((index, mut header)) = sticky_tool_run_header {
+                if !show_history_loader
+                    && let Some((index, mut header, expandable)) = sticky_tool_run_header
+                {
                     apply_line_background(
                         &mut header,
                         content_area.width as usize,
-                        if self.hovered_tool_run_header == Some(index) {
+                        if expandable && self.hovered_tool_run_header == Some(index) {
                             MESSAGE_HOVER_BG
                         } else {
                             MESSAGE_BG
@@ -4900,7 +4964,9 @@ impl BorgTerminal {
                         ..content_area
                     };
                     frame.render_widget(Paragraph::new(header), sticky_area);
-                    next_tool_run_header_hit_areas.push((sticky_area, index));
+                    if expandable {
+                        next_tool_run_header_hit_areas.push((sticky_area, index));
+                    }
                 } else if !show_history_loader && let Some((index, mut header)) = sticky_tool_header
                 {
                     apply_line_background(
@@ -5081,6 +5147,33 @@ impl BorgTerminal {
                         .scroll((composer_scroll, 0)),
                     composer_area,
                 );
+            }
+            if self.picker.is_none() {
+                let button = Rect {
+                    x: composer_area.right().saturating_sub(DICTATION_BUTTON_WIDTH),
+                    y: composer_area.y.saturating_add(u16::from(!is_launch_screen)),
+                    width: DICTATION_BUTTON_WIDTH.min(composer_area.width),
+                    height: 1,
+                };
+                let (label, color) = match dictation_state {
+                    DictationState::Idle => (" mic  ", BORG_ORANGE),
+                    DictationState::Recording => (" stop ", Color::LightRed),
+                    DictationState::Transcribing => (" ...  ", Color::Yellow),
+                };
+                frame.render_widget(
+                    Paragraph::new(label).alignment(Alignment::Center).style(
+                        if dictation_button_hovered {
+                            Style::default()
+                                .fg(Color::Black)
+                                .bg(color)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(color).add_modifier(Modifier::BOLD)
+                        },
+                    ),
+                    button,
+                );
+                next_dictation_button_area = Some(button);
             }
             if let Some(picker) = self.picker.as_ref().filter(|picker| {
                 !matches!(
@@ -5806,6 +5899,7 @@ impl BorgTerminal {
             next_permission_status_area = None;
             next_back_to_director_area = None;
             next_keybindings_hint_area = None;
+            next_dictation_button_area = None;
         }
         if picker_open || self.keybindings_open {
             next_team_roster_hit_areas.clear();
@@ -5834,6 +5928,7 @@ impl BorgTerminal {
         self.team_roster_hit_areas = next_team_roster_hit_areas;
         self.back_to_director_area = next_back_to_director_area;
         self.keybindings_hint_area = next_keybindings_hint_area;
+        self.dictation_button_area = next_dictation_button_area;
         self.scroll_from_bottom = restored_scroll_from_bottom
             .unwrap_or(self.scroll_from_bottom)
             .min(next_scroll_max);
@@ -6119,6 +6214,9 @@ impl BorgTerminal {
             }
             return Ok(UiAction::None);
         }
+        if self.keymap.matches(KeyAction::Dictate, &key) {
+            return Ok(UiAction::ToggleDictation);
+        }
         if self.keymap.matches(KeyAction::Copy, &key) {
             if let Some(text) = self.transcript.copy_text() {
                 match clipboard::copy(&text) {
@@ -6197,6 +6295,11 @@ impl BorgTerminal {
                     slash_selected_command(&self.composer.text, self.slash_selection)
             {
                 self.composer.replace_text(command);
+            }
+            if self.composer.attachments.is_empty() && self.composer.text.trim() == "/dictate" {
+                self.composer.clear();
+                self.notice = None;
+                return Ok(UiAction::ToggleDictation);
             }
             let (text, attachments) = self.composer.take();
             if text.trim().is_empty() && attachments.is_empty() {
@@ -7320,12 +7423,17 @@ fn subagent_status_label(status: SubagentStatus) -> &'static str {
 }
 
 fn format_subagent_usage(usage: &borg_remote::SubagentUsage) -> String {
-    if usage.total_tokens == 0 && usage.cost_microusd.is_none() {
+    let displayed_tokens = usage
+        .context_tokens
+        .filter(|tokens| *tokens > 0)
+        .map(|tokens| (tokens, "ctx"))
+        .or_else(|| (usage.total_tokens > 0).then_some((usage.total_tokens, "tok")));
+    if displayed_tokens.is_none() && usage.cost_microusd.is_none() {
         return "  usage —".to_string();
     }
     let mut parts = Vec::new();
-    if usage.total_tokens > 0 {
-        parts.push(format_compact_count(usage.total_tokens));
+    if let Some((tokens, unit)) = displayed_tokens {
+        parts.push(format_compact_count(tokens, unit));
     }
     if let Some(cost_microusd) = usage.cost_microusd {
         parts.push(format!("${:.4}", cost_microusd as f64 / 1_000_000.0));
@@ -7333,13 +7441,13 @@ fn format_subagent_usage(usage: &borg_remote::SubagentUsage) -> String {
     format!("  {}", parts.join(" · "))
 }
 
-fn format_compact_count(value: u64) -> String {
+fn format_compact_count(value: u64, unit: &str) -> String {
     if value >= 1_000_000 {
-        format!("{:.1}m tok", value as f64 / 1_000_000.0)
+        format!("{:.1}m {unit}", value as f64 / 1_000_000.0)
     } else if value >= 1_000 {
-        format!("{:.1}k tok", value as f64 / 1_000.0)
+        format!("{:.1}k {unit}", value as f64 / 1_000.0)
     } else {
-        format!("{value} tok")
+        format!("{value} {unit}")
     }
 }
 
@@ -9097,6 +9205,7 @@ fn keybinding_reference(keymap: &KeyMap) -> Vec<(&'static str, String)> {
         ("clear · twice exit", keymap.label(KeyAction::ClearOrExit)),
         ("exit", keymap.label(KeyAction::Exit)),
         ("attach image", keymap.label(KeyAction::AttachImage)),
+        ("start/stop dictation", keymap.label(KeyAction::Dictate)),
         ("copy selection/response", keymap.label(KeyAction::Copy)),
         (
             "scroll transcript",
@@ -9439,12 +9548,12 @@ fn nested_wheel_scroll_distance(terminal_height: u16, repetitions: usize) -> isi
 fn sticky_tool_run_header_row(
     tool_run_rows: &[ToolRunRowRange],
     scroll_start: usize,
-) -> Option<(usize, usize)> {
+) -> Option<(usize, usize, bool)> {
     tool_run_rows
         .iter()
         .rev()
-        .find(|(_, start, end, _)| *start < scroll_start && *end > scroll_start)
-        .map(|(index, start, _, _)| (*index, *start))
+        .find(|(_, start, end, _, _)| *start < scroll_start && *end > scroll_start)
+        .map(|(index, start, _, _, expandable)| (*index, *start, *expandable))
 }
 
 fn visible_row_ranges(

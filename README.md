@@ -80,11 +80,26 @@ fields and retention rather than treating README disclosure as consent.
 Copy [`configs/editor.example.toml`](configs/editor.example.toml) to
 `$XDG_CONFIG_HOME/borg/editor.toml` to configure transcript presentation and
 active-turn input policy. `active_messages = "steer"` makes Enter inject at the
-next Codex boundary; `"queue"` makes Enter start a later turn. The dedicated
+next provider boundary; `"queue"` makes Enter start a later turn. The dedicated
 queue keybinding remains available in either mode. `prevent_sleep = true` keeps
 the machine awake during active turns by default; on systemd Linux it also
 holds the lid-switch action while a turn is running. Use `/sleep off` or set it
 to `false` when a laptop should suspend on lid close.
+
+### Local dictation
+
+The terminal composer has a clickable `mic` control on its right edge. Use the
+`dictate` keybinding (`Alt+V` by default) or `/dictate` to start recording; use
+it again to stop and insert the transcription into the composer. Audio is sent
+only to the local OpenAI-compatible transcription endpoint at
+`http://127.0.0.1:5092` by default. Borg does not fall back to a cloud speech
+service.
+
+Set `BORG_CLI_DICTATION_BASE_URL` and `BORG_CLI_DICTATION_MODEL` to use another
+local model server. Microphone capture uses `ffmpeg`; devices that need custom
+input arguments can set `BORG_CLI_DICTATION_RECORD_COMMAND` to a shell-style
+argument string containing an `{output}` placeholder. Borg parses that string
+into an executable and arguments and never runs it through a shell.
 
 Automated CLI/terminal checks should use `borg agent --ephemeral --local-only`.
 That creates a temporary session store and removes it when the process exits,

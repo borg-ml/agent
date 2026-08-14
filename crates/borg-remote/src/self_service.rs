@@ -2171,6 +2171,7 @@ fn validate_settings_shape(root: &toml::Value) -> Result<()> {
                 "clear_or_exit",
                 "exit",
                 "attach_image",
+                "dictate",
                 "copy",
                 "scroll_up",
                 "scroll_down",

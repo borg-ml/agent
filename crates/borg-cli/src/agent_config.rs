@@ -320,6 +320,7 @@ pub(crate) struct KeybindingConfig {
     pub(crate) clear_or_exit: Vec<String>,
     pub(crate) exit: Vec<String>,
     pub(crate) attach_image: Vec<String>,
+    pub(crate) dictate: Vec<String>,
     pub(crate) copy: Vec<String>,
     pub(crate) scroll_up: Vec<String>,
     pub(crate) scroll_down: Vec<String>,
@@ -340,6 +341,7 @@ impl Default for KeybindingConfig {
             clear_or_exit: vec!["ctrl+c".into()],
             exit: vec!["ctrl+d".into()],
             attach_image: vec!["ctrl+v".into()],
+            dictate: vec!["alt+v".into()],
             copy: vec!["ctrl+y".into()],
             scroll_up: vec!["pageup".into()],
             scroll_down: vec!["pagedown".into()],
@@ -880,7 +882,7 @@ impl AgentConfig {
 }
 
 impl KeybindingConfig {
-    pub(crate) fn entries(&self) -> [(&'static str, &[String]); 15] {
+    pub(crate) fn entries(&self) -> [(&'static str, &[String]); 16] {
         [
             ("send", &self.send),
             ("queue", &self.queue),
@@ -890,6 +892,7 @@ impl KeybindingConfig {
             ("clear_or_exit", &self.clear_or_exit),
             ("exit", &self.exit),
             ("attach_image", &self.attach_image),
+            ("dictate", &self.dictate),
             ("copy", &self.copy),
             ("scroll_up", &self.scroll_up),
             ("scroll_down", &self.scroll_down),
