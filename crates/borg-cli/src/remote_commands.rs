@@ -1333,11 +1333,6 @@ async fn run_local_agent_session(
             .unwrap_or_else(|| session_state.latest_sequence.saturating_add(1));
         (history, page_before)
     };
-    let pending_prompt_events = if can_prompt && !fallback_terminal && resuming {
-        store.recovery(session_id).await?.queue_events
-    } else {
-        Vec::new()
-    };
     if can_prompt && !fallback_terminal {
         // Durable history is the transcript source of truth, while the latest
         // coalesced message/reasoning rows are the live tail of an in-flight
@@ -1357,12 +1352,11 @@ async fn run_local_agent_session(
     }
     let mut history_start_reached = session_state.latest_sequence == 0
         || history.first().is_some_and(|event| event.sequence <= 1);
-    let (team_history, mut team_snapshots) = if can_prompt && !fallback_terminal {
+    let (team_history, team_snapshots) = if can_prompt && !fallback_terminal {
         subagent_state_from_history(&history)
     } else {
         (Vec::new(), Vec::new())
     };
-    reconcile_subagent_snapshots(store.as_ref(), &sessions_dir, &mut team_snapshots).await;
     let request_id = initial_prompt
         .as_ref()
         .map_or(session_id, |_| Uuid::new_v4());
@@ -1580,7 +1574,6 @@ async fn run_local_agent_session(
         terminal.set_configured_model_entries(agent_config.configured_model_entries());
         terminal.set_extension_commands(extension_catalog.api_snapshot().commands);
         terminal.seed_history(&history);
-        terminal.seed_pending_prompt_events(&pending_prompt_events);
         terminal.seed_team_roster(&team_snapshots);
         terminal.seed_session_state(&display_session_state);
         if let Some(notice) = startup_update_notice.as_deref() {
@@ -1628,6 +1621,18 @@ async fn run_local_agent_session(
         eprintln!("\n  {notice}\n");
     }
     let mut displayed_update_notice = startup_update_notice;
+    // Pending prompts are durable queue state, not part of the bounded
+    // transcript bootstrap. Hydrate them after first paint so a long queue
+    // cannot make resume wait on the full recovery projection.
+    let mut pending_prompt_task = (resuming && terminal.is_some()).then(|| {
+        let pending_store = Arc::clone(&store);
+        tokio::spawn(async move {
+            pending_store
+                .recovery(session_id)
+                .await
+                .map(|recovery| recovery.queue_events)
+        })
+    });
     // Prompt recall is not part of first paint. The bounded transcript tail
     // already seeds the composer with the newest prompts; older prompts are
     // only needed when the user presses Up. Loading them here used to scan the
@@ -1774,6 +1779,28 @@ async fn run_local_agent_session(
                     }
                     Err(error) => {
                         tracing::warn!(%error, "composer history hydration task failed");
+                    }
+                }
+            }
+            pending_prompt_result = async {
+                pending_prompt_task
+                    .as_mut()
+                    .expect("pending-prompt task branch is guarded")
+                    .await
+            }, if pending_prompt_task.is_some() => {
+                pending_prompt_task = None;
+                match pending_prompt_result {
+                    Ok(Ok(pending_prompt_events)) => {
+                        if let Some(terminal) = terminal.as_mut() {
+                            terminal.seed_pending_prompt_events(&pending_prompt_events);
+                            terminal_dirty = true;
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        tracing::warn!(%error, "could not hydrate pending prompts after first paint");
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "pending prompt hydration task failed");
                     }
                 }
             }
@@ -5509,8 +5536,8 @@ async fn reconcile_subagent_snapshots(
     for agent in agents {
         // Parent SubagentActivity is a durable mirror, not the child's status
         // authority. A crash can happen after the child journals Stopped but
-        // before the parent mirrors it. Resolve the child ledger before first
-        // paint so resume can never advertise stale background work.
+        // before the parent mirrors it. Resolve the child ledger before the
+        // hydrated roster is exposed so it cannot advertise stale work.
         if let Ok(state) = store.state(agent.session_id).await {
             reconcile_subagent_snapshot(agent, &state);
         }

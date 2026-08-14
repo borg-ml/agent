@@ -891,6 +891,49 @@ struct PartialToolCall {
     arguments: String,
 }
 
+fn emit_compatible_reasoning_progress(
+    progress: Option<&UnboundedSender<ProviderProgress>>,
+    model: &str,
+    effort: Option<&str>,
+    text: &str,
+) {
+    if text.is_empty() {
+        return;
+    }
+    if let Some(sender) = progress {
+        let _ = sender.send(ProviderProgress::ProviderEvent {
+            kind: "reasoning_delta".to_string(),
+            payload: json!({ "text": text }),
+            raw_payload: Box::new(None),
+            stream_channel: Some("reasoning".to_string()),
+            content_text: Some(text.to_string()),
+            provider_item_id: None,
+            tool_use_id: None,
+            tool_name: None,
+            model: Some(model.to_string()),
+            effort: effort.map(str::to_string),
+        });
+    }
+}
+
+fn reasoning_detail_text(detail: &Value) -> Option<String> {
+    match detail {
+        Value::String(text) => (!text.is_empty()).then(|| text.clone()),
+        Value::Array(items) => {
+            let text = items
+                .iter()
+                .filter_map(reasoning_detail_text)
+                .collect::<Vec<_>>()
+                .join("\n");
+            (!text.is_empty()).then_some(text)
+        }
+        Value::Object(object) => ["text", "summary", "content", "reasoning"]
+            .iter()
+            .find_map(|field| object.get(*field).and_then(reasoning_detail_text)),
+        _ => None,
+    }
+}
+
 async fn read_compatible_model_stream(
     response: reqwest::Response,
     progress: Option<&UnboundedSender<ProviderProgress>>,
@@ -949,32 +992,34 @@ async fn read_compatible_model_stream(
                     let _ = sender.send(ProviderProgress::stdout(delta.as_bytes().to_vec()));
                 }
             }
+            let mut emitted_reasoning_delta = false;
             if let Some(delta) = chunk
                 .pointer("/choices/0/delta/reasoning_content")
                 .or_else(|| chunk.pointer("/choices/0/delta/reasoning"))
                 .and_then(Value::as_str)
             {
                 reasoning_content.push_str(delta);
-                if let Some(sender) = progress {
-                    let _ = sender.send(ProviderProgress::ProviderEvent {
-                        kind: "reasoning_delta".to_string(),
-                        payload: json!({ "text": delta }),
-                        raw_payload: Box::new(None),
-                        stream_channel: Some("reasoning".to_string()),
-                        content_text: Some(delta.to_string()),
-                        provider_item_id: None,
-                        tool_use_id: None,
-                        tool_name: None,
-                        model: Some(model.to_string()),
-                        effort: effort.map(str::to_string),
-                    });
-                }
+                emit_compatible_reasoning_progress(progress, model, effort, delta);
+                emitted_reasoning_delta = !delta.is_empty();
             }
             if let Some(details) = chunk
                 .pointer("/choices/0/delta/reasoning_details")
                 .and_then(Value::as_array)
             {
                 reasoning_details.extend(details.iter().cloned());
+                // OpenRouter/GPT-compatible providers may put the visible
+                // thinking summary only in reasoning_details. Preserve the
+                // details for replay and also surface their text live; when a
+                // direct reasoning field is present it carries the same text.
+                if !emitted_reasoning_delta {
+                    let detail_text = details
+                        .iter()
+                        .filter_map(reasoning_detail_text)
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    reasoning_content.push_str(&detail_text);
+                    emit_compatible_reasoning_progress(progress, model, effort, &detail_text);
+                }
             }
             if let Some(deltas) = chunk
                 .pointer("/choices/0/delta/tool_calls")
@@ -1487,7 +1532,7 @@ mod tests {
             .expect("bind test server");
         let address = listener.local_addr().expect("test server address");
         let body = [
-            r#"data: {"choices":[{"delta":{"reasoning_content":"inspect ","reasoning_details":[{"type":"reasoning.text","text":"inspect " }]},"finish_reason":null}]}"#,
+            r#"data: {"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.text","text":"inspect " }]},"finish_reason":null}]}"#,
             r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"read_","arguments":"{\"pa"}}]},"finish_reason":null}]}"#,
             r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"file","arguments":"th\":\"src/lib.rs\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#,
             "data: [DONE]",
@@ -1513,11 +1558,21 @@ mod tests {
         let response = reqwest::get(format!("http://{address}"))
             .await
             .expect("request test stream");
-        let streamed = read_compatible_model_stream(response, None, "local-model", Some("high"))
-            .await
-            .expect("parse stream");
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
+        let streamed =
+            read_compatible_model_stream(response, Some(&progress_tx), "local-model", Some("high"))
+                .await
+                .expect("parse stream");
         server.await.expect("test server task");
 
+        let ProviderProgress::ProviderEvent {
+            kind, content_text, ..
+        } = progress_rx.try_recv().expect("reasoning progress event")
+        else {
+            panic!("expected reasoning progress event");
+        };
+        assert_eq!(kind, "reasoning_delta");
+        assert_eq!(content_text.as_deref(), Some("inspect "));
         assert_eq!(streamed.finish_reason, "tool_calls");
         let ModelMessage::Assistant {
             reasoning_content,
