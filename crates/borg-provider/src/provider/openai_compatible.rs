@@ -1248,7 +1248,7 @@ mod tests {
         });
         merge_gateway_body(
             &mut body,
-            &serde_json::json!({
+            serde_json::json!({
                 "model": "attacker/model",
                 "messages": ["replace"],
                 "stream": false,

@@ -54,7 +54,7 @@ impl Default for ConfiguredProvider {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct ConfiguredModel {
     pub(crate) name: Option<String>,
@@ -66,18 +66,6 @@ pub(crate) struct ConfiguredModel {
     /// routing object. Core conversation/tool fields are protected by the
     /// provider adapter.
     pub(crate) body: BTreeMap<String, toml::Value>,
-}
-
-impl Default for ConfiguredModel {
-    fn default() -> Self {
-        Self {
-            name: None,
-            context_window_tokens: None,
-            max_output_tokens: None,
-            variants: BTreeMap::new(),
-            body: BTreeMap::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

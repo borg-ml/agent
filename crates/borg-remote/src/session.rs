@@ -967,6 +967,7 @@ async fn run_agent_session_kernel(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_before_compaction_hook(
     journal: &mut RuntimeSessionStore,
     events: &mpsc::Sender<SessionEvent>,

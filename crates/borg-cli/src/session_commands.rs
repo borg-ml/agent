@@ -94,7 +94,7 @@ async fn open_store() -> Result<SqliteSessionStore> {
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join("sessions/sessions.sqlite3");
-    Ok(SqliteSessionStore::open(path).await?)
+    SqliteSessionStore::open(path).await
 }
 
 async fn resolve_session(store: &SqliteSessionStore, requested: Option<Uuid>) -> Result<Uuid> {
