@@ -4,8 +4,8 @@ id = "surf-lab"
 manifest_version = 1
 name = "Surf Lab"
 skill_roots = ["skills"]
-version = "0.3.53"
+version = "0.3.54"
 
 [mcp.lab]
 command = "${extension_dir}/surf-lab"
-allowed_tools = ["start", "step", "observe", "trace", "log", "branch", "compare", "native.inspect", "native.sweep", "native.audit", "replay.audit", "replay.residual", "policy.train", "policy.train-native", "policy.inspect", "policy.compare", "policy.compare-native", "policy.track", "policy.correct", "policy.evolve", "policy.evolve-native", "policy.recover-native", "policy.collect-native-ppo", "map.generate", "map.inspect", "map.preview", "map.route", "map.export", "config"]
+allowed_tools = ["start", "step", "observe", "trace", "log", "branch", "compare", "native.inspect", "native.sweep", "native.audit", "native.replay-episode", "replay.audit", "replay.residual", "policy.train", "policy.train-native", "policy.inspect", "policy.compare", "policy.compare-native", "policy.track", "policy.correct", "policy.evolve", "policy.evolve-native", "policy.recover-native", "policy.collect-native-ppo", "map.generate", "map.inspect", "map.preview", "map.route", "map.export", "config"]

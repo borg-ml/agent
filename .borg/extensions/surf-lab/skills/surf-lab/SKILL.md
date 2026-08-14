@@ -21,7 +21,8 @@ Environment calls preserve the standard MCP response envelope; Surf Lab puts
 its structured JSON payload in the first text content block.
 
 The environment exposes `start`, `step`, `observe`, `trace`, `log`, `branch`,
-`compare`, `native.inspect`, `native.sweep`, `native.audit`, `replay.audit`,
+`compare`, `native.inspect`, `native.sweep`, `native.audit`,
+`native.replay-episode`, `replay.audit`,
 `policy.train`, `policy.train-native`, `policy.inspect`, `policy.compare`,
 `policy.compare-native`, `policy.track`, `policy.correct`, `policy.evolve`,
 `policy.evolve-native`, `policy.recover-native`, `policy.collect-native-ppo`,
