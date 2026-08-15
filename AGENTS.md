@@ -1,4 +1,4 @@
-# Borg CLI agent instructions
+# Borg Agent instructions
 
 ## Change discipline
 

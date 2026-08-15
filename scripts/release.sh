@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly REPOSITORY_URL="https://github.com/borg-ml/cli"
+readonly REPOSITORY_URL="https://github.com/borg-ml/agent"
 readonly VERSION_PATTERN='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
 
 die() {
@@ -349,7 +349,7 @@ fi
 if [[ "$recovered" -eq 1 ]]; then
   run_release_checks
   if ! git rev-parse --quiet --verify "refs/tags/$tag^{commit}" >/dev/null; then
-    git tag -a "$tag" -m "Borg CLI $target_version"
+    git tag -a "$tag" -m "Borg Agent $target_version"
   fi
   echo "Publishing $tag atomically to $remote..."
   git push --atomic "$remote" "HEAD:refs/heads/$branch" "refs/tags/$tag"
@@ -397,9 +397,9 @@ run_release_checks
 # Commit only the release files. Other staged or concurrently generated work
 # must remain in the user's working tree and must never hitchhike into a
 # release commit.
-git commit --only Cargo.toml Cargo.lock -m "Release Borg CLI $target_version"
+git commit --only Cargo.toml Cargo.lock -m "Release Borg Agent $target_version"
 committed=1
-git tag -a "$tag" -m "Borg CLI $target_version"
+git tag -a "$tag" -m "Borg Agent $target_version"
 
 echo "Publishing $tag atomically to $remote..."
 git push --atomic "$remote" "HEAD:refs/heads/$branch" "refs/tags/$tag"

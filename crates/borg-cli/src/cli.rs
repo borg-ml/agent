@@ -30,7 +30,7 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: RemoteCommand,
     },
-    /// Check for or install the latest Borg CLI release.
+    /// Check for or install the latest Borg Agent release.
     #[command(visible_alias = "install")]
     Update(UpdateArgs),
     /// Show configured and effective optional runtime capabilities.

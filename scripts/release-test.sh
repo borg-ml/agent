@@ -166,8 +166,8 @@ make_fixture() {
   } >"$fixture/Cargo.lock"
 
   git -C "$fixture" add Cargo.toml Cargo.lock
-  git -C "$fixture" commit --quiet -m "Release Borg CLI $version"
-  git -C "$fixture" tag -a "v$version" -m "Borg CLI $version"
+  git -C "$fixture" commit --quiet -m "Release Borg Agent $version"
+  git -C "$fixture" tag -a "v$version" -m "Borg Agent $version"
 
   cp "$release_script" "$fixture/scripts/release.sh"
   chmod +x "$fixture/scripts/release.sh"
@@ -291,10 +291,10 @@ assert_equal "$before_check" "$(git -C "$success_fixture" rev-parse HEAD)" \
 run_release "$success_fixture"
 assert_equal "1.2.4" "$(fixture_version "$success_fixture")" \
   "default release version"
-assert_equal "Release Borg CLI 1.2.4" \
+assert_equal "Release Borg Agent 1.2.4" \
   "$(git -C "$success_fixture" log -1 --format=%s)" \
   "default release commit"
-assert_equal "Borg CLI 1.2.4" \
+assert_equal "Borg Agent 1.2.4" \
   "$(git -C "$success_fixture" for-each-ref \
     --format='%(contents:subject)' refs/tags/v1.2.4)" \
   "default release tag"
@@ -370,7 +370,7 @@ minor_fixture="$(make_fixture minor 0.1.44)"
 run_release "$minor_fixture" --minor
 assert_equal "0.2.0" "$(fixture_version "$minor_fixture")" \
   "minor release version"
-assert_equal "Release Borg CLI 0.2.0" \
+assert_equal "Release Borg Agent 0.2.0" \
   "$(git -C "$minor_fixture" log -1 --format=%s)" \
   "minor release commit"
 git -C "$minor_fixture" rev-parse --verify 'refs/tags/v0.2.0^{commit}' \

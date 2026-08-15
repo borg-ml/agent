@@ -1,8 +1,10 @@
-# Borg CLI
+# Borg Agent
 
-Borg CLI is a free and open-source agent harness and orchestrator written entirely
-in Rust. It combines a responsive terminal UI, durable sessions, native tools,
-major AI subscriptions and APIs, and optional remote control through borg.ml.
+Borg Agent is a free and open-source agent harness and orchestrator written
+entirely in Rust. It combines a responsive terminal UI, durable sessions,
+native tools, major AI subscriptions and APIs, and optional remote control
+through borg.ml. The executable remains `borg`, and existing configuration
+paths and compatibility environment variables remain supported.
 
 ```sh
 curl -fsSL https://borg.ml/install | sh
@@ -18,14 +20,14 @@ The installer detects the operating system and CPU, verifies the release
 checksum, installs to a user-local binary directory, and checks the installed
 binary with `borg --version`.
 
-Borg CLI checks for verified stable releases in the background and installs them
+Borg Agent checks for verified stable releases in the background and installs them
 for the next launch without interrupting active work. If an unattended check or
 installation fails, Borg keeps a durable notice and prompts you to run the
 manual `borg update` command. Run `borg update` (`borg install` is an alias) to
 update immediately, or `borg update --check` to check without installing.
 Automatic updates and their check interval are configurable.
 
-## What Borg CLI provides
+## What Borg Agent provides
 
 - a responsive terminal UI with durable resume, steering, compaction, image
   input, transcript selection, and configurable keybindings;
@@ -118,7 +120,7 @@ service behavior; explicit `BORG_CLI_DICTATION_BASE_URL`, model, or API-key
 settings also bypass automatic setup. The downloaded runtime is MIT-licensed;
 the converted Parakeet weights are CC-BY-4.0 licensed.
 
-Automated CLI/terminal checks should use `borg agent --ephemeral --local-only`.
+Automated terminal checks should use `borg agent --ephemeral --local-only`.
 That creates a temporary session store and removes it when the process exits,
 so health checks do not pollute the user's resume history or Remote workspace.
 
@@ -151,7 +153,7 @@ pages only when you scroll. Restored subagents remain dormant metadata until an
 explicit child-directed action wakes them, and stopping the owning main thread
 stops every live child before releasing the session.
 
-## Extend Borg CLI with Blu
+## Extend Borg Agent with Blu
 
 Blu is Borg's inspectable, live extension system:
 
@@ -336,7 +338,7 @@ decisions, reviews, references, and provenance records.
 - `borg-search`: bounded provider-neutral web search and Exa, Firecrawl,
   Parallel, and Brave adapters;
 - `borg-remote`: session protocol, store, actor, host and local tools; and
-- `borg`: public CLI commands and terminal UI.
+- `borg`: public commands and terminal UI.
 
 ## Development
 
@@ -344,7 +346,7 @@ decisions, reviews, references, and provenance records.
 cargo check --workspace
 cargo test --workspace
 
-# Build the provider-neutral CLI core without the subscription adapters.
+# Build the provider-neutral Borg Agent core without the subscription adapters.
 cargo check -p borg --no-default-features
 
 # Include Codex/Claude subscription lanes (the release default).
@@ -357,7 +359,7 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) before submitting changes.
 
 Tags matching `v*` build checksum-paired `borg` archives for Linux, macOS, and
 Windows on x86-64 and ARM64. Each release archive contains the self-contained
-`borg` CLI, the pinned native Claude payload under `providers/claude/`,
+`borg` executable, the pinned native Claude payload under `providers/claude/`,
 the Blu guide and manifest example under `docs/` and `configs/`, `LICENSE`,
 `NOTICE.md`, and this README. The Rust protocol runtime is provided
 by the standalone MIT-licensed [`claude-agents`](https://github.com/borg-ml/claude-agents)

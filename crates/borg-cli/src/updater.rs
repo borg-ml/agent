@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use crate::agent_config::UpdateConfig;
 use crate::cli::UpdateArgs;
 
-const REPOSITORY: &str = "borg-ml/cli";
+const REPOSITORY: &str = "borg-ml/agent";
 const MAX_DOWNLOAD_BYTES: usize = 128 * 1024 * 1024;
 const MAX_UPDATE_ERROR_CHARS: usize = 512;
 static BACKGROUND_STARTED: AtomicBool = AtomicBool::new(false);

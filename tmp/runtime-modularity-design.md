@@ -45,7 +45,7 @@ TypeScript remain selectable alternatives.
 The recommended shape is:
 
 ```text
-Borg CLI monorepo
+Borg Agent monorepo
 ├── crates/borg-runtime/
 │   └── language-neutral runtime contracts and worker protocol
 ├── crates/borg-runtime-blu/
@@ -105,7 +105,7 @@ new languages.
 
 ## 3. Dependency and repository boundaries
 
-The Borg CLI monorepo is the right place for all Borg runtime integration at
+The Borg Agent monorepo is the right place for all Borg runtime integration at
 this stage. It gives the host, adapters, worker protocol, manifests, events,
 tests, and release packaging one version matrix.
 

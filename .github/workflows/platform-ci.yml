@@ -1,4 +1,4 @@
-name: Borg CLI platform CI
+name: Borg Agent platform CI
 
 on:
   push:
@@ -11,7 +11,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: borg-cli-platform-${{ github.workflow }}-${{ github.ref }}
+  group: borg-agent-platform-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -60,11 +60,11 @@ jobs:
         with:
           toolchain: "1.94.0"
           targets: ${{ matrix.target }}
-      - name: Build CLI
+      - name: Build Borg Agent
         run: cargo build --locked --release --target ${{ matrix.target }} -p borg
-      - name: Run native CLI core-flow tests
+      - name: Run native Borg Agent core-flow tests
         run: cargo test --locked --target ${{ matrix.target }} -p borg --no-fail-fast
-      - name: Smoke-test the native CLI binary
+      - name: Smoke-test the native Borg Agent binary
         shell: bash
         run: |
           binary="target/${{ matrix.target }}/release/borg"

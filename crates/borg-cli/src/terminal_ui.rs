@@ -6607,7 +6607,7 @@ impl BorgTerminal {
         if self.mode == ScreenMode::Inline {
             let _ = self.terminal.clear();
         }
-        let _ = execute!(self.terminal.backend_mut(), SetTitle("Borg CLI"));
+        let _ = execute!(self.terminal.backend_mut(), SetTitle("Borg Agent"));
         let _ = execute!(self.terminal.backend_mut(), DisableMouseCapture);
         let _ = execute!(self.terminal.backend_mut(), DisableBracketedPaste);
         if self.mode == ScreenMode::Alternate {
@@ -10567,9 +10567,9 @@ fn terminal_title(status: SessionStatus, first_prompt: Option<&str>) -> String {
         .filter(|prompt| !prompt.is_empty())
         .map(|prompt| prompt.chars().take(48).collect::<String>());
     let prefix = if matches!(status, SessionStatus::Starting | SessionStatus::Running) {
-        format!("{} Borg CLI", activity_glyph(status))
+        format!("{} Borg Agent", activity_glyph(status))
     } else {
-        "Borg CLI".to_string()
+        "Borg Agent".to_string()
     };
     prompt.map_or(prefix.clone(), |prompt| format!("{prefix} - {prompt}..."))
 }

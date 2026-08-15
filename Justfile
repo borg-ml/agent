@@ -59,7 +59,7 @@ release version="":
 release-minor version="":
     ./scripts/release.sh --minor {{ quote(version) }}
 
-# Build and install the optimized public Borg CLI from this checkout.
+# Build and install the optimized public Borg Agent from this checkout.
 cli:
     #!/usr/bin/env bash
     set -euo pipefail

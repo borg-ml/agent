@@ -1,6 +1,6 @@
 # Contributing
 
-Thank you for improving Borg CLI.
+Thank you for improving Borg Agent.
 
 ## Contributor Licence Agreement
 

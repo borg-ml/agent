@@ -3430,14 +3430,14 @@ fn tool_call_summaries_cover_cli_display_contract() {
             "web.run",
             &serde_json::json!({
                 "search_query": [
-                    {"q": "Borg CLI"},
+                    {"q": "Borg Agent"},
                     {"q": "terminal UI"}
                 ]
             })
         ),
         (
             "Search web".to_string(),
-            "“Borg CLI · terminal UI”".to_string()
+            "“Borg Agent · terminal UI”".to_string()
         )
     );
     assert_eq!(
@@ -5907,7 +5907,7 @@ fn active_terminal_title_identifies_borg_and_the_first_prompt() {
         Some("  polish   the terminal\ninteraction  "),
     );
 
-    assert!(title.contains("Borg CLI - polish the terminal interaction..."));
+    assert!(title.contains("Borg Agent - polish the terminal interaction..."));
     assert!(
         title
             .chars()
@@ -5916,7 +5916,7 @@ fn active_terminal_title_identifies_borg_and_the_first_prompt() {
     );
     assert_eq!(
         terminal_title(SessionStatus::Ready, None),
-        "Borg CLI".to_string()
+        "Borg Agent".to_string()
     );
 }
 
@@ -7621,7 +7621,7 @@ fn completed_web_search_updates_the_started_card_with_the_late_query() {
             output: String::new(),
             output_ref: None,
             is_error: false,
-            input: Some(serde_json::json!({"query": "Borg CLI queue"})),
+            input: Some(serde_json::json!({"query": "Borg Agent queue"})),
             input_ref: None,
         },
     ));
@@ -7629,7 +7629,7 @@ fn completed_web_search_updates_the_started_card_with_the_late_query() {
     assert!(matches!(
         transcript.order.first(),
         Some(TranscriptEntry::Tool { name, detail, complete: true, .. })
-            if name == "Search web" && detail == "“Borg CLI queue”"
+            if name == "Search web" && detail == "“Borg Agent queue”"
     ));
 }
 
