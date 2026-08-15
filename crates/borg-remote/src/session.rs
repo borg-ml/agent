@@ -3988,6 +3988,18 @@ fn native_conversation(
                 native_structured_in_turn = false;
             }
             SessionEventKind::ProviderEvent { kind, payload, .. }
+                if kind == "native_prompt_context" =>
+            {
+                let message = serde_json::from_value(payload.clone()).context(
+                    "durable native prompt context does not match the model-turn contract",
+                )?;
+                if active_provider.is_some_and(|provider| provider.uses_native_harness()) {
+                    pending_native.push(message);
+                } else {
+                    pending_generic.push(message);
+                }
+            }
+            SessionEventKind::ProviderEvent { kind, payload, .. }
                 if kind == "native_model_message" =>
             {
                 native_structured_in_turn = true;
@@ -4765,6 +4777,10 @@ fn format_subscription_provider_prompt(
         &format_subscription_actor_value(actor, text),
     ));
     prompt
+}
+
+pub(crate) fn format_subscription_prompt_context(content: &str) -> String {
+    format_subscription_frame(&format_subscription_text_value("user", content))
 }
 
 fn format_subscription_message(message: &borg_provider::provider::ModelMessage) -> Value {

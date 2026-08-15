@@ -678,8 +678,13 @@ impl LocalAgentTurnExecutor {
             }),
         )
         .await?;
-        turn.system_prompt_appendix
-            .push_str(&turn.agent_tools.harness_prompt_appendix().await?);
+        if matches!(
+            turn.provider,
+            CodingProvider::Codex | CodingProvider::Claude
+        ) {
+            turn.system_prompt_appendix
+                .push_str(&turn.agent_tools.harness_prompt_appendix().await?);
+        }
         turn.external_mcp_servers
             .extend(runtime_extensions.external_mcp_servers);
         turn.extension_skill_roots
@@ -859,7 +864,7 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
             .context("Codex native compaction requires a provider thread")?;
         self.prepare_local_turn(&mut turn).await?;
         let permission = local_permission(turn.permission_mode);
-        let mut request = direct_chat_stream_request(&turn, true);
+        let mut request = direct_chat_stream_request(&turn, true, "");
         let lifecycle_key = subscription_lifecycle_key(&turn, &request, turn.permission_mode);
         let prepared = self
             .subscription_pools
@@ -1058,7 +1063,11 @@ struct BorgProviderTurnRuntime {
     subscription_pools: Option<Arc<SubscriptionPoolRegistry>>,
 }
 
-fn direct_chat_stream_request(turn: &AgentTurn, tools_enabled: bool) -> ChatStreamRequest {
+fn direct_chat_stream_request(
+    turn: &AgentTurn,
+    tools_enabled: bool,
+    prompt_context: &str,
+) -> ChatStreamRequest {
     let response_language_instruction = turn.response_language.instruction();
     let mcp_external_servers = if tools_enabled {
         let mut servers = turn.external_mcp_servers.clone();
@@ -1068,7 +1077,7 @@ fn direct_chat_stream_request(turn: &AgentTurn, tools_enabled: bool) -> ChatStre
         Vec::new()
     };
     ChatStreamRequest {
-        prompt: turn.prompt.clone(),
+        prompt: append_prompt_context(&turn.prompt, prompt_context),
         lifecycle_key: None,
         owner_session_id: Some(turn.session_id.to_string()),
         client_user_message_id: Some(turn.message_id.to_string()),
@@ -1101,6 +1110,20 @@ fn direct_chat_stream_request(turn: &AgentTurn, tools_enabled: bool) -> ChatStre
     }
 }
 
+fn append_prompt_context(prompt: &str, context: &str) -> String {
+    if context.is_empty() {
+        return prompt.to_string();
+    }
+    if prompt.is_empty() {
+        return context.to_string();
+    }
+    format!(
+        "{}\n{}",
+        prompt,
+        crate::session::format_subscription_prompt_context(context)
+    )
+}
+
 async fn run_borg_provider_turn(
     turn: AgentTurn,
     events: mpsc::Sender<SessionEventKind>,
@@ -1118,9 +1141,26 @@ async fn run_borg_provider_turn(
     let ttft_message_id = turn.message_id;
     let pool_turn = turn.clone();
     let response_language_instruction = turn.response_language.instruction();
+    let prompt_context = if turn.provider == CodingProvider::OpenCode {
+        turn.agent_tools.harness_prompt_appendix().await?
+    } else {
+        String::new()
+    };
+    if !prompt_context.is_empty() {
+        let context_message = borg_provider::provider::ModelMessage::user(prompt_context.clone());
+        crate::native_harness::record_native_prompt_context(
+            &events,
+            turn.provider,
+            &context_message,
+        )
+        .await?;
+    }
     let mut request = match request_template {
         Some(mut request) => {
             request.prompt = turn.prompt.clone();
+            if !prompt_context.is_empty() {
+                request.prompt = append_prompt_context(&request.prompt, &prompt_context);
+            }
             request.owner_session_id = Some(turn.session_id.to_string());
             request.client_user_message_id = Some(turn.message_id.to_string());
             request.attachments = turn.attachments;
@@ -1158,7 +1198,7 @@ async fn run_borg_provider_turn(
             }
             request
         }
-        None => direct_chat_stream_request(&turn, tools_enabled),
+        None => direct_chat_stream_request(&turn, tools_enabled, &prompt_context),
     };
     let permission = local_permission(turn.permission_mode);
     let pool_invocation = if local

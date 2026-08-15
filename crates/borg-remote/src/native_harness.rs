@@ -204,6 +204,12 @@ impl NativeHarness {
         let user_message = native_user_message(&turn.cwd, &turn.prompt, &turn.attachments).await?;
         record_native_message(&events, turn.provider, &user_message).await?;
         messages.push(user_message);
+        let harness_prompt_appendix = turn.agent_tools.harness_prompt_appendix().await?;
+        if !harness_prompt_appendix.is_empty() {
+            let context_message = ModelMessage::user(harness_prompt_appendix);
+            record_native_prompt_context(&events, turn.provider, &context_message).await?;
+            messages.push(context_message);
+        }
         canonicalize_native_messages(&mut messages);
         let provider_session_id = format!("borg-session:{}", turn.session_id);
         let prompt_cache_key = native_prompt_cache_key(
@@ -1731,6 +1737,22 @@ async fn record_native_message(
         })
         .await
         .map_err(|_| anyhow::anyhow!("session actor stopped while recording native conversation"))
+}
+
+pub(crate) async fn record_native_prompt_context(
+    events: &mpsc::Sender<SessionEventKind>,
+    provider: crate::CodingProvider,
+    message: &ModelMessage,
+) -> Result<()> {
+    let payload = serde_json::to_value(message)?;
+    events
+        .send(SessionEventKind::ProviderEvent {
+            provider,
+            kind: "native_prompt_context".to_string(),
+            payload,
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("session actor stopped while recording prompt context"))
 }
 
 async fn send(events: &mpsc::Sender<SessionEventKind>, event: SessionEventKind) {

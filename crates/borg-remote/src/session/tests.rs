@@ -6042,6 +6042,143 @@ fn native_replay_retains_provider_reasoning_without_text_reconstruction() {
 }
 
 #[test]
+fn mutable_prompt_context_replays_after_the_user_tail_without_breaking_prefix_order() {
+    use borg_provider::provider::ModelMessage;
+
+    let native_session = Uuid::new_v4();
+    let native_events = vec![
+        SessionEvent::new(
+            native_session,
+            1,
+            SessionEventKind::TurnStarted {
+                message_id: Uuid::new_v4(),
+                provider: CodingProvider::OpenRouter,
+                model: None,
+                effort: None,
+                fast: false,
+            },
+        ),
+        SessionEvent::new(
+            native_session,
+            2,
+            SessionEventKind::ProviderEvent {
+                provider: CodingProvider::OpenRouter,
+                kind: "native_model_message".to_string(),
+                payload: serde_json::to_value(ModelMessage::user("request")).unwrap(),
+            },
+        ),
+        SessionEvent::new(
+            native_session,
+            3,
+            SessionEventKind::ProviderEvent {
+                provider: CodingProvider::OpenRouter,
+                kind: "native_prompt_context".to_string(),
+                payload: serde_json::to_value(ModelMessage::user("appendix")).unwrap(),
+            },
+        ),
+        SessionEvent::new(
+            native_session,
+            4,
+            SessionEventKind::ProviderEvent {
+                provider: CodingProvider::OpenRouter,
+                kind: "native_model_message".to_string(),
+                payload: serde_json::to_value(ModelMessage::assistant(
+                    Some("done".to_string()),
+                    None,
+                    None,
+                    Vec::new(),
+                ))
+                .unwrap(),
+            },
+        ),
+        SessionEvent::new(
+            native_session,
+            5,
+            SessionEventKind::TurnCompleted {
+                message_id: Uuid::new_v4(),
+                provider_session_id: None,
+                final_text: "done".to_string(),
+                error: None,
+            },
+        ),
+    ];
+    assert_eq!(
+        native_conversation(&native_events, CodingProvider::OpenRouter).unwrap(),
+        vec![
+            ModelMessage::user("request"),
+            ModelMessage::user("appendix"),
+            ModelMessage::assistant(Some("done".to_string()), None, None, Vec::new()),
+        ]
+    );
+
+    let subscription_session = Uuid::new_v4();
+    let subscription_events = vec![
+        SessionEvent::new(
+            subscription_session,
+            1,
+            SessionEventKind::TurnStarted {
+                message_id: Uuid::new_v4(),
+                provider: CodingProvider::OpenCode,
+                model: None,
+                effort: None,
+                fast: false,
+            },
+        ),
+        SessionEvent::new(
+            subscription_session,
+            2,
+            SessionEventKind::Message {
+                message_id: Uuid::new_v4(),
+                actor: EventActor::User,
+                text: "request".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            },
+        ),
+        SessionEvent::new(
+            subscription_session,
+            3,
+            SessionEventKind::ProviderEvent {
+                provider: CodingProvider::OpenCode,
+                kind: "native_prompt_context".to_string(),
+                payload: serde_json::to_value(ModelMessage::user("appendix")).unwrap(),
+            },
+        ),
+        SessionEvent::new(
+            subscription_session,
+            4,
+            SessionEventKind::Message {
+                message_id: Uuid::new_v4(),
+                actor: EventActor::Assistant,
+                text: "done".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            },
+        ),
+        SessionEvent::new(
+            subscription_session,
+            5,
+            SessionEventKind::TurnCompleted {
+                message_id: Uuid::new_v4(),
+                provider_session_id: None,
+                final_text: "done".to_string(),
+                error: None,
+            },
+        ),
+    ];
+    assert_eq!(
+        native_conversation(&subscription_events, CodingProvider::OpenCode).unwrap(),
+        vec![
+            ModelMessage::user("request"),
+            ModelMessage::user("appendix"),
+            ModelMessage::assistant(Some("done".to_string()), None, None, Vec::new()),
+        ]
+    );
+}
+
+#[test]
 fn retained_context_restarts_from_the_latest_cross_provider_summary() {
     let session_id = Uuid::new_v4();
     let message = |sequence: u64, actor: EventActor, text: &str| {

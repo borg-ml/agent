@@ -240,10 +240,11 @@ impl OpenAiCompatibleProvider {
             });
         }
         let request_id = request.request_id.clone();
+        let deepseek_model = request_model.to_ascii_lowercase().contains("deepseek");
         let wire_messages = request
             .messages
             .iter()
-            .map(model_message_wire_value)
+            .map(|message| model_message_wire_value(message, deepseek_model))
             .collect::<Vec<_>>();
         let mut body = json!({
             "model": request_model,
@@ -850,8 +851,8 @@ fn compatible_http_client() -> &'static reqwest::Client {
     CLIENT.get_or_init(reqwest::Client::new)
 }
 
-fn model_message_wire_value(message: &ModelMessage) -> Value {
-    match message {
+fn model_message_wire_value(message: &ModelMessage, deepseek_model: bool) -> Value {
+    let mut wire = match message {
         ModelMessage::User {
             content,
             attachments,
@@ -871,7 +872,30 @@ fn model_message_wire_value(message: &ModelMessage) -> Value {
             json!({ "role": "user", "content": blocks })
         }
         _ => serde_json::to_value(message).expect("model messages are serializable"),
+    };
+
+    // DeepSeek requires every replayed assistant message to carry a reasoning
+    // part, including tool-call messages with no visible reasoning. Keep the
+    // empty field on the wire so the provider sees the same message shape on
+    // every round and can extend the exact cached prefix.
+    if deepseek_model
+        && matches!(
+            message,
+            ModelMessage::Assistant {
+                reasoning_content: None,
+                reasoning_details: None,
+                ..
+            }
+        )
+        && let Some(object) = wire.as_object_mut()
+    {
+        object.insert(
+            "reasoning_content".to_string(),
+            Value::String(String::new()),
+        );
     }
+
+    wire
 }
 
 fn chat_completions_endpoint() -> String {
@@ -1292,13 +1316,33 @@ mod tests {
                 filename: Some("screen.png".to_string()),
             }],
         );
-        let wire = model_message_wire_value(&message);
+        let wire = model_message_wire_value(&message, false);
         assert_eq!(wire["content"][0]["type"], "text");
         assert_eq!(wire["content"][1]["type"], "image_url");
         assert_eq!(
             wire["content"][1]["image_url"]["url"],
             "data:image/png;base64,aW1hZ2U="
         );
+    }
+
+    #[test]
+    fn deepseek_replays_empty_reasoning_for_assistant_tool_rounds() {
+        let message = ModelMessage::assistant(
+            None,
+            None,
+            None,
+            vec![ModelToolCall::function(
+                "call-1".to_string(),
+                "read_file".to_string(),
+                "{}".to_string(),
+            )],
+        );
+
+        let deepseek_wire = model_message_wire_value(&message, true);
+        assert_eq!(deepseek_wire["reasoning_content"], "");
+
+        let generic_wire = model_message_wire_value(&message, false);
+        assert!(generic_wire.get("reasoning_content").is_none());
     }
 
     #[test]
