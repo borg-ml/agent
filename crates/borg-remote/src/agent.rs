@@ -678,13 +678,6 @@ impl LocalAgentTurnExecutor {
             }),
         )
         .await?;
-        if matches!(
-            turn.provider,
-            CodingProvider::Codex | CodingProvider::Claude
-        ) {
-            turn.system_prompt_appendix
-                .push_str(&turn.agent_tools.harness_prompt_appendix().await?);
-        }
         turn.external_mcp_servers
             .extend(runtime_extensions.external_mcp_servers);
         turn.extension_skill_roots
@@ -1124,6 +1117,65 @@ fn append_prompt_context(prompt: &str, context: &str) -> String {
     )
 }
 
+const CLEARED_HARNESS_PROMPT_CONTEXT: &str = "## Continual harness state\nNo persistent harness state is currently configured. Ignore earlier harness state snapshots.";
+
+fn next_harness_prompt_context(
+    conversation: &[borg_provider::provider::ModelMessage],
+    current: String,
+) -> Option<String> {
+    let previous = conversation.iter().rev().find_map(|message| match message {
+        borg_provider::provider::ModelMessage::User { content, .. }
+            if content
+                .trim_start()
+                .starts_with("## Continual harness state") =>
+        {
+            Some(content.as_str())
+        }
+        _ => None,
+    });
+    if current.is_empty() {
+        return previous
+            .filter(|content| *content != CLEARED_HARNESS_PROMPT_CONTEXT)
+            .map(|_| CLEARED_HARNESS_PROMPT_CONTEXT.to_string());
+    }
+    (previous != Some(current.as_str())).then_some(current)
+}
+
+#[cfg(test)]
+mod prompt_context_tests {
+    use super::{
+        CLEARED_HARNESS_PROMPT_CONTEXT, append_prompt_context, next_harness_prompt_context,
+    };
+
+    use borg_provider::provider::ModelMessage;
+
+    #[test]
+    fn mutable_context_is_appended_after_the_existing_prompt() {
+        let prompt = "<borg-message>{\"role\":\"user\",\"content\":\"request\"}</borg-message>";
+        let result = append_prompt_context(prompt, "mutable harness snapshot");
+
+        assert!(result.starts_with(&format!("{prompt}\n")));
+        assert!(result.ends_with("</borg-message>"));
+        assert!(!result[..prompt.len()].contains("mutable harness snapshot"));
+    }
+
+    #[test]
+    fn unchanged_harness_context_is_not_replayed_into_the_warm_tail() {
+        let context = "\n\n## Continual harness state\nstate";
+        let conversation = vec![ModelMessage::user(context)];
+
+        assert!(next_harness_prompt_context(&conversation, context.to_string()).is_none());
+        assert_eq!(
+            next_harness_prompt_context(&conversation, "updated".to_string()).as_deref(),
+            Some("updated")
+        );
+        assert_eq!(
+            next_harness_prompt_context(&conversation, String::new()).as_deref(),
+            Some(CLEARED_HARNESS_PROMPT_CONTEXT)
+        );
+    }
+}
+
 async fn run_borg_provider_turn(
     turn: AgentTurn,
     events: mpsc::Sender<SessionEventKind>,
@@ -1141,12 +1193,19 @@ async fn run_borg_provider_turn(
     let ttft_message_id = turn.message_id;
     let pool_turn = turn.clone();
     let response_language_instruction = turn.response_language.instruction();
-    let prompt_context = if turn.provider == CodingProvider::OpenCode {
-        turn.agent_tools.harness_prompt_appendix().await?
+    let prompt_context = if tools_enabled
+        && matches!(
+            turn.provider,
+            CodingProvider::Codex | CodingProvider::Claude | CodingProvider::OpenCode
+        ) {
+        next_harness_prompt_context(
+            &turn.conversation,
+            turn.agent_tools.harness_prompt_appendix().await?,
+        )
     } else {
-        String::new()
+        None
     };
-    if !prompt_context.is_empty() {
+    if let Some(prompt_context) = prompt_context.as_ref() {
         let context_message = borg_provider::provider::ModelMessage::user(prompt_context.clone());
         crate::native_harness::record_native_prompt_context(
             &events,
@@ -1158,8 +1217,8 @@ async fn run_borg_provider_turn(
     let mut request = match request_template {
         Some(mut request) => {
             request.prompt = turn.prompt.clone();
-            if !prompt_context.is_empty() {
-                request.prompt = append_prompt_context(&request.prompt, &prompt_context);
+            if let Some(prompt_context) = prompt_context.as_deref() {
+                request.prompt = append_prompt_context(&request.prompt, prompt_context);
             }
             request.owner_session_id = Some(turn.session_id.to_string());
             request.client_user_message_id = Some(turn.message_id.to_string());
@@ -1198,7 +1257,11 @@ async fn run_borg_provider_turn(
             }
             request
         }
-        None => direct_chat_stream_request(&turn, tools_enabled, &prompt_context),
+        None => direct_chat_stream_request(
+            &turn,
+            tools_enabled,
+            prompt_context.as_deref().unwrap_or_default(),
+        ),
     };
     let permission = local_permission(turn.permission_mode);
     let pool_invocation = if local
@@ -1216,8 +1279,14 @@ async fn run_borg_provider_turn(
                     context_generation: turn.context_generation,
                     provider: turn.provider,
                     provider_session_id: turn.provider_session_id.clone(),
-                    prompt: turn.prompt.clone(),
-                    prompt_delta: turn.prompt_delta.clone(),
+                    prompt: append_prompt_context(
+                        &turn.prompt,
+                        prompt_context.as_deref().unwrap_or_default(),
+                    ),
+                    prompt_delta: append_prompt_context(
+                        &turn.prompt_delta,
+                        prompt_context.as_deref().unwrap_or_default(),
+                    ),
                     lifecycle_key,
                 },
             )
