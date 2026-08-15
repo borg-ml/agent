@@ -17,7 +17,7 @@ presence = true
 cloud_sync = true
 web_relay = true
 telemetry = false
-# Native tool presentation: `native`, `code`, or `both` (the default).
+# Native tool presentation: `compact`, `native`, `code`, or `both` (the default).
 tool_mode = "both"
 # `shared_work`, `presence`, `cloud_sync`, `web_relay`, and `telemetry` are
 # reserved provider-neutral declarations in this CLI release. They do not

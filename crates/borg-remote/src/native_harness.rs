@@ -35,6 +35,15 @@ const DEFAULT_FILE_BYTES: u64 = 256 * 1024;
 const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const DEFAULT_COMMAND_TIMEOUT_MS: u64 = 120_000;
 const MAX_COMMAND_TIMEOUT_MS: u64 = 30 * 60 * 1000;
+const COMPACT_TOOL_NAMES: &[&str] = &[
+    "list_files",
+    "read_file",
+    "search_files",
+    "write_file",
+    "edit_file",
+    "exec_command",
+    "write_stdin",
+];
 
 #[derive(Clone)]
 pub(crate) struct NativeHarness {
@@ -143,8 +152,16 @@ impl NativeHarness {
         .await?;
         let tools = runtime.tool_definitions()?;
         let mut messages = Vec::with_capacity(turn.conversation.len().saturating_add(3));
-        let mut system_prompt = super::agent::CODING_SYSTEM_PROMPT.to_string();
+        let mut system_prompt = match self.tool_mode {
+            ToolMode::Compact => super::agent::COMPACT_CODING_SYSTEM_PROMPT.to_string(),
+            ToolMode::Native | ToolMode::Code | ToolMode::Both => {
+                super::agent::CODING_SYSTEM_PROMPT.to_string()
+            }
+        };
         match self.tool_mode {
+            ToolMode::Compact => system_prompt.push_str(
+                "\n\nUse the available workspace tools directly to inspect, edit, and verify the project. ",
+            ),
             ToolMode::Native => system_prompt.push_str(
                 "\n\nUse `runtime_exec` for loops, filtering, transformations, and persistent programmatic work. It is trusted user-authority execution, not a security sandbox. ",
             ),
@@ -155,18 +172,20 @@ impl NativeHarness {
                 "\n\nUse `run_code` for loops, filtering, transformations, and batches of Borg calls; use `runtime_exec` when you specifically need its persistent namespace. Both are trusted user-authority execution, not security sandboxes. ",
             ),
         }
-        system_prompt.push_str(
-            "The runtime's `borg` bridge exposes bounded filesystem, process, history, MCP, workflow, and collaboration operations. ",
-        );
-        system_prompt.push_str(
-            "Inside the persistent runtime, `borg.environment(extension_id, server)` discovers and calls the extension's long-lived MCP environment, `await borg.rlm(task)` admits a subagent and returns a handle, and `borg.harness` manages bounded prompt, memory, skill, and subagent entries that are injected into later turns. ",
-        );
-        system_prompt.push_str(
-            "Use `query_history` (or `borg.history(...)` inside Python) to retrieve exact, ",
-        );
-        system_prompt.push_str(
-            "typed, lexical, or regex evidence from the lossless journal when compacted context is insufficient. Use `history_index` or `borg.history_index(...)` to page the full normalized log and build a task-specific retrieval or BorgSearch adapter; use `borg.semantic_search(...)` when the scoped Web BorgSearch MCP service is the right candidate retriever; persist mature adapters with `create_retrieval_adapter`, test them with `borg.test_retrieval_adapter(...)`, and resolve every index hit back through canonical history. ",
-        );
+        if !matches!(self.tool_mode, ToolMode::Compact) {
+            system_prompt.push_str(
+                "The runtime's `borg` bridge exposes bounded filesystem, process, history, MCP, workflow, and collaboration operations. ",
+            );
+            system_prompt.push_str(
+                "Inside the persistent runtime, `borg.environment(extension_id, server)` discovers and calls the extension's long-lived MCP environment, `await borg.rlm(task)` admits a subagent and returns a handle, and `borg.harness` manages bounded prompt, memory, skill, and subagent entries that are injected into later turns. ",
+            );
+            system_prompt.push_str(
+                "Use `query_history` (or `borg.history(...)` inside Python) to retrieve exact, ",
+            );
+            system_prompt.push_str(
+                "typed, lexical, or regex evidence from the lossless journal when compacted context is insufficient. Use `history_index` or `borg.history_index(...)` to page the full normalized log and build a task-specific retrieval or BorgSearch adapter; use `borg.semantic_search(...)` when the scoped Web BorgSearch MCP service is the right candidate retriever; persist mature adapters with `create_retrieval_adapter`, test them with `borg.test_retrieval_adapter(...)`, and resolve every index hit back through canonical history. ",
+            );
+        }
         if matches!(self.tool_mode, ToolMode::Code | ToolMode::Both) {
             system_prompt.push_str(&code_mode_prompt(&runtime.code_mode_catalog()?));
         }
@@ -833,13 +852,24 @@ impl NativeToolRuntime {
     }
 
     fn tool_definitions(&self) -> Result<Vec<ModelToolDefinition>> {
-        let mut definitions = self.code_mode_catalog()?;
+        let mut definitions = match self.tool_mode {
+            ToolMode::Compact => Self::compact_tool_catalog()?,
+            ToolMode::Native | ToolMode::Code | ToolMode::Both => self.code_mode_catalog()?,
+        };
         if matches!(self.tool_mode, ToolMode::Code) {
             return Ok(vec![run_code_tool_definition()?]);
         }
         if matches!(self.tool_mode, ToolMode::Both) {
             definitions.push(run_code_tool_definition()?);
         }
+        validate_tool_definitions(&definitions)?;
+        Ok(definitions)
+    }
+
+    fn compact_tool_catalog() -> Result<Vec<ModelToolDefinition>> {
+        let definitions = compact_tool_specs()
+            .map(|spec| ModelToolDefinition::from_mcp_spec(&spec).map_err(anyhow::Error::msg))
+            .collect::<Result<Vec<_>>>()?;
         validate_tool_definitions(&definitions)?;
         Ok(definitions)
     }
@@ -2027,6 +2057,19 @@ fn builtin_tool_specs() -> Vec<Value> {
     ]
 }
 
+fn compact_tool_specs() -> impl Iterator<Item = Value> {
+    builtin_tool_specs().into_iter().filter(|spec| {
+        spec.get("name")
+            .and_then(Value::as_str)
+            .map(|name| {
+                COMPACT_TOOL_NAMES
+                    .iter()
+                    .any(|candidate| *candidate == name)
+            })
+            .unwrap_or(false)
+    })
+}
+
 fn run_code_tool_definition() -> Result<ModelToolDefinition> {
     ModelToolDefinition::new(
         "run_code",
@@ -2346,6 +2389,21 @@ mod tests {
         assert!(prompt.contains("`read_file`"));
         assert!(prompt.contains("\"type\":\"object\""));
         assert!(!prompt.contains("`runtime_exec`"));
+    }
+
+    #[test]
+    fn compact_catalog_is_limited_to_workspace_coding_tools() {
+        let names = compact_tool_specs()
+            .filter_map(|spec| spec.get("name").and_then(Value::as_str).map(str::to_string))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            COMPACT_TOOL_NAMES
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect::<Vec<_>>()
+        );
+        assert!(!COMPACT_TOOL_NAMES.contains(&"run_blu_workflow"));
     }
 
     #[test]

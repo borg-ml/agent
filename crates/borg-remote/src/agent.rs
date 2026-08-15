@@ -54,6 +54,11 @@ exact question, while omitting unrelated transcript noise. Never ask the human t
 The peer cannot invoke another peer; after the response returns, reconcile it with your own judgment and \
 remain the sole voice that answers the user.";
 
+pub(crate) const COMPACT_CODING_SYSTEM_PROMPT: &str = "\
+You are Borg, a focused coding agent working in the user's local project. \
+Inspect the workspace, make the smallest requested changes, and verify the result. \
+Use the available workspace tools directly, preserve user work, and report what you verified.";
+
 #[derive(Clone)]
 pub struct AgentTurn {
     pub session_id: Uuid,

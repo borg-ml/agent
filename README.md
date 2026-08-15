@@ -70,9 +70,11 @@ disabled independently; parent capability disablement cascades to dependent
 features. Run `borg capabilities` (or `borg capabilities --json`) to inspect
 the effective runtime.
 
-Native tool presentation is configured with `[capabilities].tool_mode`: `native`
-keeps one-call-per-tool schemas, `code` exposes a single `run_code` tool with a
-generated Borg SDK, and `both` (the default) exposes both surfaces.
+Native tool presentation is configured with `[capabilities].tool_mode`: `compact`
+exposes the focused workspace coding tools with a short prompt for headless or
+benchmark runs, `native` keeps one-call-per-tool schemas, `code` exposes a
+single `run_code` tool with a generated Borg SDK, and `both` (the default)
+exposes both surfaces.
 
 Manual and autonomous teams allow 16 concurrently live child agents by
 default. Set `[team].worker_concurrency` to a smaller positive integer to fit

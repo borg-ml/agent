@@ -217,8 +217,9 @@ pub(crate) struct CapabilityConfig {
     pub(crate) cloud_sync: bool,
     pub(crate) web_relay: bool,
     pub(crate) telemetry: bool,
-    /// Native-harness tool presentation. `both` preserves the legacy catalog
-    /// while adding programmatic dispatch.
+    /// Native-harness tool presentation. `compact` is the focused coding
+    /// surface; `both` preserves the legacy catalog while adding programmatic
+    /// dispatch.
     pub(crate) tool_mode: borg_remote::ToolMode,
 }
 
@@ -1231,6 +1232,18 @@ reasoning_format = "deepseek"
         .unwrap();
         assert_eq!(config.capabilities.tool_mode, borg_remote::ToolMode::Code);
         assert!(config.capabilities.subagents);
+
+        let compact: AgentConfig = toml::from_str(
+            r#"
+            [capabilities]
+            tool_mode = "compact"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            compact.capabilities.tool_mode,
+            borg_remote::ToolMode::Compact
+        );
     }
 
     #[test]

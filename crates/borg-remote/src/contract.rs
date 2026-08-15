@@ -260,6 +260,8 @@ pub enum PermissionMode {
 #[serde(rename_all = "snake_case")]
 #[ts(export)]
 pub enum ToolMode {
+    /// Expose only the focused workspace coding tools with a compact prompt.
+    Compact,
     /// Expose the ordinary one-call-per-tool catalog.
     Native,
     /// Expose one `run_code` tool with the generated Borg SDK in the prompt.
