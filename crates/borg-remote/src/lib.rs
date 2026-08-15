@@ -72,8 +72,10 @@ pub use host::{
     provider_credentials_present, run_host, run_host_with_executor_factory,
 };
 pub use local_control::{
-    LocalSessionControlServer, local_session_owner_uses_current_binary, run_attached_session,
-    send_local_session_command, session_control_presence_socket_path, session_control_socket_path,
+    LocalSessionControlServer, force_terminate_local_session_owner,
+    local_session_owner_uses_current_binary, obsolete_local_session_owner_pid,
+    run_attached_session, send_local_session_command, session_control_presence_socket_path,
+    session_control_socket_path,
 };
 pub(crate) use lsp::LspPathPolicy;
 pub use lsp::LspService;

@@ -18,8 +18,9 @@ use borg_remote::{
     SessionConfigAction, SessionEvent, SessionEventKind, SessionGoal, SessionState, SessionStatus,
     SessionStore, SessionWriterLease, SpawnSubagent, SqliteSessionStore, SubagentAction,
     SubagentSnapshot, SubagentStatus, TodoAction, default_host_config_path, enroll_host,
-    local_session_owner_uses_current_binary, login_provider, mirror_local_session,
-    probe_capabilities, probe_provider_capabilities, provider_credentials_present,
+    force_terminate_local_session_owner, local_session_owner_uses_current_binary, login_provider,
+    mirror_local_session, obsolete_local_session_owner_pid, probe_capabilities,
+    probe_provider_capabilities, provider_credentials_present,
     run_agent_session_with_store_and_writer, run_agent_session_with_store_writer_and_peers,
     run_attached_session, run_host_with_executor_factory, send_local_session_command,
     session_control_socket_path,
@@ -983,6 +984,7 @@ async fn stop_stale_local_owner_and_acquire(
     if let Some(writer) = SessionWriterLease::try_acquire(lock_path)? {
         return Ok(writer);
     }
+    let sessions_dir = lock_path.parent().unwrap_or_else(|| Path::new("."));
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     if let Err(error) = send_local_session_command(
         control_socket_path,
@@ -996,8 +998,16 @@ async fn stop_stale_local_owner_and_acquire(
                 .root_cause()
                 .downcast_ref::<io::Error>()
                 .is_some_and(|error| error.kind() == io::ErrorKind::NotFound);
-        if !control_endpoint_gone {
+        let safely_obsolete =
+            obsolete_local_session_owner_pid(sessions_dir, session_id, lock_path)?.is_some();
+        if !control_endpoint_gone && !safely_obsolete {
             return Err(error).context("failed to ask the obsolete local session owner to stop");
+        }
+        if safely_obsolete {
+            tracing::warn!(
+                session_id = %session_id,
+                "obsolete local session owner did not accept the graceful stop command; will escalate after the handoff grace period"
+            );
         }
         // The owner can remove its control socket just before its process
         // releases the writer lease. Keep polling the authoritative lock
@@ -1007,12 +1017,33 @@ async fn stop_stale_local_owner_and_acquire(
         if let Some(writer) = SessionWriterLease::try_acquire(lock_path)? {
             return Ok(writer);
         }
-        anyhow::ensure!(
-            tokio::time::Instant::now() < deadline,
-            "obsolete local session owner did not release its writer lease"
-        );
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
+
+    if let Some(pid) = obsolete_local_session_owner_pid(sessions_dir, session_id, lock_path)? {
+        tracing::warn!(
+            session_id = %session_id,
+            pid,
+            "force-terminating the verified obsolete local session owner"
+        );
+        force_terminate_local_session_owner(pid)?;
+        let force_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if let Some(writer) = SessionWriterLease::try_acquire(lock_path)? {
+                return Ok(writer);
+            }
+            anyhow::ensure!(
+                tokio::time::Instant::now() < force_deadline,
+                "verified obsolete local session owner did not release its writer lease after termination"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    anyhow::bail!("obsolete local session owner did not release its writer lease")
 }
 
 async fn run_local_agent_session(

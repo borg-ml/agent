@@ -24,6 +24,8 @@ struct LocalSessionOwnerMetadata {
     schema_version: u8,
     pid: u32,
     executable_identity: String,
+    #[serde(default)]
+    process_start_time: Option<u64>,
 }
 
 /// Path used by additional local terminals to attach to a session owner.
@@ -52,10 +54,23 @@ pub fn local_session_owner_uses_current_binary(
     sessions_dir: &Path,
     session_id: Uuid,
 ) -> Result<bool> {
+    let Some(metadata) = read_local_session_owner_metadata(sessions_dir, session_id)? else {
+        return Ok(false);
+    };
+    if !owner_process_matches_metadata(&metadata)? {
+        return Ok(false);
+    }
+    Ok(metadata.executable_identity == current_executable_identity()?)
+}
+
+fn read_local_session_owner_metadata(
+    sessions_dir: &Path,
+    session_id: Uuid,
+) -> Result<Option<LocalSessionOwnerMetadata>> {
     let path = session_control_owner_path(sessions_dir, session_id);
     let bytes = match fs::read(&path) {
         Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
             return Err(error).with_context(|| format!("failed to read {}", path.display()));
         }
@@ -64,13 +79,13 @@ pub fn local_session_owner_uses_current_binary(
         Ok(metadata) => metadata,
         Err(error) => {
             tracing::warn!(%error, path = %path.display(), "invalid local session owner metadata");
-            return Ok(false);
+            return Ok(None);
         }
     };
-    if metadata.schema_version != 1 || !process_is_alive(metadata.pid) {
-        return Ok(false);
+    if metadata.schema_version != 1 {
+        return Ok(None);
     }
-    Ok(metadata.executable_identity == current_executable_identity()?)
+    Ok(Some(metadata))
 }
 
 fn current_executable_identity() -> Result<String> {
@@ -81,8 +96,14 @@ fn current_executable_identity() -> Result<String> {
     let executable = std::env::current_exe().context("failed to locate the Borg executable")?;
     let metadata = fs::metadata(&executable)
         .with_context(|| format!("failed to identify {}", executable.display()))?;
+    let identity = executable_identity(&metadata);
+    IDENTITY.set(identity.clone()).ok();
+    Ok(identity)
+}
+
+fn executable_identity(metadata: &fs::Metadata) -> String {
     #[cfg(unix)]
-    let identity = {
+    {
         use std::os::unix::fs::MetadataExt;
         format!(
             "{}:{}:{}:{}:{}",
@@ -92,11 +113,11 @@ fn current_executable_identity() -> Result<String> {
             metadata.mtime(),
             metadata.mtime_nsec()
         )
-    };
+    }
     #[cfg(not(unix))]
-    let identity = format!("{}:{:?}", metadata.len(), metadata.modified().ok());
-    IDENTITY.set(identity.clone()).ok();
-    Ok(identity)
+    {
+        format!("{}:{:?}", metadata.len(), metadata.modified().ok())
+    }
 }
 
 #[cfg(unix)]
@@ -113,6 +134,160 @@ fn process_is_alive(_pid: u32) -> bool {
     true
 }
 
+#[cfg(target_os = "linux")]
+fn process_executable_identity(pid: u32) -> Result<Option<String>> {
+    let path = PathBuf::from("/proc").join(pid.to_string()).join("exe");
+    let file = match fs::File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect {}", path.display()));
+        }
+    };
+    Ok(Some(executable_identity(&file.metadata()?)))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_executable_identity(_pid: u32) -> Result<Option<String>> {
+    Ok(None)
+}
+
+#[cfg(target_os = "linux")]
+fn process_start_time(pid: u32) -> Result<Option<u64>> {
+    let path = PathBuf::from("/proc").join(pid.to_string()).join("stat");
+    let contents = match fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect {}", path.display()));
+        }
+    };
+    let Some((_, fields)) = contents.rsplit_once(") ") else {
+        return Ok(None);
+    };
+    Ok(fields
+        .split_whitespace()
+        .nth(19)
+        .and_then(|value| value.parse().ok()))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_start_time(_pid: u32) -> Result<Option<u64>> {
+    Ok(None)
+}
+
+fn owner_process_matches_metadata(metadata: &LocalSessionOwnerMetadata) -> Result<bool> {
+    if !process_is_alive(metadata.pid) {
+        return Ok(false);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let Some(identity) = process_executable_identity(metadata.pid)? else {
+            return Ok(false);
+        };
+        if identity != metadata.executable_identity {
+            return Ok(false);
+        }
+        if let Some(expected) = metadata.process_start_time {
+            if process_start_time(metadata.pid)? != Some(expected) {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// Return the obsolete owner only when its metadata, executable identity, and
+/// open file descriptors prove that it owns this exact session lock.
+#[cfg(target_os = "linux")]
+pub fn obsolete_local_session_owner_pid(
+    sessions_dir: &Path,
+    session_id: Uuid,
+    lock_path: &Path,
+) -> Result<Option<u32>> {
+    let Some(metadata) = read_local_session_owner_metadata(sessions_dir, session_id)? else {
+        return Ok(None);
+    };
+    if metadata.executable_identity == current_executable_identity()?
+        || !owner_process_matches_metadata(&metadata)?
+    {
+        return Ok(None);
+    }
+    #[cfg(target_os = "linux")]
+    if !process_holds_lock(metadata.pid, lock_path)? {
+        return Ok(None);
+    }
+    Ok(Some(metadata.pid))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn obsolete_local_session_owner_pid(
+    _sessions_dir: &Path,
+    _session_id: Uuid,
+    _lock_path: &Path,
+) -> Result<Option<u32>> {
+    Ok(None)
+}
+
+#[cfg(target_os = "linux")]
+fn process_holds_lock(pid: u32, lock_path: &Path) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    let lock_metadata = match fs::metadata(lock_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to inspect {}", lock_path.display()));
+        }
+    };
+    let fd_directory = PathBuf::from("/proc").join(pid.to_string()).join("fd");
+    let entries = match fs::read_dir(&fd_directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return Ok(false),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to inspect {}", fd_directory.display()));
+        }
+    };
+    for entry in entries.flatten() {
+        let Ok(metadata) = fs::metadata(entry.path()) else {
+            continue;
+        };
+        if metadata.dev() == lock_metadata.dev() && metadata.ino() == lock_metadata.ino() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Force-stop a verified obsolete local session owner.
+#[cfg(unix)]
+pub fn force_terminate_local_session_owner(pid: u32) -> Result<()> {
+    let pid = i32::try_from(pid).context("obsolete local session owner PID is invalid")?;
+    anyhow::ensure!(pid > 1, "refusing to terminate a system process");
+    anyhow::ensure!(
+        pid as u32 != std::process::id(),
+        "refusing to terminate Borg itself"
+    );
+    let result = unsafe { libc::kill(pid, libc::SIGKILL) };
+    if result == -1 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(error).with_context(|| format!("failed to terminate process {pid}"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn force_terminate_local_session_owner(_pid: u32) -> Result<()> {
+    bail!("local session owner termination is only supported on Unix")
+}
+
 #[cfg(unix)]
 fn write_local_session_owner_metadata(sessions_dir: &Path, session_id: Uuid) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -126,6 +301,7 @@ fn write_local_session_owner_metadata(sessions_dir: &Path, session_id: Uuid) -> 
         schema_version: 1,
         pid: std::process::id(),
         executable_identity: current_executable_identity()?,
+        process_start_time: process_start_time(std::process::id())?,
     };
     fs::write(&temporary, serde_json::to_vec(&metadata)?)
         .with_context(|| format!("failed to write {}", temporary.display()))?;
@@ -705,6 +881,7 @@ mod tests {
             schema_version: 1,
             pid: u32::MAX,
             executable_identity: current_executable_identity().unwrap(),
+            process_start_time: None,
         };
         fs::write(
             session_control_owner_path(root.path(), session_id),
@@ -712,6 +889,69 @@ mod tests {
         )
         .unwrap();
         assert!(!local_session_owner_uses_current_binary(root.path(), session_id).unwrap());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn verified_obsolete_owner_can_be_terminated_and_releases_its_lock() {
+        use std::process::Command;
+        use std::thread;
+        use std::time::Duration;
+
+        let root = short_socket_tempdir();
+        let session_id = Uuid::new_v4();
+        let lock_path = root.path().join(format!("{session_id}.lock"));
+        let mut owner = Command::new("flock")
+            .args([
+                "--exclusive",
+                "--no-fork",
+                lock_path.to_str().unwrap(),
+                "sleep",
+                "30",
+            ])
+            .spawn()
+            .expect("flock is required for the Linux owner recovery test");
+
+        for _ in 0..100 {
+            if SessionWriterLease::try_acquire(&lock_path)
+                .unwrap()
+                .is_none()
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            SessionWriterLease::try_acquire(&lock_path)
+                .unwrap()
+                .is_none()
+        );
+
+        let metadata = LocalSessionOwnerMetadata {
+            schema_version: 1,
+            pid: owner.id(),
+            executable_identity: process_executable_identity(owner.id())
+                .unwrap()
+                .expect("flock child executable identity"),
+            process_start_time: process_start_time(owner.id()).unwrap(),
+        };
+        fs::write(
+            session_control_owner_path(root.path(), session_id),
+            serde_json::to_vec(&metadata).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            obsolete_local_session_owner_pid(root.path(), session_id, &lock_path).unwrap(),
+            Some(owner.id())
+        );
+        force_terminate_local_session_owner(owner.id()).unwrap();
+        owner.wait().unwrap();
+        assert!(
+            SessionWriterLease::try_acquire(&lock_path)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]

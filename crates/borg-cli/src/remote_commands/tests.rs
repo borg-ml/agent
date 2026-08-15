@@ -1361,6 +1361,79 @@ async fn obsolete_owner_handoff_releases_and_reacquires_the_writer_lease() {
 }
 
 #[tokio::test]
+#[cfg(target_os = "linux")]
+async fn wedged_obsolete_owner_is_force_terminated_after_the_handoff_grace_period() {
+    use std::os::unix::fs::MetadataExt;
+    use std::process::Command;
+    use std::thread;
+
+    let root = short_socket_tempdir();
+    let session_id = Uuid::new_v4();
+    let lock_path = root.path().join(format!("{session_id}.lock"));
+    let socket_path = session_control_socket_path(root.path(), session_id);
+    let mut owner = Command::new("flock")
+        .args([
+            "--exclusive",
+            "--no-fork",
+            lock_path.to_str().unwrap(),
+            "sleep",
+            "30",
+        ])
+        .spawn()
+        .expect("flock is required for the Linux owner recovery test");
+    for _ in 0..100 {
+        if SessionWriterLease::try_acquire(&lock_path)
+            .unwrap()
+            .is_none()
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        SessionWriterLease::try_acquire(&lock_path)
+            .unwrap()
+            .is_none()
+    );
+
+    let executable = std::fs::File::open(format!("/proc/{}/exe", owner.id())).unwrap();
+    let executable_metadata = executable.metadata().unwrap();
+    let executable_identity = format!(
+        "{}:{}:{}:{}:{}",
+        executable_metadata.dev(),
+        executable_metadata.ino(),
+        executable_metadata.len(),
+        executable_metadata.mtime(),
+        executable_metadata.mtime_nsec()
+    );
+    std::fs::write(
+        root.path().join(format!("{session_id}.control.owner.json")),
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "pid": owner.id(),
+            "executable_identity": executable_identity,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    // Keep the endpoint present but unusable: the owner cannot acknowledge
+    // Stop, so recovery must use the verified PID/lock fence after the grace
+    // period rather than returning the old lease error.
+    std::fs::write(&socket_path, b"not a Unix socket").unwrap();
+
+    let replacement = stop_stale_local_owner_and_acquire(&lock_path, &socket_path, session_id)
+        .await
+        .unwrap();
+    owner.wait().unwrap();
+    drop(replacement);
+    assert!(
+        SessionWriterLease::try_acquire(&lock_path)
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
 async fn obsolete_owner_handoff_uses_a_free_lease_when_its_socket_is_gone() {
     let root = tempdir().unwrap();
     let session_id = Uuid::new_v4();

@@ -6632,6 +6632,25 @@ fn deterministic_recovery_projection_fits_the_complete_provider_request() {
     );
 }
 
+#[test]
+fn subscription_replay_budget_accounts_for_the_context_separator() {
+    let current_prompt = "continue safely";
+    let context_budget = subscription_replay_context_budget(EventActor::User, current_prompt);
+    let context = "x".repeat(context_budget);
+
+    assert_eq!(
+        subscription_prompt_chars(Some(&context), EventActor::User, current_prompt),
+        SUBSCRIPTION_INPUT_BUDGET_CHARS
+    );
+    assert!(
+        subscription_prompt_chars(
+            Some(&format!("{context}x")),
+            EventActor::User,
+            current_prompt,
+        ) > SUBSCRIPTION_INPUT_BUDGET_CHARS
+    );
+}
+
 #[tokio::test]
 async fn subscription_compaction_truncates_provider_summary_before_replay() {
     let root = tempdir().unwrap();

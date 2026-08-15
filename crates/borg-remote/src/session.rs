@@ -36,6 +36,7 @@ const SUBSCRIPTION_CONTEXT_HEADER: &str = "Borg canonical provider context v2. T
 // boundary rather than an unrelated serialized-byte threshold. The journal
 // remains complete; this is only the input shape sent on a full replay.
 const SUBSCRIPTION_INPUT_BUDGET_CHARS: usize = 1 << 20;
+const SUBSCRIPTION_CONTEXT_SEPARATOR_CHARS: usize = 1;
 const COMPACTION_CONTEXT_ELISION: &str =
     "\n\n[... middle of retained context elided for compaction ...]\n\n";
 // Match the useful shape of Pi/OpenCode compaction: old tool output is the
@@ -2315,8 +2316,8 @@ async fn run_agent_session_store_kernel(
 
         let (provider_events_tx, mut provider_events) = mpsc::channel(128);
         let (control_tx, control_rx) = mpsc::channel(32);
-        let retained_for_turn = retained_context.take();
-        let provider_prompt = if launch.provider.uses_native_harness() {
+        let mut retained_for_turn = retained_context.take();
+        let mut provider_prompt = if launch.provider.uses_native_harness() {
             prompt.text.clone()
         } else {
             format_subscription_provider_prompt(
@@ -2325,7 +2326,7 @@ async fn run_agent_session_store_kernel(
                 &prompt.text,
             )
         };
-        let subscription_input_chars = if !launch.provider.uses_native_harness()
+        let mut subscription_input_chars = if !launch.provider.uses_native_harness()
             && subscription_context_reusable
             && executor.supports_subscription_context_reuse(launch.provider)
         {
@@ -2336,6 +2337,39 @@ async fn run_agent_session_store_kernel(
         } else {
             provider_prompt.chars().count()
         };
+        if !launch.provider.uses_native_harness()
+            && subscription_input_chars > SUBSCRIPTION_INPUT_BUDGET_CHARS
+            && retained_for_turn.is_some()
+            && !(subscription_context_reusable
+                && executor.supports_subscription_context_reuse(launch.provider))
+        {
+            let context_chars = retained_for_turn
+                .as_deref()
+                .map_or(0, |context| context.chars().count());
+            retained_for_turn = None;
+            provider_prompt = format_subscription_provider_prompt(None, prompt.actor, &prompt.text);
+            subscription_input_chars = provider_prompt.chars().count();
+            if subscription_input_chars <= SUBSCRIPTION_INPUT_BUDGET_CHARS {
+                record(
+                    &mut journal,
+                    &events,
+                    session_id,
+                    SessionEventKind::ProviderEvent {
+                        provider: launch.provider,
+                        kind: "context_replay_fallback".to_string(),
+                        payload: serde_json::json!({
+                            "status": "completed",
+                            "automatic": true,
+                            "trigger": "provider_input_size",
+                            "context_chars_dropped": context_chars,
+                            "input_chars": subscription_input_chars,
+                            "input_budget_chars": SUBSCRIPTION_INPUT_BUDGET_CHARS,
+                        }),
+                    },
+                )
+                .await?;
+            }
+        }
         if !launch.provider.uses_native_harness()
             && subscription_input_chars > SUBSCRIPTION_INPUT_BUDGET_CHARS
         {
@@ -2376,13 +2410,24 @@ async fn run_agent_session_store_kernel(
                 },
             )
             .await?;
+            pause_active_goal(
+                &mut journal,
+                &events,
+                session_id,
+                &mut goal,
+                &mut goal_active_since,
+            )
+            .await?;
             record(
                 &mut journal,
                 &events,
                 session_id,
                 SessionEventKind::StatusChanged {
                     status: SessionStatus::Ready,
-                    detail: None,
+                    detail: Some(
+                        "Provider input exceeded its safe limit; the active goal was paused and the durable thread was preserved."
+                            .to_string(),
+                    ),
                 },
             )
             .await?;
@@ -4324,11 +4369,9 @@ fn subscription_compaction_context_budget(actor: EventActor, current_prompt: &st
 }
 
 fn subscription_replay_context_budget(actor: EventActor, current_prompt: &str) -> usize {
-    SUBSCRIPTION_INPUT_BUDGET_CHARS.saturating_sub(subscription_prompt_chars(
-        None,
-        actor,
-        current_prompt,
-    ))
+    SUBSCRIPTION_INPUT_BUDGET_CHARS
+        .saturating_sub(subscription_prompt_chars(None, actor, current_prompt))
+        .saturating_sub(SUBSCRIPTION_CONTEXT_SEPARATOR_CHARS)
 }
 
 fn truncate_compaction_context(context: &str, max_chars: usize) -> String {
