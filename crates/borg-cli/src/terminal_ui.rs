@@ -104,6 +104,7 @@ const MIN_TOOL_RUN_VIEWPORT_HEIGHT: usize = 6;
 const MAX_TOOL_RUN_VIEWPORT_HEIGHT: usize = 30;
 const TOOL_RUN_CHROME_HEIGHT: usize = 2;
 const MIN_SCROLLBAR_THUMB_ROWS: u16 = 5;
+const TRANSCRIPT_SCROLLBAR_GUTTER_WIDTH: u16 = 3;
 const LARGE_PASTE_CHAR_THRESHOLD: usize = 1000;
 const DICTATION_BUTTON_WIDTH: u16 = 6;
 const DICTATION_EMOJI_ICON: &str = "🎤";
@@ -785,6 +786,7 @@ pub struct BorgTerminal {
     borging_this_run: bool,
     last_terminal_title: Option<String>,
     transcript_render_cache: Option<CachedTranscriptRender>,
+    transcript_full_render_cache: Option<CachedTranscriptRender>,
     rendered_transcript_height: usize,
     pending_scroll_anchor_height: Option<usize>,
     pending_transcript_anchor: Option<TranscriptViewportAnchor>,
@@ -1741,6 +1743,7 @@ impl BorgTerminal {
             borging_this_run: false,
             last_terminal_title: None,
             transcript_render_cache: None,
+            transcript_full_render_cache: None,
             rendered_transcript_height: 0,
             pending_scroll_anchor_height: None,
             pending_transcript_anchor: None,
@@ -4359,79 +4362,40 @@ impl BorgTerminal {
         let terminal_size = self.terminal.size()?;
         let content_width = terminal_content_width(terminal_size.width);
         let tool_run_viewport_height = tool_run_viewport_height(terminal_size.height as usize);
-        // Render the transcript at the full width. The scrollbar is an overlay
-        // that only appears once the transcript actually overflows, so it does
-        // not reserve an unused gutter on the initial view.
-        let transcript_width = content_width.max(1) as usize;
+        let full_transcript_width = content_width.max(1) as usize;
         let goal_tick = self.transcript.active_goal_cache_tick();
         let tool_spinner_tick = self.transcript.tool_spinner_cache_tick();
         let local_date = Local::now().date_naive();
-        let transcript_render = self
-            .transcript_render_cache
-            .as_ref()
-            .filter(
-                |(
-                    width,
-                    cached_tool_run_viewport_height,
-                    cached_goal_tick,
-                    cached_tool_spinner_tick,
-                    cached_date,
-                    _,
-                )| {
-                    *width == transcript_width
-                        && *cached_tool_run_viewport_height == tool_run_viewport_height
-                        && *cached_goal_tick == goal_tick
-                        && *cached_tool_spinner_tick == tool_spinner_tick
-                        && *cached_date == local_date
-                },
+        // Keep a separate full-width measurement so an overflowing transcript
+        // can switch to the scrollbar-safe width without rendering both widths
+        // again on every frame.
+        let full_transcript_render = if self.transcript_render_cache.is_some() {
+            cached_transcript_render(
+                &self.transcript,
+                &mut self.transcript_full_render_cache,
+                full_transcript_width,
+                tool_run_viewport_height,
+                goal_tick,
+                tool_spinner_tick,
+                local_date,
             )
-            .map(|(_, _, _, _, _, render)| Arc::clone(render))
-            .unwrap_or_else(|| {
-                let render = Arc::new(self.transcript.render_with_tool_run_viewport(
-                    transcript_width,
-                    tool_run_viewport_height,
-                    None,
-                    None,
-                    None,
-                ));
-                self.transcript_render_cache = Some((
-                    transcript_width,
-                    tool_run_viewport_height,
-                    goal_tick,
-                    tool_spinner_tick,
-                    local_date,
-                    Arc::clone(&render),
-                ));
-                render
-            });
-        let (
-            transcript,
-            tool_rows,
-            tool_run_rows,
-            message_rows,
-            entry_rows,
-            link_rows,
-            selection_rows,
-        ) = transcript_render.as_ref();
+        } else {
+            self.transcript_full_render_cache = None;
+            cached_transcript_render(
+                &self.transcript,
+                &mut self.transcript_full_render_cache,
+                full_transcript_width,
+                tool_run_viewport_height,
+                goal_tick,
+                tool_spinner_tick,
+                local_date,
+            )
+        };
         let queued_prompts = self.active_queued_prompts().to_vec();
         // Keep the first draft anchored in the splash composition area. Moving
         // it to the chat footer on the first keystroke makes the whole screen
         // jump before the user has actually submitted anything.
-        let is_launch_screen = transcript.is_empty() && queued_prompts.is_empty();
-        let transcript_height = transcript.len();
-        self.scroll_from_bottom = resolve_pending_scroll_anchor(
-            self.transcript.follow_tail,
-            self.scroll_from_bottom,
-            self.pending_scroll_anchor_height.take(),
-            transcript_height,
-        );
-        if self.transcript.follow_tail {
-            // A viewport that returned to the live tail no longer has a
-            // detached-content anchor to preserve. This can happen between
-            // the event and render arms while wheel motion is animating.
-            self.pending_transcript_anchor = None;
-        }
-        self.rendered_transcript_height = transcript_height;
+        let is_launch_screen = full_transcript_render.0.is_empty() && queued_prompts.is_empty();
         let modal_picker_open = matches!(
             self.picker.as_ref().map(|picker| picker.kind),
             Some(PickerKind::MessageActions | PickerKind::Goal)
@@ -4706,6 +4670,62 @@ impl BorgTerminal {
         } else {
             (composer_cursor.0 as u16).saturating_sub(composer_height.saturating_sub(3))
         };
+        let transcript_viewport_height = if is_launch_screen {
+            0
+        } else {
+            let area =
+                centered_content_area(Rect::new(0, 0, terminal_size.width, terminal_size.height));
+            let chunks = terminal_vertical_chunks(
+                area,
+                queued_prompt_panel_height(&queued_prompts, area.width),
+                composer_height,
+                footer_height,
+                is_launch_screen,
+            );
+            usize::from(chunks[0].height.saturating_sub(1))
+        };
+        let transcript_width = transcript_width_for_viewport(
+            content_width,
+            full_transcript_render.0.len(),
+            transcript_viewport_height,
+        );
+        let transcript_render = if transcript_width == full_transcript_width {
+            self.transcript_render_cache = self.transcript_full_render_cache.clone();
+            Arc::clone(&full_transcript_render)
+        } else {
+            cached_transcript_render(
+                &self.transcript,
+                &mut self.transcript_render_cache,
+                transcript_width,
+                tool_run_viewport_height,
+                goal_tick,
+                tool_spinner_tick,
+                local_date,
+            )
+        };
+        let (
+            transcript,
+            tool_rows,
+            tool_run_rows,
+            message_rows,
+            entry_rows,
+            link_rows,
+            selection_rows,
+        ) = transcript_render.as_ref();
+        let transcript_height = transcript.len();
+        self.scroll_from_bottom = resolve_pending_scroll_anchor(
+            self.transcript.follow_tail,
+            self.scroll_from_bottom,
+            self.pending_scroll_anchor_height.take(),
+            transcript_height,
+        );
+        if self.transcript.follow_tail {
+            // A viewport that returned to the live tail no longer has a
+            // detached-content anchor to preserve. This can happen between
+            // the event and render arms while wheel motion is animating.
+            self.pending_transcript_anchor = None;
+        }
+        self.rendered_transcript_height = transcript_height;
         let mut next_scrollbar_area = None;
         let mut next_scrollbar_thumb_area = None;
         let mut next_transcript_viewport_area = None;
@@ -4849,7 +4869,10 @@ impl BorgTerminal {
                 let scroll_max = transcript_height.saturating_sub(transcript_area.height as usize);
                 next_scroll_max = scroll_max;
                 let scroll = scroll_max.saturating_sub(scroll_from_bottom.min(scroll_max));
-                let content_area = transcript_area;
+                let content_area = Rect {
+                    width: (transcript_width.min(transcript_area.width as usize)) as u16,
+                    ..transcript_area
+                };
                 next_transcript_viewport_area = Some(content_area);
                 let scrollbar_area = if scroll_max > 0 && transcript_area.width > 4 {
                     Some(Rect {
@@ -9424,6 +9447,69 @@ fn terminal_content_width(terminal_width: u16) -> u16 {
     terminal_width
         .saturating_sub(HORIZONTAL_MARGIN.saturating_mul(2))
         .max(1)
+}
+
+fn cached_transcript_render(
+    transcript: &Transcript,
+    cache: &mut Option<CachedTranscriptRender>,
+    width: usize,
+    tool_run_viewport_height: usize,
+    goal_tick: Option<i64>,
+    tool_spinner_tick: Option<usize>,
+    local_date: NaiveDate,
+) -> Arc<TranscriptRender> {
+    cache
+        .as_ref()
+        .filter(
+            |(
+                cached_width,
+                cached_tool_run_viewport_height,
+                cached_goal_tick,
+                cached_tool_spinner_tick,
+                cached_date,
+                _,
+            )| {
+                *cached_width == width
+                    && *cached_tool_run_viewport_height == tool_run_viewport_height
+                    && *cached_goal_tick == goal_tick
+                    && *cached_tool_spinner_tick == tool_spinner_tick
+                    && *cached_date == local_date
+            },
+        )
+        .map(|(_, _, _, _, _, render)| Arc::clone(render))
+        .unwrap_or_else(|| {
+            let render = Arc::new(transcript.render_with_tool_run_viewport(
+                width,
+                tool_run_viewport_height,
+                None,
+                None,
+                None,
+            ));
+            *cache = Some((
+                width,
+                tool_run_viewport_height,
+                goal_tick,
+                tool_spinner_tick,
+                local_date,
+                Arc::clone(&render),
+            ));
+            render
+        })
+}
+
+fn transcript_width_for_viewport(
+    content_width: u16,
+    transcript_height: usize,
+    viewport_height: usize,
+) -> usize {
+    let full_width = content_width.max(1) as usize;
+    if content_width > 4 && transcript_height > viewport_height {
+        content_width
+            .saturating_sub(TRANSCRIPT_SCROLLBAR_GUTTER_WIDTH)
+            .max(1) as usize
+    } else {
+        full_width
+    }
 }
 
 fn responsive_launch_width(available: u16) -> u16 {

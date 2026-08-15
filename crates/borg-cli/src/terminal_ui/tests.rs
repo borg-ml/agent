@@ -4475,6 +4475,13 @@ fn launch_resume_picker_height_is_stable_and_reserved_once() {
     assert!(bounded.saturating_add(6 + 1) <= 24);
 }
 
+#[test]
+fn transcript_width_reserves_scrollbar_gutter_only_when_overflowing() {
+    assert_eq!(transcript_width_for_viewport(100, 24, 24), 100);
+    assert_eq!(transcript_width_for_viewport(100, 25, 24), 97);
+    assert_eq!(transcript_width_for_viewport(4, 25, 24), 4);
+}
+
 /// Only commands whose bare form is not a command need finishing by hand;
 /// everything else must run outright or the palette is just a typing aid.
 #[test]
