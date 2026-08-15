@@ -493,14 +493,21 @@ impl OpenAiCompatibleProvider {
                 .filter(|tokens| *tokens > 0)
             {
                 usage.context_tokens = Some(usage.context_tokens.unwrap_or_else(|| {
-                    usage.input_tokens.saturating_add(usage.cached_input_tokens)
+                    usage
+                        .input_tokens
+                        .saturating_add(usage.cached_input_tokens)
+                        .saturating_add(usage.cache_creation_input_tokens)
                 }));
                 usage.context_window_tokens = Some(context_window_tokens);
             }
         }
         if profile == OpenAiCompatibleProfile::OpenRouter {
-            usage.context_tokens =
-                Some(usage.input_tokens.saturating_add(usage.cached_input_tokens));
+            usage.context_tokens = Some(
+                usage
+                    .input_tokens
+                    .saturating_add(usage.cached_input_tokens)
+                    .saturating_add(usage.cache_creation_input_tokens),
+            );
             if let Some(limits) =
                 openrouter_model_limits(client, &endpoint, api_key.as_deref(), &self.model).await
             {
@@ -766,7 +773,12 @@ fn apply_generic_context_window(usage: &mut crate::runtime::ProviderCallUsage) {
     // declared by Borg or by the server lifecycle. Without it auto-compaction
     // never engages at the context wall.
     if let Some(context_window_tokens) = generic_context_window_tokens() {
-        usage.context_tokens = Some(usage.input_tokens.saturating_add(usage.cached_input_tokens));
+        usage.context_tokens = Some(
+            usage
+                .input_tokens
+                .saturating_add(usage.cached_input_tokens)
+                .saturating_add(usage.cache_creation_input_tokens),
+        );
         usage.context_window_tokens = Some(context_window_tokens);
     }
 }

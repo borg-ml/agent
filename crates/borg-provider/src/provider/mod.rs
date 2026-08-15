@@ -508,22 +508,66 @@ pub(crate) fn extract_chat_completions_usage(
     let prompt_tokens = usage
         .get("prompt_tokens")
         .and_then(Value::as_u64)
+        .or_else(|| {
+            usage
+                .get("prompt_cache_hit_tokens")
+                .and_then(Value::as_u64)
+                .zip(
+                    usage
+                        .get("prompt_cache_miss_tokens")
+                        .and_then(Value::as_u64),
+                )
+                .map(|(hit, miss)| hit.saturating_add(miss))
+        })
         .unwrap_or_default();
     let output_tokens = usage
         .get("completion_tokens")
         .and_then(Value::as_u64)
         .unwrap_or_default();
+    let native_cache_miss_tokens = usage
+        .get("prompt_cache_miss_tokens")
+        .and_then(Value::as_u64);
     let cached_input_tokens = usage
-        .pointer("/prompt_tokens_details/cached_tokens")
+        .get("prompt_cache_hit_tokens")
         .and_then(Value::as_u64)
+        .or_else(|| {
+            usage
+                .pointer("/prompt_tokens_details/cached_tokens")
+                .and_then(Value::as_u64)
+        })
         .unwrap_or_default()
         .min(prompt_tokens);
-    let input_tokens = prompt_tokens.saturating_sub(cached_input_tokens);
+    let cache_creation_input_tokens = usage
+        .get("prompt_cache_write_tokens")
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            usage
+                .pointer("/prompt_tokens_details/cache_write_tokens")
+                .and_then(Value::as_u64)
+        })
+        .or_else(|| usage.get("cache_write_tokens").and_then(Value::as_u64))
+        .or_else(|| {
+            usage
+                .get("cache_creation_input_tokens")
+                .and_then(Value::as_u64)
+        })
+        .or_else(|| usage.get("cache_creation_tokens").and_then(Value::as_u64))
+        .unwrap_or_default()
+        .min(prompt_tokens.saturating_sub(cached_input_tokens));
+    let uncached_prompt_tokens = native_cache_miss_tokens
+        .unwrap_or_else(|| prompt_tokens.saturating_sub(cached_input_tokens));
+    let input_tokens = uncached_prompt_tokens
+        .saturating_sub(cache_creation_input_tokens)
+        .min(
+            prompt_tokens
+                .saturating_sub(cached_input_tokens)
+                .saturating_sub(cache_creation_input_tokens),
+        );
     ProviderCallUsage {
         input_tokens,
         output_tokens,
         cached_input_tokens,
-        cache_creation_input_tokens: 0,
+        cache_creation_input_tokens,
         total_tokens: usage
             .get("total_tokens")
             .and_then(Value::as_u64)
@@ -788,19 +832,41 @@ mod tests {
                 "completion_tokens": 25,
                 "total_tokens": 130,
                 "prompt_tokens_details": {
-                    "cached_tokens": 40
+                    "cached_tokens": 40,
+                    "cache_write_tokens": 10
                 }
             }
         });
 
         let usage = extract_chat_completions_usage(&raw, 250, Some(1234));
 
-        assert_eq!(usage.input_tokens, 60);
+        assert_eq!(usage.input_tokens, 50);
         assert_eq!(usage.output_tokens, 25);
         assert_eq!(usage.cached_input_tokens, 40);
+        assert_eq!(usage.cache_creation_input_tokens, 10);
         assert_eq!(usage.total_tokens, 130);
         assert_eq!(usage.duration_ms, 250);
         assert_eq!(usage.cost_microusd, Some(1234));
+    }
+
+    #[test]
+    fn deepseek_chat_usage_extracts_native_cache_hit_and_miss_fields() {
+        let raw = json!({
+            "usage": {
+                "prompt_tokens": 100,
+                "prompt_cache_hit_tokens": 64,
+                "prompt_cache_miss_tokens": 36,
+                "prompt_tokens_details": { "cached_tokens": 0 },
+                "completion_tokens": 25
+            }
+        });
+
+        let usage = extract_chat_completions_usage(&raw, 0, None);
+
+        assert_eq!(usage.input_tokens, 36);
+        assert_eq!(usage.cached_input_tokens, 64);
+        assert_eq!(usage.cache_creation_input_tokens, 0);
+        assert_eq!(usage.total_tokens, 125);
     }
 
     #[test]

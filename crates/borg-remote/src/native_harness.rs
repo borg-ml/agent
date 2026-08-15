@@ -15,7 +15,6 @@ use borg_provider::provider::{
 use borg_provider::{CostBasis, ProviderCallUsage};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -862,14 +861,16 @@ impl NativeToolRuntime {
         if matches!(self.tool_mode, ToolMode::Both) {
             definitions.push(run_code_tool_definition()?);
         }
+        sort_tool_definitions(&mut definitions);
         validate_tool_definitions(&definitions)?;
         Ok(definitions)
     }
 
     fn compact_tool_catalog() -> Result<Vec<ModelToolDefinition>> {
-        let definitions = compact_tool_specs()
+        let mut definitions = compact_tool_specs()
             .map(|spec| ModelToolDefinition::from_mcp_spec(&spec).map_err(anyhow::Error::msg))
             .collect::<Result<Vec<_>>>()?;
+        sort_tool_definitions(&mut definitions);
         validate_tool_definitions(&definitions)?;
         Ok(definitions)
     }
@@ -885,6 +886,7 @@ impl NativeToolRuntime {
             .map(|spec| ModelToolDefinition::from_mcp_spec(&spec).map_err(anyhow::Error::msg))
             .collect::<Result<Vec<_>>>()?;
         definitions.extend_from_slice(self.mcp.definitions());
+        sort_tool_definitions(&mut definitions);
         validate_tool_definitions(&definitions)?;
         Ok(definitions)
     }
@@ -1353,35 +1355,23 @@ fn canonicalize_native_messages(messages: &mut Vec<ModelMessage>) {
     *messages = canonical;
 }
 
-/// Derive a stable cache identity for the durable prefix, not for the entire
-/// request. Tool rounds therefore reuse the provider's prefix cache, while a
-/// provider/model change, compaction, or context clear is fenced into a new
-/// epoch. The system/tool fingerprint also prevents a changed native runtime
-/// from silently reusing an incompatible prefix.
+/// Derive a stable cache identity for the logical session, not for each prompt
+/// shape. OpenRouter uses this as a fallback cache-affinity hint, so changing
+/// it when the transcript grows or a tool catalog is refreshed would partition
+/// one conversation across provider cache lanes. The provider still validates
+/// the exact message prefix; provider/model identity prevents accidental
+/// cross-backend reuse.
 fn native_prompt_cache_key(
     session_id: Uuid,
-    context_generation: u64,
+    _context_generation: u64,
     provider: crate::CodingProvider,
     model: &str,
-    system_prompt: &str,
-    tools: &[ModelToolDefinition],
+    _system_prompt: &str,
+    _tools: &[ModelToolDefinition],
 ) -> String {
-    let mut digest = Sha256::new();
-    digest.update(system_prompt.as_bytes());
-    digest.update([0]);
-    for tool in tools {
-        digest.update(serde_json::to_vec(&tool.chat_completions_value()).unwrap_or_default());
-        digest.update([0]);
-    }
-    let fingerprint = digest
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
     format!(
-        "borg:v2:{session_id}:{context_generation}:{}:{model}:{}",
-        provider.catalog_backend(),
-        fingerprint
+        "borg:v3:{session_id}:{}:{model}",
+        provider.catalog_backend()
     )
 }
 
@@ -2106,6 +2096,10 @@ fn validate_tool_definitions(definitions: &[ModelToolDefinition]) -> Result<()> 
     Ok(())
 }
 
+fn sort_tool_definitions(definitions: &mut [ModelToolDefinition]) {
+    definitions.sort_by(|left, right| left.name.cmp(&right.name));
+}
+
 fn code_mode_prompt(catalog: &[ModelToolDefinition]) -> String {
     let mut prompt = String::from(concat!(
         "\n\nCode Mode SDK (generated from this session's tool catalog):\n",
@@ -2407,7 +2401,27 @@ mod tests {
     }
 
     #[test]
-    fn native_cache_identity_is_stable_within_an_epoch_and_fenced_at_boundaries() {
+    fn native_tool_definitions_have_deterministic_wire_order() {
+        let mut definitions = vec![
+            ModelToolDefinition::new("write_file", "Write a file", json!({"type": "object"}))
+                .unwrap(),
+            ModelToolDefinition::new("read_file", "Read a file", json!({"type": "object"}))
+                .unwrap(),
+        ];
+
+        sort_tool_definitions(&mut definitions);
+
+        assert_eq!(
+            definitions
+                .iter()
+                .map(|definition| definition.name.as_str())
+                .collect::<Vec<_>>(),
+            ["read_file", "write_file"]
+        );
+    }
+
+    #[test]
+    fn native_cache_identity_stays_stable_as_the_prefix_grows() {
         let session_id = Uuid::new_v4();
         let first = native_prompt_cache_key(
             session_id,
@@ -2428,7 +2442,7 @@ mod tests {
                 &[],
             )
         );
-        assert_ne!(
+        assert_eq!(
             first,
             native_prompt_cache_key(
                 session_id,
@@ -2437,6 +2451,22 @@ mod tests {
                 "openai/gpt-5",
                 "system",
                 &[],
+            )
+        );
+        assert_eq!(
+            first,
+            native_prompt_cache_key(
+                session_id,
+                0,
+                crate::CodingProvider::OpenRouter,
+                "openai/gpt-5",
+                "changed system",
+                &[ModelToolDefinition::new(
+                    "read_file",
+                    "Read a file",
+                    json!({"type": "object"}),
+                )
+                .unwrap()],
             )
         );
         assert_ne!(
