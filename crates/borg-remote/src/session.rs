@@ -36,6 +36,7 @@ const SUBSCRIPTION_CONTEXT_HEADER: &str = "Borg canonical provider context v2. T
 // boundary rather than an unrelated serialized-byte threshold. The journal
 // remains complete; this is only the input shape sent on a full replay.
 const SUBSCRIPTION_INPUT_BUDGET_CHARS: usize = 1 << 20;
+const SUBSCRIPTION_REPLAY_BUDGET_QUANTUM_CHARS: usize = 64 * 1024;
 const SUBSCRIPTION_CONTEXT_SEPARATOR_CHARS: usize = 1;
 const COMPACTION_CONTEXT_ELISION: &str =
     "\n\n[... middle of retained context elided for compaction ...]\n\n";
@@ -4381,9 +4382,14 @@ fn subscription_compaction_context_budget(actor: EventActor, current_prompt: &st
 }
 
 fn subscription_replay_context_budget(actor: EventActor, current_prompt: &str) -> usize {
-    SUBSCRIPTION_INPUT_BUDGET_CHARS
+    let budget = SUBSCRIPTION_INPUT_BUDGET_CHARS
         .saturating_sub(subscription_prompt_chars(None, actor, current_prompt))
-        .saturating_sub(SUBSCRIPTION_CONTEXT_SEPARATOR_CHARS)
+        .saturating_sub(SUBSCRIPTION_CONTEXT_SEPARATOR_CHARS);
+    if budget < SUBSCRIPTION_REPLAY_BUDGET_QUANTUM_CHARS {
+        budget
+    } else {
+        budget - budget % SUBSCRIPTION_REPLAY_BUDGET_QUANTUM_CHARS
+    }
 }
 
 fn truncate_compaction_context(context: &str, max_chars: usize) -> String {

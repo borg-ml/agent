@@ -6775,17 +6775,30 @@ fn subscription_replay_budget_accounts_for_the_context_separator() {
     let context_budget = subscription_replay_context_budget(EventActor::User, current_prompt);
     let context = "x".repeat(context_budget);
 
-    assert_eq!(
-        subscription_prompt_chars(Some(&context), EventActor::User, current_prompt),
-        SUBSCRIPTION_INPUT_BUDGET_CHARS
+    assert_eq!(context_budget % SUBSCRIPTION_REPLAY_BUDGET_QUANTUM_CHARS, 0);
+    assert!(
+        subscription_prompt_chars(Some(&context), EventActor::User, current_prompt)
+            <= SUBSCRIPTION_INPUT_BUDGET_CHARS
     );
     assert!(
         subscription_prompt_chars(
-            Some(&format!("{context}x")),
+            Some(&format!(
+                "{context}{}",
+                "x".repeat(SUBSCRIPTION_REPLAY_BUDGET_QUANTUM_CHARS)
+            )),
             EventActor::User,
             current_prompt,
         ) > SUBSCRIPTION_INPUT_BUDGET_CHARS
     );
+}
+
+#[test]
+fn subscription_replay_budget_keeps_projection_boundaries_stable() {
+    let short = subscription_replay_context_budget(EventActor::User, "short");
+    let longer =
+        subscription_replay_context_budget(EventActor::User, &"longer prompt ".repeat(1024));
+
+    assert_eq!(short, longer);
 }
 
 #[tokio::test]
