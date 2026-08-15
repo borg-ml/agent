@@ -284,6 +284,12 @@ impl OpenAiCompatibleProvider {
                 if let Some(reasoning) = compatible_reasoning(self.effort.as_deref()) {
                     body["reasoning"] = reasoning;
                 }
+                if let Some(max_tokens) = nonempty_env("BORG_OPENROUTER_MAX_COMPLETION_TOKENS")
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .filter(|value| *value > 0)
+                {
+                    body["max_tokens"] = json!(max_tokens);
+                }
             }
             OpenAiCompatibleProfile::Generic => {
                 if let Some(max_tokens) = openai_compatible_max_tokens() {
@@ -1620,6 +1626,7 @@ mod tests {
         let base_url = format!("http://{address}/api/v1");
         let _base = TestEnvGuard::set("BORG_OPENROUTER_BASE_URL", &base_url);
         let _key = TestEnvGuard::set("OPENROUTER_API_KEY", "test-openrouter-key");
+        let _max = TestEnvGuard::set("BORG_OPENROUTER_MAX_COMPLETION_TOKENS", "24000");
 
         let (request_tx, request_rx) = tokio::sync::oneshot::channel();
         let response_body = [
@@ -1728,6 +1735,7 @@ mod tests {
         assert_eq!(body["session_id"], "borg-session:stable");
         assert_eq!(body["prompt_cache_key"], "borg-prefix:test");
         assert_eq!(body["reasoning"]["effort"], "high");
+        assert_eq!(body["max_tokens"], 24000);
         assert_eq!(body["tool_choice"], "auto");
         assert_eq!(body["response_format"]["type"], "json_schema");
         assert_eq!(body["provider"]["require_parameters"], true);
