@@ -4528,6 +4528,7 @@ impl BorgTerminal {
         };
         let keybindings_hint = format!("keybindings {}", self.keymap.label(KeyAction::Keybindings));
         let copy_notice_active = notice.as_deref().is_some_and(is_copy_notice);
+        let copy_notice_text = notice.clone().filter(|_| copy_notice_active);
         let notice_style = if copy_notice_active {
             Style::default()
                 .fg(Color::Black)
@@ -4539,7 +4540,9 @@ impl BorgTerminal {
             Style::default().fg(Color::DarkGray)
         };
         let controls = slash_suggestions.unwrap_or_else(|| {
-            if let Some(hint) = hover_notice_hint {
+            if let Some(notice) = copy_notice_text.as_ref() {
+                vec![copy_notice_line(notice.clone())]
+            } else if let Some(hint) = hover_notice_hint {
                 vec![Line::from(Span::styled(
                     hint,
                     Style::default().fg(Color::Yellow),
@@ -5971,6 +5974,31 @@ impl BorgTerminal {
                     );
                     next_picker_hit_areas.push((row, index));
                 }
+            }
+            // Copy feedback is the topmost transient overlay. Tooltips can
+            // extend into the footer, so rendering the badge only with the
+            // normal footer content lets a later tooltip overwrite it.
+            if let Some(notice) = copy_notice_text.as_deref()
+                && !footer_area.is_empty()
+            {
+                let metadata_width = Some(footer_metadata_text(
+                    todo_status.as_deref().unwrap_or(""),
+                    &cwd_status,
+                    usize::MAX,
+                ))
+                .filter(|value| !value.is_empty())
+                .map(|value| (value.width() as u16).min(footer_area.width))
+                .unwrap_or(0);
+                let copy_area = Rect {
+                    width: footer_area.width.saturating_sub(metadata_width),
+                    ..footer_area
+                };
+                frame.render_widget(Clear, copy_area);
+                frame.render_widget(
+                    Paragraph::new(copy_notice_line(notice.to_string()))
+                        .style(Style::default().bg(COMMAND_PANEL_BG)),
+                    copy_area,
+                );
             }
         })?;
         if background_hover_suppressed {
