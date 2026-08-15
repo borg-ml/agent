@@ -2966,6 +2966,43 @@ async fn run_local_agent_session(
                         continue;
                     }
                 };
+                // Resume hydration is deliberately deferred until after the
+                // first paint. Up is the one input that depends on both
+                // deferred prompt-history and pending-queue state, so make
+                // the first recall key wait for those tasks instead of
+                // silently treating an empty projection as empty history.
+                if terminal_event.is_up() {
+                    if let Some(task) = composer_history_task.take() {
+                        match task.await {
+                            Ok(Ok(composer_history)) => {
+                                if let Some(terminal) = terminal.as_mut() {
+                                    terminal.seed_composer_history(&composer_history);
+                                }
+                            }
+                            Ok(Err(error)) => {
+                                tracing::warn!(%error, "could not hydrate composer history before recall");
+                            }
+                            Err(error) => {
+                                tracing::warn!(%error, "composer history hydration task failed before recall");
+                            }
+                        }
+                    }
+                    if let Some(task) = pending_prompt_task.take() {
+                        match task.await {
+                            Ok(Ok(pending_prompt_events)) => {
+                                if let Some(terminal) = terminal.as_mut() {
+                                    terminal.seed_pending_prompt_events(&pending_prompt_events);
+                                }
+                            }
+                            Ok(Err(error)) => {
+                                tracing::warn!(%error, "could not hydrate pending prompts before recall");
+                            }
+                            Err(error) => {
+                                tracing::warn!(%error, "pending prompt hydration task failed before recall");
+                            }
+                        }
+                    }
+                }
                 let scroll_was_active = terminal
                     .as_ref()
                     .expect("terminal")

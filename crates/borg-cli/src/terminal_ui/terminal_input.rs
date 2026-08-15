@@ -1,7 +1,7 @@
 use std::io;
 use std::time::Duration;
 
-use crossterm::event::{Event, EventStream, MouseEvent, MouseEventKind};
+use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, MouseEvent, MouseEventKind};
 use futures_util::{Stream, StreamExt};
 
 const PRIORITY_EVENT_CHANNEL_CAPACITY: usize = 64;
@@ -23,6 +23,13 @@ impl TerminalInputEvent {
             event,
             scroll_repetitions: 1,
         }
+    }
+
+    pub(crate) fn is_up(&self) -> bool {
+        matches!(
+            &self.event,
+            Event::Key(key) if key.kind != KeyEventKind::Release && key.code == KeyCode::Up
+        )
     }
 }
 
@@ -385,7 +392,9 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+    use crossterm::event::{
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+    };
 
     use super::*;
 
@@ -396,6 +405,24 @@ mod tests {
             row: 10,
             modifiers: KeyModifiers::NONE,
         }
+    }
+
+    #[test]
+    fn up_recall_barrier_only_matches_non_release_up_keys() {
+        let press =
+            TerminalInputEvent::single(Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)));
+        assert!(press.is_up());
+
+        let mut release = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+        release.kind = KeyEventKind::Release;
+        assert!(!TerminalInputEvent::single(Event::Key(release)).is_up());
+        assert!(
+            !TerminalInputEvent::single(Event::Key(KeyEvent::new(
+                KeyCode::Down,
+                KeyModifiers::NONE,
+            )))
+            .is_up()
+        );
     }
 
     #[tokio::test]
