@@ -1317,6 +1317,74 @@ async fn ensuring_a_sidecar_reuses_one_idle_provider_session() {
 }
 
 #[tokio::test]
+async fn rotating_a_sidecar_archives_the_old_identity_and_rebinds_the_lane() {
+    let directory = tempdir().unwrap();
+    let root = Uuid::new_v4();
+    let store = Arc::new(
+        crate::SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
+            .await
+            .unwrap(),
+    );
+    store.create_session(root).await.unwrap();
+    let mut root_launch = launch();
+    root_launch.capabilities.multiplayer = false;
+    root_launch.cwd = directory.path().to_path_buf();
+    let coordinator = SubagentCoordinator::new_with_store_and_executor(
+        directory.path(),
+        root,
+        root_launch,
+        3,
+        Arc::new(crate::LocalAgentTurnExecutor::default()),
+        store,
+    )
+    .unwrap();
+
+    let first = coordinator
+        .ensure_sidecar(
+            "gpt",
+            CodingProvider::Codex,
+            Some("gpt-5.6-sol".to_string()),
+            Some("xhigh".to_string()),
+        )
+        .await
+        .unwrap();
+    let rotation = coordinator
+        .rotate_sidecar(
+            "gpt",
+            CodingProvider::Codex,
+            Some("gpt-5.6-luna".to_string()),
+            Some("max".to_string()),
+        )
+        .await
+        .unwrap();
+
+    let archived = coordinator
+        .list(None)
+        .await
+        .into_iter()
+        .find(|agent| agent.session_id == first.session_id)
+        .expect("archived sidecar remains visible");
+    assert_ne!(rotation.session_id, first.session_id);
+    assert_eq!(rotation.task_name, "/root/gpt");
+    assert_eq!(rotation.model.as_deref(), Some("gpt-5.6-luna"));
+    assert_eq!(rotation.effort.as_deref(), Some("max"));
+    assert_eq!(archived.session_id, first.session_id);
+    assert!(archived.task_name.starts_with("/root/peer_archive_"));
+    assert_eq!(archived.status, SubagentStatus::Stopped);
+    assert_eq!(
+        coordinator
+            .resolve_snapshot(&archived.task_name)
+            .await
+            .unwrap()
+            .session_id,
+        first.session_id
+    );
+    assert_eq!(coordinator.list(None).await.len(), 2);
+
+    coordinator.stop("/root/gpt").await.unwrap();
+}
+
+#[tokio::test]
 async fn subagent_admission_rejects_a_provider_without_host_authentication() {
     let directory = tempdir().unwrap();
     let root = Uuid::new_v4();
@@ -2364,6 +2432,7 @@ fn persistent_peer_tool_is_root_only_and_not_recursive() {
     .filter_map(|tool| tool["name"].as_str().map(str::to_owned))
     .collect::<Vec<_>>();
     assert!(root_names.iter().any(|name| name == "consult_peer"));
+    assert!(root_names.iter().any(|name| name == "rotate_peer"));
 
     let child_names = agent_tool_specs_with_capabilities_and_consultation(
         CodingProvider::Claude,
@@ -2377,6 +2446,7 @@ fn persistent_peer_tool_is_root_only_and_not_recursive() {
     .collect::<Vec<_>>();
     assert!(!child_names.iter().any(|name| name == "consult_peer"));
     assert!(!child_names.iter().any(|name| name == "consult_model"));
+    assert!(!child_names.iter().any(|name| name == "rotate_peer"));
 }
 
 #[tokio::test]

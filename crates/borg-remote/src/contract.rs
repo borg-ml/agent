@@ -1112,6 +1112,15 @@ pub enum SubagentAction {
         model: Option<String>,
         effort: Option<String>,
     },
+    /// Archive the current deterministic sidecar lane and replace it with a
+    /// fresh child using the requested provider model and reasoning effort.
+    Rotate {
+        request_id: Uuid,
+        task_name: String,
+        provider: CodingProvider,
+        model: Option<String>,
+        effort: Option<String>,
+    },
     List {
         request_id: Uuid,
         path_prefix: Option<String>,
@@ -1168,6 +1177,7 @@ impl SubagentAction {
     pub fn request_id(&self) -> Uuid {
         match self {
             Self::Ensure { request_id, .. }
+            | Self::Rotate { request_id, .. }
             | Self::List { request_id, .. }
             | Self::Message { request_id, .. }
             | Self::Prompt { request_id, .. }

@@ -425,7 +425,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/director", "send text to the persistent director thread"),
     ("/claude", "ask the active model to consult its Claude peer"),
     ("/gpt", "ask the active model to consult its GPT peer"),
-    ("/peer", "directly message or reset a persistent peer"),
+    ("/peer", "message, clear, or replace a persistent peer"),
     ("/settings", "view interactive session settings"),
     ("/model", "choose the model"),
     ("/effort", "choose reasoning effort"),
@@ -5444,19 +5444,26 @@ impl BorgTerminal {
                 permission_status_color,
             );
             let context_status_start = status_spans.iter().map(|span| span.width()).sum::<usize>();
-            let context_status_start =
-                context_status_start.saturating_add(STATUS_SEPARATOR.width());
-            let context_status_width = context_status.width();
-            push_interactive_status_segment(
-                &mut status_spans,
-                Some(context_status.clone()),
-                self.context_status_hovered,
-                if context_imminent {
-                    Color::Yellow
-                } else {
-                    Color::Gray
-                },
-            );
+            let context_status_start = if context_status.is_empty() {
+                context_status_start
+            } else {
+                context_status_start.saturating_add(STATUS_SEPARATOR.width())
+            };
+            let context_status_width = (!context_status.is_empty()).then(|| context_status.width());
+            if let Some(context_status) =
+                (!context_status.is_empty()).then_some(context_status.clone())
+            {
+                push_interactive_status_segment(
+                    &mut status_spans,
+                    Some(context_status),
+                    self.context_status_hovered,
+                    if context_imminent {
+                        Color::Yellow
+                    } else {
+                        Color::Gray
+                    },
+                );
+            }
             let status_line = Line::from(status_spans);
             let alignment_offset = if is_launch_screen {
                 status_area.width.saturating_sub(status_line.width() as u16) / 2
@@ -5501,7 +5508,7 @@ impl BorgTerminal {
             next_effort_status_area =
                 effort_status_width.map(|width| status_hit_area(effort_status_start, width));
             next_context_status_area =
-                Some(status_hit_area(context_status_start, context_status_width));
+                context_status_width.map(|width| status_hit_area(context_status_start, width));
             next_fast_status_area =
                 fast_status_width.map(|width| status_hit_area(fast_status_start, width));
             next_permission_status_area = permission_status_width
@@ -5699,7 +5706,10 @@ impl BorgTerminal {
                     tooltip,
                 );
             }
-            if self.context_status_hovered {
+            if self.context_status_hovered
+                && !context_tooltip.is_empty()
+                && next_context_status_area.is_some()
+            {
                 let tooltip_width = (context_tooltip.width() as u16)
                     .saturating_add(4)
                     .clamp(24, 72);

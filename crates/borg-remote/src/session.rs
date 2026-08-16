@@ -6053,6 +6053,19 @@ async fn apply_subagent_action(
                         .await?,
                 ),
             }),
+            SubagentAction::Rotate {
+                task_name,
+                provider,
+                model,
+                effort,
+                ..
+            } => Ok(SubagentControlOutcome::Accepted {
+                agent: Box::new(
+                    subagents
+                        .rotate_sidecar(&task_name, provider, model, effort)
+                        .await?,
+                ),
+            }),
             SubagentAction::List { path_prefix, .. } => Ok(SubagentControlOutcome::Listed {
                 agents: subagents.list(path_prefix.as_deref()).await,
             }),

@@ -1254,6 +1254,16 @@ impl Transcript {
                 self.todos = items.clone();
                 self.upsert_plan(items.clone(), local_event_time(event));
             }
+            SessionEventKind::ProviderEvent { kind, payload, .. }
+                if Self::provider_reasoning_lifecycle(kind, payload) == Some(true) =>
+            {
+                self.start_reasoning(event.created_at, local_event_time(event));
+            }
+            SessionEventKind::ProviderEvent { kind, payload, .. }
+                if Self::provider_reasoning_lifecycle(kind, payload) == Some(false) =>
+            {
+                self.finish_reasoning(event.created_at);
+            }
             SessionEventKind::ProviderEvent { kind, .. }
                 if kind == "context_compaction_failed" =>
             {
@@ -1539,12 +1549,38 @@ impl Transcript {
         if text.trim().is_empty() {
             return;
         }
+        self.start_reasoning(started_at, time);
+        if let Some(index) = self.active_reasoning
+            && let Some(TranscriptEntry::Tool {
+                code_view: Some((language, source)),
+                ..
+            }) = self.order.get_mut(index)
+            && language == "reasoning"
+        {
+            Self::merge_reasoning_snapshot(source, text);
+        }
+    }
+
+    fn start_reasoning(&mut self, started_at: DateTime<Utc>, time: String) {
+        if let Some(index) = self.active_reasoning {
+            if matches!(
+                self.order.get(index),
+                Some(TranscriptEntry::Tool {
+                    code_view: Some((language, _)),
+                    complete: false,
+                    ..
+                }) if language == "reasoning"
+            ) {
+                return;
+            }
+            self.active_reasoning = None;
+        }
         let index = self.order.len();
         self.order.push(TranscriptEntry::Tool {
             source_name: "reasoning".to_string(),
             name: "Thinking".to_string(),
             detail: String::new(),
-            code_view: Some(("reasoning".to_string(), text.to_string())),
+            code_view: Some(("reasoning".to_string(), String::new())),
             output_view: None,
             payload_refs: Vec::new(),
             time,
@@ -1591,6 +1627,40 @@ impl Transcript {
             *complete = true;
             *expanded = false;
             *stored_completed_at = Some(completed_at);
+        }
+    }
+
+    fn provider_reasoning_lifecycle(
+        kind: &str,
+        payload: &serde_json::Value,
+    ) -> Option<bool> {
+        let (method, suffix) = kind
+            .rsplit_once(':')
+            .map_or((kind, None), |(method, suffix)| (method, Some(suffix)));
+        let item_type = suffix
+            .or_else(|| payload.pointer("/item/type").and_then(serde_json::Value::as_str))
+            .or_else(|| {
+                payload
+                    .pointer("/params/item/type")
+                    .and_then(serde_json::Value::as_str)
+            });
+        let method = method
+            .to_ascii_lowercase()
+            .replace('.', "/")
+            .replace('_', "/")
+            .replace('-', "/");
+        let is_reasoning = item_type
+            .is_some_and(|item_type| item_type.to_ascii_lowercase().contains("reasoning"))
+            || method.contains("reasoning");
+        if !is_reasoning {
+            return None;
+        }
+        if method.ends_with("/started") || method.ends_with("/added") {
+            Some(true)
+        } else if method.ends_with("/completed") || method.ends_with("/done") {
+            Some(false)
+        } else {
+            None
         }
     }
 
@@ -1731,7 +1801,7 @@ impl Transcript {
 
     fn context_status(&self) -> (String, bool) {
         if !self.context_known {
-            return ("context unknown".to_string(), false);
+            return (String::new(), false);
         }
         let imminent = self.context_remaining_percent <= 20;
         let status = if imminent {
@@ -1761,7 +1831,7 @@ impl Transcript {
 
     fn context_tooltip(&self) -> String {
         if !self.context_known {
-            return "Context usage is not available yet".to_string();
+            return String::new();
         }
         match (self.context_tokens, self.context_window_tokens) {
             (Some(tokens), Some(window)) => format!(

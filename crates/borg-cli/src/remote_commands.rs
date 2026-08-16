@@ -6017,6 +6017,10 @@ impl PersistentSidecar {
 enum PersistentSidecarIntent {
     Ensure,
     Clear,
+    Rotate {
+        model: Option<String>,
+        effort: Option<String>,
+    },
     Prompt(String),
 }
 
@@ -6046,14 +6050,43 @@ fn persistent_sidecar_command(
         "claude" => PersistentSidecar::Claude,
         "gpt" => PersistentSidecar::Gpt,
         _ => {
-            return Some(Err(anyhow::anyhow!("usage: /peer claude|gpt [TEXT|clear]")));
+            return Some(Err(anyhow::anyhow!(
+                "usage: /peer claude|gpt [TEXT|clear|new [MODEL@EFFORT]]"
+            )));
         }
     };
     let request = parts.next().unwrap_or_default().trim();
-    let intent = if request.is_empty() {
+    let mut words = request.split_whitespace();
+    let first = words.next().unwrap_or_default();
+    let intent = if first.is_empty() {
         PersistentSidecarIntent::Ensure
-    } else if matches!(request.to_ascii_lowercase().as_str(), "clear" | "new") {
+    } else if first.eq_ignore_ascii_case("clear") && words.next().is_none() {
         PersistentSidecarIntent::Clear
+    } else if first.eq_ignore_ascii_case("new") || first.eq_ignore_ascii_case("rotate") {
+        let profile = words.next();
+        if words.next().is_some() {
+            return Some(Err(anyhow::anyhow!(
+                "usage: /peer claude|gpt new [MODEL@EFFORT]"
+            )));
+        }
+        let (model, effort) = match profile {
+            Some(profile) => match profile.rsplit_once('@') {
+                Some((model, effort)) => {
+                    if effort.is_empty() || model.contains('@') {
+                        return Some(Err(anyhow::anyhow!(
+                            "peer profile must be MODEL@EFFORT or @EFFORT"
+                        )));
+                    }
+                    (
+                        (!model.is_empty()).then(|| model.to_string()),
+                        Some(effort.to_string()),
+                    )
+                }
+                None => (Some(profile.to_string()), None),
+            },
+            None => (None, None),
+        };
+        PersistentSidecarIntent::Rotate { model, effort }
     } else {
         PersistentSidecarIntent::Prompt(request.to_string())
     };
@@ -6090,6 +6123,20 @@ fn persistent_sidecar_commands(
                 },
             },
         ],
+        PersistentSidecarIntent::Rotate { model, effort } => vec![HostCommand::Subagent {
+            session_id,
+            action: SubagentAction::Rotate {
+                request_id: Uuid::new_v4(),
+                task_name: sidecar.task_name_argument().to_string(),
+                provider: sidecar.provider(),
+                model: Some(model.clone().unwrap_or_else(|| sidecar.model().to_string())),
+                effort: Some(
+                    effort
+                        .clone()
+                        .unwrap_or_else(|| sidecar.effort().to_string()),
+                ),
+            },
+        }],
         PersistentSidecarIntent::Prompt(prompt) => vec![
             ensure,
             HostCommand::Subagent {
@@ -6111,6 +6158,15 @@ fn sidecar_notice(sidecar: PersistentSidecar, intent: &PersistentSidecarIntent) 
     match intent {
         PersistentSidecarIntent::Ensure => format!("{} peer ready", sidecar.label()),
         PersistentSidecarIntent::Clear => format!("Clearing {} peer context", sidecar.label()),
+        PersistentSidecarIntent::Rotate { model, effort } => {
+            let profile = match (model.as_deref(), effort.as_deref()) {
+                (Some(model), Some(effort)) => format!("{model}@{effort}"),
+                (Some(model), None) => model.to_string(),
+                (None, Some(effort)) => format!("@{effort}"),
+                (None, None) => "provider default".to_string(),
+            };
+            format!("Replacing {} peer with {profile}", sidecar.label())
+        }
         PersistentSidecarIntent::Prompt(_) => format!("Sending to {} peer", sidecar.label()),
     }
 }
@@ -6294,7 +6350,7 @@ fn print_agent_help() {
   /director TEXT    send a message to the persistent director thread
   /claude TEXT      ask the active model to consult its persistent Claude peer
   /gpt TEXT         ask the active model to consult its persistent GPT peer
-  /peer PROVIDER    direct persistent-peer control; add TEXT, clear, or new
+  /peer PROVIDER    direct peer control; add TEXT, clear, or new MODEL@EFFORT
   /model            choose the model
   /effort           choose reasoning effort
   /followups        choose steer current turn or queue next turn

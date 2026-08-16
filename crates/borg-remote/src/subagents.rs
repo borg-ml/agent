@@ -42,7 +42,32 @@ const RUNTIME_MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const RUNTIME_DEFAULT_COMMAND_TIMEOUT_MS: u64 = 120_000;
 const RUNTIME_MAX_COMMAND_TIMEOUT_MS: u64 = 30 * 60 * 1000;
 const MAX_RUNTIME_HOST_CALLS: usize = 128;
-const PERSISTENT_PEER_CONSULTATION_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const DEFAULT_PERSISTENT_PEER_CONSULTATION_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const MIN_PERSISTENT_PEER_CONSULTATION_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_PERSISTENT_PEER_CONSULTATION_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
+const SIDECAR_STOP_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn persistent_peer_consultation_timeout() -> Duration {
+    let seconds = std::env::var("BORG_PEER_CONSULTATION_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|seconds| {
+            seconds.clamp(
+                MIN_PERSISTENT_PEER_CONSULTATION_TIMEOUT.as_secs(),
+                MAX_PERSISTENT_PEER_CONSULTATION_TIMEOUT.as_secs(),
+            )
+        });
+    Duration::from_secs(seconds.unwrap_or(DEFAULT_PERSISTENT_PEER_CONSULTATION_TIMEOUT.as_secs()))
+}
+
+fn format_timeout(timeout: Duration) -> String {
+    let seconds = timeout.as_secs();
+    if seconds % 60 == 0 {
+        format!("{} minutes", seconds / 60)
+    } else {
+        format!("{seconds} seconds")
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
@@ -1293,6 +1318,26 @@ impl AgentToolDispatcher {
                     .consult_peer(self.provider, args.profile.as_deref(), &args.prompt)
                     .await
             }
+            "rotate_peer" => {
+                anyhow::ensure!(
+                    self.consultation_enabled,
+                    "persistent peer rotation is disabled for peer sessions"
+                );
+                anyhow::ensure!(
+                    self.subagents_enabled,
+                    "persistent peer rotation requires subagents"
+                );
+                let args: RotatePeerArgs = serde_json::from_value(arguments)?;
+                self.subagents
+                    .as_ref()
+                    .context("persistent peer rotation is disabled for this session")?
+                    .rotate_peer(
+                        self.provider,
+                        args.profile.as_deref(),
+                        args.handoff.as_deref(),
+                    )
+                    .await
+            }
             "get_plan" => {
                 let _: NoArgs = serde_json::from_value(arguments)?;
                 todo_response(self.todos.call(SessionTodoToolRequest::Get).await)
@@ -2338,6 +2383,12 @@ enum PeerConsultationOutcome {
     Failed(String),
 }
 
+#[derive(Debug, Clone)]
+pub struct PeerRotation {
+    pub archived: Option<SubagentSnapshot>,
+    pub replacement: SubagentSnapshot,
+}
+
 /// Borg-native child sessions for one root CLI session.
 ///
 /// Each child reuses the canonical session actor with its own provider context
@@ -3077,6 +3128,282 @@ impl SubagentCoordinator {
         Ok(snapshot)
     }
 
+    /// Replace a deterministic sidecar lane with a fresh child. The previous
+    /// child keeps its UUID, journal, usage, and transcript, but is moved to a
+    /// unique archived task name so hydration cannot confuse it with the new
+    /// `/root/{task_name}` mapping.
+    pub async fn rotate_sidecar(
+        &self,
+        task_name: &str,
+        provider: CodingProvider,
+        model: Option<String>,
+        effort: Option<String>,
+    ) -> Result<SubagentSnapshot> {
+        let _consultation_guard = self.consultation_lock.lock().await;
+        Ok(self
+            .rotate_sidecar_locked(task_name, provider, model, effort)
+            .await?
+            .replacement)
+    }
+
+    async fn rotate_sidecar_locked(
+        &self,
+        task_name: &str,
+        provider: CodingProvider,
+        model: Option<String>,
+        effort: Option<String>,
+    ) -> Result<PeerRotation> {
+        ensure_provider_can_spawn(&self.root_launch, provider)?;
+        let task_name = canonical_sidecar_task_name(task_name)?;
+        let launch = self.sidecar_launch(&task_name, provider, model, effort)?;
+        let existing = {
+            let table = self.table.lock().await;
+            table
+                .task_names
+                .get(&task_name)
+                .and_then(|session_id| table.entries.get(session_id))
+                .map(|entry| entry.snapshot.clone())
+        };
+        if let Some(snapshot) = existing.as_ref() {
+            anyhow::ensure!(
+                snapshot.provider == provider,
+                "sidecar {} is pinned to {}, not {}",
+                snapshot.task_name,
+                snapshot.provider.label(),
+                provider.label()
+            );
+            self.stop_and_wait(snapshot.session_id).await?;
+        }
+
+        let archived = if let Some(snapshot) = existing.as_ref() {
+            let archived_name = format!("/root/peer_archive_{}", snapshot.session_id.simple());
+            let archived = {
+                let mut table = self.table.lock().await;
+                let entry = table
+                    .entries
+                    .get_mut(&snapshot.session_id)
+                    .expect("sidecar still exists while rotating");
+                let mut archived = entry.snapshot.clone();
+                archived.task_name = archived_name.clone();
+                if archived.status != SubagentStatus::Failed {
+                    archived.status = SubagentStatus::Stopped;
+                }
+                archived.detail = Some(format!(
+                    "Archived persistent peer; replaced at {}",
+                    task_name
+                ));
+                archived.updated_at = Utc::now();
+                entry.snapshot = archived.clone();
+                entry.commands = None;
+                entry.dormant = false;
+                table.task_names.remove(&task_name);
+                table
+                    .task_names
+                    .insert(archived_name.clone(), snapshot.session_id);
+                archived
+            };
+            Some(archived)
+        } else {
+            None
+        };
+
+        let replacement = {
+            let mut table = self.table.lock().await;
+            let reserved = table.reserve(
+                task_name
+                    .strip_prefix("/root/")
+                    .expect("canonical sidecar task name"),
+                &launch,
+            );
+            match reserved {
+                Ok(replacement) => replacement,
+                Err(error) => {
+                    table.task_names.remove(&task_name);
+                    if let Some(previous) = existing.as_ref() {
+                        let previous_id = previous.session_id;
+                        let archived_name = format!("/root/peer_archive_{}", previous_id.simple());
+                        let mut restored = previous.clone();
+                        restored.task_name = task_name.clone();
+                        restored.status = SubagentStatus::Stopped;
+                        restored.detail = Some(format!("Peer rotation failed: {error:#}"));
+                        restored.updated_at = Utc::now();
+                        let entry = table
+                            .entries
+                            .get_mut(&previous_id)
+                            .expect("archived sidecar still exists after reservation failure");
+                        entry.snapshot = restored;
+                        entry.commands = None;
+                        entry.dormant = false;
+                        table.task_names.remove(&archived_name);
+                        table.task_names.insert(task_name.clone(), previous_id);
+                    }
+                    return Err(error);
+                }
+            }
+        };
+        if let Err(error) = self
+            .start_reserved(replacement.clone(), launch, false)
+            .await
+        {
+            let mut table = self.table.lock().await;
+            table.task_names.remove(&task_name);
+            table.entries.remove(&replacement.session_id);
+            if let Some(previous) = existing {
+                let previous_id = previous.session_id;
+                let archived_name = format!("/root/peer_archive_{}", previous_id.simple());
+                let mut restored = previous;
+                restored.task_name = task_name.clone();
+                restored.status = SubagentStatus::Stopped;
+                restored.detail = Some(format!("Peer rotation failed: {error:#}"));
+                restored.updated_at = Utc::now();
+                let entry = table
+                    .entries
+                    .get_mut(&previous_id)
+                    .expect("archived sidecar still exists after replacement failure");
+                entry.snapshot = restored;
+                entry.commands = None;
+                entry.dormant = false;
+                table.task_names.remove(&archived_name);
+                table.task_names.insert(task_name, previous_id);
+            }
+            return Err(error);
+        }
+
+        if let Some(archived) = archived.clone() {
+            let _ = self
+                .activity_tx
+                .send(SubagentActivity::Stopped { agent: archived });
+        }
+        let _ = self.activity_tx.send(SubagentActivity::Started {
+            agent: replacement.clone(),
+        });
+        Ok(PeerRotation {
+            archived,
+            replacement,
+        })
+    }
+
+    fn sidecar_launch(
+        &self,
+        task_name: &str,
+        provider: CodingProvider,
+        model: Option<String>,
+        effort: Option<String>,
+    ) -> Result<LaunchSession> {
+        let mut launch = self.root_launch.clone();
+        launch.request_id = Uuid::new_v4();
+        launch.initial_prompt = None;
+        launch.provider = provider;
+        launch.model = model.or_else(|| default_model_for_cross_provider_peer(provider));
+        launch.effort = effort.or_else(|| default_effort_for_cross_provider_peer(provider));
+        validate_subagent_overrides(
+            launch.provider,
+            launch.model.as_deref(),
+            launch.effort.as_deref(),
+        )?;
+        anyhow::ensure!(
+            !launch.provider.uses_native_harness() || launch.model.is_some(),
+            "{} sidecar requires an explicit model",
+            provider.label()
+        );
+        launch.name = Some(task_name.to_string());
+        Ok(launch)
+    }
+
+    async fn stop_and_wait(&self, session_id: Uuid) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + SIDECAR_STOP_TIMEOUT;
+        let mut stop_sent = false;
+        loop {
+            let state = {
+                let table = self.table.lock().await;
+                let entry = table
+                    .entries
+                    .get(&session_id)
+                    .with_context(|| format!("unknown sidecar session {session_id}"))?;
+                (
+                    entry.commands.clone(),
+                    entry.snapshot.status.is_terminal(),
+                    entry.dormant,
+                    entry.snapshot.task_name.clone(),
+                )
+            };
+            if state.0.is_none() && (state.1 || state.2) {
+                return Ok(());
+            }
+            if let Some(commands) = state.0
+                && !stop_sent
+            {
+                commands
+                    .send(HostCommand::Stop { session_id })
+                    .await
+                    .map_err(|_| anyhow::anyhow!("{} peer command channel closed", state.3))?;
+                stop_sent = true;
+            }
+            anyhow::ensure!(
+                tokio::time::Instant::now() < deadline,
+                "{} peer did not stop within {} seconds",
+                state.3,
+                SIDECAR_STOP_TIMEOUT.as_secs()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Rotate a persistent peer from an agent-facing control. An optional
+    /// handoff is queued as the first prompt in the replacement thread after
+    /// the archive/new-child boundary is durable.
+    pub async fn rotate_peer(
+        &self,
+        parent_provider: CodingProvider,
+        profile: Option<&str>,
+        handoff: Option<&str>,
+    ) -> Result<Value> {
+        let handoff = handoff
+            .map(required_message)
+            .transpose()?
+            .map(|handoff| {
+                anyhow::ensure!(
+                    handoff.chars().count() <= 200_000,
+                    "persistent peer handoff is too long"
+                );
+                Ok::<_, anyhow::Error>(handoff)
+            })
+            .transpose()?;
+        let _consultation_guard = self.consultation_lock.lock().await;
+        let (provider, model, effort) = resolve_persistent_peer_profile(parent_provider, profile)?;
+        let (task_name, label) = persistent_peer_lane(provider);
+        let rotation = self
+            .rotate_sidecar_locked(&task_name, provider, model, effort)
+            .await?;
+        let handoff_queued = if let Some(handoff) = handoff {
+            let text = format!(
+                "You are taking over the persistent private {label} peer thread. The previous peer was archived and this is a fresh context. Do not invoke another model or ask the human for clarification. Use this handoff as your starting context:\n\n{handoff}"
+            );
+            self.prompt_child(
+                &rotation.replacement.task_name,
+                Uuid::new_v4(),
+                text,
+                Vec::new(),
+                PromptDelivery::Queue,
+            )
+            .await?;
+            true
+        } else {
+            false
+        };
+        Ok(json!({
+            "persistent": true,
+            "rotated": true,
+            "provider": provider.catalog_backend(),
+            "model": rotation.replacement.model,
+            "effort": rotation.replacement.effort,
+            "thread": rotation.replacement.task_name,
+            "archived": rotation.archived,
+            "replacement": rotation.replacement,
+            "handoff_queued": handoff_queued,
+        }))
+    }
+
     /// Ask the persistent provider sidecar for a private second opinion.
     ///
     /// This deliberately reuses the same `/root/claude` or `/root/gpt` child
@@ -3097,15 +3424,44 @@ impl SubagentCoordinator {
         );
         let _consultation_guard = self.consultation_lock.lock().await;
         let (provider, model, effort) = resolve_persistent_peer_profile(parent_provider, profile)?;
-        let (task_name, label) = match provider {
-            CodingProvider::Claude => ("claude", "Claude"),
-            CodingProvider::Codex => ("gpt", "GPT"),
-            _ => unreachable!("persistent peer profile is restricted to GPT and Claude"),
-        };
+        let explicit_profile = profile
+            .map(str::trim)
+            .is_some_and(|profile| !profile.is_empty());
+        let (task_name, label) = persistent_peer_lane(provider);
         let activity = self.subscribe();
-        let sidecar = self
-            .ensure_sidecar(task_name, provider, model.clone(), effort.clone())
-            .await?;
+        let current = {
+            let table = self.table.lock().await;
+            let canonical = canonical_sidecar_task_name(&task_name)?;
+            table
+                .task_names
+                .get(&canonical)
+                .and_then(|session_id| table.entries.get(session_id))
+                .map(|entry| entry.snapshot.clone())
+        };
+        let sidecar = match current {
+            Some(current)
+                if current.provider != provider
+                    || (explicit_profile
+                        && (current.model != model || current.effort != effort)) =>
+            {
+                self.rotate_sidecar_locked(&task_name, provider, model.clone(), effort.clone())
+                    .await?
+                    .replacement
+            }
+            Some(current) if !explicit_profile => {
+                self.ensure_sidecar(
+                    task_name,
+                    provider,
+                    current.model.clone(),
+                    current.effort.clone(),
+                )
+                .await?
+            }
+            _ => {
+                self.ensure_sidecar(task_name, provider, model.clone(), effort.clone())
+                    .await?
+            }
+        };
         let message_id = Uuid::new_v4();
         let peer_prompt = format!(
             "You are the persistent private {label} peer for the primary Borg agent. This is an \
@@ -3173,7 +3529,8 @@ impl SubagentCoordinator {
                 "completed": true,
                 "consultation_id": message_id,
                 "provider": provider.catalog_backend(),
-                "model": model,
+                "model": sidecar.model,
+                "effort": sidecar.effort,
                 "thread": sidecar.task_name,
                 "response": response,
             })),
@@ -3188,12 +3545,14 @@ impl SubagentCoordinator {
         message_id: Uuid,
         label: &str,
     ) -> PeerConsultationOutcome {
-        let deadline = Instant::now() + PERSISTENT_PEER_CONSULTATION_TIMEOUT;
+        let timeout = persistent_peer_consultation_timeout();
+        let timeout_label = format_timeout(timeout);
+        let deadline = Instant::now() + timeout;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return PeerConsultationOutcome::Failed(format!(
-                    "persistent {label} peer consultation {message_id} timed out after 15 minutes"
+                    "persistent {label} peer consultation {message_id} timed out after {timeout_label}"
                 ));
             }
             match tokio::time::timeout(remaining, activity.recv()).await {
@@ -3253,7 +3612,7 @@ impl SubagentCoordinator {
                 }
                 Err(_) => {
                     return PeerConsultationOutcome::Failed(format!(
-                        "persistent {label} peer consultation {message_id} timed out after 15 minutes"
+                        "persistent {label} peer consultation {message_id} timed out after {timeout_label}"
                     ));
                 }
             }
@@ -3447,6 +3806,22 @@ impl SubagentCoordinator {
                 .context("subagent actor task failed")
                 .and_then(|x| x);
             if let Some(activity) = finish_agent(&table, actor_session_id, outcome.err()).await {
+                let table = table.lock().await;
+                let activity = match (
+                    activity,
+                    table
+                        .entries
+                        .get(&actor_session_id)
+                        .map(|entry| entry.snapshot.clone()),
+                ) {
+                    (SubagentActivity::Stopped { .. }, Some(agent)) => {
+                        SubagentActivity::Stopped { agent }
+                    }
+                    (SubagentActivity::Failed { .. }, Some(agent)) => {
+                        SubagentActivity::Failed { agent }
+                    }
+                    (activity, _) => activity,
+                };
                 let _ = activity_tx.send(activity);
             }
         });
@@ -4385,6 +4760,14 @@ fn default_effort_for_cross_provider_peer(provider: CodingProvider) -> Option<St
     }
 }
 
+fn persistent_peer_lane(provider: CodingProvider) -> (&'static str, &'static str) {
+    match provider {
+        CodingProvider::Claude => ("claude", "Claude"),
+        CodingProvider::Codex => ("gpt", "GPT"),
+        _ => unreachable!("persistent peer profile is restricted to GPT and Claude"),
+    }
+}
+
 fn resolve_persistent_peer_profile(
     parent_provider: CodingProvider,
     profile: Option<&str>,
@@ -5098,12 +5481,35 @@ fn agent_tool_specs_with_capabilities_and_consultation_and_search(
                 }),
             ),
         );
+        specs.insert(
+            2,
+            tool(
+                "rotate_peer",
+                "Archive the current persistent GPT/Claude peer thread and replace it with a fresh thread. Use this when a different model or reasoning effort is needed; the archived child remains recoverable by its UUID. Optionally provide a concise handoff for the replacement.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "profile": {
+                            "type": "string",
+                            "maxLength": 128,
+                            "description": "Optional target peer profile such as claude-opus-5@max or gpt-5.6-luna@max. Omit to use the opposite provider default."
+                        },
+                        "handoff": {
+                            "type": "string",
+                            "maxLength": 200000,
+                            "description": "Optional context to queue as the replacement peer's first prompt."
+                        }
+                    },
+                    "additionalProperties": false
+                }),
+            ),
+        );
     }
     if !consultation_enabled {
         specs.retain(|spec| {
             !matches!(
                 spec.get("name").and_then(Value::as_str),
-                Some("consult_model" | "consult_peer")
+                Some("consult_model" | "consult_peer" | "rotate_peer")
             )
         });
     }
@@ -5464,6 +5870,15 @@ struct ConsultPeerArgs {
     prompt: String,
     #[serde(default)]
     profile: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RotatePeerArgs {
+    #[serde(default)]
+    profile: Option<String>,
+    #[serde(default)]
+    handoff: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -5922,6 +6337,12 @@ fn canonical_task_name(task_name: &str) -> Result<String> {
         bail!("task_name must contain 1-64 lowercase letters, digits, or underscores");
     }
     Ok(format!("/root/{task_name}"))
+}
+
+fn canonical_sidecar_task_name(task_name: &str) -> Result<String> {
+    let task_name = task_name.trim();
+    let task_name = task_name.strip_prefix("/root/").unwrap_or(task_name);
+    canonical_task_name(task_name)
 }
 
 fn required_message(message: &str) -> Result<String> {

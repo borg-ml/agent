@@ -2038,10 +2038,9 @@ fn model_changes_do_not_retain_the_old_context_percentage() {
         3,
         configured("gpt-5.6-luna"),
     ));
-    assert_eq!(
-        transcript.context_status(),
-        ("context unknown".to_string(), false)
-    );
+    assert_eq!(transcript.context_status(), (String::new(), false));
+    assert!(transcript.context_limit_label().is_empty());
+    assert!(transcript.context_tooltip().is_empty());
 
     transcript.apply(&SessionEvent::new(
         session_id,
@@ -7261,6 +7260,51 @@ fn reasoning_is_one_live_muted_disclosure_that_collapses_at_a_tool_boundary() {
     assert!(matches!(
         &transcript.order[0],
         TranscriptEntry::Tool { expanded: true, .. }
+    ));
+}
+
+#[test]
+fn reasoning_lifecycle_events_show_thinking_without_a_text_delta() {
+    let session_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::ProviderEvent {
+            provider: CodingProvider::Codex,
+            kind: "item/started:reasoning".to_string(),
+            payload: serde_json::json!({"item": {"type": "reasoning"}}),
+        },
+    ));
+
+    assert!(matches!(
+        &transcript.order[0],
+        TranscriptEntry::Tool {
+            name,
+            code_view: Some((language, source)),
+            complete: false,
+            expanded: true,
+            ..
+        } if name == "Thinking" && language == "reasoning" && source.is_empty()
+    ));
+
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::ProviderEvent {
+            provider: CodingProvider::Codex,
+            kind: "item/completed:reasoning".to_string(),
+            payload: serde_json::json!({"item": {"type": "reasoning", "summary": []}}),
+        },
+    ));
+    assert!(matches!(
+        &transcript.order[0],
+        TranscriptEntry::Tool {
+            name,
+            complete: true,
+            expanded: false,
+            ..
+        } if name == "Thinking"
     ));
 }
 

@@ -319,8 +319,15 @@ provider form. The peer's answer returns to the primary model for
 reconciliation, so the human never has to relay messages between models.
 Omitting the provider from `/ask` lets the model use the opposite provider
 automatically. The peer cannot invoke another peer. Direct peer maintenance
-uses the deliberately explicit `/peer claude|gpt [TEXT|clear]` command, and
-shares the same durable `/root/claude` and `/root/gpt` lanes as consultation.
+uses `/peer claude|gpt [TEXT|clear|new MODEL@EFFORT]`; `new` archives the old
+lane and starts a fresh durable child, for example
+`/peer gpt new gpt-5.6-luna@max`. The same rotation is available to the agent
+as `rotate_peer`, with an optional handoff. Once Borg accepts a consultation,
+its peer waiter allows up to 30 minutes by default;
+`BORG_PEER_CONSULTATION_TIMEOUT_SECS` can tune that between one minute and two
+hours. A provider MCP transport can still cancel the foreground tool call
+sooner; the peer continues in that case and delivers a completed result
+privately at the next root boundary.
 
 ## Local multiplayer workspaces
 

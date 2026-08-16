@@ -80,6 +80,26 @@ fn persistent_sidecar_aliases_keep_their_durable_lane_identity() {
         Some(Ok((PersistentSidecar::Gpt, PersistentSidecarIntent::Clear)))
     ));
     assert!(matches!(
+        persistent_sidecar_command("/peer gpt new gpt-5.6-luna@max"),
+        Some(Ok((
+            PersistentSidecar::Gpt,
+            PersistentSidecarIntent::Rotate {
+                model: Some(ref model),
+                effort: Some(ref effort),
+            }
+        ))) if model == "gpt-5.6-luna" && effort == "max"
+    ));
+    assert!(matches!(
+        persistent_sidecar_command("/peer claude rotate @max"),
+        Some(Ok((
+            PersistentSidecar::Claude,
+            PersistentSidecarIntent::Rotate {
+                model: None,
+                effort: Some(ref effort),
+            }
+        ))) if effort == "max"
+    ));
+    assert!(matches!(
         persistent_sidecar_command("/peer claude"),
         Some(Ok((
             PersistentSidecar::Claude,
@@ -246,6 +266,34 @@ fn persistent_sidecar_prompt_is_ensured_then_sent_to_the_same_child() {
             },
             ..
         } if target == "/root/claude" && text == "review the design"
+    ));
+}
+
+#[test]
+fn persistent_sidecar_rotation_uses_the_requested_model_and_effort() {
+    let commands = persistent_sidecar_commands(
+        Uuid::new_v4(),
+        PersistentSidecar::Gpt,
+        &PersistentSidecarIntent::Rotate {
+            model: Some("gpt-5.6-luna".to_string()),
+            effort: Some("max".to_string()),
+        },
+        Uuid::nil(),
+        &[],
+        PromptDelivery::Queue,
+    );
+    assert!(matches!(
+        &commands[..],
+        [HostCommand::Subagent {
+            action: SubagentAction::Rotate {
+                task_name,
+                provider: CodingProvider::Codex,
+                model: Some(model),
+                effort: Some(effort),
+                ..
+            },
+            ..
+        }] if task_name == "gpt" && model == "gpt-5.6-luna" && effort == "max"
     ));
 }
 
