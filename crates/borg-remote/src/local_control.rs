@@ -216,7 +216,7 @@ pub fn obsolete_local_session_owner_pid(
         return Ok(None);
     }
     #[cfg(target_os = "linux")]
-    if !process_holds_lock(metadata.pid, lock_path)? {
+    if !process_tree_holds_lock(metadata.pid, lock_path)? {
         return Ok(None);
     }
     Ok(Some(metadata.pid))
@@ -264,9 +264,56 @@ fn process_holds_lock(pid: u32, lock_path: &Path) -> Result<bool> {
     Ok(false)
 }
 
+#[cfg(target_os = "linux")]
+fn process_tree_pids(root_pid: u32) -> Vec<u32> {
+    let mut pending = vec![root_pid];
+    let mut pids = Vec::new();
+    while let Some(pid) = pending.pop() {
+        if pids.contains(&pid) {
+            continue;
+        }
+        pids.push(pid);
+        let children_path = PathBuf::from("/proc")
+            .join(pid.to_string())
+            .join("task")
+            .join(pid.to_string())
+            .join("children");
+        let Ok(children) = fs::read_to_string(children_path) else {
+            continue;
+        };
+        pending.extend(
+            children
+                .split_whitespace()
+                .filter_map(|child| child.parse::<u32>().ok()),
+        );
+    }
+    pids
+}
+
+#[cfg(target_os = "linux")]
+fn process_tree_holds_lock(pid: u32, lock_path: &Path) -> Result<bool> {
+    for candidate in process_tree_pids(pid) {
+        if process_holds_lock(candidate, lock_path)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Force-stop a verified obsolete local session owner.
 #[cfg(unix)]
 pub fn force_terminate_local_session_owner(pid: u32) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    for child_pid in process_tree_pids(pid).into_iter().rev() {
+        if child_pid != pid {
+            terminate_local_session_process(child_pid)?;
+        }
+    }
+    terminate_local_session_process(pid)
+}
+
+#[cfg(unix)]
+fn terminate_local_session_process(pid: u32) -> Result<()> {
     let pid = i32::try_from(pid).context("obsolete local session owner PID is invalid")?;
     anyhow::ensure!(pid > 1, "refusing to terminate a system process");
     anyhow::ensure!(
