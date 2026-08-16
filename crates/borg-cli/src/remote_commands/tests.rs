@@ -4,6 +4,41 @@ use tempfile::tempdir;
 #[cfg(unix)]
 use tokio::io::AsyncReadExt;
 
+#[tokio::test]
+async fn goal_dispatch_does_not_wait_for_a_full_command_queue() {
+    let session_id = Uuid::new_v4();
+    let (sender, mut receiver) = mpsc::channel(1);
+    sender
+        .send(HostCommand::Goal {
+            session_id,
+            action: GoalAction::Pause,
+        })
+        .await
+        .expect("seed command queue");
+
+    assert!(dispatch_host_command_without_blocking(
+        &sender,
+        HostCommand::Goal {
+            session_id,
+            action: GoalAction::Resume,
+        },
+    ));
+    assert!(matches!(
+        receiver.recv().await,
+        Some(HostCommand::Goal {
+            session_id: received_session,
+            action: GoalAction::Pause,
+        }) if received_session == session_id
+    ));
+    assert!(matches!(
+        receiver.recv().await,
+        Some(HostCommand::Goal {
+            session_id: received_session,
+            action: GoalAction::Resume,
+        }) if received_session == session_id
+    ));
+}
+
 #[test]
 fn resume_retries_sqlite_contention_but_not_permanent_errors() {
     assert!(local_resume_error_is_retryable(&anyhow::anyhow!(

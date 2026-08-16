@@ -2501,6 +2501,30 @@ fn actionable_inactive_goals_remain_in_the_status_line() {
 }
 
 #[test]
+fn goal_toggle_updates_the_visible_status_before_the_durable_event() {
+    use borg_remote::GoalAction;
+
+    let mut transcript = Transcript::default();
+    transcript.goal = Some(SessionGoal::new(
+        "Keep the terminal responsive".to_string(),
+        None,
+    ));
+
+    assert!(transcript.optimistically_apply_goal_action(&GoalAction::Pause));
+    assert_eq!(
+        transcript.goal.as_ref().map(|goal| goal.status),
+        Some(GoalStatus::Paused)
+    );
+    assert_eq!(transcript.goal_status().as_deref(), Some("paused /goal"));
+
+    assert!(transcript.optimistically_apply_goal_action(&GoalAction::Resume));
+    assert_eq!(
+        transcript.goal.as_ref().map(|goal| goal.status),
+        Some(GoalStatus::Active)
+    );
+}
+
+#[test]
 fn todo_status_counts_open_items_and_tooltip_matches_plan_order_and_clipping() {
     let transcript = Transcript {
         todos: vec![
@@ -2638,6 +2662,7 @@ fn every_goal_toggle_command_round_trips_through_the_parser() {
     ] {
         goal.status = status;
         let command = goal_toggle_command(&goal).expect("status is toggleable");
+        assert_eq!(goal_toggle_action(&goal), Some(expected.clone()));
         assert_eq!(
             crate::remote_commands::parse_goal_action(command).expect("parser accepts the click"),
             expected

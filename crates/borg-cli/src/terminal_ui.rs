@@ -23,12 +23,12 @@ use crate::editor_preferences::{DictationIconStyle, TranscriptPreferences, parse
 use anyhow::{Context, Result};
 use attachments::{AttachmentStore, PasteOutcome};
 use borg_remote::{
-    ApprovalDecision, CodingProvider, EventActor, GoalStatus, MessageStatus, PermissionMode,
-    PlanItem, PlanItemStatus, PromptDelivery, ResponseLanguage, SessionEvent, SessionEventKind,
-    SessionGoal, SessionPayloadKind, SessionPayloadRef, SessionState, SessionStatus,
-    SubagentActivityKind, SubagentSnapshot, SubagentStatus, ToolPresentationCategory, compact_text,
-    is_diff_language, is_edit_tool, is_mcp_resource_probe, is_subagent_tool,
-    project_tool_presentation, tool_has_rich_ui, tool_output_code_view,
+    ApprovalDecision, CodingProvider, EventActor, GoalAction, GoalStatus, MessageStatus,
+    PermissionMode, PlanItem, PlanItemStatus, PromptDelivery, ResponseLanguage, SessionEvent,
+    SessionEventKind, SessionGoal, SessionPayloadKind, SessionPayloadRef, SessionState,
+    SessionStatus, SubagentActivityKind, SubagentSnapshot, SubagentStatus,
+    ToolPresentationCategory, compact_text, is_diff_language, is_edit_tool, is_mcp_resource_probe,
+    is_subagent_tool, project_tool_presentation, tool_has_rich_ui, tool_output_code_view,
     tool_output_is_backgrounded, web_search_query,
 };
 #[cfg(test)]
@@ -521,6 +521,9 @@ fn dictation_icon(style: DictationIconStyle) -> &'static str {
 #[derive(Debug)]
 pub enum UiAction {
     None,
+    ToggleGoal {
+        action: GoalAction,
+    },
     Submit {
         target: Option<Uuid>,
         text: String,
@@ -2684,6 +2687,15 @@ impl BorgTerminal {
         self.transcript_render_cache = None;
     }
 
+    pub fn optimistically_apply_goal_action(&mut self, action: &GoalAction) -> bool {
+        let changed = self.transcript.optimistically_apply_goal_action(action);
+        if changed {
+            self.transcript_render_cache = None;
+            self.event_redraw_needed = true;
+        }
+        changed
+    }
+
     pub fn show_plan(&mut self, items: &[PlanItem]) {
         self.notice = None;
         if let Some(removed) = self.transcript.show_plan(items) {
@@ -3406,13 +3418,8 @@ impl BorgTerminal {
                             .goal_status_area
                             .is_some_and(|area| area.contains(pointer))
                         {
-                            if let Some(command) = self.active_goal().and_then(goal_toggle_command)
-                            {
-                                return Ok(UiAction::Submit {
-                                    target: None,
-                                    text: command.to_string(),
-                                    attachments: Vec::new(),
-                                });
+                            if let Some(action) = self.active_goal().and_then(goal_toggle_action) {
+                                return Ok(UiAction::ToggleGoal { action });
                             }
                             self.open_goal_picker();
                             return Ok(UiAction::None);
@@ -10596,9 +10603,19 @@ fn goal_tooltip_title(goal: &SessionGoal) -> String {
 /// nothing to flip: a completed goal is finished, and a budget-limited one
 /// needs a new budget rather than a resume.
 fn goal_toggle_command(goal: &SessionGoal) -> Option<&'static str> {
+    match goal_toggle_action(goal)? {
+        GoalAction::Pause => Some("/goal pause"),
+        GoalAction::Resume => Some("/goal resume"),
+        GoalAction::Set { .. } | GoalAction::Clear => None,
+    }
+}
+
+fn goal_toggle_action(goal: &SessionGoal) -> Option<GoalAction> {
     match goal.status {
-        GoalStatus::Active => Some("/goal pause"),
-        GoalStatus::Paused | GoalStatus::Blocked | GoalStatus::UsageLimited => Some("/goal resume"),
+        GoalStatus::Active => Some(GoalAction::Pause),
+        GoalStatus::Paused | GoalStatus::Blocked | GoalStatus::UsageLimited => {
+            Some(GoalAction::Resume)
+        }
         GoalStatus::BudgetLimited | GoalStatus::Complete => None,
     }
 }

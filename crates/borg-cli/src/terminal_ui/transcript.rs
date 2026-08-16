@@ -382,6 +382,28 @@ impl Transcript {
         }
     }
 
+    fn optimistically_apply_goal_action(&mut self, action: &GoalAction) -> bool {
+        let updated_goal = {
+            let Some(goal) = self.goal.as_mut() else {
+                return false;
+            };
+            let next_status = match action {
+                GoalAction::Pause if goal.status == GoalStatus::Active => GoalStatus::Paused,
+                GoalAction::Resume
+                    if matches!(
+                        goal.status,
+                        GoalStatus::Paused | GoalStatus::Blocked | GoalStatus::UsageLimited
+                    ) => GoalStatus::Active,
+                _ => return false,
+            };
+            goal.status = next_status;
+            goal.updated_at = Utc::now();
+            goal.clone()
+        };
+        self.upsert_goal(updated_goal, canonical_local_time(Local::now()));
+        true
+    }
+
     fn show_director_context_boundary(&mut self) {
         self.order.push(TranscriptEntry::Activity {
             text: DIRECTOR_CONTEXT_BOUNDARY.to_string(),

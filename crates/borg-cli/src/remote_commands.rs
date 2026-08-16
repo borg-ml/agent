@@ -3061,6 +3061,20 @@ async fn run_local_agent_session(
                 }
                 match action {
                     UiAction::None => {}
+                    UiAction::ToggleGoal { action } => {
+                        let terminal = terminal.as_mut().expect("terminal");
+                        terminal.optimistically_apply_goal_action(&action);
+                        terminal_dirty = true;
+                        if !dispatch_host_command_without_blocking(
+                            &session_command_tx,
+                            HostCommand::Goal {
+                                session_id,
+                                action,
+                            },
+                        ) {
+                            terminal.set_notice("Could not reach the session actor");
+                        }
+                    }
                     UiAction::Approve { target, decision } => {
                         if let Some(target) = target {
                             if let Some(approval_id) =
@@ -4281,10 +4295,24 @@ async fn run_local_agent_session(
                         } else if line.starts_with("/goal ") && attachments.is_empty() {
                             match parse_goal_action(line) {
                                 Ok(action) => {
-                                    session_command_tx.send(HostCommand::Goal {
-                                        session_id,
-                                        action,
-                                    }).await.ok();
+                                    let optimistic = matches!(
+                                        &action,
+                                        GoalAction::Pause | GoalAction::Resume
+                                    );
+                                    let terminal = terminal.as_mut().expect("terminal");
+                                    if optimistic {
+                                        terminal.optimistically_apply_goal_action(&action);
+                                        terminal_dirty = true;
+                                    }
+                                    if !dispatch_host_command_without_blocking(
+                                        &session_command_tx,
+                                        HostCommand::Goal {
+                                            session_id,
+                                            action,
+                                        },
+                                    ) {
+                                        terminal.set_notice("Could not reach the session actor");
+                                    }
                                 }
                                 Err(error) => terminal.as_mut().expect("terminal").set_notice(error.to_string()),
                             }
@@ -6413,6 +6441,23 @@ pub(crate) fn parse_goal_action(line: &str) -> Result<GoalAction> {
         objective: objective.to_string(),
         token_budget,
     })
+}
+
+fn dispatch_host_command_without_blocking(
+    sender: &mpsc::Sender<HostCommand>,
+    command: HostCommand,
+) -> bool {
+    match sender.try_send(command) {
+        Ok(()) => true,
+        Err(mpsc::error::TrySendError::Full(command)) => {
+            let sender = sender.clone();
+            tokio::spawn(async move {
+                let _ = sender.send(command).await;
+            });
+            true
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => false,
+    }
 }
 
 #[derive(Default)]
