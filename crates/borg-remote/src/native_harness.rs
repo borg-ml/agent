@@ -1156,6 +1156,7 @@ fn tool_execution_class(name: &str) -> ToolExecutionClass {
         | "list_agents"
         | "lsp_status"
         | "lsp_diagnostics"
+        | "lsp_workspace_diagnostics"
         | "lsp_hover"
         | "lsp_definition"
         | "lsp_references"
@@ -2073,11 +2074,7 @@ fn compact_tool_specs() -> impl Iterator<Item = Value> {
     builtin_tool_specs().into_iter().filter(|spec| {
         spec.get("name")
             .and_then(Value::as_str)
-            .map(|name| {
-                COMPACT_TOOL_NAMES
-                    .iter()
-                    .any(|candidate| *candidate == name)
-            })
+            .map(|name| COMPACT_TOOL_NAMES.contains(&name))
             .unwrap_or(false)
     })
 }

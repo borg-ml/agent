@@ -594,6 +594,7 @@ mod tests {
         assert!(names.contains(&"create_shared_work"));
         assert!(names.contains(&"consult_peer"));
         assert!(names.contains(&"rotate_peer"));
+        assert!(names.contains(&"lsp_workspace_diagnostics"));
         assert!(names.contains(&"list_blu_workflows"));
         assert!(names.contains(&"run_blu_extension"));
     }

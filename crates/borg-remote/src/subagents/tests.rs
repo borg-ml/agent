@@ -2354,6 +2354,7 @@ fn every_execution_lane_exposes_the_same_borg_control_plane() {
         "get_plan",
         "update_plan",
         "lsp_diagnostics",
+        "lsp_workspace_diagnostics",
         "list_plugins",
         "read_plugin",
         "get_agent_settings",

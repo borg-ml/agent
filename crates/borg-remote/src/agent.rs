@@ -38,7 +38,7 @@ exists, then create the plan. Before updating an existing plan, call get_plan an
 item UUIDs; omit IDs for new items. \
 Use the canonical update_plan shape `{\"explanation\":\"optional\",\"plan\":[{\"id\":\"UUID\",\"content\":\"step\",\"status\":\"pending|in_progress|completed\"}]}`; \
 plan content is limited to 500 characters and only one item may be in_progress. \
-Use its LSP tools for diagnostics and semantic code navigation when the workspace language is supported. \
+Use `lsp_workspace_diagnostics` for a project-wide diagnostic pass when the workspace language is supported; use `lsp_diagnostics` for a targeted file and the other LSP tools for semantic navigation. \
 After editing supported source files, run LSP diagnostics before finishing and repair errors caused by the edit. \
 Do not use a provider-native spawn or collaboration tool because those children are not part of \
 the Borg session tree and cannot be controlled from Borg Remote. \

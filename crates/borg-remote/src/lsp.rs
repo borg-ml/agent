@@ -12,6 +12,7 @@ use url::Url;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_LSP_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_WORKSPACE_DIAGNOSTIC_FILES: usize = 4096;
 
 #[derive(Clone)]
 pub struct LspService {
@@ -132,20 +133,9 @@ impl LspService {
         let (path, uri, spec, workspace_root) = self.resolve_document(path).await?;
         let mut clients = self.clients.lock().await;
         let client = ensure_client(&mut clients, spec, &workspace_root).await?;
-        client.open_document(&path, &uri, spec.language_id).await?;
-        match client
-            .request(
-                "textDocument/diagnostic",
-                json!({ "textDocument": { "uri": uri } }),
-            )
+        client
+            .document_diagnostics(&path, &uri, spec.language_id)
             .await
-        {
-            Ok(result) => Ok(result),
-            Err(pull_error) => client
-                .wait_for_published_diagnostics(&uri)
-                .await
-                .with_context(|| format!("pull diagnostics failed ({pull_error:#})")),
-        }
     }
 
     pub async fn hover(&self, path: &Path, line: u32, character: u32) -> Result<Value> {
@@ -194,6 +184,58 @@ impl LspService {
                         workspace_label(key, server_counts[key.server_id])
                     )
                 })?;
+            results.insert(workspace_label(key, server_counts[key.server_id]), value);
+        }
+        Ok(Value::Object(results))
+    }
+
+    /// Request diagnostics for every document known to each active language
+    /// server workspace. An optional source path can bootstrap the matching
+    /// language server when this service has not been used yet.
+    pub async fn workspace_diagnostics(&self, path: Option<&Path>) -> Result<Value> {
+        if let Some(path) = path {
+            let (path, uri, spec, workspace_root) = self.resolve_document(path).await?;
+            let mut clients = self.clients.lock().await;
+            let client = ensure_client(&mut clients, spec, &workspace_root).await?;
+            client.open_document(&path, &uri, spec.language_id).await?;
+        }
+
+        let mut clients = self.clients.lock().await;
+        if clients.is_empty() {
+            bail!(
+                "no language server is active; provide a representative source path to initialize one"
+            );
+        }
+        let mut server_counts = HashMap::new();
+        for key in clients.keys() {
+            *server_counts.entry(key.server_id).or_insert(0usize) += 1;
+        }
+        let mut results = serde_json::Map::new();
+        for (key, client) in clients.iter_mut() {
+            let value = match client.workspace_diagnostics().await {
+                Ok(value) => value,
+                Err(error) if is_unknown_workspace_diagnostics_request(&error) => {
+                    let spec = spec_for_id(key.server_id)
+                        .with_context(|| format!("unknown language server `{}`", key.server_id))?;
+                    client
+                        .document_workspace_diagnostics(&key.workspace_root, spec)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "{} document diagnostics fallback failed ({error:#})",
+                                workspace_label(key, server_counts[key.server_id])
+                            )
+                        })?
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "{} workspace diagnostics request failed",
+                            workspace_label(key, server_counts[key.server_id])
+                        )
+                    });
+                }
+            };
             results.insert(workspace_label(key, server_counts[key.server_id]), value);
         }
         Ok(Value::Object(results))
@@ -361,6 +403,60 @@ impl LspClient {
         self.notify(method, params).await
     }
 
+    async fn document_diagnostics(
+        &mut self,
+        path: &Path,
+        uri: &str,
+        language_id: &str,
+    ) -> Result<Value> {
+        self.open_document(path, uri, language_id).await?;
+        match self
+            .request(
+                "textDocument/diagnostic",
+                json!({ "textDocument": { "uri": uri } }),
+            )
+            .await
+        {
+            Ok(result) => Ok(result),
+            Err(pull_error) => self
+                .wait_for_published_diagnostics(uri)
+                .await
+                .with_context(|| format!("pull diagnostics failed ({pull_error:#})")),
+        }
+    }
+
+    async fn document_workspace_diagnostics(
+        &mut self,
+        workspace_root: &Path,
+        spec: &ServerSpec,
+    ) -> Result<Value> {
+        let scan = discover_workspace_documents(workspace_root, spec.extensions).await;
+        let mut items = Vec::new();
+        for path in scan.paths {
+            let uri = Url::from_file_path(&path)
+                .map_err(|_| anyhow::anyhow!("cannot convert {} to a file URI", path.display()))?
+                .to_string();
+            let report = self
+                .document_diagnostics(&path, &uri, spec.language_id)
+                .await
+                .with_context(|| format!("diagnostics failed for {}", path.display()))?;
+            items.push(workspace_document_report(&uri, report));
+        }
+        let mut result = json!({ "kind": "full", "items": items });
+        if scan.truncated {
+            result["partial"] = Value::Bool(true);
+            result["partialReason"] = Value::String(format!(
+                "workspace scan limited to {MAX_WORKSPACE_DIAGNOSTIC_FILES} files"
+            ));
+        }
+        Ok(result)
+    }
+
+    async fn workspace_diagnostics(&mut self) -> Result<Value> {
+        self.request("workspace/diagnostic", json!({ "previousResultIds": [] }))
+            .await
+    }
+
     async fn notify(&mut self, method: &str, params: Value) -> Result<()> {
         self.write_message(&json!({
             "jsonrpc": "2.0",
@@ -513,6 +609,103 @@ fn workspace_label(key: &LspClientKey, server_count: usize) -> String {
     }
 }
 
+fn is_unknown_workspace_diagnostics_request(error: &anyhow::Error) -> bool {
+    let message = error.to_string();
+    message.contains("\"code\":-32601") || message.contains("unknown request")
+}
+
+fn workspace_document_report(uri: &str, report: Value) -> Value {
+    match report {
+        Value::Object(mut report) => {
+            report.insert("uri".to_string(), Value::String(uri.to_string()));
+            Value::Object(report)
+        }
+        Value::Array(items) => json!({
+            "kind": "full",
+            "uri": uri,
+            "items": items
+        }),
+        Value::Null => json!({
+            "kind": "full",
+            "uri": uri,
+            "items": []
+        }),
+        other => json!({
+            "kind": "full",
+            "uri": uri,
+            "items": [],
+            "report": other
+        }),
+    }
+}
+
+struct WorkspaceDocumentScan {
+    paths: Vec<PathBuf>,
+    truncated: bool,
+}
+
+async fn discover_workspace_documents(root: &Path, extensions: &[&str]) -> WorkspaceDocumentScan {
+    let mut pending = vec![root.to_path_buf()];
+    let mut paths = Vec::new();
+    let mut truncated = false;
+    while let Some(directory) = pending.pop() {
+        let Ok(mut entries) = tokio::fs::read_dir(&directory).await else {
+            continue;
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type().await else {
+                continue;
+            };
+            if file_type.is_dir() {
+                if !ignored_workspace_directory(&path) {
+                    pending.push(path);
+                }
+                continue;
+            }
+            if file_type.is_file()
+                && path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| {
+                        extensions
+                            .iter()
+                            .any(|candidate| candidate.eq_ignore_ascii_case(extension))
+                    })
+            {
+                if paths.len() == MAX_WORKSPACE_DIAGNOSTIC_FILES {
+                    truncated = true;
+                    break;
+                }
+                paths.push(path);
+            }
+        }
+        if truncated {
+            break;
+        }
+    }
+    paths.sort();
+    WorkspaceDocumentScan { paths, truncated }
+}
+
+fn ignored_workspace_directory(path: &Path) -> bool {
+    matches!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some(
+            ".git"
+                | ".hg"
+                | ".svn"
+                | "target"
+                | "node_modules"
+                | "vendor"
+                | "build"
+                | "dist"
+                | ".venv"
+                | "__pycache__"
+        )
+    )
+}
+
 async fn discover_project_root(path: &Path, boundary: Option<&Path>, fallback: PathBuf) -> PathBuf {
     let mut current = path.parent().unwrap_or(path).to_path_buf();
     loop {
@@ -562,6 +755,10 @@ fn spec_for_path(path: &Path) -> Option<&'static ServerSpec> {
     server_specs()
         .iter()
         .find(|spec| spec.extensions.contains(&extension.as_str()))
+}
+
+fn spec_for_id(id: &str) -> Option<&'static ServerSpec> {
+    server_specs().iter().find(|spec| spec.id == id)
 }
 
 fn supported_server_status() -> Vec<Value> {
@@ -824,6 +1021,19 @@ mod tests {
             .await
             .expect("rust-analyzer diagnostic request");
         assert!(result.is_object() || result.is_array() || result.is_null());
+
+        let workspace = LspService::new(&root)
+            .workspace_diagnostics(Some(Path::new("src/lib.rs")))
+            .await
+            .expect("rust-analyzer workspace diagnostic request");
+        let items = workspace["rust-analyzer"]["items"]
+            .as_array()
+            .expect("workspace diagnostic report items");
+        assert!(items.iter().any(|item| {
+            item["uri"]
+                .as_str()
+                .is_some_and(|uri| uri.ends_with("/src/lib.rs"))
+        }));
     }
 
     #[tokio::test]

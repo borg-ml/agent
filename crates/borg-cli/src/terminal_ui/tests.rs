@@ -3629,6 +3629,15 @@ fn wait_spawn_and_lsp_diagnostics_use_compact_stable_result_shapes() {
     assert!(diagnostics.contains("DIAGNOSTICS · src/main.rs · 1 issue"));
     assert!(diagnostics.contains("error:5  expected expression"));
     assert!(borg_lsp_diagnostics_view("lsp_diagnostics", None, "{}").is_none());
+
+    let workspace_diagnostics = borg_lsp_diagnostics_view(
+        "lsp_workspace_diagnostics",
+        None,
+        r#"{"rust-analyzer":{"kind":"full","items":[{"uri":"file:///workspace/src/main.rs","kind":"full","items":[{"severity":2,"message":"unused import"}]}]}}"#,
+    )
+    .expect("structured workspace diagnostics");
+    assert!(workspace_diagnostics.contains("WORKSPACE DIAGNOSTICS · 1 issue"));
+    assert!(workspace_diagnostics.contains("rust-analyzer · 1 issue"));
 }
 
 #[test]

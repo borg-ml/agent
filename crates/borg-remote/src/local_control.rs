@@ -190,10 +190,10 @@ fn owner_process_matches_metadata(metadata: &LocalSessionOwnerMetadata) -> Resul
         if identity != metadata.executable_identity {
             return Ok(false);
         }
-        if let Some(expected) = metadata.process_start_time {
-            if process_start_time(metadata.pid)? != Some(expected) {
-                return Ok(false);
-            }
+        if let Some(expected) = metadata.process_start_time
+            && process_start_time(metadata.pid)? != Some(expected)
+        {
+            return Ok(false);
         }
     }
     Ok(true)

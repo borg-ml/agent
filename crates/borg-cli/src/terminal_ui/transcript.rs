@@ -1646,9 +1646,7 @@ impl Transcript {
             });
         let method = method
             .to_ascii_lowercase()
-            .replace('.', "/")
-            .replace('_', "/")
-            .replace('-', "/");
+            .replace(['.', '_', '-'], "/");
         let is_reasoning = item_type
             .is_some_and(|item_type| item_type.to_ascii_lowercase().contains("reasoning"))
             || method.contains("reasoning");

@@ -494,6 +494,10 @@ pub fn tool_call_summary(name: &str, input: &Value) -> (String, String) {
         return ("Language servers".to_string(), "status".to_string());
     }
 
+    if tool == "lsp_workspace_diagnostics" {
+        return ("Workspace diagnostics".to_string(), source_location(input));
+    }
+
     if tool == "lsp_workspace_symbols" {
         let query = string_field(input, "query").unwrap_or("");
         return (

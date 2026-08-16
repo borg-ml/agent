@@ -7589,7 +7589,12 @@ fn borg_lsp_diagnostics_view(
     input: Option<&serde_json::Value>,
     output: &str,
 ) -> Option<String> {
-    if !name.to_ascii_lowercase().ends_with("lsp_diagnostics") {
+    let normalized_name = name.to_ascii_lowercase();
+    let workspace = normalized_name.ends_with("lsp_workspace_diagnostics");
+    if workspace {
+        return borg_lsp_workspace_diagnostics_view(output);
+    }
+    if !normalized_name.ends_with("lsp_diagnostics") {
         return None;
     }
     let value = serde_json::from_str::<serde_json::Value>(output).ok()?;
@@ -7627,6 +7632,66 @@ fn borg_lsp_diagnostics_view(
             "  {severity:>7}{line}  {}",
             compact_text(message, 120)
         ));
+    }
+    Some(rows.join("\n"))
+}
+
+fn borg_lsp_workspace_diagnostics_view(output: &str) -> Option<String> {
+    let workspaces = serde_json::from_str::<serde_json::Value>(output)
+        .ok()?
+        .as_object()?
+        .clone();
+    let mut documents = Vec::new();
+    for (server, report) in workspaces {
+        let items = report.get("items")?.as_array()?;
+        for document in items {
+            let diagnostics = document
+                .get("items")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            documents.push((server.clone(), document.clone(), diagnostics));
+        }
+    }
+    let issue_count = documents
+        .iter()
+        .map(|(_, _, diagnostics)| diagnostics.len())
+        .sum::<usize>();
+    let mut rows = vec![format!(
+        "WORKSPACE DIAGNOSTICS · {} issue{} · {} document{}",
+        issue_count,
+        if issue_count == 1 { "" } else { "s" },
+        documents.len(),
+        if documents.len() == 1 { "" } else { "s" }
+    )];
+    for (server, document, diagnostics) in documents.iter().take(8) {
+        let uri = document
+            .get("uri")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown document");
+        rows.push(format!(
+            "  {server} · {} issue{} · {uri}",
+            diagnostics.len(),
+            if diagnostics.len() == 1 { "" } else { "s" }
+        ));
+        for diagnostic in diagnostics.iter().take(2) {
+            let severity = diagnostic
+                .get("severity")
+                .and_then(serde_json::Value::as_u64)
+                .map(|value| match value {
+                    1 => "error",
+                    2 => "warning",
+                    3 => "info",
+                    4 => "hint",
+                    _ => "issue",
+                })
+                .unwrap_or("issue");
+            let message = json_text(diagnostic, &["message"]).unwrap_or("diagnostic");
+            rows.push(format!("    {severity:>7}  {}", compact_text(message, 120)));
+        }
+    }
+    if documents.len() > 8 {
+        rows.push(format!("  … {} more documents", documents.len() - 8));
     }
     Some(rows.join("\n"))
 }

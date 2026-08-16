@@ -62,7 +62,7 @@ fn persistent_peer_consultation_timeout() -> Duration {
 
 fn format_timeout(timeout: Duration) -> String {
     let seconds = timeout.as_secs();
-    if seconds % 60 == 0 {
+    if seconds.is_multiple_of(60) {
         format!("{} minutes", seconds / 60)
     } else {
         format!("{seconds} seconds")
@@ -1378,6 +1378,10 @@ impl AgentToolDispatcher {
             "lsp_diagnostics" => {
                 let args: LspPathArgs = serde_json::from_value(arguments)?;
                 self.lsp.diagnostics(&args.path).await
+            }
+            "lsp_workspace_diagnostics" => {
+                let args: LspWorkspaceDiagnosticsArgs = serde_json::from_value(arguments)?;
+                self.lsp.workspace_diagnostics(args.path.as_deref()).await
             }
             "lsp_hover" => {
                 let args: LspPositionArgs = serde_json::from_value(arguments)?;
@@ -3373,7 +3377,7 @@ impl SubagentCoordinator {
         let (provider, model, effort) = resolve_persistent_peer_profile(parent_provider, profile)?;
         let (task_name, label) = persistent_peer_lane(provider);
         let rotation = self
-            .rotate_sidecar_locked(&task_name, provider, model, effort)
+            .rotate_sidecar_locked(task_name, provider, model, effort)
             .await?;
         let handoff_queued = if let Some(handoff) = handoff {
             let text = format!(
@@ -3431,7 +3435,7 @@ impl SubagentCoordinator {
         let activity = self.subscribe();
         let current = {
             let table = self.table.lock().await;
-            let canonical = canonical_sidecar_task_name(&task_name)?;
+            let canonical = canonical_sidecar_task_name(task_name)?;
             table
                 .task_names
                 .get(&canonical)
@@ -3444,7 +3448,7 @@ impl SubagentCoordinator {
                     || (explicit_profile
                         && (current.model != model || current.effort != effort)) =>
             {
-                self.rotate_sidecar_locked(&task_name, provider, model.clone(), effort.clone())
+                self.rotate_sidecar_locked(task_name, provider, model.clone(), effort.clone())
                     .await?
                     .replacement
             }
@@ -5420,6 +5424,20 @@ fn agent_tool_specs_with_capabilities_and_consultation_and_search(
             lsp_path_schema(),
         ),
         tool(
+            "lsp_workspace_diagnostics",
+            "Read diagnostics for every document in each active language-server workspace in one call. Optionally provide any supported source path to initialize its language server; trusted sessions may use an absolute path in another local project.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Optional representative source file. Omit it to query already-active language-server workspaces."
+                    }
+                },
+                "additionalProperties": false
+            }),
+        ),
+        tool(
             "lsp_hover",
             "Read language-server hover/type information at a one-based source position. Trusted sessions may use an absolute path in another local project.",
             lsp_position_schema(),
@@ -5907,6 +5925,13 @@ struct UpdatePlanArgs {
 #[serde(deny_unknown_fields)]
 struct LspPathArgs {
     path: PathBuf,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LspWorkspaceDiagnosticsArgs {
+    #[serde(default)]
+    path: Option<PathBuf>,
 }
 
 #[derive(Deserialize)]
