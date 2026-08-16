@@ -325,9 +325,11 @@ lane and starts a fresh durable child, for example
 as `rotate_peer`, with an optional handoff. Once Borg accepts a consultation,
 its peer waiter allows up to 30 minutes by default;
 `BORG_PEER_CONSULTATION_TIMEOUT_SECS` can tune that between one minute and two
-hours. A provider MCP transport can still cancel the foreground tool call
-sooner; the peer continues in that case and delivers a completed result
-privately at the next root boundary.
+hours. Borg gives its local agent MCP bridge a two-hour-plus tool-call deadline,
+so a provider's ordinary five-minute MCP ceiling cannot truncate a consultation
+while the peer is still thinking. If the provider is disconnected for another
+reason, the peer still continues and delivers a completed result privately at
+the next root boundary.
 
 ## Local multiplayer workspaces
 

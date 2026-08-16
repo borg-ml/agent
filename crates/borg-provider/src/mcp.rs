@@ -8,6 +8,11 @@ use serde_json::{Map, json};
 #[cfg(windows)]
 use uuid::Uuid;
 
+// Persistent peer consultations wait for at most two hours. Claude's default
+// MCP tool deadline can be five minutes, so leave a minute of headroom for the
+// peer result to cross the local bridge before the provider gives up.
+const BORG_AGENT_MCP_TOOL_TIMEOUT_MS: u64 = (2 * 60 * 60 + 60) * 1_000;
+
 #[derive(Debug, Clone, Default)]
 pub struct ProviderMcpSetup {
     pub claude_config_path: Option<PathBuf>,
@@ -68,14 +73,15 @@ pub fn prepare_external_provider_mcp(
         if server.name.trim().is_empty() || servers.contains_key(&server.name) {
             continue;
         }
-        servers.insert(
-            server.name.clone(),
-            json!({
-                "command": server.command,
-                "args": server.args,
-                "env": server.env,
-            }),
-        );
+        let mut config = json!({
+            "command": server.command,
+            "args": server.args,
+            "env": server.env,
+        });
+        if server.name == "borg_agent" {
+            config["timeout"] = json!(BORG_AGENT_MCP_TOOL_TIMEOUT_MS);
+        }
+        servers.insert(server.name.clone(), config);
     }
     write_private_file(
         &claude_config_path,
@@ -185,5 +191,30 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn borg_agent_provider_config_allows_long_running_peer_tools() {
+        let root = tempfile::tempdir().expect("temporary provider home");
+        let servers = vec![ExternalMcpServer {
+            name: "borg_agent".to_string(),
+            command: "/bin/borg".to_string(),
+            args: vec!["__agent-mcp".to_string()],
+            env: BTreeMap::new(),
+            allowed_tools: Vec::new(),
+        }];
+
+        prepare_external_provider_mcp(root.path(), &servers).unwrap();
+        let config = serde_json::from_slice::<serde_json::Value>(
+            &fs::read(root.path().join(".borg-local-mcp.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            config
+                .get("mcpServers")
+                .and_then(|servers| servers.get("borg_agent"))
+                .and_then(|server| server.get("timeout")),
+            Some(&json!(BORG_AGENT_MCP_TOOL_TIMEOUT_MS))
+        );
     }
 }
