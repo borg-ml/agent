@@ -143,7 +143,7 @@ pub(crate) async fn ensure_backend(config: LocalDictationConfig) -> Result<Local
         .arg("5092")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::null())
         .kill_on_drop(true)
         .spawn()
         .with_context(|| {
