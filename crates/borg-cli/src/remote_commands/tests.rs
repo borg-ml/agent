@@ -1479,16 +1479,27 @@ async fn wedged_obsolete_owner_is_force_terminated_after_the_handoff_grace_perio
             .is_none()
     );
 
-    let executable = std::fs::File::open(format!("/proc/{}/exe", owner.id())).unwrap();
-    let executable_metadata = executable.metadata().unwrap();
-    let executable_identity = format!(
-        "{}:{}:{}:{}:{}",
-        executable_metadata.dev(),
-        executable_metadata.ino(),
-        executable_metadata.len(),
-        executable_metadata.mtime(),
-        executable_metadata.mtime_nsec()
-    );
+    let read_executable_identity = || {
+        let executable = std::fs::File::open(format!("/proc/{}/exe", owner.id())).unwrap();
+        let metadata = executable.metadata().unwrap();
+        format!(
+            "{}:{}:{}:{}:{}",
+            metadata.dev(),
+            metadata.ino(),
+            metadata.len(),
+            metadata.mtime(),
+            metadata.mtime_nsec()
+        )
+    };
+    let mut executable_identity = read_executable_identity();
+    loop {
+        thread::sleep(Duration::from_millis(10));
+        let next_identity = read_executable_identity();
+        if next_identity == executable_identity {
+            break;
+        }
+        executable_identity = next_identity;
+    }
     std::fs::write(
         root.path().join(format!("{session_id}.control.owner.json")),
         serde_json::to_vec(&serde_json::json!({
