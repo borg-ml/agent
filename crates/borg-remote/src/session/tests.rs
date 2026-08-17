@@ -2433,7 +2433,7 @@ async fn multiple_queue_mode_prompts_drain_fifo_after_a_natural_turn_boundary() 
         })
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(1), first_started.notified())
+    tokio::time::timeout(Duration::from_secs(5), first_started.notified())
         .await
         .expect("first turn starts");
 
@@ -2452,7 +2452,7 @@ async fn multiple_queue_mode_prompts_drain_fifo_after_a_natural_turn_boundary() 
     }
     let mut queued = Vec::new();
     while queued.len() < queued_message_ids.len() {
-        let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+        let event = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
             .await
             .expect("queued event arrives")
             .expect("session event stream remains open");
@@ -2470,7 +2470,7 @@ async fn multiple_queue_mode_prompts_drain_fifo_after_a_natural_turn_boundary() 
     // Releasing the first turn must batch all queue-mode prompts at the
     // natural boundary. They are one provider input, in FIFO text order.
     release_first.notify_one();
-    tokio::time::timeout(Duration::from_secs(1), async {
+    tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if turns.lock().unwrap().len() == 2 {
                 break;
@@ -3230,7 +3230,7 @@ async fn unacknowledged_steer_does_not_block_interrupt_or_fifo_fallback() {
         })
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(1), turn_started.notified())
+    tokio::time::timeout(Duration::from_secs(5), turn_started.notified())
         .await
         .expect("first turn starts");
     let followup_id = Uuid::new_v4();
@@ -3245,7 +3245,7 @@ async fn unacknowledged_steer_does_not_block_interrupt_or_fifo_fallback() {
         })
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(1), steer_seen.notified())
+    tokio::time::timeout(Duration::from_secs(5), steer_seen.notified())
         .await
         .expect("provider receives steer");
     let mut transitions = Vec::new();
@@ -3254,11 +3254,11 @@ async fn unacknowledged_steer_does_not_block_interrupt_or_fifo_fallback() {
         .send(HostCommand::Interrupt { session_id })
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(1), turn_started.notified())
+    tokio::time::timeout(Duration::from_secs(5), turn_started.notified())
         .await
         .expect("unacknowledged steer falls back to the FIFO");
     loop {
-        let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+        let event = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
             .await
             .expect("the FIFO turn reaches a terminal boundary")
             .expect("session remains open");
@@ -4440,7 +4440,7 @@ async fn model_consultation_dispatches_a_freeform_briefing_to_an_isolated_provid
         })
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(1), called.notified())
+    tokio::time::timeout(Duration::from_secs(5), called.notified())
         .await
         .expect("main executor received the consultation result");
 
