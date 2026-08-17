@@ -2645,7 +2645,7 @@ impl Transcript {
                     } else if *backgrounded {
                         "↗"
                     } else if *complete {
-                        if is_reasoning { "◇" } else { "✓" }
+                        "✓"
                     } else {
                         activity_glyph(SessionStatus::Running)
                     };

@@ -7340,6 +7340,14 @@ fn reasoning_lifecycle_events_show_thinking_without_a_text_delta() {
             ..
         } if name == "Thinking"
     ));
+    let rendered = transcript
+        .lines(100)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("✓ Thinking"));
+    assert!(!rendered.contains("◇ Thinking"));
 }
 
 #[test]

@@ -2081,6 +2081,9 @@ fn codex_turn_start_params(
         "model": request.model,
         "cwd": request.working_directory.as_ref().map(|path| path.to_string_lossy().into_owned()),
         "effort": request.effort,
+        // Ask Codex for the richest reasoning summary supported by the
+        // selected model; this does not expose raw reasoning tokens.
+        "summary": "auto",
         "approvalPolicy": match permission {
             LocalAgentPermission::FullAccess => "never",
             LocalAgentPermission::Auto | LocalAgentPermission::Manual => "on-request",
@@ -3509,7 +3512,10 @@ mod tests {
             codex_auto_turn.get("approvalsReviewer"),
             Some(&Value::String("auto_review".to_string()))
         );
-        assert!(codex_auto_turn.get("summary").is_none());
+        assert_eq!(
+            codex_auto_turn.get("summary"),
+            Some(&Value::String("auto".to_string()))
+        );
         assert_eq!(
             codex_config
                 .get("config")
