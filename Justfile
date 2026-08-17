@@ -40,7 +40,7 @@ release-test:
 verify:
     cargo fmt --all -- --check
     cargo check --workspace --locked
-    cargo test --workspace --locked --no-fail-fast
+    cargo test --workspace --locked --no-fail-fast -- --test-threads=1
     cargo clippy --workspace --all-targets --locked -- -D warnings
     cargo deny check advisories bans licenses sources
     # Keep the RSA dependency check explicit so a future database feature
