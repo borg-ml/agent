@@ -2504,11 +2504,13 @@ fn actionable_inactive_goals_remain_in_the_status_line() {
 fn goal_toggle_updates_the_visible_status_before_the_durable_event() {
     use borg_remote::GoalAction;
 
-    let mut transcript = Transcript::default();
-    transcript.goal = Some(SessionGoal::new(
-        "Keep the terminal responsive".to_string(),
-        None,
-    ));
+    let mut transcript = Transcript {
+        goal: Some(SessionGoal::new(
+            "Keep the terminal responsive".to_string(),
+            None,
+        )),
+        ..Default::default()
+    };
 
     assert!(transcript.optimistically_apply_goal_action(&GoalAction::Pause));
     assert_eq!(
