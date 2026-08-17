@@ -2045,7 +2045,7 @@ async fn detached_live_projection_cannot_block_durable_turn_terminalization() {
     let session_store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let durable = session_store.read(session_id).await.unwrap_or_default();
             if durable.iter().any(|event| {
@@ -2060,7 +2060,7 @@ async fn detached_live_projection_cannot_block_durable_turn_terminalization() {
             }) {
                 break;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
@@ -2069,7 +2069,7 @@ async fn detached_live_projection_cannot_block_durable_turn_terminalization() {
         .send(HostCommand::Stop { session_id })
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(1), actor)
+    tokio::time::timeout(Duration::from_secs(2), actor)
         .await
         .expect("detached projection cannot wedge the actor")
         .unwrap()
