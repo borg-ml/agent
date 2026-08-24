@@ -199,6 +199,21 @@ async fn session_creation_waits_through_extended_writer_contention() {
 }
 
 #[tokio::test]
+async fn writer_contention_has_a_bounded_escape_hatch() {
+    let (_directory, store) = store().await;
+    let blocker = store.begin_write().await.unwrap();
+
+    let result = SqliteSessionStore::begin_sqlite_write_with_timeout(
+        store.pool(),
+        Duration::from_millis(100),
+    )
+    .await;
+
+    assert!(matches!(result, Err(sqlx::Error::PoolTimedOut)));
+    blocker.rollback().await.unwrap();
+}
+
+#[tokio::test]
 async fn empty_sessions_are_discarded_but_real_sessions_are_kept() {
     let (_directory, store) = store().await;
     let empty = Uuid::new_v4();

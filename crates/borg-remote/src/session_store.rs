@@ -28,6 +28,7 @@ use crate::{
 pub(crate) const INLINE_SESSION_PAYLOAD_BYTES: usize = 64 * 1024;
 pub(crate) const SESSION_PAYLOAD_PREVIEW_BYTES: usize = 4 * 1024;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const SQLITE_WRITE_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 const SQLITE_WRITE_TRANSACTION: &str = "BEGIN IMMEDIATE";
 const SQLITE_JOURNAL_SIZE_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_HOST_LAUNCH_METADATA_BYTES: usize = 512 * 1024;
@@ -2219,9 +2220,38 @@ impl SqliteSessionStore {
     pub(crate) async fn begin_sqlite_write(
         pool: &SqlitePool,
     ) -> Result<Transaction<'static, Sqlite>, sqlx::Error> {
+        Self::begin_sqlite_write_with_timeout(pool, SQLITE_WRITE_WAIT_TIMEOUT).await
+    }
+
+    async fn begin_sqlite_write_with_timeout(
+        pool: &SqlitePool,
+        timeout: Duration,
+    ) -> Result<Transaction<'static, Sqlite>, sqlx::Error> {
+        let deadline = tokio::time::Instant::now() + timeout;
         let mut reported_contention = false;
         loop {
-            match pool.begin_with(SQLITE_WRITE_TRANSACTION).await {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                warn!(
+                    timeout_seconds = timeout.as_secs(),
+                    "SQLite session journal writer wait timed out"
+                );
+                return Err(sqlx::Error::PoolTimedOut);
+            }
+            let result =
+                match tokio::time::timeout(remaining, pool.begin_with(SQLITE_WRITE_TRANSACTION))
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(_) => {
+                        warn!(
+                            timeout_seconds = timeout.as_secs(),
+                            "SQLite session journal writer wait timed out"
+                        );
+                        return Err(sqlx::Error::PoolTimedOut);
+                    }
+                };
+            match result {
                 Ok(transaction) => return Ok(transaction),
                 Err(error) if sqlite_lock_text(&error.to_string()) => {
                     if !reported_contention {
@@ -2236,7 +2266,17 @@ impl SqliteSessionStore {
                     // down an otherwise healthy actor. The connection-level
                     // busy timeout handles ordinary contention; keep waiting
                     // in bounded slices when another Borg process holds the
-                    // writer lock longer (for example during a large commit).
+                    // writer lock longer (for example during a large commit),
+                    // but do not let one stalled process block every actor
+                    // indefinitely.
+                    if tokio::time::Instant::now() >= deadline {
+                        warn!(
+                            error = %error,
+                            timeout_seconds = timeout.as_secs(),
+                            "SQLite session journal writer wait timed out"
+                        );
+                        return Err(error);
+                    }
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
                 Err(error) => return Err(error),

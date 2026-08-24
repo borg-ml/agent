@@ -625,13 +625,17 @@ fn spawn_idle_reaper(clients: &std::sync::Arc<Mutex<HashMap<LspClientKey, LspCli
             clients
                 .lock()
                 .await
-                .retain(|_, client| !lsp_client_is_expired(client.last_used.elapsed()));
+                .retain(|key, client| !lsp_client_should_reap(key, client.last_used.elapsed()));
         }
     });
 }
 
 fn lsp_client_is_expired(idle_for: Duration) -> bool {
     idle_for >= LSP_IDLE_TIMEOUT
+}
+
+fn lsp_client_should_reap(key: &LspClientKey, idle_for: Duration) -> bool {
+    lsp_client_is_expired(idle_for) || !key.workspace_root.is_dir()
 }
 
 fn server_initialization_options(spec: &ServerSpec) -> Option<Value> {
@@ -997,6 +1001,19 @@ mod tests {
             LSP_IDLE_TIMEOUT - Duration::from_millis(1)
         ));
         assert!(lsp_client_is_expired(LSP_IDLE_TIMEOUT));
+    }
+
+    #[test]
+    fn missing_lsp_workspaces_are_reaped_even_when_recently_used() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let key = LspClientKey {
+            server_id: "rust-analyzer",
+            workspace_root: workspace.path().to_path_buf(),
+        };
+        assert!(!lsp_client_should_reap(&key, Duration::ZERO));
+
+        drop(workspace);
+        assert!(lsp_client_should_reap(&key, Duration::ZERO));
     }
 
     #[test]
