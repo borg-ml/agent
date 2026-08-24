@@ -5,6 +5,7 @@ pub(super) fn markdown_lines(
     width: usize,
     text_color: Option<Color>,
 ) -> Vec<Line<'static>> {
+    let markdown = escape_currency_dollars(markdown);
     let mut lines = Vec::new();
     let mut current = Vec::new();
     let base_style = text_color.map_or_else(Style::default, |color| Style::default().fg(color));
@@ -14,7 +15,7 @@ pub(super) fn markdown_lines(
     let mut table: Option<MarkdownTable> = None;
     let mut quote_depth = 0usize;
     let mut list_indices = Vec::new();
-    for event in Parser::new_ext(markdown, Options::all()) {
+    for event in Parser::new_ext(&markdown, Options::all()) {
         match event {
             MarkdownEvent::Start(Tag::Table(alignments)) => {
                 flush_markdown_line(&mut lines, &mut current, width, quote_depth);
@@ -250,10 +251,11 @@ pub(super) fn markdown_lines(
 /// presentation syntax. In particular, fenced code contributes only its
 /// source, not the opening language marker or closing fence.
 pub(super) fn markdown_plain_text(markdown: &str) -> String {
+    let markdown = escape_currency_dollars(markdown);
     let mut output = String::new();
     let mut list_indices = Vec::new();
 
-    for event in Parser::new_ext(markdown, Options::all()) {
+    for event in Parser::new_ext(&markdown, Options::all()) {
         match event {
             MarkdownEvent::Start(Tag::CodeBlock(_)) => append_line_break(&mut output),
             MarkdownEvent::End(TagEnd::CodeBlock) => append_line_break(&mut output),
@@ -315,9 +317,10 @@ fn append_line_break(output: &mut String) {
 }
 
 pub(super) fn markdown_link_ranges(markdown: &str, lines: &[Line<'_>]) -> Vec<LinkRowRange> {
+    let markdown = escape_currency_dollars(markdown);
     let mut targets = Vec::new();
     let mut active: Option<(Option<String>, String)> = None;
-    for event in Parser::new_ext(markdown, Options::all()) {
+    for event in Parser::new_ext(&markdown, Options::all()) {
         match event {
             MarkdownEvent::Start(Tag::Link { dest_url, .. }) => {
                 active = Some((safe_http_url(&dest_url), String::new()));
@@ -415,15 +418,136 @@ fn terminal_math_lines(source: &str) -> Vec<String> {
         .collect()
 }
 
+fn escape_currency_dollars(markdown: &str) -> String {
+    let mut escaped = String::with_capacity(markdown.len());
+    let mut index = 0;
+    while index < markdown.len() {
+        let character = markdown[index..]
+            .chars()
+            .next()
+            .expect("index must remain on a character boundary");
+        if character == '\\' {
+            let next = index + character.len_utf8();
+            escaped.push(character);
+            if let Some(next_character) = markdown[next..].chars().next() {
+                escaped.push(next_character);
+                index = next + next_character.len_utf8();
+            } else {
+                index = next;
+            }
+            continue;
+        }
+        if character == '`' {
+            let run = markdown[index..]
+                .chars()
+                .take_while(|character| *character == '`')
+                .count();
+            let content_start = index + run;
+            let end = find_code_span_end(markdown, content_start, run).unwrap_or(markdown.len());
+            escaped.push_str(&markdown[index..end]);
+            index = end;
+            continue;
+        }
+        if character == '$'
+            && markdown[index + character.len_utf8()..]
+                .chars()
+                .next()
+                .is_some_and(|next| next.is_ascii_digit())
+        {
+            let content_start = index + character.len_utf8();
+            let close = find_unescaped_dollar(markdown, content_start);
+            let is_currency = close
+                .is_some_and(|close| currency_math_source(&markdown[content_start..close]))
+                || close.is_none() && currency_math_source(&markdown[content_start..]);
+            if is_currency {
+                escaped.push('\\');
+                escaped.push('$');
+                index = content_start;
+                continue;
+            }
+        }
+        escaped.push(character);
+        index += character.len_utf8();
+    }
+    escaped
+}
+
+fn find_code_span_end(markdown: &str, mut index: usize, delimiter_len: usize) -> Option<usize> {
+    while index < markdown.len() {
+        let character = markdown[index..]
+            .chars()
+            .next()
+            .expect("index must remain on a character boundary");
+        if character != '`' {
+            index += character.len_utf8();
+            continue;
+        }
+        let run = markdown[index..]
+            .chars()
+            .take_while(|character| *character == '`')
+            .count();
+        if run == delimiter_len {
+            return Some(index + run);
+        }
+        index += run;
+    }
+    None
+}
+
+fn find_unescaped_dollar(markdown: &str, mut index: usize) -> Option<usize> {
+    while index < markdown.len() {
+        let character = markdown[index..]
+            .chars()
+            .next()
+            .expect("index must remain on a character boundary");
+        if character == '\\' {
+            index += character.len_utf8();
+            if let Some(next) = markdown[index..].chars().next() {
+                index += next.len_utf8();
+            }
+            continue;
+        }
+        if character == '$' {
+            return Some(index);
+        }
+        index += character.len_utf8();
+    }
+    None
+}
+
 fn currency_math_source(source: &str) -> bool {
     let lower = source.to_ascii_lowercase();
-    source
+    let starts_numeric = source
         .chars()
         .next()
-        .is_some_and(|character| character.is_ascii_digit())
-        && ["/hour", "/day", "/month", " per hour", " per day"]
-            .iter()
-            .any(|suffix| lower.contains(suffix))
+        .is_some_and(|character| character.is_ascii_digit());
+    if !starts_numeric {
+        return false;
+    }
+    if ["/hour", "/day", "/month", " per hour", " per day"]
+        .iter()
+        .any(|suffix| lower.contains(suffix))
+    {
+        return true;
+    }
+    if source.contains('\\') {
+        return false;
+    }
+    if source.contains(['–', '—']) || source.contains("**") {
+        return true;
+    }
+    let has_word = source.split_whitespace().any(|word| {
+        word.chars()
+            .filter(|character| character.is_ascii_alphabetic())
+            .count()
+            >= 2
+    });
+    let has_uppercase_suffix = source
+        .chars()
+        .skip_while(|character| character.is_ascii_digit() || matches!(character, '.' | ','))
+        .next()
+        .is_some_and(|character| character.is_ascii_uppercase());
+    has_word || has_uppercase_suffix
 }
 
 fn push_terminal_math_lines(

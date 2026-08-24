@@ -1,3 +1,5 @@
+const USER_INTERRUPT_ACTIVITY: &str = "agent interrupted by user";
+
 struct Transcript {
     order: Vec<TranscriptEntry>,
     messages: HashMap<Uuid, usize>,
@@ -2200,14 +2202,29 @@ impl Transcript {
                         | TranscriptEntry::Action { .. }
                         | TranscriptEntry::Compaction { .. }
                 );
-            if starts_labeled_group
+            let separator_start = lines.len();
+            let added_group_separator = if starts_labeled_group
                 && lines
                     .last()
                     .is_none_or(|line: &Line<'static>| !line.spans.is_empty())
             {
                 lines.push(Line::default());
-            }
-            let entry_start = lines.len();
+                true
+            } else {
+                false
+            };
+            let entry_start = if added_group_separator
+                && matches!(
+                    entry,
+                    TranscriptEntry::Message {
+                        actor: EventActor::User | EventActor::Assistant,
+                        ..
+                    }
+                ) {
+                separator_start
+            } else {
+                lines.len()
+            };
             match entry {
                 TranscriptEntry::Message {
                     actor,
@@ -2230,7 +2247,9 @@ impl Transcript {
                         EventActor::Tool => ("Tool".to_string(), Color::Blue),
                         EventActor::System => ("System".to_string(), Color::DarkGray),
                     };
-                    if matches!(actor, EventActor::User | EventActor::Assistant) {
+                    if matches!(actor, EventActor::User | EventActor::Assistant)
+                        && !added_group_separator
+                    {
                         lines.push(Line::default());
                     }
                     let time = display_local_time(time, &today_prefix);
@@ -2354,7 +2373,9 @@ impl Transcript {
                 TranscriptEntry::Activity { text, time } => {
                     let time = display_local_time(time, &today_prefix);
                     let prefix = if tool_window.is_some() { "│ " } else { "  " };
-                    let activity_color = if is_subagent_activity_text(text) {
+                    let activity_color = if text == USER_INTERRUPT_ACTIVITY {
+                        Color::LightRed
+                    } else if is_subagent_activity_text(text) {
                         SUBAGENT_PINK
                     } else {
                         Color::DarkGray

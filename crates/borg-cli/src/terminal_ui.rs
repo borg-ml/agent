@@ -2703,6 +2703,21 @@ impl BorgTerminal {
         self.notice = Some(notice.into());
     }
 
+    fn record_user_interrupt(&mut self) {
+        if self.active_status() != SessionStatus::Running {
+            return;
+        }
+        self.transcript.order.push(TranscriptEntry::Activity {
+            text: USER_INTERRUPT_ACTIVITY.to_string(),
+            time: canonical_local_time(Local::now()),
+        });
+        self.transcript.follow_tail = true;
+        self.scroll_from_bottom = 0;
+        self.transcript_render_cache = None;
+        self.transcript_full_render_cache = None;
+        self.event_redraw_needed = true;
+    }
+
     pub fn hydrate_payload(&mut self, payload: &SessionPayloadRef, bytes: Vec<u8>) -> Result<()> {
         self.transcript.hydrate_payload(payload, bytes)?;
         self.transcript.tool_body_cache.get_mut().lines.clear();
@@ -6337,6 +6352,7 @@ impl BorgTerminal {
         }
         if let Some(target) = focused_child_interrupt_target(&self.keymap, &key, self.focused_child)
         {
+            self.record_user_interrupt();
             return Ok(UiAction::Interrupt {
                 target: Some(target),
             });
@@ -6524,6 +6540,7 @@ impl BorgTerminal {
             return Ok(UiAction::None);
         }
         if self.keymap.matches(KeyAction::Interrupt, &key) {
+            self.record_user_interrupt();
             return Ok(UiAction::Interrupt {
                 target: self.focused_child,
             });

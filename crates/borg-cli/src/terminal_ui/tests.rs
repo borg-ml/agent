@@ -3469,6 +3469,21 @@ fn markdown_currency_does_not_become_terminal_math() {
 }
 
 #[test]
+fn markdown_currency_inside_bold_text_stays_literal() {
+    let markdown = "The pilot is **$7.60–7.82**, with a hard **$20 cap** and roughly **$65K**.";
+    let rendered = markdown_lines(markdown, 80, Some(Color::White));
+    let text = rendered
+        .iter()
+        .map(Line::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("$7.60–7.82"), "{text}");
+    assert!(text.contains("$20 cap"), "{text}");
+    assert!(text.contains("$65K"), "{text}");
+    assert!(!text.contains('·'), "{text}");
+}
+
+#[test]
 fn quoted_pasted_text_keeps_gutter_without_code_line_numbers() {
     let markdown = "> ```text\n> pasted first line\n> pasted second line\n> ```";
     let rendered = markdown_lines(markdown, 80, None)
@@ -6588,7 +6603,18 @@ fn transcript_separates_labeled_groups_from_header_and_tool_activity() {
     transcript.assistant_label = "borg".to_string();
 
     let lines = transcript.lines(80);
-    assert!(lines.first().is_some_and(|line| line.spans.is_empty()));
+    assert!(
+        lines
+            .first()
+            .is_some_and(|line| line.to_string().trim().is_empty())
+    );
+    assert_eq!(
+        lines
+            .first()
+            .and_then(|line| line.spans.last())
+            .and_then(|span| span.style.bg),
+        Some(MESSAGE_BG)
+    );
     let user_label = lines
         .iter()
         .flat_map(|line| line.spans.iter())
@@ -6638,6 +6664,22 @@ fn transcript_separates_labeled_groups_from_header_and_tool_activity() {
         .position(|line| line.spans.iter().any(|span| span.content.contains("Plan")))
         .expect("plan header");
     assert!(lines[plan_header - 1].spans.is_empty());
+}
+
+#[test]
+fn user_interrupt_activity_is_rendered_in_red() {
+    let mut transcript = Transcript::default();
+    transcript.order.push(TranscriptEntry::Activity {
+        text: USER_INTERRUPT_ACTIVITY.to_string(),
+        time: "12:00".to_string(),
+    });
+
+    let line = transcript
+        .lines(80)
+        .into_iter()
+        .find(|line| line.to_string().contains(USER_INTERRUPT_ACTIVITY))
+        .expect("interrupt activity");
+    assert_eq!(line.spans[1].style.fg, Some(Color::LightRed));
 }
 
 #[test]
