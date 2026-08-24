@@ -1624,35 +1624,20 @@ fn expensive_draws_leave_time_for_input_and_animation_events() {
         responsive_tui_frame_interval(60, std::time::Duration::from_millis(40), true),
         std::time::Duration::from_millis(40)
     );
+    assert_eq!(
+        responsive_tui_frame_interval(60, std::time::Duration::from_millis(500), false),
+        MAX_RENDER_BACKOFF_INTERVAL
+    );
 }
 
 #[test]
-fn active_terminal_frames_do_not_depend_on_composer_text() {
-    assert!(terminal_needs_activity_tick(
-        false,
-        false,
-        SessionStatus::Starting
-    ));
-    assert!(terminal_needs_activity_tick(
-        false,
-        false,
-        SessionStatus::Running
-    ));
-    assert!(terminal_needs_activity_tick(
-        true,
-        false,
-        SessionStatus::Ready
-    ));
-    assert!(terminal_needs_activity_tick(
-        false,
-        true,
-        SessionStatus::Ready
-    ));
-    assert!(!terminal_needs_activity_tick(
-        false,
-        false,
-        SessionStatus::Ready
-    ));
+fn terminal_animation_ticks_separate_active_and_idle_rates() {
+    assert!(terminal_needs_activity_tick(SessionStatus::Starting));
+    assert!(terminal_needs_activity_tick(SessionStatus::Running));
+    assert!(!terminal_needs_activity_tick(SessionStatus::Ready));
+    assert!(terminal_needs_idle_tick(true, false));
+    assert!(terminal_needs_idle_tick(false, true));
+    assert!(!terminal_needs_idle_tick(false, false));
 }
 
 #[tokio::test]

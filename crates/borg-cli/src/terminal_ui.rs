@@ -89,6 +89,7 @@ const GOAL_CLEAR_COMMAND: &str = "/goal clear";
 const DIRECTOR_CONTEXT_BOUNDARY: &str = "— context provided by director agent —";
 const DOUBLE_CTRL_C_WINDOW: Duration = Duration::from_secs(1);
 const COPY_NOTICE_DURATION: Duration = Duration::from_secs(5);
+const SPLASH_ANIMATION_DURATION: Duration = Duration::from_millis(1_500);
 const NESTED_SCROLL_GESTURE_GAP: Duration = Duration::from_millis(200);
 const WHEEL_SCROLL_VIEWPORT_DIVISOR: usize = 6;
 const MIN_WHEEL_SCROLL_LINES_PER_EVENT: usize = 1;
@@ -175,14 +176,7 @@ type TranscriptRender = (
     Vec<LinkRowRange>,
     Vec<SelectionRowRange>,
 );
-type CachedTranscriptRender = (
-    usize,
-    usize,
-    Option<i64>,
-    Option<usize>,
-    NaiveDate,
-    Arc<TranscriptRender>,
-);
+type CachedTranscriptRender = (usize, usize, Option<i64>, NaiveDate, Arc<TranscriptRender>);
 
 /// A semantic viewport position that survives transcript reflow.  Tool bodies
 /// are special: after they collapse their header is the nearest durable row.
@@ -2171,6 +2165,10 @@ impl BorgTerminal {
             && self.composer.attachments.is_empty()
     }
 
+    pub fn has_active_splash_animation(&self) -> bool {
+        self.is_launch_screen() && self.splash_started_at.elapsed() < SPLASH_ANIMATION_DURATION
+    }
+
     pub fn has_expiring_notice(&self) -> bool {
         self.copy_notice_expires_at.is_some()
     }
@@ -4072,7 +4070,7 @@ impl BorgTerminal {
     }
 
     fn copy_text_selection(&mut self) -> bool {
-        let Some((_, _, _, _, _, render)) = self.transcript_render_cache.as_ref() else {
+        let Some((_, _, _, _, render)) = self.transcript_render_cache.as_ref() else {
             return false;
         };
         let Some((start, end)) = self
@@ -4124,7 +4122,7 @@ impl BorgTerminal {
         let Some(area) = self.transcript_viewport_area else {
             return;
         };
-        let Some((_, _, _, _, _, render)) = self.transcript_render_cache.as_ref() else {
+        let Some((_, _, _, _, render)) = self.transcript_render_cache.as_ref() else {
             return;
         };
         self.pending_transcript_anchor = transcript_viewport_anchor(
@@ -4376,7 +4374,6 @@ impl BorgTerminal {
         let tool_run_viewport_height = tool_run_viewport_height(terminal_size.height as usize);
         let full_transcript_width = content_width.max(1) as usize;
         let goal_tick = self.transcript.active_goal_cache_tick();
-        let tool_spinner_tick = self.transcript.tool_spinner_cache_tick();
         let local_date = Local::now().date_naive();
         // Keep a separate full-width measurement so an overflowing transcript
         // can switch to the scrollbar-safe width without rendering both widths
@@ -4388,7 +4385,6 @@ impl BorgTerminal {
                 full_transcript_width,
                 tool_run_viewport_height,
                 goal_tick,
-                tool_spinner_tick,
                 local_date,
             )
         } else {
@@ -4399,7 +4395,6 @@ impl BorgTerminal {
                 full_transcript_width,
                 tool_run_viewport_height,
                 goal_tick,
-                tool_spinner_tick,
                 local_date,
             )
         };
@@ -4714,7 +4709,6 @@ impl BorgTerminal {
                 transcript_width,
                 tool_run_viewport_height,
                 goal_tick,
-                tool_spinner_tick,
                 local_date,
             )
         };
@@ -9569,35 +9563,25 @@ fn cached_transcript_render(
     width: usize,
     tool_run_viewport_height: usize,
     goal_tick: Option<i64>,
-    tool_spinner_tick: Option<usize>,
     local_date: NaiveDate,
 ) -> Arc<TranscriptRender> {
     cache
         .as_ref()
         .filter(
-            |(
-                cached_width,
-                cached_tool_run_viewport_height,
-                cached_goal_tick,
-                cached_tool_spinner_tick,
-                cached_date,
-                _,
-            )| {
+            |(cached_width, cached_tool_run_viewport_height, cached_goal_tick, cached_date, _)| {
                 *cached_width == width
                     && *cached_tool_run_viewport_height == tool_run_viewport_height
                     && *cached_goal_tick == goal_tick
-                    && *cached_tool_spinner_tick == tool_spinner_tick
                     && *cached_date == local_date
             },
         )
-        .map(|(_, _, _, _, _, render)| Arc::clone(render))
+        .map(|(_, _, _, _, render)| Arc::clone(render))
         .unwrap_or_else(|| {
             let render = Arc::new(transcript.render_for_cache(width, tool_run_viewport_height));
             *cache = Some((
                 width,
                 tool_run_viewport_height,
                 goal_tick,
-                tool_spinner_tick,
                 local_date,
                 Arc::clone(&render),
             ));
@@ -10205,9 +10189,7 @@ fn splash_logo_line(elapsed: Duration, seed: u64) -> Line<'static> {
         ['한', 'Я', '東', 'Я', '₹', '尺', 'र', 'Ř'],
         ['ก', 'न', 'Ω', 'Ğ', 'Ԍ', 'Ǥ', 'Ǧ', 'ဂ'],
     ];
-    // Repeat the short glitch phase while the launch screen is visible.
     let phase = (elapsed.as_millis() / 110) as u64;
-    let cycle_phase = phase % 45;
     let mut random = splitmix64(seed ^ phase.wrapping_mul(0x9e37_79b9_7f4a_7c15));
     let roll = random % 100;
     let changed_count = if roll < 76 {
@@ -10221,7 +10203,7 @@ fn splash_logo_line(elapsed: Duration, seed: u64) -> Line<'static> {
     };
     let mut cells = ORIGINAL;
     let mut changed = [false; 4];
-    if cycle_phase < 12 {
+    if phase < 12 {
         for _ in 0..changed_count {
             random = splitmix64(random);
             let mut index = (random % 4) as usize;

@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 use chrono::{DateTime, Utc};
-use reqwest::{Client, StatusCode};
+use reqwest::{Client, StatusCode, header::RETRY_AFTER};
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 use tokio::sync::{Mutex, mpsc, watch};
@@ -61,6 +61,38 @@ const SYSTEMD_ISOLATION_ATTESTATION: &str = "systemd-user-sandbox-v1";
 const ISOLATION_ATTESTATION_ENV: &str = "BORG_HOST_ISOLATION_ATTESTATION";
 const PROVIDER_CAPABILITIES_CACHE_TTL: Duration = Duration::from_secs(5);
 const PROVIDER_AUTH_JSON_MAX_BYTES: u64 = 1024 * 1024;
+const REMOTE_RETRY_INITIAL: Duration = Duration::from_secs(2);
+const REMOTE_RETRY_MAX: Duration = Duration::from_secs(60);
+const REMOTE_RETRY_AFTER_MAX: Duration = Duration::from_secs(300);
+
+#[derive(Default)]
+struct RemoteRetryBackoff {
+    failures: u32,
+}
+
+impl RemoteRetryBackoff {
+    fn next_delay(&mut self, retry_after: Option<Duration>) -> Duration {
+        let multiplier = 1_u32 << self.failures.min(5);
+        self.failures = self.failures.saturating_add(1);
+        REMOTE_RETRY_INITIAL
+            .saturating_mul(multiplier)
+            .min(REMOTE_RETRY_MAX)
+            .max(retry_after.unwrap_or_default().min(REMOTE_RETRY_AFTER_MAX))
+    }
+
+    fn reset(&mut self) {
+        self.failures = 0;
+    }
+}
+
+fn response_retry_after(response: &reqwest::Response) -> Option<Duration> {
+    response
+        .headers()
+        .get(RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
+}
 
 type ProviderCapabilitiesCache = HashMap<bool, (Instant, Vec<ProviderCapability>)>;
 
@@ -1443,6 +1475,7 @@ pub async fn run_host_with_executor_factory(
         probe_capabilities_with_profile(config.roots.clone(), config.execution_profile).await;
     capabilities.resource_limits = config.resource_limits.clone();
     let mut capabilities_probed_at = Instant::now();
+    let mut command_poll_backoff = RemoteRetryBackoff::default();
     loop {
         if capabilities_probed_at.elapsed() >= Duration::from_secs(300) {
             capabilities =
@@ -1477,8 +1510,13 @@ pub async fn run_host_with_executor_factory(
         let response = match response {
             Ok(response) => response,
             Err(error) => {
-                tracing::warn!(%error, "remote command poll failed; retrying");
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                let retry_delay = command_poll_backoff.next_delay(None);
+                tracing::warn!(
+                    %error,
+                    retry_seconds = retry_delay.as_secs(),
+                    "remote command poll failed; retrying"
+                );
+                tokio::time::sleep(retry_delay).await;
                 continue;
             }
         };
@@ -1486,10 +1524,16 @@ pub async fn run_host_with_executor_factory(
             bail!("remote host token was rejected; enroll this host again");
         }
         if !response.status().is_success() {
-            tracing::warn!(status = %response.status(), "remote command poll failed");
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            let retry_delay = command_poll_backoff.next_delay(response_retry_after(&response));
+            tracing::warn!(
+                status = %response.status(),
+                retry_seconds = retry_delay.as_secs(),
+                "remote command poll failed"
+            );
+            tokio::time::sleep(retry_delay).await;
             continue;
         }
+        command_poll_backoff.reset();
         let commands: CommandsResponse = response
             .json()
             .await
@@ -1547,12 +1591,13 @@ pub async fn mirror_local_session(
     ensure_execution_boundary(&config)?;
     let client = Client::builder()
         .connect_timeout(Duration::from_secs(3))
-        .timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(35))
         .build()?;
     let registration = serde_json::json!({
         "session_id": session_id,
         "request": request,
     });
+    let mut registration_backoff = RemoteRetryBackoff::default();
     let command_cursor = loop {
         let response = client
             .post(endpoint(&config.server, "/api/remote/host/sessions"))
@@ -1560,7 +1605,7 @@ pub async fn mirror_local_session(
             .json(&registration)
             .send()
             .await;
-        match response {
+        let retry_delay = match response {
             Ok(response) if response.status().is_success() => {
                 let registered: RegisterSessionResponse = response
                     .json()
@@ -1582,10 +1627,13 @@ pub async fn mirror_local_session(
                 if response.status().is_server_error()
                     || response.status() == StatusCode::TOO_MANY_REQUESTS =>
             {
+                let retry_delay = registration_backoff.next_delay(response_retry_after(&response));
                 tracing::warn!(
                     status = %response.status(),
+                    retry_seconds = retry_delay.as_secs(),
                     "local session registration failed; retrying"
                 );
+                retry_delay
             }
             Ok(response) => {
                 let status = response.status();
@@ -1596,10 +1644,16 @@ pub async fn mirror_local_session(
                 bail!("remote session registration was rejected ({status}): {detail}");
             }
             Err(error) => {
-                tracing::warn!(%error, "local session registration failed; retrying");
+                let retry_delay = registration_backoff.next_delay(None);
+                tracing::warn!(
+                    %error,
+                    retry_seconds = retry_delay.as_secs(),
+                    "local session registration failed; retrying"
+                );
+                retry_delay
             }
-        }
-        if wait_for_mirror_shutdown(&mut shutdown, Duration::from_secs(2)).await {
+        };
+        if wait_for_mirror_shutdown(&mut shutdown, retry_delay).await {
             return Ok(());
         }
     };
@@ -1612,6 +1666,7 @@ pub async fn mirror_local_session(
     let mut command_claim_token = None;
     let mut event_retry_at = Instant::now();
     let mut shutdown_flush_pending = false;
+    let mut command_poll_backoff = RemoteRetryBackoff::default();
     loop {
         if last_heartbeat.elapsed() >= Duration::from_secs(15) {
             if let Err(error) = heartbeat(
@@ -1696,7 +1751,7 @@ pub async fn mirror_local_session(
             .bearer_auth(&config.host_token)
             .query(&[
                 ("after", command_cursor.to_string()),
-                ("wait_seconds", "1".to_string()),
+                ("wait_seconds", "20".to_string()),
                 ("protocol", "1".to_string()),
             ])
             .send();
@@ -1717,7 +1772,10 @@ pub async fn mirror_local_session(
             continue;
         };
         let response = match response {
-            Ok(response) if response.status().is_success() => response,
+            Ok(response) if response.status().is_success() => {
+                command_poll_backoff.reset();
+                response
+            }
             Ok(response) if response.status() == StatusCode::UNAUTHORIZED => {
                 bail!("remote host token was rejected; enroll this host again");
             }
@@ -1728,15 +1786,25 @@ pub async fn mirror_local_session(
                 );
             }
             Ok(response) => {
-                tracing::warn!(status = %response.status(), "local session command poll failed");
-                if wait_for_mirror_shutdown(&mut shutdown, Duration::from_secs(2)).await {
+                let retry_delay = command_poll_backoff.next_delay(response_retry_after(&response));
+                tracing::warn!(
+                    status = %response.status(),
+                    retry_seconds = retry_delay.as_secs(),
+                    "local session command poll failed"
+                );
+                if wait_for_mirror_shutdown(&mut shutdown, retry_delay).await {
                     continue;
                 }
                 continue;
             }
             Err(error) => {
-                tracing::warn!(%error, "local session command poll failed");
-                if wait_for_mirror_shutdown(&mut shutdown, Duration::from_secs(2)).await {
+                let retry_delay = command_poll_backoff.next_delay(None);
+                tracing::warn!(
+                    %error,
+                    retry_seconds = retry_delay.as_secs(),
+                    "local session command poll failed"
+                );
+                if wait_for_mirror_shutdown(&mut shutdown, retry_delay).await {
                     continue;
                 }
                 continue;
@@ -3655,6 +3723,22 @@ mod tests {
             .await
             .unwrap();
         SqliteReceiptStore::open(pool).await.unwrap()
+    }
+
+    #[test]
+    fn remote_retry_backoff_grows_respects_retry_after_and_resets() {
+        let mut backoff = RemoteRetryBackoff::default();
+        assert_eq!(backoff.next_delay(None), Duration::from_secs(2));
+        assert_eq!(backoff.next_delay(None), Duration::from_secs(4));
+        assert_eq!(
+            backoff.next_delay(Some(Duration::from_secs(90))),
+            Duration::from_secs(90)
+        );
+        for _ in 0..8 {
+            assert!(backoff.next_delay(None) <= REMOTE_RETRY_MAX);
+        }
+        backoff.reset();
+        assert_eq!(backoff.next_delay(None), REMOTE_RETRY_INITIAL);
     }
 
     #[test]

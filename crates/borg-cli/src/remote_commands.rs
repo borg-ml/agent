@@ -52,6 +52,8 @@ mod local_server;
 const MIN_TUI_FPS: u64 = 15;
 const MAX_TUI_FPS: u64 = 240;
 const ACTIVITY_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(120);
+const IDLE_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+const MAX_RENDER_BACKOFF_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 /// Keep first paint bounded while retaining enough context to include a real
 /// recent exchange instead of an empty shell made only of projection events.
 const RICH_TUI_HISTORY_EVENT_LIMIT: usize = 128;
@@ -1763,6 +1765,8 @@ async fn run_local_agent_session(
     let mut render_tick = tui_render_interval(render_frame_interval);
     let mut activity_tick = tokio::time::interval(ACTIVITY_FRAME_INTERVAL);
     activity_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut idle_tick = tokio::time::interval(IDLE_FRAME_INTERVAL);
+    idle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut cache_tick = tokio::time::interval(std::time::Duration::from_secs(30));
     cache_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut agent_config_tick = tokio::time::interval(std::time::Duration::from_millis(500));
@@ -2010,12 +2014,17 @@ async fn run_local_agent_session(
                 terminal_dirty = terminal.has_pending_scroll_frame();
             }
             _ = activity_tick.tick(), if terminal.as_ref().is_some_and(|terminal| {
-                terminal_needs_activity_tick(
+                terminal_needs_activity_tick(status)
+                    || terminal.has_active_splash_animation()
+                    || terminal.is_history_page_loading()
+            }) => {
+                terminal_dirty = true;
+            }
+            _ = idle_tick.tick(), if terminal.as_ref().is_some_and(|terminal| {
+                terminal_needs_idle_tick(
                     terminal.has_expiring_notice(),
                     terminal.has_blinking_cursor(),
-                    status,
-                ) || terminal.is_launch_screen()
-                    || terminal.is_history_page_loading()
+                )
             }) => {
                 terminal_dirty = true;
             }
@@ -5831,7 +5840,7 @@ fn responsive_tui_frame_interval(
         } else {
             last_draw.saturating_mul(3)
         })
-        .min(ACTIVITY_FRAME_INTERVAL)
+        .min(MAX_RENDER_BACKOFF_INTERVAL)
 }
 
 fn parse_on_off(value: &str) -> Option<bool> {
@@ -5907,14 +5916,12 @@ fn tui_render_interval(frame_interval: std::time::Duration) -> tokio::time::Inte
     interval
 }
 
-fn terminal_needs_activity_tick(
-    has_expiring_notice: bool,
-    has_blinking_cursor: bool,
-    status: SessionStatus,
-) -> bool {
-    has_expiring_notice
-        || has_blinking_cursor
-        || matches!(status, SessionStatus::Starting | SessionStatus::Running)
+fn terminal_needs_activity_tick(status: SessionStatus) -> bool {
+    matches!(status, SessionStatus::Starting | SessionStatus::Running)
+}
+
+fn terminal_needs_idle_tick(has_expiring_notice: bool, has_blinking_cursor: bool) -> bool {
+    has_expiring_notice || has_blinking_cursor
 }
 
 fn spawn_terminal_input() -> mpsc::Receiver<io::Result<String>> {

@@ -1306,7 +1306,7 @@ fn native_edit_file_keeps_the_replacement_diff_after_its_mutation_receipt() {
 }
 
 #[test]
-fn running_tool_uses_animated_spinner() {
+fn running_tool_uses_a_stable_marker_without_invalidating_transcript_cache() {
     let mut transcript = Transcript::default();
     transcript.apply(&SessionEvent::new(
         Uuid::new_v4(),
@@ -1319,14 +1319,15 @@ fn running_tool_uses_animated_spinner() {
         },
     ));
 
-    assert!(transcript.tool_spinner_cache_tick().is_some());
+    assert!(transcript.has_running_tool());
     let rendered = transcript
         .lines(100)
         .into_iter()
         .map(|line| line.to_string())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(rendered.chars().any(|glyph| "⠋⠙⠹⠸⠼⠴⠦⠧".contains(glyph)));
+    assert!(rendered.contains('●'));
+    assert!(!rendered.chars().any(|glyph| "⠋⠙⠹⠸⠼⠴⠦⠧".contains(glyph)));
     assert!(!rendered.contains('↳'));
 }
 
@@ -5893,7 +5894,7 @@ fn recovered_idle_session_stops_orphaned_tool_spinner() {
             input_ref: None,
         },
     ));
-    assert!(transcript.tool_spinner_cache_tick().is_some());
+    assert!(transcript.has_running_tool());
 
     transcript.reconcile_session_status(&SessionState {
         status: Some(SessionStatus::Ready),
@@ -5901,7 +5902,7 @@ fn recovered_idle_session_stops_orphaned_tool_spinner() {
         ..SessionState::default()
     });
 
-    assert!(transcript.tool_spinner_cache_tick().is_none());
+    assert!(!transcript.has_running_tool());
     assert!(matches!(
         transcript.order.first(),
         Some(TranscriptEntry::Tool { complete: true, .. })
@@ -6024,6 +6025,10 @@ fn splash_logo_randomizes_glitches_and_then_settles() {
     assert_eq!(splash_alpha_line().to_string(), "αlphα");
     assert_eq!(
         splash_logo_line(Duration::from_millis(1_320), 7).to_string(),
+        "B O R G"
+    );
+    assert_eq!(
+        splash_logo_line(Duration::from_secs(30), 7).to_string(),
         "B O R G"
     );
     let glitch = splash_logo_line(Duration::ZERO, 7).to_string();
@@ -7322,14 +7327,14 @@ fn reasoning_is_one_live_muted_disclosure_that_collapses_at_a_tool_boundary() {
             && language == "reasoning"
             && source == "Checking the source"
     ));
-    assert!(transcript.tool_spinner_cache_tick().is_some());
+    assert!(transcript.has_running_tool());
     let rendered = transcript
         .lines(100)
         .into_iter()
         .map(|line| line.to_string())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(rendered.chars().any(|glyph| "⠋⠙⠹⠸⠼⠴⠦⠧".contains(glyph)));
+    assert!(rendered.contains('●'));
 
     transcript.apply(&SessionEvent::new(
         session_id,

@@ -2034,10 +2034,6 @@ impl Transcript {
             })
     }
 
-    fn tool_spinner_cache_tick(&self) -> Option<usize> {
-        self.has_running_tool().then(spinner_frame_index)
-    }
-
     fn has_running_tool(&self) -> bool {
         self.order.iter().any(|entry| {
             matches!(
@@ -2695,7 +2691,7 @@ impl Transcript {
                     } else if *complete {
                         "✓"
                     } else {
-                        activity_glyph(SessionStatus::Running)
+                        "●"
                     };
                     let style = if *error || *user_interrupted {
                         Style::default().fg(Color::Red)
