@@ -103,6 +103,8 @@ The profiling variant writes one bounded, content-free snapshot to
 provider setup, provider wait, first model output, tool execution, and
 aggregated count/average/p95/max timings. The snapshot is not part of the
 durable session journal and is only created when BORG_PROFILE is enabled.
+`borg inspect live` also ranks the top three measured phases by wall-time
+share, so a dominant provider wait or tool phase is immediately visible.
 
 This semantic profile explains where a turn spends wall time. For CPU-only
 hotspots, attach the platform profiler separately (for example perf record on

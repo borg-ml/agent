@@ -11,6 +11,7 @@ use uuid::Uuid;
 use crate::cli::{InspectArgs, InspectCommand};
 
 const OWNER_FILE_SUFFIX: &str = ".control.owner.json";
+const MAX_HOTSPOTS: usize = 3;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct OwnerMetadata {
@@ -28,7 +29,19 @@ struct LiveSessionInspection {
     running: bool,
     profile_path: PathBuf,
     profile: Option<RuntimeProfileSnapshot>,
+    hotspots: Vec<ProfileHotspot>,
     profile_error: Option<String>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct ProfileHotspot {
+    phase: String,
+    total_ms: u64,
+    count: u64,
+    average_ms: u64,
+    p95_ms: u64,
+    max_ms: u64,
+    share_percent: u8,
 }
 
 #[derive(Debug, Serialize)]
@@ -128,14 +141,52 @@ fn inspect_session(sessions_dir: &Path, session_id: Uuid) -> Result<LiveSessionI
         Err(_) if !profile_path.exists() => (None, None),
         Err(error) => (None, Some(error.to_string())),
     };
+    let hotspots = profile.as_ref().map(profile_hotspots).unwrap_or_default();
     Ok(LiveSessionInspection {
         session_id,
         running: owner.as_ref().is_some_and(|owner| owner.running),
         owner,
         profile_path,
         profile,
+        hotspots,
         profile_error,
     })
+}
+
+fn profile_hotspots(profile: &RuntimeProfileSnapshot) -> Vec<ProfileHotspot> {
+    let measured_ms = profile
+        .phases
+        .values()
+        .map(|stats| u128::from(stats.total_ms))
+        .sum::<u128>();
+    if measured_ms == 0 {
+        return Vec::new();
+    }
+    let mut hotspots = profile
+        .phases
+        .iter()
+        .filter(|(_, stats)| stats.total_ms > 0)
+        .map(|(phase, stats)| ProfileHotspot {
+            phase: phase.clone(),
+            total_ms: stats.total_ms,
+            count: stats.count,
+            average_ms: stats.average_ms,
+            p95_ms: stats.p95_ms,
+            max_ms: stats.max_ms,
+            share_percent: u8::try_from(
+                ((u128::from(stats.total_ms) * 100) + measured_ms / 2) / measured_ms,
+            )
+            .unwrap_or(100),
+        })
+        .collect::<Vec<_>>();
+    hotspots.sort_by(|left, right| {
+        right
+            .total_ms
+            .cmp(&left.total_ms)
+            .then_with(|| left.phase.cmp(&right.phase))
+    });
+    hotspots.truncate(MAX_HOTSPOTS);
+    hotspots
 }
 
 fn print_human_inspection(inspection: &LiveSessionInspection) {
@@ -178,11 +229,20 @@ fn print_human_inspection(inspection: &LiveSessionInspection) {
                     if last_turn.success { "ok" } else { "failed" }
                 );
             }
-            for (phase, stats) in &profile.phases {
-                println!(
-                    "    {phase}: count={} avg={} ms p95={} ms max={} ms",
-                    stats.count, stats.average_ms, stats.p95_ms, stats.max_ms
-                );
+            if !inspection.hotspots.is_empty() {
+                println!("  hotspots by measured wall time:");
+                for hotspot in &inspection.hotspots {
+                    println!(
+                        "    {}: {}% · total={} ms · count={} · avg={} ms p95={} ms max={} ms",
+                        hotspot.phase,
+                        hotspot.share_percent,
+                        hotspot.total_ms,
+                        hotspot.count,
+                        hotspot.average_ms,
+                        hotspot.p95_ms,
+                        hotspot.max_ms
+                    );
+                }
             }
         }
         None if inspection.profile_error.is_some() => {
@@ -198,6 +258,67 @@ fn print_human_inspection(inspection: &LiveSessionInspection) {
             "  profile: off · use a profiling build with BORG_PROFILE=1; path={}",
             inspection.profile_path.display()
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use borg_remote::RuntimeProfilePhase;
+    use chrono::Utc;
+
+    #[test]
+    fn hotspot_ranking_uses_measured_time_and_is_bounded() {
+        let mut phases = std::collections::BTreeMap::new();
+        for (name, total_ms, count) in [
+            ("provider_wait", 800_u64, 4_u64),
+            ("model_output", 150, 3),
+            ("tool_execution", 50, 2),
+            ("prepare", 1, 1),
+        ] {
+            phases.insert(
+                name.to_string(),
+                RuntimeProfilePhase {
+                    count,
+                    total_ms,
+                    max_ms: total_ms,
+                    average_ms: total_ms / count,
+                    p95_ms: total_ms,
+                    buckets: [0; 13],
+                },
+            );
+        }
+        let profile = RuntimeProfileSnapshot {
+            schema_version: 1,
+            session_id: Uuid::nil(),
+            pid: 1,
+            started_at: Utc::now(),
+            updated_at: Utc::now(),
+            active_turn: None,
+            current_phase: None,
+            current_phase_started_at: None,
+            turns_completed: 1,
+            last_turn: None,
+            phases,
+        };
+
+        let hotspots = profile_hotspots(&profile);
+
+        assert_eq!(hotspots.len(), 3);
+        assert_eq!(
+            hotspots[0],
+            ProfileHotspot {
+                phase: "provider_wait".to_string(),
+                total_ms: 800,
+                count: 4,
+                average_ms: 200,
+                p95_ms: 800,
+                max_ms: 800,
+                share_percent: 80,
+            }
+        );
+        assert_eq!(hotspots[1].phase, "model_output");
+        assert_eq!(hotspots[2].phase, "tool_execution");
     }
 }
 
