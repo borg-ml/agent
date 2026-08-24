@@ -20,7 +20,7 @@ use borg_remote::{
     SubagentSnapshot, SubagentStatus, TodoAction, default_host_config_path, enroll_host,
     force_terminate_local_session_owner, local_session_owner_uses_current_binary, login_provider,
     mirror_local_session, obsolete_local_session_owner_pid, probe_capabilities,
-    probe_provider_capabilities, provider_credentials_present,
+    probe_provider_admission_capabilities, provider_credentials_present,
     run_agent_session_with_store_and_writer, run_agent_session_with_store_writer_and_peers,
     run_attached_session, run_host_with_executor_factory, send_local_session_command,
     session_control_socket_path,
@@ -1257,7 +1257,7 @@ async fn run_local_agent_session(
         "{provider:?} requires --model or BORG_OPENAI_COMPATIBLE_MODEL"
     );
     let mut capabilities = borg_remote::SessionCapabilities::from(&agent_config.capabilities);
-    capabilities.provider_capabilities = probe_provider_capabilities().await;
+    capabilities.provider_capabilities = probe_provider_admission_capabilities().await;
     let team_policy = agent_config.autonomous_team_policy(&capabilities, provider, session_id);
     if !resuming
         && args.effort.is_none()

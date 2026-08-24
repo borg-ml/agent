@@ -66,6 +66,12 @@ remote-session probe returned the same host-local snapshot in 1.5 µs. The
 five-second cache also single-flights concurrent callers, while its bounded
 freshness keeps provider login changes short-lived.
 
+Persistent-session launch now builds the same provider admission fields from
+executable metadata and bounded local credential JSON, reserving CLI commands
+for detailed status refreshes. The release profile measured this cold
+admission path at 162.9 µs versus 550.5 ms for detailed discovery, a roughly
+3,400× reduction in the fixed launch gate.
+
 For sampled counters, install `perf` and run the command printed by the
 profile script. `cargo-flamegraph` can be used on the same release test binary
 when available.

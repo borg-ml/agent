@@ -18,7 +18,7 @@ use borg_remote::{
     ApprovalDecision, EventActor, HostCommand, LaunchSession, MessageStatus, PlanItemStatus,
     PromptDelivery, ResponseLanguage, SessionCapabilities, SessionConfiguration, SessionEvent,
     SessionEventKind, SessionStore, SessionWriterLease, SqliteSessionStore,
-    default_host_config_path, probe_provider_capabilities, run_agent_session_with_writer,
+    default_host_config_path, probe_provider_admission_capabilities, run_agent_session_with_writer,
 };
 use tokio::sync::{Mutex, broadcast, mpsc};
 use uuid::Uuid;
@@ -494,7 +494,7 @@ impl AcpRuntime {
             }
         });
         let mut capabilities = SessionCapabilities::from(&self.config.capabilities);
-        capabilities.provider_capabilities = probe_provider_capabilities().await;
+        capabilities.provider_capabilities = probe_provider_admission_capabilities().await;
         let launch = LaunchSession {
             request_id: id,
             cwd: cwd.clone(),
@@ -557,7 +557,7 @@ impl AcpRuntime {
             }
         });
         let mut capabilities = SessionCapabilities::from(&self.config.capabilities);
-        capabilities.provider_capabilities = probe_provider_capabilities().await;
+        capabilities.provider_capabilities = probe_provider_admission_capabilities().await;
         let launch = LaunchSession {
             request_id: id,
             cwd: configuration.cwd.clone(),

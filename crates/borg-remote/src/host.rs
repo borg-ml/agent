@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -60,6 +60,7 @@ pub struct HostConfig {
 const SYSTEMD_ISOLATION_ATTESTATION: &str = "systemd-user-sandbox-v1";
 const ISOLATION_ATTESTATION_ENV: &str = "BORG_HOST_ISOLATION_ATTESTATION";
 const PROVIDER_CAPABILITIES_CACHE_TTL: Duration = Duration::from_secs(5);
+const PROVIDER_AUTH_JSON_MAX_BYTES: u64 = 1024 * 1024;
 
 type ProviderCapabilitiesCache = HashMap<bool, (Instant, Vec<ProviderCapability>)>;
 
@@ -885,6 +886,19 @@ pub async fn probe_provider_capabilities() -> Vec<ProviderCapability> {
     probe_provider_capabilities_with_managed_kimi(false).await
 }
 
+/// Build the provider admission snapshot from local executable and credential
+/// metadata without starting every provider CLI. Detailed host/status probes
+/// continue to validate commands and report versions.
+pub async fn probe_provider_admission_capabilities() -> Vec<ProviderCapability> {
+    probe_provider_admission_capabilities_with_managed_kimi(false).await
+}
+
+async fn probe_provider_admission_capabilities_with_managed_kimi(
+    managed_kimi: bool,
+) -> Vec<ProviderCapability> {
+    probe_provider_capabilities_uncached(managed_kimi, ProviderProbeMode::Admission).await
+}
+
 async fn probe_provider_capabilities_with_managed_kimi(
     managed_kimi: bool,
 ) -> Vec<ProviderCapability> {
@@ -896,19 +910,29 @@ async fn probe_provider_capabilities_with_managed_kimi(
         return providers.clone();
     }
 
-    let providers = probe_provider_capabilities_uncached(managed_kimi).await;
+    let providers =
+        probe_provider_capabilities_uncached(managed_kimi, ProviderProbeMode::Detailed).await;
     cache.insert(managed_kimi, (Instant::now(), providers.clone()));
     providers
 }
 
-async fn probe_provider_capabilities_uncached(managed_kimi: bool) -> Vec<ProviderCapability> {
+#[derive(Clone, Copy)]
+enum ProviderProbeMode {
+    Admission,
+    Detailed,
+}
+
+async fn probe_provider_capabilities_uncached(
+    managed_kimi: bool,
+    mode: ProviderProbeMode,
+) -> Vec<ProviderCapability> {
     let (codex, claude, opencode, kimi, openrouter, compatible) = tokio::join!(
-        probe_provider(CodingProvider::Codex, managed_kimi),
-        probe_provider(CodingProvider::Claude, managed_kimi),
-        probe_provider(CodingProvider::OpenCode, managed_kimi),
-        probe_provider(CodingProvider::Kimi, managed_kimi),
-        probe_provider(CodingProvider::OpenRouter, managed_kimi),
-        probe_provider(CodingProvider::OpenAiCompatible, managed_kimi),
+        probe_provider(CodingProvider::Codex, managed_kimi, mode),
+        probe_provider(CodingProvider::Claude, managed_kimi, mode),
+        probe_provider(CodingProvider::OpenCode, managed_kimi, mode),
+        probe_provider(CodingProvider::Kimi, managed_kimi, mode),
+        probe_provider(CodingProvider::OpenRouter, managed_kimi, mode),
+        probe_provider(CodingProvider::OpenAiCompatible, managed_kimi, mode),
     );
     vec![codex, claude, opencode, kimi, openrouter, compatible]
 }
@@ -922,33 +946,67 @@ fn workspace_attachment_capabilities() -> crate::WorkspaceAttachmentCapabilities
     }
 }
 
-async fn probe_provider(provider: CodingProvider, managed_kimi: bool) -> ProviderCapability {
-    let (version, auth_status) = tokio::join!(
-        async {
-            command_output(provider.executable(), &["--version"])
-                .await
-                .ok()
-                .filter(|value| !value.is_empty())
-        },
-        async {
-            match provider {
-                CodingProvider::Codex | CodingProvider::Claude | CodingProvider::OpenCode => {
-                    provider_auth_status(provider).await.ok()
+async fn probe_provider(
+    provider: CodingProvider,
+    managed_kimi: bool,
+    mode: ProviderProbeMode,
+) -> ProviderCapability {
+    let (version, subscription_authenticated) = match mode {
+        ProviderProbeMode::Detailed => {
+            let (version, auth_status) = tokio::join!(
+                async {
+                    command_output(provider.executable(), &["--version"])
+                        .await
+                        .ok()
+                        .filter(|value| !value.is_empty())
+                },
+                async {
+                    match provider {
+                        CodingProvider::Codex
+                        | CodingProvider::Claude
+                        | CodingProvider::OpenCode => provider_auth_status(provider).await.ok(),
+                        CodingProvider::Kimi
+                        | CodingProvider::OpenRouter
+                        | CodingProvider::OpenAiCompatible => None,
+                    }
                 }
+            );
+            let authenticated = match provider {
+                CodingProvider::Codex => auth_status
+                    .as_deref()
+                    .is_some_and(codex_auth_status_authenticated),
+                CodingProvider::Claude => auth_status
+                    .as_deref()
+                    .is_some_and(claude_auth_status_authenticated),
+                CodingProvider::OpenCode => auth_status
+                    .as_deref()
+                    .is_some_and(opencode_auth_status_authenticated),
                 CodingProvider::Kimi
                 | CodingProvider::OpenRouter
-                | CodingProvider::OpenAiCompatible => None,
-            }
+                | CodingProvider::OpenAiCompatible => false,
+            };
+            (version, authenticated)
         }
-    );
+        ProviderProbeMode::Admission => {
+            let authenticated = provider_subscription_credentials_present(provider);
+            #[cfg(target_os = "macos")]
+            let authenticated = if provider == CodingProvider::Claude && !authenticated {
+                provider_auth_status(provider)
+                    .await
+                    .ok()
+                    .as_deref()
+                    .is_some_and(claude_auth_status_authenticated)
+            } else {
+                authenticated
+            };
+            (None, authenticated)
+        }
+    };
     let mut auth_methods = Vec::new();
     let mut detail = Vec::new();
     match provider {
         CodingProvider::Codex => {
-            if auth_status
-                .as_deref()
-                .is_some_and(codex_auth_status_authenticated)
-            {
+            if subscription_authenticated {
                 auth_methods.push(ProviderAuthMethod::Subscription);
                 detail.push("Codex subscription authenticated");
             }
@@ -958,10 +1016,7 @@ async fn probe_provider(provider: CodingProvider, managed_kimi: bool) -> Provide
             }
         }
         CodingProvider::Claude => {
-            if auth_status
-                .as_deref()
-                .is_some_and(claude_auth_status_authenticated)
-            {
+            if subscription_authenticated {
                 auth_methods.push(ProviderAuthMethod::Subscription);
                 detail.push("Claude subscription authenticated");
             }
@@ -975,10 +1030,7 @@ async fn probe_provider(provider: CodingProvider, managed_kimi: bool) -> Provide
             }
         }
         CodingProvider::OpenCode => {
-            if auth_status
-                .as_deref()
-                .is_some_and(opencode_auth_status_authenticated)
-            {
+            if subscription_authenticated {
                 auth_methods.push(ProviderAuthMethod::Subscription);
                 detail.push("OpenCode provider credentials available");
             }
@@ -1033,9 +1085,12 @@ async fn probe_provider(provider: CodingProvider, managed_kimi: bool) -> Provide
         CodingProvider::Kimi | CodingProvider::OpenRouter | CodingProvider::OpenAiCompatible => {
             true
         }
-        CodingProvider::Codex | CodingProvider::Claude | CodingProvider::OpenCode => {
-            version.is_some()
-        }
+        CodingProvider::Codex | CodingProvider::Claude | CodingProvider::OpenCode => match mode {
+            ProviderProbeMode::Admission => {
+                executable_in_path(Path::new(provider.executable())).is_some()
+            }
+            ProviderProbeMode::Detailed => version.is_some(),
+        },
     };
     let can_spawn = installed && authenticated;
     ProviderCapability {
@@ -1046,6 +1101,137 @@ async fn probe_provider(provider: CodingProvider, managed_kimi: bool) -> Provide
         auth_detail: (!detail.is_empty()).then(|| detail.join("; ")),
         auth_methods,
         can_spawn,
+    }
+}
+
+fn provider_subscription_credentials_present(provider: CodingProvider) -> bool {
+    match provider {
+        CodingProvider::Codex => codex_auth_path()
+            .and_then(|path| read_bounded_auth_json(&path))
+            .as_ref()
+            .is_some_and(codex_auth_json_authenticated),
+        CodingProvider::Claude => {
+            nonempty_env("CLAUDE_CODE_OAUTH_TOKEN").is_some()
+                || claude_credentials_path()
+                    .and_then(|path| read_bounded_auth_json(&path))
+                    .as_ref()
+                    .is_some_and(claude_auth_json_authenticated)
+        }
+        CodingProvider::OpenCode => opencode_auth_json()
+            .as_ref()
+            .is_some_and(opencode_auth_json_authenticated),
+        CodingProvider::Kimi | CodingProvider::OpenRouter | CodingProvider::OpenAiCompatible => {
+            false
+        }
+    }
+}
+
+fn codex_auth_path() -> Option<PathBuf> {
+    nonempty_path_env("CODEX_HOME")
+        .map(|directory| directory.join("auth.json"))
+        .or_else(|| nonempty_path_env("HOME").map(|home| home.join(".codex").join("auth.json")))
+}
+
+fn claude_credentials_path() -> Option<PathBuf> {
+    nonempty_path_env("CLAUDE_SECURESTORAGE_CONFIG_DIR")
+        .or_else(|| nonempty_path_env("CLAUDE_CONFIG_DIR"))
+        .map(|directory| directory.join(".credentials.json"))
+        .or_else(|| {
+            nonempty_path_env("HOME").map(|home| home.join(".claude").join(".credentials.json"))
+        })
+}
+
+fn opencode_auth_json() -> Option<serde_json::Value> {
+    if let Ok(contents) = std::env::var("OPENCODE_AUTH_CONTENT")
+        && let Some(value) = parse_bounded_auth_json(contents.as_bytes())
+    {
+        return Some(value);
+    }
+    let data_home = nonempty_path_env("XDG_DATA_HOME")
+        .or_else(|| nonempty_path_env("HOME").map(|home| home.join(".local").join("share")))?;
+    read_bounded_auth_json(&data_home.join("opencode").join("auth.json"))
+}
+
+fn nonempty_path_env(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn read_bounded_auth_json(path: &Path) -> Option<serde_json::Value> {
+    let file = fs::File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    file.take(PROVIDER_AUTH_JSON_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    parse_bounded_auth_json(&bytes)
+}
+
+fn parse_bounded_auth_json(bytes: &[u8]) -> Option<serde_json::Value> {
+    if u64::try_from(bytes.len()).ok()? > PROVIDER_AUTH_JSON_MAX_BYTES {
+        return None;
+    }
+    serde_json::from_slice(bytes).ok()
+}
+
+fn nonempty_json_string(value: Option<&serde_json::Value>) -> bool {
+    value
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn codex_auth_json_authenticated(value: &serde_json::Value) -> bool {
+    value
+        .get("tokens")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|tokens| {
+            tokens
+                .values()
+                .any(|value| nonempty_json_string(Some(value)))
+        })
+        || nonempty_json_string(value.get("OPENAI_API_KEY"))
+}
+
+fn claude_auth_json_authenticated(value: &serde_json::Value) -> bool {
+    value
+        .get("claudeAiOauth")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|oauth| {
+            nonempty_json_string(oauth.get("accessToken"))
+                || nonempty_json_string(oauth.get("refreshToken"))
+        })
+}
+
+fn opencode_auth_json_authenticated(value: &serde_json::Value) -> bool {
+    value
+        .as_object()
+        .is_some_and(|providers| providers.values().any(opencode_auth_entry_authenticated))
+}
+
+fn opencode_auth_entry_authenticated(value: &serde_json::Value) -> bool {
+    match value.get("type").and_then(serde_json::Value::as_str) {
+        Some("api") => nonempty_json_string(value.get("key")),
+        Some("oauth") => {
+            value
+                .get("expires")
+                .and_then(serde_json::Value::as_u64)
+                .is_some()
+                && value
+                    .get("access")
+                    .is_some_and(serde_json::Value::is_string)
+                && value
+                    .get("refresh")
+                    .is_some_and(serde_json::Value::is_string)
+                && (nonempty_json_string(value.get("access"))
+                    || nonempty_json_string(value.get("refresh")))
+        }
+        Some("wellknown") => {
+            value.get("key").is_some_and(serde_json::Value::is_string)
+                && value.get("token").is_some_and(serde_json::Value::is_string)
+                && (nonempty_json_string(value.get("key"))
+                    || nonempty_json_string(value.get("token")))
+        }
+        _ => false,
     }
 }
 
@@ -1133,22 +1319,19 @@ async fn command_output_from(command: &mut Command, executable: &str) -> Result<
 /// credentials come from the environment are treated as configured; they fail
 /// loudly at call time with their own message.
 pub fn provider_credentials_present(provider: CodingProvider) -> bool {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
     match provider {
         CodingProvider::Claude => {
             borg_provider::credentials::api_key(
                 borg_provider::credentials::ApiKeyCredential::Anthropic,
             )
             .is_some()
-                || home.is_some_and(|home| home.join(".claude/.credentials.json").is_file())
+                || provider_subscription_credentials_present(provider)
         }
         CodingProvider::Codex => {
             nonempty_env("OPENAI_API_KEY").is_some()
-                || home.is_some_and(|home| home.join(".codex/auth.json").is_file())
+                || provider_subscription_credentials_present(provider)
         }
-        CodingProvider::OpenCode => home.is_some_and(|home| {
-            home.join(".config/opencode").exists() || home.join(".local/share/opencode").exists()
-        }),
+        CodingProvider::OpenCode => provider_subscription_credentials_present(provider),
         CodingProvider::Kimi => {
             nonempty_env("BORG_KIMI_API_KEY").is_some()
                 || nonempty_env("MOONSHOT_API_KEY").is_some()
@@ -2346,12 +2529,44 @@ fn terminal_emulator() -> Option<PathBuf> {
 
 fn executable_in_path(candidate: &Path) -> Option<PathBuf> {
     if candidate.components().count() > 1 {
-        return candidate.is_file().then(|| candidate.to_path_buf());
+        return path_is_executable(candidate).then(|| candidate.to_path_buf());
     }
     std::env::split_paths(&std::env::var_os("PATH")?).find_map(|directory| {
         let path = directory.join(candidate);
-        path.is_file().then_some(path)
+        if path_is_executable(&path) {
+            return Some(path);
+        }
+        #[cfg(windows)]
+        if candidate.extension().is_none() {
+            let extensions =
+                std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+            for extension in extensions.split(';').filter(|value| !value.is_empty()) {
+                let path = directory.join(format!("{}{}", candidate.display(), extension));
+                if path_is_executable(&path) {
+                    return Some(path);
+                }
+            }
+        }
+        None
     })
+}
+
+fn path_is_executable(path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 async fn workspace_command_response(
@@ -2590,7 +2805,7 @@ async fn run_session(
     // Authentication is a host-local fact, so refresh it after the workspace
     // boundary and before constructing the child coordinator.
     launch.capabilities.provider_capabilities =
-        probe_provider_capabilities_with_managed_kimi(true).await;
+        probe_provider_admission_capabilities_with_managed_kimi(true).await;
     launch.capabilities.resource_limits = Some(config.resource_limits.clone());
     if let Some(context) = fetch_runtime_mcp_context(&client, &config, session_id).await? {
         launch.capabilities.runtime_mcp_context = Some(context);
@@ -4385,6 +4600,51 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn local_auth_json_requires_typed_nonempty_credentials() {
+        assert!(codex_auth_json_authenticated(&serde_json::json!({
+            "tokens": {"refresh_token": "refresh"}
+        })));
+        assert!(!codex_auth_json_authenticated(&serde_json::json!({
+            "tokens": {}, "OPENAI_API_KEY": " "
+        })));
+        assert!(claude_auth_json_authenticated(&serde_json::json!({
+            "claudeAiOauth": {"accessToken": "access"}
+        })));
+        assert!(!claude_auth_json_authenticated(&serde_json::json!({
+            "claudeAiOauth": {"accessToken": "", "refreshToken": " "}
+        })));
+        assert!(opencode_auth_json_authenticated(&serde_json::json!({
+            "anthropic": {"type": "api", "key": "key"},
+            "openai": {"type": "oauth", "access": "", "refresh": "refresh", "expires": 0}
+        })));
+        assert!(opencode_auth_json_authenticated(&serde_json::json!({
+            "custom": {"type": "wellknown", "key": "key", "token": ""}
+        })));
+        assert!(!opencode_auth_json_authenticated(&serde_json::json!({
+            "unknown": {"type": "other", "key": "key"},
+            "empty": {"type": "api", "key": " "},
+            "malformed": {"type": "oauth", "refresh": "refresh"}
+        })));
+
+        let oversized = vec![b' '; usize::try_from(PROVIDER_AUTH_JSON_MAX_BYTES).unwrap() + 1];
+        assert!(parse_bounded_auth_json(&oversized).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_admission_requires_an_executable_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempdir().unwrap();
+        let executable = directory.path().join("provider");
+        fs::write(&executable, b"#!/bin/sh\n").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(executable_in_path(&executable), None);
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(executable_in_path(&executable), Some(executable));
+    }
+
     #[tokio::test]
     #[ignore = "explicit provider capability probe cache profile"]
     async fn provider_capability_probe_cache_profile() {
@@ -4394,12 +4654,26 @@ mod tests {
         let warm_started = Instant::now();
         let warm = probe_provider_capabilities_with_managed_kimi(false).await;
         let warm_elapsed = warm_started.elapsed();
+        let admission_started = Instant::now();
+        let admission = probe_provider_admission_capabilities().await;
+        let admission_elapsed = admission_started.elapsed();
 
         assert_eq!(warm, cold);
-        eprintln!("provider capability probe: cold={cold_elapsed:?}; warm={warm_elapsed:?}");
+        let mut expected_admission = cold.clone();
+        for capability in &mut expected_admission {
+            capability.version = None;
+        }
+        assert_eq!(admission, expected_admission);
+        eprintln!(
+            "provider capability probe: detailed_cold={cold_elapsed:?}; detailed_warm={warm_elapsed:?}; admission={admission_elapsed:?}"
+        );
         assert!(
             warm_elapsed < Duration::from_millis(10),
             "cached provider capability probe exceeded 10 ms: {warm_elapsed:?}"
+        );
+        assert!(
+            admission_elapsed < Duration::from_millis(10),
+            "provider admission probe exceeded 10 ms: {admission_elapsed:?}"
         );
     }
 
