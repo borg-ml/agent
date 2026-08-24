@@ -1400,6 +1400,83 @@ async fn only_acknowledged_terminal_turns_remain_provider_resume_checkpoints() {
 }
 
 #[tokio::test]
+async fn provider_checkpoint_recovery_keeps_only_the_unacknowledged_tail() {
+    let (directory, store) = store().await;
+    let session_id = Uuid::new_v4();
+    let completed_id = Uuid::new_v4();
+    let pending_id = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+    for kind in [
+        SessionEventKind::SessionStarted,
+        configured(directory.path()),
+        message(completed_id, &"old user context ".repeat(20_000)),
+        SessionEventKind::TurnStarted {
+            message_id: completed_id,
+            provider: CodingProvider::Codex,
+            model: Some("gpt-test".to_string()),
+            effort: Some("high".to_string()),
+            fast: false,
+        },
+        SessionEventKind::Message {
+            message_id: Uuid::new_v4(),
+            actor: EventActor::Assistant,
+            text: "old assistant context ".repeat(20_000),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: None,
+        },
+        SessionEventKind::ProviderSessionLinked {
+            provider_session_id: "durable-thread".to_string(),
+            provider_turn_id: Some("durable-turn".to_string()),
+        },
+        SessionEventKind::TurnCompleted {
+            message_id: completed_id,
+            provider_session_id: Some("durable-thread".to_string()),
+            final_text: "done".to_string(),
+            error: None,
+        },
+        SessionEventKind::Message {
+            message_id: pending_id,
+            actor: EventActor::User,
+            text: "recover this exact tail".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Queued,
+            delivery: Some(PromptDelivery::Queue),
+        },
+        SessionEventKind::TurnStarted {
+            message_id: pending_id,
+            provider: CodingProvider::Codex,
+            model: Some("gpt-test".to_string()),
+            effort: Some("high".to_string()),
+            fast: false,
+        },
+    ] {
+        store
+            .append(SessionEvent::new(session_id, 0, kind))
+            .await
+            .unwrap();
+    }
+
+    let recovery = store
+        .recovery_from_provider_checkpoint(session_id, "durable-thread")
+        .await
+        .unwrap()
+        .expect("matching durable checkpoint");
+
+    assert_eq!(recovery.queue_events.len(), 1);
+    assert!(matches!(
+        &recovery.queue_events[0].kind,
+        SessionEventKind::Message { message_id, text, .. }
+            if *message_id == pending_id && text == "recover this exact tail"
+    ));
+    assert!(recovery.context_events.iter().any(|event| matches!(
+        event.kind,
+        SessionEventKind::TurnCompleted { message_id, .. } if message_id == completed_id
+    )));
+    assert!(serde_json::to_vec(&recovery.context_events).unwrap().len() < 10_000);
+}
+
+#[tokio::test]
 async fn state_projects_pending_approval_and_cumulative_usage() {
     let (directory, store) = store().await;
     let session_id = Uuid::new_v4();
@@ -2307,7 +2384,7 @@ async fn large_tool_payloads_are_loaded_only_by_reference() {
     assert!(matches!(
         appended.kind,
         SessionEventKind::ToolStarted {
-            input_ref: None,
+            input_ref: Some(_),
             ..
         }
     ));

@@ -217,6 +217,7 @@ enum PendingSteerState {
 struct RuntimeSessionStore {
     store: Arc<dyn SessionStore>,
     context_events: Vec<SessionEvent>,
+    context_complete: bool,
     workspace_projection: Option<WorkspaceProjection>,
     projection_diagnostics: VecDeque<SessionEvent>,
 }
@@ -492,10 +493,15 @@ fn start_workspace_projection_repair(
 }
 
 impl RuntimeSessionStore {
-    fn new(store: Arc<dyn SessionStore>, context_events: Vec<SessionEvent>) -> Self {
+    fn new(
+        store: Arc<dyn SessionStore>,
+        context_events: Vec<SessionEvent>,
+        context_complete: bool,
+    ) -> Self {
         Self {
             store,
             context_events,
+            context_complete,
             workspace_projection: None,
             projection_diagnostics: VecDeque::new(),
         }
@@ -508,6 +514,28 @@ impl RuntimeSessionStore {
 
     fn context_events(&self) -> &[SessionEvent] {
         &self.context_events
+    }
+
+    async fn ensure_complete_context(&mut self, session_id: Uuid) -> Result<()> {
+        if !self.context_complete {
+            self.context_events = self.store.recovery(session_id).await?.context_events;
+            self.context_complete = true;
+        }
+        Ok(())
+    }
+
+    fn retain_latest_turn_checkpoint(&mut self) {
+        let Some(index) = self
+            .context_events
+            .iter()
+            .rposition(|event| matches!(event.kind, SessionEventKind::TurnCompleted { .. }))
+        else {
+            return;
+        };
+        if index > 0 {
+            self.context_events = self.context_events.split_off(index);
+        }
+        self.context_complete = false;
     }
 
     async fn state(&self, session_id: Uuid) -> Result<SessionState> {
@@ -555,6 +583,7 @@ impl RuntimeSessionStore {
         }
         if matches!(event.kind, SessionEventKind::ContextCleared) {
             self.context_events.clear();
+            self.context_complete = true;
         }
         if event.kind.is_context_relevant() {
             self.context_events.push(event.clone());
@@ -1111,14 +1140,25 @@ async fn run_agent_session_store_kernel(
     if launch.capabilities.provider_capabilities.is_empty() {
         launch.capabilities.provider_capabilities = initial_state.provider_capabilities.clone();
     }
-    let recovery = if fresh {
-        crate::SessionRecovery::default()
+    let (recovery, context_complete) = if fresh {
+        (crate::SessionRecovery::default(), true)
+    } else if launch.provider == CodingProvider::Codex
+        && let Some(provider_session_id) = initial_state.provider_session_id.as_deref()
+        && let Some(recovery) = store
+            .recovery_from_provider_checkpoint(session_id, provider_session_id)
+            .await?
+    {
+        (recovery, false)
     } else {
-        store.recovery(session_id).await?
+        (store.recovery(session_id).await?, true)
     };
     let subagent_store = Arc::clone(&store);
     let autonomy_store = store.autonomy_store().await?;
-    let mut journal = RuntimeSessionStore::new(Arc::clone(&store), recovery.context_events);
+    let mut journal = RuntimeSessionStore::new(
+        Arc::clone(&store),
+        recovery.context_events,
+        context_complete,
+    );
     if let Some(projection) = workspace_projection.clone() {
         journal = journal.with_workspace_projection(projection);
     }
@@ -1715,6 +1755,7 @@ async fn run_agent_session_store_kernel(
                                     retained_context = if launch.provider.uses_native_harness() {
                                         None
                                     } else {
+                                        journal.ensure_complete_context(session_id).await?;
                                         retained_conversation_context(journal.context_events())
                                     };
                                 }
@@ -1831,6 +1872,9 @@ async fn run_agent_session_store_kernel(
                             Some("user"),
                         )
                         .await?;
+                        if launch.provider.uses_native_harness() || !provider_context_compaction {
+                            journal.ensure_complete_context(session_id).await?;
+                        }
                         let result: Result<Option<crate::AgentCompaction>> = async {
                             if launch.provider.uses_native_harness() {
                                 let model = launch
@@ -2010,6 +2054,7 @@ async fn run_agent_session_store_kernel(
                                     // different prompt shape. A provider
                                     // session id is only an adapter detail; it
                                     // must never replace Borg's context.
+                                    journal.ensure_complete_context(session_id).await?;
                                     retained_context =
                                         retained_conversation_context(journal.context_events());
                                 } else if provider_context_preserved
@@ -2175,6 +2220,7 @@ async fn run_agent_session_store_kernel(
                     Some("context_threshold"),
                 )
                 .await?;
+                journal.ensure_complete_context(session_id).await?;
                 let result = async {
                     executor
                         .compact_native(
@@ -2266,21 +2312,30 @@ async fn run_agent_session_store_kernel(
             }
         }
 
-        if !launch.provider.uses_native_harness() && retained_context.is_none() {
-            // Resume recovery is durable and complete, but provider replay is
-            // lazy. Do not serialize a large journal until a request actually
-            // needs the canonical prompt.
+        let native_provider = launch.provider.uses_native_harness();
+        let reuse_subscription_context = !native_provider
+            && subscription_context_reusable
+            && executor.supports_subscription_context_reuse(launch.provider);
+        if native_provider {
+            journal.ensure_complete_context(session_id).await?;
+        } else if reuse_subscription_context {
+            // The durable journal remains authoritative, but a healthy pool or
+            // acknowledged Codex checkpoint needs only the new input. If that
+            // checkpoint is unavailable, the safe retry path reloads the
+            // canonical branch before issuing another provider request.
+            retained_context = None;
+        } else if retained_context.is_none() {
+            journal.ensure_complete_context(session_id).await?;
             retained_context = retained_conversation_context(journal.context_events());
         }
 
-        if !launch.provider.uses_native_harness()
+        if !native_provider
             && retained_context.as_deref().is_some_and(|context| {
                 subscription_context_needs_projection(
                     context,
                     prompt.actor,
                     &prompt.text,
-                    subscription_context_reusable
-                        && executor.supports_subscription_context_reuse(launch.provider),
+                    reuse_subscription_context,
                 )
             })
         {
@@ -2317,8 +2372,10 @@ async fn run_agent_session_store_kernel(
         let (provider_events_tx, mut provider_events) = mpsc::channel(128);
         let (control_tx, control_rx) = mpsc::channel(32);
         let mut retained_for_turn = retained_context.take();
-        let mut provider_prompt = if launch.provider.uses_native_harness() {
+        let mut provider_prompt = if native_provider {
             prompt.text.clone()
+        } else if reuse_subscription_context {
+            format_subscription_frame(&format_subscription_actor_value(prompt.actor, &prompt.text))
         } else {
             format_subscription_provider_prompt(
                 retained_for_turn.as_deref(),
@@ -2326,10 +2383,7 @@ async fn run_agent_session_store_kernel(
                 &prompt.text,
             )
         };
-        let mut subscription_input_chars = if !launch.provider.uses_native_harness()
-            && subscription_context_reusable
-            && executor.supports_subscription_context_reuse(launch.provider)
-        {
+        let mut subscription_input_chars = if reuse_subscription_context {
             // A healthy pooled process receives only this delta. Measuring the
             // complete canonical replay here was the source of premature
             // compaction while the provider still had ample context space.
@@ -2337,11 +2391,10 @@ async fn run_agent_session_store_kernel(
         } else {
             provider_prompt.chars().count()
         };
-        if !launch.provider.uses_native_harness()
+        if !native_provider
             && subscription_input_chars > SUBSCRIPTION_INPUT_BUDGET_CHARS
             && retained_for_turn.is_some()
-            && !(subscription_context_reusable
-                && executor.supports_subscription_context_reuse(launch.provider))
+            && !reuse_subscription_context
         {
             let context_chars = retained_for_turn
                 .as_deref()
@@ -2370,9 +2423,7 @@ async fn run_agent_session_store_kernel(
                 .await?;
             }
         }
-        if !launch.provider.uses_native_harness()
-            && subscription_input_chars > SUBSCRIPTION_INPUT_BUDGET_CHARS
-        {
+        if !native_provider && subscription_input_chars > SUBSCRIPTION_INPUT_BUDGET_CHARS {
             let message = format!(
                 "provider input remains {} characters after deterministic recovery projection; refusing an over-limit subscription request (budget {} characters)",
                 subscription_input_chars, SUBSCRIPTION_INPUT_BUDGET_CHARS
@@ -2516,15 +2567,14 @@ async fn run_agent_session_store_kernel(
             message_id: prompt.message_id,
             context_generation: journal.state(session_id).await?.context_generation,
             provider: launch.provider,
-            provider_session_id: (launch.provider.uses_native_harness()
-                || subscription_context_reusable)
+            provider_session_id: (native_provider || reuse_subscription_context)
                 .then(|| provider_session_id.clone())
                 .flatten(),
-            provider_fork_turn_id: subscription_context_reusable
+            provider_fork_turn_id: reuse_subscription_context
                 .then(|| provider_fork_turn_id.clone())
                 .flatten(),
             cwd: launch.cwd.clone(),
-            prompt_delta: if launch.provider.uses_native_harness() {
+            prompt_delta: if native_provider {
                 prompt.text.clone()
             } else {
                 format_subscription_frame(&format_subscription_actor_value(
@@ -2540,7 +2590,11 @@ async fn run_agent_session_store_kernel(
             fast: launch.fast,
             response_language: launch.response_language,
             permission_mode: launch.permission_mode,
-            conversation: native_conversation(journal.context_events(), launch.provider)?,
+            conversation: if native_provider {
+                native_conversation(journal.context_events(), launch.provider)?
+            } else {
+                Vec::new()
+            },
             agent_mcp_server: agent_mcp_server.clone(),
             agent_tools: dispatcher.clone(),
             external_mcp_servers: runtime_mcp_servers.clone(),
@@ -3700,12 +3754,15 @@ async fn run_agent_session_store_kernel(
         )
         .await?;
         if !launch.provider.uses_native_harness() {
-            // Pi rebuilds the provider message branch from its persisted
-            // session entries before every request. Do the same for Borg's
-            // subscription lanes so queued turns, restarts, and provider
-            // session loss all see the exact durable prefix through the last
-            // compaction boundary.
-            retained_context = retained_conversation_context(journal.context_events());
+            if subscription_context_reusable
+                && executor.supports_subscription_context_reuse(launch.provider)
+            {
+                journal.retain_latest_turn_checkpoint();
+                retained_context = None;
+            } else {
+                journal.ensure_complete_context(session_id).await?;
+                retained_context = retained_conversation_context(journal.context_events());
+            }
         }
         at_turn_boundary = true;
         if std::mem::take(&mut provider_switch_pending) {
@@ -3715,6 +3772,7 @@ async fn run_agent_session_store_kernel(
             retained_context = if launch.provider.uses_native_harness() {
                 None
             } else {
+                journal.ensure_complete_context(session_id).await?;
                 retained_conversation_context(journal.context_events())
             };
         }
@@ -3735,6 +3793,7 @@ async fn run_agent_session_store_kernel(
                 retained_context = if launch.provider.uses_native_harness() {
                     None
                 } else {
+                    journal.ensure_complete_context(session_id).await?;
                     retained_conversation_context(journal.context_events())
                 };
             }

@@ -73,9 +73,9 @@ pub struct AgentTurn {
     /// Codex tail from a durable checkpoint.
     pub provider_fork_turn_id: Option<String>,
     pub cwd: PathBuf,
-    /// The new durable user input represented by this turn. `prompt` remains
-    /// the complete canonical replay prompt; the subscription pool uses this
-    /// delta only when its native process is proven to be the same context.
+    /// The new durable user input represented by this turn. A reusable
+    /// subscription checkpoint receives only this delta; a cold turn's
+    /// `prompt` contains the complete canonical replay.
     pub prompt_delta: String,
     pub prompt: String,
     pub attachments: Vec<PathBuf>,
@@ -85,7 +85,7 @@ pub struct AgentTurn {
     pub fast: Option<bool>,
     pub response_language: crate::ResponseLanguage,
     pub permission_mode: PermissionMode,
-    /// Provider-neutral conversation reconstructed from the durable journal.
+    /// Provider-neutral conversation reconstructed for native providers.
     pub conversation: Vec<borg_provider::provider::ModelMessage>,
     /// One local MCP transport for Borg-owned goal, plan, and subagent tools.
     pub agent_mcp_server: borg_provider::mcp::ExternalMcpServer,
@@ -414,6 +414,8 @@ impl SubscriptionPoolRegistry {
             .as_ref()
             .and_then(|_| provider_fork_turn_id);
         let reusing_native_context = append || resume_session_id.is_some();
+        let resume_unavailable_prompt =
+            (reusing_native_context && prompt != prompt_delta).then(|| prompt.clone());
         let effective_key = format!("{lifecycle_key}#epoch={}", slot.epoch);
         PreparedSubscriptionTurn {
             prompt: if reusing_native_context {
@@ -426,7 +428,7 @@ impl SubscriptionPoolRegistry {
             reused: reusing_native_context,
             resume_session_id,
             fork_turn_id,
-            resume_unavailable_prompt: reusing_native_context.then_some(prompt),
+            resume_unavailable_prompt,
         }
     }
 
@@ -1390,6 +1392,8 @@ async fn run_borg_provider_turn(
     let mut first_model_output = true;
     let mut terminal_seen = false;
     let mut reasoning_text = String::new();
+    let mut pending_reasoning = String::new();
+    let mut last_reasoning_emit = Instant::now() - Duration::from_millis(50);
     let mut last_completed_reasoning = None;
     while let Some(event) = stream.recv().await {
         match event {
@@ -1432,7 +1436,7 @@ async fn run_borg_provider_turn(
                     );
                 }
                 text.push_str(&delta);
-                if last_text_emit.elapsed() >= Duration::from_millis(40) || delta.ends_with('\n') {
+                if last_text_emit.elapsed() >= live_output_interval(text.len()) {
                     send(
                         &events,
                         SessionEventKind::Message {
@@ -1468,11 +1472,16 @@ async fn run_borg_provider_turn(
                         "Borg provider stage"
                     );
                 }
-                send(&events, SessionEventKind::ReasoningDelta { text: delta }).await;
+                pending_reasoning.push_str(&delta);
+                if last_reasoning_emit.elapsed() >= live_output_interval(reasoning_text.len()) {
+                    flush_pending_reasoning(&events, &mut pending_reasoning).await;
+                    last_reasoning_emit = Instant::now();
+                }
             }
             ChatStreamEvent::Narration {
                 text: narration_text,
             } => {
+                flush_pending_reasoning(&events, &mut pending_reasoning).await;
                 reasoning_text.clear();
                 last_completed_reasoning = None;
                 if first_model_output {
@@ -1507,6 +1516,7 @@ async fn run_borg_provider_turn(
             }
             ChatStreamEvent::Phase { name, input } => {
                 if name == "reasoning_completed" {
+                    flush_pending_reasoning(&events, &mut pending_reasoning).await;
                     last_completed_reasoning =
                         (!reasoning_text.is_empty()).then(|| reasoning_text.clone());
                     reasoning_text.clear();
@@ -1524,6 +1534,7 @@ async fn run_borg_provider_turn(
                 .await;
             }
             ChatStreamEvent::ToolCall { id, name, input } => {
+                flush_pending_reasoning(&events, &mut pending_reasoning).await;
                 reasoning_text.clear();
                 last_completed_reasoning = None;
                 if first_model_output {
@@ -1618,6 +1629,7 @@ async fn run_borg_provider_turn(
                 session_id,
                 provider_turn_id,
             } => {
+                flush_pending_reasoning(&events, &mut pending_reasoning).await;
                 terminal_seen = true;
                 final_output = final_text;
                 if let Some(session_id) = session_id {
@@ -1708,6 +1720,7 @@ async fn run_borg_provider_turn(
                 }
             }
             ChatStreamEvent::Failed { error } => {
+                flush_pending_reasoning(&events, &mut pending_reasoning).await;
                 if let Some((registry, _)) = pool_invocation.as_ref() {
                     registry.mark(turn.session_id, turn.provider, false).await;
                 }
@@ -1764,6 +1777,27 @@ async fn run_borg_provider_turn(
             final_output
         },
     })
+}
+
+pub(crate) fn live_output_interval(bytes: usize) -> Duration {
+    match bytes {
+        0..=16_384 => Duration::from_millis(40),
+        16_385..=65_536 => Duration::from_millis(80),
+        65_537..=262_144 => Duration::from_millis(160),
+        _ => Duration::from_millis(300),
+    }
+}
+
+async fn flush_pending_reasoning(events: &mpsc::Sender<SessionEventKind>, pending: &mut String) {
+    if !pending.is_empty() {
+        send(
+            events,
+            SessionEventKind::ReasoningDelta {
+                text: std::mem::take(pending),
+            },
+        )
+        .await;
+    }
 }
 
 fn require_provider_stream_terminal(terminal_seen: bool) -> Result<()> {
@@ -2211,6 +2245,22 @@ mod tests {
             Some("large canonical replay + next")
         );
         assert!(prepared.reused);
+
+        let lazy = registry
+            .prepare(
+                Uuid::new_v4(),
+                SubscriptionTurnInput {
+                    context_generation: 4,
+                    provider: CodingProvider::Codex,
+                    provider_session_id: Some("durable-codex-thread".to_string()),
+                    provider_fork_turn_id: None,
+                    prompt: "<borg-message>next</borg-message>".to_string(),
+                    prompt_delta: "<borg-message>next</borg-message>".to_string(),
+                    lifecycle_key: "stable-config".to_string(),
+                },
+            )
+            .await;
+        assert!(lazy.resume_unavailable_prompt.is_none());
     }
 
     #[tokio::test]

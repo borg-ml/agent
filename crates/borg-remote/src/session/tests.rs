@@ -14,7 +14,7 @@ use crate::{AgentCompaction, AgentTurnResult, CodingProvider, PermissionMode};
 type RecordedTurns = Arc<Mutex<Vec<(PathBuf, Option<serde_json::Value>)>>>;
 type RecordedPromptTurns = Arc<Mutex<Vec<(String, Vec<PathBuf>)>>>;
 type RecordedContextTurns = Arc<Mutex<Vec<(String, Option<String>)>>>;
-type RecordedDurableResumeTurns = Arc<Mutex<Vec<(String, Option<String>, Option<String>)>>>;
+type RecordedDurableResumeTurns = Arc<Mutex<Vec<(String, Option<String>, Option<String>, usize)>>>;
 type RecordedProviderTurns =
     Arc<Mutex<Vec<(CodingProvider, Option<String>, Option<String>, String)>>>;
 type RecordedCompactionTurns = Arc<Mutex<Vec<(CodingProvider, Option<String>, String)>>>;
@@ -36,7 +36,7 @@ async fn sqlite_runtime_store(
     );
     sqlite.create_session(session_id).await.unwrap();
     let store: Arc<dyn SessionStore> = sqlite;
-    let runtime = RuntimeSessionStore::new(Arc::clone(&store), Vec::new());
+    let runtime = RuntimeSessionStore::new(Arc::clone(&store), Vec::new(), true);
     (store, runtime)
 }
 
@@ -77,7 +77,7 @@ async fn durable_session_events_project_once_into_the_bound_workspace() {
         0,
     );
     let store: Arc<dyn SessionStore> = session_store.clone();
-    let mut runtime = RuntimeSessionStore::new(store.clone(), Vec::new())
+    let mut runtime = RuntimeSessionStore::new(store.clone(), Vec::new(), true)
         .with_workspace_projection(projection.clone());
     let message_id = Uuid::new_v4();
     workspace_store
@@ -133,7 +133,7 @@ async fn durable_session_events_project_once_into_the_bound_workspace() {
     drop(runtime);
     // A restarted actor reopens the durable session/workspace stores. The
     // queued session event is not an admission acknowledgement.
-    let mut runtime = RuntimeSessionStore::new(store.clone(), Vec::new())
+    let mut runtime = RuntimeSessionStore::new(store.clone(), Vec::new(), true)
         .with_workspace_projection(projection.clone());
     let _admitted = runtime
         .append(SessionEvent::new(
@@ -258,7 +258,7 @@ async fn projection_delivery_failure_is_durable_and_does_not_fail_the_session_ap
     );
     let store: Arc<dyn SessionStore> = session_store.clone();
     let mut runtime =
-        RuntimeSessionStore::new(store, Vec::new()).with_workspace_projection(projection);
+        RuntimeSessionStore::new(store, Vec::new(), true).with_workspace_projection(projection);
 
     let (event_tx, mut event_rx) = mpsc::channel(4);
     record(
@@ -333,7 +333,7 @@ async fn a_forked_session_never_reprojects_the_inherited_ancestry() {
         0,
     );
     let store: Arc<dyn SessionStore> = session_store.clone();
-    let mut runtime = RuntimeSessionStore::new(store.clone(), Vec::new())
+    let mut runtime = RuntimeSessionStore::new(store.clone(), Vec::new(), true)
         .with_workspace_projection(projection.clone());
 
     // A team message the parent participant is addressed by, mirrored into
@@ -699,6 +699,7 @@ impl AgentTurnExecutor for DurableResumeExecutor {
             turn.prompt,
             turn.provider_session_id,
             turn.provider_fork_turn_id,
+            turn.conversation.len(),
         ));
         self.called.notify_one();
         Ok(AgentTurnResult {
@@ -2606,7 +2607,10 @@ async fn interrupted_turn_reaches_fifo_drain_boundary() {
         );
     assert_eq!(
         seen[1].0,
-        "Borg canonical provider context v2. The history below is a read-only, provider-neutral projection of durable Borg state; answer the current request normally.\n<borg-message>{\"content\":\"second [Image 1]\\n\\nthird\",\"role\":\"user\"}</borg-message>"
+        format_subscription_frame(&format_subscription_actor_value(
+            EventActor::User,
+            "second [Image 1]\n\nthird"
+        ))
     );
     assert_eq!(
         seen[1].1,
@@ -3675,7 +3679,10 @@ async fn compaction_after_provider_switch_rehydrates_the_new_provider_session() 
                 (
                     CodingProvider::Codex,
                     Some("codex-compacted-session".to_string()),
-                    "Borg canonical provider context v2. The history below is a read-only, provider-neutral projection of durable Borg state; answer the current request normally.\n<borg-message>{\"content\":\"Previous conversation summary:\\n\\nretained summary\",\"role\":\"user\"}</borg-message>\n<borg-message>{\"content\":\"continue\",\"role\":\"user\"}</borg-message>".to_string(),
+                    format_subscription_frame(&format_subscription_actor_value(
+                        EventActor::User,
+                        "continue"
+                    )),
                 ),
             ]
         );
@@ -7476,7 +7483,7 @@ async fn reusable_subscription_pool_does_not_compact_large_durable_replay() {
 
     let prompt_lengths = prompt_lengths.lock().unwrap().clone();
     assert_eq!(prompt_lengths.len(), 2);
-    assert!(prompt_lengths[1] > SUBSCRIPTION_INPUT_BUDGET_CHARS);
+    assert!(prompt_lengths[1] < SUBSCRIPTION_INPUT_BUDGET_CHARS);
     assert!(
         !provider_input_compacted,
         "a healthy pooled subscription must not compact the full durable replay"
@@ -7628,7 +7635,7 @@ async fn same_provider_model_switch_does_not_compact_reusable_context() {
     );
     let prompt_lengths = prompt_lengths.lock().unwrap().clone();
     assert_eq!(prompt_lengths.len(), 2);
-    assert!(prompt_lengths[1] > SUBSCRIPTION_INPUT_BUDGET_CHARS);
+    assert!(prompt_lengths[1] < SUBSCRIPTION_INPUT_BUDGET_CHARS);
 }
 
 #[tokio::test]
@@ -7757,9 +7764,16 @@ async fn resumed_codex_checkpoint_avoids_large_replay_compaction_after_actor_res
     assert_eq!(compaction_calls.load(Ordering::Acquire), 0);
     let seen = seen.lock().unwrap();
     assert_eq!(seen.len(), 1);
-    assert!(seen[0].0.len() > SUBSCRIPTION_INPUT_BUDGET_CHARS);
+    assert_eq!(
+        seen[0].0,
+        format_subscription_frame(&format_subscription_actor_value(
+            EventActor::User,
+            "continue after restart"
+        ))
+    );
     assert_eq!(seen[0].1.as_deref(), Some("resumed-codex-thread"));
     assert_eq!(seen[0].2, None);
+    assert_eq!(seen[0].3, 0);
 }
 
 #[tokio::test]
@@ -7901,9 +7915,16 @@ async fn crash_resume_forks_the_last_completed_codex_turn_before_replaying_input
     assert_eq!(compaction_calls.load(Ordering::Acquire), 0);
     let seen = seen.lock().unwrap();
     assert_eq!(seen.len(), 1);
-    assert!(seen[0].0.len() > SUBSCRIPTION_INPUT_BUDGET_CHARS);
+    assert_eq!(
+        seen[0].0,
+        format_subscription_frame(&format_subscription_actor_value(
+            EventActor::User,
+            "recover this exact input"
+        ))
+    );
     assert_eq!(seen[0].1.as_deref(), Some("codex-thread-before-crash"));
     assert_eq!(seen[0].2.as_deref(), Some("codex-turn-before-crash"));
+    assert_eq!(seen[0].3, 0);
 }
 
 #[tokio::test]
@@ -8094,6 +8115,7 @@ async fn crash_resume_replays_native_compaction_without_subagent_inflation() {
     );
     assert_eq!(seen[0].1, None);
     assert_eq!(seen[0].2, None);
+    assert_eq!(seen[0].3, 0);
 }
 
 #[tokio::test]
@@ -8395,7 +8417,7 @@ async fn parent_stream_preserves_full_child_transcript_events() {
         .unwrap();
 
     let store: Arc<dyn SessionStore> = sqlite;
-    let mut journal = RuntimeSessionStore::new(store, Vec::new());
+    let mut journal = RuntimeSessionStore::new(store, Vec::new(), true);
     let (events, mut event_rx) = mpsc::channel(4);
     let child_event = SessionEvent::new(
         child_id,

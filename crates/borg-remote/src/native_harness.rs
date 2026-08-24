@@ -1208,9 +1208,7 @@ async fn call_model_streaming(
                     chunk,
                 }) => {
                     text.push_str(&String::from_utf8_lossy(&chunk));
-                    if last_text_emit.elapsed() >= live_text_interval(text.len())
-                        || chunk.ends_with(b"\n")
-                    {
+                    if last_text_emit.elapsed() >= crate::agent::live_output_interval(text.len()) {
                         send(context.events, SessionEventKind::Message {
                             message_id: context.assistant_message_id,
                             actor: EventActor::Assistant,
@@ -1235,8 +1233,9 @@ async fn call_model_streaming(
                         {
                             pending_reasoning.push_str(&delta);
                         }
-                        if last_reasoning_emit.elapsed() >= Duration::from_millis(50)
-                            || pending_reasoning.ends_with('\n')
+                        if !pending_reasoning.is_empty()
+                            && last_reasoning_emit.elapsed()
+                            >= crate::agent::live_output_interval(reasoning_accumulated.len())
                         {
                             send(
                                 context.events,
@@ -1298,15 +1297,6 @@ async fn call_model_streaming(
                 .take()
                 .expect("completed native model result is present");
         }
-    }
-}
-
-fn live_text_interval(bytes: usize) -> Duration {
-    match bytes {
-        0..=16_384 => Duration::from_millis(40),
-        16_385..=65_536 => Duration::from_millis(80),
-        65_537..=262_144 => Duration::from_millis(160),
-        _ => Duration::from_millis(300),
     }
 }
 
@@ -2569,9 +2559,18 @@ mod tests {
 
     #[test]
     fn live_text_updates_back_off_as_the_response_grows() {
-        assert_eq!(live_text_interval(1_000), Duration::from_millis(40));
-        assert_eq!(live_text_interval(100_000), Duration::from_millis(160));
-        assert_eq!(live_text_interval(1_000_000), Duration::from_millis(300));
+        assert_eq!(
+            crate::agent::live_output_interval(1_000),
+            Duration::from_millis(40)
+        );
+        assert_eq!(
+            crate::agent::live_output_interval(100_000),
+            Duration::from_millis(160)
+        );
+        assert_eq!(
+            crate::agent::live_output_interval(1_000_000),
+            Duration::from_millis(300)
+        );
     }
 
     #[test]

@@ -949,6 +949,13 @@ pub trait SessionStore: Send + Sync {
         Ok(0)
     }
     async fn recovery(&self, session_id: Uuid) -> Result<SessionRecovery>;
+    async fn recovery_from_provider_checkpoint(
+        &self,
+        _session_id: Uuid,
+        _provider_session_id: &str,
+    ) -> Result<Option<SessionRecovery>> {
+        Ok(None)
+    }
     async fn live_events_after(
         &self,
         session_id: Uuid,
@@ -3221,6 +3228,129 @@ impl SqliteSessionStore {
         })
     }
 
+    async fn recovery_projection_from_sequence(
+        &self,
+        session_id: Uuid,
+        recovery_start_sequence: i64,
+        resolved_message_id: Option<Uuid>,
+    ) -> Result<SessionRecovery> {
+        // A replay boundary does not discard unresolved prompts or the latest
+        // durable state of existing subagents.
+        let session_key = session_id.to_string();
+        let resolved_message_id = resolved_message_id.map(|id| id.to_string());
+        let suffix = sqlx::query(
+            "select e.event_json from session_events e \
+                 where e.session_id = ? and e.sequence >= ? and e.recovery_relevant = 1 \
+                 and (e.event_kind != 'subagent_activity' or e.sequence in ( \
+                   select max(sequence) from session_events \
+                   where session_id = ? and event_kind = 'subagent_activity' \
+                   group by json_extract(event_json, '$.kind.agent.session_id') \
+                 )) order by e.sequence",
+        )
+        .bind(&session_key)
+        .bind(recovery_start_sequence)
+        .bind(&session_key)
+        .fetch_all(&self.pool);
+        let legacy_messages = sqlx::query(
+            "select e.event_json from session_event_search search \
+                 join session_events e \
+                   on e.session_id = search.session_id and e.event_id = search.event_id \
+                 left join session_actions a \
+                   on a.session_id = e.session_id and a.action_id = e.message_id \
+                 where search.session_id = ? and search.sequence < ? \
+                 and search.event_kind = 'message' \
+                 and search.actor in ('user', 'system') \
+                 and (? is null or e.message_id != ?) \
+                 and (a.action_id is null \
+                   or a.state not in ('completed', 'failed', 'cancelled')) \
+                 order by search.sequence",
+        )
+        .bind(&session_key)
+        .bind(recovery_start_sequence)
+        .bind(&resolved_message_id)
+        .bind(&resolved_message_id)
+        .fetch_all(&self.pool);
+        let legacy_recalls = sqlx::query(
+            "select e.event_json from session_event_search search \
+                 join session_events e \
+                   on e.session_id = search.session_id and e.event_id = search.event_id \
+                 where search.session_id = ? and search.sequence < ? \
+                 and search.event_kind = 'prompt_recalled' order by search.sequence",
+        )
+        .bind(&session_key)
+        .bind(recovery_start_sequence)
+        .fetch_all(&self.pool);
+        let prior_subagents = sqlx::query(
+            "select e.event_json from session_events e \
+                 where e.session_id = ? and e.sequence < ? \
+                 and e.event_kind = 'subagent_activity' and e.sequence in ( \
+                   select max(sequence) from session_events \
+                   where session_id = ? and event_kind = 'subagent_activity' \
+                   group by json_extract(event_json, '$.kind.agent.session_id') \
+                 ) order by e.sequence",
+        )
+        .bind(&session_key)
+        .bind(recovery_start_sequence)
+        .bind(&session_key)
+        .fetch_all(&self.pool);
+        let (suffix, legacy_messages, legacy_recalls, prior_subagents) =
+            tokio::try_join!(suffix, legacy_messages, legacy_recalls, prior_subagents)?;
+        let suffix = suffix
+            .into_iter()
+            .map(|row| serde_json::from_str(row.try_get("event_json")?).map_err(Into::into))
+            .collect::<Result<Vec<SessionEvent>>>()?;
+        let mut recovery = SessionRecovery::from_events(suffix);
+        let mut queue_events = legacy_messages
+            .into_iter()
+            .chain(legacy_recalls)
+            .map(|row| serde_json::from_str(row.try_get("event_json")?).map_err(Into::into))
+            .collect::<Result<Vec<SessionEvent>>>()?;
+        queue_events.sort_unstable_by_key(|event| event.sequence);
+        queue_events.append(&mut recovery.queue_events);
+        recovery.queue_events = queue_events;
+        let mut subagent_events = prior_subagents
+            .into_iter()
+            .map(|row| serde_json::from_str(row.try_get("event_json")?).map_err(Into::into))
+            .collect::<Result<Vec<SessionEvent>>>()?;
+        subagent_events.append(&mut recovery.subagent_events);
+        recovery.subagent_events = subagent_events;
+        Ok(recovery)
+    }
+
+    async fn provider_checkpoint_recovery_projection(
+        &self,
+        session_id: Uuid,
+        provider_session_id: &str,
+    ) -> Result<Option<SessionRecovery>> {
+        if self.session_row(session_id).await?.inherited_event_count != 0 {
+            return Ok(None);
+        }
+        let Some(row) = sqlx::query(
+            "select sequence, event_json from session_events \
+             where session_id = ? and event_kind = 'turn_completed' \
+               and json_extract(event_json, '$.kind.provider_session_id') = ? \
+               and (json_extract(event_json, '$.kind.error') is null \
+                    or json_extract(event_json, '$.kind.error') = 'turn interrupted') \
+             order by sequence desc limit 1",
+        )
+        .bind(session_id.to_string())
+        .bind(provider_session_id)
+        .fetch_optional(&self.pool)
+        .await?
+        else {
+            return Ok(None);
+        };
+        let sequence = row.try_get::<i64, _>("sequence")?;
+        let checkpoint: SessionEvent = serde_json::from_str(row.try_get("event_json")?)?;
+        let SessionEventKind::TurnCompleted { message_id, .. } = checkpoint.kind else {
+            unreachable!("provider checkpoint query returned a non-terminal event");
+        };
+        Ok(Some(
+            self.recovery_projection_from_sequence(session_id, sequence, Some(message_id))
+                .await?,
+        ))
+    }
+
     async fn recovery_projection(&self, session_id: Uuid) -> Result<SessionRecovery> {
         let boundary = sqlx::query(
             "select s.inherited_event_count, ( \
@@ -3281,83 +3411,9 @@ impl SqliteSessionStore {
         if inherited_event_count == 0
             && let Some(recovery_start_sequence) = recovery_start_sequence
         {
-            // A replay boundary does not discard unresolved prompts or the
-            // latest durable state of existing subagents.
-            let session_key = session_id.to_string();
-            let suffix = sqlx::query(
-                "select e.event_json from session_events e \
-                     where e.session_id = ? and e.sequence >= ? and e.recovery_relevant = 1 \
-                     and (e.event_kind != 'subagent_activity' or e.sequence in ( \
-                       select max(sequence) from session_events \
-                       where session_id = ? and event_kind = 'subagent_activity' \
-                       group by json_extract(event_json, '$.kind.agent.session_id') \
-                     )) order by e.sequence",
-            )
-            .bind(&session_key)
-            .bind(recovery_start_sequence)
-            .bind(&session_key)
-            .fetch_all(&self.pool);
-            let legacy_messages = sqlx::query(
-                "select e.event_json from session_event_search search \
-                     join session_events e \
-                       on e.session_id = search.session_id and e.event_id = search.event_id \
-                     left join session_actions a \
-                       on a.session_id = e.session_id and a.action_id = e.message_id \
-                     where search.session_id = ? and search.sequence < ? \
-                     and search.event_kind = 'message' \
-                     and search.actor in ('user', 'system') \
-                     and (a.action_id is null \
-                       or a.state not in ('completed', 'failed', 'cancelled')) \
-                     order by search.sequence",
-            )
-            .bind(&session_key)
-            .bind(recovery_start_sequence)
-            .fetch_all(&self.pool);
-            let legacy_recalls = sqlx::query(
-                "select e.event_json from session_event_search search \
-                     join session_events e \
-                       on e.session_id = search.session_id and e.event_id = search.event_id \
-                     where search.session_id = ? and search.sequence < ? \
-                     and search.event_kind = 'prompt_recalled' order by search.sequence",
-            )
-            .bind(&session_key)
-            .bind(recovery_start_sequence)
-            .fetch_all(&self.pool);
-            let prior_subagents = sqlx::query(
-                "select e.event_json from session_events e \
-                     where e.session_id = ? and e.sequence < ? \
-                     and e.event_kind = 'subagent_activity' and e.sequence in ( \
-                       select max(sequence) from session_events \
-                       where session_id = ? and event_kind = 'subagent_activity' \
-                       group by json_extract(event_json, '$.kind.agent.session_id') \
-                     ) order by e.sequence",
-            )
-            .bind(&session_key)
-            .bind(recovery_start_sequence)
-            .bind(&session_key)
-            .fetch_all(&self.pool);
-            let (suffix, legacy_messages, legacy_recalls, prior_subagents) =
-                tokio::try_join!(suffix, legacy_messages, legacy_recalls, prior_subagents)?;
-            let suffix = suffix
-                .into_iter()
-                .map(|row| serde_json::from_str(row.try_get("event_json")?).map_err(Into::into))
-                .collect::<Result<Vec<SessionEvent>>>()?;
-            let mut recovery = SessionRecovery::from_events(suffix);
-            let mut queue_events = legacy_messages
-                .into_iter()
-                .chain(legacy_recalls)
-                .map(|row| serde_json::from_str(row.try_get("event_json")?).map_err(Into::into))
-                .collect::<Result<Vec<SessionEvent>>>()?;
-            queue_events.sort_unstable_by_key(|event| event.sequence);
-            queue_events.append(&mut recovery.queue_events);
-            recovery.queue_events = queue_events;
-            let mut subagent_events = prior_subagents
-                .into_iter()
-                .map(|row| serde_json::from_str(row.try_get("event_json")?).map_err(Into::into))
-                .collect::<Result<Vec<SessionEvent>>>()?;
-            subagent_events.append(&mut recovery.subagent_events);
-            recovery.subagent_events = subagent_events;
-            return Ok(recovery);
+            return self
+                .recovery_projection_from_sequence(session_id, recovery_start_sequence, None)
+                .await;
         }
         let events = self
             .composed_recovery_events(session_id, None)
@@ -3947,7 +4003,7 @@ impl SqliteSessionStore {
         .bind(event.session_id.to_string())
         .execute(&mut **transaction)
         .await?;
-        Ok(event)
+        Ok(compact_event)
     }
 }
 
@@ -5242,6 +5298,15 @@ impl SessionStore for SqliteSessionStore {
 
     async fn recovery(&self, session_id: Uuid) -> Result<SessionRecovery> {
         self.recovery_projection(session_id).await
+    }
+
+    async fn recovery_from_provider_checkpoint(
+        &self,
+        session_id: Uuid,
+        provider_session_id: &str,
+    ) -> Result<Option<SessionRecovery>> {
+        self.provider_checkpoint_recovery_projection(session_id, provider_session_id)
+            .await
     }
 
     async fn live_events_after(

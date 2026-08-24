@@ -1221,10 +1221,9 @@ async fn run_codex_subscription_process_pooled(
         let started =
             start_pooled_codex_process(&request, permission, state._auth_home.as_ref()).await?;
         if request.session_id.is_some() && !started.resumed {
-            request.prompt = request
-                .resume_unavailable_prompt
-                .take()
-                .context("Codex recovery failed without a durable replay prompt")?;
+            request.prompt = request.resume_unavailable_prompt.take().context(
+                "Codex durable thread recovery unavailable; retry from Borg's durable journal",
+            )?;
             request.session_id = None;
             request.fork_turn_id = None;
         }
@@ -1408,7 +1407,9 @@ async fn start_pooled_codex_process(
                     .resume_unavailable_prompt
                     .as_deref()
                     .with_context(|| {
-                        format!("failed to recover Codex thread {thread_id}: {recovery_error:#}")
+                        format!(
+                            "Codex durable thread recovery unavailable; retry from Borg's durable journal: {recovery_error:#}"
+                        )
                     })?;
                 anyhow::ensure!(
                     replay.chars().count() <= CODEX_APP_SERVER_TEXT_INPUT_LIMIT_CHARS,
