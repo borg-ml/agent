@@ -1213,6 +1213,14 @@ async fn context_clear_resets_provider_projection_and_recovery_prefix() {
             context_tokens: 40_000,
             context_window_tokens: 100_000,
         },
+        SessionEventKind::Message {
+            message_id: Uuid::new_v4(),
+            actor: EventActor::User,
+            text: "queued across context clear".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Queued,
+            delivery: Some(PromptDelivery::Queue),
+        },
         SessionEventKind::ContextCleared,
         message(Uuid::new_v4(), "new context"),
     ] {
@@ -1235,6 +1243,14 @@ async fn context_clear_resets_provider_projection_and_recovery_prefix() {
         &recovery.context_events[1].kind,
         SessionEventKind::Message { text, .. } if text == "new context"
     ));
+    assert!(recovery.queue_events.iter().any(|event| matches!(
+        &event.kind,
+        SessionEventKind::Message {
+            text,
+            status: MessageStatus::Queued,
+            ..
+        } if text == "queued across context clear"
+    )));
 }
 
 #[tokio::test]
@@ -2690,22 +2706,7 @@ async fn large_session_recent_prompt_recall_p95_gate() {
         };
         let event = SessionEvent::new(session_id, sequence, kind);
         state.apply(&event).unwrap();
-        sqlx::query(
-            "insert into session_events \
-             (session_id, sequence, event_id, event_kind, event_json, projection_json, \
-              fork_inheritable, recovery_relevant, message_id, created_at) \
-             values (?, ?, ?, 'message', ?, ?, 1, 1, ?, ?)",
-        )
-        .bind(session_id.to_string())
-        .bind(i64::try_from(sequence).unwrap())
-        .bind(event.id.to_string())
-        .bind(serde_json::to_string(&event).unwrap())
-        .bind(serde_json::to_string(&state).unwrap())
-        .bind(message_id.to_string())
-        .bind(event.created_at.to_rfc3339())
-        .execute(&mut *transaction)
-        .await
-        .unwrap();
+        insert_performance_profile_event(&mut transaction, &event, &state).await;
     }
     sqlx::query("update sessions set next_sequence=?, state_json=?, updated_at=? where id=?")
         .bind(i64::try_from(EVENT_COUNT + 1).unwrap())
@@ -2731,6 +2732,117 @@ async fn large_session_recent_prompt_recall_p95_gate() {
         p95 < Duration::from_millis(10),
         "recent prompt recall p95 exceeded 10 ms: {p95:?}"
     );
+}
+
+#[tokio::test]
+#[ignore = "explicit cleared-context recovery p95 performance gate"]
+async fn large_cleared_context_recovery_p95_gate() {
+    const OBSOLETE_EVENT_COUNT: u64 = 25_000;
+    const RETAINED_EVENT_COUNT: u64 = 100;
+    const SAMPLES: usize = 20;
+
+    let (_directory, store) = store().await;
+    let session_id = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+    let mut state = SessionState::default();
+    let mut transaction = store.pool().begin().await.unwrap();
+    for sequence in 1..=OBSOLETE_EVENT_COUNT {
+        let event = SessionEvent::new(
+            session_id,
+            sequence,
+            SessionEventKind::Message {
+                message_id: Uuid::new_v4(),
+                actor: EventActor::Assistant,
+                text: format!("obsolete recovery context {sequence}"),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            },
+        );
+        state.apply(&event).unwrap();
+        insert_performance_profile_event(&mut transaction, &event, &state).await;
+    }
+    let clear_sequence = OBSOLETE_EVENT_COUNT + 1;
+    let clear = SessionEvent::new(session_id, clear_sequence, SessionEventKind::ContextCleared);
+    state.apply(&clear).unwrap();
+    insert_performance_profile_event(&mut transaction, &clear, &state).await;
+    for sequence in (clear_sequence + 1)..=(clear_sequence + RETAINED_EVENT_COUNT) {
+        let event = SessionEvent::new(
+            session_id,
+            sequence,
+            SessionEventKind::Message {
+                message_id: Uuid::new_v4(),
+                actor: EventActor::Assistant,
+                text: format!("retained recovery context {sequence}"),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            },
+        );
+        state.apply(&event).unwrap();
+        insert_performance_profile_event(&mut transaction, &event, &state).await;
+    }
+    let next_sequence = clear_sequence + RETAINED_EVENT_COUNT + 1;
+    sqlx::query("update sessions set next_sequence=?, state_json=?, updated_at=? where id=?")
+        .bind(i64::try_from(next_sequence).unwrap())
+        .bind(serde_json::to_string(&state).unwrap())
+        .bind(Utc::now().to_rfc3339())
+        .bind(session_id.to_string())
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
+
+    let mut samples = Vec::with_capacity(SAMPLES);
+    for _ in 0..SAMPLES {
+        let started = Instant::now();
+        let recovery = store.recovery(session_id).await.unwrap();
+        assert_eq!(
+            recovery.context_events.len(),
+            usize::try_from(RETAINED_EVENT_COUNT + 1).unwrap()
+        );
+        assert!(matches!(
+            recovery.context_events.first().unwrap().kind,
+            SessionEventKind::ContextCleared
+        ));
+        assert!(recovery.queue_events.is_empty());
+        samples.push(started.elapsed());
+    }
+    let p95 = duration_p95(&mut samples);
+    eprintln!("25k-event cleared-context recovery p95: {p95:?}");
+    assert!(
+        p95 < Duration::from_millis(10),
+        "cleared-context recovery p95 exceeded 10 ms: {p95:?}"
+    );
+}
+
+async fn insert_performance_profile_event(
+    transaction: &mut Transaction<'_, Sqlite>,
+    event: &SessionEvent,
+    state: &SessionState,
+) {
+    let message_id = match &event.kind {
+        SessionEventKind::Message { message_id, .. } => Some(message_id.to_string()),
+        _ => None,
+    };
+    sqlx::query(
+        "insert into session_events \
+         (session_id, sequence, event_id, event_kind, event_json, projection_json, \
+          fork_inheritable, recovery_relevant, message_id, created_at) \
+         values (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+    )
+    .bind(event.session_id.to_string())
+    .bind(i64::try_from(event.sequence).unwrap())
+    .bind(event.id.to_string())
+    .bind(event_kind(&event.kind).unwrap())
+    .bind(serde_json::to_string(event).unwrap())
+    .bind(serde_json::to_string(state).unwrap())
+    .bind(i64::from(event.kind.is_fork_inheritable()))
+    .bind(message_id)
+    .bind(event.created_at.to_rfc3339())
+    .execute(&mut **transaction)
+    .await
+    .unwrap();
 }
 
 #[tokio::test]

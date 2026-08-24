@@ -41,6 +41,11 @@ the actor/status filter, reverse sequence order, and result limit in SQLite
 instead of deserializing and sorting the entire message history reduced p95
 from 88.0 ms to 0.42 ms on the same checkout.
 
+The ignored `large_cleared_context_recovery_p95_gate` test profiles resume
+after an explicit context reset with 25,000 obsolete events and a 100-event
+retained suffix. Indexed boundary, legacy-queue, and latest-subagent reads
+reduced recovery p95 from 54.7 ms to 0.76 ms on the same checkout.
+
 For sampled counters, install `perf` and run the command printed by the
 profile script. `cargo-flamegraph` can be used on the same release test binary
 when available.
