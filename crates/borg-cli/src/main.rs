@@ -6,6 +6,8 @@ mod collab;
 mod dictation;
 mod editor_preferences;
 mod extensions;
+mod limits;
+mod protection;
 mod remote_commands;
 mod session_commands;
 mod sleep_inhibitor;
@@ -25,6 +27,10 @@ use crate::remote_commands::{print_local_workspaces, run_local_agent, run_remote
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cli = Cli::parse();
+    let no_limits = cli.no_limits;
+    let command = cli.command_or_agent();
+    limits::reexec_local_agent_if_enabled(&command, no_limits)?;
     let writer = log_writer();
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -34,7 +40,7 @@ async fn main() -> Result<()> {
         .with_ansi(false)
         .with_writer(writer)
         .init();
-    match Cli::parse().command_or_agent() {
+    match command {
         Command::Agent(args) => run_local_agent(args).await,
         Command::Resume { session } => run_local_agent(LocalAgentCliArgs::resume(session)).await,
         Command::Remote { command } => run_remote_command(command).await,
@@ -46,6 +52,7 @@ async fn main() -> Result<()> {
         Command::Acp(args) => acp::run(args).await,
         Command::Collab { command } => collab::run(command).await,
         Command::Doctor { json } => doctor(json).await,
+        Command::Limits(args) => limits::run(args).await,
         Command::AgentMcp => agent_mcp::run().await,
     }
 }

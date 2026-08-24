@@ -126,6 +126,50 @@ Automated terminal checks should use `borg agent --ephemeral --local-only`.
 That creates a temporary session store and removes it when the process exits,
 so health checks do not pollute the user's resume history or Remote workspace.
 
+### Local resource limits
+
+On Linux systems with systemd and cgroup v2, one command keeps local Borg
+sessions from exhausting the workstation:
+
+```sh
+borg limits enable
+```
+
+Future `borg` and `borg resume` processes automatically enter their own
+terminal-compatible scope; no wrapper or `sudo` is needed. Borg computes a
+generous per-session memory boundary and a shared boundary across every active
+session, preserving headroom for the desktop. CPU is not capped, but Borg gets
+less priority when the machine is busy. Process-count and I/O weights are used
+only when the OS actually delegates those controllers.
+
+Run `borg limits` or `borg limits status` to see the effective values, active
+protected sessions, and memory-pressure/OOM counters. `borg limits disable`
+turns protection off for future launches without stopping existing sessions;
+`borg --no-limits` or `BORG_LIMITS=0 borg` bypasses it for one launch. The
+managed user unit is validated and probed before enablement, and Borg refuses
+to overwrite a unit it does not own.
+
+Important desktop processes can be protected separately when they are managed
+as systemd user services:
+
+```sh
+borg limits protect add dms
+borg limits protect list
+borg limits protect remove dms
+```
+
+The service name may omit `.service`. Borg configures automatic recovery with
+bounded retry delay and gives the service more CPU and I/O priority when those
+controllers are available. Changes apply immediately without restarting the
+service. Borg refuses to replace a drop-in it does not own; starting or enabling
+the service remains under the user's control.
+
+These limits cover Borg and its direct process tree, including builds and
+subagents. Containers started by a rootful Docker daemon use Docker's cgroups
+and need their own limits. This is a resource-exhaustion guardrail, not a
+sandbox or protection from processes running as the same user, kernel, driver,
+storage, or hardware failures.
+
 ### Durable data and trust boundaries
 
 Local session data is intentionally disposable while Borg is pre-1.0. Borg

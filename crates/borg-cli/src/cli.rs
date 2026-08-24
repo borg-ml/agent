@@ -8,6 +8,9 @@ use uuid::Uuid;
 #[command(about = "A high-performance, open-source agent harness and orchestrator")]
 #[command(version)]
 pub(crate) struct Cli {
+    /// Start this invocation without configured local resource limits.
+    #[arg(long, global = true)]
+    pub(crate) no_limits: bool,
     #[command(subcommand)]
     pub(crate) command: Option<Command>,
 }
@@ -56,8 +59,53 @@ pub(crate) enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Keep local agent workloads within a generous machine-wide budget.
+    Limits(LimitsArgs),
     #[command(name = "__agent-mcp", hide = true)]
     AgentMcp,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct LimitsArgs {
+    #[command(subcommand)]
+    pub(crate) command: Option<LimitsCommand>,
+    /// Emit machine-readable JSON output.
+    #[arg(long, global = true)]
+    pub(crate) json: bool,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum LimitsCommand {
+    /// Enable automatic limits for future local Borg sessions.
+    Enable,
+    /// Show configured limits and whether this machine can enforce them.
+    Status,
+    /// Disable limits for future sessions without stopping active ones.
+    Disable,
+    /// Keep important user services restartable and favored under pressure.
+    Protect(LimitsProtectArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct LimitsProtectArgs {
+    #[command(subcommand)]
+    pub(crate) command: Option<LimitsProtectCommand>,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum LimitsProtectCommand {
+    /// Protect a user service without interrupting it.
+    Add {
+        /// A systemd user service such as dms.service.
+        service: String,
+    },
+    /// Show configured services and whether protection is effective.
+    List,
+    /// Remove Borg's protection without interrupting the service.
+    Remove {
+        /// The systemd user service to stop protecting.
+        service: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -401,6 +449,41 @@ mod tests {
             panic!("workspaces command must not launch an agent");
         };
         assert!(args.json);
+    }
+
+    #[test]
+    fn limits_are_one_command_to_enable_and_have_a_global_escape_hatch() {
+        let cli = Cli::try_parse_from(["borg", "limits", "enable", "--json"])
+            .expect("limits enable parses");
+        assert!(!cli.no_limits);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Limits(LimitsArgs {
+                command: Some(LimitsCommand::Enable),
+                json: true,
+            }))
+        ));
+
+        let cli = Cli::try_parse_from(["borg", "resume", "--no-limits"])
+            .expect("one-run limits bypass parses");
+        assert!(cli.no_limits);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Resume { session: None })
+        ));
+
+        let command = Cli::try_parse_from(["borg", "limits", "protect", "add", "dms"])
+            .expect("protected service parses")
+            .command_or_agent();
+        assert!(matches!(
+            command,
+            Command::Limits(LimitsArgs {
+                command: Some(LimitsCommand::Protect(LimitsProtectArgs {
+                    command: Some(LimitsProtectCommand::Add { service }),
+                })),
+                json: false,
+            }) if service == "dms"
+        ));
     }
 
     #[test]
