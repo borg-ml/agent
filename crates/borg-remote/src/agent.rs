@@ -790,13 +790,15 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
             .profiler
             .as_ref()
             .map(|profiler| profiler.begin_turn(turn.provider));
-        let prepare_result = self.prepare_local_turn(&mut turn).await;
-        if let Err(error) = prepare_result {
-            #[cfg(feature = "profiling")]
-            if let Some((profiler, started)) = self.profiler.as_ref().zip(profile_started) {
-                profiler.finish_turn(turn.provider, started, false);
+        match self.prepare_local_turn(&mut turn).await {
+            Ok(()) => {}
+            Err(error) => {
+                #[cfg(feature = "profiling")]
+                if let Some((profiler, started)) = self.profiler.as_ref().zip(profile_started) {
+                    profiler.finish_turn(turn.provider, started, false);
+                }
+                return Err(error);
             }
-            return Err(error);
         }
         #[cfg(feature = "profiling")]
         let profile_provider = turn.provider;
