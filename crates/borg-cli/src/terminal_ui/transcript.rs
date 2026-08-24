@@ -2253,12 +2253,19 @@ impl Transcript {
                                 {
                                     missed = true;
                                 }
-                                let lines = markdown_lines(
+                                let mut lines = markdown_lines(
                                     text,
                                     width.saturating_sub(MESSAGE_HORIZONTAL_PADDING * 2),
                                     text_color,
                                 );
-                                let links = markdown_link_ranges(text, &lines);
+                                let mut links = markdown_link_ranges(text, &lines);
+                                for link in &mut links {
+                                    link.start += MESSAGE_HORIZONTAL_PADDING;
+                                    link.end += MESSAGE_HORIZONTAL_PADDING;
+                                }
+                                for line in &mut lines {
+                                    line.spans.insert(0, Span::raw("  "));
+                                }
                                 entry.insert(MarkdownRender { lines, links }).clone()
                             }
                         };
@@ -2270,13 +2277,8 @@ impl Transcript {
                     };
                     for link in &mut message_lines.links {
                         link.row += lines.len();
-                        link.start += MESSAGE_HORIZONTAL_PADDING;
-                        link.end += MESSAGE_HORIZONTAL_PADDING;
                     }
                     link_rows.extend(message_lines.links);
-                    for line in &mut message_lines.lines {
-                        line.spans.insert(0, Span::raw("  "));
-                    }
                     lines.extend(message_lines.lines);
                     for (number, path) in attachments {
                         let token = format!("[Image {number}]");
@@ -3109,8 +3111,15 @@ impl Transcript {
                                     EventActor::Assistant => Some(assistant_message_color),
                                     _ => None,
                                 };
-                                let lines = markdown_lines(text, content_width, text_color);
-                                let links = markdown_link_ranges(text, &lines);
+                                let mut lines = markdown_lines(text, content_width, text_color);
+                                let mut links = markdown_link_ranges(text, &lines);
+                                for link in &mut links {
+                                    link.start += MESSAGE_HORIZONTAL_PADDING;
+                                    link.end += MESSAGE_HORIZONTAL_PADDING;
+                                }
+                                for line in &mut lines {
+                                    line.spans.insert(0, Span::raw("  "));
+                                }
                                 Some((
                                     chunk_index * chunk_size + entry_index,
                                     MarkdownRender { lines, links },
