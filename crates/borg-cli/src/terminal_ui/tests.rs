@@ -1448,6 +1448,34 @@ fn tool_duration_appears_only_from_one_tenth_of_a_second() {
 }
 
 #[test]
+fn running_tool_elapsed_cache_tick_changes_each_tenth() {
+    let session_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::ToolStarted {
+            tool_call_id: "timed-1".to_string(),
+            name: "command_execution".to_string(),
+            input: serde_json::json!({"command": "sleep 1"}),
+            input_ref: None,
+        },
+    ));
+    let started_at = DateTime::parse_from_rfc3339("2026-07-29T10:00:00.000Z")
+        .unwrap()
+        .with_timezone(&Utc);
+
+    assert_eq!(
+        transcript.tool_elapsed_cache_tick_at(started_at + chrono::Duration::milliseconds(99)),
+        transcript.tool_elapsed_cache_tick_at(started_at)
+    );
+    assert_ne!(
+        transcript.tool_elapsed_cache_tick_at(started_at),
+        transcript.tool_elapsed_cache_tick_at(started_at + chrono::Duration::milliseconds(100))
+    );
+}
+
+#[test]
 fn a_new_edit_or_message_collapses_the_previous_diff() {
     let session_id = Uuid::new_v4();
     let mut transcript = Transcript::default();
@@ -6709,7 +6737,7 @@ fn transcript_separates_labeled_groups_from_header_and_tool_activity() {
 }
 
 #[test]
-fn tool_calls_keep_blank_rows_before_the_following_message() {
+fn adjacent_tool_calls_are_compact_but_leave_gap_before_following_message() {
     let mut transcript = Transcript::default();
     let tool = |name: &str| TranscriptEntry::Tool {
         source_name: "command_execution".to_string(),
@@ -6741,13 +6769,62 @@ fn tool_calls_keep_blank_rows_before_the_following_message() {
     });
 
     let rendered = transcript.render(80, None, None, None);
-    assert_eq!(rendered.1, vec![(0, 0, 1), (1, 2, 3)]);
-    assert!(rendered.0[1].spans.is_empty());
+    assert_eq!(rendered.1, vec![(0, 0, 1), (1, 1, 2)]);
+    assert!(!rendered.0[1].spans.is_empty());
     assert_eq!(
-        rendered.0[3].spans.last().and_then(|span| span.style.bg),
+        rendered.0[2].spans.last().and_then(|span| span.style.bg),
         Some(MESSAGE_BG)
     );
-    assert_eq!(rendered.3[0].1, 3);
+    assert_eq!(rendered.3[0].1, 2);
+}
+
+#[test]
+fn adjacent_expanded_thinking_entries_are_compact_but_separate_from_message() {
+    let mut transcript = Transcript::default();
+    let thinking = |text: &str| TranscriptEntry::Tool {
+        source_name: "reasoning".to_string(),
+        name: "Thinking".to_string(),
+        detail: String::new(),
+        code_view: Some(("reasoning".to_string(), text.to_string())),
+        output_view: None,
+        payload_refs: Vec::new(),
+        time: "12:00".to_string(),
+        started_at: Utc::now(),
+        completed_at: Some(Utc::now()),
+        complete: true,
+        error: false,
+        user_interrupted: false,
+        backgrounded: false,
+        expanded: true,
+    };
+    transcript.order.push(thinking("first"));
+    transcript.order.push(thinking("second"));
+    transcript.order.push(TranscriptEntry::Message {
+        actor: EventActor::Assistant,
+        text: "finished".to_string(),
+        attachments: Vec::new(),
+        model: None,
+        effort: None,
+        time: "12:01".to_string(),
+        status: MessageStatus::Complete,
+        complete: true,
+    });
+
+    let lines = transcript.lines(80);
+    let thinking_rows = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.to_string().contains("Thinking"))
+        .map(|(row, _)| row)
+        .collect::<Vec<_>>();
+    let message_header = lines
+        .iter()
+        .position(|line| line.to_string().contains("borg"))
+        .expect("assistant header");
+
+    assert_eq!(thinking_rows.len(), 2);
+    assert!(!lines[thinking_rows[1] - 1].spans.is_empty());
+    assert!(lines[message_header - 1].to_string().trim().is_empty());
 }
 
 #[test]

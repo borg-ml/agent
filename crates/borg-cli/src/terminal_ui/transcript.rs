@@ -1,4 +1,5 @@
 const USER_INTERRUPT_ACTIVITY: &str = "agent interrupted by user";
+const TOOL_ELAPSED_REFRESH_MILLIS: i64 = 100;
 
 struct Transcript {
     order: Vec<TranscriptEntry>,
@@ -2048,6 +2049,15 @@ impl Transcript {
             })
     }
 
+    fn tool_elapsed_cache_tick(&self) -> Option<i64> {
+        self.tool_elapsed_cache_tick_at(Utc::now())
+    }
+
+    fn tool_elapsed_cache_tick_at(&self, now: DateTime<Utc>) -> Option<i64> {
+        self.has_running_tool()
+            .then(|| now.timestamp_millis().div_euclid(TOOL_ELAPSED_REFRESH_MILLIS))
+    }
+
     fn has_running_tool(&self) -> bool {
         self.order.iter().any(|entry| {
             matches!(
@@ -2725,6 +2735,15 @@ impl Transcript {
                     expanded,
                     ..
                 } => {
+                    let previous_is_tool = index > 0
+                        && matches!(
+                            self.order.get(index - 1),
+                            Some(TranscriptEntry::Tool { .. })
+                        );
+                    let next_is_tool = matches!(
+                        self.order.get(index + 1),
+                        Some(TranscriptEntry::Tool { .. })
+                    );
                     let time = display_local_time(time, &today_prefix);
                     let is_reasoning = matches!(
                         code_view.as_ref(),
@@ -2741,6 +2760,7 @@ impl Transcript {
                     );
                     if *expanded
                         && rich_ui
+                        && (tool_window.is_some() || !previous_is_tool)
                         && lines
                             .last()
                             .is_some_and(|line: &Line<'static>| !line.spans.is_empty())
@@ -2929,6 +2949,7 @@ impl Transcript {
                     }
                     if *expanded
                         && rich_ui
+                        && (tool_window.is_some() || !next_is_tool)
                         && lines
                             .last()
                             .is_some_and(|line: &Line<'static>| !line.spans.is_empty())
@@ -2941,7 +2962,7 @@ impl Transcript {
                     } else {
                         SelectionRowRange::transcript_entry(index, summary_start, lines.len())
                     });
-                    if tool_window.is_none() {
+                    if tool_window.is_none() && !next_is_tool {
                         let tool_separator_row = if lines
                             .last()
                             .is_some_and(|line: &Line<'static>| line.spans.is_empty())

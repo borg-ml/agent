@@ -176,7 +176,14 @@ type TranscriptRender = (
     Vec<LinkRowRange>,
     Vec<SelectionRowRange>,
 );
-type CachedTranscriptRender = (usize, usize, Option<i64>, NaiveDate, Arc<TranscriptRender>);
+type CachedTranscriptRender = (
+    usize,
+    usize,
+    Option<i64>,
+    Option<i64>,
+    NaiveDate,
+    Arc<TranscriptRender>,
+);
 
 /// A semantic viewport position that survives transcript reflow.  Tool bodies
 /// are special: after they collapse their header is the nearest durable row.
@@ -2193,6 +2200,10 @@ impl BorgTerminal {
         self.is_launch_screen() && self.splash_started_at.elapsed() < SPLASH_ANIMATION_DURATION
     }
 
+    pub fn has_running_tool(&self) -> bool {
+        self.transcript.has_running_tool()
+    }
+
     pub fn has_expiring_notice(&self) -> bool {
         self.copy_notice_expires_at.is_some()
     }
@@ -4121,7 +4132,7 @@ impl BorgTerminal {
     }
 
     fn copy_text_selection(&mut self) -> bool {
-        let Some((_, _, _, _, render)) = self.transcript_render_cache.as_ref() else {
+        let Some((.., render)) = self.transcript_render_cache.as_ref() else {
             return false;
         };
         let Some((start, end)) = self
@@ -4173,7 +4184,7 @@ impl BorgTerminal {
         let Some(area) = self.transcript_viewport_area else {
             return;
         };
-        let Some((_, _, _, _, render)) = self.transcript_render_cache.as_ref() else {
+        let Some((.., render)) = self.transcript_render_cache.as_ref() else {
             return;
         };
         self.pending_transcript_anchor = transcript_viewport_anchor(
@@ -4436,6 +4447,7 @@ impl BorgTerminal {
         let tool_run_viewport_height = tool_run_viewport_height(terminal_size.height as usize);
         let full_transcript_width = content_width.max(1) as usize;
         let goal_tick = self.transcript.active_goal_cache_tick();
+        let tool_elapsed_tick = self.transcript.tool_elapsed_cache_tick();
         let local_date = Local::now().date_naive();
         // Keep a separate full-width measurement so an overflowing transcript
         // can switch to the scrollbar-safe width without rendering both widths
@@ -4448,16 +4460,18 @@ impl BorgTerminal {
                         cached_width,
                         cached_tool_run_viewport_height,
                         cached_goal_tick,
+                        cached_tool_elapsed_tick,
                         cached_date,
                         _,
                     )| {
                         *cached_width == full_transcript_width
                             && *cached_tool_run_viewport_height == tool_run_viewport_height
                             && *cached_goal_tick == goal_tick
+                            && *cached_tool_elapsed_tick == tool_elapsed_tick
                             && *cached_date == local_date
                     },
                 )
-                .map(|(_, _, _, _, render)| Arc::clone(render))
+                .map(|(_, _, _, _, _, render)| Arc::clone(render))
         });
         let full_transcript_render = stale_full_transcript_render.flatten().unwrap_or_else(|| {
             if self.transcript_render_cache.is_some() {
@@ -4467,6 +4481,7 @@ impl BorgTerminal {
                     full_transcript_width,
                     tool_run_viewport_height,
                     goal_tick,
+                    tool_elapsed_tick,
                     local_date,
                 )
             } else {
@@ -4477,6 +4492,7 @@ impl BorgTerminal {
                     full_transcript_width,
                     tool_run_viewport_height,
                     goal_tick,
+                    tool_elapsed_tick,
                     local_date,
                 )
             }
@@ -4794,6 +4810,7 @@ impl BorgTerminal {
                 transcript_width,
                 tool_run_viewport_height,
                 goal_tick,
+                tool_elapsed_tick,
                 local_date,
             )
         };
@@ -9747,25 +9764,35 @@ fn cached_transcript_render(
     width: usize,
     tool_run_viewport_height: usize,
     goal_tick: Option<i64>,
+    tool_elapsed_tick: Option<i64>,
     local_date: NaiveDate,
 ) -> Arc<TranscriptRender> {
     cache
         .as_ref()
         .filter(
-            |(cached_width, cached_tool_run_viewport_height, cached_goal_tick, cached_date, _)| {
+            |(
+                cached_width,
+                cached_tool_run_viewport_height,
+                cached_goal_tick,
+                cached_tool_elapsed_tick,
+                cached_date,
+                _,
+            )| {
                 *cached_width == width
                     && *cached_tool_run_viewport_height == tool_run_viewport_height
                     && *cached_goal_tick == goal_tick
+                    && *cached_tool_elapsed_tick == tool_elapsed_tick
                     && *cached_date == local_date
             },
         )
-        .map(|(_, _, _, _, render)| Arc::clone(render))
+        .map(|(_, _, _, _, _, render)| Arc::clone(render))
         .unwrap_or_else(|| {
             let render = Arc::new(transcript.render_for_cache(width, tool_run_viewport_height));
             *cache = Some((
                 width,
                 tool_run_viewport_height,
                 goal_tick,
+                tool_elapsed_tick,
                 local_date,
                 Arc::clone(&render),
             ));
