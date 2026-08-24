@@ -1299,6 +1299,15 @@ async fn run_local_agent_session(
         .with_extension_skill_roots(extension_skill_roots)
         .with_extension_workflows(extension_workflows)
         .with_extension_api(extension_catalog.api_snapshot());
+    #[cfg(feature = "profiling")]
+    let local_executor = if !session_access.is_attached() {
+        match borg_remote::RuntimeProfiler::start(&sessions_dir, session_id)? {
+            Some(profiler) => local_executor.with_profiler(profiler),
+            None => local_executor,
+        }
+    } else {
+        local_executor
+    };
     let live_extension_executor = local_executor.clone();
     let executor: Arc<dyn AgentTurnExecutor> = Arc::new(local_executor);
     let lifecycle_executor = Arc::clone(&executor);

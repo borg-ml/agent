@@ -268,6 +268,8 @@ pub struct LocalAgentTurnExecutor {
     runtime_extension_loader: Option<RuntimeExtensionLoader>,
     subscription_pools: Arc<SubscriptionPoolRegistry>,
     web_search: Option<Arc<dyn borg_search::WebSearchProvider>>,
+    #[cfg(feature = "profiling")]
+    profiler: Option<Arc<crate::RuntimeProfiler>>,
 }
 
 impl Default for LocalAgentTurnExecutor {
@@ -287,6 +289,8 @@ impl Default for LocalAgentTurnExecutor {
             runtime_extension_loader: None,
             subscription_pools: Arc::new(SubscriptionPoolRegistry::default()),
             web_search,
+            #[cfg(feature = "profiling")]
+            profiler: None,
         }
     }
 }
@@ -534,6 +538,12 @@ impl LocalAgentTurnExecutor {
         self
     }
 
+    #[cfg(feature = "profiling")]
+    pub fn with_profiler(mut self, profiler: Arc<crate::RuntimeProfiler>) -> Self {
+        self.profiler = Some(profiler);
+        self
+    }
+
     pub fn with_external_mcp_servers(
         self,
         servers: Vec<borg_provider::mcp::ExternalMcpServer>,
@@ -775,12 +785,34 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
         events: mpsc::Sender<SessionEventKind>,
         controls: Option<mpsc::Receiver<AgentTurnControl>>,
     ) -> Result<AgentTurnResult> {
-        self.prepare_local_turn(&mut turn).await?;
+        #[cfg(feature = "profiling")]
+        let profile_started = self
+            .profiler
+            .as_ref()
+            .map(|profiler| profiler.begin_turn(turn.provider));
+        let prepare_result = self.prepare_local_turn(&mut turn).await;
+        if let Err(error) = prepare_result {
+            #[cfg(feature = "profiling")]
+            if let Some((profiler, started)) = self.profiler.as_ref().zip(profile_started) {
+                profiler.finish_turn(turn.provider, started, false);
+            }
+            return Err(error);
+        }
+        #[cfg(feature = "profiling")]
+        let profile_provider = turn.provider;
+        #[cfg(feature = "profiling")]
+        if let Some(profiler) = self.profiler.as_ref() {
+            profiler.set_phase("provider_start");
+        }
         if turn.provider.uses_native_harness() {
             let result = self
                 .native_harness
                 .run(turn.clone(), events, controls)
                 .await;
+            #[cfg(feature = "profiling")]
+            if let Some((profiler, started)) = self.profiler.as_ref().zip(profile_started) {
+                profiler.finish_turn(profile_provider, started, result.is_ok());
+            }
             if let Err(error) = self
                 .run_extension_hooks(
                     &turn,
@@ -804,6 +836,8 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
                         request_template: None,
                         local: true,
                         subscription_pools: Some(Arc::clone(&self.subscription_pools)),
+                        #[cfg(feature = "profiling")]
+                        profiler: self.profiler.clone(),
                     },
                     true,
                 )
@@ -813,6 +847,10 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
             | CodingProvider::OpenRouter
             | CodingProvider::OpenAiCompatible => unreachable!("native provider handled above"),
         };
+        #[cfg(feature = "profiling")]
+        if let Some((profiler, started)) = self.profiler.as_ref().zip(profile_started) {
+            profiler.finish_turn(profile_provider, started, result.is_ok());
+        }
         if let Err(error) = self
             .run_extension_hooks(
                 &completed_hook_turn,
@@ -954,6 +992,8 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
                 request_template: None,
                 local: true,
                 subscription_pools: None,
+                #[cfg(feature = "profiling")]
+                profiler: None,
             },
             false,
         ));
@@ -1054,6 +1094,8 @@ pub async fn run_agent_turn_controlled(
                     request_template: None,
                     local: true,
                     subscription_pools: None,
+                    #[cfg(feature = "profiling")]
+                    profiler: None,
                 },
                 true,
             )
@@ -1066,6 +1108,8 @@ struct BorgProviderTurnRuntime {
     request_template: Option<ChatStreamRequest>,
     local: bool,
     subscription_pools: Option<Arc<SubscriptionPoolRegistry>>,
+    #[cfg(feature = "profiling")]
+    profiler: Option<Arc<crate::RuntimeProfiler>>,
 }
 
 fn direct_chat_stream_request(
@@ -1200,6 +1244,8 @@ async fn run_borg_provider_turn(
         request_template,
         local,
         subscription_pools,
+        #[cfg(feature = "profiling")]
+        profiler,
     } = runtime;
     let provider_turn_started = Instant::now();
     let ttft_session_id = turn.session_id;
@@ -1381,6 +1427,10 @@ async fn run_borg_provider_turn(
         message_id = %ttft_message_id,
         "Borg provider stage"
     );
+    #[cfg(feature = "profiling")]
+    if let Some(profiler) = profiler.as_ref() {
+        profiler.set_phase("provider_wait");
+    }
     let mut assistant_message_id = Uuid::new_v4();
     let mut text = String::new();
     let mut final_output = String::new();
@@ -1423,6 +1473,10 @@ async fn run_borg_provider_turn(
             ChatStreamEvent::Delta(delta) => {
                 if first_model_output {
                     first_model_output = false;
+                    #[cfg(feature = "profiling")]
+                    if let Some(profiler) = profiler.as_ref() {
+                        profiler.set_phase("model_output");
+                    }
                     tracing::debug!(
                         target: "borg_ttft",
                         stage = "first_model_output",
@@ -1460,6 +1514,10 @@ async fn run_borg_provider_turn(
                 };
                 if first_model_output {
                     first_model_output = false;
+                    #[cfg(feature = "profiling")]
+                    if let Some(profiler) = profiler.as_ref() {
+                        profiler.set_phase("model_output");
+                    }
                     tracing::debug!(
                         target: "borg_ttft",
                         stage = "first_model_output",
@@ -1484,6 +1542,10 @@ async fn run_borg_provider_turn(
                 last_completed_reasoning = None;
                 if first_model_output {
                     first_model_output = false;
+                    #[cfg(feature = "profiling")]
+                    if let Some(profiler) = profiler.as_ref() {
+                        profiler.set_phase("model_output");
+                    }
                     tracing::debug!(
                         target: "borg_ttft",
                         stage = "first_model_output",
@@ -1557,6 +1619,10 @@ async fn run_borg_provider_turn(
                     },
                 )
                 .await;
+                #[cfg(feature = "profiling")]
+                if let Some(profiler) = profiler.as_ref() {
+                    profiler.set_phase("tool_execution");
+                }
             }
             ChatStreamEvent::ToolResult {
                 tool_use_id,
@@ -1576,6 +1642,10 @@ async fn run_borg_provider_turn(
                     },
                 )
                 .await;
+                #[cfg(feature = "profiling")]
+                if let Some(profiler) = profiler.as_ref() {
+                    profiler.set_phase("provider_wait");
+                }
             }
             ChatStreamEvent::ApprovalRequested {
                 approval_id,

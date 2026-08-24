@@ -6,6 +6,7 @@ mod collab;
 mod dictation;
 mod editor_preferences;
 mod extensions;
+mod inspect;
 mod limits;
 mod protection;
 mod remote_commands;
@@ -47,6 +48,7 @@ async fn main() -> Result<()> {
         Command::Update(args) => updater::run(args).await,
         Command::Capabilities(args) => print_capabilities(args),
         Command::Extensions(args) => print_extensions(args),
+        Command::Inspect(args) => inspect::run(args).await,
         Command::Workspaces(args) => print_local_workspaces(args.json).await,
         Command::Session { command } => session_commands::run(command).await,
         Command::Acp(args) => acp::run(args).await,

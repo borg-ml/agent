@@ -40,6 +40,8 @@ pub(crate) enum Command {
     Capabilities(CapabilitiesArgs),
     /// Manage Blu live extensions.
     Extensions(ExtensionsArgs),
+    /// Inspect live local session owners and opt-in runtime profiling data.
+    Inspect(InspectArgs),
     /// List local multiplayer workspaces available to this OS user.
     Workspaces(WorkspacesArgs),
     /// Inspect, branch, export, and restore local durable sessions.
@@ -221,6 +223,25 @@ pub(crate) struct ExtensionsArgs {
     // accepting `borg extensions info <id> --json`.
     #[arg(long, global = true)]
     pub(crate) json: bool,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct InspectArgs {
+    #[command(subcommand)]
+    pub(crate) command: Option<InspectCommand>,
+    /// Emit machine-readable JSON output.
+    #[arg(long, global = true)]
+    pub(crate) json: bool,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum InspectCommand {
+    /// Show live local session owners and their profiling snapshot.
+    Live {
+        /// Inspect only this session; omit to list every local owner.
+        #[arg(long)]
+        session: Option<Uuid>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -452,6 +473,22 @@ mod tests {
             panic!("workspaces command must not launch an agent");
         };
         assert!(args.json);
+    }
+
+    #[test]
+    fn inspect_live_accepts_an_optional_session_target() {
+        let session = "22222222-2222-2222-2222-222222222222";
+        let command =
+            Cli::try_parse_from(["borg", "inspect", "live", "--session", session, "--json"])
+                .expect("inspect live command parses")
+                .command_or_agent();
+        assert!(matches!(
+            command,
+            Command::Inspect(InspectArgs {
+                command: Some(InspectCommand::Live { session: Some(_) }),
+                json: true,
+            })
+        ));
     }
 
     #[test]

@@ -83,3 +83,27 @@ admission path at 162.9 µs versus 550.5 ms for detailed discovery, a roughly
 For sampled counters, install `perf` and run the command printed by the
 profile script. `cargo-flamegraph` can be used on the same release test binary
 when available.
+
+## Opt-in live runtime profile
+
+The normal Borg build does not collect runtime profile data. To profile an
+owned local session, build the separate profiling variant and opt it in for
+that launch:
+
+    cargo build --release -p borg --features profiling
+    BORG_PROFILE=1 target/release/borg agent
+
+From another terminal, inspect every local session owner:
+
+    borg inspect live
+    borg inspect live --session SESSION_ID --json
+
+The profiling variant writes one bounded, content-free snapshot to
+.borg/remote/sessions/<session-id>.profile.json. It records turn duration,
+provider setup, provider wait, first model output, tool execution, and
+aggregated count/average/p95/max timings. The snapshot is not part of the
+durable session journal and is only created when BORG_PROFILE is enabled.
+
+This semantic profile explains where a turn spends wall time. For CPU-only
+hotspots, attach the platform profiler separately (for example perf record on
+Linux) to the profiled process and its provider children.

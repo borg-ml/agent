@@ -27,6 +27,7 @@ mod orchestration;
 mod persistent_runtime;
 mod plugin_store;
 mod process_environment;
+mod profiling;
 mod receipt;
 mod runtime_protocol;
 mod self_service;
@@ -83,6 +84,12 @@ pub use lsp::LspService;
 pub use native_process::ProcessSnapshot;
 pub use orchestration::*;
 pub(crate) use plugin_store::SqlitePluginStore;
+#[cfg(feature = "profiling")]
+pub use profiling::RuntimeProfiler;
+pub use profiling::{
+    RuntimeProfileActiveTurn, RuntimeProfilePhase, RuntimeProfileSnapshot, RuntimeProfileTurn,
+    read_runtime_profile, runtime_profile_path,
+};
 pub use runtime_protocol::{
     AGENT_RUNTIME_PROTOCOL, AGENT_RUNTIME_PROTOCOL_VERSION, AgentRuntimeCommandEnvelope,
     AgentRuntimeEventEnvelope, AgentRuntimeSnapshot,

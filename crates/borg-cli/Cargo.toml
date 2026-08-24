@@ -16,6 +16,7 @@ subscription-adapters = [
     "borg-provider/subscription-adapters",
     "borg-remote/subscription-adapters",
 ]
+profiling = ["borg-remote/profiling"]
 
 [[bin]]
 name = "borg"
