@@ -1501,6 +1501,43 @@ fn live_tail_updates_reuse_completed_message_markdown() {
 }
 
 #[test]
+fn cached_message_background_deferral_preserves_transcript_layout() {
+    let session_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    for (sequence, actor, text) in [
+        (1, EventActor::User, "A **formatted** request"),
+        (2, EventActor::Assistant, "A completed response"),
+    ] {
+        transcript.apply(&SessionEvent::new(
+            session_id,
+            sequence,
+            SessionEventKind::Message {
+                message_id: Uuid::new_v4(),
+                actor,
+                text: text.to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            },
+        ));
+    }
+
+    let width = 80;
+    let styled = transcript.render(width, None, None, None);
+    let mut cached = transcript.render_for_cache(width, DEFAULT_TOOL_RUN_VIEWPORT_HEIGHT);
+    assert_eq!(cached.1, styled.1);
+    assert_eq!(cached.2, styled.2);
+    assert_eq!(cached.3, styled.3);
+    assert_eq!(cached.4, styled.4);
+    assert_eq!(cached.5, styled.5);
+    assert_eq!(cached.6, styled.6);
+    for (_, start, end) in &cached.3 {
+        apply_viewport_background(&mut cached.0, *start, *end, 0, width, MESSAGE_BG);
+    }
+    assert_eq!(cached.0, styled.0);
+}
+
+#[test]
 fn live_tail_updates_reuse_completed_tool_bodies() {
     let session_id = Uuid::new_v4();
     let mut transcript = Transcript::default();
@@ -1782,30 +1819,42 @@ fn large_resume_ingest_and_transcript_scroll_profile() {
         ));
     }
 
+    let history_order_started = Instant::now();
+    let display_events = transcript_history_in_display_order(&events);
+    let history_order = history_order_started.elapsed();
+    assert_eq!(display_events.len(), RESUME_TURNS * 2);
+    std::hint::black_box(display_events);
+
     let mut transcript = Transcript::default();
     transcript.reserve_history(events.len());
     let ingest_started = Instant::now();
-    for event in &events {
+    for event in &events[..RESUME_TURNS * 2] {
         transcript.apply(event);
     }
+    let message_ingest = ingest_started.elapsed();
+    let child_ingest_started = Instant::now();
+    for event in &events[RESUME_TURNS * 2..] {
+        transcript.apply(event);
+    }
+    let child_ingest = child_ingest_started.elapsed();
     let ingest = ingest_started.elapsed();
     assert_eq!(transcript.messages.len(), RESUME_TURNS * 2);
     assert_eq!(transcript.subagent_entries.len(), CHILD_COUNT);
 
     let first_render_started = Instant::now();
-    let first_render = transcript.render(120, None, None, None);
+    let first_render = transcript.render_for_cache(120, DEFAULT_TOOL_RUN_VIEWPORT_HEIGHT);
     let first_render_time = first_render_started.elapsed();
     assert!(first_render.0.len() > VIEWPORT_HEIGHT);
 
     let cached_render_started = Instant::now();
-    let cached_render = transcript.render(120, None, None, None);
+    let cached_render = transcript.render_for_cache(120, DEFAULT_TOOL_RUN_VIEWPORT_HEIGHT);
     let cached_render_time = cached_render_started.elapsed();
     assert_eq!(cached_render.0.len(), first_render.0.len());
 
     let reflow_started = Instant::now();
     let mut reflow_rows = 0usize;
     for width in [96, 144, 80, 120, 110, 132] {
-        let rendered = transcript.render(width, None, None, None);
+        let rendered = transcript.render_for_cache(width, DEFAULT_TOOL_RUN_VIEWPORT_HEIGHT);
         reflow_rows = reflow_rows.saturating_add(rendered.0.len());
         std::hint::black_box(rendered);
     }
@@ -1829,7 +1878,7 @@ fn large_resume_ingest_and_transcript_scroll_profile() {
     std::hint::black_box((reflow_rows, scroll_checksum));
 
     eprintln!(
-        "large resume/profile: events={} entries={} ingest={ingest:?} first_render={first_render_time:?} cached_render={cached_render_time:?} reflow={reflow_time:?} scroll={scroll_time:?}",
+        "large resume/profile: events={} entries={} history_order={history_order:?} ingest={ingest:?} message_ingest={message_ingest:?} child_ingest={child_ingest:?} first_render={first_render_time:?} cached_render={cached_render_time:?} reflow={reflow_time:?} scroll={scroll_time:?}",
         events.len(),
         transcript.order.len(),
     );
@@ -6547,10 +6596,14 @@ fn transcript_separates_labeled_groups_from_header_and_tool_activity() {
 #[test]
 fn timestamps_add_the_date_only_when_it_is_not_today() {
     let today = NaiveDate::from_ymd_opt(2026, 7, 26).unwrap();
+    let today_prefix = today.format("%Y-%m-%d ").to_string();
 
-    assert_eq!(display_local_time("2026-07-26 12:02", today), "12:02");
     assert_eq!(
-        display_local_time("2026-07-25 23:58", today),
+        display_local_time("2026-07-26 12:02", &today_prefix),
+        "12:02"
+    );
+    assert_eq!(
+        display_local_time("2026-07-25 23:58", &today_prefix),
         "2026-07-25 23:58"
     );
 }

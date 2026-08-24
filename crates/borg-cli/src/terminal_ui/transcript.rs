@@ -2071,6 +2071,7 @@ impl Transcript {
         )
     }
 
+    #[cfg(test)]
     fn render_with_tool_run_viewport(
         &self,
         width: usize,
@@ -2079,7 +2080,43 @@ impl Transcript {
         hovered_message: Option<usize>,
         hovered_entry: Option<usize>,
     ) -> TranscriptRender {
+        self.render_with_tool_run_viewport_mode(
+            width,
+            tool_run_viewport_height,
+            hovered_tool,
+            hovered_message,
+            hovered_entry,
+            false,
+        )
+    }
+
+    fn render_for_cache(
+        &self,
+        width: usize,
+        tool_run_viewport_height: usize,
+    ) -> TranscriptRender {
+        self.render_with_tool_run_viewport_mode(
+            width,
+            tool_run_viewport_height,
+            None,
+            None,
+            None,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_with_tool_run_viewport_mode(
+        &self,
+        width: usize,
+        tool_run_viewport_height: usize,
+        hovered_tool: Option<usize>,
+        hovered_message: Option<usize>,
+        hovered_entry: Option<usize>,
+        defer_completed_message_backgrounds: bool,
+    ) -> TranscriptRender {
         let today = Local::now().date_naive();
+        let today_prefix = today.format("%Y-%m-%d ").to_string();
         self.prepare_message_markdown_cache(width);
         {
             let mut cache = self.tool_body_cache.borrow_mut();
@@ -2162,7 +2199,7 @@ impl Transcript {
                     if matches!(actor, EventActor::User | EventActor::Assistant) {
                         lines.push(Line::default());
                     }
-                    let time = display_local_time(time, today);
+                    let time = display_local_time(time, &today_prefix);
                     let mut header = vec![Span::styled(
                         format!("  ▌ {label}"),
                         Style::default().fg(color).add_modifier(Modifier::BOLD),
@@ -2256,7 +2293,9 @@ impl Transcript {
                             Style::default().fg(Color::Cyan),
                         )));
                     }
-                    if matches!(actor, EventActor::User | EventActor::Assistant) {
+                    if matches!(actor, EventActor::User | EventActor::Assistant)
+                        && (!defer_completed_message_backgrounds || !*complete)
+                    {
                         let background = if hovered_message == Some(index) {
                             MESSAGE_HOVER_BG
                         } else {
@@ -2277,7 +2316,7 @@ impl Transcript {
                     lines.push(Line::default());
                 }
                 TranscriptEntry::Activity { text, time } => {
-                    let time = display_local_time(time, today);
+                    let time = display_local_time(time, &today_prefix);
                     let prefix = if tool_window.is_some() { "│ " } else { "  " };
                     let activity_color = if is_subagent_activity_text(text) {
                         SUBAGENT_PINK
@@ -2308,7 +2347,7 @@ impl Transcript {
                     state,
                     expanded,
                 } => {
-                    let time = display_local_time(time, today);
+                    let time = display_local_time(time, &today_prefix);
                     let prefix = if tool_window.is_some() { "│ " } else { "  " };
                     let glyph = transcript_action_glyph(*state);
                     let color = transcript_action_color(*kind, *state);
@@ -2365,7 +2404,7 @@ impl Transcript {
                     time,
                     expanded,
                 } => {
-                    let time = display_local_time(time, today);
+                    let time = display_local_time(time, &today_prefix);
                     let done = items
                         .iter()
                         .filter(|item| item.status == PlanItemStatus::Completed)
@@ -2457,7 +2496,7 @@ impl Transcript {
                     lines.push(Line::default());
                 }
                 TranscriptEntry::Goal { goal, time } => {
-                    let time = display_local_time(time, today);
+                    let time = display_local_time(time, &today_prefix);
                     let live_time =
                         goal.time_used_seconds
                             .saturating_add(if goal.status.is_active() {
@@ -2510,7 +2549,7 @@ impl Transcript {
                     lines.push(Line::default());
                 }
                 TranscriptEntry::Info { title, text, time } => {
-                    let time = display_local_time(time, today);
+                    let time = display_local_time(time, &today_prefix);
                     lines.push(Line::from(vec![
                         Span::styled(
                             format!("▌ {}", title.to_ascii_uppercase()),
@@ -2546,7 +2585,7 @@ impl Transcript {
                     complete,
                     ..
                 } => {
-                    let time = display_local_time(time, today);
+                    let time = display_local_time(time, &today_prefix);
                     let expandable = *complete && compaction_has_expandable_detail(summary);
                     let action_hint = if expandable {
                         if *expanded {
@@ -2609,7 +2648,7 @@ impl Transcript {
                     expanded,
                     ..
                 } => {
-                    let time = display_local_time(time, today);
+                    let time = display_local_time(time, &today_prefix);
                     let is_reasoning = matches!(
                         code_view.as_ref(),
                         Some((language, _)) if language == "reasoning"

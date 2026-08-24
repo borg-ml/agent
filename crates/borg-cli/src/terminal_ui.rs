@@ -4972,16 +4972,18 @@ impl BorgTerminal {
                 for (index, start, end) in
                     visible_row_ranges(message_rows, scroll_start, visible_height)
                 {
-                    if self.hovered_message == Some(*index) {
-                        apply_viewport_background(
-                            &mut visible_transcript,
-                            *start,
-                            *end,
-                            scroll_start,
-                            content_area.width as usize,
-                            MESSAGE_HOVER_BG,
-                        );
-                    }
+                    apply_viewport_background(
+                        &mut visible_transcript,
+                        *start,
+                        *end,
+                        scroll_start,
+                        content_area.width as usize,
+                        if self.hovered_message == Some(*index) {
+                            MESSAGE_HOVER_BG
+                        } else {
+                            MESSAGE_BG
+                        },
+                    );
                     next_message_hit_areas.push((
                         viewport_hit_area(content_area, scroll_start, *start, *end),
                         *index,
@@ -8539,11 +8541,8 @@ fn canonical_local_time(time: DateTime<Local>) -> String {
     time.format("%Y-%m-%d %H:%M").to_string()
 }
 
-fn display_local_time(time: &str, today: NaiveDate) -> Cow<'_, str> {
-    let today_prefix = today.format("%Y-%m-%d ").to_string();
-    time.strip_prefix(&today_prefix)
-        .map(Cow::Borrowed)
-        .unwrap_or_else(|| Cow::Borrowed(time))
+fn display_local_time<'a>(time: &'a str, today_prefix: &str) -> &'a str {
+    time.strip_prefix(today_prefix).unwrap_or(time)
 }
 
 fn terminal_color(value: &str) -> Color {
@@ -9590,13 +9589,7 @@ fn cached_transcript_render(
         )
         .map(|(_, _, _, _, _, render)| Arc::clone(render))
         .unwrap_or_else(|| {
-            let render = Arc::new(transcript.render_with_tool_run_viewport(
-                width,
-                tool_run_viewport_height,
-                None,
-                None,
-                None,
-            ));
+            let render = Arc::new(transcript.render_for_cache(width, tool_run_viewport_height));
             *cache = Some((
                 width,
                 tool_run_viewport_height,

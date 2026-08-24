@@ -13,18 +13,21 @@ release-mode run on the development workstation measured:
 
 | Path | Time |
 | --- | ---: |
-| Event ingest | 76.4 ms |
-| First full render | 30.6 ms |
-| Same-width cached render | 23.4 ms |
-| Six width reflows | 157.7 ms |
-| Viewport slicing/scroll | 8.0 ms |
+| History display ordering | 1.7 ms |
+| Event ingest | 75.5 ms |
+| First full render | 16.2 ms |
+| Same-width cached render | 11.0 ms |
+| Six width reflows | 101.1 ms |
+| Viewport slicing/scroll | 1.9 ms |
 
 Parallel cold-cache Markdown rendering reduced first paint from 62.1 ms to
-30.6 ms and six width reflows from 380.8 ms to 157.7 ms on the same checkout.
-The largest remaining transcript cost is full-history row assembly after the
-content changes. Normal viewport scrolling is not the bottleneck. Completed
-message/tool caches remain effective: the existing 200-message live-tail gate
-measured about 1 ms cached p95 versus 62 ms uncached p95.
+16.2 ms and six width reflows from 380.8 ms to 101.1 ms on the same checkout.
+Completed-message backgrounds are now painted only for visible rows, and the
+current-date display prefix is computed once per render instead of once per
+entry. The largest remaining transcript cost is full-history row assembly
+after the content changes. Normal viewport scrolling is not the bottleneck.
+Completed message/tool caches remain effective: the existing 200-message
+live-tail gate measured about 1 ms cached p95 versus 62 ms uncached p95.
 
 For sampled counters, install `perf` and run the command printed by the
 profile script. `cargo-flamegraph` can be used on the same release test binary
