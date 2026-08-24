@@ -646,8 +646,8 @@ fn product_tool_summary(name: &str, input: &Value) -> Option<(String, String)> {
         "edit" | "apply_patch" => "Edit",
         "grep" | "glob" => "Search",
         "todo_list" | "todowrite" => "Update plan",
-        "image_generation" => "Generate image",
-        "view_image" => "View image",
+        "image_generation" | "imagegeneration" => "Generate image",
+        "view_image" | "imageview" => "View image",
         "remote_approval" => "Approval required",
         "search_documents" => "Search source documents",
         "list_documents" => "List source documents",
@@ -716,7 +716,10 @@ fn tool_category(name: &str, label: &str, input: &Value) -> ToolPresentationCate
         ToolPresentationCategory::Read
     } else if leaf == "remote_approval" {
         ToolPresentationCategory::Approval
-    } else if matches!(leaf.as_str(), "image_generation" | "view_image") {
+    } else if matches!(
+        leaf.as_str(),
+        "image_generation" | "imagegeneration" | "view_image" | "imageview"
+    ) {
         ToolPresentationCategory::Image
     } else if name.to_ascii_lowercase().contains("web") {
         ToolPresentationCategory::Web
@@ -2081,6 +2084,21 @@ mod tests {
             Some("diff:rs")
         );
         assert_eq!(edit.output, None);
+    }
+
+    #[test]
+    fn presents_image_tools_with_action_labels_across_provider_name_variants() {
+        for name in ["view_image", "imageview"] {
+            let presentation = project_tool_presentation(name, &json!({}), None, false);
+            assert_eq!(presentation.label, "View image", "{name}");
+            assert_eq!(presentation.category, ToolPresentationCategory::Image);
+        }
+
+        for name in ["image_generation", "imagegeneration"] {
+            let presentation = project_tool_presentation(name, &json!({}), None, false);
+            assert_eq!(presentation.label, "Generate image", "{name}");
+            assert_eq!(presentation.category, ToolPresentationCategory::Image);
+        }
     }
 
     #[test]
