@@ -194,7 +194,7 @@ run_release_checks() (
   test_tmp="$(mktemp -d /tmp/borg-release-tests.XXXXXX)"
   trap 'rm -rf -- "$test_tmp"' EXIT
   cargo fmt --all -- --check
-  TMPDIR="$test_tmp" cargo test --workspace --locked
+  TMPDIR="$test_tmp" cargo test --workspace --locked -- --test-threads=1
   git diff --check -- Cargo.toml Cargo.lock
 )
 

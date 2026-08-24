@@ -309,7 +309,7 @@ grep -Fxq 'check --workspace --all-targets' "$test_root/success-fake-cargo.log" 
   fail "release did not run the workspace check"
 grep -Fxq 'fmt --all -- --check' "$test_root/success-fake-cargo.log" ||
   fail "release did not run the formatting check"
-grep -Fxq 'test --workspace --locked' "$test_root/success-fake-cargo.log" ||
+grep -Fxq 'test --workspace --locked -- --test-threads=1' "$test_root/success-fake-cargo.log" ||
   fail "release did not run workspace tests"
 
 run_release "$success_fixture" v2.0.0
