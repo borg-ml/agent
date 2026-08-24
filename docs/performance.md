@@ -35,6 +35,12 @@ anti-join on every query with the store's atomic projection-count invariant
 reduced canonical FTS query p95 from 38.4 ms to 0.74 ms on the same checkout.
 The bounded regular-expression fallback measured 14.5 ms p95.
 
+The ignored `large_session_recent_prompt_recall_p95_gate` test measures the
+rich TUI's bounded prompt-history load over 25,000 message events. Applying
+the actor/status filter, reverse sequence order, and result limit in SQLite
+instead of deserializing and sorting the entire message history reduced p95
+from 88.0 ms to 0.42 ms on the same checkout.
+
 For sampled counters, install `perf` and run the command printed by the
 profile script. `cargo-flamegraph` can be used on the same release test binary
 when available.
