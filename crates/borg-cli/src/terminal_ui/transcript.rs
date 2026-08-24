@@ -2046,6 +2046,19 @@ impl Transcript {
         })
     }
 
+    fn tool_activity_is_running(&self, index: usize) -> bool {
+        matches!(
+            self.order.get(index),
+            Some(TranscriptEntry::Tool {
+                complete: false,
+                error: false,
+                user_interrupted: false,
+                backgrounded: false,
+                ..
+            })
+        )
+    }
+
     fn first_prompt(&self) -> Option<&str> {
         self.order.iter().find_map(|entry| match entry {
             TranscriptEntry::Message {

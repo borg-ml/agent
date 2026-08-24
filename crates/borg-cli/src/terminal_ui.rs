@@ -1953,6 +1953,28 @@ impl BorgTerminal {
         self.composer.seed_session_events(events);
     }
 
+    pub fn has_composer_history(&self) -> bool {
+        !self.composer.history.is_empty()
+    }
+
+    pub fn has_active_queued_prompts(&self) -> bool {
+        !self.active_queued_prompts().is_empty()
+    }
+
+    pub fn has_empty_composer_text(&self) -> bool {
+        self.composer.text.trim().is_empty()
+    }
+
+    pub fn up_may_recall_history(&self) -> bool {
+        let width = self
+            .terminal
+            .size()
+            .map_or(1, |size| terminal_content_width(size.width).max(1) as usize);
+        self.composer.history_index.is_some()
+            || self.composer.text.is_empty()
+            || composer_cursor_position(&self.composer.text, self.composer.cursor, width).0 == 0
+    }
+
     pub fn replace_history(&mut self, events: &[SessionEvent]) {
         let previous_height = self.rendered_transcript_height;
         let replaced_displayed = replace_root_transcript_history(
@@ -4897,7 +4919,16 @@ impl BorgTerminal {
                 let visible_height = content_area.height as usize;
                 let sticky_tool_run_header =
                     sticky_tool_run_header_row(tool_run_rows, scroll_start).map(
-                        |(index, row, expandable)| (index, transcript[row].clone(), expandable),
+                        |(index, row, expandable)| {
+                            let mut header = transcript[row].clone();
+                            if self.transcript.tool_activity_is_running(index) {
+                                replace_tool_activity_glyph(
+                                    &mut header,
+                                    activity_glyph(SessionStatus::Running),
+                                );
+                            }
+                            (index, header, expandable)
+                        },
                     );
                 let sticky_index = tool_rows.partition_point(|(_, start, _)| *start < scroll_start);
                 let sticky_tool_header = if sticky_tool_run_header.is_some() {
@@ -4907,7 +4938,16 @@ impl BorgTerminal {
                         .checked_sub(1)
                         .and_then(|index| tool_rows.get(index))
                         .filter(|(_, _, end)| *end > scroll_start)
-                        .map(|(index, start, _)| (*index, transcript[*start].clone()))
+                        .map(|(index, start, _)| {
+                            let mut header = transcript[*start].clone();
+                            if self.transcript.tool_activity_is_running(*index) {
+                                replace_tool_activity_glyph(
+                                    &mut header,
+                                    activity_glyph(SessionStatus::Running),
+                                );
+                            }
+                            (*index, header)
+                        })
                 };
                 let visible_transcript = transcript
                     .iter()
@@ -4919,6 +4959,12 @@ impl BorgTerminal {
                 for (index, start, end) in
                     visible_row_ranges(tool_rows, scroll_start, visible_height)
                 {
+                    if *start >= scroll_start
+                        && self.transcript.tool_activity_is_running(*index)
+                        && let Some(line) = visible_transcript.get_mut(*start - scroll_start)
+                    {
+                        replace_tool_activity_glyph(line, activity_glyph(SessionStatus::Running));
+                    }
                     if self.hovered_tool == Some(*index) {
                         apply_viewport_background(
                             &mut visible_transcript,
@@ -6531,10 +6577,10 @@ impl BorgTerminal {
                         target: self.focused_child,
                     });
                 }
-                if self.composer.history_index.is_some() || self.composer.text.is_empty() {
+                let width = terminal_content_width(self.terminal.size()?.width).max(1) as usize;
+                if self.composer.should_recall_history_on_up(width) {
                     self.composer.history_previous();
                 } else {
-                    let width = terminal_content_width(self.terminal.size()?.width).max(1) as usize;
                     self.composer.move_vertical(-1, width);
                 }
                 self.update_slash_notice();
@@ -7501,6 +7547,13 @@ impl Composer {
         self.text = text.into();
         self.cursor = self.text.len();
         self.preferred_column = None;
+    }
+
+    fn should_recall_history_on_up(&self, width: usize) -> bool {
+        !self.history.is_empty()
+            && (self.history_index.is_some()
+                || self.text.is_empty()
+                || composer_cursor_position(&self.text, self.cursor, width).0 == 0)
     }
 
     fn history_previous(&mut self) {
@@ -10704,6 +10757,18 @@ fn activity_glyph(status: SessionStatus) -> &'static str {
     }
     const FRAMES: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
     FRAMES[spinner_frame_index()]
+}
+
+fn replace_tool_activity_glyph(line: &mut Line<'static>, glyph: &str) {
+    let Some(span) = line.spans.first_mut() else {
+        return;
+    };
+    let Some(start) = span.content.find('●') else {
+        return;
+    };
+    let mut content = span.content.to_string();
+    content.replace_range(start..start + '●'.len_utf8(), glyph);
+    span.content = Cow::Owned(content);
 }
 
 fn history_loading_line() -> Line<'static> {

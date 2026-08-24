@@ -1329,6 +1329,15 @@ fn running_tool_uses_a_stable_marker_without_invalidating_transcript_cache() {
     assert!(rendered.contains('●'));
     assert!(!rendered.chars().any(|glyph| "⠋⠙⠹⠸⠼⠴⠦⠧".contains(glyph)));
     assert!(!rendered.contains('↳'));
+
+    let mut summary = transcript
+        .lines(100)
+        .into_iter()
+        .find(|line| line.to_string().contains('●'))
+        .expect("running tool summary");
+    replace_tool_activity_glyph(&mut summary, "⠹");
+    assert!(summary.to_string().contains('⠹'));
+    assert!(!summary.to_string().contains('●'));
 }
 
 #[test]
@@ -3103,6 +3112,27 @@ fn composer_history_restores_the_unsent_draft() {
     assert_eq!(composer.text, "second");
     composer.history_next();
     assert_eq!(composer.text, "draft");
+}
+
+#[test]
+fn single_line_draft_up_recalls_history_instead_of_moving_the_cursor() {
+    let mut composer = Composer::default();
+    composer.insert("first");
+    let _ = composer.take();
+    composer.insert("second");
+    let _ = composer.take();
+    composer.insert("draft");
+
+    assert!(composer.should_recall_history_on_up(80));
+    composer.history_previous();
+    assert_eq!(composer.text, "second");
+    assert_eq!(composer.history_index, Some(1));
+
+    let mut multiline = Composer::default();
+    multiline.insert("previous");
+    let _ = multiline.take();
+    multiline.insert("top\nbottom");
+    assert!(!multiline.should_recall_history_on_up(80));
 }
 
 #[test]

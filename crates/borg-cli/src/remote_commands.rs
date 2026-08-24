@@ -3008,12 +3008,18 @@ async fn run_local_agent_session(
                     }
                 };
                 // Resume hydration is deliberately deferred until after the
-                // first paint. Up is the one input that depends on both
-                // deferred prompt-history and pending-queue state, so make
-                // the first recall key wait for those tasks instead of
-                // silently treating an empty projection as empty history.
+                // first paint. Up may depend on either deferred projection,
+                // but an already hydrated local history or an in-progress
+                // multiline edit must not wait on storage before being handled.
                 if terminal_event.is_up() {
-                    if let Some(task) = composer_history_task.take() {
+                    let should_wait_for_composer_history = terminal
+                        .as_ref()
+                        .is_some_and(|terminal| {
+                            !terminal.has_composer_history() && terminal.up_may_recall_history()
+                        });
+                    if should_wait_for_composer_history
+                        && let Some(task) = composer_history_task.take()
+                    {
                         match task.await {
                             Ok(Ok(composer_history)) => {
                                 if let Some(terminal) = terminal.as_mut() {
@@ -3028,7 +3034,12 @@ async fn run_local_agent_session(
                             }
                         }
                     }
-                    if let Some(task) = pending_prompt_task.take() {
+                    let should_wait_for_pending_prompts = terminal.as_ref().is_some_and(|terminal| {
+                        terminal.has_empty_composer_text() && !terminal.has_active_queued_prompts()
+                    });
+                    if should_wait_for_pending_prompts
+                        && let Some(task) = pending_prompt_task.take()
+                    {
                         match task.await {
                             Ok(Ok(pending_prompt_events)) => {
                                 if let Some(terminal) = terminal.as_mut() {
