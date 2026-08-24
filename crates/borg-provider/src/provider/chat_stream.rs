@@ -1152,9 +1152,7 @@ fn normalize_claude_cost(
 }
 
 fn claude_cost_delta(tracker: &ClaudeCostTracker, cumulative: Option<u64>) -> Option<u64> {
-    let Some(cumulative) = cumulative else {
-        return None;
-    };
+    let cumulative = cumulative?;
     let mut previous = tracker
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
