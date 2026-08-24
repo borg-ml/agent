@@ -5142,11 +5142,9 @@ impl BorgTerminal {
                     apply_line_background(
                         &mut header,
                         content_area.width as usize,
-                        if expandable && self.hovered_tool_run_header == Some(index) {
-                            MESSAGE_HOVER_BG
-                        } else {
-                            MESSAGE_BG
-                        },
+                        sticky_tool_header_background(
+                            expandable && self.hovered_tool_run_header == Some(index),
+                        ),
                     );
                     let sticky_area = Rect {
                         height: 1,
@@ -5161,11 +5159,7 @@ impl BorgTerminal {
                     apply_line_background(
                         &mut header,
                         content_area.width as usize,
-                        if self.hovered_tool == Some(index) {
-                            MESSAGE_HOVER_BG
-                        } else {
-                            MESSAGE_BG
-                        },
+                        sticky_tool_header_background(self.hovered_tool == Some(index)),
                     );
                     let sticky_area = Rect {
                         height: 1,
@@ -9215,6 +9209,14 @@ fn tool_run_separator(in_tool_run: bool) -> Line<'static> {
         Line::from(Span::styled("│", Style::default().fg(Color::DarkGray)))
     } else {
         Line::default()
+    }
+}
+
+fn sticky_tool_header_background(hovered: bool) -> Color {
+    if hovered {
+        MESSAGE_HOVER_BG
+    } else {
+        Color::Reset
     }
 }
 

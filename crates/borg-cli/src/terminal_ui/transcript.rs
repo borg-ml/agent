@@ -2168,6 +2168,7 @@ impl Transcript {
         let mut entry_rows = Vec::new();
         let mut link_rows = Vec::new();
         let mut selection_rows: Vec<SelectionRowRange> = Vec::new();
+        let mut trailing_tool_separator = None;
         let mut tool_run_starts = HashMap::new();
         let tool_run_windows = self.tool_run_windows();
         let running_tool = self.has_running_tool();
@@ -2202,6 +2203,16 @@ impl Transcript {
                         | TranscriptEntry::Action { .. }
                         | TranscriptEntry::Compaction { .. }
                 );
+            let existing_tool_separator = trailing_tool_separator;
+            if !matches!(
+                entry,
+                TranscriptEntry::Message {
+                    status: MessageStatus::Queued,
+                    ..
+                }
+            ) {
+                trailing_tool_separator = None;
+            }
             let separator_start = lines.len();
             let added_group_separator = if starts_labeled_group
                 && lines
@@ -2222,6 +2233,14 @@ impl Transcript {
                     }
                 ) {
                 separator_start
+            } else if matches!(
+                entry,
+                TranscriptEntry::Message {
+                    actor: EventActor::User | EventActor::Assistant,
+                    ..
+                }
+            ) {
+                existing_tool_separator.unwrap_or_else(|| lines.len())
             } else {
                 lines.len()
             };
@@ -2249,6 +2268,7 @@ impl Transcript {
                     };
                     if matches!(actor, EventActor::User | EventActor::Assistant)
                         && !added_group_separator
+                        && existing_tool_separator.is_none()
                     {
                         lines.push(Line::default());
                     }
@@ -2921,6 +2941,18 @@ impl Transcript {
                     } else {
                         SelectionRowRange::transcript_entry(index, summary_start, lines.len())
                     });
+                    if tool_window.is_none() {
+                        let tool_separator_row = if lines
+                            .last()
+                            .is_some_and(|line: &Line<'static>| line.spans.is_empty())
+                        {
+                            lines.len().saturating_sub(1)
+                        } else {
+                            lines.push(Line::default());
+                            lines.len().saturating_sub(1)
+                        };
+                        trailing_tool_separator = Some(tool_separator_row);
+                    }
                     if let Some(window) = tool_window
                         && index + 1 == window.end
                     {

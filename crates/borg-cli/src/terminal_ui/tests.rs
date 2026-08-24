@@ -6698,6 +6698,54 @@ fn transcript_separates_labeled_groups_from_header_and_tool_activity() {
 }
 
 #[test]
+fn tool_calls_keep_blank_rows_before_the_following_message() {
+    let mut transcript = Transcript::default();
+    let tool = |name: &str| TranscriptEntry::Tool {
+        source_name: "command_execution".to_string(),
+        name: name.to_string(),
+        detail: "done".to_string(),
+        code_view: None,
+        output_view: None,
+        payload_refs: Vec::new(),
+        time: "12:00".to_string(),
+        started_at: Utc::now(),
+        completed_at: Some(Utc::now()),
+        complete: true,
+        error: false,
+        user_interrupted: false,
+        backgrounded: false,
+        expanded: false,
+    };
+    transcript.order.push(tool("Read"));
+    transcript.order.push(tool("Run Git operations"));
+    transcript.order.push(TranscriptEntry::Message {
+        actor: EventActor::Assistant,
+        text: "finished".to_string(),
+        attachments: Vec::new(),
+        model: None,
+        effort: None,
+        time: "12:01".to_string(),
+        status: MessageStatus::Complete,
+        complete: true,
+    });
+
+    let rendered = transcript.render(80, None, None, None);
+    assert_eq!(rendered.1, vec![(0, 0, 1), (1, 2, 3)]);
+    assert!(rendered.0[1].spans.is_empty());
+    assert_eq!(
+        rendered.0[3].spans.last().and_then(|span| span.style.bg),
+        Some(MESSAGE_BG)
+    );
+    assert_eq!(rendered.3[0].1, 3);
+}
+
+#[test]
+fn idle_sticky_tool_headers_do_not_use_message_card_background() {
+    assert_eq!(sticky_tool_header_background(false), Color::Reset);
+    assert_eq!(sticky_tool_header_background(true), MESSAGE_HOVER_BG);
+}
+
+#[test]
 fn user_interrupt_activity_is_rendered_in_red() {
     let mut transcript = Transcript::default();
     transcript.order.push(TranscriptEntry::Activity {
