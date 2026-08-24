@@ -410,9 +410,7 @@ impl SubscriptionPoolRegistry {
         let resume_session_id = (!append && provider == CodingProvider::Codex)
             .then_some(provider_session_id)
             .flatten();
-        let fork_turn_id = resume_session_id
-            .as_ref()
-            .and_then(|_| provider_fork_turn_id);
+        let fork_turn_id = resume_session_id.as_ref().and(provider_fork_turn_id);
         let reusing_native_context = append || resume_session_id.is_some();
         let resume_unavailable_prompt =
             (reusing_native_context && prompt != prompt_delta).then(|| prompt.clone());
