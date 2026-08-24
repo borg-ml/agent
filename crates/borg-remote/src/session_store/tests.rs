@@ -3093,8 +3093,8 @@ async fn large_session_history_query_p95_gate() {
     let regex_p95 = duration_p95(&mut regex_samples);
     eprintln!("25k-event bounded regex query p95: {regex_p95:?}");
     assert!(
-        regex_p95 < Duration::from_millis(250),
-        "history regex query p95 exceeded 250 ms: {regex_p95:?}"
+        regex_p95 < Duration::from_millis(10),
+        "history regex query p95 exceeded 10 ms: {regex_p95:?}"
     );
 }
 

@@ -1352,9 +1352,11 @@ impl SqliteSessionStore {
             sql.push(" order by bm25(session_event_fts) asc");
             sql.push(" limit ")
                 .push_bind(i64::try_from(scan_limit + 1).unwrap_or(i64::MAX));
+            // Keep the selective FTS result as the outer loop. A normal join lets SQLite
+            // walk the session sequence index first to satisfy the final ordering.
             sql.push(
                 ") select e.event_json, s.body from fts_candidates c \
-                 join session_event_search s on s.rowid=c.rowid \
+                 cross join session_event_search s on s.rowid=c.rowid \
                  join session_events e on e.session_id=s.session_id and e.event_id=s.event_id \
                  where s.session_id = ",
             );

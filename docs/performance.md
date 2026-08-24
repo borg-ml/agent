@@ -33,7 +33,9 @@ The ignored `large_session_history_query_p95_gate` test profiles lossless
 history retrieval over 25,000 events. Replacing a full event/search-table
 anti-join on every query with the store's atomic projection-count invariant
 reduced canonical FTS query p95 from 38.4 ms to 0.74 ms on the same checkout.
-The bounded regular-expression fallback measured 14.5 ms p95.
+Keeping the materialized FTS candidate set as SQLite's outer join loop reduced
+the bounded regular-expression fallback from 14.9 ms to 1.49 ms p95 without
+changing its relevance or sequence ordering.
 
 The ignored `large_session_recent_prompt_recall_p95_gate` test measures the
 rich TUI's bounded prompt-history load over 25,000 message events. Applying
