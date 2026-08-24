@@ -195,7 +195,7 @@ fn fork_history_moves_a_late_user_completion_before_the_response() {
     let history = transcript_history_in_display_order(&[assistant, user_completion]);
     let mut transcript = Transcript::default();
     for event in &history {
-        transcript.apply(event);
+        transcript.apply_history(event);
     }
 
     let actors = transcript
@@ -1823,13 +1823,13 @@ fn large_resume_ingest_and_transcript_scroll_profile() {
     let display_events = transcript_history_in_display_order(&events);
     let history_order = history_order_started.elapsed();
     assert_eq!(display_events.len(), RESUME_TURNS * 2);
-    std::hint::black_box(display_events);
+    std::hint::black_box(&display_events);
 
     let mut transcript = Transcript::default();
     transcript.reserve_history(events.len());
     let ingest_started = Instant::now();
-    for event in &events[..RESUME_TURNS * 2] {
-        transcript.apply(event);
+    for event in &display_events {
+        transcript.apply_history(event);
     }
     let message_ingest = ingest_started.elapsed();
     let child_ingest_started = Instant::now();
@@ -1840,6 +1840,10 @@ fn large_resume_ingest_and_transcript_scroll_profile() {
     let ingest = ingest_started.elapsed();
     assert_eq!(transcript.messages.len(), RESUME_TURNS * 2);
     assert_eq!(transcript.subagent_entries.len(), CHILD_COUNT);
+    assert!(
+        message_ingest < Duration::from_millis(20),
+        "preordered resume-message ingest exceeded 20 ms: {message_ingest:?}"
+    );
 
     let first_render_started = Instant::now();
     let first_render = transcript.render_for_cache(120, DEFAULT_TOOL_RUN_VIEWPORT_HEIGHT);

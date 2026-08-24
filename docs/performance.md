@@ -14,7 +14,7 @@ release-mode run on the development workstation measured:
 | Path | Time |
 | --- | ---: |
 | History display ordering | 1.7 ms |
-| Event ingest | 75.5 ms |
+| Event ingest | 7.0 ms |
 | First full render | 16.2 ms |
 | Same-width cached render | 11.0 ms |
 | Six width reflows | 101.1 ms |
@@ -22,6 +22,9 @@ release-mode run on the development workstation measured:
 
 Parallel cold-cache Markdown rendering reduced first paint from 62.1 ms to
 16.2 ms and six width reflows from 380.8 ms to 101.1 ms on the same checkout.
+Applying canonicalized resume history without the live late-arrival reindex
+reduced 14,000-event ingest from 77.9 ms to 7.0 ms. Live events still retain
+late-message correction.
 Completed-message backgrounds are now painted only for visible rows, and the
 current-date display prefix is computed once per render instead of once per
 entry. The largest remaining transcript cost is full-history row assembly

@@ -734,6 +734,18 @@ impl Transcript {
     }
 
     fn apply(&mut self, event: &SessionEvent) -> Option<usize> {
+        self.apply_event(event, true)
+    }
+
+    fn apply_history(&mut self, event: &SessionEvent) -> Option<usize> {
+        self.apply_event(event, false)
+    }
+
+    fn apply_event(
+        &mut self,
+        event: &SessionEvent,
+        reorder_late_user_messages: bool,
+    ) -> Option<usize> {
         let completed_turn = match &event.kind {
             SessionEventKind::TurnCompleted { message_id, .. }
             | SessionEventKind::PromptRecalled { message_id, .. } => Some(*message_id),
@@ -1002,6 +1014,7 @@ impl Transcript {
                         && !queued
                         && event.sequence > 0
                         && !self.live_turn_closed
+                        && reorder_late_user_messages
                     {
                         self.late_user_message_insertion_index()
                     } else {

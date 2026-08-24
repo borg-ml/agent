@@ -2308,6 +2308,7 @@ impl BorgTerminal {
             _ => {}
         }
         let (removed_entry, transcript_changed) = {
+            let replaying_history = self.replaying_history;
             let transcript = self
                 .director_transcript
                 .as_deref_mut()
@@ -2321,6 +2322,8 @@ impl BorgTerminal {
                     transcript.upsert_subagent_snapshot(agent);
                 }
                 None
+            } else if replaying_history {
+                transcript.apply_history(event)
             } else {
                 transcript.apply(event)
             };
@@ -6836,7 +6839,7 @@ fn replace_root_transcript_history(
     let mut replacement = fresh_transcript_like(previous);
     replacement.reserve_history(display_events.len());
     for event in &display_events {
-        replacement.apply(event);
+        replacement.apply_history(event);
     }
     // Older-page hydration rebuilds the root transcript. It may contain the
     // parent's last pre-crash Running mirror even though child hydration has
