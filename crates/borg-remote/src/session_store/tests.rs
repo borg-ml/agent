@@ -2745,8 +2745,8 @@ async fn large_session_history_query_p95_gate() {
     let p95 = duration_p95(&mut samples);
     eprintln!("25k-event canonical FTS query p95: {p95:?}");
     assert!(
-        p95 < Duration::from_millis(50),
-        "history FTS query p95 exceeded 50 ms: {p95:?}"
+        p95 < Duration::from_millis(10),
+        "history FTS query p95 exceeded 10 ms: {p95:?}"
     );
 
     let regex_query = SessionHistoryQuery {

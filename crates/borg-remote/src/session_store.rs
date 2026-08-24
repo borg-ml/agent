@@ -1059,10 +1059,8 @@ impl SqliteSessionStore {
         session_id: Uuid,
         query: SessionHistoryQuery,
     ) -> Result<SessionHistoryPage> {
-        ensure!(
-            self.contains_session(session_id).await?,
-            "session {session_id} does not exist"
-        );
+        let (inherited_event_count, next_sequence) =
+            self.history_session_bounds(session_id).await?;
         if let (Some(start), Some(end)) = (query.start_sequence, query.end_sequence) {
             ensure!(start <= end, "history start_sequence exceeds end_sequence");
         }
@@ -1104,11 +1102,11 @@ impl SqliteSessionStore {
                 "history prefilter exceeds {MAX_HISTORY_QUERY_BYTES} bytes"
             );
         }
-        let session = self.session_row(session_id).await?;
-        if session.inherited_event_count == 0 && text.is_some() {
-            self.ensure_history_projection(session_id).await?;
+        if inherited_event_count == 0 && text.is_some() {
+            self.ensure_history_projection(session_id, next_sequence.saturating_sub(1))
+                .await?;
         }
-        if session.inherited_event_count > 0 {
+        if inherited_event_count > 0 {
             return self.query_history_lineage(session_id, &query, text).await;
         }
         match (text, query.mode) {
@@ -1133,8 +1131,9 @@ impl SqliteSessionStore {
         limit: usize,
     ) -> Result<Vec<SessionHistoryIndexDocument>> {
         let limit = limit.clamp(1, 1_000);
-        let session = self.session_row(session_id).await?;
-        if sequence < session.inherited_event_count {
+        let (inherited_event_count, next_sequence) =
+            self.history_session_bounds(session_id).await?;
+        if sequence < inherited_event_count {
             let events = self
                 .projected_events(session_id, None)
                 .await?
@@ -1158,7 +1157,11 @@ impl SqliteSessionStore {
             }
             return Ok(documents);
         }
-        self.ensure_history_projection(session_id).await?;
+        let local_event_count = next_sequence
+            .saturating_sub(inherited_event_count)
+            .saturating_sub(1);
+        self.ensure_history_projection(session_id, local_event_count)
+            .await?;
 
         let rows = sqlx::query(
             "select e.event_json, s.event_kind, s.actor, s.body \
@@ -1189,21 +1192,32 @@ impl SqliteSessionStore {
             .collect()
     }
 
-    async fn ensure_history_projection(&self, session_id: Uuid) -> Result<()> {
-        let missing: i64 = sqlx::query_scalar(
-            "select exists(\
-                select 1 from session_events e \
-                left join session_event_search s \
-                    on s.session_id=e.session_id and s.event_id=e.event_id \
-                where e.session_id=? and s.rowid is null limit 1\
-            )",
-        )
-        .bind(session_id.to_string())
-        .fetch_one(&self.pool)
-        .await?;
-        if missing == 0 {
+    async fn ensure_history_projection(
+        &self,
+        session_id: Uuid,
+        expected_event_count: u64,
+    ) -> Result<()> {
+        let projected_count: i64 =
+            sqlx::query_scalar("select count(*) from session_event_search where session_id = ?")
+                .bind(session_id.to_string())
+                .fetch_one(&self.pool)
+                .await?;
+        if u64::try_from(projected_count).context("negative history projection count")?
+            == expected_event_count
+        {
             return Ok(());
         }
+        let mut transaction = self.begin_write().await?;
+        sqlx::query(
+            "delete from session_event_search where session_id = ? and not exists ( \
+                 select 1 from session_events e \
+                 where e.session_id=session_event_search.session_id \
+                   and e.event_id=session_event_search.event_id \
+             )",
+        )
+        .bind(session_id.to_string())
+        .execute(&mut *transaction)
+        .await?;
         sqlx::query(
             "insert into session_event_search \
              (session_id, sequence, event_id, event_kind, actor, body) \
@@ -1221,8 +1235,9 @@ impl SqliteSessionStore {
              )",
         )
         .bind(session_id.to_string())
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
+        transaction.commit().await?;
         Ok(())
     }
 
@@ -2820,6 +2835,21 @@ impl SqliteSessionStore {
         .await?
         .with_context(|| format!("session {session_id} does not exist"))?;
         StoredSession::from_row(&row)
+    }
+
+    async fn history_session_bounds(&self, session_id: Uuid) -> Result<(u64, u64)> {
+        let row =
+            sqlx::query("select inherited_event_count, next_sequence from sessions where id = ?")
+                .bind(session_id.to_string())
+                .fetch_optional(&self.pool)
+                .await?
+                .with_context(|| format!("session {session_id} does not exist"))?;
+        Ok((
+            u64::try_from(row.try_get::<i64, _>("inherited_event_count")?)
+                .context("negative inherited event count")?,
+            u64::try_from(row.try_get::<i64, _>("next_sequence")?)
+                .context("negative next sequence")?,
+        ))
     }
 
     fn composed_events<'a>(

@@ -29,6 +29,12 @@ after the content changes. Normal viewport scrolling is not the bottleneck.
 Completed message/tool caches remain effective: the existing 200-message
 live-tail gate measured about 1 ms cached p95 versus 62 ms uncached p95.
 
+The ignored `large_session_history_query_p95_gate` test profiles lossless
+history retrieval over 25,000 events. Replacing a full event/search-table
+anti-join on every query with the store's atomic projection-count invariant
+reduced canonical FTS query p95 from 38.4 ms to 0.74 ms on the same checkout.
+The bounded regular-expression fallback measured 14.5 ms p95.
+
 For sampled counters, install `perf` and run the command printed by the
 profile script. `cargo-flamegraph` can be used on the same release test binary
 when available.
