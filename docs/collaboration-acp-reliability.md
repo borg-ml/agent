@@ -138,4 +138,5 @@ borg acp --provider codex --permission manual
 
 Run `borg doctor` (or `borg doctor --json`) for a non-content-bearing durability
 readiness report. A degraded result exits unsuccessfully so service managers can
-use it as a readiness probe.
+use it as a readiness probe. Add `--deep` when an exhaustive SQLite integrity
+scan is required; that scan intentionally reads the full durable database.

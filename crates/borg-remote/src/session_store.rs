@@ -29,6 +29,7 @@ pub(crate) const INLINE_SESSION_PAYLOAD_BYTES: usize = 64 * 1024;
 pub(crate) const SESSION_PAYLOAD_PREVIEW_BYTES: usize = 4 * 1024;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const SQLITE_WRITE_TRANSACTION: &str = "BEGIN IMMEDIATE";
+const SQLITE_JOURNAL_SIZE_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_HOST_LAUNCH_METADATA_BYTES: usize = 512 * 1024;
 // Cap fork replay at 255 local events without duplicating SessionState in every row.
 const FORK_PROJECTION_CHECKPOINT_INTERVAL: u64 = 256;
@@ -964,9 +965,13 @@ pub struct SqliteSessionStore {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionStoreHealth {
     pub integrity: String,
+    #[serde(default)]
+    pub integrity_checked: bool,
     pub journal_mode: String,
     pub synchronous: i64,
     pub foreign_keys: bool,
+    #[serde(default)]
+    pub journal_size_limit_bytes: i64,
     pub wal_busy: i64,
     pub wal_log_frames: i64,
     pub wal_checkpointed_frames: i64,
@@ -979,7 +984,7 @@ pub struct SessionStoreHealth {
 
 impl SessionStoreHealth {
     pub fn is_ready(&self) -> bool {
-        self.integrity == "ok"
+        (!self.integrity_checked || self.integrity == "ok")
             && self.journal_mode.eq_ignore_ascii_case("wal")
             && self.synchronous >= 2
             && self.foreign_keys
@@ -1005,6 +1010,10 @@ impl SqliteSessionStore {
         let options = SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))?
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
+            .pragma(
+                "journal_size_limit",
+                SQLITE_JOURNAL_SIZE_LIMIT_BYTES.to_string(),
+            )
             .synchronous(SqliteSynchronous::Full)
             .busy_timeout(SQLITE_BUSY_TIMEOUT)
             .foreign_keys(true);
@@ -2100,11 +2109,24 @@ impl SqliteSessionStore {
         Ok(state)
     }
 
-    /// Check the durable authority without reading prompt or tool payload data.
+    /// Check readiness without scanning the full database contents.
+    pub async fn readiness(&self) -> Result<SessionStoreHealth> {
+        self.health_snapshot(false).await
+    }
+
+    /// Check the durable authority, including SQLite's exhaustive quick check.
     pub async fn health(&self) -> Result<SessionStoreHealth> {
-        let integrity: String = sqlx::query_scalar("pragma quick_check")
-            .fetch_one(&self.pool)
-            .await?;
+        self.health_snapshot(true).await
+    }
+
+    async fn health_snapshot(&self, check_integrity: bool) -> Result<SessionStoreHealth> {
+        let integrity = if check_integrity {
+            sqlx::query_scalar("pragma quick_check")
+                .fetch_one(&self.pool)
+                .await?
+        } else {
+            "not_checked".to_string()
+        };
         let journal_mode: String = sqlx::query_scalar("pragma journal_mode")
             .fetch_one(&self.pool)
             .await?;
@@ -2112,6 +2134,9 @@ impl SqliteSessionStore {
             .fetch_one(&self.pool)
             .await?;
         let foreign_keys: i64 = sqlx::query_scalar("pragma foreign_keys")
+            .fetch_one(&self.pool)
+            .await?;
+        let journal_size_limit_bytes: i64 = sqlx::query_scalar("pragma journal_size_limit")
             .fetch_one(&self.pool)
             .await?;
         let (wal_busy, wal_log_frames, wal_checkpointed_frames): (i64, i64, i64) =
@@ -2132,9 +2157,11 @@ impl SqliteSessionStore {
             .await?;
         Ok(SessionStoreHealth {
             integrity,
+            integrity_checked: check_integrity,
             journal_mode,
             synchronous,
             foreign_keys: foreign_keys != 0,
+            journal_size_limit_bytes,
             wal_busy,
             wal_log_frames,
             wal_checkpointed_frames,
@@ -2490,25 +2517,6 @@ impl SqliteSessionStore {
             create index if not exists idx_session_events_context_clear
                 on session_events (session_id, sequence desc)
                 where event_kind = 'context_cleared';
-
-            create index if not exists idx_session_events_context_compaction
-                on session_events (session_id, sequence desc)
-                where event_kind = 'provider_event'
-                  and json_extract(event_json, '$.kind.kind') = 'context_compaction';
-
-            create index if not exists idx_session_events_successful_turn
-                on session_events (session_id, sequence desc)
-                where event_kind = 'turn_completed'
-                  and json_extract(event_json, '$.kind.error') is null;
-
-            create index if not exists idx_session_events_prompt_message_recovery
-                on session_events (session_id, sequence, message_id)
-                where event_kind = 'message'
-                  and json_extract(event_json, '$.kind.actor') in ('user', 'system');
-
-            create index if not exists idx_session_events_prompt_recall_recovery
-                on session_events (session_id, sequence)
-                where event_kind = 'prompt_recalled';
 
             create index if not exists idx_sessions_activity
                 on sessions (updated_at desc);
@@ -3254,22 +3262,27 @@ impl SqliteSessionStore {
             .bind(&session_key)
             .fetch_all(&self.pool);
             let legacy_messages = sqlx::query(
-                "select e.event_json from session_events e \
+                "select e.event_json from session_event_search search \
+                     join session_events e \
+                       on e.session_id = search.session_id and e.event_id = search.event_id \
                      left join session_actions a \
                        on a.session_id = e.session_id and a.action_id = e.message_id \
-                     where e.session_id = ? and e.sequence < ? and e.event_kind = 'message' \
-                     and json_extract(e.event_json, '$.kind.actor') in ('user', 'system') \
+                     where search.session_id = ? and search.sequence < ? \
+                     and search.event_kind = 'message' \
+                     and search.actor in ('user', 'system') \
                      and (a.action_id is null \
                        or a.state not in ('completed', 'failed', 'cancelled')) \
-                     order by e.sequence",
+                     order by search.sequence",
             )
             .bind(&session_key)
             .bind(recovery_start_sequence)
             .fetch_all(&self.pool);
             let legacy_recalls = sqlx::query(
-                "select e.event_json from session_events e \
-                     where e.session_id = ? and e.sequence < ? \
-                     and e.event_kind = 'prompt_recalled' order by e.sequence",
+                "select e.event_json from session_event_search search \
+                     join session_events e \
+                       on e.session_id = search.session_id and e.event_id = search.event_id \
+                     where search.session_id = ? and search.sequence < ? \
+                     and search.event_kind = 'prompt_recalled' order by search.sequence",
             )
             .bind(&session_key)
             .bind(recovery_start_sequence)

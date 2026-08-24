@@ -58,6 +58,9 @@ pub(crate) enum Command {
     Doctor {
         #[arg(long)]
         json: bool,
+        /// Include SQLite's exhaustive full-database integrity scan.
+        #[arg(long)]
+        deep: bool,
     },
     /// Keep local agent workloads within a generous machine-wide budget.
     Limits(LimitsArgs),
@@ -577,7 +580,19 @@ mod tests {
             Cli::try_parse_from(["borg", "doctor", "--json"])
                 .unwrap()
                 .command_or_agent(),
-            Command::Doctor { json: true }
+            Command::Doctor {
+                json: true,
+                deep: false
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["borg", "doctor", "--deep"])
+                .unwrap()
+                .command_or_agent(),
+            Command::Doctor {
+                json: false,
+                deep: true
+            }
         ));
     }
 

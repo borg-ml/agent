@@ -51,20 +51,24 @@ async fn main() -> Result<()> {
         Command::Session { command } => session_commands::run(command).await,
         Command::Acp(args) => acp::run(args).await,
         Command::Collab { command } => collab::run(command).await,
-        Command::Doctor { json } => doctor(json).await,
+        Command::Doctor { json, deep } => doctor(json, deep).await,
         Command::Limits(args) => limits::run(args).await,
         Command::AgentMcp => agent_mcp::run().await,
     }
 }
 
-async fn doctor(json: bool) -> Result<()> {
+async fn doctor(json: bool, deep: bool) -> Result<()> {
     let sessions_dir = borg_remote::default_host_config_path()
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
         .join("sessions");
     let store =
         borg_remote::SqliteSessionStore::open(sessions_dir.join("sessions.sqlite3")).await?;
-    let health = store.health().await?;
+    let health = if deep {
+        store.health().await?
+    } else {
+        store.readiness().await?
+    };
     if json {
         println!("{}", serde_json::to_string_pretty(&health)?);
     } else {
@@ -76,14 +80,24 @@ async fn doctor(json: bool) -> Result<()> {
                 "degraded"
             }
         );
-        println!("  integrity: {}", health.integrity);
+        println!(
+            "  integrity: {}",
+            if health.integrity_checked {
+                health.integrity.as_str()
+            } else {
+                "not checked (run `borg doctor --deep`)"
+            }
+        );
         println!(
             "  sqlite: {} · synchronous={} · foreign_keys={}",
             health.journal_mode, health.synchronous, health.foreign_keys
         );
         println!(
-            "  WAL: busy={} · log={} · checkpointed={}",
-            health.wal_busy, health.wal_log_frames, health.wal_checkpointed_frames
+            "  WAL: busy={} · log={} · checkpointed={} · retained limit={} MiB",
+            health.wal_busy,
+            health.wal_log_frames,
+            health.wal_checkpointed_frames,
+            health.journal_size_limit_bytes / (1024 * 1024)
         );
         println!(
             "  durable rows: {} sessions · {} events · {} payloads",

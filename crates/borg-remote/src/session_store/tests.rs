@@ -1189,8 +1189,18 @@ async fn recent_user_messages_are_bounded_ordered_and_ignore_non_recallable_prom
 #[tokio::test]
 async fn durable_store_health_requires_full_sync_wal_and_foreign_keys() {
     let (_directory, store) = store().await;
+    let readiness = store.readiness().await.unwrap();
+    assert_eq!(readiness.integrity, "not_checked");
+    assert!(!readiness.integrity_checked);
+    assert_eq!(
+        readiness.journal_size_limit_bytes,
+        i64::try_from(SQLITE_JOURNAL_SIZE_LIMIT_BYTES).unwrap()
+    );
+    assert!(readiness.is_ready());
+
     let health = store.health().await.unwrap();
     assert_eq!(health.integrity, "ok");
+    assert!(health.integrity_checked);
     assert_eq!(health.journal_mode.to_ascii_lowercase(), "wal");
     assert!(health.synchronous >= 2);
     assert!(health.foreign_keys);
