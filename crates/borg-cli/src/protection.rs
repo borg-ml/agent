@@ -5,12 +5,14 @@ use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Output};
 
 use anyhow::{Context, Result, bail, ensure};
+use regex::Regex;
 use serde_json::json;
 
 use crate::cli::{LimitsProtectArgs, LimitsProtectCommand};
 
 const DROP_IN_NAME: &str = "50-borg-protection.conf";
 const UNIT_MARKER: &str = "# Managed by Borg Agent protected service";
+const PROCESS_MARKER: &str = "# ProcessName=";
 const POLICY_VERSION: u32 = 1;
 const CPU_WEIGHT: u64 = 200;
 const IO_WEIGHT: u64 = 200;
@@ -42,6 +44,7 @@ struct ProtectionStatus {
     service: String,
     state: Option<String>,
     ready: bool,
+    earlyoom_unprotected: Vec<String>,
     error: Option<String>,
 }
 
@@ -91,7 +94,11 @@ fn add(service: &str, json_output: bool) -> Result<()> {
             path.display()
         ),
     };
-    let source = drop_in_source(&environment);
+    let mut process_names = service_process_names(&service, &service_properties);
+    if let Some(source) = previous.as_deref() {
+        process_names.extend(stored_process_names(source));
+    }
+    let source = drop_in_source(&environment, &process_names);
     let unchanged = previous.as_deref() == Some(source.as_str());
     write_atomic(&path, source.as_bytes())?;
 
@@ -106,6 +113,8 @@ fn add(service: &str, json_output: bool) -> Result<()> {
         ));
     }
     let state = service_state(&service).ok();
+    let earlyoom_unprotected = earlyoom_unprotected_processes(&process_names)?;
+    let ready = earlyoom_unprotected.is_empty();
 
     if json_output {
         println!(
@@ -113,8 +122,10 @@ fn add(service: &str, json_output: bool) -> Result<()> {
             serde_json::to_string_pretty(&json!({
                 "service": service,
                 "protected": true,
-                "ready": true,
+                "ready": ready,
                 "state": state,
+                "process_names": process_names,
+                "earlyoom_unprotected_processes": earlyoom_unprotected,
                 "unit": path,
             }))?
         );
@@ -133,6 +144,13 @@ fn add(service: &str, json_output: bool) -> Result<()> {
         println!("  Protection applied without restarting the service.");
         print_state_guidance(&service, state.as_deref());
     }
+    if !json_output && !earlyoom_unprotected.is_empty() {
+        println!(
+            "  Attention: the active earlyoom policy can still select: {}.",
+            earlyoom_unprotected.join(", ")
+        );
+        println!("  Add those names to earlyoom's `--ignore` regex, then restart earlyoom.");
+    }
     Ok(())
 }
 
@@ -150,6 +168,7 @@ fn list(json_output: bool) -> Result<()> {
                     "service": status.service,
                     "state": status.state,
                     "ready": status.ready,
+                    "earlyoom_unprotected_processes": status.earlyoom_unprotected,
                     "error": status.error,
                 })
             })
@@ -263,13 +282,14 @@ fn remove(service: &str, json_output: bool) -> Result<()> {
 }
 
 fn protection_status(service: String, path: PathBuf) -> ProtectionStatus {
-    match read_managed_drop_in(&path) {
-        Ok(ManagedDropIn::Borg(_)) => {}
+    let source = match read_managed_drop_in(&path) {
+        Ok(ManagedDropIn::Borg(source)) => source,
         Ok(_) => {
             return ProtectionStatus {
                 service,
                 state: None,
                 ready: false,
+                earlyoom_unprotected: Vec::new(),
                 error: Some("the protection drop-in is no longer managed by Borg".to_string()),
             };
         }
@@ -278,10 +298,11 @@ fn protection_status(service: String, path: PathBuf) -> ProtectionStatus {
                 service,
                 state: None,
                 ready: false,
+                earlyoom_unprotected: Vec::new(),
                 error: Some(format!("failed to read protection: {error:#}")),
             };
         }
-    }
+    };
     let environment = match detect_environment() {
         Ok(environment) => environment,
         Err(error) => {
@@ -289,6 +310,7 @@ fn protection_status(service: String, path: PathBuf) -> ProtectionStatus {
                 service,
                 state: None,
                 ready: false,
+                earlyoom_unprotected: Vec::new(),
                 error: Some(format!("cannot reach effective protection: {error:#}")),
             };
         }
@@ -300,26 +322,51 @@ fn protection_status(service: String, path: PathBuf) -> ProtectionStatus {
                 service,
                 state: None,
                 ready: false,
+                earlyoom_unprotected: Vec::new(),
                 error: Some(format!("cannot inspect service: {error:#}")),
             };
         }
     };
     let state = properties.get("ActiveState").cloned();
-    let ready = properties_match(&properties, &path, &environment);
+    let properties_ready = properties_match(&properties, &path, &environment);
+    let mut process_names = stored_process_names(&source);
+    process_names.extend(service_process_names(&service, &properties));
+    let (earlyoom_unprotected, earlyoom_error) =
+        match earlyoom_unprotected_processes(&process_names) {
+            Ok(names) => (names, None),
+            Err(error) => (
+                Vec::new(),
+                Some(format!(
+                    "cannot inspect the active earlyoom policy: {error:#}"
+                )),
+            ),
+        };
+    let ready = properties_ready && earlyoom_unprotected.is_empty() && earlyoom_error.is_none();
+    let error = if !properties_ready {
+        Some("effective systemd policy differs; run `borg limits protect add` again".to_string())
+    } else if !earlyoom_unprotected.is_empty() {
+        Some(format!(
+            "active earlyoom can still select {}; add these names to its `--ignore` regex",
+            earlyoom_unprotected.join(", ")
+        ))
+    } else {
+        earlyoom_error
+    };
     ProtectionStatus {
         service,
         state,
         ready,
-        error: (!ready).then(|| {
-            "effective systemd policy differs; run `borg limits protect add` again".to_string()
-        }),
+        earlyoom_unprotected,
+        error,
     }
 }
 
-fn drop_in_source(environment: &ProtectionEnvironment) -> String {
-    let mut source = format!(
-        "{UNIT_MARKER}\n# PolicyVersion={POLICY_VERSION}\n\n[Unit]\nStartLimitIntervalSec=0\n\n[Service]\nRestart=on-failure\n"
-    );
+fn drop_in_source(environment: &ProtectionEnvironment, process_names: &BTreeSet<String>) -> String {
+    let mut source = format!("{UNIT_MARKER}\n# PolicyVersion={POLICY_VERSION}\n");
+    for process_name in process_names {
+        source.push_str(&format!("{PROCESS_MARKER}{process_name}\n"));
+    }
+    source.push_str("\n[Unit]\nStartLimitIntervalSec=0\n\n[Service]\nRestart=on-failure\n");
     if environment.progressive_restart {
         source.push_str("RestartSec=1s\nRestartSteps=8\nRestartMaxDelaySec=1min\n");
     } else {
@@ -327,10 +374,10 @@ fn drop_in_source(environment: &ProtectionEnvironment) -> String {
     }
     source.push_str("OOMPolicy=stop\n");
     if environment.cpu_supported() {
-        source.push_str(&format!("CPUAccounting=yes\nCPUWeight={CPU_WEIGHT}\n"));
+        source.push_str(&format!("CPUWeight={CPU_WEIGHT}\n"));
     }
     if environment.io_supported() {
-        source.push_str(&format!("IOAccounting=yes\nIOWeight={IO_WEIGHT}\n"));
+        source.push_str(&format!("IOWeight={IO_WEIGHT}\n"));
     }
     source
 }
@@ -391,9 +438,9 @@ fn service_properties(
     progressive_restart: bool,
 ) -> Result<BTreeMap<String, String>> {
     let properties = if progressive_restart {
-        "LoadState,ActiveState,Type,Restart,RestartUSec,RestartSteps,RestartMaxDelayUSec,OOMPolicy,CPUWeight,IOWeight,StartLimitIntervalUSec,DropInPaths"
+        "LoadState,ActiveState,Type,Restart,RestartUSec,RestartSteps,RestartMaxDelayUSec,OOMPolicy,CPUWeight,IOWeight,StartLimitIntervalUSec,DropInPaths,ControlGroup"
     } else {
-        "LoadState,ActiveState,Type,Restart,RestartUSec,OOMPolicy,CPUWeight,IOWeight,StartLimitIntervalUSec,DropInPaths"
+        "LoadState,ActiveState,Type,Restart,RestartUSec,OOMPolicy,CPUWeight,IOWeight,StartLimitIntervalUSec,DropInPaths,ControlGroup"
     };
     let output = systemctl_output(&["show", service, &format!("--property={properties}")])?;
     Ok(parse_key_values(&String::from_utf8_lossy(&output.stdout)))
@@ -408,6 +455,113 @@ fn service_state(service: &str) -> Result<String> {
         "systemd did not report the service state"
     );
     Ok(state.to_string())
+}
+
+fn service_process_names(service: &str, properties: &BTreeMap<String, String>) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    if let Some(stem) = service.strip_suffix(".service") {
+        let stem = stem.split('@').next().unwrap_or(stem);
+        if !stem.is_empty() {
+            names.insert(stem.to_string());
+        }
+    }
+    let Some(control_group) = properties
+        .get("ControlGroup")
+        .filter(|group| group.starts_with('/') && !group.contains(".."))
+    else {
+        return names;
+    };
+    let cgroup = Path::new("/sys/fs/cgroup").join(control_group.trim_start_matches('/'));
+    let Ok(processes) = fs::read_to_string(cgroup.join("cgroup.procs")) else {
+        return names;
+    };
+    for pid in processes.lines().filter_map(|pid| pid.parse::<u32>().ok()) {
+        let Ok(name) = fs::read_to_string(format!("/proc/{pid}/comm")) else {
+            continue;
+        };
+        let name = name.trim();
+        if !name.is_empty() {
+            names.insert(name.to_string());
+        }
+    }
+    names
+}
+
+fn stored_process_names(source: &str) -> BTreeSet<String> {
+    source
+        .lines()
+        .filter_map(|line| line.strip_prefix(PROCESS_MARKER))
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn earlyoom_unprotected_processes(process_names: &BTreeSet<String>) -> Result<Vec<String>> {
+    let output = systemctl_system_output(&[
+        "show",
+        "earlyoom.service",
+        "--property=LoadState,ActiveState,MainPID",
+    ])?;
+    let properties = parse_key_values(&String::from_utf8_lossy(&output.stdout));
+    if properties
+        .get("LoadState")
+        .is_none_or(|state| state != "loaded")
+        || properties
+            .get("ActiveState")
+            .is_none_or(|state| state != "active")
+    {
+        return Ok(Vec::new());
+    }
+    let pid = properties
+        .get("MainPID")
+        .context("earlyoom did not report a main process")?
+        .parse::<u32>()
+        .context("earlyoom returned an invalid main process")?;
+    ensure!(pid > 0, "earlyoom has no running main process");
+    let command_line = fs::read(format!("/proc/{pid}/cmdline"))
+        .context("failed to read the active earlyoom command line")?;
+    let arguments = command_line
+        .split(|byte| *byte == 0)
+        .filter(|argument| !argument.is_empty())
+        .map(|argument| String::from_utf8_lossy(argument).into_owned())
+        .collect::<Vec<_>>();
+    let safe_patterns = earlyoom_ignore_patterns(&arguments)?;
+    Ok(unprotected_processes(process_names, &safe_patterns))
+}
+
+fn earlyoom_ignore_patterns(arguments: &[String]) -> Result<Vec<Regex>> {
+    let mut safe_patterns = Vec::new();
+    let mut index = 0;
+    while index < arguments.len() {
+        let argument = &arguments[index];
+        if argument == "--ignore" {
+            if let Some(pattern) = arguments.get(index + 1) {
+                safe_patterns.push(pattern.clone());
+                index += 1;
+            }
+        } else if let Some((option, pattern)) = argument.split_once('=')
+            && option == "--ignore"
+        {
+            safe_patterns.push(pattern.to_string());
+        }
+        index += 1;
+    }
+    let safe_patterns = safe_patterns
+        .into_iter()
+        .map(|pattern| {
+            Regex::new(&pattern).with_context(|| format!("invalid earlyoom regex `{pattern}`"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(safe_patterns)
+}
+
+fn unprotected_processes(process_names: &BTreeSet<String>, safe_patterns: &[Regex]) -> Vec<String> {
+    process_names
+        .iter()
+        .filter(|name| !safe_patterns.iter().any(|pattern| pattern.is_match(name)))
+        .cloned()
+        .collect()
 }
 
 fn detect_environment() -> Result<ProtectionEnvironment> {
@@ -664,6 +818,21 @@ fn systemctl_output(args: &[&str]) -> Result<Output> {
     Ok(output)
 }
 
+fn systemctl_system_output(args: &[&str]) -> Result<Output> {
+    let output = ProcessCommand::new("systemctl")
+        .args(args)
+        .output()
+        .context("failed to run systemctl")?;
+    ensure!(
+        output.status.success(),
+        "systemctl {} failed with {}: {}",
+        args.join(" "),
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(output)
+}
+
 fn configure_systemd_user_bus(command: &mut ProcessCommand) {
     #[cfg(target_os = "linux")]
     {
@@ -718,8 +887,12 @@ mod tests {
 
     #[test]
     fn protected_service_policy_recovers_forever_without_capping_memory() {
-        let source = drop_in_source(&environment());
+        let process_names = ["dms", "qs"].into_iter().map(str::to_string).collect();
+        let source = drop_in_source(&environment(), &process_names);
         assert!(source.starts_with(UNIT_MARKER));
+        assert!(source.contains("# ProcessName=dms"));
+        assert!(source.contains("# ProcessName=qs"));
+        assert_eq!(stored_process_names(&source), process_names);
         assert!(source.contains("Restart=on-failure"));
         assert!(source.contains("StartLimitIntervalSec=0"));
         assert!(source.contains("RestartSteps=8"));
@@ -728,10 +901,13 @@ mod tests {
         assert!(!source.contains("MemoryMax="));
         assert!(!source.contains("MemoryLow="));
 
-        let source = drop_in_source(&ProtectionEnvironment {
-            controllers: BTreeSet::new(),
-            progressive_restart: false,
-        });
+        let source = drop_in_source(
+            &ProtectionEnvironment {
+                controllers: BTreeSet::new(),
+                progressive_restart: false,
+            },
+            &BTreeSet::new(),
+        );
         assert!(source.contains("RestartSec=5s"));
         assert!(!source.contains("RestartSteps="));
     }
@@ -745,6 +921,25 @@ mod tests {
         );
         assert!(normalize_service_name("../../dms").is_err());
         assert!(normalize_service_name("dms.timer").is_err());
+    }
+
+    #[test]
+    fn earlyoom_must_cover_every_recorded_service_process() {
+        let arguments = [
+            "/usr/bin/earlyoom",
+            "--avoid",
+            "borg|qs",
+            "--ignore=dms|never-kill",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        let patterns = earlyoom_ignore_patterns(&arguments).unwrap();
+        let processes = ["dms", "qs", "never-kill"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(unprotected_processes(&processes, &patterns), ["qs"]);
     }
 
     #[test]

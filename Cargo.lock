@@ -515,6 +515,7 @@ dependencies = [
  "pulldown-cmark",
  "qrcode",
  "ratatui",
+ "regex",
  "reqwest",
  "semver",
  "serde",

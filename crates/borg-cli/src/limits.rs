@@ -508,7 +508,7 @@ fn slice_unit(environment: &LimitEnvironment) -> String {
         source.push_str(&format!("MemorySwapMax={}\n", policy.aggregate_swap_max));
     }
     if environment.cpu_supported() {
-        source.push_str(&format!("CPUAccounting=yes\nCPUWeight={CPU_WEIGHT}\n"));
+        source.push_str(&format!("CPUWeight={CPU_WEIGHT}\n"));
     }
     if environment.io_supported() {
         source.push_str(&format!("IOAccounting=yes\nIOWeight={IO_WEIGHT}\n"));

@@ -161,8 +161,12 @@ borg limits protect remove dms
 The service name may omit `.service`. Borg configures automatic recovery with
 bounded retry delay and gives the service more CPU and I/O priority when those
 controllers are available. Changes apply immediately without restarting the
-service. Borg refuses to replace a drop-in it does not own; starting or enabling
-the service remains under the user's control.
+service. When system-wide `earlyoom` is active, Borg records the service's real
+process names and reports protection as not ready until its `--ignore` regex
+covers them; `--avoid` only reduces the chance of selection. Updating that
+root-owned policy still requires administrator authorization. Borg refuses to
+replace a drop-in it does not own; starting or enabling the service remains
+under the user's control.
 
 These limits cover Borg and its direct process tree, including builds and
 subagents. Containers started by a rootful Docker daemon use Docker's cgroups
