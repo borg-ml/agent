@@ -1170,22 +1170,6 @@ async fn run_agent_session_store_kernel(
         )
         .await?;
     }
-    if !fresh && let Some(context_window_tokens) = initial_state.usage.context_window_tokens {
-        // Provider usage is a live observation, not durable conversation
-        // state. ZCode resets that observation on resume and lets the first
-        // request establish a fresh baseline instead of compacting from an
-        // old provider turn that may no longer exist.
-        record(
-            &mut journal,
-            &events,
-            session_id,
-            SessionEventKind::ContextWindowUpdated {
-                context_tokens: 0,
-                context_window_tokens,
-            },
-        )
-        .await?;
-    }
     let state = journal.state(session_id).await?;
     validate_session_state(session_id, &state)?;
     let mut provider_context_usage_valid = fresh;
@@ -1197,12 +1181,23 @@ async fn run_agent_session_store_kernel(
     // acknowledged provider checkpoint after an idle Borg/app-server restart,
     // preserving provider-side cache without replaying the whole transcript.
     // Failed/uncertain turns durably clear this id before recovery.
-    let mut subscription_context_reusable = launch.provider == CodingProvider::Codex
-        && provider_session_id
+    let codex_checkpoint_acknowledged =
+        provider_session_id
             .as_deref()
             .is_some_and(|provider_session_id| {
                 codex_checkpoint_is_acknowledged(journal.context_events(), provider_session_id)
-            })
+            });
+    let mut provider_fork_turn_id = (!codex_checkpoint_acknowledged)
+        .then(|| {
+            codex_checkpoint_fork_turn_id(
+                journal.context_events(),
+                state.provider_turn_id.as_deref(),
+            )
+        })
+        .flatten();
+    let mut subscription_context_reusable = launch.provider == CodingProvider::Codex
+        && provider_session_id.is_some()
+        && (codex_checkpoint_acknowledged || provider_fork_turn_id.is_some())
         && executor.supports_subscription_context_reuse(launch.provider);
     // Borg's journal remains authoritative. Native subscription sessions are
     // cache-preserving checkpoints only; whenever one cannot be proven usable,
@@ -1716,6 +1711,7 @@ async fn run_agent_session_store_kernel(
                                     // provider we just left, so the next turn
                                     // replays retained context instead.
                                     provider_session_id = None;
+                                    provider_fork_turn_id = None;
                                     retained_context = if launch.provider.uses_native_harness() {
                                         None
                                     } else {
@@ -1874,6 +1870,7 @@ async fn run_agent_session_store_kernel(
                                             .context_generation,
                                         provider: launch.provider,
                                         provider_session_id: Some(provider_session_id.to_string()),
+                                        provider_fork_turn_id: None,
                                         cwd: launch.cwd.clone(),
                                         prompt_delta: String::new(),
                                         prompt: String::new(),
@@ -1993,6 +1990,7 @@ async fn run_agent_session_store_kernel(
                                         session_id,
                                         SessionEventKind::ProviderSessionLinked {
                                             provider_session_id: new_provider_session_id.clone(),
+                                            provider_turn_id: None,
                                         },
                                     )
                                     .await?;
@@ -2063,6 +2061,7 @@ async fn run_agent_session_store_kernel(
                     }) if command_session_id == session_id => {
                         subscription_context_reusable = false;
                         provider_session_id = None;
+                        provider_fork_turn_id = None;
                         retained_context = None;
                         record(
                             &mut journal,
@@ -2521,6 +2520,9 @@ async fn run_agent_session_store_kernel(
                 || subscription_context_reusable)
                 .then(|| provider_session_id.clone())
                 .flatten(),
+            provider_fork_turn_id: subscription_context_reusable
+                .then(|| provider_fork_turn_id.clone())
+                .flatten(),
             cwd: launch.cwd.clone(),
             prompt_delta: if launch.provider.uses_native_harness() {
                 prompt.text.clone()
@@ -2672,6 +2674,7 @@ async fn run_agent_session_store_kernel(
                                         .supports_subscription_context_reuse(launch.provider),
                                 );
                             provider_session_id = outcome.provider_session_id.clone();
+                            provider_fork_turn_id = None;
                             let final_text = outcome.final_text;
                             if autonomy_result_sender.is_some() {
                                 autonomy_result = Some(if interrupted {
@@ -2729,7 +2732,7 @@ async fn run_agent_session_store_kernel(
                             }
                             let ready_detail = if retry {
                                 if error.to_ascii_lowercase().contains(
-                                    "durable thread resume unavailable",
+                                    "durable thread recovery unavailable",
                                 ) {
                                     "The provider thread could not be resumed; your message was preserved and Borg is retrying from its durable journal."
                                         .to_string()
@@ -2922,6 +2925,7 @@ async fn run_agent_session_store_kernel(
                 }, if interrupt_deadline.is_some() => {
                     subscription_context_reusable = false;
                     provider_session_id = None;
+                    provider_fork_turn_id = None;
                     running.abort();
                     let _ = (&mut running).await;
                     executor.stop_session(session_id).await?;
@@ -3452,6 +3456,7 @@ async fn run_agent_session_store_kernel(
                             executor.stop_session(session_id).await?;
                             subscription_context_reusable = false;
                             provider_session_id = None;
+                            provider_fork_turn_id = None;
                             deny_pending_approval(
                                 &mut journal,
                                 &events,
@@ -3706,6 +3711,7 @@ async fn run_agent_session_store_kernel(
         if std::mem::take(&mut provider_switch_pending) {
             subscription_context_reusable = false;
             provider_session_id = None;
+            provider_fork_turn_id = None;
             retained_context = if launch.provider.uses_native_harness() {
                 None
             } else {
@@ -3725,6 +3731,7 @@ async fn run_agent_session_store_kernel(
                 CodingProvider::Codex | CodingProvider::Claude
             ) {
                 provider_session_id = None;
+                provider_fork_turn_id = None;
                 retained_context = if launch.provider.uses_native_harness() {
                     None
                 } else {
@@ -4259,6 +4266,23 @@ fn codex_checkpoint_is_acknowledged(events: &[SessionEvent], provider_session_id
     }) == Some(true)
 }
 
+fn codex_checkpoint_fork_turn_id(
+    events: &[SessionEvent],
+    provider_turn_id: Option<&str>,
+) -> Option<String> {
+    let latest_boundary_is_uncertain_codex =
+        events.iter().rev().find_map(|event| match &event.kind {
+            SessionEventKind::TurnStarted { provider, .. } => {
+                Some(*provider == CodingProvider::Codex)
+            }
+            SessionEventKind::TurnCompleted { .. } => Some(false),
+            _ => None,
+        }) == Some(true);
+    latest_boundary_is_uncertain_codex
+        .then(|| provider_turn_id.map(str::to_string))
+        .flatten()
+}
+
 struct SubscriptionCompactionRequest<'a> {
     executor: &'a Arc<dyn AgentTurnExecutor>,
     session_id: Uuid,
@@ -4310,6 +4334,7 @@ async fn compact_subscription_context_for_budget(
             context_generation: 0,
             provider: launch.provider,
             provider_session_id: None,
+            provider_fork_turn_id: None,
             cwd: launch.cwd.clone(),
             prompt_delta: prompt.clone(),
             prompt,
@@ -6377,7 +6402,7 @@ fn provider_error_is_usage_limited(error: &str) -> bool {
 fn is_safe_automatic_retry_error(error: &str) -> bool {
     let error = error.to_ascii_lowercase();
     error.contains("returned an empty response")
-        || error.contains("durable thread resume unavailable")
+        || error.contains("durable thread recovery unavailable")
 }
 
 fn provider_event_has_side_effect(kind: &SessionEventKind) -> bool {

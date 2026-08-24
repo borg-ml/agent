@@ -481,6 +481,12 @@ pub struct SessionState {
     pub status: Option<SessionStatus>,
     pub status_detail: Option<String>,
     pub provider_session_id: Option<String>,
+    /// Last provider turn committed by a durable `TurnCompleted` boundary.
+    pub provider_turn_id: Option<String>,
+    /// Codex reports its native checkpoint just before the session actor
+    /// commits `TurnCompleted`; keep it pending until that boundary lands.
+    pub pending_provider_turn_id: Option<String>,
+    pub pending_provider_turn_session_id: Option<String>,
     pub pending_approval_id: Option<String>,
     pub pending_provider_interaction_id: Option<String>,
     pub pending_provider_interaction_kind: Option<String>,
@@ -562,6 +568,9 @@ impl SessionState {
                     // necessarily invalidate the old session id.
                     if provider_changed || *provider != CodingProvider::Codex {
                         self.provider_session_id = None;
+                        self.provider_turn_id = None;
+                        self.pending_provider_turn_id = None;
+                        self.pending_provider_turn_session_id = None;
                     }
                     self.usage.context_tokens = Some(0);
                 }
@@ -578,7 +587,18 @@ impl SessionState {
             }
             SessionEventKind::ProviderSessionLinked {
                 provider_session_id,
-            } => self.provider_session_id = Some(provider_session_id.clone()),
+                provider_turn_id,
+            } => {
+                if let Some(provider_turn_id) = provider_turn_id {
+                    self.pending_provider_turn_id = Some(provider_turn_id.clone());
+                    self.pending_provider_turn_session_id = Some(provider_session_id.clone());
+                } else {
+                    self.provider_session_id = Some(provider_session_id.clone());
+                    self.provider_turn_id = None;
+                    self.pending_provider_turn_id = None;
+                    self.pending_provider_turn_session_id = None;
+                }
+            }
             SessionEventKind::TurnCompleted {
                 provider_session_id,
                 error,
@@ -588,12 +608,19 @@ impl SessionState {
                 // boundary. Successful turns and acknowledged interrupts are
                 // valid checkpoints; uncertain failures explicitly unlink the
                 // native thread so recovery replays Borg's journal instead.
-                self.provider_session_id =
-                    if error.is_none() || error.as_deref() == Some("turn interrupted") {
-                        provider_session_id.clone()
-                    } else {
-                        None
-                    };
+                if error.is_none() || error.as_deref() == Some("turn interrupted") {
+                    self.provider_turn_id = provider_session_id.as_ref().and_then(|session_id| {
+                        (self.pending_provider_turn_session_id.as_ref() == Some(session_id))
+                            .then(|| self.pending_provider_turn_id.clone())
+                            .flatten()
+                    });
+                    self.provider_session_id = provider_session_id.clone();
+                } else {
+                    self.provider_session_id = None;
+                    self.provider_turn_id = None;
+                }
+                self.pending_provider_turn_id = None;
+                self.pending_provider_turn_session_id = None;
             }
             SessionEventKind::ApprovalRequested { approval_id, .. } => {
                 self.pending_approval_id = Some(approval_id.clone());
@@ -676,12 +703,18 @@ impl SessionState {
             }
             SessionEventKind::ContextCleared => {
                 self.provider_session_id = None;
+                self.provider_turn_id = None;
+                self.pending_provider_turn_id = None;
+                self.pending_provider_turn_session_id = None;
                 self.usage.context_tokens = Some(0);
                 self.context_generation = self.context_generation.saturating_add(1);
             }
             kind if kind.is_completed_context_compaction() => {
                 self.context_generation = self.context_generation.saturating_add(1);
                 self.provider_session_id = None;
+                self.provider_turn_id = None;
+                self.pending_provider_turn_id = None;
+                self.pending_provider_turn_session_id = None;
                 self.usage.context_tokens = Some(0);
             }
             SessionEventKind::Message {
@@ -713,6 +746,9 @@ impl SessionState {
         state.status = None;
         state.status_detail = None;
         state.provider_session_id = None;
+        state.provider_turn_id = None;
+        state.pending_provider_turn_id = None;
+        state.pending_provider_turn_session_id = None;
         // A fork keeps the canonical conversation, but it always starts a
         // fresh provider context. Carrying the parent's near-full usage into
         // the child makes the next prompt pass the pre-turn auto-compaction

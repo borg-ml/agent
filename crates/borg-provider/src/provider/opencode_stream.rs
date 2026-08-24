@@ -237,6 +237,7 @@ async fn run(
                 ..usage
             }),
             session_id,
+            provider_turn_id: None,
         })
         .await
         .ok();

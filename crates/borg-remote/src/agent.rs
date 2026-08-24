@@ -69,6 +69,9 @@ pub struct AgentTurn {
     pub context_generation: u64,
     pub provider: CodingProvider,
     pub provider_session_id: Option<String>,
+    /// Completed provider turn to fork through when recovering an uncertain
+    /// Codex tail from a durable checkpoint.
+    pub provider_fork_turn_id: Option<String>,
     pub cwd: PathBuf,
     /// The new durable user input represented by this turn. `prompt` remains
     /// the complete canonical replay prompt; the subscription pool uses this
@@ -326,6 +329,7 @@ struct PreparedSubscriptionTurn {
     pool: SubscriptionPool,
     reused: bool,
     resume_session_id: Option<String>,
+    fork_turn_id: Option<String>,
     resume_unavailable_prompt: Option<String>,
 }
 
@@ -333,6 +337,7 @@ struct SubscriptionTurnInput {
     context_generation: u64,
     provider: CodingProvider,
     provider_session_id: Option<String>,
+    provider_fork_turn_id: Option<String>,
     prompt: String,
     prompt_delta: String,
     lifecycle_key: String,
@@ -354,6 +359,7 @@ impl SubscriptionPoolRegistry {
             context_generation,
             provider,
             provider_session_id,
+            provider_fork_turn_id,
             prompt,
             prompt_delta,
             lifecycle_key,
@@ -404,6 +410,9 @@ impl SubscriptionPoolRegistry {
         let resume_session_id = (!append && provider == CodingProvider::Codex)
             .then_some(provider_session_id)
             .flatten();
+        let fork_turn_id = resume_session_id
+            .as_ref()
+            .and_then(|_| provider_fork_turn_id);
         let reusing_native_context = append || resume_session_id.is_some();
         let effective_key = format!("{lifecycle_key}#epoch={}", slot.epoch);
         PreparedSubscriptionTurn {
@@ -416,6 +425,7 @@ impl SubscriptionPoolRegistry {
             pool: slot.pool.clone(),
             reused: reusing_native_context,
             resume_session_id,
+            fork_turn_id,
             resume_unavailable_prompt: reusing_native_context.then_some(prompt),
         }
     }
@@ -867,6 +877,7 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
                     context_generation: turn.context_generation,
                     provider: turn.provider,
                     provider_session_id: Some(provider_session_id.clone()),
+                    provider_fork_turn_id: None,
                     prompt: String::new(),
                     prompt_delta: String::new(),
                     lifecycle_key,
@@ -876,6 +887,7 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
         request.prompt = prepared.prompt.clone();
         request.lifecycle_key = Some(prepared.lifecycle_key.clone());
         request.session_id = prepared.resume_session_id.clone();
+        request.fork_turn_id = None;
         request.resume_unavailable_prompt = prepared.resume_unavailable_prompt.clone();
         request.persist_session = Some(true);
         let pool = match prepared.pool {
@@ -1096,6 +1108,7 @@ fn direct_chat_stream_request(
         git_credentials: Vec::new(),
         working_directory: Some(turn.cwd.clone()),
         session_id: None,
+        fork_turn_id: None,
         provider_channel: ProviderChannel::Direct,
         persist_session: Some(false),
         web_search_allowed: true,
@@ -1239,6 +1252,7 @@ async fn run_borg_provider_turn(
             // would silently omit durable Borg tool events or duplicate the
             // locally reconstructed prefix.
             request.session_id = None;
+            request.fork_turn_id = None;
             request.persist_session = Some(false);
             request.resume_unavailable_prompt = None;
             if tools_enabled {
@@ -1279,6 +1293,7 @@ async fn run_borg_provider_turn(
                     context_generation: turn.context_generation,
                     provider: turn.provider,
                     provider_session_id: turn.provider_session_id.clone(),
+                    provider_fork_turn_id: turn.provider_fork_turn_id.clone(),
                     prompt: append_prompt_context(
                         &turn.prompt,
                         prompt_context.as_deref().unwrap_or_default(),
@@ -1294,6 +1309,7 @@ async fn run_borg_provider_turn(
         request.prompt = prepared.prompt.clone();
         request.lifecycle_key = Some(prepared.lifecycle_key.clone());
         request.session_id = prepared.resume_session_id.clone();
+        request.fork_turn_id = prepared.fork_turn_id.clone();
         request.resume_unavailable_prompt = prepared.resume_unavailable_prompt.clone();
         // Codex app-server threads are the cache-preserving continuation of
         // Borg's durable journal. Persist them so an idle process restart can
@@ -1600,6 +1616,7 @@ async fn run_borg_provider_turn(
                 final_text,
                 usage,
                 session_id,
+                provider_turn_id,
             } => {
                 terminal_seen = true;
                 final_output = final_text;
@@ -1609,6 +1626,7 @@ async fn run_borg_provider_turn(
                         &events,
                         SessionEventKind::ProviderSessionLinked {
                             provider_session_id: session_id,
+                            provider_turn_id,
                         },
                     )
                     .await;
@@ -2111,6 +2129,7 @@ mod tests {
                     context_generation: 0,
                     provider: CodingProvider::Claude,
                     provider_session_id: None,
+                    provider_fork_turn_id: None,
                     prompt: "canonical history + first".to_string(),
                     prompt_delta: "<borg-message>first</borg-message>".to_string(),
                     lifecycle_key: "stable-config".to_string(),
@@ -2129,6 +2148,7 @@ mod tests {
                     context_generation: 0,
                     provider: CodingProvider::Claude,
                     provider_session_id: None,
+                    provider_fork_turn_id: None,
                     prompt: "canonical history + first + second".to_string(),
                     prompt_delta: "<borg-message>second</borg-message>".to_string(),
                     lifecycle_key: "stable-config".to_string(),
@@ -2147,6 +2167,7 @@ mod tests {
                     context_generation: 0,
                     provider: CodingProvider::Claude,
                     provider_session_id: None,
+                    provider_fork_turn_id: None,
                     prompt: "canonical history + first + second + third".to_string(),
                     prompt_delta: "<borg-message>third</borg-message>".to_string(),
                     lifecycle_key: "stable-config".to_string(),
@@ -2158,7 +2179,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_pool_resumes_a_durable_thread_with_only_the_new_delta() {
+    async fn codex_pool_recovers_a_durable_checkpoint_with_only_the_new_delta() {
         let registry = SubscriptionPoolRegistry::default();
         let session_id = Uuid::new_v4();
         let prepared = registry
@@ -2168,6 +2189,7 @@ mod tests {
                     context_generation: 4,
                     provider: CodingProvider::Codex,
                     provider_session_id: Some("durable-codex-thread".to_string()),
+                    provider_fork_turn_id: Some("completed-codex-turn".to_string()),
                     prompt: "large canonical replay + next".to_string(),
                     prompt_delta: "<borg-message>next</borg-message>".to_string(),
                     lifecycle_key: "stable-config".to_string(),
@@ -2179,6 +2201,10 @@ mod tests {
         assert_eq!(
             prepared.resume_session_id.as_deref(),
             Some("durable-codex-thread")
+        );
+        assert_eq!(
+            prepared.fork_turn_id.as_deref(),
+            Some("completed-codex-turn")
         );
         assert_eq!(
             prepared.resume_unavailable_prompt.as_deref(),

@@ -2052,6 +2052,8 @@ pub enum SessionEventKind {
     },
     ProviderSessionLinked {
         provider_session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_turn_id: Option<String>,
     },
     PromptRecalled {
         message_id: Uuid,

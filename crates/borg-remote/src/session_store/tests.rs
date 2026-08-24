@@ -1217,6 +1217,7 @@ async fn context_clear_resets_provider_projection_and_recovery_prefix() {
         configured(directory.path()),
         SessionEventKind::ProviderSessionLinked {
             provider_session_id: "old-provider-thread".to_string(),
+            provider_turn_id: None,
         },
         message(Uuid::new_v4(), "old context"),
         SessionEventKind::ContextWindowUpdated {
@@ -1491,6 +1492,7 @@ async fn fork_records_lineage_without_copying_events() {
         configured(directory.path()),
         SessionEventKind::ProviderSessionLinked {
             provider_session_id: "provider-thread".to_string(),
+            provider_turn_id: None,
         },
         message(retained_message_id, "keep"),
         message(discarded_message_id, "discard"),
@@ -1764,6 +1766,7 @@ async fn inherited_event_pages_match_the_full_projection_across_lineage_boundari
         configured(directory.path()),
         SessionEventKind::ProviderSessionLinked {
             provider_session_id: "must-not-fork".to_string(),
+            provider_turn_id: None,
         },
         message(Uuid::new_v4(), "parent-a"),
         message(Uuid::new_v4(), "parent-b"),
@@ -2632,7 +2635,8 @@ fn persistence_and_fork_rules_are_typed_rust_contracts() {
     assert!(compaction_completed.is_context_relevant());
     assert!(
         !SessionEventKind::ProviderSessionLinked {
-            provider_session_id: "provider".to_string()
+            provider_session_id: "provider".to_string(),
+            provider_turn_id: None,
         }
         .is_fork_inheritable()
     );

@@ -14,6 +14,7 @@ use crate::{AgentCompaction, AgentTurnResult, CodingProvider, PermissionMode};
 type RecordedTurns = Arc<Mutex<Vec<(PathBuf, Option<serde_json::Value>)>>>;
 type RecordedPromptTurns = Arc<Mutex<Vec<(String, Vec<PathBuf>)>>>;
 type RecordedContextTurns = Arc<Mutex<Vec<(String, Option<String>)>>>;
+type RecordedDurableResumeTurns = Arc<Mutex<Vec<(String, Option<String>, Option<String>)>>>;
 type RecordedProviderTurns =
     Arc<Mutex<Vec<(CodingProvider, Option<String>, Option<String>, String)>>>;
 type RecordedCompactionTurns = Arc<Mutex<Vec<(CodingProvider, Option<String>, String)>>>;
@@ -499,7 +500,7 @@ struct InterruptibleReusableContextExecutor {
 }
 
 struct DurableResumeExecutor {
-    seen: RecordedContextTurns,
+    seen: RecordedDurableResumeTurns,
     called: Arc<Notify>,
     compaction_calls: Arc<AtomicUsize>,
 }
@@ -694,10 +695,11 @@ impl AgentTurnExecutor for DurableResumeExecutor {
         _events: mpsc::Sender<SessionEventKind>,
         _controls: Option<mpsc::Receiver<AgentTurnControl>>,
     ) -> Result<AgentTurnResult> {
-        self.seen
-            .lock()
-            .unwrap()
-            .push((turn.prompt, turn.provider_session_id));
+        self.seen.lock().unwrap().push((
+            turn.prompt,
+            turn.provider_session_id,
+            turn.provider_fork_turn_id,
+        ));
         self.called.notify_one();
         Ok(AgentTurnResult {
             provider_session_id: Some("resumed-codex-thread".to_string()),
@@ -5403,7 +5405,7 @@ fn resume_recovers_unresolved_queue_entries_for_any_session_status() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn resumed_session_drains_unresolved_input_and_resets_context_usage() {
+async fn resumed_session_drains_unresolved_input_and_preserves_last_context_usage() {
     let root = tempdir().unwrap();
     let journal_path = root.path().join("session.lock");
     let session_id = Uuid::new_v4();
@@ -5510,7 +5512,7 @@ async fn resumed_session_drains_unresolved_input_and_resets_context_usage() {
     .expect("unresolved input starts and completes during resume");
     assert_eq!(seen.lock().unwrap().len(), 1);
     assert!(
-        store
+        !store
             .live_events_after(session_id, 0)
             .await
             .unwrap()
@@ -5522,6 +5524,10 @@ async fn resumed_session_drains_unresolved_input_and_resets_context_usage() {
                     ..
                 }
             ))
+    );
+    assert_eq!(
+        store.state(session_id).await.unwrap().usage.context_tokens,
+        Some(95_000)
     );
 
     command_tx
@@ -5732,7 +5738,7 @@ fn only_side_effect_free_transport_recovery_is_eligible_for_automatic_retry() {
         "codex returned an empty response"
     ));
     assert!(is_safe_automatic_retry_error(
-        "Codex durable thread resume unavailable; retry from Borg's durable journal"
+        "Codex durable thread recovery unavailable; retry from Borg's durable journal"
     ));
     assert!(!is_safe_automatic_retry_error("turn interrupted"));
     assert!(!is_safe_automatic_retry_error("tool execution failed"));
@@ -7341,6 +7347,7 @@ fn codex_resume_requires_a_terminal_checkpoint_after_the_latest_turn_start() {
         ),
     ];
     assert!(codex_checkpoint_is_acknowledged(&events, "thread-1"));
+    assert_eq!(codex_checkpoint_fork_turn_id(&events, Some("turn-1")), None);
 
     events.push(SessionEvent::new(
         session_id,
@@ -7358,9 +7365,14 @@ fn codex_resume_requires_a_terminal_checkpoint_after_the_latest_turn_start() {
         4,
         SessionEventKind::ProviderSessionLinked {
             provider_session_id: "thread-1".to_string(),
+            provider_turn_id: None,
         },
     ));
     assert!(!codex_checkpoint_is_acknowledged(&events, "thread-1"));
+    assert_eq!(
+        codex_checkpoint_fork_turn_id(&events, Some("turn-1")).as_deref(),
+        Some("turn-1")
+    );
 }
 
 #[test]
@@ -7666,6 +7678,7 @@ async fn resumed_codex_checkpoint_avoids_large_replay_compaction_after_actor_res
         },
         SessionEventKind::ProviderSessionLinked {
             provider_session_id: "resumed-codex-thread".to_string(),
+            provider_turn_id: Some("completed-codex-turn".to_string()),
         },
         SessionEventKind::TurnCompleted {
             message_id: previous_id,
@@ -7746,6 +7759,151 @@ async fn resumed_codex_checkpoint_avoids_large_replay_compaction_after_actor_res
     assert_eq!(seen.len(), 1);
     assert!(seen[0].0.len() > SUBSCRIPTION_INPUT_BUDGET_CHARS);
     assert_eq!(seen[0].1.as_deref(), Some("resumed-codex-thread"));
+    assert_eq!(seen[0].2, None);
+}
+
+#[tokio::test]
+async fn crash_resume_forks_the_last_completed_codex_turn_before_replaying_input() {
+    let root = tempdir().unwrap();
+    let journal_path = root.path().join("session.lock");
+    let session_id = Uuid::new_v4();
+    let completed_id = Uuid::new_v4();
+    let interrupted_id = Uuid::new_v4();
+    let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+        .await
+        .unwrap();
+    store.create_session(session_id).await.unwrap();
+    for kind in [
+        SessionEventKind::SessionStarted,
+        SessionEventKind::SessionConfigured {
+            cwd: root.path().to_path_buf(),
+            provider: CodingProvider::Codex,
+            model: Some("gpt-5.6-sol".to_string()),
+            effort: Some("xhigh".to_string()),
+            fast: false,
+            response_language: crate::ResponseLanguage::Auto,
+            permission_mode: PermissionMode::Manual,
+        },
+        SessionEventKind::Message {
+            message_id: completed_id,
+            actor: EventActor::User,
+            text: "u".repeat(450_000),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: Some(PromptDelivery::Queue),
+        },
+        SessionEventKind::TurnStarted {
+            message_id: completed_id,
+            provider: CodingProvider::Codex,
+            model: Some("gpt-5.6-sol".to_string()),
+            effort: Some("xhigh".to_string()),
+            fast: false,
+        },
+        SessionEventKind::Message {
+            message_id: Uuid::new_v4(),
+            actor: EventActor::Assistant,
+            text: "r".repeat(650_000),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: None,
+        },
+        SessionEventKind::ProviderSessionLinked {
+            provider_session_id: "codex-thread-before-crash".to_string(),
+            provider_turn_id: Some("codex-turn-before-crash".to_string()),
+        },
+        SessionEventKind::TurnCompleted {
+            message_id: completed_id,
+            provider_session_id: Some("codex-thread-before-crash".to_string()),
+            final_text: "done".to_string(),
+            error: None,
+        },
+        SessionEventKind::Message {
+            message_id: interrupted_id,
+            actor: EventActor::User,
+            text: "recover this exact input".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::InProgress,
+            delivery: Some(PromptDelivery::Queue),
+        },
+        SessionEventKind::TurnStarted {
+            message_id: interrupted_id,
+            provider: CodingProvider::Codex,
+            model: Some("gpt-5.6-sol".to_string()),
+            effort: Some("xhigh".to_string()),
+            fast: false,
+        },
+        SessionEventKind::StatusChanged {
+            status: SessionStatus::Running,
+            detail: Some("provider active when host crashed".to_string()),
+        },
+    ] {
+        store
+            .append(SessionEvent::new(session_id, 0, kind))
+            .await
+            .unwrap();
+    }
+    let checkpoint = store.state(session_id).await.unwrap();
+    assert_eq!(
+        checkpoint.provider_session_id.as_deref(),
+        Some("codex-thread-before-crash")
+    );
+    assert_eq!(
+        checkpoint.provider_turn_id.as_deref(),
+        Some("codex-turn-before-crash")
+    );
+
+    let (command_tx, command_rx) = mpsc::channel(8);
+    let (event_tx, _event_rx) = mpsc::channel(64);
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let called = Arc::new(Notify::new());
+    let compaction_calls = Arc::new(AtomicUsize::new(0));
+    let executor = Arc::new(DurableResumeExecutor {
+        seen: Arc::clone(&seen),
+        called: Arc::clone(&called),
+        compaction_calls: Arc::clone(&compaction_calls),
+    });
+    let actor = tokio::spawn(async move {
+        run_agent_session_with_executor(
+            &journal_path,
+            session_id,
+            LaunchSession {
+                request_id: Uuid::new_v4(),
+                cwd: root.path().to_path_buf(),
+                provider: CodingProvider::Codex,
+                model: Some("gpt-5.6-sol".to_string()),
+                effort: Some("xhigh".to_string()),
+                fast: Some(false),
+                response_language: crate::ResponseLanguage::Auto,
+                permission_mode: PermissionMode::Manual,
+                name: None,
+                initial_prompt: None,
+                capabilities: Default::default(),
+                subagent_concurrency_limit: None,
+                extension_skill_roots: Vec::new(),
+                team_policy: None,
+            },
+            command_rx,
+            event_tx,
+            executor,
+        )
+        .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(5), called.notified())
+        .await
+        .expect("recovered turn starts from the provider checkpoint");
+    command_tx
+        .send(HostCommand::Stop { session_id })
+        .await
+        .unwrap();
+    actor.await.unwrap().unwrap();
+
+    assert_eq!(compaction_calls.load(Ordering::Acquire), 0);
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert!(seen[0].0.len() > SUBSCRIPTION_INPUT_BUDGET_CHARS);
+    assert_eq!(seen[0].1.as_deref(), Some("codex-thread-before-crash"));
+    assert_eq!(seen[0].2.as_deref(), Some("codex-turn-before-crash"));
 }
 
 #[tokio::test]
@@ -7935,6 +8093,7 @@ async fn crash_resume_replays_native_compaction_without_subagent_inflation() {
         )
     );
     assert_eq!(seen[0].1, None);
+    assert_eq!(seen[0].2, None);
 }
 
 #[tokio::test]

@@ -253,6 +253,7 @@ pub enum ChatStreamEvent {
         final_text: String,
         usage: Option<ProviderCallUsage>,
         session_id: Option<String>,
+        provider_turn_id: Option<String>,
     },
     Failed {
         error: String,
@@ -384,6 +385,9 @@ pub struct ChatStreamRequest {
     pub git_credentials: Vec<ChatGitCredential>,
     pub working_directory: Option<PathBuf>,
     pub session_id: Option<String>,
+    /// When set with `session_id`, fork that persisted Codex thread through
+    /// this completed turn instead of resuming an uncertain tail.
+    pub fork_turn_id: Option<String>,
     pub provider_channel: ProviderChannel,
     pub persist_session: Option<bool>,
     pub web_search_allowed: bool,
@@ -1102,6 +1106,7 @@ fn map_claude_event_with_correlation(
             final_text,
             usage: usage.map(|usage| map_claude_usage(usage, billing_mode)),
             session_id,
+            provider_turn_id: None,
         },
         claude_agents::ChatStreamEvent::Failed { error } => ChatStreamEvent::Failed { error },
     }
@@ -1219,8 +1224,9 @@ async fn run_codex_subscription_process_pooled(
             request.prompt = request
                 .resume_unavailable_prompt
                 .take()
-                .context("Codex resume failed without a durable replay prompt")?;
+                .context("Codex recovery failed without a durable replay prompt")?;
             request.session_id = None;
+            request.fork_turn_id = None;
         }
         state.process = Some(started.process);
     }
@@ -1379,30 +1385,40 @@ async fn start_pooled_codex_process(
         .as_deref()
         .filter(|thread_id| !thread_id.trim().is_empty())
     {
-        write_codex_request(
-            &mut stdin,
-            2,
-            "thread/resume",
-            codex_thread_resume_params(request, permission, thread_id),
-        )
-        .await?;
+        let (method, params) = if let Some(turn_id) = request
+            .fork_turn_id
+            .as_deref()
+            .filter(|turn_id| !turn_id.trim().is_empty())
+        {
+            (
+                "thread/fork",
+                codex_thread_fork_params(request, permission, thread_id, turn_id),
+            )
+        } else {
+            (
+                "thread/resume",
+                codex_thread_resume_params(request, permission, thread_id),
+            )
+        };
+        write_codex_request(&mut stdin, 2, method, params).await?;
         match read_codex_response(&mut lines, 2).await {
             Ok(response) => (response, true),
-            Err(resume_error) => {
+            Err(recovery_error) => {
                 let replay = request
                     .resume_unavailable_prompt
                     .as_deref()
                     .with_context(|| {
-                        format!("failed to resume Codex thread {thread_id}: {resume_error:#}")
+                        format!("failed to recover Codex thread {thread_id}: {recovery_error:#}")
                     })?;
                 anyhow::ensure!(
                     replay.chars().count() <= CODEX_APP_SERVER_TEXT_INPUT_LIMIT_CHARS,
-                    "Codex durable thread resume unavailable; retry from Borg's durable journal after context compaction: {resume_error:#}"
+                    "Codex durable thread recovery unavailable; retry from Borg's durable journal after context compaction: {recovery_error:#}"
                 );
                 tracing::warn!(
                     thread_id,
-                    error = %resume_error,
-                    "Codex durable thread was unavailable; starting from Borg's canonical replay"
+                    recovery_method = method,
+                    error = %recovery_error,
+                    "Codex durable checkpoint was unavailable; starting from Borg's canonical replay"
                 );
                 write_codex_request(
                     &mut stdin,
@@ -1614,6 +1630,7 @@ async fn run_pooled_codex_turn(
             final_text,
             usage: Some(usage),
             session_id,
+            provider_turn_id: Some(turn_id),
         })
         .await
         .is_err()
@@ -1895,6 +1912,7 @@ async fn run_codex_subscription_process(
             final_text,
             usage: Some(usage),
             session_id,
+            provider_turn_id: Some(turn_id),
         })
         .await
         .ok();
@@ -2067,6 +2085,27 @@ fn codex_thread_resume_params(
     // Borg already owns and renders the durable transcript. Avoid returning a
     // potentially enormous duplicate turn array just to reopen the thread.
     object.insert("excludeTurns".to_string(), Value::Bool(true));
+    params
+}
+
+fn codex_thread_fork_params(
+    request: &ChatStreamRequest,
+    permission: LocalAgentPermission,
+    thread_id: &str,
+    last_turn_id: &str,
+) -> Value {
+    let mut params = codex_thread_start_params(request, permission);
+    let object = params
+        .as_object_mut()
+        .expect("Codex thread parameters are always an object");
+    object.remove("experimentalRawEvents");
+    object.insert("threadId".to_string(), Value::String(thread_id.to_string()));
+    object.insert(
+        "lastTurnId".to_string(),
+        Value::String(last_turn_id.to_string()),
+    );
+    object.insert("excludeTurns".to_string(), Value::Bool(true));
+    object.insert("deferGoalContinuation".to_string(), Value::Bool(true));
     params
 }
 
@@ -3405,6 +3444,7 @@ mod tests {
             git_credentials: Vec::new(),
             working_directory: None,
             session_id: Some("session-1".to_string()),
+            fork_turn_id: None,
             provider_channel: ProviderChannel::Direct,
             persist_session: Some(false),
             web_search_allowed: false,
@@ -3471,6 +3511,7 @@ mod tests {
             git_credentials: Vec::new(),
             working_directory: Some(root.path().to_path_buf()),
             session_id: None,
+            fork_turn_id: None,
             provider_channel: ProviderChannel::Direct,
             persist_session: Some(false),
             web_search_allowed: false,
@@ -3598,6 +3639,7 @@ mod tests {
                     ..
                 }),
                 session_id: Some(session_id),
+                provider_turn_id: None,
             } if final_text == "done" && session_id == "session-1"
         ));
     }
@@ -4126,6 +4168,7 @@ mod tests {
             git_credentials: Vec::new(),
             working_directory: Some(PathBuf::from("/tmp/workspace")),
             session_id: Some("thread-1".to_string()),
+            fork_turn_id: None,
             provider_channel: ProviderChannel::Direct,
             persist_session: Some(true),
             web_search_allowed: true,
@@ -4150,6 +4193,18 @@ mod tests {
             params.pointer("/config/mcp_servers/borg_agent/args/0"),
             Some(&Value::from("__agent-mcp"))
         );
+
+        let fork = codex_thread_fork_params(
+            &request,
+            LocalAgentPermission::FullAccess,
+            "thread-1",
+            "turn-7",
+        );
+        assert_eq!(fork.get("threadId"), Some(&Value::from("thread-1")));
+        assert_eq!(fork.get("lastTurnId"), Some(&Value::from("turn-7")));
+        assert_eq!(fork.get("excludeTurns"), Some(&Value::Bool(true)));
+        assert_eq!(fork.get("deferGoalContinuation"), Some(&Value::Bool(true)));
+        assert!(fork.get("experimentalRawEvents").is_none());
     }
 
     #[test]
