@@ -23,9 +23,15 @@ const SERVER_INFO_META: &str = "io.modelcontextprotocol/serverInfo";
 
 pub(crate) async fn run() -> Result<()> {
     let endpoint = Arc::new(AgentToolEndpoint::from_env()?);
-    let stdin = BufReader::new(tokio::io::stdin());
-    let mut lines = stdin.lines();
-    let mut stdout = tokio::io::stdout();
+    serve(endpoint, tokio::io::stdin(), tokio::io::stdout()).await
+}
+
+async fn serve<R, W>(endpoint: Arc<AgentToolEndpoint>, read: R, mut write: W) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut lines = BufReader::new(read).lines();
     let (response_tx, mut response_rx) = mpsc::channel(32);
     let mut active = HashMap::<String, CancellationToken>::new();
     loop {
@@ -35,6 +41,14 @@ pub(crate) async fn run() -> Result<()> {
                 if let Some(request_id) = cancellation_request_id(&line) {
                     if let Some(cancel) = active.remove(&request_key(&request_id)) {
                         cancel.cancel();
+                    }
+                    continue;
+                }
+                if !request_is_tool_call(&line) {
+                    if let Some(response) = handle_line_with_cancel(&endpoint, &line, None).await {
+                        write.write_all(response.to_string().as_bytes()).await?;
+                        write.write_all(b"\n").await?;
+                        write.flush().await?;
                     }
                     continue;
                 }
@@ -66,9 +80,9 @@ pub(crate) async fn run() -> Result<()> {
                     active.remove(&key);
                 }
                 if let Some(response) = response {
-                    stdout.write_all(response.to_string().as_bytes()).await?;
-                    stdout.write_all(b"\n").await?;
-                    stdout.flush().await?;
+                    write.write_all(response.to_string().as_bytes()).await?;
+                    write.write_all(b"\n").await?;
+                    write.flush().await?;
                 }
             }
         }
@@ -524,6 +538,18 @@ fn request_id_from_line(line: &str) -> Option<Value> {
         .and_then(|request| request.get("id").cloned())
 }
 
+fn request_is_tool_call(line: &str) -> bool {
+    serde_json::from_str::<Value>(line)
+        .ok()
+        .and_then(|request| {
+            request
+                .get("method")
+                .and_then(Value::as_str)
+                .map(|method| method == "tools/call")
+        })
+        .unwrap_or(false)
+}
+
 fn cancellation_request_id(line: &str) -> Option<Value> {
     let request = serde_json::from_str::<Value>(line).ok()?;
     if request.get("method").and_then(Value::as_str) != Some("notifications/cancelled") {
@@ -555,6 +581,7 @@ fn rpc_error_with_data(id: Value, code: i64, message: String, data: Value) -> Va
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncReadExt;
 
     #[tokio::test]
     async fn local_proxy_exposes_the_shared_agent_tool_catalog() {
@@ -768,5 +795,54 @@ mod tests {
             response["result"]["protocolVersion"],
             LEGACY_PROTOCOL_VERSION
         );
+    }
+
+    #[tokio::test]
+    async fn pipelined_handshake_is_flushed_before_input_eof() {
+        #[cfg(unix)]
+        let endpoint = AgentToolEndpoint::Unix {
+            socket: Path::new("/unused").to_path_buf(),
+            provider: borg_remote::CodingProvider::Codex,
+            shared_work_enabled: false,
+            consultation_enabled: true,
+            team_policy: None,
+        };
+        #[cfg(not(unix))]
+        let endpoint = AgentToolEndpoint::Loopback {
+            address: "127.0.0.1:1".parse().unwrap(),
+            token: "unused".to_string(),
+            provider: borg_remote::CodingProvider::Codex,
+            shared_work_enabled: false,
+            consultation_enabled: true,
+            team_policy: None,
+        };
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let (read, write) = tokio::io::split(server);
+        let serving = tokio::spawn(serve(Arc::new(endpoint), read, write));
+        client
+            .write_all(
+                concat!(
+                    "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n",
+                    "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n",
+                    "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}\n",
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        client.shutdown().await.unwrap();
+        let mut output = Vec::new();
+        client.read_to_end(&mut output).await.unwrap();
+        serving.await.unwrap().unwrap();
+
+        let responses = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0]["id"], 1);
+        assert_eq!(responses[1]["id"], 2);
+        assert!(responses[1]["result"]["tools"].is_array());
     }
 }
