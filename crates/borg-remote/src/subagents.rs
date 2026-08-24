@@ -96,6 +96,7 @@ pub struct SubagentUsage {
     pub total_tokens: u64,
     pub context_tokens: Option<u64>,
     pub cost_microusd: Option<u64>,
+    pub cost_basis: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -6506,6 +6507,7 @@ async fn update_from_session_event(
             total_tokens,
             context_tokens,
             cost_microusd,
+            cost_basis,
             ..
         } => {
             entry.snapshot.usage.input_tokens = entry
@@ -6532,6 +6534,7 @@ async fn update_from_session_event(
                     (None, Some(value)) => Some(*value),
                     (current, None) => current,
                 };
+            entry.snapshot.usage.cost_basis = cost_basis.clone();
         }
         SessionEventKind::ContextWindowUpdated { context_tokens, .. } => {
             entry.snapshot.usage.context_tokens = Some(*context_tokens);
@@ -6563,6 +6566,7 @@ fn project_child_state(snapshot: &mut SubagentSnapshot, state: &crate::SessionSt
         total_tokens: state.usage.total_tokens,
         context_tokens: state.usage.context_tokens,
         cost_microusd: state.usage.cost_microusd,
+        cost_basis: state.usage.cost_basis.clone(),
     };
 }
 

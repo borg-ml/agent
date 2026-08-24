@@ -7728,7 +7728,13 @@ fn format_subagent_usage(usage: &borg_remote::SubagentUsage) -> String {
         parts.push(format_compact_count(tokens, unit));
     }
     if let Some(cost_microusd) = usage.cost_microusd {
-        parts.push(format!("${:.4}", cost_microusd as f64 / 1_000_000.0));
+        let cost = cost_microusd as f64 / 1_000_000.0;
+        let label = match usage.cost_basis.as_str() {
+            "subscription_equivalent" => format!("${cost:.4} (sub)"),
+            "estimated_from_pricing" => format!("~${cost:.4} (est)"),
+            _ => format!("${cost:.4}"),
+        };
+        parts.push(label);
     }
     format!("  {}", parts.join(" · "))
 }

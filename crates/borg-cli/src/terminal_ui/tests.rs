@@ -3849,6 +3849,17 @@ fn subagent_selector_prefers_current_context_over_cumulative_provider_work() {
 }
 
 #[test]
+fn subagent_subscription_cost_is_marked_as_api_equivalent() {
+    let usage = borg_remote::SubagentUsage {
+        cost_microusd: Some(1_234_567),
+        cost_basis: "subscription_equivalent".to_string(),
+        ..Default::default()
+    };
+
+    assert_eq!(format_subagent_usage(&usage), "  $1.2346 (sub)");
+}
+
+#[test]
 fn persistent_peers_follow_ordinary_agent_visibility() {
     let now = chrono::Utc::now();
     let mut peer = SubagentSnapshot {

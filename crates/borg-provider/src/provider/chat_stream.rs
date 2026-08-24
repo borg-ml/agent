@@ -406,11 +406,16 @@ pub struct ClaudeSubscriptionPool {
     inner: Arc<Mutex<ClaudeSubscriptionPoolState>>,
 }
 
+type ClaudeCostTracker = Arc<StdMutex<Option<u64>>>;
+
 #[derive(Default)]
 struct ClaudeSubscriptionPoolState {
     native: claude_agents::ClaudePool,
     lifecycle_key: Option<String>,
     command: Option<claude_agents::CommandSpec>,
+    // Claude's streaming-input result cost is cumulative for the live process;
+    // keep the prior total beside the pooled process so Borg emits a turn delta.
+    cost_tracker: ClaudeCostTracker,
     _auth_home: Option<TempDir>,
     _mcp_setup: Option<(TempDir, ProviderMcpSetup)>,
 }
@@ -779,7 +784,7 @@ async fn run_claude_subscription_process(
             .unwrap_or_else(|| "borg-claude-subscription".to_string()),
     };
 
-    relay_claude_runtime(claude_request, controls, events, None, billing_mode).await
+    relay_claude_runtime(claude_request, controls, events, None, billing_mode, None).await
 }
 
 async fn run_claude_subscription_process_pooled(
@@ -812,6 +817,10 @@ async fn run_claude_subscription_process_pooled(
             build_claude_command_spec(&request, permission, auth_home.as_ref(), mcp_config_path)?;
         state.lifecycle_key = Some(lifecycle_key.clone());
         state.command = Some(command);
+        *state
+            .cost_tracker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         state._auth_home = auth_home;
         state._mcp_setup = mcp_setup;
     }
@@ -820,6 +829,7 @@ async fn run_claude_subscription_process_pooled(
         .clone()
         .context("pooled Claude command was not initialized")?;
     let native_pool = state.native.clone();
+    let cost_tracker = Arc::clone(&state.cost_tracker);
     let billing_mode = provider_billing_mode(
         SubscriptionProvider::Claude,
         &request,
@@ -841,6 +851,7 @@ async fn run_claude_subscription_process_pooled(
         events,
         Some(native_pool),
         billing_mode,
+        Some(cost_tracker),
     )
     .await
 }
@@ -851,6 +862,7 @@ async fn relay_claude_runtime(
     events: mpsc::Sender<ChatStreamEvent>,
     pool: Option<claude_agents::ClaudePool>,
     billing_mode: ProviderBillingMode,
+    cost_tracker: Option<ClaudeCostTracker>,
 ) -> Result<()> {
     let (native_events, mut native_events_receiver) = mpsc::channel(64);
     let steer_correlation = Arc::new(StdMutex::new(ClaudeSteerCorrelation::default()));
@@ -939,14 +951,13 @@ async fn relay_claude_runtime(
                 let Some(event) = event else {
                     break;
                 };
-                if events
-                    .send(map_claude_event_with_correlation(
-                        event,
-                        billing_mode,
-                        Some(&steer_correlation),
-                    ))
-                    .await
-                    .is_err()
+                let event = map_claude_event_with_correlation(
+                    event,
+                    billing_mode,
+                    Some(&steer_correlation),
+                );
+                let event = normalize_claude_cost(event, cost_tracker.as_ref());
+                if events.send(event).await.is_err()
                 {
                     if let Some(runner) = runner.take() {
                         runner.abort();
@@ -1110,6 +1121,54 @@ fn map_claude_event_with_correlation(
         },
         claude_agents::ChatStreamEvent::Failed { error } => ChatStreamEvent::Failed { error },
     }
+}
+
+fn normalize_claude_cost(
+    event: ChatStreamEvent,
+    cost_tracker: Option<&ClaudeCostTracker>,
+) -> ChatStreamEvent {
+    let Some(cost_tracker) = cost_tracker else {
+        return event;
+    };
+    let ChatStreamEvent::Done {
+        final_text,
+        usage,
+        session_id,
+        provider_turn_id,
+    } = event
+    else {
+        return event;
+    };
+    let usage = usage.map(|mut usage| {
+        usage.cost_microusd = claude_cost_delta(cost_tracker, usage.cost_microusd);
+        usage
+    });
+    ChatStreamEvent::Done {
+        final_text,
+        usage,
+        session_id,
+        provider_turn_id,
+    }
+}
+
+fn claude_cost_delta(tracker: &ClaudeCostTracker, cumulative: Option<u64>) -> Option<u64> {
+    let Some(cumulative) = cumulative else {
+        return None;
+    };
+    let mut previous = tracker
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let delta = previous
+        .map(|previous| {
+            if cumulative >= previous {
+                cumulative - previous
+            } else {
+                cumulative
+            }
+        })
+        .unwrap_or(cumulative);
+    *previous = Some(cumulative);
+    Some(delta)
 }
 
 fn enrich_claude_lifecycle_payload(
@@ -3750,6 +3809,33 @@ mod tests {
             usage_cost_basis(Some(1_000), ProviderBillingMode::Unknown),
             crate::runtime::CostBasis::ProviderReported
         );
+    }
+
+    #[test]
+    fn pooled_claude_done_event_reports_the_running_total_delta() {
+        let tracker = Arc::new(StdMutex::new(None));
+        let done = |cost_microusd| ChatStreamEvent::Done {
+            final_text: "done".to_string(),
+            usage: Some(ProviderCallUsage {
+                cost_microusd,
+                ..Default::default()
+            }),
+            session_id: None,
+            provider_turn_id: None,
+        };
+        let cost = |event| match normalize_claude_cost(event, Some(&tracker)) {
+            ChatStreamEvent::Done {
+                usage: Some(ProviderCallUsage { cost_microusd, .. }),
+                ..
+            } => cost_microusd,
+            _ => unreachable!("cost normalization must preserve the done event"),
+        };
+
+        assert_eq!(cost(done(Some(100))), Some(100));
+        assert_eq!(cost(done(Some(160))), Some(60));
+        assert_eq!(cost(done(None)), None);
+        assert_eq!(cost(done(Some(220))), Some(60));
+        assert_eq!(cost(done(Some(15))), Some(15));
     }
 
     #[test]
