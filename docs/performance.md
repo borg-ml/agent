@@ -46,6 +46,11 @@ after an explicit context reset with 25,000 obsolete events and a 100-event
 retained suffix. Indexed boundary, legacy-queue, and latest-subagent reads
 reduced recovery p95 from 54.7 ms to 0.76 ms on the same checkout.
 
+The ignored `large_compacted_context_recovery_p95_gate` uses the same shape
+after a completed replay-resetting compaction. Starting cold recovery at the
+last successful turn boundary before the durable summary reduced p95 from
+61.1 ms to 0.73 ms while retaining failed and interrupted prompt tails.
+
 For sampled counters, install `perf` and run the command printed by the
 profile script. `cargo-flamegraph` can be used on the same release test binary
 when available.

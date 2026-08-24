@@ -1254,6 +1254,86 @@ async fn context_clear_resets_provider_projection_and_recovery_prefix() {
 }
 
 #[tokio::test]
+async fn compacted_recovery_keeps_the_unresolved_prompt_tail() {
+    let (_directory, store) = store().await;
+    let session_id = Uuid::new_v4();
+    let summarized_id = Uuid::new_v4();
+    let failed_id = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+    for kind in [
+        SessionEventKind::TurnStarted {
+            message_id: summarized_id,
+            provider: CodingProvider::Codex,
+            model: Some("gpt-test".to_string()),
+            effort: None,
+            fast: false,
+        },
+        message(summarized_id, "summarized old context"),
+        SessionEventKind::TurnCompleted {
+            message_id: summarized_id,
+            provider_session_id: None,
+            final_text: "old result".to_string(),
+            error: None,
+        },
+        SessionEventKind::TurnStarted {
+            message_id: failed_id,
+            provider: CodingProvider::Codex,
+            model: Some("gpt-test".to_string()),
+            effort: None,
+            fast: false,
+        },
+        SessionEventKind::TurnCompleted {
+            message_id: failed_id,
+            provider_session_id: None,
+            final_text: String::new(),
+            error: Some("provider failed".to_string()),
+        },
+        SessionEventKind::Message {
+            message_id: failed_id,
+            actor: EventActor::User,
+            text: "preserve exact failed prompt".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Failed,
+            delivery: Some(PromptDelivery::Queue),
+        },
+        SessionEventKind::ProviderEvent {
+            provider: CodingProvider::Codex,
+            kind: "context_compaction".to_string(),
+            payload: serde_json::json!({
+                "status": "completed",
+                "summary": "summary of the old context",
+            }),
+        },
+        message(Uuid::new_v4(), "new context after compaction"),
+    ] {
+        store
+            .append(SessionEvent::new(session_id, 0, kind))
+            .await
+            .unwrap();
+    }
+
+    let recovery = store.recovery(session_id).await.unwrap();
+    let context_text = recovery
+        .context_events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            SessionEventKind::Message { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(!context_text.contains(&"summarized old context"));
+    assert!(context_text.contains(&"preserve exact failed prompt"));
+    assert!(context_text.contains(&"new context after compaction"));
+    assert!(recovery.context_events.iter().any(|event| matches!(
+        &event.kind,
+        SessionEventKind::ProviderEvent { kind, payload, .. }
+            if kind == "context_compaction"
+                && payload.get("summary").and_then(serde_json::Value::as_str)
+                    == Some("summary of the old context")
+    )));
+}
+
+#[tokio::test]
 async fn only_acknowledged_terminal_turns_remain_provider_resume_checkpoints() {
     let (directory, store) = store().await;
     let session_id = Uuid::new_v4();
@@ -2734,23 +2814,36 @@ async fn large_session_recent_prompt_recall_p95_gate() {
     );
 }
 
-#[tokio::test]
-#[ignore = "explicit cleared-context recovery p95 performance gate"]
-async fn large_cleared_context_recovery_p95_gate() {
-    const OBSOLETE_EVENT_COUNT: u64 = 25_000;
-    const RETAINED_EVENT_COUNT: u64 = 100;
-    const SAMPLES: usize = 20;
+const RECOVERY_PROFILE_OBSOLETE_EVENTS: u64 = 25_000;
+const RECOVERY_PROFILE_RETAINED_EVENTS: u64 = 100;
 
-    let (_directory, store) = store().await;
+async fn recovery_profile_store(
+    boundary_kind: SessionEventKind,
+) -> (tempfile::TempDir, SqliteSessionStore, Uuid) {
+    let (directory, store) = store().await;
     let session_id = Uuid::new_v4();
     store.create_session(session_id).await.unwrap();
     let mut state = SessionState::default();
     let mut transaction = store.pool().begin().await.unwrap();
-    for sequence in 1..=OBSOLETE_EVENT_COUNT {
-        let event = SessionEvent::new(
-            session_id,
-            sequence,
-            SessionEventKind::Message {
+    let completed_message_id = Uuid::new_v4();
+    for sequence in 1..=RECOVERY_PROFILE_OBSOLETE_EVENTS {
+        let kind = match sequence {
+            value if value == RECOVERY_PROFILE_OBSOLETE_EVENTS - 1 => {
+                SessionEventKind::TurnStarted {
+                    message_id: completed_message_id,
+                    provider: CodingProvider::Codex,
+                    model: Some("gpt-profile".to_string()),
+                    effort: None,
+                    fast: false,
+                }
+            }
+            value if value == RECOVERY_PROFILE_OBSOLETE_EVENTS => SessionEventKind::TurnCompleted {
+                message_id: completed_message_id,
+                provider_session_id: None,
+                final_text: String::new(),
+                error: None,
+            },
+            _ => SessionEventKind::Message {
                 message_id: Uuid::new_v4(),
                 actor: EventActor::Assistant,
                 text: format!("obsolete recovery context {sequence}"),
@@ -2758,15 +2851,17 @@ async fn large_cleared_context_recovery_p95_gate() {
                 status: MessageStatus::Complete,
                 delivery: None,
             },
-        );
+        };
+        let event = SessionEvent::new(session_id, sequence, kind);
         state.apply(&event).unwrap();
         insert_performance_profile_event(&mut transaction, &event, &state).await;
     }
-    let clear_sequence = OBSOLETE_EVENT_COUNT + 1;
-    let clear = SessionEvent::new(session_id, clear_sequence, SessionEventKind::ContextCleared);
-    state.apply(&clear).unwrap();
-    insert_performance_profile_event(&mut transaction, &clear, &state).await;
-    for sequence in (clear_sequence + 1)..=(clear_sequence + RETAINED_EVENT_COUNT) {
+    let boundary_sequence = RECOVERY_PROFILE_OBSOLETE_EVENTS + 1;
+    let boundary = SessionEvent::new(session_id, boundary_sequence, boundary_kind);
+    state.apply(&boundary).unwrap();
+    insert_performance_profile_event(&mut transaction, &boundary, &state).await;
+    for sequence in (boundary_sequence + 1)..=(boundary_sequence + RECOVERY_PROFILE_RETAINED_EVENTS)
+    {
         let event = SessionEvent::new(
             session_id,
             sequence,
@@ -2782,7 +2877,7 @@ async fn large_cleared_context_recovery_p95_gate() {
         state.apply(&event).unwrap();
         insert_performance_profile_event(&mut transaction, &event, &state).await;
     }
-    let next_sequence = clear_sequence + RETAINED_EVENT_COUNT + 1;
+    let next_sequence = boundary_sequence + RECOVERY_PROFILE_RETAINED_EVENTS + 1;
     sqlx::query("update sessions set next_sequence=?, state_json=?, updated_at=? where id=?")
         .bind(i64::try_from(next_sequence).unwrap())
         .bind(serde_json::to_string(&state).unwrap())
@@ -2792,6 +2887,15 @@ async fn large_cleared_context_recovery_p95_gate() {
         .await
         .unwrap();
     transaction.commit().await.unwrap();
+    (directory, store, session_id)
+}
+
+#[tokio::test]
+#[ignore = "explicit cleared-context recovery p95 performance gate"]
+async fn large_cleared_context_recovery_p95_gate() {
+    const SAMPLES: usize = 20;
+    let (_directory, store, session_id) =
+        recovery_profile_store(SessionEventKind::ContextCleared).await;
 
     let mut samples = Vec::with_capacity(SAMPLES);
     for _ in 0..SAMPLES {
@@ -2799,7 +2903,7 @@ async fn large_cleared_context_recovery_p95_gate() {
         let recovery = store.recovery(session_id).await.unwrap();
         assert_eq!(
             recovery.context_events.len(),
-            usize::try_from(RETAINED_EVENT_COUNT + 1).unwrap()
+            usize::try_from(RECOVERY_PROFILE_RETAINED_EVENTS + 1).unwrap()
         );
         assert!(matches!(
             recovery.context_events.first().unwrap().kind,
@@ -2813,6 +2917,43 @@ async fn large_cleared_context_recovery_p95_gate() {
     assert!(
         p95 < Duration::from_millis(10),
         "cleared-context recovery p95 exceeded 10 ms: {p95:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "explicit compacted-context recovery p95 performance gate"]
+async fn large_compacted_context_recovery_p95_gate() {
+    const SAMPLES: usize = 20;
+    let (_directory, store, session_id) = recovery_profile_store(SessionEventKind::ProviderEvent {
+        provider: CodingProvider::Codex,
+        kind: "context_compaction".to_string(),
+        payload: serde_json::json!({
+            "status": "completed",
+            "summary": "retained recovery summary",
+        }),
+    })
+    .await;
+
+    let mut samples = Vec::with_capacity(SAMPLES);
+    for _ in 0..SAMPLES {
+        let started = Instant::now();
+        let recovery = store.recovery(session_id).await.unwrap();
+        assert_eq!(
+            recovery.context_events.len(),
+            usize::try_from(RECOVERY_PROFILE_RETAINED_EVENTS + 1).unwrap()
+        );
+        assert!(matches!(
+            recovery.context_events.first().unwrap().kind,
+            SessionEventKind::ProviderEvent { ref kind, .. } if kind == "context_compaction"
+        ));
+        assert!(recovery.queue_events.is_empty());
+        samples.push(started.elapsed());
+    }
+    let p95 = duration_p95(&mut samples);
+    eprintln!("25k-event compacted-context recovery p95: {p95:?}");
+    assert!(
+        p95 < Duration::from_millis(10),
+        "compacted-context recovery p95 exceeded 10 ms: {p95:?}"
     );
 }
 
