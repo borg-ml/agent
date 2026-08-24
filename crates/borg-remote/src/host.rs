@@ -904,17 +904,31 @@ fn workspace_attachment_capabilities() -> crate::WorkspaceAttachmentCapabilities
 }
 
 async fn probe_provider(provider: CodingProvider, managed_kimi: bool) -> ProviderCapability {
-    let version = command_output(provider.executable(), &["--version"])
-        .await
-        .ok()
-        .filter(|value| !value.is_empty());
+    let (version, auth_status) = tokio::join!(
+        async {
+            command_output(provider.executable(), &["--version"])
+                .await
+                .ok()
+                .filter(|value| !value.is_empty())
+        },
+        async {
+            match provider {
+                CodingProvider::Codex | CodingProvider::Claude | CodingProvider::OpenCode => {
+                    provider_auth_status(provider).await.ok()
+                }
+                CodingProvider::Kimi
+                | CodingProvider::OpenRouter
+                | CodingProvider::OpenAiCompatible => None,
+            }
+        }
+    );
     let mut auth_methods = Vec::new();
     let mut detail = Vec::new();
     match provider {
         CodingProvider::Codex => {
-            if provider_auth_status(provider)
-                .await
-                .is_ok_and(|output| codex_auth_status_authenticated(&output))
+            if auth_status
+                .as_deref()
+                .is_some_and(codex_auth_status_authenticated)
             {
                 auth_methods.push(ProviderAuthMethod::Subscription);
                 detail.push("Codex subscription authenticated");
@@ -925,9 +939,9 @@ async fn probe_provider(provider: CodingProvider, managed_kimi: bool) -> Provide
             }
         }
         CodingProvider::Claude => {
-            if provider_auth_status(provider)
-                .await
-                .is_ok_and(|output| claude_auth_status_authenticated(&output))
+            if auth_status
+                .as_deref()
+                .is_some_and(claude_auth_status_authenticated)
             {
                 auth_methods.push(ProviderAuthMethod::Subscription);
                 detail.push("Claude subscription authenticated");
@@ -942,9 +956,9 @@ async fn probe_provider(provider: CodingProvider, managed_kimi: bool) -> Provide
             }
         }
         CodingProvider::OpenCode => {
-            if provider_auth_status(provider)
-                .await
-                .is_ok_and(|output| opencode_auth_status_authenticated(&output))
+            if auth_status
+                .as_deref()
+                .is_some_and(opencode_auth_status_authenticated)
             {
                 auth_methods.push(ProviderAuthMethod::Subscription);
                 detail.push("OpenCode provider credentials available");
