@@ -30,6 +30,8 @@ pub(crate) const SESSION_PAYLOAD_PREVIEW_BYTES: usize = 4 * 1024;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const SQLITE_WRITE_TRANSACTION: &str = "BEGIN IMMEDIATE";
 const MAX_HOST_LAUNCH_METADATA_BYTES: usize = 512 * 1024;
+// Cap fork replay at 255 local events without duplicating SessionState in every row.
+const FORK_PROJECTION_CHECKPOINT_INTERVAL: u64 = 256;
 pub const SESSION_PROJECTION_VERSION: i32 = 3;
 const SESSION_SCHEMA_VERSION: i64 = 5;
 const DISPOSABLE_SCHEMA_ERROR: &str = "Borg session database schema is incompatible";
@@ -42,6 +44,19 @@ pub(crate) const MAX_HISTORY_PAYLOAD_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_HISTORY_QUERY_BYTES: usize = 8 * 1024;
 pub(crate) const MAX_RUNTIME_CHECKPOINT_BYTES: usize = 512 * 1024;
 pub(crate) const HARNESS_CHECKPOINT_PREFIX: &str = "__borg_harness__";
+
+fn historical_projection_json(
+    sequence: u64,
+    inherited_event_count: u64,
+    projection_json: &str,
+) -> &str {
+    let local_sequence = sequence.saturating_sub(inherited_event_count);
+    if local_sequence == 1 || local_sequence.is_multiple_of(FORK_PROJECTION_CHECKPOINT_INTERVAL) {
+        projection_json
+    } else {
+        ""
+    }
+}
 
 /// Version of the durable runtime namespace manifest. The manifest describes
 /// how to reconnect to a trusted runtime; it is not a second semantic-memory
@@ -3319,78 +3334,64 @@ impl SqliteSessionStore {
     ) -> Result<(u64, SessionState)> {
         if parent.parent_session_id.is_none() {
             let cut = i64::try_from(sequence.saturating_sub(1)).unwrap_or(i64::MAX);
-            let inherited_event_count: i64 = sqlx::query_scalar(
-                "select count(*) from session_events \
-                 where session_id = ? and sequence <= ? and fork_inheritable = 1",
+            let row = sqlx::query(
+                "select count(*) as inherited_event_count, max(sequence) as target_sequence \
+                 from session_events where session_id = ? and sequence <= ? \
+                 and fork_inheritable = 1",
             )
             .bind(parent_session_id.to_string())
             .bind(cut)
             .fetch_one(&self.pool)
             .await?;
-            let projection = sqlx::query(
-                "select projection_json, created_at from session_events \
-                 where session_id = ? and sequence <= ? and fork_inheritable = 1 \
-                 order by sequence desc limit 1",
-            )
-            .bind(parent_session_id.to_string())
-            .bind(cut)
-            .fetch_optional(&self.pool)
-            .await?;
-            let mut projection = match projection {
-                Some(row) => {
-                    let mut state: SessionState =
-                        serde_json::from_str(row.try_get("projection_json")?)?;
-                    state.activity_at = Some(
-                        DateTime::parse_from_rfc3339(row.try_get("created_at")?)?
-                            .with_timezone(&Utc),
-                    );
-                    state
-                }
+            let inherited_event_count =
+                u64::try_from(row.try_get::<i64, _>("inherited_event_count")?)
+                    .context("negative inherited event count")?;
+            let target_sequence = row
+                .try_get::<Option<i64>, _>("target_sequence")?
+                .map(u64::try_from)
+                .transpose()
+                .context("negative fork projection sequence")?;
+            let mut projection = match target_sequence {
+                Some(target_sequence) => match self
+                    .local_projection_at(parent_session_id, 0, target_sequence)
+                    .await?
+                {
+                    Some(projection) => projection,
+                    None => SessionState::reduce(
+                        &self
+                            .projected_events(parent_session_id, Some(target_sequence))
+                            .await?,
+                    )?,
+                },
                 None => SessionState::default(),
             };
-            projection.latest_sequence =
-                u64::try_from(inherited_event_count).context("negative inherited event count")?;
+            projection.latest_sequence = inherited_event_count;
             return Ok((projection.latest_sequence, projection));
         }
-        // A compaction checkpoint in a resumed/forked session is normally a
-        // local durable event. Its projection_json is already the exact
-        // SessionState at that boundary, so do not rebuild the entire
-        // inherited transcript just to fork after it. The old recursive path
-        // is retained for checkpoints that fall inside inherited ancestry.
+        // Local checkpoints already include inherited state, so a descendant
+        // fork only needs the bounded local tail. Cuts inside inherited
+        // ancestry retain the recursive lineage path.
         let cut = sequence.saturating_sub(1);
-        if cut > parent.inherited_event_count {
-            let projection = sqlx::query(
-                "select projection_json, created_at from session_events \
+        if cut > parent.inherited_event_count
+            && let Some(mut state) = self
+                .local_projection_at(parent_session_id, parent.inherited_event_count, cut)
+                .await?
+        {
+            let local_inherited: i64 = sqlx::query_scalar(
+                "select count(*) from session_events \
                  where session_id = ? and sequence > ? and sequence <= ? \
-                 order by sequence desc limit 1",
+                 and fork_inheritable = 1",
             )
             .bind(parent_session_id.to_string())
             .bind(i64::try_from(parent.inherited_event_count).unwrap_or(i64::MAX))
             .bind(i64::try_from(cut).unwrap_or(i64::MAX))
-            .fetch_optional(&self.pool)
+            .fetch_one(&self.pool)
             .await?;
-            if let Some(row) = projection {
-                let local_inherited: i64 = sqlx::query_scalar(
-                    "select count(*) from session_events \
-                     where session_id = ? and sequence > ? and sequence <= ? \
-                     and fork_inheritable = 1",
-                )
-                .bind(parent_session_id.to_string())
-                .bind(i64::try_from(parent.inherited_event_count).unwrap_or(i64::MAX))
-                .bind(i64::try_from(cut).unwrap_or(i64::MAX))
-                .fetch_one(&self.pool)
-                .await?;
-                let inherited_event_count = parent
-                    .inherited_event_count
-                    .saturating_add(u64::try_from(local_inherited).unwrap_or(0));
-                let mut state: SessionState =
-                    serde_json::from_str(row.try_get("projection_json")?)?;
-                state.activity_at = Some(
-                    DateTime::parse_from_rfc3339(row.try_get("created_at")?)?.with_timezone(&Utc),
-                );
-                state.latest_sequence = inherited_event_count;
-                return Ok((inherited_event_count, state));
-            }
+            let inherited_event_count = parent
+                .inherited_event_count
+                .saturating_add(u64::try_from(local_inherited).unwrap_or(0));
+            state.latest_sequence = inherited_event_count;
+            return Ok((inherited_event_count, state));
         }
         let events = self
             .projected_events(parent_session_id, sequence.checked_sub(1))
@@ -3400,6 +3401,47 @@ impl SqliteSessionStore {
             .filter(|event| event.kind.is_fork_inheritable())
             .count() as u64;
         Ok((inherited_event_count, SessionState::reduce(&events)?))
+    }
+
+    async fn local_projection_at(
+        &self,
+        session_id: Uuid,
+        local_start_sequence: u64,
+        target_sequence: u64,
+    ) -> Result<Option<SessionState>> {
+        let checkpoint = sqlx::query(
+            "select sequence, projection_json, created_at from session_events \
+             where session_id = ? and sequence > ? and sequence <= ? \
+             and projection_json <> '' order by sequence desc limit 1",
+        )
+        .bind(session_id.to_string())
+        .bind(i64::try_from(local_start_sequence).unwrap_or(i64::MAX))
+        .bind(i64::try_from(target_sequence).unwrap_or(i64::MAX))
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(checkpoint) = checkpoint else {
+            return Ok(None);
+        };
+        let checkpoint_sequence = u64::try_from(checkpoint.try_get::<i64, _>("sequence")?)
+            .context("negative fork projection sequence")?;
+        let mut state: SessionState = serde_json::from_str(checkpoint.try_get("projection_json")?)?;
+        state.activity_at = Some(
+            DateTime::parse_from_rfc3339(checkpoint.try_get("created_at")?)?.with_timezone(&Utc),
+        );
+        let rows = sqlx::query(
+            "select event_json from session_events where session_id = ? \
+             and sequence > ? and sequence <= ? order by sequence",
+        )
+        .bind(session_id.to_string())
+        .bind(i64::try_from(checkpoint_sequence).unwrap_or(i64::MAX))
+        .bind(i64::try_from(target_sequence).unwrap_or(i64::MAX))
+        .fetch_all(&self.pool)
+        .await?;
+        for row in rows {
+            let event: SessionEvent = serde_json::from_str(row.try_get("event_json")?)?;
+            state.apply(&event)?;
+        }
+        Ok(Some(state))
     }
 
     fn contains_message_before<'a>(
@@ -3762,11 +3804,15 @@ impl SqliteSessionStore {
         transaction: &mut Transaction<'_, Sqlite>,
         mut event: SessionEvent,
     ) -> Result<SessionEvent> {
-        let row = sqlx::query("select next_sequence, state_json from sessions where id = ?")
-            .bind(event.session_id.to_string())
-            .fetch_optional(&mut **transaction)
-            .await?
-            .with_context(|| format!("session {} does not exist", event.session_id))?;
+        let row = sqlx::query(
+            "select inherited_event_count, next_sequence, state_json from sessions where id = ?",
+        )
+        .bind(event.session_id.to_string())
+        .fetch_optional(&mut **transaction)
+        .await?
+        .with_context(|| format!("session {} does not exist", event.session_id))?;
+        let inherited_event_count = u64::try_from(row.try_get::<i64, _>("inherited_event_count")?)
+            .context("negative inherited event count")?;
         let next_sequence = u64::try_from(row.try_get::<i64, _>("next_sequence")?)
             .context("negative SQLite session sequence")?;
         if event.sequence == 0 {
@@ -3785,6 +3831,8 @@ impl SqliteSessionStore {
         let compact_event = self.compact_payloads(transaction, &event).await?;
         let event_json = serde_json::to_string(&compact_event)?;
         let projection_json = serde_json::to_string(&state)?;
+        let historical_projection =
+            historical_projection_json(event.sequence, inherited_event_count, &projection_json);
         let message_id = match &event.kind {
             SessionEventKind::Message { message_id, .. } => Some(message_id.to_string()),
             _ => None,
@@ -3800,7 +3848,7 @@ impl SqliteSessionStore {
         .bind(event.id.to_string())
         .bind(&stored_event_kind)
         .bind(event_json)
-        .bind(&projection_json)
+        .bind(historical_projection)
         .bind(i64::from(event.kind.is_fork_inheritable()))
         .bind(i64::from(event.kind.is_recovery_relevant()))
         .bind(message_id)

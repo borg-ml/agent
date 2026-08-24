@@ -59,6 +59,14 @@ after a completed replay-resetting compaction. Starting cold recovery at the
 last successful turn boundary before the durable summary reduced p95 from
 61.1 ms to 0.73 ms while retaining failed and interrupted prompt tails.
 
+A 1.45-million-event live store exposed 14.0 GB of repeated `SessionState`
+snapshots inside a 28 GB database. Fork projections are now checkpointed once
+per 256 local events and rebuild at most the 255-event tail. The synthetic
+large-state fixture retained 132.8 KB instead of a 36.0 MB dense lower bound,
+over 271× less, while the 38,272-event lineage profile kept fork p95 at 2.28 ms
+and indexed tail p95 at 0.19 ms. Existing dense rows remain valid checkpoints,
+so the change needs no blocking startup migration.
+
 The ignored `provider_capability_probe_cache_profile` measures provider
 discovery inside a persistent Borg process. A cold probe that starts the Codex,
 Claude, and OpenCode version/auth commands took 539.1 ms; a repeated ACP or

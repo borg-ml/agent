@@ -1537,6 +1537,76 @@ async fn fork_records_lineage_without_copying_events() {
 }
 
 #[tokio::test]
+async fn fork_projection_checkpoints_bound_state_amplification() {
+    const LARGE_RESPONSE_BYTES: usize = 128 * 1024;
+    const EVENT_COUNT: u64 = FORK_PROJECTION_CHECKPOINT_INTERVAL + 23;
+
+    let (directory, store) = store().await;
+    let parent_id = Uuid::new_v4();
+    let fork_id = Uuid::new_v4();
+    let goal = SessionGoal::new("retained sparse projection goal".to_string(), None);
+    let response = "r".repeat(LARGE_RESPONSE_BYTES);
+    store.create_session(parent_id).await.unwrap();
+    let mut transaction = store.begin_write().await.unwrap();
+    for sequence in 1..=EVENT_COUNT {
+        let kind = match sequence {
+            1 => SessionEventKind::SessionStarted,
+            2 => configured(directory.path()),
+            3 => message(Uuid::new_v4(), "retained prompt"),
+            4 => SessionEventKind::Message {
+                message_id: Uuid::new_v4(),
+                actor: EventActor::Assistant,
+                text: response.clone(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            },
+            value if value == FORK_PROJECTION_CHECKPOINT_INTERVAL + 7 => {
+                SessionEventKind::GoalUpdated { goal: goal.clone() }
+            }
+            _ => SessionEventKind::Error {
+                message: format!("sparse projection fixture {sequence}"),
+            },
+        };
+        store
+            .append_durable_in_transaction(&mut transaction, SessionEvent::new(parent_id, 0, kind))
+            .await
+            .unwrap();
+    }
+    transaction.commit().await.unwrap();
+
+    let (checkpoint_count, checkpoint_bytes): (i64, i64) = sqlx::query_as(
+        "select count(*), coalesce(sum(length(projection_json)), 0) \
+         from session_events where session_id = ? and projection_json <> ''",
+    )
+    .bind(parent_id.to_string())
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    assert_eq!(checkpoint_count, 2);
+    assert!(
+        checkpoint_bytes < i64::try_from(LARGE_RESPONSE_BYTES * 3).unwrap(),
+        "sparse fork projections retained {checkpoint_bytes} bytes"
+    );
+    let dense_projection_lower_bound =
+        i64::try_from((EVENT_COUNT - 4) * u64::try_from(LARGE_RESPONSE_BYTES).unwrap()).unwrap();
+    assert!(dense_projection_lower_bound > checkpoint_bytes * 100);
+    eprintln!(
+        "fork projection fixture: dense_lower_bound={dense_projection_lower_bound} bytes; sparse={checkpoint_bytes} bytes"
+    );
+
+    let fork = store
+        .fork_before(parent_id, fork_id, EVENT_COUNT + 1)
+        .await
+        .unwrap();
+    assert_eq!(fork.inherited_event_count, EVENT_COUNT);
+    let state = store.state(fork_id).await.unwrap();
+    assert_eq!(state.latest_sequence, EVENT_COUNT);
+    assert_eq!(state.latest_response.as_deref(), Some(response.as_str()));
+    assert_eq!(state.goal, Some(goal));
+}
+
+#[tokio::test]
 async fn fork_starts_a_fresh_provider_context_without_losing_capacity() {
     let (directory, store) = store().await;
     let parent_id = Uuid::new_v4();
@@ -2695,6 +2765,7 @@ async fn large_session_lineage_and_tail_p95_gates() {
         };
         let event = SessionEvent::new(parent_id, sequence, kind);
         state.apply(&event).unwrap();
+        let projection_json = serde_json::to_string(&state).unwrap();
         sqlx::query(
             "insert into session_events \
                  (session_id, sequence, event_id, event_kind, event_json, projection_json, \
@@ -2706,7 +2777,7 @@ async fn large_session_lineage_and_tail_p95_gates() {
         .bind(event.id.to_string())
         .bind(event_kind(&event.kind).unwrap())
         .bind(serde_json::to_string(&event).unwrap())
-        .bind(serde_json::to_string(&state).unwrap())
+        .bind(historical_projection_json(sequence, 0, &projection_json))
         .bind(i64::from(event.kind.is_fork_inheritable()))
         .bind(i64::from(event.kind.is_recovery_relevant()))
         .bind(event.created_at.to_rfc3339())
@@ -2966,6 +3037,7 @@ async fn insert_performance_profile_event(
         SessionEventKind::Message { message_id, .. } => Some(message_id.to_string()),
         _ => None,
     };
+    let projection_json = serde_json::to_string(state).unwrap();
     sqlx::query(
         "insert into session_events \
          (session_id, sequence, event_id, event_kind, event_json, projection_json, \
@@ -2977,7 +3049,11 @@ async fn insert_performance_profile_event(
     .bind(event.id.to_string())
     .bind(event_kind(&event.kind).unwrap())
     .bind(serde_json::to_string(event).unwrap())
-    .bind(serde_json::to_string(state).unwrap())
+    .bind(historical_projection_json(
+        event.sequence,
+        0,
+        &projection_json,
+    ))
     .bind(i64::from(event.kind.is_fork_inheritable()))
     .bind(message_id)
     .bind(event.created_at.to_rfc3339())
@@ -3010,6 +3086,7 @@ async fn large_session_history_query_p95_gate() {
         state.apply(&event).unwrap();
         let event_json = serde_json::to_string(&event).unwrap();
         let stored_kind = event_kind(&event.kind).unwrap();
+        let projection_json = serde_json::to_string(&state).unwrap();
         sqlx::query(
             "insert into session_events \
              (session_id, sequence, event_id, event_kind, event_json, projection_json, \
@@ -3021,7 +3098,7 @@ async fn large_session_history_query_p95_gate() {
         .bind(event.id.to_string())
         .bind(&stored_kind)
         .bind(&event_json)
-        .bind(serde_json::to_string(&state).unwrap())
+        .bind(historical_projection_json(sequence, 0, &projection_json))
         .bind(i64::from(event.kind.is_fork_inheritable()))
         .bind(i64::from(event.kind.is_recovery_relevant()))
         .bind(event.created_at.to_rfc3339())
