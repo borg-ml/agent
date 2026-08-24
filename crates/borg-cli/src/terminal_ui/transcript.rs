@@ -2080,13 +2080,7 @@ impl Transcript {
         hovered_entry: Option<usize>,
     ) -> TranscriptRender {
         let today = Local::now().date_naive();
-        {
-            let mut cache = self.message_markdown_cache.borrow_mut();
-            if cache.width != width {
-                cache.width = width;
-                cache.messages.clear();
-            }
-        }
+        self.prepare_message_markdown_cache(width);
         {
             let mut cache = self.tool_body_cache.borrow_mut();
             if cache.width != width {
@@ -2995,6 +2989,98 @@ impl Transcript {
             link_rows,
             selection_rows,
         )
+    }
+
+    fn prepare_message_markdown_cache(&self, width: usize) {
+        {
+            let mut cache = self.message_markdown_cache.borrow_mut();
+            if cache.width == width {
+                return;
+            }
+            cache.width = width;
+            cache.messages.clear();
+        }
+
+        let message_count = self
+            .order
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry,
+                    TranscriptEntry::Message { status, .. }
+                        if *status != MessageStatus::Queued
+                )
+            })
+            .count();
+        if message_count < PARALLEL_MARKDOWN_RENDER_MIN_MESSAGES {
+            return;
+        }
+
+        let worker_count = thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1)
+            .min(MAX_PARALLEL_MARKDOWN_RENDER_WORKERS)
+            .min(message_count.div_ceil(128));
+        if worker_count < 2 {
+            return;
+        }
+
+        let chunk_size = self.order.len().div_ceil(worker_count);
+        let content_width = width.saturating_sub(MESSAGE_HORIZONTAL_PADDING * 2);
+        let user_message_color = self.user_message_color;
+        let assistant_message_color = self.assistant_message_color;
+        let messages = thread::scope(|scope| {
+            let handles = self
+                .order
+                .chunks(chunk_size)
+                .enumerate()
+                .map(|(chunk_index, entries)| {
+                    scope.spawn(move || {
+                        entries
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(entry_index, entry)| {
+                                let TranscriptEntry::Message {
+                                    actor,
+                                    text,
+                                    status,
+                                    ..
+                                } = entry
+                                else {
+                                    return None;
+                                };
+                                if *status == MessageStatus::Queued {
+                                    return None;
+                                }
+                                let text_color = match actor {
+                                    EventActor::User => Some(user_message_color),
+                                    EventActor::Assistant => Some(assistant_message_color),
+                                    _ => None,
+                                };
+                                let lines = markdown_lines(text, content_width, text_color);
+                                let links = markdown_link_ranges(text, &lines);
+                                Some((
+                                    chunk_index * chunk_size + entry_index,
+                                    MarkdownRender { lines, links },
+                                ))
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            handles
+                .into_iter()
+                .flat_map(|handle| handle.join().expect("Markdown renderer panicked"))
+                .collect::<HashMap<_, _>>()
+        });
+
+        let mut cache = self.message_markdown_cache.borrow_mut();
+        #[cfg(test)]
+        {
+            cache.misses += messages.len();
+        }
+        cache.messages = messages;
     }
 
     fn tool_run_windows(&self) -> Vec<Option<ToolRunWindow>> {

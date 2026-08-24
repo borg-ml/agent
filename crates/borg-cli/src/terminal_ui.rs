@@ -78,6 +78,8 @@ const USER_TEXT: Color = Color::Rgb(198, 228, 255);
 const MESSAGE_BG: Color = Color::Rgb(33, 25, 29);
 const MESSAGE_HOVER_BG: Color = Color::Rgb(48, 36, 41);
 const MESSAGE_HORIZONTAL_PADDING: usize = 2;
+const PARALLEL_MARKDOWN_RENDER_MIN_MESSAGES: usize = 512;
+const MAX_PARALLEL_MARKDOWN_RENDER_WORKERS: usize = 16;
 const COMMAND_PANEL_BG: Color = Color::Rgb(31, 24, 27);
 /// Divider between status-line segments. It is its own span so a hovered
 /// segment underlines its own text only.
