@@ -2338,8 +2338,16 @@ impl BorgTerminal {
                 || (!suppress_root_subagent_activity
                     && session_event_changes_transcript(&event.kind));
             let removed_entry = if suppress_root_subagent_activity {
-                if let SessionEventKind::SubagentActivity { agent, .. } = &event.kind {
-                    transcript.upsert_subagent_snapshot(agent);
+                if let SessionEventKind::SubagentActivity {
+                    activity,
+                    agent,
+                    event: child_event,
+                } = &event.kind
+                {
+                    transcript.upsert_subagent_snapshot_with_status(
+                        agent,
+                        effective_subagent_status(*activity, agent.status, child_event.as_deref()),
+                    );
                 }
                 None
             } else if replaying_history {
@@ -2372,15 +2380,19 @@ impl BorgTerminal {
 
     fn record_child_event(&mut self, event: &SessionEvent) -> bool {
         let SessionEventKind::SubagentActivity {
+            activity,
             agent,
             event: child_event,
-            ..
         } = &event.kind
         else {
             return false;
         };
         let child_id = agent.session_id;
-        let status = subagent_session_status(agent.status);
+        let status = subagent_session_status(effective_subagent_status(
+            *activity,
+            agent.status,
+            child_event.as_deref(),
+        ));
         self.child_statuses.insert(child_id, status);
         track_child_activity(
             &mut self.child_active_since,
@@ -6998,6 +7010,36 @@ fn subagent_session_status(status: SubagentStatus) -> SessionStatus {
         SubagentStatus::Stopped => SessionStatus::Stopped,
         SubagentStatus::Failed => SessionStatus::Failed,
     }
+}
+
+fn effective_subagent_status(
+    activity: SubagentActivityKind,
+    snapshot_status: SubagentStatus,
+    child_event: Option<&SessionEvent>,
+) -> SubagentStatus {
+    match activity {
+        SubagentActivityKind::Completed => SubagentStatus::Ready,
+        SubagentActivityKind::Stopped => SubagentStatus::Stopped,
+        SubagentActivityKind::Failed => SubagentStatus::Failed,
+        SubagentActivityKind::Updated => child_event
+            .and_then(|event| subagent_status_from_child_event(&event.kind))
+            .unwrap_or(snapshot_status),
+        SubagentActivityKind::Started => snapshot_status,
+    }
+}
+
+fn subagent_status_from_child_event(kind: &SessionEventKind) -> Option<SubagentStatus> {
+    let SessionEventKind::StatusChanged { status, .. } = kind else {
+        return None;
+    };
+    Some(match status {
+        SessionStatus::Starting => SubagentStatus::Starting,
+        SessionStatus::Running => SubagentStatus::Running,
+        SessionStatus::Ready | SessionStatus::Completed => SubagentStatus::Ready,
+        SessionStatus::WaitingForApproval => SubagentStatus::WaitingForApproval,
+        SessionStatus::Stopped => SubagentStatus::Stopped,
+        SessionStatus::Failed => SubagentStatus::Failed,
+    })
 }
 
 fn focused_child_interrupt_target(

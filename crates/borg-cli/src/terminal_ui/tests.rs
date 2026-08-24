@@ -4099,11 +4099,19 @@ fn subagent_activity_collapses_chatter_and_keeps_terminal_result() {
         } if label == "Agent"
             && detail == "inspect_ui · needs approval · Run focused tests?"
     ));
-    agent.status = SubagentStatus::Stopped;
+    // A terminal activity can carry the last live snapshot from before the
+    // child published its completion boundary.
+    agent.status = SubagentStatus::Running;
     agent.final_text = Some("Found the renderer issue.\nExtra detail".to_string());
     transcript.apply(&activity(5, SubagentActivityKind::Completed, &agent, None));
 
     assert_eq!(transcript.order.len(), 1);
+    assert_eq!(transcript.active_subagent_count(), 0);
+    assert_eq!(transcript.subagents[&child_id], SubagentStatus::Ready);
+    assert_eq!(
+        transcript.subagent_snapshots[&child_id].status,
+        SubagentStatus::Ready
+    );
     assert!(matches!(
         &transcript.order[0],
         TranscriptEntry::Action {

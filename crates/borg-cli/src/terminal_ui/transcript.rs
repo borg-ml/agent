@@ -265,9 +265,18 @@ fn transcript_entry_is_turn_output(entry: &TranscriptEntry) -> bool {
 
 impl Transcript {
     fn upsert_subagent_snapshot(&mut self, agent: &SubagentSnapshot) {
-        self.subagents.insert(agent.session_id, agent.status);
-        self.subagent_snapshots
-            .insert(agent.session_id, agent.clone());
+        self.upsert_subagent_snapshot_with_status(agent, agent.status);
+    }
+
+    fn upsert_subagent_snapshot_with_status(
+        &mut self,
+        agent: &SubagentSnapshot,
+        status: SubagentStatus,
+    ) {
+        self.subagents.insert(agent.session_id, status);
+        let mut snapshot = agent.clone();
+        snapshot.status = status;
+        self.subagent_snapshots.insert(agent.session_id, snapshot);
     }
 
     fn project_optimistic_message(&mut self, event: &SessionEvent) {
@@ -1383,9 +1392,12 @@ impl Transcript {
                 agent,
                 event: child_event,
             } => {
-                self.subagents.insert(agent.session_id, agent.status);
-                self.subagent_snapshots
-                    .insert(agent.session_id, agent.clone());
+                let status = effective_subagent_status(
+                    *activity,
+                    agent.status,
+                    child_event.as_deref(),
+                );
+                self.upsert_subagent_snapshot_with_status(agent, status);
                 if let Some((label, detail, body, state)) =
                     subagent_action_projection(*activity, agent, child_event.as_deref())
                 {
