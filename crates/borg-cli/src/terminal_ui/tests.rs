@@ -773,6 +773,7 @@ fn hover_redraw_gate_ignores_motion_inside_one_target() {
         hovered_message: None,
         hovered_picker_option: None,
         hovered_team_roster: None,
+        hovered_link: None,
         status_hovered: false,
         goal_status_hovered: false,
         todo_status_hovered: false,
@@ -790,11 +791,41 @@ fn hover_redraw_gate_ignores_motion_inside_one_target() {
     };
     let running = HoverState {
         status_hovered: true,
-        ..idle
+        ..idle.clone()
+    };
+    let hovered_link = HoverState {
+        hovered_link: Some("https://example.com".to_owned()),
+        ..idle.clone()
     };
 
-    assert!(!hover_state_changed(idle, idle));
+    assert!(!hover_state_changed(idle.clone(), idle.clone()));
+    assert!(hover_state_changed(idle.clone(), hovered_link));
     assert!(hover_state_changed(idle, running));
+}
+
+#[test]
+fn hovered_message_links_gain_a_bold_light_blue_style() {
+    let mut line = Line::from(vec![
+        Span::raw("before "),
+        Span::styled(
+            "link",
+            Style::default()
+                .fg(Color::LightBlue)
+                .add_modifier(Modifier::UNDERLINED),
+        ),
+        Span::raw(" after"),
+    ]);
+
+    apply_link_hover(&mut line, 7, 11);
+
+    assert_eq!(line.to_string(), "before link after");
+    assert!(line.spans[7..11].iter().all(|span| {
+        span.style.fg == Some(Color::LightBlue)
+            && span.style.add_modifier.contains(Modifier::BOLD)
+            && span.style.add_modifier.contains(Modifier::UNDERLINED)
+    }));
+    assert!(!line.spans[0].style.add_modifier.contains(Modifier::BOLD));
+    assert_eq!(line.spans[11].content, " ");
 }
 
 #[test]

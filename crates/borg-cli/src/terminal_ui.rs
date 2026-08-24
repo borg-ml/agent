@@ -796,7 +796,7 @@ pub struct BorgTerminal {
     terminal_restored: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct HoverState {
     hovered_tool: Option<usize>,
     hovered_tool_run_header: Option<usize>,
@@ -804,6 +804,7 @@ struct HoverState {
     hovered_message: Option<usize>,
     hovered_picker_option: Option<usize>,
     hovered_team_roster: Option<usize>,
+    hovered_link: Option<String>,
     status_hovered: bool,
     goal_status_hovered: bool,
     todo_status_hovered: bool,
@@ -832,6 +833,7 @@ impl BorgTerminal {
             hovered_message: self.hovered_message,
             hovered_picker_option: self.hovered_picker_option,
             hovered_team_roster: self.hovered_team_roster,
+            hovered_link: self.hovered_link.clone(),
             status_hovered: self.status_hovered,
             goal_status_hovered: self.goal_status_hovered,
             todo_status_hovered: self.todo_status_hovered,
@@ -5077,6 +5079,15 @@ impl BorgTerminal {
                         *index,
                     ));
                 }
+                for link in link_rows.iter().filter(|link| {
+                    self.hovered_link.as_deref() == Some(link.url.as_str())
+                        && link.row >= scroll_start
+                        && link.row < visible_end
+                }) {
+                    if let Some(line) = visible_transcript.get_mut(link.row - scroll_start) {
+                        apply_link_hover(line, link.start, link.end);
+                    }
+                }
                 if let Some(selection) = self
                     .text_selection
                     .as_mut()
@@ -8772,6 +8783,25 @@ fn apply_line_background(line: &mut Line<'static>, width: usize, background: Col
         " ".repeat(fill),
         Style::default().bg(background),
     ));
+}
+
+fn apply_link_hover(line: &mut Line<'static>, start: usize, end: usize) {
+    let mut column = 0usize;
+    let mut spans = Vec::new();
+    for span in &line.spans {
+        for grapheme in span.content.graphemes(true) {
+            let grapheme_width = grapheme.width();
+            let hovered = column < end && column.saturating_add(grapheme_width) > start;
+            let style = if hovered {
+                span.style.fg(Color::LightBlue).add_modifier(Modifier::BOLD)
+            } else {
+                span.style
+            };
+            spans.push(Span::styled(grapheme.to_string(), style));
+            column = column.saturating_add(grapheme_width);
+        }
+    }
+    line.spans = spans;
 }
 
 fn apply_text_selection(
