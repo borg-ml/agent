@@ -7,10 +7,12 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
-use tokio::time::{Duration, timeout};
+use tokio::time::{Duration, Instant, timeout};
 use url::Url;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const LSP_IDLE_TIMEOUT: Duration = Duration::from_secs(2 * 60);
+const LSP_REAPER_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_LSP_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_WORKSPACE_DIAGNOSTIC_FILES: usize = 4096;
 
@@ -88,6 +90,7 @@ struct LspClient {
     next_id: u64,
     opened_versions: HashMap<PathBuf, i32>,
     published_diagnostics: HashMap<String, Value>,
+    last_used: Instant,
 }
 
 impl LspService {
@@ -96,10 +99,12 @@ impl LspService {
     }
 
     pub(crate) fn with_path_policy(root: impl Into<PathBuf>, path_policy: LspPathPolicy) -> Self {
+        let clients = std::sync::Arc::new(Mutex::new(HashMap::new()));
+        spawn_idle_reaper(&clients);
         Self {
             root: root.into(),
             path_policy,
-            clients: std::sync::Arc::new(Mutex::new(HashMap::new())),
+            clients,
         }
     }
 
@@ -347,29 +352,29 @@ impl LspClient {
             next_id: 1,
             opened_versions: HashMap::new(),
             published_diagnostics: HashMap::new(),
+            last_used: Instant::now(),
         };
         let root_uri = Url::from_directory_path(root)
             .map_err(|_| anyhow::anyhow!("cannot convert workspace root to URI"))?
             .to_string();
-        client
-            .request(
-                "initialize",
-                json!({
-                    "processId": std::process::id(),
-                    "rootUri": root_uri,
-                    "capabilities": {
-                        "textDocument": {
-                            "hover": { "contentFormat": ["markdown", "plaintext"] },
-                            "definition": { "linkSupport": true },
-                            "documentSymbol": { "hierarchicalDocumentSymbolSupport": true },
-                            "diagnostic": {}
-                        },
-                        "workspace": { "symbol": { "resolveSupport": { "properties": [] } } }
-                    },
-                    "clientInfo": { "name": "borg", "version": env!("CARGO_PKG_VERSION") }
-                }),
-            )
-            .await?;
+        let mut initialize = json!({
+            "processId": std::process::id(),
+            "rootUri": root_uri,
+            "capabilities": {
+                "textDocument": {
+                    "hover": { "contentFormat": ["markdown", "plaintext"] },
+                    "definition": { "linkSupport": true },
+                    "documentSymbol": { "hierarchicalDocumentSymbolSupport": true },
+                    "diagnostic": {}
+                },
+                "workspace": { "symbol": { "resolveSupport": { "properties": [] } } }
+            },
+            "clientInfo": { "name": "borg", "version": env!("CARGO_PKG_VERSION") }
+        });
+        if let Some(options) = server_initialization_options(spec) {
+            initialize["initializationOptions"] = options;
+        }
+        client.request("initialize", initialize).await?;
         client.notify("initialized", json!({})).await?;
         Ok(client)
     }
@@ -598,7 +603,46 @@ async fn ensure_client<'a>(
     if !clients.contains_key(&key) {
         clients.insert(key.clone(), LspClient::start(spec, root).await?);
     }
-    Ok(clients.get_mut(&key).expect("inserted LSP client"))
+    let client = clients.get_mut(&key).expect("inserted LSP client");
+    client.last_used = Instant::now();
+    Ok(client)
+}
+
+fn spawn_idle_reaper(clients: &std::sync::Arc<Mutex<HashMap<LspClientKey, LspClient>>>) {
+    let clients = std::sync::Arc::downgrade(clients);
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    runtime.spawn(async move {
+        let mut interval = tokio::time::interval(LSP_REAPER_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let Some(clients) = clients.upgrade() else {
+                return;
+            };
+            clients
+                .lock()
+                .await
+                .retain(|_, client| !lsp_client_is_expired(client.last_used.elapsed()));
+        }
+    });
+}
+
+fn lsp_client_is_expired(idle_for: Duration) -> bool {
+    idle_for >= LSP_IDLE_TIMEOUT
+}
+
+fn server_initialization_options(spec: &ServerSpec) -> Option<Value> {
+    (spec.id == "rust-analyzer").then(|| {
+        json!({
+            "cachePriming": { "enable": false },
+            "cargo": { "allTargets": false },
+            "checkOnSave": false,
+            "check": { "allTargets": false }
+        })
+    })
 }
 
 fn workspace_label(key: &LspClientKey, server_count: usize) -> String {
@@ -945,6 +989,25 @@ mod tests {
         ] {
             assert!(languages.contains(&language), "missing {language}");
         }
+    }
+
+    #[test]
+    fn inactive_language_servers_expire_at_the_idle_boundary() {
+        assert!(!lsp_client_is_expired(
+            LSP_IDLE_TIMEOUT - Duration::from_millis(1)
+        ));
+        assert!(lsp_client_is_expired(LSP_IDLE_TIMEOUT));
+    }
+
+    #[test]
+    fn rust_analyzer_avoids_eager_workspace_builds() {
+        let spec = spec_for_id("rust-analyzer").expect("rust-analyzer spec");
+        let options = server_initialization_options(spec).expect("rust-analyzer options");
+
+        assert_eq!(options.pointer("/cachePriming/enable"), Some(&json!(false)));
+        assert_eq!(options.pointer("/cargo/allTargets"), Some(&json!(false)));
+        assert_eq!(options.get("checkOnSave"), Some(&json!(false)));
+        assert_eq!(options.pointer("/check/allTargets"), Some(&json!(false)));
     }
 
     #[tokio::test]

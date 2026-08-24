@@ -54,6 +54,7 @@ const MAX_TUI_FPS: u64 = 240;
 const ACTIVITY_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(120);
 const IDLE_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 const MAX_RENDER_BACKOFF_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+const EXTENSION_DISCOVERY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 /// Keep first paint bounded while retaining enough context to include a real
 /// recent exchange instead of an empty shell made only of projection events.
 const RICH_TUI_HISTORY_EVENT_LIMIT: usize = 128;
@@ -1771,7 +1772,7 @@ async fn run_local_agent_session(
     cache_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut agent_config_tick = tokio::time::interval(std::time::Duration::from_millis(500));
     agent_config_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut blu_tick = tokio::time::interval(std::time::Duration::from_millis(500));
+    let mut blu_tick = tokio::time::interval(EXTENSION_DISCOVERY_INTERVAL);
     blu_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut update_tick = tokio::time::interval(std::time::Duration::from_secs(1));
     update_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
