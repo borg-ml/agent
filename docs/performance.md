@@ -59,6 +59,13 @@ after a completed replay-resetting compaction. Starting cold recovery at the
 last successful turn boundary before the durable summary reduced p95 from
 61.1 ms to 0.73 ms while retaining failed and interrupted prompt tails.
 
+The ignored `provider_capability_probe_cache_profile` measures provider
+discovery inside a persistent Borg process. A cold probe that starts the Codex,
+Claude, and OpenCode version/auth commands took 539.1 ms; a repeated ACP or
+remote-session probe returned the same host-local snapshot in 1.5 µs. The
+five-second cache also single-flights concurrent callers, while its bounded
+freshness keeps provider login changes short-lived.
+
 For sampled counters, install `perf` and run the command printed by the
 profile script. `cargo-flamegraph` can be used on the same release test binary
 when available.

@@ -4,8 +4,8 @@ use std::io::Write;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
@@ -59,6 +59,11 @@ pub struct HostConfig {
 /// isolated-host allowlist and the service manager's sandbox are the authority.
 const SYSTEMD_ISOLATION_ATTESTATION: &str = "systemd-user-sandbox-v1";
 const ISOLATION_ATTESTATION_ENV: &str = "BORG_HOST_ISOLATION_ATTESTATION";
+const PROVIDER_CAPABILITIES_CACHE_TTL: Duration = Duration::from_secs(5);
+
+type ProviderCapabilitiesCache = HashMap<bool, (Instant, Vec<ProviderCapability>)>;
+
+static PROVIDER_CAPABILITIES_CACHE: OnceLock<Mutex<ProviderCapabilitiesCache>> = OnceLock::new();
 
 impl HostConfig {
     fn validate(&self) -> Result<()> {
@@ -883,6 +888,20 @@ pub async fn probe_provider_capabilities() -> Vec<ProviderCapability> {
 async fn probe_provider_capabilities_with_managed_kimi(
     managed_kimi: bool,
 ) -> Vec<ProviderCapability> {
+    let cache = PROVIDER_CAPABILITIES_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache.lock().await;
+    if let Some((probed_at, providers)) = cache.get(&managed_kimi)
+        && probed_at.elapsed() < PROVIDER_CAPABILITIES_CACHE_TTL
+    {
+        return providers.clone();
+    }
+
+    let providers = probe_provider_capabilities_uncached(managed_kimi).await;
+    cache.insert(managed_kimi, (Instant::now(), providers.clone()));
+    providers
+}
+
+async fn probe_provider_capabilities_uncached(managed_kimi: bool) -> Vec<ProviderCapability> {
     let (codex, claude, opencode, kimi, openrouter, compatible) = tokio::join!(
         probe_provider(CodingProvider::Codex, managed_kimi),
         probe_provider(CodingProvider::Claude, managed_kimi),
@@ -1182,6 +1201,9 @@ pub async fn login_provider(provider: CodingProvider) -> Result<()> {
         "{} login completed but no authenticated session is available",
         provider.executable()
     );
+    if let Some(cache) = PROVIDER_CAPABILITIES_CACHE.get() {
+        cache.lock().await.clear();
+    }
     Ok(())
 }
 
@@ -4361,6 +4383,24 @@ mod tests {
         assert!(!opencode_auth_status_authenticated(
             "Provider                 Status"
         ));
+    }
+
+    #[tokio::test]
+    #[ignore = "explicit provider capability probe cache profile"]
+    async fn provider_capability_probe_cache_profile() {
+        let cold_started = Instant::now();
+        let cold = probe_provider_capabilities_with_managed_kimi(false).await;
+        let cold_elapsed = cold_started.elapsed();
+        let warm_started = Instant::now();
+        let warm = probe_provider_capabilities_with_managed_kimi(false).await;
+        let warm_elapsed = warm_started.elapsed();
+
+        assert_eq!(warm, cold);
+        eprintln!("provider capability probe: cold={cold_elapsed:?}; warm={warm_elapsed:?}");
+        assert!(
+            warm_elapsed < Duration::from_millis(10),
+            "cached provider capability probe exceeded 10 ms: {warm_elapsed:?}"
+        );
     }
 
     #[test]
