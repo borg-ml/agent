@@ -2240,7 +2240,7 @@ impl Transcript {
                     ..
                 }
             ) {
-                existing_tool_separator.unwrap_or_else(|| lines.len())
+                existing_tool_separator.unwrap_or(lines.len())
             } else {
                 lines.len()
             };

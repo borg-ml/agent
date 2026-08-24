@@ -261,6 +261,66 @@ fn print_human_inspection(inspection: &LiveSessionInspection) {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn process_is_alive(metadata: &OwnerMetadata) -> bool {
+    if !process_signal_is_alive(metadata.pid) {
+        return false;
+    }
+    let executable = PathBuf::from("/proc")
+        .join(metadata.pid.to_string())
+        .join("exe");
+    let Ok(file_metadata) = fs::metadata(executable) else {
+        return false;
+    };
+    if executable_identity(&file_metadata) != metadata.executable_identity {
+        return false;
+    }
+    metadata
+        .process_start_time
+        .is_none_or(|expected| process_start_time(metadata.pid) == Some(expected))
+}
+
+#[cfg(unix)]
+fn process_signal_is_alive(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    let result = unsafe { libc::kill(pid, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(target_os = "linux")]
+fn executable_identity(metadata: &fs::Metadata) -> String {
+    use std::os::unix::fs::MetadataExt;
+
+    format!(
+        "{}:{}:{}:{}:{}",
+        metadata.dev(),
+        metadata.ino(),
+        metadata.len(),
+        metadata.mtime(),
+        metadata.mtime_nsec()
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn process_start_time(pid: u32) -> Option<u64> {
+    let contents =
+        fs::read_to_string(PathBuf::from("/proc").join(pid.to_string()).join("stat")).ok()?;
+    let (_, fields) = contents.rsplit_once(") ")?;
+    fields.split_whitespace().nth(19)?.parse().ok()
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn process_is_alive(metadata: &OwnerMetadata) -> bool {
+    process_signal_is_alive(metadata.pid)
+}
+
+#[cfg(not(unix))]
+fn process_is_alive(_metadata: &OwnerMetadata) -> bool {
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -320,64 +380,4 @@ mod tests {
         assert_eq!(hotspots[1].phase, "model_output");
         assert_eq!(hotspots[2].phase, "tool_execution");
     }
-}
-
-#[cfg(target_os = "linux")]
-fn process_is_alive(metadata: &OwnerMetadata) -> bool {
-    if !process_signal_is_alive(metadata.pid) {
-        return false;
-    }
-    let executable = PathBuf::from("/proc")
-        .join(metadata.pid.to_string())
-        .join("exe");
-    let Ok(file_metadata) = fs::metadata(executable) else {
-        return false;
-    };
-    if executable_identity(&file_metadata) != metadata.executable_identity {
-        return false;
-    }
-    metadata
-        .process_start_time
-        .is_none_or(|expected| process_start_time(metadata.pid) == Some(expected))
-}
-
-#[cfg(unix)]
-fn process_signal_is_alive(pid: u32) -> bool {
-    let Ok(pid) = i32::try_from(pid) else {
-        return false;
-    };
-    let result = unsafe { libc::kill(pid, 0) };
-    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
-#[cfg(target_os = "linux")]
-fn executable_identity(metadata: &fs::Metadata) -> String {
-    use std::os::unix::fs::MetadataExt;
-
-    format!(
-        "{}:{}:{}:{}:{}",
-        metadata.dev(),
-        metadata.ino(),
-        metadata.len(),
-        metadata.mtime(),
-        metadata.mtime_nsec()
-    )
-}
-
-#[cfg(target_os = "linux")]
-fn process_start_time(pid: u32) -> Option<u64> {
-    let contents =
-        fs::read_to_string(PathBuf::from("/proc").join(pid.to_string()).join("stat")).ok()?;
-    let (_, fields) = contents.rsplit_once(") ")?;
-    fields.split_whitespace().nth(19)?.parse().ok()
-}
-
-#[cfg(all(unix, not(target_os = "linux")))]
-fn process_is_alive(metadata: &OwnerMetadata) -> bool {
-    process_signal_is_alive(metadata.pid)
-}
-
-#[cfg(not(unix))]
-fn process_is_alive(_metadata: &OwnerMetadata) -> bool {
-    true
 }

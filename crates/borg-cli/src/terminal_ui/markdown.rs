@@ -544,8 +544,7 @@ fn currency_math_source(source: &str) -> bool {
     });
     let has_uppercase_suffix = source
         .chars()
-        .skip_while(|character| character.is_ascii_digit() || matches!(character, '.' | ','))
-        .next()
+        .find(|character| !(character.is_ascii_digit() || matches!(character, '.' | ',')))
         .is_some_and(|character| character.is_ascii_uppercase());
     has_word || has_uppercase_suffix
 }
