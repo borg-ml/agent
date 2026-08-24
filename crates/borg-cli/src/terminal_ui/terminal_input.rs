@@ -31,6 +31,11 @@ impl TerminalInputEvent {
             Event::Key(key) if key.kind != KeyEventKind::Release && key.code == KeyCode::Up
         )
     }
+
+    pub(crate) fn is_keyboard_input(&self) -> bool {
+        matches!(&self.event, Event::Paste(_))
+            || matches!(&self.event, Event::Key(key) if key.kind != KeyEventKind::Release)
+    }
 }
 
 pub(super) struct TerminalInput {
@@ -423,6 +428,23 @@ mod tests {
             )))
             .is_up()
         );
+    }
+
+    #[test]
+    fn keyboard_input_excludes_release_and_visual_events() {
+        assert!(
+            TerminalInputEvent::single(Event::Key(KeyEvent::new(
+                KeyCode::Char('x'),
+                KeyModifiers::NONE,
+            )))
+            .is_keyboard_input()
+        );
+        assert!(TerminalInputEvent::single(Event::Paste("x".to_string())).is_keyboard_input());
+
+        let mut release = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
+        release.kind = KeyEventKind::Release;
+        assert!(!TerminalInputEvent::single(Event::Key(release)).is_keyboard_input());
+        assert!(!TerminalInputEvent::single(Event::Resize(80, 24)).is_keyboard_input());
     }
 
     #[tokio::test]

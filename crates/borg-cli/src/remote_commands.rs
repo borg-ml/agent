@@ -3064,6 +3064,8 @@ async fn run_local_agent_session(
                         }
                     }
                 }
+                let input_is_keyboard = terminal_event.is_keyboard_input();
+                let terminal_dirty_before_input = terminal_dirty;
                 let scroll_was_active = terminal
                     .as_ref()
                     .expect("terminal")
@@ -3082,6 +3084,21 @@ async fn run_local_agent_session(
                     .expect("terminal")
                     .take_event_redraw_needed();
                 terminal_dirty |= event_redraw_needed;
+                if input_is_keyboard
+                    && event_redraw_needed
+                    && matches!(&action, UiAction::None)
+                    && !terminal.as_ref().expect("terminal").is_launch_screen()
+                {
+                    terminal
+                        .as_mut()
+                        .expect("terminal")
+                        .draw_for_input()?;
+                    terminal_dirty = terminal_dirty_before_input
+                        || terminal
+                            .as_ref()
+                            .expect("terminal")
+                            .has_pending_scroll_frame();
+                }
                 if matches!(&action, UiAction::None)
                     && event_redraw_needed
                     && terminal.as_ref().expect("terminal").is_launch_screen()

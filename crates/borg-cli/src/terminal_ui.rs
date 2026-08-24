@@ -4394,6 +4394,17 @@ impl BorgTerminal {
     }
 
     pub fn draw(&mut self) -> Result<()> {
+        self.draw_internal(false)
+    }
+
+    /// Draw input feedback without rebuilding a transcript that is currently
+    /// being updated by the session stream. The next ordinary frame refreshes
+    /// the transcript from the latest projection.
+    pub fn draw_for_input(&mut self) -> Result<()> {
+        self.draw_internal(true)
+    }
+
+    fn draw_internal(&mut self, input_fast_path: bool) -> Result<()> {
         if self
             .copy_notice_expires_at
             .is_some_and(|expires_at| Instant::now() >= expires_at)
@@ -4429,26 +4440,47 @@ impl BorgTerminal {
         // Keep a separate full-width measurement so an overflowing transcript
         // can switch to the scrollbar-safe width without rendering both widths
         // again on every frame.
-        let full_transcript_render = if self.transcript_render_cache.is_some() {
-            cached_transcript_render(
-                &self.transcript,
-                &mut self.transcript_full_render_cache,
-                full_transcript_width,
-                tool_run_viewport_height,
-                goal_tick,
-                local_date,
-            )
-        } else {
-            self.transcript_full_render_cache = None;
-            cached_transcript_render(
-                &self.transcript,
-                &mut self.transcript_full_render_cache,
-                full_transcript_width,
-                tool_run_viewport_height,
-                goal_tick,
-                local_date,
-            )
-        };
+        let stale_full_transcript_render = input_fast_path.then(|| {
+            self.transcript_full_render_cache
+                .as_ref()
+                .filter(
+                    |(
+                        cached_width,
+                        cached_tool_run_viewport_height,
+                        cached_goal_tick,
+                        cached_date,
+                        _,
+                    )| {
+                        *cached_width == full_transcript_width
+                            && *cached_tool_run_viewport_height == tool_run_viewport_height
+                            && *cached_goal_tick == goal_tick
+                            && *cached_date == local_date
+                    },
+                )
+                .map(|(_, _, _, _, render)| Arc::clone(render))
+        });
+        let full_transcript_render = stale_full_transcript_render.flatten().unwrap_or_else(|| {
+            if self.transcript_render_cache.is_some() {
+                cached_transcript_render(
+                    &self.transcript,
+                    &mut self.transcript_full_render_cache,
+                    full_transcript_width,
+                    tool_run_viewport_height,
+                    goal_tick,
+                    local_date,
+                )
+            } else {
+                self.transcript_full_render_cache = None;
+                cached_transcript_render(
+                    &self.transcript,
+                    &mut self.transcript_full_render_cache,
+                    full_transcript_width,
+                    tool_run_viewport_height,
+                    goal_tick,
+                    local_date,
+                )
+            }
+        });
         let queued_prompts = self.active_queued_prompts().to_vec();
         // Keep the first draft anchored in the splash composition area. Moving
         // it to the chat footer on the first keystroke makes the whole screen
@@ -4750,7 +4782,9 @@ impl BorgTerminal {
             full_transcript_render.0.len(),
             transcript_viewport_height,
         );
-        let transcript_render = if transcript_width == full_transcript_width {
+        let transcript_render = if input_fast_path {
+            Arc::clone(&full_transcript_render)
+        } else if transcript_width == full_transcript_width {
             self.transcript_render_cache = self.transcript_full_render_cache.clone();
             Arc::clone(&full_transcript_render)
         } else {
