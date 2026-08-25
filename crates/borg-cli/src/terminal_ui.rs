@@ -7058,10 +7058,11 @@ fn fresh_transcript_like(previous: &Transcript) -> Transcript {
 }
 
 fn transcript_history_in_display_order(events: &[SessionEvent]) -> Vec<SessionEvent> {
+    let events = reorder_queued_user_completions(events);
     let mut ordered = Vec::with_capacity(events.len());
     let mut turn = Vec::new();
 
-    for event in events {
+    for event in &events {
         // Agent lifecycle has its own roster and child-transcript recovery.
         // Replaying it into the root transcript makes old cards appear only
         // after reconnect even though they were not part of the live view.
@@ -7127,6 +7128,78 @@ fn transcript_history_in_display_order(events: &[SessionEvent]) -> Vec<SessionEv
 
     ordered.extend(turn);
     ordered
+}
+
+fn reorder_queued_user_completions(events: &[SessionEvent]) -> Vec<SessionEvent> {
+    let mut admission_order = HashMap::<Uuid, u64>::new();
+    for (index, event) in events.iter().enumerate() {
+        if let SessionEventKind::Message {
+            message_id,
+            actor: EventActor::User,
+            status: MessageStatus::Queued,
+            ..
+        } = &event.kind
+        {
+            admission_order.insert(
+                *message_id,
+                if event.sequence > 0 {
+                    event.sequence
+                } else {
+                    index as u64
+                },
+            );
+        }
+    }
+    if admission_order.len() < 2 {
+        return events.to_vec();
+    }
+
+    let mut completions = events
+        .iter()
+        .filter_map(|event| {
+            let SessionEventKind::Message {
+                message_id,
+                actor: EventActor::User,
+                status: MessageStatus::Complete | MessageStatus::Failed,
+                ..
+            } = &event.kind
+            else {
+                return None;
+            };
+            admission_order
+                .get(message_id)
+                .copied()
+                .map(|sequence| (sequence, event.clone()))
+        })
+        .collect::<Vec<_>>();
+    if completions.len() < 2 {
+        return events.to_vec();
+    }
+    completions.sort_by_key(|(sequence, _)| *sequence);
+
+    let mut next_completion = completions.into_iter();
+    events
+        .iter()
+        .map(|event| {
+            let is_queued_completion = matches!(
+                &event.kind,
+                SessionEventKind::Message {
+                    message_id,
+                    actor: EventActor::User,
+                    status: MessageStatus::Complete | MessageStatus::Failed,
+                    ..
+                } if admission_order.contains_key(message_id)
+            );
+            if is_queued_completion {
+                next_completion
+                    .next()
+                    .map(|(_, event)| event)
+                    .unwrap_or_else(|| event.clone())
+            } else {
+                event.clone()
+            }
+        })
+        .collect()
 }
 
 fn transcript_turn_output(event: &SessionEvent) -> bool {

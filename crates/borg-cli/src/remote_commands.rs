@@ -5548,24 +5548,38 @@ struct ResumeBootstrapSelection {
 }
 
 fn select_resume_bootstrap_history(events: Vec<SessionEvent>) -> ResumeBootstrapSelection {
-    // Queued input is a pending-work projection, not conversation history.
-    // Replaying it into the first frame made an old queue entry look like a
-    // fresh prompt and could also wake it during resume recovery.
+    // Queued input is not rendered as a conversation row, but its durable
+    // admission marker is part of the ordering contract. A later completion
+    // can arrive out of order when several steer prompts are pending; the
+    // transcript uses these markers to restore the order in which the user
+    // submitted them. Applying a queued event only updates that projection;
+    // it never wakes or re-runs the prompt.
+    let terminal_user_ids = events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            SessionEventKind::Message {
+                message_id,
+                actor: EventActor::User,
+                status: MessageStatus::Complete | MessageStatus::Failed,
+                ..
+            } => Some(*message_id),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
     let events = events
         .into_iter()
-        .filter(|event| {
-            !matches!(
-                event.kind,
-                SessionEventKind::Message {
-                    status: MessageStatus::Queued,
-                    ..
-                }
-            ) && !matches!(
-                &event.kind,
-                kind @ SessionEventKind::ProviderEvent { kind: event_kind, .. }
-                    if event_kind == "context_compaction"
-                        && !kind.is_completed_context_compaction()
-            )
+        .filter(|event| match &event.kind {
+            SessionEventKind::Message {
+                message_id,
+                status: MessageStatus::Queued,
+                ..
+            } => terminal_user_ids.contains(message_id),
+            kind @ SessionEventKind::ProviderEvent {
+                kind: event_kind, ..
+            } if event_kind == "context_compaction" && !kind.is_completed_context_compaction() => {
+                false
+            }
+            _ => true,
         })
         .collect::<Vec<_>>();
     if events.len() <= RICH_TUI_HISTORY_EVENT_LIMIT {
@@ -5621,6 +5635,18 @@ fn select_resume_bootstrap_history(events: Vec<SessionEvent>) -> ResumeBootstrap
 }
 
 fn trim_resume_bootstrap_to_user_boundary(events: Vec<SessionEvent>) -> Vec<SessionEvent> {
+    let retained_user_ids = events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            SessionEventKind::Message {
+                message_id,
+                actor: EventActor::User,
+                status: MessageStatus::Complete | MessageStatus::Failed | MessageStatus::InProgress,
+                ..
+            } => Some(*message_id),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
     let Some(first_user) = events.iter().position(|event| {
         matches!(
             event.kind,
@@ -5633,7 +5659,21 @@ fn trim_resume_bootstrap_to_user_boundary(events: Vec<SessionEvent>) -> Vec<Sess
     }) else {
         return Vec::new();
     };
-    events.into_iter().skip(first_user).collect()
+    let first_admission_marker = events.iter().position(|event| {
+        matches!(
+            &event.kind,
+            SessionEventKind::Message {
+                message_id,
+                actor: EventActor::User,
+                status: MessageStatus::Queued,
+                ..
+            } if retained_user_ids.contains(message_id)
+        )
+    });
+    events
+        .into_iter()
+        .skip(first_admission_marker.unwrap_or(first_user))
+        .collect()
 }
 
 fn merge_tui_history_page(history: &mut Vec<SessionEvent>, older: Vec<SessionEvent>) {

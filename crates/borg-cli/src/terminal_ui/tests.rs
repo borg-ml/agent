@@ -253,6 +253,63 @@ fn live_late_user_completion_is_inserted_before_existing_turn_output() {
 }
 
 #[test]
+fn queued_user_completions_keep_admission_order_when_they_finish_out_of_order() {
+    let session_id = Uuid::new_v4();
+    let first_id = Uuid::new_v4();
+    let second_id = Uuid::new_v4();
+    let queued = |message_id: Uuid, text: &str, sequence: u64| {
+        SessionEvent::new(
+            session_id,
+            sequence,
+            SessionEventKind::Message {
+                message_id,
+                actor: EventActor::User,
+                text: text.to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Queued,
+                delivery: Some(PromptDelivery::Steer),
+            },
+        )
+    };
+    let completed = |message_id: Uuid, text: &str, sequence: u64| {
+        SessionEvent::new(
+            session_id,
+            sequence,
+            SessionEventKind::Message {
+                message_id,
+                actor: EventActor::User,
+                text: text.to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: Some(PromptDelivery::Steer),
+            },
+        )
+    };
+    let events = vec![
+        queued(first_id, "first", 1),
+        queued(second_id, "second", 2),
+        completed(second_id, "second", 3),
+        completed(first_id, "first", 4),
+    ];
+
+    let history = transcript_history_in_display_order(&events);
+    let mut transcript = Transcript::default();
+    for event in &history {
+        transcript.apply_history(event);
+    }
+
+    let messages = transcript
+        .order
+        .iter()
+        .filter_map(|entry| match entry {
+            TranscriptEntry::Message { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(messages, vec!["first", "second"]);
+}
+
+#[test]
 fn user_completion_after_interrupted_turn_stays_at_transcript_tail() {
     let session_id = Uuid::new_v4();
     let previous_user_id = Uuid::new_v4();
@@ -7041,9 +7098,12 @@ fn adjacent_tool_calls_are_compact_but_leave_gap_before_following_message() {
     let rendered = transcript.render(80, None, None, None);
     assert_eq!(rendered.1, vec![(0, 0, 1), (1, 1, 2)]);
     assert!(!rendered.0[1].spans.is_empty());
-    assert!(rendered.0[2].spans.is_empty());
+    assert_eq!(
+        rendered.0[2].spans.last().and_then(|span| span.style.bg),
+        Some(MESSAGE_BG)
+    );
     let (_, message_start, message_end) = rendered.3[0];
-    assert_eq!(message_start, 3);
+    assert_eq!(message_start, 2);
     assert_eq!(
         rendered.0[message_end - 1]
             .spans
@@ -7096,10 +7156,8 @@ fn message_tool_message_edges_have_one_separator_row_each() {
 
     assert_eq!(first_message.2 - first_message.1, 4);
     assert_eq!(second_message.2 - second_message.1, 4);
-    assert_eq!(tool.1, first_message.2 + 1);
-    assert_eq!(second_message.1, tool.2 + 1);
-    assert!(rendered.0[first_message.2].spans.is_empty());
-    assert!(rendered.0[tool.2].spans.is_empty());
+    assert_eq!(tool.1, first_message.2);
+    assert_eq!(second_message.1, tool.2);
     assert!(
         rendered.0[first_message.1]
             .spans
