@@ -6707,7 +6707,7 @@ fn format_count(value: u64) -> String {
     let raw = value.to_string();
     let mut formatted = String::with_capacity(raw.len() + raw.len() / 3);
     for (index, character) in raw.chars().enumerate() {
-        if index > 0 && (raw.len() - index) % 3 == 0 {
+        if index > 0 && (raw.len() - index).is_multiple_of(3) {
             formatted.push(',');
         }
         formatted.push(character);
