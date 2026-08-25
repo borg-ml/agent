@@ -5366,8 +5366,10 @@ fn accepted_steer_moves_from_pending_input_into_the_timeline() {
 #[test]
 fn detached_history_rebuild_preserves_scroll_follow_state() {
     let session_id = Uuid::new_v4();
-    let mut transcript = Transcript::default();
-    transcript.follow_tail = false;
+    let mut transcript = Transcript {
+        follow_tail: false,
+        ..Transcript::default()
+    };
     let event = SessionEvent::new(
         session_id,
         1,
