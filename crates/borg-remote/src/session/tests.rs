@@ -2934,6 +2934,7 @@ async fn accepted_codex_steer_is_requeued_when_turn_is_interrupted() {
         transitions,
         [
             (MessageStatus::Queued, PromptDelivery::Steer),
+            (MessageStatus::Complete, PromptDelivery::Steer),
             (MessageStatus::Queued, PromptDelivery::Queue),
         ],
         "an accepted steer must be retried when its surrounding turn is interrupted"
@@ -3044,6 +3045,7 @@ async fn accepted_claude_steer_is_requeued_when_turn_is_interrupted() {
         transitions,
         [
             (MessageStatus::Queued, PromptDelivery::Steer),
+            (MessageStatus::Complete, PromptDelivery::Steer),
             (MessageStatus::Queued, PromptDelivery::Queue),
         ],
         "an accepted Claude steer must be retried when its surrounding turn is interrupted"
@@ -4926,6 +4928,7 @@ fn only_an_uncommitted_steer_is_withdrawable_from_the_active_turn() {
             },
             admission,
             state,
+            status_recorded: false,
             attempt_boundary: 0,
         };
     let accepted = SteerAdmission::pending();

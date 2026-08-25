@@ -206,6 +206,7 @@ struct PendingSteer {
     prompt: QueuedPrompt,
     admission: SteerAdmission,
     state: PendingSteerState,
+    status_recorded: bool,
     attempt_boundary: u64,
 }
 
@@ -3129,6 +3130,19 @@ async fn run_agent_session_store_kernel(
                         // surrounding turn completes; if that turn is
                         // interrupted immediately afterwards, the user
                         // message still needs a real next-turn admission.
+                        if !pending_steers[index].status_recorded {
+                            let prompt = pending_steers[index].prompt.clone();
+                            record_prompt_status(
+                                &mut journal,
+                                &events,
+                                session_id,
+                                &prompt,
+                                MessageStatus::Complete,
+                                PromptDelivery::Steer,
+                            )
+                            .await?;
+                            pending_steers[index].status_recorded = true;
+                        }
                         pending_steers[index].state = PendingSteerState::Accepted;
                     } else {
                         let error = acknowledgement.err().unwrap_or_else(|| {
@@ -3272,6 +3286,7 @@ async fn run_agent_session_store_kernel(
                                         },
                                     }
                                 },
+                                status_recorded: false,
                                 attempt_boundary: steer_boundary_generation,
                             });
                         }
@@ -5745,15 +5760,17 @@ async fn promote_uncommitted_steers(
     let mut promoted = Vec::new();
     while let Some(steer) = pending_steers.pop_front() {
         if steer.admission.is_accepted() && !after_interrupt {
-            record_prompt_status(
-                journal,
-                events,
-                session_id,
-                &steer.prompt,
-                MessageStatus::Complete,
-                PromptDelivery::Steer,
-            )
-            .await?;
+            if !steer.status_recorded {
+                record_prompt_status(
+                    journal,
+                    events,
+                    session_id,
+                    &steer.prompt,
+                    MessageStatus::Complete,
+                    PromptDelivery::Steer,
+                )
+                .await?;
+            }
         } else {
             promoted.push(steer.prompt);
         }
