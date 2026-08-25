@@ -902,9 +902,12 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn short_socket_tempdir() -> tempfile::TempDir {
+        let temp_root = std::env::var_os("TMPDIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/tmp"));
         tempfile::Builder::new()
             .prefix("borg-session-")
-            .tempdir_in("/tmp")
+            .tempdir_in(temp_root)
             .expect("short Unix socket test directory")
     }
 
