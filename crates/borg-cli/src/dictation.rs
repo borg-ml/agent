@@ -3,7 +3,7 @@ use std::io;
 #[cfg(windows)]
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -11,7 +11,7 @@ use futures_util::StreamExt;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tempfile::TempPath;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 use tokio::time::{Instant, sleep, timeout};
 
@@ -31,6 +31,7 @@ const DICTATION_SETUP_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const DICTATION_CACHE_LOCK_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const DICTATION_CACHE_LOCK_STALE_AFTER: Duration = Duration::from_secs(2 * 60 * 60);
 const RECORDER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+const MAX_RECORDER_STDERR_BYTES: usize = 16 * 1024;
 const MAX_AUDIO_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 
@@ -629,28 +630,34 @@ fn ensure_safe_archive_path(path: &Path) -> Result<()> {
 pub(crate) struct LocalDictationRecorder {
     child: Child,
     audio_path: TempPath,
+    stderr_task: tokio::task::JoinHandle<String>,
 }
 
 impl LocalDictationRecorder {
     pub(crate) fn start(config: &LocalDictationConfig) -> Result<Self> {
-        let audio = tempfile::Builder::new()
-            .prefix("borg-dictation-")
-            .suffix(".wav")
-            .tempfile()
-            .context("failed to create temporary dictation audio")?;
+        let audio = recording_tempfile()?;
         let audio_path = audio.into_temp_path();
         let mut command = recorder_command(config, audio_path.as_ref())?;
-        let child = command
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .context(
                 "failed to start local microphone recorder; install ffmpeg or set \
                  BORG_CLI_DICTATION_RECORD_COMMAND with an {output} placeholder",
             )?;
-        Ok(Self { child, audio_path })
+        let stderr = child
+            .stderr
+            .take()
+            .context("microphone recorder stderr pipe was unavailable")?;
+        let stderr_task = tokio::spawn(read_recorder_stderr(stderr));
+        Ok(Self {
+            child,
+            audio_path,
+            stderr_task,
+        })
     }
 
     pub(crate) async fn finish_and_transcribe(
@@ -672,11 +679,74 @@ impl LocalDictationRecorder {
                     .context("failed to stop microphone recorder")?
             }
         };
+        let stderr = self.stderr_task.await.unwrap_or_default();
         if !status.success() {
-            bail!("microphone recording failed with {status}");
+            bail!("{}", recorder_failure_message(status, &stderr));
         }
         transcribe(&config, self.audio_path.as_ref()).await
     }
+}
+
+fn recording_tempfile() -> Result<tempfile::NamedTempFile> {
+    let cache_result = dictation_cache_dir().and_then(|cache_dir| {
+        let recordings_dir = cache_dir.join("recordings");
+        fs::create_dir_all(&recordings_dir).with_context(|| {
+            format!(
+                "failed to create dictation recording directory {}",
+                recordings_dir.display()
+            )
+        })?;
+        tempfile::Builder::new()
+            .prefix("borg-dictation-")
+            .suffix(".wav")
+            .tempfile_in(&recordings_dir)
+            .with_context(|| format!("failed to create recording in {}", recordings_dir.display()))
+    });
+    match cache_result {
+        Ok(audio) => Ok(audio),
+        Err(cache_error) => tempfile::Builder::new()
+            .prefix("borg-dictation-")
+            .suffix(".wav")
+            .tempfile()
+            .with_context(|| {
+            format!(
+                "failed to create temporary dictation audio (cache attempt failed: {cache_error:#})"
+            )
+        }),
+    }
+}
+
+async fn read_recorder_stderr(mut reader: impl AsyncRead + Unpin) -> String {
+    let mut output = Vec::new();
+    let mut truncated = false;
+    let mut buffer = [0_u8; 4096];
+    loop {
+        let read = match reader.read(&mut buffer).await {
+            Ok(read) => read,
+            Err(_) => break,
+        };
+        if read == 0 {
+            break;
+        }
+        let remaining = MAX_RECORDER_STDERR_BYTES.saturating_sub(output.len());
+        let keep = remaining.min(read);
+        output.extend_from_slice(&buffer[..keep]);
+        truncated |= keep < read;
+    }
+    let mut output = String::from_utf8_lossy(&output).into_owned();
+    if truncated {
+        output.push_str(" [stderr truncated]");
+    }
+    output
+}
+
+fn recorder_failure_message(status: ExitStatus, stderr: &str) -> String {
+    let detail = stderr.split_whitespace().collect::<Vec<_>>().join(" ");
+    if detail.is_empty() {
+        return format!("microphone recording failed with {status}");
+    }
+    let detail = detail.chars().take(512).collect::<String>();
+    format!("microphone recording failed with {status}: {detail}")
 }
 
 fn recorder_command(config: &LocalDictationConfig, output: &std::path::Path) -> Result<Command> {
@@ -805,7 +875,9 @@ fn env_bool(name: &str) -> Option<bool> {
 mod tests {
     use std::path::Path;
 
-    use super::{LocalDictationConfig, ensure_safe_archive_path, transcription_text};
+    use super::{
+        LocalDictationConfig, LocalDictationRecorder, ensure_safe_archive_path, transcription_text,
+    };
 
     fn default_config() -> LocalDictationConfig {
         LocalDictationConfig {
@@ -850,5 +922,29 @@ mod tests {
             Some("hello")
         );
         assert_eq!(transcription_text(r#"{"text":""}"#), None);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn recorder_failure_includes_the_child_diagnostic() {
+        let mut config = default_config();
+        config.record_command =
+            Some("sh -c 'printf recorder-disk-quota-failure >&2; exit 134' {output}".to_string());
+        let recorder = LocalDictationRecorder::start(&config).expect("recorder starts");
+        let recordings_dir = super::dictation_cache_dir()
+            .expect("unix tests have a user cache directory")
+            .join("recordings");
+        assert!(
+            (&*recorder.audio_path).starts_with(&recordings_dir),
+            "recording path should avoid the shared temp directory: {}",
+            recorder.audio_path.display()
+        );
+        let error = recorder
+            .finish_and_transcribe(config)
+            .await
+            .expect_err("recorder should fail");
+        let message = error.to_string();
+        assert!(message.contains("134"), "{message}");
+        assert!(message.contains("recorder-disk-quota-failure"), "{message}");
     }
 }
