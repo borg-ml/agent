@@ -2967,9 +2967,10 @@ async fn accepted_codex_steer_is_requeued_when_turn_is_interrupted() {
         transitions,
         [
             (MessageStatus::Queued, PromptDelivery::Steer),
+            (MessageStatus::InProgress, PromptDelivery::Steer),
             (MessageStatus::Queued, PromptDelivery::Queue),
         ],
-        "an accepted steer must stay durable and be retried when its surrounding turn is interrupted"
+        "an accepted steer must enter the timeline and still be retried when its surrounding turn is interrupted"
     );
 
     command_tx
@@ -3077,9 +3078,10 @@ async fn accepted_claude_steer_is_requeued_when_turn_is_interrupted() {
         transitions,
         [
             (MessageStatus::Queued, PromptDelivery::Steer),
+            (MessageStatus::InProgress, PromptDelivery::Steer),
             (MessageStatus::Queued, PromptDelivery::Queue),
         ],
-        "an accepted Claude steer must stay durable and be retried when its surrounding turn is interrupted"
+        "an accepted Claude steer must enter the timeline and still be retried when its surrounding turn is interrupted"
     );
 
     command_tx

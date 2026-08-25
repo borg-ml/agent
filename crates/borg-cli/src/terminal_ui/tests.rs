@@ -1520,6 +1520,27 @@ fn instant_tools_keep_a_diamond_without_animation() {
         .join("\n");
     assert!(rendered.contains("◇ Read plan"));
     assert!(!rendered.chars().any(|glyph| "⠋⠙⠹⠸⠼⠴⠦⠧".contains(glyph)));
+
+    transcript.apply(&SessionEvent::new(
+        Uuid::new_v4(),
+        2,
+        SessionEventKind::ToolCompleted {
+            tool_call_id: "instant-1".to_string(),
+            output: "done".to_string(),
+            output_ref: None,
+            is_error: false,
+            input: Some(serde_json::json!({})),
+            input_ref: None,
+        },
+    ));
+    let completed = transcript
+        .lines(100)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(completed.contains("◇ Read plan"));
+    assert!(!completed.contains("✓ Read plan"));
 }
 
 #[test]
@@ -5264,11 +5285,10 @@ fn picker_numbers_are_visible_and_select_immediately() {
 }
 
 #[test]
-fn accepted_steer_stays_pending_until_user_message_commit() {
+fn accepted_steer_moves_from_pending_input_into_the_timeline() {
     let message_id = Uuid::new_v4();
     let mut queue = Vec::new();
-    // A resumed session may hydrate the durable in-progress boundary without
-    // replaying the earlier optimistic/queued projection.
+
     update_queued_prompts(
         &mut queue,
         &SessionEventKind::Message {
@@ -5280,8 +5300,7 @@ fn accepted_steer_stays_pending_until_user_message_commit() {
             delivery: Some(PromptDelivery::Steer),
         },
     );
-    assert_eq!(queue.len(), 1);
-    assert_eq!(queue[0].message_id, message_id);
+    assert!(queue.is_empty());
 
     update_queued_prompts(
         &mut queue,
@@ -5314,6 +5333,19 @@ fn accepted_steer_stays_pending_until_user_message_commit() {
             delivery: Some(PromptDelivery::Steer),
         },
     );
+    assert!(queue.is_empty());
+
+    update_queued_prompts(
+        &mut queue,
+        &SessionEventKind::Message {
+            message_id,
+            actor: EventActor::User,
+            text: "follow up".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Queued,
+            delivery: Some(PromptDelivery::Queue),
+        },
+    );
     assert_eq!(queue.len(), 1);
     assert_eq!(queue[0].message_id, message_id);
 
@@ -5329,6 +5361,33 @@ fn accepted_steer_stays_pending_until_user_message_commit() {
         },
     );
     assert!(queue.is_empty());
+}
+
+#[test]
+fn detached_history_rebuild_preserves_scroll_follow_state() {
+    let session_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    transcript.follow_tail = false;
+    let event = SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::Message {
+            message_id: Uuid::new_v4(),
+            actor: EventActor::User,
+            text: "older history".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: Some(PromptDelivery::Steer),
+        },
+    );
+
+    assert!(replace_root_transcript_history(
+        &mut transcript,
+        &mut None,
+        false,
+        &[event],
+    ));
+    assert!(!transcript.follow_tail);
 }
 
 #[test]
@@ -7826,6 +7885,17 @@ fn transcript_scroll_anchor_tracks_content_growth_and_collapse() {
     assert_eq!(preserve_scroll_anchor(7, 20, 24), 11);
     assert_eq!(preserve_scroll_anchor(11, 24, 20), 7);
     assert_eq!(preserve_scroll_anchor(2, 24, 20), 0);
+}
+
+#[test]
+fn scrollbar_thumb_scales_with_history_and_stays_within_track() {
+    let (top, short_history) = scrollbar_thumb_geometry(20, 40, 0, 20);
+    let (_, long_history) = scrollbar_thumb_geometry(20, 80, 0, 60);
+    assert_eq!(top, 0);
+    assert!(long_history < short_history);
+
+    let (bottom, bottom_height) = scrollbar_thumb_geometry(20, 80, 60, 60);
+    assert_eq!(bottom + bottom_height, 20);
 }
 
 #[test]

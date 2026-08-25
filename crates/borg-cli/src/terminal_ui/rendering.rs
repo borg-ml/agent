@@ -61,30 +61,17 @@ fn reasoning_lines(source: &str, width: usize) -> Vec<Line<'static>> {
     }
     items
         .into_iter()
-        .enumerate()
-        .flat_map(|(item_index, item)| {
-            let mut lines = super::wrap_display(&item, width.saturating_sub(2).max(1))
+        .flat_map(|item| {
+            super::wrap_display(&item, width.max(1))
                 .into_iter()
-                .enumerate()
-                .map(|(line_index, line)| {
-                    Line::from(vec![
-                        Span::styled(
-                            if line_index == 0 { "• " } else { "  " },
-                            Style::default().fg(super::BORG_ORANGE_HOVER),
-                        ),
-                        Span::styled(
-                            line,
-                            Style::default()
-                                .fg(Color::Gray)
-                                .add_modifier(Modifier::ITALIC),
-                        ),
-                    ])
+                .map(|line| {
+                    Line::from(Span::styled(
+                        line,
+                        Style::default()
+                            .fg(Color::Gray)
+                            .add_modifier(Modifier::ITALIC),
+                    ))
                 })
-                .collect::<Vec<_>>();
-            if item_index > 0 {
-                lines.insert(0, Line::default());
-            }
-            lines
         })
         .collect()
 }
@@ -749,11 +736,11 @@ mod tests {
             "  │ ",
         );
 
-        assert_eq!(lines.len(), 3);
-        assert_eq!(lines[0].to_string(), "  │ • Inspecting blank lines");
-        assert_eq!(lines[1].to_string(), "  │ ");
-        assert_eq!(lines[2].to_string(), "  │ • Restoring card padding");
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].to_string(), "  │ Inspecting blank lines");
+        assert_eq!(lines[1].to_string(), "  │ Restoring card padding");
         assert!(lines.iter().all(|line| !line.to_string().contains("**")));
+        assert!(lines.iter().all(|line| !line.to_string().contains('•')));
     }
 
     #[test]
@@ -765,12 +752,10 @@ mod tests {
             "  │ ",
         );
 
-        assert_eq!(lines[0].to_string(), "  │ • First sentence");
-        assert_eq!(lines[1].to_string(), "  │ ");
-        assert!(lines[2].to_string().starts_with("  │ • second sentence"));
-        assert!(lines[3].to_string().starts_with("  │   "));
-        assert!(lines[3..].iter().all(|line| {
-            line.to_string().contains("• ") == (line.to_string() == lines[2].to_string())
+        assert_eq!(lines[0].to_string(), "  │ First sentence");
+        assert!(lines[1].to_string().starts_with("  │ second sentence"));
+        assert!(lines[2..].iter().all(|line| {
+            !line.to_string().contains("• ") && !line.to_string().trim().is_empty()
         }));
     }
 

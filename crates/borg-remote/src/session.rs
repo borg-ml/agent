@@ -3124,11 +3124,20 @@ async fn run_agent_session_store_kernel(
                         continue;
                     };
                     if pending_steers[index].admission.is_accepted() {
-                        // Admission only proves that the provider accepted
-                        // the steer transport. Keep it pending until the
-                        // surrounding turn completes; if that turn is
-                        // interrupted immediately afterwards, the user
-                        // message still needs a real next-turn admission.
+                        // The provider has admitted the steer into the active
+                        // turn. Project it into the timeline now; the later
+                        // turn boundary still owns the terminal Complete
+                        // event, and interruption can still requeue it.
+                        let prompt = pending_steers[index].prompt.clone();
+                        record_prompt_status(
+                            &mut journal,
+                            &events,
+                            session_id,
+                            &prompt,
+                            MessageStatus::InProgress,
+                            PromptDelivery::Steer,
+                        )
+                        .await?;
                         pending_steers[index].state = PendingSteerState::Accepted;
                     } else {
                         let error = acknowledgement.err().unwrap_or_else(|| {

@@ -2907,7 +2907,7 @@ impl Transcript {
                         "■"
                     } else if *backgrounded {
                         "↗"
-                    } else if *complete {
+                    } else if *complete && !is_instant {
                         "✓"
                     } else {
                         "◇"

@@ -5472,17 +5472,12 @@ impl BorgTerminal {
                     next_link_hit_areas.retain(|(area, _)| !is_behind_loader(area));
                 }
                 if let Some(area) = scrollbar_area {
-                    let minimum_thumb_height = MIN_SCROLLBAR_THUMB_ROWS.min(area.height);
-                    let thumb_height = ((u64::from(area.height) * u64::from(area.height))
-                        / transcript_height.max(1) as u64)
-                        .clamp(u64::from(minimum_thumb_height), u64::from(area.height))
-                        as u16;
-                    let thumb_travel = area.height.saturating_sub(thumb_height);
-                    let thumb_top = if scroll_max == 0 {
-                        0
-                    } else {
-                        (scroll as u64 * u64::from(thumb_travel) / scroll_max as u64) as u16
-                    };
+                    let (thumb_top, thumb_height) = scrollbar_thumb_geometry(
+                        area.height,
+                        transcript_height,
+                        scroll,
+                        scroll_max,
+                    );
                     let rows = (0..area.height)
                         .map(|row| {
                             let in_thumb = row >= thumb_top && row < thumb_top + thumb_height;
@@ -7074,6 +7069,7 @@ fn fresh_transcript_like(previous: &Transcript) -> Transcript {
     Transcript {
         auto_expand_edits: previous.auto_expand_edits,
         auto_expand_tools: previous.auto_expand_tools,
+        follow_tail: previous.follow_tail,
         user_label: previous.user_label.clone(),
         assistant_label: previous.assistant_label.clone(),
         user_label_color: previous.user_label_color,
@@ -8822,11 +8818,10 @@ fn update_queued_prompts(
         SessionEventKind::Message {
             message_id,
             actor: EventActor::User,
-            text,
             status: MessageStatus::InProgress,
-            delivery: Some(delivery @ PromptDelivery::Steer),
+            delivery: Some(PromptDelivery::Steer),
             ..
-        } => push_queued_prompt(queued_prompts, *message_id, text.clone(), *delivery),
+        } => queued_prompts.retain(|queued| queued.message_id != *message_id),
         SessionEventKind::Message {
             message_id,
             actor: EventActor::User,
@@ -9952,6 +9947,25 @@ fn resolve_pending_scroll_anchor(
     previous_height.map_or(scroll_from_bottom, |previous_height| {
         preserve_scroll_anchor(scroll_from_bottom, previous_height, next_height)
     })
+}
+
+fn scrollbar_thumb_geometry(
+    track_height: u16,
+    transcript_height: usize,
+    scroll: usize,
+    scroll_max: usize,
+) -> (u16, u16) {
+    let minimum_thumb_height = MIN_SCROLLBAR_THUMB_ROWS.min(track_height);
+    let thumb_height =
+        ((u64::from(track_height) * u64::from(track_height)) / transcript_height.max(1) as u64)
+            .clamp(u64::from(minimum_thumb_height), u64::from(track_height)) as u16;
+    let thumb_travel = track_height.saturating_sub(thumb_height);
+    let thumb_top = if scroll_max == 0 {
+        0
+    } else {
+        (scroll.min(scroll_max) as u64 * u64::from(thumb_travel) / scroll_max as u64) as u16
+    };
+    (thumb_top, thumb_height)
 }
 
 fn should_preserve_transcript_viewport(follow_tail: bool) -> bool {
