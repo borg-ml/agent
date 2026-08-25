@@ -5215,19 +5215,21 @@ impl BorgTerminal {
                 let scroll_start = scroll;
                 let show_history_loader = self.history_page_loading;
                 let visible_height = content_area.height as usize;
-                let sticky_tool_run_header =
-                    sticky_tool_run_header_row(tool_run_rows, scroll_start).map(
-                        |(index, row, expandable)| {
-                            let mut header = transcript[row].clone();
-                            if self.transcript.tool_activity_is_running(index) {
-                                replace_tool_activity_glyph(
-                                    &mut header,
-                                    activity_glyph(SessionStatus::Running),
-                                );
-                            }
-                            (index, header, expandable)
-                        },
-                    );
+                let sticky_tool_run_header = sticky_tool_run_header_row(
+                    tool_run_rows,
+                    scroll_start,
+                )
+                .map(|(index, row, expandable)| {
+                    let mut header = transcript[row].clone();
+                    if self.transcript.tool_activity_is_running(index) {
+                        replace_tool_activity_glyph(
+                            &mut header,
+                            activity_glyph(SessionStatus::Running),
+                        );
+                        apply_running_tool_pulse(&mut header, running_activity_pulse_phase());
+                    }
+                    (index, header, expandable)
+                });
                 let sticky_index = tool_rows.partition_point(|(_, start, _)| *start < scroll_start);
                 let sticky_tool_header = if sticky_tool_run_header.is_some() {
                     None
@@ -5242,6 +5244,10 @@ impl BorgTerminal {
                                 replace_tool_activity_glyph(
                                     &mut header,
                                     activity_glyph(SessionStatus::Running),
+                                );
+                                apply_running_tool_pulse(
+                                    &mut header,
+                                    running_activity_pulse_phase(),
                                 );
                             }
                             (*index, header)
@@ -5262,6 +5268,7 @@ impl BorgTerminal {
                         && let Some(line) = visible_transcript.get_mut(*start - scroll_start)
                     {
                         replace_tool_activity_glyph(line, activity_glyph(SessionStatus::Running));
+                        apply_running_tool_pulse(line, running_activity_pulse_phase());
                     }
                     if self.hovered_tool == Some(*index) {
                         apply_viewport_background(
@@ -11505,6 +11512,87 @@ fn replace_tool_activity_glyph(line: &mut Line<'static>, glyph: &str) {
     let mut content = span.content.to_string();
     content.replace_range(start..start + '◇'.len_utf8(), glyph);
     span.content = Cow::Owned(content);
+}
+
+const RUNNING_PULSE_RADIUS: usize = 2;
+
+fn running_activity_pulse_phase() -> usize {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| (elapsed.as_millis() / 90) as usize)
+}
+
+fn apply_running_tool_pulse(line: &mut Line<'static>, phase: usize) {
+    if line.spans.len() < 2 {
+        return;
+    }
+    let content_width = line
+        .spans
+        .iter()
+        .skip(1)
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum::<usize>();
+    if content_width == 0 {
+        return;
+    }
+
+    let cycle = content_width.saturating_add(RUNNING_PULSE_RADIUS * 2);
+    let pulse_center = (phase % cycle) as isize - RUNNING_PULSE_RADIUS as isize;
+    let mut offset = 0usize;
+    let mut spans = Vec::with_capacity(line.spans.len() + 2);
+    spans.push(line.spans[0].clone());
+    for span in line.spans.iter().skip(1) {
+        for grapheme in span.content.graphemes(true) {
+            let distance = (offset as isize - pulse_center).unsigned_abs();
+            let style = match distance {
+                0 => brighten_style(span.style, 2),
+                1 => brighten_style(span.style, 1),
+                _ => span.style,
+            };
+            append_styled_grapheme(&mut spans, grapheme, style);
+            offset = offset.saturating_add(UnicodeWidthStr::width(grapheme));
+        }
+    }
+    line.spans = spans;
+}
+
+fn append_styled_grapheme(spans: &mut Vec<Span<'static>>, grapheme: &str, style: Style) {
+    if spans.len() > 1
+        && let Some(previous) = spans.last_mut()
+        && previous.style == style
+    {
+        let mut content = previous.content.to_string();
+        content.push_str(grapheme);
+        previous.content = Cow::Owned(content);
+    } else {
+        spans.push(Span::styled(grapheme.to_string(), style));
+    }
+}
+
+fn brighten_style(style: Style, steps: u8) -> Style {
+    style.fg(brighten_color(style.fg.unwrap_or(Color::White), steps))
+}
+
+fn brighten_color(color: Color, steps: u8) -> Color {
+    match color {
+        Color::Rgb(red, green, blue) => {
+            let lift = u16::from(steps) * 48;
+            let lift_channel =
+                |channel: u8| channel.saturating_add(lift.min(u16::from(u8::MAX)) as u8);
+            Color::Rgb(lift_channel(red), lift_channel(green), lift_channel(blue))
+        }
+        Color::DarkGray => Color::Gray,
+        Color::Gray => Color::White,
+        Color::White => Color::LightYellow,
+        Color::Red => Color::LightRed,
+        Color::Green => Color::LightGreen,
+        Color::Yellow => Color::LightYellow,
+        Color::Blue => Color::LightBlue,
+        Color::Magenta => Color::LightMagenta,
+        Color::Cyan => Color::LightCyan,
+        Color::Black | Color::Reset | Color::Indexed(_) => Color::White,
+        light => light,
+    }
 }
 
 fn history_loading_line() -> Line<'static> {

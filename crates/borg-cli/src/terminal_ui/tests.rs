@@ -1373,6 +1373,45 @@ fn running_tool_uses_a_stable_marker_without_invalidating_transcript_cache() {
 }
 
 #[test]
+fn running_tool_pulse_moves_across_text_without_touching_the_gutter() {
+    let resting = Style::default().fg(Color::DarkGray);
+    let mut first = Line::from(vec![
+        Span::styled("│ ", resting),
+        Span::styled("running action", resting),
+    ]);
+    let mut second = first.clone();
+
+    apply_running_tool_pulse(&mut first, RUNNING_PULSE_RADIUS);
+    apply_running_tool_pulse(&mut second, RUNNING_PULSE_RADIUS + 6);
+
+    assert_eq!(first.spans[0].style, resting);
+    assert_eq!(second.spans[0].style, resting);
+    assert_eq!(first.to_string(), second.to_string());
+    assert!(first.spans.iter().skip(1).any(|span| span.style != resting));
+    assert!(
+        second
+            .spans
+            .iter()
+            .skip(1)
+            .any(|span| span.style != resting)
+    );
+    assert_ne!(
+        first
+            .spans
+            .iter()
+            .skip(1)
+            .map(|span| span.style)
+            .collect::<Vec<_>>(),
+        second
+            .spans
+            .iter()
+            .skip(1)
+            .map(|span| span.style)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn instant_tools_keep_a_diamond_without_animation() {
     let mut transcript = Transcript::default();
     transcript.apply(&SessionEvent::new(
