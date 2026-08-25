@@ -191,7 +191,7 @@ run_release_checks() (
   local test_tmp
   # Keep the sandbox path short: borg-remote exposes Unix sockets below
   # TMPDIR, whose platform limit is shorter than a repository-relative path.
-  test_tmp="$(mktemp -d "${TMPDIR:-/tmp}/borg-release-tests.XXXXXX")"
+  test_tmp="$(mktemp -d "${TMPDIR:-/tmp}/b.XXXXXX")"
   trap 'rm -rf -- "$test_tmp"' EXIT
   cargo fmt --all -- --check
   TMPDIR="$test_tmp" cargo test --workspace --locked -- --test-threads=1
