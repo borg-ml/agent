@@ -18,6 +18,10 @@ fn line_is_blank(line: &Line<'static>) -> bool {
         .all(|span| span.content.trim().is_empty())
 }
 
+fn line_is_unstyled_blank(line: &Line<'static>) -> bool {
+    line.spans.is_empty()
+}
+
 struct Transcript {
     order: Vec<TranscriptEntry>,
     messages: HashMap<Uuid, usize>,
@@ -2313,7 +2317,6 @@ impl Transcript {
         let mut entry_rows = Vec::new();
         let mut link_rows = Vec::new();
         let mut selection_rows: Vec<SelectionRowRange> = Vec::new();
-        let mut trailing_tool_separator = None;
         let mut tool_run_starts = HashMap::new();
         let tool_run_windows = self.tool_run_windows();
         let running_tool = self.has_running_tool();
@@ -2339,16 +2342,6 @@ impl Transcript {
                 entry,
                 TranscriptEntry::Message { status, .. } if *status != MessageStatus::Queued
             );
-            let existing_tool_separator = trailing_tool_separator;
-            if !matches!(
-                entry,
-                TranscriptEntry::Message {
-                    status: MessageStatus::Queued,
-                    ..
-                }
-            ) {
-                trailing_tool_separator = None;
-            }
             let starts_labeled_group = visible_message
                 || matches!(
                     entry,
@@ -2367,19 +2360,19 @@ impl Transcript {
                 } if *status != MessageStatus::Queued
             );
             let entry_start = if is_chat_message {
-                if let Some(separator) = existing_tool_separator {
-                    separator
-                } else if lines.last().is_some_and(line_is_blank) {
-                    lines.len().saturating_sub(1)
-                } else {
+                if !lines.is_empty()
+                    && lines
+                        .last()
+                        .is_none_or(|line| !line_is_unstyled_blank(line))
+                {
                     lines.push(Line::default());
-                    lines.len().saturating_sub(1)
                 }
+                lines.len()
             } else {
                 if starts_labeled_group
                     && lines
                         .last()
-                        .is_none_or(|line| !line_is_blank(line))
+                        .is_none_or(|line| !line_is_unstyled_blank(line))
                 {
                     lines.push(Line::default());
                 }
@@ -2407,6 +2400,13 @@ impl Transcript {
                         EventActor::Tool => ("Tool".to_string(), Color::Blue),
                         EventActor::System => ("System".to_string(), Color::DarkGray),
                     };
+                    let message_background_start = if is_chat_message {
+                        lines.push(Line::default());
+                        lines.len().saturating_sub(1)
+                    } else {
+                        lines.len()
+                    };
+                    let message_content_start = lines.len();
                     let time = display_local_time(time, &today_prefix);
                     let mut header = vec![Span::styled(
                         format!("  ▌ {label}"),
@@ -2503,7 +2503,7 @@ impl Transcript {
                             Style::default().fg(Color::Cyan),
                         )));
                     }
-                    while lines.len() > entry_start
+                    while lines.len() > message_content_start
                         && lines.last().is_some_and(line_is_blank)
                     {
                         lines.pop();
@@ -2518,7 +2518,7 @@ impl Transcript {
                             } else {
                                 MESSAGE_BG
                             };
-                            for line in &mut lines[entry_start..end] {
+                            for line in &mut lines[message_background_start..end] {
                                 apply_line_background(line, width, background);
                             }
                         }
@@ -2527,13 +2527,20 @@ impl Transcript {
                         lines.len()
                     };
                     if is_chat_message && *complete {
-                        message_rows.push((index, entry_start, message_end));
+                        message_rows.push((index, message_background_start, message_end));
                     }
                     selection_rows.push(SelectionRowRange::transcript_entry(
                         index,
-                        entry_start,
+                        if is_chat_message {
+                            message_content_start
+                        } else {
+                            entry_start
+                        },
                         message_content_end,
                     ));
+                    if is_chat_message {
+                        lines.push(Line::default());
+                    }
                 }
                 TranscriptEntry::Activity { text, time } => {
                     let time = display_local_time(time, &today_prefix);
@@ -3089,14 +3096,13 @@ impl Transcript {
                     } else {
                         SelectionRowRange::transcript_entry(index, summary_start, lines.len())
                     });
-                    if tool_window.is_none() && !next_is_tool {
-                        let tool_separator_row = if lines.last().is_some_and(line_is_blank) {
-                            lines.len().saturating_sub(1)
-                        } else {
-                            lines.push(Line::default());
-                            lines.len().saturating_sub(1)
-                        };
-                        trailing_tool_separator = Some(tool_separator_row);
+                    if tool_window.is_none()
+                        && !next_is_tool
+                        && lines
+                            .last()
+                            .is_none_or(|line| !line_is_unstyled_blank(line))
+                    {
+                        lines.push(Line::default());
                     }
                     if let Some(window) = tool_window
                         && index + 1 == window.end

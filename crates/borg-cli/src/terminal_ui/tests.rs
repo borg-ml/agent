@@ -7098,12 +7098,9 @@ fn adjacent_tool_calls_are_compact_but_leave_gap_before_following_message() {
     let rendered = transcript.render(80, None, None, None);
     assert_eq!(rendered.1, vec![(0, 0, 1), (1, 1, 2)]);
     assert!(!rendered.0[1].spans.is_empty());
-    assert_eq!(
-        rendered.0[2].spans.last().and_then(|span| span.style.bg),
-        Some(MESSAGE_BG)
-    );
+    assert!(rendered.0[2].spans.is_empty());
     let (_, message_start, message_end) = rendered.3[0];
-    assert_eq!(message_start, 2);
+    assert_eq!(message_start, 3);
     assert_eq!(
         rendered.0[message_end - 1]
             .spans
@@ -7156,8 +7153,10 @@ fn message_tool_message_edges_have_one_separator_row_each() {
 
     assert_eq!(first_message.2 - first_message.1, 4);
     assert_eq!(second_message.2 - second_message.1, 4);
-    assert_eq!(tool.1, first_message.2);
-    assert_eq!(second_message.1, tool.2);
+    assert_eq!(tool.1, first_message.2 + 1);
+    assert_eq!(second_message.1, tool.2 + 1);
+    assert!(rendered.0[first_message.2].spans.is_empty());
+    assert!(rendered.0[tool.2].spans.is_empty());
     assert!(
         rendered.0[first_message.1]
             .spans
