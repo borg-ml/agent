@@ -704,15 +704,17 @@ fn recording_tempfile() -> Result<tempfile::NamedTempFile> {
     });
     match cache_result {
         Ok(audio) => Ok(audio),
-        Err(cache_error) => tempfile::Builder::new()
-            .prefix("borg-dictation-")
-            .suffix(".wav")
-            .tempfile()
-            .with_context(|| {
-            format!(
-                "failed to create temporary dictation audio (cache attempt failed: {cache_error:#})"
-            )
-        }),
+        Err(cache_error) => {
+            let audio = tempfile::Builder::new()
+                .prefix("borg-dictation-")
+                .suffix(".wav")
+                .tempfile();
+            audio.with_context(|| {
+                format!(
+                    "failed to create temporary dictation audio (cache attempt failed: {cache_error:#})"
+                )
+            })
+        }
     }
 }
 
