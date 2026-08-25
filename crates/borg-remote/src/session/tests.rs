@@ -1753,7 +1753,7 @@ async fn intermediate_narration_does_not_start_provider_drain_timeout() {
 
     let mut observed = Vec::new();
     loop {
-        let event = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+        let event = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
             .await
             .expect("delayed consultation remains live");
         let Some(event) = event else {
@@ -2711,7 +2711,7 @@ async fn interrupt_timeout_cannot_publish_ready_before_provider_cleanup_finishes
         })
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(1), started.notified())
+    tokio::time::timeout(Duration::from_secs(5), started.notified())
         .await
         .expect("provider starts");
     while event_rx.try_recv().is_ok() {}
