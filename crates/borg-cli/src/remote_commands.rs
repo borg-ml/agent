@@ -3116,11 +3116,13 @@ async fn run_local_agent_session(
                     .expect("terminal")
                     .take_event_redraw_needed();
                 terminal_dirty |= event_redraw_needed;
-                if input_is_keyboard
-                    && event_redraw_needed
-                    && matches!(&action, UiAction::None)
-                    && !terminal.as_ref().expect("terminal").is_launch_screen()
-                {
+                if should_draw_input_fast_path(
+                    input_is_keyboard,
+                    event_redraw_needed,
+                    matches!(&action, UiAction::None),
+                    terminal_dirty_before_input,
+                    !terminal.as_ref().expect("terminal").is_launch_screen(),
+                ) {
                     terminal
                         .as_mut()
                         .expect("terminal")
@@ -6048,6 +6050,20 @@ fn terminal_needs_activity_tick(status: SessionStatus) -> bool {
 
 fn terminal_needs_idle_tick(has_expiring_notice: bool, has_blinking_cursor: bool) -> bool {
     has_expiring_notice || has_blinking_cursor
+}
+
+fn should_draw_input_fast_path(
+    input_is_keyboard: bool,
+    event_redraw_needed: bool,
+    action_is_none: bool,
+    transcript_dirty: bool,
+    not_launch_screen: bool,
+) -> bool {
+    input_is_keyboard
+        && event_redraw_needed
+        && action_is_none
+        && !transcript_dirty
+        && not_launch_screen
 }
 
 fn spawn_terminal_input() -> mpsc::Receiver<io::Result<String>> {

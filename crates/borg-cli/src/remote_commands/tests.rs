@@ -61,6 +61,15 @@ fn resume_retry_delay_is_capped_to_avoid_a_reconnect_storm() {
     assert_eq!(delay, LOCAL_RESUME_RETRY_MAX_DELAY);
 }
 
+#[test]
+fn input_fast_path_waits_for_a_pending_transcript_frame() {
+    assert!(should_draw_input_fast_path(true, true, true, false, true));
+    assert!(!should_draw_input_fast_path(true, true, true, true, true));
+    assert!(!should_draw_input_fast_path(true, false, true, false, true));
+    assert!(!should_draw_input_fast_path(true, true, false, false, true));
+    assert!(!should_draw_input_fast_path(false, true, true, false, true));
+}
+
 #[cfg(unix)]
 fn short_socket_tempdir() -> tempfile::TempDir {
     let temp_root = std::env::var_os("TMPDIR")
