@@ -1757,6 +1757,9 @@ async fn run_local_agent_session(
     let mut prevent_sleep = editor_preferences.interaction.prevent_sleep;
     let mut steer_active_turn =
         editor_preferences.interaction.active_messages == ActiveMessageBehavior::Steer;
+    if let Some(terminal) = terminal.as_mut() {
+        terminal.set_active_message_behavior(steer_active_turn);
+    }
     let mut resume_session = None;
     let mut rewind_prompt = None;
     let mut pending_revert_sequence = None;
@@ -2694,9 +2697,9 @@ async fn run_local_agent_session(
                         current_effort.as_deref().unwrap_or("provider default"),
                         if current_fast { "on" } else { "off" },
                         if steer_active_turn {
-                            "steer current turn"
+                            "send now and redirect the current turn"
                         } else {
-                            "queue next turn"
+                            "send after the current turn finishes"
                         },
                         if prevent_sleep { "on" } else { "off" },
                         editor_preferences.transcript.user_label,
@@ -2736,9 +2739,9 @@ async fn run_local_agent_session(
                     println!(
                         "\n  Messages sent while Borg works: {}.\n",
                         if steer_active_turn {
-                            "steer current turn"
+                            "send now and redirect the current turn"
                         } else {
-                            "queue next turn"
+                            "send after the current turn finishes"
                         }
                     );
                     continue;
@@ -3365,6 +3368,7 @@ async fn run_local_agent_session(
                             restored.set_dictation_icon(dictation_icon_style_for_preference(
                                 editor_preferences.presentation.dictation_icon,
                             ));
+                            restored.set_active_message_behavior(steer_active_turn);
                             restored.set_configured_model_entries(agent_config.configured_model_entries());
                             restored.set_extension_commands(extension_catalog.api_snapshot().commands);
                             let composer_history = store
@@ -3471,12 +3475,14 @@ async fn run_local_agent_session(
                             ActiveMessageBehavior::Queue
                         };
                         editor_preferences.save()?;
-                        terminal.as_mut().expect("terminal").set_notice(format!(
+                        let terminal = terminal.as_mut().expect("terminal");
+                        terminal.set_active_message_behavior(enabled);
+                        terminal.set_notice(format!(
                             "Messages sent while Borg works: {}",
                             if enabled {
-                                "steer current turn"
+                                "send now and redirect the current turn"
                             } else {
-                                "queue next turn"
+                                "send after the current turn finishes"
                             }
                         ));
                     }
@@ -4327,7 +4333,7 @@ async fn run_local_agent_session(
                                         ActiveMessageBehavior::Steer;
                                     editor_preferences.save()?;
                                     terminal.as_mut().expect("terminal").set_notice(
-                                        "Messages sent while Borg works: steer current turn",
+                                        "Messages sent while Borg works: send now and redirect the current turn",
                                     );
                                 }
                                 "queue" => {
@@ -4336,7 +4342,7 @@ async fn run_local_agent_session(
                                         ActiveMessageBehavior::Queue;
                                     editor_preferences.save()?;
                                     terminal.as_mut().expect("terminal").set_notice(
-                                        "Messages sent while Borg works: queue next turn",
+                                        "Messages sent while Borg works: send after the current turn finishes",
                                     );
                                 }
                                 _ => terminal.as_mut().expect("terminal").set_notice(
@@ -6441,7 +6447,7 @@ fn print_agent_help() {
   /peer PROVIDER    direct peer control; add TEXT, clear, or new MODEL@EFFORT
   /model            choose the model
   /effort           choose reasoning effort
-  /followups        choose steer current turn or queue next turn
+  /followups        choose message delivery: redirect now or wait for this turn to finish
   /refresh          choose terminal refresh rate
   /sleep            keep the machine awake during active turns
   /colors           show transcript colours

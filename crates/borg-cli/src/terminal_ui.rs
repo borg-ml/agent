@@ -406,6 +406,20 @@ impl TextSelection {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ComposerSelection {
+    anchor: usize,
+    focus: usize,
+    dragging: bool,
+    pointer: Position,
+}
+
+impl ComposerSelection {
+    fn is_empty(self) -> bool {
+        self.anchor == self.focus
+    }
+}
+
 #[derive(Clone, Debug)]
 enum PendingTranscriptClick {
     Link(String),
@@ -419,8 +433,12 @@ enum PendingTranscriptClick {
     Background,
 }
 
+const ACTIVE_MESSAGES_SEND_NOW: &str = "Send now and redirect the current turn";
+const ACTIVE_MESSAGES_WAIT: &str = "Wait and send after the current turn finishes";
+
 const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/help", "show commands"),
+    ("/copy", "copy the last assistant message"),
     (
         "/ask",
         "ask another model through its persistent peer thread",
@@ -436,7 +454,10 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/lsp", "view language server support"),
     ("/extensions", "view the live Blu extension runtime"),
     ("/fast", "toggle provider priority/fast mode"),
-    ("/followups", "choose steer current turn or queue next turn"),
+    (
+        "/followups",
+        "choose message delivery: redirect now or wait for this turn to finish",
+    ),
     ("/refresh", "choose terminal refresh rate"),
     ("/sleep", "keep the machine awake during active turns"),
     ("/expand-edits", "auto-expand edit diffs"),
@@ -452,8 +473,8 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/todo", "view or update the durable todo list"),
     ("/todos", "alias for /todo"),
     ("/dictate", "start or stop local dictation"),
-    ("/queue", "run after the current turn"),
-    ("/steer", "steer the current turn"),
+    ("/queue", "send after the current turn finishes"),
+    ("/steer", "send now and redirect the current turn"),
     ("/interrupt", "interrupt the current turn"),
     ("/stop", "alias for /interrupt"),
     ("/login", "reconnect the current provider"),
@@ -709,6 +730,7 @@ pub struct BorgTerminal {
     extension_commands: Vec<borg_remote::ExtensionApiCommand>,
     git_status_cache: GitStatusCache,
     status: SessionStatus,
+    steer_active_turn: bool,
     /// Highest durable root sequence incorporated into this projection.
     /// Asynchronous history/state hydration may finish after live events, so
     /// an older snapshot must never overwrite newer status or metadata.
@@ -722,6 +744,10 @@ pub struct BorgTerminal {
     scrollbar_thumb_area: Option<Rect>,
     scrollbar_drag_offset: u16,
     transcript_viewport_area: Option<Rect>,
+    composer_area: Option<Rect>,
+    composer_text_area: Option<Rect>,
+    composer_text_width: usize,
+    composer_scroll: u16,
     transcript_scroll_max: usize,
     dragging_scrollbar: bool,
     scrollbar_hovered: bool,
@@ -770,6 +796,7 @@ pub struct BorgTerminal {
     nested_scroll_capture: Option<NestedScrollCapture>,
     nested_scroll_motion: Option<NestedScrollMotion>,
     text_selection: Option<TextSelection>,
+    composer_selection: Option<ComposerSelection>,
     pending_transcript_click: Option<PendingTranscriptClick>,
     pending_tool_copy: Option<usize>,
     active_since: Option<DateTime<Utc>>,
@@ -1673,6 +1700,7 @@ impl BorgTerminal {
             extension_commands: Vec::new(),
             git_status_cache: GitStatusCache::default(),
             status: SessionStatus::Starting,
+            steer_active_turn: false,
             session_state_sequence: 0,
             pending_approval: false,
             pending_provider_interaction: false,
@@ -1683,6 +1711,10 @@ impl BorgTerminal {
             scrollbar_thumb_area: None,
             scrollbar_drag_offset: 0,
             transcript_viewport_area: None,
+            composer_area: None,
+            composer_text_area: None,
+            composer_text_width: 0,
+            composer_scroll: 0,
             transcript_scroll_max: 0,
             dragging_scrollbar: false,
             scrollbar_hovered: false,
@@ -1731,6 +1763,7 @@ impl BorgTerminal {
             nested_scroll_capture: None,
             nested_scroll_motion: None,
             text_selection: None,
+            composer_selection: None,
             pending_transcript_click: None,
             pending_tool_copy: None,
             active_since: None,
@@ -1905,6 +1938,7 @@ impl BorgTerminal {
 
     pub fn handle_external_interrupt(&mut self) {
         self.composer.clear();
+        self.composer_selection = None;
         self.notice = Some("Prompt cleared · press Ctrl-C again to exit".to_string());
         self.event_redraw_needed = true;
     }
@@ -2067,9 +2101,11 @@ impl BorgTerminal {
 
     pub fn restore_composer(&mut self, text: String, attachments: Vec<PathBuf>) {
         self.composer.restore(text, attachments);
+        self.composer_selection = None;
     }
 
     pub fn insert_dictation(&mut self, text: &str) {
+        self.composer_selection = None;
         if !self.composer.text.is_empty()
             && !self
                 .composer
@@ -2186,6 +2222,7 @@ impl BorgTerminal {
             }
         }
         self.composer.restore(text, attachments);
+        self.composer_selection = None;
         self.notice = Some("Could not send the prompt; it was returned to the composer".into());
     }
 
@@ -2680,6 +2717,7 @@ impl BorgTerminal {
         self.transcript.follow_tail = true;
         self.transcript_render_cache = None;
         self.text_selection = None;
+        self.composer_selection = None;
         self.pending_transcript_click = None;
         self.pending_tool_copy = None;
         self.hovered_entry = None;
@@ -2714,6 +2752,10 @@ impl BorgTerminal {
 
     pub fn set_notice(&mut self, notice: impl Into<String>) {
         self.notice = Some(notice.into());
+    }
+
+    pub fn set_active_message_behavior(&mut self, steer_active: bool) {
+        self.steer_active_turn = steer_active;
     }
 
     fn record_user_interrupt(&mut self) {
@@ -3064,11 +3106,11 @@ impl BorgTerminal {
         self.picker = Some(Picker::new(
             PickerKind::ActiveMessages,
             "Messages sent while Borg is working",
-            ["Steer current turn", "Queue next turn"],
+            [ACTIVE_MESSAGES_SEND_NOW, ACTIVE_MESSAGES_WAIT],
             Some(if steer_active {
-                "Steer current turn"
+                ACTIVE_MESSAGES_SEND_NOW
             } else {
-                "Queue next turn"
+                ACTIVE_MESSAGES_WAIT
             }),
         ));
     }
@@ -3299,6 +3341,7 @@ impl BorgTerminal {
             }
             Event::Paste(value) => {
                 self.last_ctrl_c = None;
+                self.composer_selection = None;
                 let value = normalize_terminal_capture_paste(&value);
                 let PasteOutcome { text, attachments } =
                     self.attachment_store.stage_paste(&value, &self.cwd)?;
@@ -3613,8 +3656,12 @@ impl BorgTerminal {
                     && !self
                         .transcript_viewport_area
                         .is_some_and(|area| area.contains(pointer))
+                    && !self
+                        .composer_area
+                        .is_some_and(|area| area.contains(pointer))
                 {
                     self.text_selection = None;
+                    self.composer_selection = None;
                     self.pending_transcript_click = None;
                 }
                 match mouse.kind {
@@ -3645,8 +3692,30 @@ impl BorgTerminal {
                         self.cancel_scroll_motion();
                         self.scroll_from_bottom = 0;
                         self.text_selection = None;
+                        self.composer_selection = None;
                         self.pending_transcript_click = None;
                         self.transcript.follow_tail = true;
+                    }
+                    MouseEventKind::Down(MouseButton::Left)
+                        if self.picker.is_none()
+                            && !self.pending_provider_interaction_secret
+                            && self
+                                .composer_area
+                                .is_some_and(|area| area.contains(pointer)) =>
+                    {
+                        self.text_selection = None;
+                        self.pending_transcript_click = None;
+                        if let Some(point) = self.composer_selection_point_at(pointer) {
+                            self.composer.cursor = point;
+                            self.composer.preferred_column = None;
+                            self.composer_selection = Some(ComposerSelection {
+                                anchor: point,
+                                focus: point,
+                                dragging: true,
+                                pointer,
+                            });
+                        }
+                        self.event_redraw_needed = true;
                     }
                     MouseEventKind::Down(MouseButton::Left)
                         if mouse_starts_text_selection(&mouse, self.transcript_viewport_area) =>
@@ -3659,6 +3728,7 @@ impl BorgTerminal {
                                 autoscroll: 0,
                                 pointer,
                             });
+                            self.composer_selection = None;
                             self.pending_transcript_click =
                                 (!mouse.modifiers.contains(KeyModifiers::SHIFT))
                                     .then(|| self.pending_transcript_click(hovered_tool_run));
@@ -3674,6 +3744,14 @@ impl BorgTerminal {
                     }
                     MouseEventKind::Drag(MouseButton::Left)
                         if self
+                            .composer_selection
+                            .is_some_and(|selection| selection.dragging) =>
+                    {
+                        self.update_composer_selection_drag(pointer);
+                        self.event_redraw_needed = true;
+                    }
+                    MouseEventKind::Drag(MouseButton::Left)
+                        if self
                             .text_selection
                             .is_some_and(|selection| selection.dragging) =>
                     {
@@ -3683,6 +3761,22 @@ impl BorgTerminal {
                     }
                     MouseEventKind::Up(MouseButton::Left) => {
                         self.dragging_scrollbar = false;
+                        if self
+                            .composer_selection
+                            .is_some_and(|selection| selection.dragging)
+                        {
+                            self.update_composer_selection_drag(pointer);
+                            if let Some(selection) = self.composer_selection.as_mut() {
+                                selection.dragging = false;
+                            }
+                            if self
+                                .composer_selection
+                                .is_some_and(ComposerSelection::is_empty)
+                            {
+                                self.composer_selection = None;
+                            }
+                            return Ok(UiAction::None);
+                        }
                         if self
                             .text_selection
                             .is_some_and(|selection| selection.dragging)
@@ -3698,6 +3792,12 @@ impl BorgTerminal {
                         }
                     }
                     MouseEventKind::ScrollUp => {
+                        if self
+                            .composer_selection
+                            .is_some_and(|selection| selection.dragging)
+                        {
+                            return Ok(UiAction::None);
+                        }
                         if self
                             .text_selection
                             .is_some_and(|selection| selection.dragging)
@@ -3760,6 +3860,12 @@ impl BorgTerminal {
                         }
                     }
                     MouseEventKind::ScrollDown => {
+                        if self
+                            .composer_selection
+                            .is_some_and(|selection| selection.dragging)
+                        {
+                            return Ok(UiAction::None);
+                        }
                         if self
                             .text_selection
                             .is_some_and(|selection| selection.dragging)
@@ -4077,6 +4183,37 @@ impl BorgTerminal {
         ))
     }
 
+    fn composer_selection_point_at(&self, pointer: Position) -> Option<usize> {
+        let area = self.composer_text_area?;
+        if self.composer.text.is_empty() || area.height == 0 || area.width == 0 {
+            return None;
+        }
+        let ranges = display_ranges(&self.composer.text, self.composer_text_width, true);
+        let row = usize::from(
+            pointer
+                .y
+                .clamp(area.y, area.bottom().saturating_sub(1))
+                .saturating_sub(area.y),
+        )
+        .saturating_add(usize::from(self.composer_scroll))
+        .min(ranges.len().saturating_sub(1));
+        let (start, end) = ranges.get(row).copied()?;
+        let column = usize::from(pointer.x.saturating_sub(area.x));
+        Some(cursor_at_column(&self.composer.text, start, end, column))
+    }
+
+    fn update_composer_selection_drag(&mut self, pointer: Position) {
+        let Some(focus) = self.composer_selection_point_at(pointer) else {
+            return;
+        };
+        if let Some(selection) = self.composer_selection.as_mut() {
+            selection.focus = focus;
+            selection.pointer = pointer;
+        }
+        self.composer.cursor = focus;
+        self.composer.preferred_column = None;
+    }
+
     fn transcript_point_for_pointer(&self, area: Rect, pointer: Position) -> TranscriptPoint {
         let scroll_start = self
             .transcript_scroll_max
@@ -4132,6 +4269,9 @@ impl BorgTerminal {
     }
 
     fn copy_text_selection(&mut self) -> bool {
+        if self.copy_composer_selection() {
+            return true;
+        }
         let Some((.., render)) = self.transcript_render_cache.as_ref() else {
             return false;
         };
@@ -4149,6 +4289,37 @@ impl BorgTerminal {
             Ok(lease) => {
                 self.clipboard_lease = lease;
                 self.show_copy_notice("✓ Copied selection to clipboard");
+            }
+            Err(error) => self.notice = Some(format!("Copy failed: {error}")),
+        }
+        true
+    }
+
+    fn copy_composer_selection(&mut self) -> bool {
+        let Some(selection) = self.composer_selection.filter(|selection| {
+            !selection.is_empty()
+                && selection.anchor <= self.composer.text.len()
+                && selection.focus <= self.composer.text.len()
+        }) else {
+            return false;
+        };
+        let (start, end) = if selection.anchor <= selection.focus {
+            (selection.anchor, selection.focus)
+        } else {
+            (selection.focus, selection.anchor)
+        };
+        let Some(text) = self
+            .composer
+            .text
+            .get(start..end)
+            .filter(|text| !text.is_empty())
+        else {
+            return false;
+        };
+        match clipboard::copy(text) {
+            Ok(lease) => {
+                self.clipboard_lease = lease;
+                self.show_copy_notice("✓ Copied composer selection to clipboard");
             }
             Err(error) => self.notice = Some(format!("Copy failed: {error}")),
         }
@@ -4213,6 +4384,20 @@ impl BorgTerminal {
             Ok(lease) => {
                 self.clipboard_lease = lease;
                 self.show_copy_notice("✓ Copied to clipboard");
+            }
+            Err(error) => self.notice = Some(format!("Copy failed: {error}")),
+        }
+    }
+
+    fn copy_last_assistant_message(&mut self) {
+        let Some(text) = self.transcript.last_assistant_message_text() else {
+            self.notice = Some("No assistant message is available to copy".to_string());
+            return;
+        };
+        match clipboard::copy(&text) {
+            Ok(lease) => {
+                self.clipboard_lease = lease;
+                self.show_copy_notice("✓ Copied last assistant message to clipboard");
             }
             Err(error) => self.notice = Some(format!("Copy failed: {error}")),
         }
@@ -4372,7 +4557,7 @@ impl BorgTerminal {
             ),
             PickerKind::PreventSleep => UiAction::SetPreventSleep(picker.selected_value() == "On"),
             PickerKind::ActiveMessages => {
-                UiAction::SetSteerActive(picker.selected_value() == "Steer current turn")
+                UiAction::SetSteerActive(picker.selected_value() == ACTIVE_MESSAGES_SEND_NOW)
             }
             PickerKind::AutoExpandEdits => {
                 UiAction::SetAutoExpandEdits(picker.selected_value() == "On")
@@ -4738,7 +4923,8 @@ impl BorgTerminal {
         } else {
             " > "
         };
-        let composer_render_lines = if self.picker.as_ref().is_some_and(|_| !modal_picker_open) {
+        let mut composer_render_lines = if self.picker.as_ref().is_some_and(|_| !modal_picker_open)
+        {
             Vec::new()
         } else if self.composer.text.is_empty() {
             let placeholder = if pending_provider_interaction {
@@ -4746,7 +4932,7 @@ impl BorgTerminal {
             } else {
                 match status {
                     SessionStatus::Running | SessionStatus::Starting => {
-                        "Ask a follow-up or steer the current turn…"
+                        active_message_placeholder(self.steer_active_turn)
                     }
                     SessionStatus::WaitingForApproval => "Allow · Y   Deny · N",
                     _ => "Describe a task…",
@@ -4762,6 +4948,19 @@ impl BorgTerminal {
             self.composer
                 .styled_lines_for_ranges(&composer_ranges, prompt_marker)
         };
+        if self.picker.is_none()
+            && !pending_provider_interaction_secret
+            && let Some(selection) = self.composer_selection
+        {
+            apply_composer_selection(
+                &mut composer_render_lines,
+                &composer_display_text,
+                &composer_ranges,
+                UnicodeWidthStr::width(prompt_marker),
+                selection.anchor,
+                selection.focus,
+            );
+        }
         let composer_max_height = if resume_picker_open { 18 } else { 8 };
         let composer_height = composer_panel_height(
             composer_line_count,
@@ -4846,6 +5045,8 @@ impl BorgTerminal {
         let mut next_scrollbar_area = None;
         let mut next_scrollbar_thumb_area = None;
         let mut next_transcript_viewport_area = None;
+        let mut next_composer_area = None;
+        let mut next_composer_text_area = None;
         let mut next_scroll_max = 0;
         let mut next_tool_hit_areas = Vec::new();
         let mut next_tool_run_hit_areas = Vec::new();
@@ -4952,6 +5153,17 @@ impl BorgTerminal {
                     chunks[4],
                 )
             };
+            next_composer_text_area = Some(Rect {
+                x: composer_area
+                    .x
+                    .saturating_add(composer_cursor_x_offset(is_launch_screen)),
+                y: composer_area.y.saturating_add(u16::from(!is_launch_screen)),
+                width: composer_text_width.min(u16::MAX as usize) as u16,
+                height: composer_area
+                    .height
+                    .saturating_sub(u16::from(!is_launch_screen)),
+            });
+            next_composer_area = Some(composer_area);
             if !is_launch_screen && let Some(todo_status) = todo_status.as_ref() {
                 let metadata_width =
                     footer_metadata_text(todo_status, &cwd_status, usize::MAX).width() as u16;
@@ -6183,6 +6395,10 @@ impl BorgTerminal {
         self.scrollbar_area = next_scrollbar_area;
         self.scrollbar_thumb_area = next_scrollbar_thumb_area;
         self.transcript_viewport_area = next_transcript_viewport_area;
+        self.composer_area = next_composer_area;
+        self.composer_text_area = next_composer_text_area;
+        self.composer_text_width = composer_text_width;
+        self.composer_scroll = composer_scroll;
         self.transcript_scroll_max = next_scroll_max;
         self.tool_hit_areas = next_tool_hit_areas;
         self.tool_run_hit_areas = next_tool_run_hit_areas;
@@ -6295,6 +6511,7 @@ impl BorgTerminal {
             Some(PickerKind::Resume)
         ) {
             if is_composer_newline(&self.keymap, &key) {
+                self.composer_selection = None;
                 self.composer.insert("\n");
                 return Ok(UiAction::None);
             }
@@ -6369,6 +6586,7 @@ impl BorgTerminal {
             return Ok(UiAction::None);
         }
         if is_composer_newline(&self.keymap, &key) {
+            self.composer_selection = None;
             self.composer.insert("\n");
             return Ok(UiAction::None);
         }
@@ -6451,6 +6669,7 @@ impl BorgTerminal {
                 return Ok(UiAction::ForceQuit);
             }
             self.composer.clear();
+            self.composer_selection = None;
             self.notice = Some(format!(
                 "Prompt cleared · press {} again to exit",
                 self.keymap.label(KeyAction::ClearOrExit)
@@ -6458,6 +6677,7 @@ impl BorgTerminal {
             return Ok(UiAction::None);
         }
         self.last_ctrl_c = None;
+        self.composer_selection = None;
         if self.pending_approval {
             return Ok(if self.keymap.matches(KeyAction::Approve, &key) {
                 UiAction::Approve {
@@ -6495,6 +6715,9 @@ impl BorgTerminal {
             return Ok(UiAction::ToggleDictation);
         }
         if self.keymap.matches(KeyAction::Copy, &key) {
+            if self.copy_text_selection() {
+                return Ok(UiAction::None);
+            }
             if let Some(text) = self.transcript.copy_text() {
                 match clipboard::copy(&text) {
                     Ok(lease) => {
@@ -6572,6 +6795,12 @@ impl BorgTerminal {
                     slash_selected_command(&self.composer.text, self.slash_selection)
             {
                 self.composer.replace_text(command);
+            }
+            if self.composer.attachments.is_empty() && self.composer.text.trim() == "/copy" {
+                self.composer.clear();
+                self.notice = None;
+                self.copy_last_assistant_message();
+                return Ok(UiAction::None);
             }
             if self.composer.attachments.is_empty() && self.composer.text.trim() == "/dictate" {
                 self.composer.clear();
@@ -8873,23 +9102,147 @@ fn apply_text_selection(
         else {
             continue;
         };
-        let mut column = 0usize;
-        let mut spans = Vec::new();
-        for span in &line.spans {
-            for grapheme in span.content.graphemes(true) {
-                let grapheme_width = grapheme.width();
-                let selected = column < end && column.saturating_add(grapheme_width) > start;
-                let style = if selected {
-                    span.style.fg(Color::White).bg(Color::Rgb(45, 83, 120))
-                } else {
-                    span.style
-                };
-                spans.push(Span::styled(grapheme.to_string(), style));
-                column = column.saturating_add(grapheme_width);
-            }
-        }
-        line.spans = spans;
+        let selectable = selection_line_ranges(line);
+        apply_column_selection(line, start, end, &selectable);
     }
+}
+
+fn apply_column_selection(
+    line: &mut Line<'static>,
+    start: usize,
+    end: usize,
+    selectable: &[(usize, usize)],
+) {
+    let mut column = 0usize;
+    let mut spans = Vec::new();
+    for span in &line.spans {
+        for grapheme in span.content.graphemes(true) {
+            let grapheme_width = grapheme.width();
+            let selected = selectable.iter().any(|(selectable_start, selectable_end)| {
+                column < end
+                    && column.saturating_add(grapheme_width) > start
+                    && column < *selectable_end
+                    && column.saturating_add(grapheme_width) > *selectable_start
+            });
+            let style = if selected {
+                span.style.fg(Color::White).bg(Color::Rgb(45, 83, 120))
+            } else {
+                span.style
+            };
+            spans.push(Span::styled(grapheme.to_string(), style));
+            column = column.saturating_add(grapheme_width);
+        }
+    }
+    line.spans = spans;
+}
+
+fn apply_composer_selection(
+    lines: &mut [Line<'static>],
+    value: &str,
+    ranges: &[(usize, usize)],
+    prompt_width: usize,
+    anchor: usize,
+    focus: usize,
+) {
+    let (start, end) = if anchor <= focus {
+        (anchor, focus)
+    } else {
+        (focus, anchor)
+    };
+    if start == end {
+        return;
+    }
+    for (row, (line_start, line_end)) in ranges.iter().copied().enumerate() {
+        let from = if start <= line_start {
+            0
+        } else {
+            UnicodeWidthStr::width(&value[line_start..start.min(line_end)])
+        };
+        let to = if end >= line_end {
+            UnicodeWidthStr::width(&value[line_start..line_end])
+        } else if end > line_start {
+            UnicodeWidthStr::width(&value[line_start..end])
+        } else {
+            0
+        };
+        if from >= to {
+            continue;
+        }
+        if let Some(line) = lines.get_mut(row) {
+            apply_column_selection(
+                line,
+                prompt_width.saturating_add(from),
+                prompt_width.saturating_add(to),
+                &[(prompt_width, usize::MAX)],
+            );
+        }
+    }
+}
+
+fn selection_line_ranges(line: &Line<'static>) -> Vec<(usize, usize)> {
+    let width = line.width();
+    if width == 0 || line.spans.iter().all(|span| span.content.trim().is_empty()) {
+        return Vec::new();
+    }
+    let first = line
+        .spans
+        .first()
+        .map(|span| span.content.as_ref())
+        .unwrap_or_default();
+    if first.contains('▌') {
+        return Vec::new();
+    }
+    if line.spans.len() >= 3
+        && line.spans[1].content.as_ref() == " │ "
+        && line.spans[0].content.contains('│')
+        && line.spans[2].content.contains('│')
+    {
+        let first_start = diff_code_start(first).unwrap_or(0);
+        let second_start = diff_code_start(line.spans[2].content.as_ref()).unwrap_or(0);
+        let first_width = first.width();
+        let separator_width = line.spans[1].width();
+        return vec![
+            (first_start, first_width),
+            (
+                first_width
+                    .saturating_add(separator_width)
+                    .saturating_add(second_start),
+                first_width
+                    .saturating_add(separator_width)
+                    .saturating_add(line.spans[2].width()),
+            ),
+        ];
+    }
+    if first.contains('│')
+        && first[..first.find('│').unwrap_or(0)]
+            .chars()
+            .any(|character| character.is_ascii_digit())
+    {
+        return vec![(first.width(), width)];
+    }
+    let prefix = if first == "  " {
+        2
+    } else if first.starts_with("│   │ ") {
+        first.width()
+    } else if first.starts_with("  │ ") {
+        first.width()
+    } else if matches!(first, "+ " | "− ") {
+        first.width()
+    } else {
+        0
+    };
+    (prefix < width)
+        .then_some((prefix, width))
+        .into_iter()
+        .collect()
+}
+
+fn diff_code_start(value: &str) -> Option<usize> {
+    ["│ + ", "│ − ", "│   "].iter().find_map(|marker| {
+        value
+            .find(marker)
+            .map(|start| UnicodeWidthStr::width(&value[..start + marker.len()]))
+    })
 }
 
 fn action_run_bridge(entry: &TranscriptEntry) -> bool {
@@ -8932,12 +9285,19 @@ fn selected_transcript_text(
         } else {
             line_width
         };
+        let selectable = selection_line_ranges(line);
         let mut column = 0usize;
         let mut text = String::new();
         for span in &line.spans {
             for grapheme in span.content.graphemes(true) {
                 let grapheme_width = grapheme.width();
-                if column < to && column.saturating_add(grapheme_width) > from {
+                let selected = selectable.iter().any(|(selectable_start, selectable_end)| {
+                    column < to
+                        && column.saturating_add(grapheme_width) > from
+                        && column < *selectable_end
+                        && column.saturating_add(grapheme_width) > *selectable_start
+                });
+                if selected {
                     text.push_str(grapheme);
                 }
                 column = column.saturating_add(grapheme_width);
@@ -8945,7 +9305,7 @@ fn selected_transcript_text(
         }
         selected.push(text.trim_end().to_string());
     }
-    let text = selected.join("\n");
+    let text = selected.join("\n").trim_matches('\n').to_string();
     (!text.is_empty()).then_some(text)
 }
 
@@ -9031,19 +9391,20 @@ fn resolve_selection_point_in_lines(
     let mut remaining = logical_offset;
     for row in range.start..range.end {
         let line = lines.get(row)?;
-        let (prefix, width) = selection_line_content_metrics(line);
+        let width = selection_line_selectable_width(line);
         if remaining < width {
             return Some(TranscriptPoint {
                 row,
-                column: prefix.saturating_add(remaining),
+                column: selection_column_for_offset(line, remaining),
             });
         }
         remaining = remaining.saturating_sub(width);
     }
-    let (prefix, width) = selection_line_content_metrics(lines.get(last)?);
+    let line = lines.get(last)?;
+    let width = selection_line_selectable_width(line);
     Some(TranscriptPoint {
         row: last,
-        column: prefix.saturating_add(width),
+        column: selection_column_for_offset(line, width),
     })
 }
 
@@ -9237,15 +9598,12 @@ fn selection_point_for_row_in_lines(
     };
     let logical_offset = (range.start..row)
         .filter_map(|line| lines.get(line))
-        .map(|line| selection_line_content_metrics(line).1)
+        .map(selection_line_selectable_width)
         .sum::<usize>()
         .saturating_add(
             lines
                 .get(row)
-                .map(selection_line_content_metrics)
-                .map_or(0, |(prefix, width)| {
-                    column.saturating_sub(prefix).min(width)
-                }),
+                .map_or(0, |line| selection_offset_for_column(line, column)),
         );
     SelectionPoint {
         logical_offset: Some(logical_offset),
@@ -9253,18 +9611,37 @@ fn selection_point_for_row_in_lines(
     }
 }
 
-fn selection_line_content_metrics(line: &Line<'static>) -> (usize, usize) {
-    let width = line
-        .spans
-        .iter()
-        .map(|span| span.content.width())
-        .sum::<usize>();
-    let prefix = line
-        .spans
-        .first()
-        .filter(|span| span.content.as_ref() == "  ")
-        .map_or(0, |_| 2);
-    (prefix, width.saturating_sub(prefix))
+fn selection_line_selectable_width(line: &Line<'static>) -> usize {
+    selection_line_ranges(line)
+        .into_iter()
+        .map(|(start, end)| end.saturating_sub(start))
+        .sum()
+}
+
+fn selection_offset_for_column(line: &Line<'static>, column: usize) -> usize {
+    let mut offset = 0usize;
+    for (start, end) in selection_line_ranges(line) {
+        if column <= start {
+            return offset;
+        }
+        if column < end {
+            return offset.saturating_add(column.saturating_sub(start));
+        }
+        offset = offset.saturating_add(end.saturating_sub(start));
+    }
+    offset
+}
+
+fn selection_column_for_offset(line: &Line<'static>, mut offset: usize) -> usize {
+    let ranges = selection_line_ranges(line);
+    for (start, end) in &ranges {
+        let width = end.saturating_sub(*start);
+        if offset < width {
+            return start.saturating_add(offset);
+        }
+        offset = offset.saturating_sub(width);
+    }
+    ranges.last().map_or(0, |(_, end)| *end)
 }
 
 fn tool_run_separator(in_tool_run: bool) -> Line<'static> {
@@ -9600,6 +9977,14 @@ fn primary_controls_line(keymap: &KeyMap) -> String {
     )
 }
 
+fn active_message_placeholder(steer_active: bool) -> &'static str {
+    if steer_active {
+        "Type a follow-up to redirect the current turn now…"
+    } else {
+        "Type a follow-up to send after the current turn finishes…"
+    }
+}
+
 fn is_copy_notice(message: &str) -> bool {
     message.to_ascii_lowercase().contains("copied")
 }
@@ -9624,7 +10009,7 @@ fn inset_control_lines(mut lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
 fn keybinding_reference(keymap: &KeyMap) -> Vec<(&'static str, String)> {
     vec![
         ("send", keymap.label(KeyAction::Send)),
-        ("queue next turn", keymap.label(KeyAction::Queue)),
+        ("send after current turn", keymap.label(KeyAction::Queue)),
         ("newline", keymap.label(KeyAction::Newline)),
         ("commands", "/".to_string()),
         ("interrupt or close", keymap.label(KeyAction::Interrupt)),

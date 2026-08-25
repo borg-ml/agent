@@ -1013,7 +1013,7 @@ fn keybinding_help_is_action_first_and_uses_configuration() {
         .join("\n");
     assert!(help.contains("send"));
     assert!(help.find("send").unwrap() < help.find("ctrl+s").unwrap());
-    assert!(help.contains("queue next turn"));
+    assert!(help.contains("send after current turn"));
     assert!(help.contains("start/stop dictation"));
     assert!(help.contains("alt+v"));
 
@@ -4375,6 +4375,31 @@ fn transcript_copy_selection_can_move_beyond_last_assistant_message() {
 }
 
 #[test]
+fn last_assistant_message_copy_ignores_later_activity_and_selection() {
+    let mut transcript = Transcript::default();
+    transcript.order.push(TranscriptEntry::Message {
+        actor: EventActor::Assistant,
+        text: "answer".to_string(),
+        attachments: Vec::new(),
+        model: None,
+        effort: None,
+        time: "12:00".to_string(),
+        status: MessageStatus::Complete,
+        complete: true,
+    });
+    transcript.order.push(TranscriptEntry::Activity {
+        text: "finished".to_string(),
+        time: "12:01".to_string(),
+    });
+    transcript.select_previous();
+
+    assert_eq!(
+        transcript.last_assistant_message_text().as_deref(),
+        Some("answer")
+    );
+}
+
+#[test]
 fn copied_markdown_message_omits_fenced_code_markers() {
     let markdown = "Run this:\n\n```bash\nenv -u WAYLAND_DISPLAY cargo run --release\n```";
     assert_eq!(
@@ -4705,6 +4730,8 @@ fn only_argument_taking_commands_are_inserted_rather_than_run() {
     assert!(slash_command_needs_argument("/peer"));
     assert!(slash_command_needs_argument("/queue"));
     assert!(slash_command_needs_argument("/steer"));
+    assert_eq!(slash_matches("/copy")[0].0, "/copy");
+    assert!(!slash_command_needs_argument("/copy"));
     for (command, _) in SLASH_COMMANDS.iter().filter(|(command, _)| {
         !matches!(
             *command,
@@ -8204,6 +8231,114 @@ fn transcript_text_selection_uses_stable_document_rows() {
     assert_eq!(
         selected_transcript_text(&lines, start, end).as_deref(),
         Some("two\nthree four\nfi")
+    );
+}
+
+#[test]
+fn transcript_selection_skips_headers_and_diff_line_number_gutters() {
+    let header = Line::from(vec![
+        Span::raw("  ▌ borg"),
+        Span::raw("  gpt-5.6-sol"),
+        Span::raw("  12:00"),
+    ]);
+    let body = Line::from(vec![Span::raw("  "), Span::raw("answer")]);
+    let diff = Line::from(vec![
+        Span::styled(
+            "    4    5 │ + ",
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("fn main()"),
+    ]);
+    let lines = vec![header, body, diff];
+    let start = TranscriptPoint { row: 0, column: 0 };
+    let end = TranscriptPoint {
+        row: 2,
+        column: usize::MAX,
+    };
+
+    assert_eq!(
+        selected_transcript_text(&lines, start, end).as_deref(),
+        Some("answer\nfn main()")
+    );
+
+    let mut highlighted = lines.clone();
+    let diff_start = selection_line_ranges(&lines[2])[0].0;
+    apply_text_selection(&mut highlighted, 0, start, end);
+    assert!(
+        highlighted[0]
+            .spans
+            .iter()
+            .all(|span| span.style.bg.is_none())
+    );
+    assert!(
+        highlighted[1]
+            .spans
+            .iter()
+            .any(|span| span.style.bg.is_some())
+    );
+    assert!(
+        highlighted[2]
+            .spans
+            .iter()
+            .take(diff_start)
+            .all(|span| span.style.bg.is_none())
+    );
+    assert!(
+        highlighted[2]
+            .spans
+            .iter()
+            .skip(diff_start)
+            .any(|span| span.style.bg.is_some())
+    );
+}
+
+#[test]
+fn composer_selection_highlights_text_without_the_prompt_marker() {
+    let value = "hello\nworld";
+    let ranges = display_ranges(value, 40, true);
+    let mut lines = styled_plain_composer_lines(value, &ranges, " > ");
+
+    apply_composer_selection(&mut lines, value, &ranges, 3, 1, 8);
+
+    assert!(
+        lines[0]
+            .spans
+            .iter()
+            .take(3)
+            .all(|span| span.style.bg.is_none())
+    );
+    assert!(
+        lines[0]
+            .spans
+            .iter()
+            .skip(3)
+            .any(|span| span.style.bg.is_some())
+    );
+    assert!(
+        lines[1]
+            .spans
+            .iter()
+            .take(3)
+            .all(|span| span.style.bg.is_none())
+    );
+    assert!(
+        lines[1]
+            .spans
+            .iter()
+            .skip(3)
+            .any(|span| span.style.bg.is_some())
+    );
+}
+
+#[test]
+fn active_message_placeholder_explains_both_follow_up_modes() {
+    assert_eq!(
+        active_message_placeholder(true),
+        "Type a follow-up to redirect the current turn now…"
+    );
+    assert_eq!(
+        active_message_placeholder(false),
+        "Type a follow-up to send after the current turn finishes…"
     );
 }
 

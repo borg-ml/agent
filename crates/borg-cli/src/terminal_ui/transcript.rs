@@ -3296,15 +3296,19 @@ impl Transcript {
                 .get(index)
                 .and_then(TranscriptEntry::copy_text_owned)
         } else {
-            self.order.iter().rev().find_map(|entry| match entry {
-                TranscriptEntry::Message {
-                    actor: EventActor::Assistant,
-                    text,
-                    ..
-                } => Some(markdown_plain_text(text)),
-                _ => None,
-            })
+            self.last_assistant_message_text()
         }
+    }
+
+    fn last_assistant_message_text(&self) -> Option<String> {
+        self.order.iter().rev().find_map(|entry| match entry {
+            TranscriptEntry::Message {
+                actor: EventActor::Assistant,
+                text,
+                ..
+            } => Some(markdown_plain_text(text)),
+            _ => None,
+        })
     }
 
     fn select_previous(&mut self) {
