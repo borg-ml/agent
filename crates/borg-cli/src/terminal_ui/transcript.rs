@@ -1,6 +1,12 @@
 const USER_INTERRUPT_ACTIVITY: &str = "agent interrupted by user";
 const TOOL_ELAPSED_REFRESH_MILLIS: i64 = 100;
 
+fn line_is_blank(line: &Line<'static>) -> bool {
+    line.spans
+        .iter()
+        .all(|span| span.content.trim().is_empty())
+}
+
 struct Transcript {
     order: Vec<TranscriptEntry>,
     messages: HashMap<Uuid, usize>,
@@ -2228,45 +2234,34 @@ impl Transcript {
             ) {
                 trailing_tool_separator = None;
             }
-            let separator_start = lines.len();
-            let added_group_separator = if starts_labeled_group
-                && lines
+            let is_chat_message = matches!(
+                entry,
+                TranscriptEntry::Message {
+                    actor: EventActor::User | EventActor::Assistant,
+                    status,
+                    ..
+                } if *status != MessageStatus::Queued
+            );
+            let entry_start = if is_chat_message {
+                if let Some(separator) = existing_tool_separator {
+                    separator
+                } else if lines
                     .last()
-                    .is_none_or(|line: &Line<'static>| !line.spans.is_empty())
-            {
-                lines.push(Line::default());
-                true
-            } else {
-                false
-            };
-            let message_has_tool_separator = matches!(
-                entry,
-                TranscriptEntry::Message {
-                    actor: EventActor::User | EventActor::Assistant,
-                    ..
+                    .is_some_and(line_is_blank)
+                {
+                    lines.len().saturating_sub(1)
+                } else {
+                    lines.push(Line::default());
+                    lines.len().saturating_sub(1)
                 }
-            ) && (existing_tool_separator.is_some()
-                || (added_group_separator && previous_is_tool));
-            let entry_start = if message_has_tool_separator {
-                lines.len()
-            } else if added_group_separator
-                && matches!(
-                    entry,
-                    TranscriptEntry::Message {
-                        actor: EventActor::User | EventActor::Assistant,
-                        ..
-                    }
-                ) {
-                separator_start
-            } else if matches!(
-                entry,
-                TranscriptEntry::Message {
-                    actor: EventActor::User | EventActor::Assistant,
-                    ..
-                }
-            ) {
-                existing_tool_separator.unwrap_or(lines.len())
             } else {
+                if starts_labeled_group
+                    && lines
+                        .last()
+                        .is_none_or(|line| !line_is_blank(line))
+                {
+                    lines.push(Line::default());
+                }
                 lines.len()
             };
             match entry {
@@ -2291,12 +2286,6 @@ impl Transcript {
                         EventActor::Tool => ("Tool".to_string(), Color::Blue),
                         EventActor::System => ("System".to_string(), Color::DarkGray),
                     };
-                    if matches!(actor, EventActor::User | EventActor::Assistant)
-                        && !added_group_separator
-                        && existing_tool_separator.is_none()
-                    {
-                        lines.push(Line::default());
-                    }
                     let time = display_local_time(time, &today_prefix);
                     let mut header = vec![Span::styled(
                         format!("  ▌ {label}"),
@@ -2393,7 +2382,15 @@ impl Transcript {
                             Style::default().fg(Color::Cyan),
                         )));
                     }
-                    if matches!(actor, EventActor::User | EventActor::Assistant)
+                    while lines.len() > entry_start
+                        && lines.last().is_some_and(line_is_blank)
+                    {
+                        lines.pop();
+                    }
+                    let message_content_end = lines.len();
+                    lines.push(Line::default());
+                    let message_end = lines.len();
+                    if is_chat_message
                         && (!defer_completed_message_backgrounds || !*complete)
                     {
                         let background = if hovered_message == Some(index) {
@@ -2401,19 +2398,18 @@ impl Transcript {
                         } else {
                             MESSAGE_BG
                         };
-                        for line in &mut lines[entry_start..] {
+                        for line in &mut lines[entry_start..message_end] {
                             apply_line_background(line, width, background);
                         }
                     }
-                    if matches!(actor, EventActor::User | EventActor::Assistant) && *complete {
-                        message_rows.push((index, entry_start, lines.len()));
+                    if is_chat_message && *complete {
+                        message_rows.push((index, entry_start, message_end));
                     }
                     selection_rows.push(SelectionRowRange::transcript_entry(
                         index,
                         entry_start,
-                        lines.len(),
+                        message_content_end,
                     ));
-                    lines.push(Line::default());
                 }
                 TranscriptEntry::Activity { text, time } => {
                     let time = display_local_time(time, &today_prefix);
@@ -2768,12 +2764,18 @@ impl Transcript {
                         code_view.as_ref(),
                         output_view.as_ref(),
                     );
-                    if *expanded
-                        && rich_ui
-                        && (tool_window.is_some() || !previous_is_tool)
+                    let (separator_before, separator_after) = tool_edge_separators(
+                        *expanded,
+                        rich_ui,
+                        *complete,
+                        tool_window.is_some(),
+                        previous_is_tool,
+                        next_is_tool,
+                    );
+                    if separator_before
                         && lines
                             .last()
-                            .is_some_and(|line: &Line<'static>| !line.spans.is_empty())
+                            .is_some_and(|line| !line_is_blank(line))
                     {
                         lines.push(tool_run_separator(tool_window.is_some()));
                     }
@@ -2957,12 +2959,10 @@ impl Transcript {
                             ));
                         }
                     }
-                    if *expanded
-                        && rich_ui
-                        && (tool_window.is_some() || !next_is_tool)
+                    if separator_after
                         && lines
                             .last()
-                            .is_some_and(|line: &Line<'static>| !line.spans.is_empty())
+                            .is_some_and(|line| !line_is_blank(line))
                     {
                         lines.push(tool_run_separator(tool_window.is_some()));
                     }
@@ -2975,7 +2975,7 @@ impl Transcript {
                     if tool_window.is_none() && !next_is_tool {
                         let tool_separator_row = if lines
                             .last()
-                            .is_some_and(|line: &Line<'static>| line.spans.is_empty())
+                            .is_some_and(line_is_blank)
                         {
                             lines.len().saturating_sub(1)
                         } else {

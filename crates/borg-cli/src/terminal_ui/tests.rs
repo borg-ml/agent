@@ -6722,7 +6722,13 @@ fn transcript_separates_labeled_groups_from_header_and_tool_activity() {
     assert_eq!(assistant_header_spans[1].style.fg, Some(Color::DarkGray));
     assert_eq!(assistant_header_spans[2].content, "  12:02");
     assert!(lines[assistant_header - 1].to_string().trim().is_empty());
-    assert!(lines[assistant_header - 1].spans.is_empty());
+    assert_eq!(
+        lines[assistant_header - 1]
+            .spans
+            .last()
+            .and_then(|span| span.style.bg),
+        Some(MESSAGE_BG)
+    );
     let plan_header = lines
         .iter()
         .position(|line| line.spans.iter().any(|span| span.content.contains("Plan")))
@@ -6765,8 +6771,90 @@ fn adjacent_tool_calls_are_compact_but_leave_gap_before_following_message() {
     let rendered = transcript.render(80, None, None, None);
     assert_eq!(rendered.1, vec![(0, 0, 1), (1, 1, 2)]);
     assert!(!rendered.0[1].spans.is_empty());
-    assert!(rendered.0[2].spans.is_empty());
-    assert_eq!(rendered.3[0].1, 3);
+    assert_eq!(
+        rendered.0[2].spans.last().and_then(|span| span.style.bg),
+        Some(MESSAGE_BG)
+    );
+    let (_, message_start, message_end) = rendered.3[0];
+    assert_eq!(message_start, 2);
+    assert_eq!(
+        rendered.0[message_end - 1]
+            .spans
+            .last()
+            .and_then(|span| span.style.bg),
+        Some(MESSAGE_BG)
+    );
+}
+
+#[test]
+fn message_tool_message_edges_have_one_separator_row_each() {
+    let mut transcript = Transcript::default();
+    let message = |actor: EventActor, text: &str, time: &str| TranscriptEntry::Message {
+        actor,
+        text: text.to_string(),
+        attachments: Vec::new(),
+        model: None,
+        effort: None,
+        time: time.to_string(),
+        status: MessageStatus::Complete,
+        complete: true,
+    };
+    transcript
+        .order
+        .push(message(EventActor::User, "request", "12:00"));
+    transcript.order.push(TranscriptEntry::Tool {
+        source_name: "command_execution".to_string(),
+        name: "Read".to_string(),
+        detail: "done".to_string(),
+        code_view: None,
+        output_view: None,
+        payload_refs: Vec::new(),
+        time: "12:01".to_string(),
+        started_at: Utc::now(),
+        completed_at: Some(Utc::now()),
+        complete: true,
+        error: false,
+        user_interrupted: false,
+        backgrounded: false,
+        expanded: false,
+    });
+    transcript
+        .order
+        .push(message(EventActor::Assistant, "answer", "12:02"));
+
+    let rendered = transcript.render(80, None, None, None);
+    let first_message = rendered.3[0];
+    let tool = rendered.1[0];
+    let second_message = rendered.3[1];
+
+    assert_eq!(first_message.2 - first_message.1, 4);
+    assert_eq!(second_message.2 - second_message.1, 4);
+    assert_eq!(tool.1, first_message.2);
+    assert_eq!(tool.2, second_message.1);
+    assert!(
+        rendered.0[first_message.1]
+            .spans
+            .last()
+            .is_some_and(|span| { span.style.bg == Some(MESSAGE_BG) })
+    );
+    assert!(
+        rendered.0[first_message.2 - 1]
+            .spans
+            .last()
+            .is_some_and(|span| span.style.bg == Some(MESSAGE_BG))
+    );
+    assert!(
+        rendered.0[second_message.1]
+            .spans
+            .last()
+            .is_some_and(|span| span.style.bg == Some(MESSAGE_BG))
+    );
+    assert!(
+        rendered.0[second_message.2 - 1]
+            .spans
+            .last()
+            .is_some_and(|span| span.style.bg == Some(MESSAGE_BG))
+    );
 }
 
 #[test]
@@ -6816,7 +6904,68 @@ fn adjacent_expanded_thinking_entries_are_compact_but_separate_from_message() {
     assert_eq!(thinking_rows.len(), 2);
     assert!(!lines[thinking_rows[1] - 1].spans.is_empty());
     assert!(lines[message_header - 1].to_string().trim().is_empty());
-    assert!(lines[message_header - 1].spans.is_empty());
+    assert_eq!(
+        lines[message_header - 1]
+            .spans
+            .last()
+            .and_then(|span| span.style.bg),
+        Some(MESSAGE_BG)
+    );
+}
+
+#[test]
+fn running_actions_keep_edge_spacing_in_compact_and_boxed_runs() {
+    let tool = |name: String, complete: bool| TranscriptEntry::Tool {
+        source_name: "command_execution".to_string(),
+        name,
+        detail: String::new(),
+        code_view: None,
+        output_view: None,
+        payload_refs: Vec::new(),
+        time: "12:00".to_string(),
+        started_at: Utc::now(),
+        completed_at: complete.then(Utc::now),
+        complete,
+        error: false,
+        user_interrupted: false,
+        backgrounded: false,
+        expanded: false,
+    };
+
+    let mut compact = Transcript::default();
+    compact.order.extend([
+        tool("before".to_string(), true),
+        tool("running".to_string(), false),
+        tool("after".to_string(), true),
+    ]);
+    let compact_lines = compact.lines(80);
+    let compact_running_row = compact_lines
+        .iter()
+        .position(|line| line.to_string().contains("running"))
+        .expect("compact running action");
+    assert!(compact_lines[compact_running_row - 1].spans.is_empty());
+    assert!(compact_lines[compact_running_row + 1].spans.is_empty());
+
+    let mut boxed = Transcript::default();
+    boxed.order.extend((0..9).map(|index| {
+        tool(
+            if index == 4 {
+                "running".to_string()
+            } else {
+                format!("done-{index}")
+            },
+            index != 4,
+        )
+    }));
+    let boxed_lines = boxed
+        .render_with_tool_run_viewport(80, 40, None, None, None)
+        .0;
+    let boxed_running_row = boxed_lines
+        .iter()
+        .position(|line| line.to_string().contains("running"))
+        .expect("boxed running action");
+    assert_eq!(boxed_lines[boxed_running_row - 1].to_string(), "│");
+    assert_eq!(boxed_lines[boxed_running_row + 1].to_string(), "│");
 }
 
 #[test]

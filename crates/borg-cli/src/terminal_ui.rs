@@ -4452,28 +4452,34 @@ impl BorgTerminal {
         // Keep a separate full-width measurement so an overflowing transcript
         // can switch to the scrollbar-safe width without rendering both widths
         // again on every frame.
-        let stale_full_transcript_render = input_fast_path.then(|| {
-            self.transcript_full_render_cache
-                .as_ref()
-                .filter(
-                    |(
-                        cached_width,
-                        cached_tool_run_viewport_height,
-                        cached_goal_tick,
-                        cached_tool_elapsed_tick,
-                        cached_date,
-                        _,
-                    )| {
-                        *cached_width == full_transcript_width
-                            && *cached_tool_run_viewport_height == tool_run_viewport_height
-                            && *cached_goal_tick == goal_tick
-                            && *cached_tool_elapsed_tick == tool_elapsed_tick
-                            && *cached_date == local_date
-                    },
-                )
-                .map(|(_, _, _, _, _, render)| Arc::clone(render))
-        });
-        let full_transcript_render = stale_full_transcript_render.flatten().unwrap_or_else(|| {
+        // A missing viewport cache means the transcript changed. Reusing the
+        // old full-width frame during a keystroke makes the composer flicker
+        // when the normal render catches up with a live transcript update.
+        let stale_full_transcript_render =
+            if input_fast_path && self.transcript_render_cache.is_some() {
+                self.transcript_full_render_cache
+                    .as_ref()
+                    .filter(
+                        |(
+                            cached_width,
+                            cached_tool_run_viewport_height,
+                            cached_goal_tick,
+                            cached_tool_elapsed_tick,
+                            cached_date,
+                            _,
+                        )| {
+                            *cached_width == full_transcript_width
+                                && *cached_tool_run_viewport_height == tool_run_viewport_height
+                                && *cached_goal_tick == goal_tick
+                                && *cached_tool_elapsed_tick == tool_elapsed_tick
+                                && *cached_date == local_date
+                        },
+                    )
+                    .map(|(_, _, _, _, _, render)| Arc::clone(render))
+            } else {
+                None
+            };
+        let full_transcript_render = stale_full_transcript_render.unwrap_or_else(|| {
             if self.transcript_render_cache.is_some() {
                 cached_transcript_render(
                     &self.transcript,
@@ -9267,6 +9273,22 @@ fn tool_run_separator(in_tool_run: bool) -> Line<'static> {
     } else {
         Line::default()
     }
+}
+
+fn tool_edge_separators(
+    expanded: bool,
+    rich_ui: bool,
+    complete: bool,
+    in_tool_run: bool,
+    previous_is_tool: bool,
+    next_is_tool: bool,
+) -> (bool, bool) {
+    let current_action = !complete;
+    let rich_action = expanded && rich_ui;
+    (
+        current_action || (rich_action && (in_tool_run || !previous_is_tool)),
+        current_action || (rich_action && (in_tool_run || !next_is_tool)),
+    )
 }
 
 fn sticky_tool_header_background(hovered: bool) -> Color {
