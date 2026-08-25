@@ -9222,11 +9222,10 @@ fn selection_line_ranges(line: &Line<'static>) -> Vec<(usize, usize)> {
     }
     let prefix = if first == "  " {
         2
-    } else if first.starts_with("│   │ ") {
-        first.width()
-    } else if first.starts_with("  │ ") {
-        first.width()
-    } else if matches!(first, "+ " | "− ") {
+    } else if first.starts_with("│   │ ")
+        || first.starts_with("  │ ")
+        || matches!(first, "+ " | "− ")
+    {
         first.width()
     } else {
         0
