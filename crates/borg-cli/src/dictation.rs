@@ -722,11 +722,7 @@ async fn read_recorder_stderr(mut reader: impl AsyncRead + Unpin) -> String {
     let mut output = Vec::new();
     let mut truncated = false;
     let mut buffer = [0_u8; 4096];
-    loop {
-        let read = match reader.read(&mut buffer).await {
-            Ok(read) => read,
-            Err(_) => break,
-        };
+    while let Ok(read) = reader.read(&mut buffer).await {
         if read == 0 {
             break;
         }
@@ -937,7 +933,7 @@ mod tests {
             .expect("unix tests have a user cache directory")
             .join("recordings");
         assert!(
-            (&*recorder.audio_path).starts_with(&recordings_dir),
+            recorder.audio_path.starts_with(&recordings_dir),
             "recording path should avoid the shared temp directory: {}",
             recorder.audio_path.display()
         );
