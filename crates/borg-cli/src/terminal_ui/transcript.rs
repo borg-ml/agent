@@ -1078,6 +1078,49 @@ impl Transcript {
             SessionEventKind::ReasoningCompleted => {
                 self.finish_reasoning(event.created_at);
             }
+            SessionEventKind::ProviderEvent { kind, payload, .. }
+                if is_live_tool_call_event(kind) =>
+            {
+                let Some(tool_call_id) = payload
+                    .get("tool_call_id")
+                    .and_then(serde_json::Value::as_str)
+                else {
+                    return removed_entry;
+                };
+                let Some(raw_name) = payload.get("name").and_then(serde_json::Value::as_str)
+                else {
+                    return removed_entry;
+                };
+                if self.tools.contains_key(tool_call_id) {
+                    return removed_entry;
+                }
+                self.finish_reasoning(event.created_at);
+                let input = payload
+                    .get("input")
+                    .unwrap_or(&serde_json::Value::Null);
+                let presentation = project_tool_presentation(raw_name, input, None, false);
+                let display_name = presentation.label;
+                let detail = presentation.detail;
+                let code_view = presentation.input.map(|body| (body.language, body.text));
+                let tool_index = self.order.len();
+                self.tools.insert(tool_call_id.to_string(), tool_index);
+                self.order.push(TranscriptEntry::Tool {
+                    source_name: raw_name.to_string(),
+                    name: display_name,
+                    detail,
+                    code_view,
+                    output_view: None,
+                    payload_refs: Vec::new(),
+                    time: local_event_time(event),
+                    started_at: event.created_at,
+                    completed_at: None,
+                    complete: false,
+                    error: false,
+                    user_interrupted: false,
+                    backgrounded: false,
+                    expanded: false,
+                });
+            }
             SessionEventKind::ToolStarted {
                 tool_call_id,
                 name,
@@ -1105,6 +1148,41 @@ impl Transcript {
                         || (!is_edit_diff
                             && code_view.is_some()
                             && (rich_ui || self.auto_expand_tools)));
+                if let Some(tool_index) = self.tools.get(tool_call_id).copied()
+                    && let Some(TranscriptEntry::Tool {
+                        source_name: stored_source_name,
+                        name: stored_name,
+                        detail: stored_detail,
+                        code_view: stored_code_view,
+                        output_view: stored_output_view,
+                        payload_refs: stored_payload_refs,
+                        complete: stored_complete,
+                        error: stored_error,
+                        user_interrupted: stored_user_interrupted,
+                        backgrounded: stored_backgrounded,
+                        expanded: stored_expanded,
+                        completed_at: stored_completed_at,
+                        ..
+                    }) = self.order.get_mut(tool_index)
+                    && !*stored_complete
+                {
+                    *stored_source_name = name.clone();
+                    *stored_name = display_name;
+                    *stored_detail = detail;
+                    *stored_code_view = code_view;
+                    *stored_output_view = None;
+                    *stored_payload_refs = input_ref.iter().cloned().collect();
+                    *stored_complete = false;
+                    *stored_error = false;
+                    *stored_user_interrupted = false;
+                    *stored_backgrounded = false;
+                    *stored_expanded = expanded;
+                    *stored_completed_at = None;
+                    if is_edit_diff {
+                        self.last_edit = Some(tool_index);
+                    }
+                    return removed_entry;
+                }
                 let tool_index = self.order.len();
                 self.tools.insert(tool_call_id.clone(), tool_index);
                 self.order.push(TranscriptEntry::Tool {
@@ -2838,6 +2916,8 @@ impl Transcript {
                         Some("preparing edit")
                     } else if !*complete && !is_reasoning && !is_instant {
                         Some("running")
+                    } else if !*complete && is_instant {
+                        Some("in progress")
                     } else {
                         None
                     };

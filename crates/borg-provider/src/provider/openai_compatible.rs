@@ -989,6 +989,7 @@ async fn read_compatible_model_stream(
     let mut reasoning_content = String::new();
     let mut reasoning_details = Vec::new();
     let mut tool_calls = BTreeMap::<usize, PartialToolCall>::new();
+    let mut started_tool_calls = HashSet::new();
     let mut finish_reason = None;
     let mut usage = None;
     let mut saw_done = false;
@@ -1086,6 +1087,17 @@ async fn read_compatible_model_stream(
                         delta.pointer("/function/arguments").and_then(Value::as_str)
                     {
                         call.arguments.push_str(arguments);
+                    }
+                    if !call.id.is_empty()
+                        && !call.name.is_empty()
+                        && started_tool_calls.insert(index)
+                        && let Some(sender) = progress
+                    {
+                        let _ = sender.send(ProviderProgress::ToolCallStarted {
+                            id: call.id.clone(),
+                            name: call.name.clone(),
+                            input: Value::Null,
+                        });
                     }
                 }
             }
@@ -1635,6 +1647,14 @@ mod tests {
         };
         assert_eq!(kind, "reasoning_delta");
         assert_eq!(content_text.as_deref(), Some("inspect "));
+        let ProviderProgress::ToolCallStarted { id, name, input } =
+            progress_rx.try_recv().expect("tool-call progress event")
+        else {
+            panic!("expected tool-call progress event");
+        };
+        assert_eq!(id, "call-1");
+        assert_eq!(name, "read_");
+        assert_eq!(input, Value::Null);
         assert_eq!(streamed.finish_reason, "tool_calls");
         let ModelMessage::Assistant {
             reasoning_content,

@@ -1255,6 +1255,21 @@ async fn call_model_streaming(
                         payload,
                     }).await;
                 }
+                Some(ProviderProgress::ToolCallStarted { id, name, input }) => {
+                    send(
+                        context.events,
+                        SessionEventKind::ProviderEvent {
+                            provider: context.coding_provider,
+                            kind: "tool_call_started".to_string(),
+                            payload: json!({
+                                "tool_call_id": id,
+                                "name": name,
+                                "input": input,
+                            }),
+                        },
+                    )
+                    .await;
+                }
                 Some(_) => {}
                 None => progress_open = false,
             },
@@ -2267,6 +2282,13 @@ mod tests {
                     effort: None,
                 })
                 .expect("progress receiver remains alive");
+            progress
+                .send(ProviderProgress::ToolCallStarted {
+                    id: "call-1".to_string(),
+                    name: "apply_patch".to_string(),
+                    input: Value::Null,
+                })
+                .expect("progress receiver remains alive");
             *self.held_progress.lock().unwrap() = Some(progress);
             Ok(ModelTurnResult {
                 message: ModelMessage::assistant(
@@ -2346,6 +2368,16 @@ mod tests {
                 payload,
                 ..
             }) if kind == "background_task_live" && payload["task_id"] == "task-1"
+        ));
+        assert!(matches!(
+            events_rx.recv().await,
+            Some(SessionEventKind::ProviderEvent {
+                kind,
+                payload,
+                ..
+            }) if kind == "tool_call_started"
+                && payload["tool_call_id"] == "call-1"
+                && payload["name"] == "apply_patch"
         ));
     }
 

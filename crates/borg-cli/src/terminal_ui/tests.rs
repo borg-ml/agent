@@ -1409,6 +1409,35 @@ fn running_tool_pulse_moves_across_text_without_touching_the_gutter() {
             .map(|span| span.style)
             .collect::<Vec<_>>()
     );
+
+    let mut white = Line::from(vec![
+        Span::styled("│ ", resting),
+        Span::styled("white action", Style::default().fg(Color::White)),
+    ]);
+    apply_running_activity_pulse(&mut white, RUNNING_PULSE_RADIUS);
+    assert!(
+        white
+            .spans
+            .iter()
+            .skip(1)
+            .any(|span| span.style.fg == Some(Color::Gray))
+    );
+    assert!(
+        !white
+            .spans
+            .iter()
+            .skip(1)
+            .any(|span| span.style.fg == Some(Color::LightYellow))
+    );
+
+    let mut paused = Line::from(vec![
+        Span::styled("│ ", resting),
+        Span::styled("running action", resting),
+    ]);
+    let paused_before = paused.clone();
+    let sweep_width = "running action".width() + RUNNING_PULSE_RADIUS * 2;
+    apply_running_activity_pulse(&mut paused, sweep_width + RUNNING_PULSE_PAUSE_STEPS);
+    assert_eq!(paused.spans, paused_before.spans);
 }
 
 #[test]
@@ -2996,6 +3025,108 @@ fn an_edit_reads_as_preparing_until_its_diff_is_on_screen() {
     assert!(!read.contains("preparing edit"), "{read}");
     assert!(read.contains("◇ Read"), "{read}");
     assert!(!read.contains("· running"), "{read}");
+}
+
+#[test]
+fn streamed_tool_preview_is_replaced_by_the_durable_tool_once() {
+    let session_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::ProviderEvent {
+            provider: CodingProvider::OpenRouter,
+            kind: "tool_call_started".to_string(),
+            payload: serde_json::json!({
+                "tool_call_id": "edit-1",
+                "name": "apply_patch",
+                "input": null,
+            }),
+        },
+    ));
+    let pending = transcript
+        .lines(120)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(pending.contains("◇ Edit"), "{pending}");
+    assert!(pending.contains("preparing edit"), "{pending}");
+    assert_eq!(
+        transcript
+            .order
+            .iter()
+            .filter(|entry| matches!(entry, TranscriptEntry::Tool { .. }))
+            .count(),
+        1
+    );
+
+    let input = serde_json::json!({
+        "file_path": "src/main.rs",
+        "patch": "--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1 +1 @@\n-old\n+new\n",
+    });
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::ToolStarted {
+            tool_call_id: "edit-1".to_string(),
+            name: "apply_patch".to_string(),
+            input: input.clone(),
+            input_ref: None,
+        },
+    ));
+    assert_eq!(
+        transcript
+            .order
+            .iter()
+            .filter(|entry| matches!(entry, TranscriptEntry::Tool { .. }))
+            .count(),
+        1
+    );
+
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        3,
+        SessionEventKind::ToolCompleted {
+            tool_call_id: "edit-1".to_string(),
+            output: "applied".to_string(),
+            output_ref: None,
+            is_error: false,
+            input: Some(input),
+            input_ref: None,
+        },
+    ));
+    let completed = transcript
+        .lines(120)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(completed.contains("✓ Edit"), "{completed}");
+    assert!(!completed.contains("preparing edit"), "{completed}");
+
+    let mut plan = Transcript::default();
+    plan.apply(&SessionEvent::new(
+        session_id,
+        4,
+        SessionEventKind::ProviderEvent {
+            provider: CodingProvider::OpenRouter,
+            kind: "tool_call_started".to_string(),
+            payload: serde_json::json!({
+                "tool_call_id": "plan-1",
+                "name": "update_plan",
+                "input": null,
+            }),
+        },
+    ));
+    let plan = plan
+        .lines(120)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(plan.contains("◇ Update plan"), "{plan}");
+    assert!(plan.contains("in progress"), "{plan}");
 }
 
 #[test]

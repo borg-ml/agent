@@ -2292,7 +2292,9 @@ impl BorgTerminal {
             SessionEventKind::SessionStarted
             | SessionEventKind::ProviderSessionLinked { .. }
             | SessionEventKind::SubagentControl { .. } => false,
-            SessionEventKind::ProviderEvent { kind, .. } => is_context_compaction(kind),
+            SessionEventKind::ProviderEvent { kind, .. } => {
+                is_context_compaction(kind) || is_live_tool_call_event(kind)
+            }
             _ => true,
         };
         if let SessionEventKind::StatusChanged { status, .. } = event.kind {
@@ -8304,7 +8306,9 @@ fn session_event_changes_transcript(kind: &SessionEventKind) -> bool {
             ..
         } => true,
         SessionEventKind::StatusChanged { .. } => false,
-        SessionEventKind::ProviderEvent { kind, .. } => is_context_compaction(kind),
+        SessionEventKind::ProviderEvent { kind, .. } => {
+            is_context_compaction(kind) || is_live_tool_call_event(kind)
+        }
         SessionEventKind::SubagentActivity {
             activity,
             agent,
@@ -8325,6 +8329,10 @@ fn session_event_changes_transcript(kind: &SessionEventKind) -> bool {
         | SessionEventKind::TurnCompleted { .. }
         | SessionEventKind::Error { .. } => true,
     }
+}
+
+fn is_live_tool_call_event(kind: &str) -> bool {
+    kind == "tool_call_started"
 }
 
 fn should_suppress_root_subagent_activity(
@@ -11486,11 +11494,15 @@ fn replace_tool_activity_glyph(line: &mut Line<'static>, glyph: &str) {
 }
 
 const RUNNING_PULSE_RADIUS: usize = 2;
+const RUNNING_PULSE_STEP_MILLIS: u128 = 80;
+const RUNNING_PULSE_PAUSE_STEPS: usize = 32;
 
 fn running_activity_pulse_phase() -> usize {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| (elapsed.as_millis() / 90) as usize)
+        .map_or(0, |elapsed| {
+            (elapsed.as_millis() / RUNNING_PULSE_STEP_MILLIS) as usize
+        })
 }
 
 fn apply_running_activity_pulse(line: &mut Line<'static>, phase: usize) {
@@ -11507,8 +11519,13 @@ fn apply_running_activity_pulse(line: &mut Line<'static>, phase: usize) {
         return;
     }
 
-    let cycle = content_width.saturating_add(RUNNING_PULSE_RADIUS * 2);
-    let pulse_center = (phase % cycle) as isize - RUNNING_PULSE_RADIUS as isize;
+    let sweep_width = content_width.saturating_add(RUNNING_PULSE_RADIUS * 2);
+    let cycle = sweep_width.saturating_add(RUNNING_PULSE_PAUSE_STEPS);
+    let phase = phase % cycle;
+    if phase >= sweep_width {
+        return;
+    }
+    let pulse_center = phase as isize - RUNNING_PULSE_RADIUS as isize;
     let mut offset = 0usize;
     let mut spans = Vec::with_capacity(line.spans.len() + 2);
     spans.push(line.spans[0].clone());
@@ -11554,7 +11571,7 @@ fn brighten_color(color: Color, steps: u8) -> Color {
         }
         Color::DarkGray => Color::Gray,
         Color::Gray => Color::White,
-        Color::White => Color::LightYellow,
+        Color::White => Color::Gray,
         Color::Red => Color::LightRed,
         Color::Green => Color::LightGreen,
         Color::Yellow => Color::LightYellow,

@@ -54,7 +54,7 @@ mod local_server;
 
 const MIN_TUI_FPS: u64 = 15;
 const MAX_TUI_FPS: u64 = 240;
-const ACTIVITY_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(120);
+const ACTIVITY_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(80);
 const IDLE_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 const MAX_RENDER_BACKOFF_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 const LOCAL_RESUME_RETRY_INITIAL_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
