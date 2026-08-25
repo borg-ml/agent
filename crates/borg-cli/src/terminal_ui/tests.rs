@@ -6722,13 +6722,7 @@ fn transcript_separates_labeled_groups_from_header_and_tool_activity() {
     assert_eq!(assistant_header_spans[1].style.fg, Some(Color::DarkGray));
     assert_eq!(assistant_header_spans[2].content, "  12:02");
     assert!(lines[assistant_header - 1].to_string().trim().is_empty());
-    assert_eq!(
-        lines[assistant_header - 1]
-            .spans
-            .last()
-            .and_then(|span| span.style.bg),
-        Some(MESSAGE_BG)
-    );
+    assert!(lines[assistant_header - 1].spans.is_empty());
     let plan_header = lines
         .iter()
         .position(|line| line.spans.iter().any(|span| span.content.contains("Plan")))
@@ -6771,11 +6765,8 @@ fn adjacent_tool_calls_are_compact_but_leave_gap_before_following_message() {
     let rendered = transcript.render(80, None, None, None);
     assert_eq!(rendered.1, vec![(0, 0, 1), (1, 1, 2)]);
     assert!(!rendered.0[1].spans.is_empty());
-    assert_eq!(
-        rendered.0[2].spans.last().and_then(|span| span.style.bg),
-        Some(MESSAGE_BG)
-    );
-    assert_eq!(rendered.3[0].1, 2);
+    assert!(rendered.0[2].spans.is_empty());
+    assert_eq!(rendered.3[0].1, 3);
 }
 
 #[test]
@@ -6825,6 +6816,7 @@ fn adjacent_expanded_thinking_entries_are_compact_but_separate_from_message() {
     assert_eq!(thinking_rows.len(), 2);
     assert!(!lines[thinking_rows[1] - 1].spans.is_empty());
     assert!(lines[message_header - 1].to_string().trim().is_empty());
+    assert!(lines[message_header - 1].spans.is_empty());
 }
 
 #[test]

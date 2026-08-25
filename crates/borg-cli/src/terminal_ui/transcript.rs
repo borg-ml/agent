@@ -2204,6 +2204,11 @@ impl Transcript {
                 entry,
                 TranscriptEntry::Message { status, .. } if *status != MessageStatus::Queued
             );
+            let previous_is_tool = index > 0
+                && matches!(
+                    self.order.get(index - 1),
+                    Some(TranscriptEntry::Tool { .. })
+                );
             let starts_labeled_group = visible_message
                 || matches!(
                     entry,
@@ -2234,7 +2239,17 @@ impl Transcript {
             } else {
                 false
             };
-            let entry_start = if added_group_separator
+            let message_has_tool_separator = matches!(
+                entry,
+                TranscriptEntry::Message {
+                    actor: EventActor::User | EventActor::Assistant,
+                    ..
+                }
+            ) && (existing_tool_separator.is_some()
+                || (added_group_separator && previous_is_tool));
+            let entry_start = if message_has_tool_separator {
+                lines.len()
+            } else if added_group_separator
                 && matches!(
                     entry,
                     TranscriptEntry::Message {
@@ -2735,11 +2750,6 @@ impl Transcript {
                     expanded,
                     ..
                 } => {
-                    let previous_is_tool = index > 0
-                        && matches!(
-                            self.order.get(index - 1),
-                            Some(TranscriptEntry::Tool { .. })
-                        );
                     let next_is_tool = matches!(
                         self.order.get(index + 1),
                         Some(TranscriptEntry::Tool { .. })
