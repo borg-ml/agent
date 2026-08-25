@@ -266,7 +266,7 @@ impl SqliteReceiptStore {
     }
 
     async fn begin_write(&self) -> Result<Transaction<'static, Sqlite>> {
-        Ok(self.pool.begin_with("BEGIN IMMEDIATE").await?)
+        Ok(crate::SqliteSessionStore::begin_sqlite_write(&self.pool).await?)
     }
 
     async fn ensure_schema(&self) -> Result<()> {

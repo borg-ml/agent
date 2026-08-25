@@ -57,6 +57,8 @@ const MAX_TUI_FPS: u64 = 240;
 const ACTIVITY_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(120);
 const IDLE_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 const MAX_RENDER_BACKOFF_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+const LOCAL_RESUME_RETRY_INITIAL_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+const LOCAL_RESUME_RETRY_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
 const EXTENSION_DISCOVERY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 /// Keep first paint bounded while retaining enough context to include a real
 /// recent exchange instead of an empty shell made only of projection events.
@@ -730,6 +732,7 @@ pub(crate) async fn run_local_agent(args: LocalAgentCliArgs) -> Result<()> {
     let mut selected_session = None;
     let mut restored_prompt = None;
     let mut reusable_terminal = None;
+    let mut resume_retry_delay = LOCAL_RESUME_RETRY_INITIAL_DELAY;
     loop {
         let resume_requested =
             args.resume.is_some() || args.continue_latest || selected_session.is_some();
@@ -751,6 +754,12 @@ pub(crate) async fn run_local_agent(args: LocalAgentCliArgs) -> Result<()> {
                 selected_session = Some(next_session);
                 restored_prompt = next_prompt;
                 reusable_terminal = next_terminal;
+                if resume_requested {
+                    tokio::time::sleep(resume_retry_delay).await;
+                    resume_retry_delay = next_local_resume_retry_delay(resume_retry_delay);
+                } else {
+                    resume_retry_delay = LOCAL_RESUME_RETRY_INITIAL_DELAY;
+                }
             }
             Ok(Ok(None)) => {
                 crash_context.tui_active.store(false, Ordering::Release);
@@ -761,7 +770,11 @@ pub(crate) async fn run_local_agent(args: LocalAgentCliArgs) -> Result<()> {
                 crash_context.set_retry_notice(format!(
                     "The resumed session is waiting on its journal and Borg is retrying: {error:#}"
                 ));
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                if selected_session.is_none() {
+                    selected_session = args.resume;
+                }
+                tokio::time::sleep(resume_retry_delay).await;
+                resume_retry_delay = next_local_resume_retry_delay(resume_retry_delay);
                 continue;
             }
             Ok(Err(error)) if crash_context.tui_active.swap(false, Ordering::AcqRel) => {
@@ -771,7 +784,8 @@ pub(crate) async fn run_local_agent(args: LocalAgentCliArgs) -> Result<()> {
                 crash_context.set_retry_notice(format!(
                     "The resumed session hit a transient error and Borg is reconnecting: {error:#}"
                 ));
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                tokio::time::sleep(resume_retry_delay).await;
+                resume_retry_delay = next_local_resume_retry_delay(resume_retry_delay);
                 selected_session = Some(session_id);
                 continue;
             }
@@ -5220,6 +5234,13 @@ fn local_resume_error_is_retryable(error: &anyhow::Error) -> bool {
         || message.contains("database table is locked")
         || message.contains("database is busy")
         || message.contains("pool timed out")
+}
+
+fn next_local_resume_retry_delay(delay: std::time::Duration) -> std::time::Duration {
+    delay
+        .checked_mul(2)
+        .unwrap_or(LOCAL_RESUME_RETRY_MAX_DELAY)
+        .min(LOCAL_RESUME_RETRY_MAX_DELAY)
 }
 
 async fn resolve_resume_target(

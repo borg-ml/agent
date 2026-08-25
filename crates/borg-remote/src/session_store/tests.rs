@@ -214,6 +214,47 @@ async fn writer_contention_has_a_bounded_escape_hatch() {
 }
 
 #[tokio::test]
+async fn writer_contention_does_not_exhaust_the_pool() {
+    let (_directory, store) = store().await;
+    let session_id = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+    let blocker = store.begin_write().await.unwrap();
+
+    let contenders = (0..8)
+        .map(|_| {
+            let pool = store.pool().clone();
+            tokio::spawn(async move {
+                SqliteSessionStore::begin_sqlite_write_with_timeout(&pool, Duration::from_secs(2))
+                    .await
+            })
+        })
+        .collect::<Vec<_>>();
+
+    // Before the admission gate, the seven available connections all sit in
+    // SQLite busy waits and the next ordinary read times out waiting for the
+    // pool. The read must remain available while the journal writer is held.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            store.contains_session(session_id)
+        )
+        .await
+        .expect("a read must not wait behind blocked writers")
+        .expect("the session read must succeed")
+    );
+
+    blocker.rollback().await.unwrap();
+    for contender in contenders {
+        let _transaction = tokio::time::timeout(Duration::from_secs(2), contender)
+            .await
+            .expect("contending writer did not finish")
+            .expect("contending writer task panicked")
+            .expect("contending writer failed after the lock cleared");
+    }
+}
+
+#[tokio::test]
 async fn empty_sessions_are_discarded_but_real_sessions_are_kept() {
     let (_directory, store) = store().await;
     let empty = Uuid::new_v4();

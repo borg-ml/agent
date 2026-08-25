@@ -52,6 +52,15 @@ fn resume_retries_sqlite_contention_but_not_permanent_errors() {
     )));
 }
 
+#[test]
+fn resume_retry_delay_is_capped_to_avoid_a_reconnect_storm() {
+    let mut delay = LOCAL_RESUME_RETRY_INITIAL_DELAY;
+    for _ in 0..8 {
+        delay = next_local_resume_retry_delay(delay);
+    }
+    assert_eq!(delay, LOCAL_RESUME_RETRY_MAX_DELAY);
+}
+
 #[cfg(unix)]
 fn short_socket_tempdir() -> tempfile::TempDir {
     tempfile::Builder::new()

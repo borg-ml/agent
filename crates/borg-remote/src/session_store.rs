@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::str::FromStr;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -27,7 +28,11 @@ use crate::{
 
 pub(crate) const INLINE_SESSION_PAYLOAD_BYTES: usize = 64 * 1024;
 pub(crate) const SESSION_PAYLOAD_PREVIEW_BYTES: usize = 4 * 1024;
-const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+// A blocked SQLite connection must return to the pool quickly. The writer
+// admission loop below owns the longer wait; keeping that wait in SQLite
+// would strand a pooled connection and starve unrelated reads.
+const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_millis(100);
+const SQLITE_SCHEMA_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 const SQLITE_WRITE_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 const SQLITE_WRITE_TRANSACTION: &str = "BEGIN IMMEDIATE";
 const SQLITE_JOURNAL_SIZE_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
@@ -1063,7 +1068,7 @@ impl SqliteSessionStore {
             .foreign_keys(true);
         let open_error_context =
             || format!("failed to open SQLite session store {}", path.display());
-        let schema_deadline = std::time::Instant::now() + SQLITE_BUSY_TIMEOUT;
+        let schema_deadline = std::time::Instant::now() + SQLITE_SCHEMA_WAIT_TIMEOUT;
         let pool = loop {
             match SqlitePoolOptions::new()
                 .max_connections(8)
@@ -1081,7 +1086,7 @@ impl SqliteSessionStore {
             }
         };
         let store = Self { pool };
-        let schema_deadline = std::time::Instant::now() + SQLITE_BUSY_TIMEOUT;
+        let schema_deadline = std::time::Instant::now() + SQLITE_SCHEMA_WAIT_TIMEOUT;
         let schema_result = loop {
             match store.ensure_schema().await {
                 Ok(()) => break Ok(()),
@@ -2228,6 +2233,22 @@ impl SqliteSessionStore {
         timeout: Duration,
     ) -> Result<Transaction<'static, Sqlite>, sqlx::Error> {
         let deadline = tokio::time::Instant::now() + timeout;
+        // SQLite has one writer at a time, but this pool also serves reads and
+        // projections. Keep only one connection in this process waiting for
+        // that writer lock; otherwise concurrent retries can occupy every
+        // pooled connection and make unrelated store reads time out.
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let _write_gate =
+            match tokio::time::timeout(remaining, sqlite_write_begin_gate().lock()).await {
+                Ok(guard) => guard,
+                Err(_) => {
+                    warn!(
+                        timeout_seconds = timeout.as_secs(),
+                        "SQLite session journal writer wait timed out"
+                    );
+                    return Err(sqlx::Error::PoolTimedOut);
+                }
+            };
         let mut reported_contention = false;
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -4045,6 +4066,11 @@ impl SqliteSessionStore {
         .await?;
         Ok(compact_event)
     }
+}
+
+fn sqlite_write_begin_gate() -> &'static tokio::sync::Mutex<()> {
+    static GATE: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    GATE.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 fn is_disposable_schema_error(error: &anyhow::Error) -> bool {

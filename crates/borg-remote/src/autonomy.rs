@@ -28,7 +28,6 @@ const MAX_CHECKPOINT_KEY_BYTES: usize = 256;
 const MAX_CHECKPOINT_KIND_BYTES: usize = 128;
 const MAX_CHECKPOINT_JSON_BYTES: usize = 2 * 1024 * 1024;
 
-const SQLITE_WRITE_TRANSACTION: &str = "BEGIN IMMEDIATE";
 const AUTONOMY_SCHEMA_VERSION: i64 = 2;
 
 /// The durable lifecycle of one programmatic runtime job.
@@ -392,7 +391,7 @@ impl SqliteAutonomyStore {
         let payload_json = serde_json::to_string(&input.payload)?;
         let now = Utc::now();
         let job_id = input.job_id.unwrap_or_else(Uuid::new_v4);
-        let mut tx = self.pool.begin_with(SQLITE_WRITE_TRANSACTION).await?;
+        let mut tx = crate::SqliteSessionStore::begin_sqlite_write(&self.pool).await?;
 
         if let Some(row) = sqlx::query("select * from autonomy_jobs where idempotency_key=?")
             .bind(&input.idempotency_key)
@@ -499,7 +498,7 @@ impl SqliteAutonomyStore {
         validate_batch_size(limit)?;
         ensure!(!lease_duration.is_zero(), "lease duration must be non-zero");
         let lease_expires_at = add_duration(now, lease_duration)?;
-        let mut tx = self.pool.begin_with(SQLITE_WRITE_TRANSACTION).await?;
+        let mut tx = crate::SqliteSessionStore::begin_sqlite_write(&self.pool).await?;
         let rows = sqlx::query(
             "select job_id from autonomy_jobs \
              where state='queued' and due_at_ms <= ? and attempt < max_attempts \
@@ -569,7 +568,7 @@ impl SqliteAutonomyStore {
         validate_owner(&lease.owner)?;
         ensure!(!lease_duration.is_zero(), "lease duration must be non-zero");
         let lease_expires_at = add_duration(now, lease_duration)?;
-        let mut tx = self.pool.begin_with(SQLITE_WRITE_TRANSACTION).await?;
+        let mut tx = crate::SqliteSessionStore::begin_sqlite_write(&self.pool).await?;
         let current = load_job(&mut tx, job_id).await?;
         ensure!(
             matches!(
@@ -622,7 +621,7 @@ impl SqliteAutonomyStore {
             expected,
             next
         );
-        let mut tx = self.pool.begin_with(SQLITE_WRITE_TRANSACTION).await?;
+        let mut tx = crate::SqliteSessionStore::begin_sqlite_write(&self.pool).await?;
         let current = load_job(&mut tx, job_id).await?;
         ensure!(
             current.state == expected,
@@ -718,7 +717,7 @@ impl SqliteAutonomyStore {
             result_json.len() <= MAX_PAYLOAD_BYTES,
             "autonomy job result exceeds {MAX_PAYLOAD_BYTES} bytes"
         );
-        let mut tx = self.pool.begin_with(SQLITE_WRITE_TRANSACTION).await?;
+        let mut tx = crate::SqliteSessionStore::begin_sqlite_write(&self.pool).await?;
         let current = load_job(&mut tx, job_id).await?;
         ensure!(
             current.state == AutonomyJobState::Running,
@@ -785,7 +784,7 @@ impl SqliteAutonomyStore {
         session_id: Option<Uuid>,
     ) -> Result<Vec<AutonomyJob>> {
         validate_batch_size(limit)?;
-        let mut tx = self.pool.begin_with(SQLITE_WRITE_TRANSACTION).await?;
+        let mut tx = crate::SqliteSessionStore::begin_sqlite_write(&self.pool).await?;
         let rows = sqlx::query(
             "select job_id from autonomy_jobs \
              where state in ('claimed', 'running') and lease_expires_at_ms <= ? \
@@ -869,7 +868,7 @@ impl SqliteAutonomyStore {
         let evidence_json = serde_json::to_string(&input.evidence)?;
         let content_hash = checkpoint_hash(&state_json, &evidence_json);
         let checkpoint_id = input.checkpoint_id.unwrap_or_else(Uuid::new_v4);
-        let mut tx = self.pool.begin_with(SQLITE_WRITE_TRANSACTION).await?;
+        let mut tx = crate::SqliteSessionStore::begin_sqlite_write(&self.pool).await?;
         let job = load_job(&mut tx, input.job_id).await?;
         if let Some(session_id) = input.session_id {
             ensure!(
