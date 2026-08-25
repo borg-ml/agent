@@ -1,9 +1,9 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::str::FromStr;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -2234,21 +2234,22 @@ impl SqliteSessionStore {
     ) -> Result<Transaction<'static, Sqlite>, sqlx::Error> {
         let deadline = tokio::time::Instant::now() + timeout;
         // SQLite has one writer at a time, but this pool also serves reads and
-        // projections. Keep only one connection in this process waiting for
-        // that writer lock; otherwise concurrent retries can occupy every
-        // pooled connection and make unrelated store reads time out.
+        // projections. Keep only one connection per database in this process
+        // waiting for that writer lock; otherwise concurrent retries can
+        // occupy every pooled connection and make unrelated store reads time
+        // out.
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        let _write_gate =
-            match tokio::time::timeout(remaining, sqlite_write_begin_gate().lock()).await {
-                Ok(guard) => guard,
-                Err(_) => {
-                    warn!(
-                        timeout_seconds = timeout.as_secs(),
-                        "SQLite session journal writer wait timed out"
-                    );
-                    return Err(sqlx::Error::PoolTimedOut);
-                }
-            };
+        let write_gate = sqlite_write_begin_gate(pool);
+        let _write_gate = match tokio::time::timeout(remaining, write_gate.lock()).await {
+            Ok(guard) => guard,
+            Err(_) => {
+                warn!(
+                    timeout_seconds = timeout.as_secs(),
+                    "SQLite session journal writer wait timed out"
+                );
+                return Err(sqlx::Error::PoolTimedOut);
+            }
+        };
         let mut reported_contention = false;
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -4068,9 +4069,20 @@ impl SqliteSessionStore {
     }
 }
 
-fn sqlite_write_begin_gate() -> &'static tokio::sync::Mutex<()> {
-    static GATE: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-    GATE.get_or_init(|| tokio::sync::Mutex::new(()))
+fn sqlite_write_begin_gate(pool: &SqlitePool) -> Arc<tokio::sync::Mutex<()>> {
+    static GATES: OnceLock<Mutex<HashMap<PathBuf, Weak<tokio::sync::Mutex<()>>>>> = OnceLock::new();
+    let path = pool.connect_options().get_filename().to_owned();
+    let mut gates = GATES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("SQLite writer gate registry lock poisoned");
+    gates.retain(|_, gate| gate.strong_count() > 0);
+    if let Some(gate) = gates.get(&path).and_then(Weak::upgrade) {
+        return gate;
+    }
+    let gate = Arc::new(tokio::sync::Mutex::new(()));
+    gates.insert(path, Arc::downgrade(&gate));
+    gate
 }
 
 fn is_disposable_schema_error(error: &anyhow::Error) -> bool {
