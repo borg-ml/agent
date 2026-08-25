@@ -65,6 +65,7 @@ fn resume_retry_delay_is_capped_to_avoid_a_reconnect_storm() {
 fn short_socket_tempdir() -> tempfile::TempDir {
     let temp_root = std::env::var_os("TMPDIR")
         .map(std::path::PathBuf::from)
+        .filter(|path| path.to_string_lossy().len() <= 32)
         .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
     tempfile::Builder::new()
         .prefix("borg-session-")

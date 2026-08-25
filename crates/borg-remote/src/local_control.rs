@@ -901,9 +901,12 @@ mod tests {
     use crate::PromptDelivery;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    const MAX_UNIX_SOCKET_TEMP_ROOT_LENGTH: usize = 32;
+
     fn short_socket_tempdir() -> tempfile::TempDir {
         let temp_root = std::env::var_os("TMPDIR")
             .map(PathBuf::from)
+            .filter(|path| path.to_string_lossy().len() <= MAX_UNIX_SOCKET_TEMP_ROOT_LENGTH)
             .unwrap_or_else(|| PathBuf::from("/tmp"));
         tempfile::Builder::new()
             .prefix("borg-session-")

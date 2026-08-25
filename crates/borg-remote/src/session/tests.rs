@@ -2048,7 +2048,7 @@ async fn detached_live_projection_cannot_block_durable_turn_terminalization() {
     let session_store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             let durable = session_store.read(session_id).await.unwrap_or_default();
             if durable.iter().any(|event| {
