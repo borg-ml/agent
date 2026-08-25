@@ -2296,7 +2296,7 @@ impl SqliteSessionStore {
                             timeout_seconds = timeout.as_secs(),
                             "SQLite session journal writer wait timed out"
                         );
-                        return Err(error);
+                        return Err(sqlx::Error::PoolTimedOut);
                     }
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
