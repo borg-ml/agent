@@ -2254,3 +2254,38 @@ fn redirected_output_never_enters_rich_terminal_mode() {
     assert!(!rich_terminal_can_prompt(true, false, false));
     assert!(!rich_terminal_can_prompt(true, true, true));
 }
+
+#[test]
+fn usage_screen_keeps_account_limits_and_session_usage_distinct() {
+    let session = SessionUsage {
+        calls: 2,
+        input_tokens: 12_345,
+        output_tokens: 678,
+        cached_input_tokens: 1_234,
+        total_tokens: 13_023,
+        ..SessionUsage::default()
+    };
+    let limits = CodexAccountRateLimits {
+        plan_type: Some("pro".to_string()),
+        primary: Some(CodexRateLimitWindow {
+            used_percent: 48,
+            window_duration_mins: 10_080,
+            resets_at: None,
+        }),
+        secondary: None,
+    };
+
+    let summary = format_usage_summary(CodingProvider::Codex, &session, Some(&limits));
+    assert!(summary.contains("Account limits · Codex"));
+    assert!(summary.contains("Weekly"));
+    assert!(summary.contains("[██████████░░░░░░░░░░] 52% left"));
+    assert!(summary.contains("Session\n"));
+    assert!(summary.contains("Input tokens     12,345"));
+    assert!(summary.contains("Total tokens     13,023"));
+    assert!(!summary.contains("Session ·"));
+
+    let generic = format_usage_summary(CodingProvider::OpenRouter, &SessionUsage::default(), None);
+    assert!(generic.contains("Account limits · OpenRouter"));
+    assert!(generic.contains("not exposed by OpenRouter"));
+    assert!(!generic.contains("Codex"));
+}

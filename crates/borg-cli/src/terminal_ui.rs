@@ -465,7 +465,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/icons", "choose the dictation icon"),
     ("/colors", "view configurable transcript colours"),
     ("/color", "set a transcript colour"),
-    ("/usage", "view real Codex weekly limit and session usage"),
+    ("/usage", "view account limits and session usage"),
     ("/clear", "clear conversation context"),
     ("/compact", "compact the current conversation context"),
     ("/resume", "resume a saved Borg session"),

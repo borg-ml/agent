@@ -394,6 +394,146 @@ pub struct ChatStreamRequest {
     pub resume_unavailable_prompt: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexRateLimitWindow {
+    pub used_percent: u8,
+    pub window_duration_mins: u64,
+    pub resets_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexAccountRateLimits {
+    pub plan_type: Option<String>,
+    pub primary: Option<CodexRateLimitWindow>,
+    pub secondary: Option<CodexRateLimitWindow>,
+}
+
+/// Read the authenticated Codex account limits through the same app-server
+/// protocol used for subscription turns. The command layer decides how to
+/// present an unavailable account view for other providers.
+pub async fn read_codex_account_rate_limits() -> Result<CodexAccountRateLimits> {
+    #[cfg(not(feature = "codex"))]
+    {
+        bail!("Codex account limits require the Codex subscription adapter")
+    }
+    #[cfg(feature = "codex")]
+    {
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            read_codex_account_rate_limits_inner(),
+        )
+        .await
+        .context("timed out reading Codex account limits")?
+    }
+}
+
+#[cfg(feature = "codex")]
+async fn read_codex_account_rate_limits_inner() -> Result<CodexAccountRateLimits> {
+    let mut command = Command::new("codex");
+    command
+        .args(["app-server", "--stdio"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let mut child = command
+        .spawn()
+        .context("failed to start Codex app server for account limits")?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .context("Codex app server stdin pipe missing")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("Codex app server stdout pipe missing")?;
+    let mut lines = BufReader::new(stdout).lines();
+    let result = async {
+        write_codex_request(
+            &mut stdin,
+            1,
+            "initialize",
+            serde_json::json!({
+                "clientInfo": {
+                    "name": "borg",
+                    "title": "Borg",
+                    "version": env!("CARGO_PKG_VERSION")
+                },
+                "capabilities": {
+                    "experimentalApi": true,
+                    "optOutNotificationMethods": []
+                }
+            }),
+        )
+        .await
+        .context("failed to initialize Codex app server for account limits")?;
+        read_codex_response(&mut lines, 1).await?;
+        write_codex_notification(&mut stdin, "initialized", Value::Object(Default::default()))
+            .await?;
+        write_codex_request(
+            &mut stdin,
+            2,
+            "account/rateLimits/read",
+            Value::Object(Default::default()),
+        )
+        .await?;
+        let response = read_codex_response(&mut lines, 2).await?;
+        parse_codex_account_rate_limits(&response)
+    }
+    .await;
+    drop(lines);
+    drop(stdin);
+    child.start_kill().ok();
+    let _ = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
+    result
+}
+
+fn parse_codex_account_rate_limits(response: &Value) -> Result<CodexAccountRateLimits> {
+    let limits = response
+        .pointer("/result/rateLimits")
+        .or_else(|| response.get("rateLimits"))
+        .context("Codex account response did not contain rate limits")?;
+    Ok(CodexAccountRateLimits {
+        plan_type: limits
+            .get("planType")
+            .or_else(|| limits.get("plan_type"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        primary: parse_codex_rate_limit_window(limits.get("primary"))?,
+        secondary: parse_codex_rate_limit_window(limits.get("secondary"))?,
+    })
+}
+
+fn parse_codex_rate_limit_window(value: Option<&Value>) -> Result<Option<CodexRateLimitWindow>> {
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let used_percent = value
+        .get("usedPercent")
+        .or_else(|| value.get("used_percent"))
+        .and_then(Value::as_u64)
+        .context("Codex account response omitted rate-limit usage")?
+        .min(100) as u8;
+    let window_duration_mins = value
+        .get("windowDurationMins")
+        .or_else(|| value.get("window_duration_mins"))
+        .and_then(Value::as_u64)
+        .context("Codex account response omitted rate-limit window")?;
+    let resets_at = value
+        .get("resetsAt")
+        .or_else(|| value.get("resets_at"))
+        .and_then(|value| {
+            value
+                .as_i64()
+                .or_else(|| value.as_u64().map(|value| value as i64))
+        });
+    Ok(Some(CodexRateLimitWindow {
+        used_percent,
+        window_duration_mins,
+        resets_at,
+    }))
+}
+
 /// A volatile, per-Borg-session Claude subscription lane.
 ///
 /// Borg's SQLite journal remains authoritative. This pool only keeps the
@@ -3466,6 +3606,35 @@ impl SubscriptionProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_account_rate_limits_parse_app_server_shape() {
+        let parsed = parse_codex_account_rate_limits(&serde_json::json!({
+            "result": {
+                "rateLimits": {
+                    "planType": "pro",
+                    "primary": {
+                        "usedPercent": 49,
+                        "windowDurationMins": 10080,
+                        "resetsAt": 1788137121
+                    },
+                    "secondary": null
+                }
+            }
+        }))
+        .expect("Codex account limits");
+
+        assert_eq!(parsed.plan_type.as_deref(), Some("pro"));
+        assert_eq!(
+            parsed.primary,
+            Some(CodexRateLimitWindow {
+                used_percent: 49,
+                window_duration_mins: 10080,
+                resets_at: Some(1788137121),
+            })
+        );
+        assert_eq!(parsed.secondary, None);
+    }
 
     #[test]
     fn steer_admission_has_exactly_one_winner() {

@@ -1,6 +1,17 @@
 const USER_INTERRUPT_ACTIVITY: &str = "agent interrupted by user";
 const TOOL_ELAPSED_REFRESH_MILLIS: i64 = 100;
 
+fn goal_status_label(status: GoalStatus) -> &'static str {
+    match status {
+        GoalStatus::Active => "active",
+        GoalStatus::Paused => "paused",
+        GoalStatus::Blocked => "blocked",
+        GoalStatus::UsageLimited => "usage limited",
+        GoalStatus::BudgetLimited => "budget limited",
+        GoalStatus::Complete => "complete",
+    }
+}
+
 fn line_is_blank(line: &Line<'static>) -> bool {
     line.spans
         .iter()
@@ -1970,7 +1981,7 @@ impl Transcript {
     fn goal_status(&self) -> Option<String> {
         let goal = self.goal.as_ref()?;
         let label = match goal.status {
-            GoalStatus::Active => "pursuing",
+            GoalStatus::Active => "active",
             GoalStatus::Paused => "paused",
             GoalStatus::Blocked => "blocked",
             GoalStatus::UsageLimited => "usage limited",
@@ -2634,8 +2645,13 @@ impl Transcript {
                         ),
                         Span::styled(
                             format_elapsed_duration(live_time).map_or_else(
-                                || format!("  {time}  {:?}", goal.status),
-                                |duration| format!("  {time}  {:?} · {duration}", goal.status),
+                                || format!("  {time}  {}", goal_status_label(goal.status)),
+                                |duration| {
+                                    format!(
+                                        "  {time}  {} · {duration}",
+                                        goal_status_label(goal.status)
+                                    )
+                                },
                             ),
                             Style::default().fg(Color::DarkGray),
                         ),

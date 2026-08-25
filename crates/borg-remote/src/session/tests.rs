@@ -4477,6 +4477,138 @@ async fn model_consultation_dispatches_a_freeform_briefing_to_an_isolated_provid
 }
 
 #[tokio::test]
+async fn resuming_an_idle_goal_emits_starting_before_running() {
+    let root = tempdir().unwrap();
+    let session_id = Uuid::new_v4();
+    let (store, mut journal) = sqlite_runtime_store(&root, session_id).await;
+    let mut goal = SessionGoal::new("Keep going".to_string(), None);
+    goal.status = GoalStatus::Paused;
+    journal
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::SessionStarted,
+        ))
+        .await
+        .unwrap();
+    journal
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::SessionConfigured {
+                cwd: root.path().to_path_buf(),
+                provider: CodingProvider::Codex,
+                model: None,
+                effort: None,
+                fast: false,
+                response_language: crate::ResponseLanguage::Auto,
+                permission_mode: PermissionMode::Manual,
+            },
+        ))
+        .await
+        .unwrap();
+    journal
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::GoalUpdated { goal },
+        ))
+        .await
+        .unwrap();
+    drop(journal);
+
+    let (command_tx, command_rx) = mpsc::channel(8);
+    let (event_tx, mut event_rx) = mpsc::channel(128);
+    let executor = Arc::new(RecordingExecutor {
+        seen: Arc::new(Mutex::new(Vec::new())),
+        called: Arc::new(Notify::new()),
+    });
+    let actor = tokio::spawn({
+        let journal_path = root.path().join("session.lock");
+        let cwd = root.path().to_path_buf();
+        async move {
+            run_agent_session_with_executor(
+                &journal_path,
+                session_id,
+                LaunchSession {
+                    request_id: Uuid::new_v4(),
+                    cwd,
+                    provider: CodingProvider::Codex,
+                    model: None,
+                    effort: None,
+                    fast: Some(false),
+                    response_language: crate::ResponseLanguage::Auto,
+                    permission_mode: PermissionMode::Manual,
+                    name: None,
+                    initial_prompt: None,
+                    capabilities: Default::default(),
+                    subagent_concurrency_limit: None,
+                    extension_skill_roots: Vec::new(),
+                    team_policy: None,
+                },
+                command_rx,
+                event_tx,
+                executor,
+            )
+            .await
+        }
+    });
+
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+            .await
+            .expect("idle session reaches Ready");
+        let Some(event) = event else {
+            let outcome = actor.await;
+            panic!("session actor ended before Ready: {outcome:?}");
+        };
+        if matches!(
+            event.kind,
+            SessionEventKind::StatusChanged {
+                status: SessionStatus::Ready,
+                ..
+            }
+        ) {
+            break;
+        }
+    }
+
+    command_tx
+        .send(HostCommand::Goal {
+            session_id,
+            action: GoalAction::Resume,
+        })
+        .await
+        .unwrap();
+
+    let mut statuses = Vec::new();
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+            .await
+            .expect("resumed goal starts a turn")
+            .expect("session event stream remains open");
+        if let SessionEventKind::StatusChanged { status, .. } = event.kind {
+            statuses.push(status);
+            if status == SessionStatus::Running {
+                break;
+            }
+        }
+    }
+    assert_eq!(statuses, [SessionStatus::Starting, SessionStatus::Running]);
+
+    command_tx
+        .send(HostCommand::Stop { session_id })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), actor)
+        .await
+        .expect("session stops after the lifecycle assertion")
+        .unwrap()
+        .unwrap();
+    assert!(store.state(session_id).await.unwrap().goal.is_some());
+}
+
+#[tokio::test]
 async fn goal_state_is_recoverable_from_the_session_journal() {
     let root = tempdir().unwrap();
     let session_id = Uuid::new_v4();

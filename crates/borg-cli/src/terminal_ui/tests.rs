@@ -2620,6 +2620,14 @@ fn actionable_inactive_goals_remain_in_the_status_line() {
     goal.time_used_seconds = 125;
     let session_id = Uuid::new_v4();
 
+    goal.status = GoalStatus::Active;
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        0,
+        SessionEventKind::GoalUpdated { goal: goal.clone() },
+    ));
+    assert_eq!(transcript.goal_status().as_deref(), Some("active /goal 2m"));
+
     goal.status = GoalStatus::Paused;
     transcript.apply(&SessionEvent::new(
         session_id,

@@ -10,6 +10,9 @@ use std::sync::{
 };
 
 use anyhow::{Context, Result, ensure};
+use borg_provider::provider::{
+    CodexAccountRateLimits, CodexRateLimitWindow, read_codex_account_rate_limits,
+};
 use borg_remote::{
     AgentTurnExecutor, ApprovalDecision, CodingProvider, EventActor, GoalAction, GoalStatus,
     HostCommand, HostConfig, HostExecutionProfile, HostExecutorFactory, LaunchSession,
@@ -25,7 +28,7 @@ use borg_remote::{
     run_attached_session, run_host_with_executor_factory, send_local_session_command,
     session_control_socket_path,
 };
-use chrono::{Local, Utc};
+use chrono::{Local, TimeZone, Utc};
 use futures_util::FutureExt;
 use pulldown_cmark::{Event as MarkdownEvent, Parser as MarkdownParser};
 use serde::Deserialize;
@@ -2363,12 +2366,14 @@ async fn run_local_agent_session(
                         input_tokens,
                         output_tokens,
                         cached_input_tokens,
+                        total_tokens,
                         cost_usd,
                         ..
                     } => session_usage.add(
                         *input_tokens,
                         *output_tokens,
                         *cached_input_tokens,
+                        *total_tokens,
                         *cost_usd,
                     ),
                     SessionEventKind::SubagentActivity {
@@ -2657,9 +2662,10 @@ async fn run_local_agent_session(
                     continue;
                 }
                 if line == "/usage" {
+                    let summary = usage_summary(provider, &session_usage).await;
                     println!(
-                        "\n  {}\n",
-                        usage_summary(provider, &session_usage).await
+                        "\n  Usage\n{}\n",
+                        indent_usage_summary(&summary)
                     );
                     continue;
                 }
@@ -6453,7 +6459,7 @@ fn print_agent_help() {
   /colors           show transcript colours
   /color TARGET HEX set a transcript colour
   /icons            choose the dictation icon (nerd or emoji)
-  /usage            show real Codex weekly limit and session tokens
+  /usage            view account limits and session usage
   /clear            clear the conversation context
   /compact          compact the current provider context
   /goal             show the durable session goal
@@ -6532,6 +6538,7 @@ struct SessionUsage {
     input_tokens: u64,
     output_tokens: u64,
     cached_input_tokens: u64,
+    total_tokens: u64,
     cost_usd: Option<f64>,
 }
 
@@ -6542,35 +6549,170 @@ impl SessionUsage {
             input_tokens: projected.input_tokens,
             output_tokens: projected.output_tokens,
             cached_input_tokens: projected.cached_input_tokens,
+            total_tokens: projected.total_tokens,
             cost_usd: projected.cost_usd,
         }
     }
 
-    fn add(&mut self, input: u64, output: u64, cached: u64, cost: Option<f64>) {
+    fn add(&mut self, input: u64, output: u64, cached: u64, total: u64, cost: Option<f64>) {
         self.calls += 1;
         self.input_tokens += input;
         self.output_tokens += output;
         self.cached_input_tokens += cached;
+        self.total_tokens += total;
         if let Some(cost) = cost {
             self.cost_usd = Some(self.cost_usd.unwrap_or_default() + cost);
         }
     }
-
-    fn summary(&self) -> String {
-        let mut summary = format!(
-            "Session · {} calls · {} input · {} cached · {} output",
-            self.calls, self.input_tokens, self.cached_input_tokens, self.output_tokens
-        );
-        if let Some(cost) = self.cost_usd {
-            summary.push_str(&format!(" · ${cost:.4}"));
-        }
-        summary
-    }
 }
 
 async fn usage_summary(provider: CodingProvider, session: &SessionUsage) -> String {
-    let _ = provider;
-    session.summary()
+    let limits = if provider == CodingProvider::Codex {
+        match read_codex_account_rate_limits().await {
+            Ok(limits) => Some(limits),
+            Err(error) => {
+                tracing::debug!(%error, "Codex account limits unavailable for usage view");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    format_usage_summary(provider, session, limits.as_ref())
+}
+
+fn format_usage_summary(
+    provider: CodingProvider,
+    session: &SessionUsage,
+    limits: Option<&CodexAccountRateLimits>,
+) -> String {
+    let mut lines = vec![format!("Account limits · {}", provider.label())];
+    if provider == CodingProvider::Codex {
+        if let Some(limits) = limits {
+            if let Some(plan) = limits.plan_type.as_deref() {
+                lines.push(format!("  {:<16} {}", "Plan", title_case(plan)));
+            }
+            for (label, window) in [
+                ("Primary", limits.primary.as_ref()),
+                ("Secondary", limits.secondary.as_ref()),
+            ] {
+                if let Some(window) = window {
+                    append_rate_limit_window(&mut lines, label, window);
+                }
+            }
+            if limits.primary.is_none() && limits.secondary.is_none() {
+                lines.push("  No active account limit reported.".to_string());
+            }
+        } else {
+            lines.push("  Unavailable      Could not read current account limits.".to_string());
+            lines.push("  Details          https://chatgpt.com/codex/settings/usage".to_string());
+        }
+    } else {
+        lines.push(format!(
+            "  Unavailable      Account limits are not exposed by {}.",
+            provider.label()
+        ));
+    }
+
+    lines.extend([
+        String::new(),
+        "Session".to_string(),
+        format!("  {:<16} {}", "Calls", format_count(session.calls)),
+        format!(
+            "  {:<16} {}",
+            "Input tokens",
+            format_count(session.input_tokens)
+        ),
+        format!(
+            "  {:<16} {}",
+            "Cached input",
+            format_count(session.cached_input_tokens)
+        ),
+        format!(
+            "  {:<16} {}",
+            "Output tokens",
+            format_count(session.output_tokens)
+        ),
+        format!(
+            "  {:<16} {}",
+            "Total tokens",
+            format_count(session.total_tokens)
+        ),
+    ]);
+    if let Some(cost) = session.cost_usd {
+        lines.push(format!("  {:<16} ${cost:.4}", "Estimated cost"));
+    }
+    if session.calls == 0 {
+        lines.push("  Status           No completed provider turns yet.".to_string());
+    }
+    lines.join("\n")
+}
+
+fn indent_usage_summary(summary: &str) -> String {
+    summary
+        .lines()
+        .map(|line| format!("  {line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn append_rate_limit_window(lines: &mut Vec<String>, label: &str, window: &CodexRateLimitWindow) {
+    lines.push(format!(
+        "  {:<16} {}",
+        window_label(label, window.window_duration_mins),
+        rate_limit_bar(window.used_percent)
+    ));
+    if let Some(resets_at) = window.resets_at
+        && let Some(reset) = Local.timestamp_opt(resets_at, 0).single()
+    {
+        lines.push(format!(
+            "  {:<16} resets {}",
+            "",
+            reset.format("%H:%M on %d %b")
+        ));
+    }
+}
+
+fn window_label(fallback: &str, duration_mins: u64) -> String {
+    match duration_mins {
+        0 => fallback.to_string(),
+        10_080 => "Weekly".to_string(),
+        1_440 => "Daily".to_string(),
+        300 => "5-hour".to_string(),
+        60 => "Hourly".to_string(),
+        mins if mins % 1_440 == 0 => format!("{}-day", mins / 1_440),
+        mins if mins % 60 == 0 => format!("{}-hour", mins / 60),
+        mins => format!("{mins}-minute"),
+    }
+}
+
+fn rate_limit_bar(used_percent: u8) -> String {
+    let left_percent = 100_u8.saturating_sub(used_percent.min(100));
+    let filled = usize::from(left_percent) * 20 / 100;
+    format!(
+        "[{}{}] {left_percent}% left",
+        "█".repeat(filled),
+        "░".repeat(20 - filled)
+    )
+}
+
+fn title_case(value: &str) -> String {
+    let mut chars = value.chars();
+    chars.next().map_or_else(String::new, |first| {
+        format!("{}{}", first.to_uppercase(), chars.as_str())
+    })
+}
+
+fn format_count(value: u64) -> String {
+    let raw = value.to_string();
+    let mut formatted = String::with_capacity(raw.len() + raw.len() / 3);
+    for (index, character) in raw.chars().enumerate() {
+        if index > 0 && (raw.len() - index) % 3 == 0 {
+            formatted.push(',');
+        }
+        formatted.push(character);
+    }
+    formatted
 }
 
 fn parse_todo_action(line: &str, items: &[PlanItem]) -> Result<TodoAction> {

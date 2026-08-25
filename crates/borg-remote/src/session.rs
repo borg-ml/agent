@@ -1790,6 +1790,16 @@ async fn run_agent_session_store_kernel(
                             .as_ref()
                             .is_some_and(|goal| goal.status == GoalStatus::Active)
                         {
+                            record(
+                                &mut journal,
+                                &events,
+                                session_id,
+                                SessionEventKind::StatusChanged {
+                                    status: SessionStatus::Starting,
+                                    detail: None,
+                                },
+                            )
+                            .await?;
                             break Some(QueuedPrompt {
                                 message_id: Uuid::new_v4(),
                                 text: continuation_prompt(
