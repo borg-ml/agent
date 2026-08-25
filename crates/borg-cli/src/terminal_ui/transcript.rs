@@ -22,14 +22,6 @@ fn line_is_unstyled_blank(line: &Line<'static>) -> bool {
     line.spans.is_empty()
 }
 
-fn line_is_tool_edge_separator(line: &Line<'static>, in_tool_run: bool) -> bool {
-    if in_tool_run {
-        line.spans.len() == 1 && line.spans[0].content == "│"
-    } else {
-        line_is_unstyled_blank(line)
-    }
-}
-
 struct Transcript {
     order: Vec<TranscriptEntry>,
     messages: HashMap<Uuid, usize>,
@@ -2237,11 +2229,6 @@ impl Transcript {
                 entry,
                 TranscriptEntry::Message { status, .. } if *status != MessageStatus::Queued
             );
-            let previous_is_tool = index > 0
-                && matches!(
-                    self.order.get(index - 1),
-                    Some(TranscriptEntry::Tool { .. })
-                );
             let starts_labeled_group = visible_message
                 || matches!(
                     entry,
@@ -2791,10 +2778,6 @@ impl Transcript {
                         code_view.as_ref(),
                         Some((language, _)) if language == "reasoning"
                     );
-                    let rich_ui = tool_has_rich_ui(
-                        name,
-                        code_view.as_ref().map(|(language, _)| language.as_str()),
-                    );
                     let expandable = tool_has_expandable_body(
                         source_name,
                         code_view.as_ref(),
@@ -2804,24 +2787,6 @@ impl Transcript {
                         name,
                         code_view.as_ref().map(|(language, _)| language.as_str()),
                     );
-                    let (separator_before, separator_after) = tool_edge_separators(
-                        *expanded,
-                        rich_ui,
-                        *complete,
-                        is_reasoning,
-                        tool_window.is_some(),
-                        previous_is_tool,
-                        next_is_tool,
-                    );
-                    if separator_before
-                        && lines
-                            .last()
-                            .is_some_and(|line| {
-                                !line_is_tool_edge_separator(line, tool_window.is_some())
-                            })
-                    {
-                        lines.push(tool_run_separator(tool_window.is_some()));
-                    }
                     let summary_start = lines.len();
                     let glyph = if *error {
                         "!"
@@ -3009,15 +2974,6 @@ impl Transcript {
                                 body_prefix,
                             ));
                         }
-                    }
-                    if separator_after
-                        && lines
-                            .last()
-                            .is_some_and(|line| {
-                                !line_is_tool_edge_separator(line, tool_window.is_some())
-                            })
-                    {
-                        lines.push(tool_run_separator(tool_window.is_some()));
                     }
                     tool_rows.push((index, summary_start, lines.len()));
                     selection_rows.push(if tool_window.is_some() {

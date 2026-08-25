@@ -4637,33 +4637,24 @@ impl BorgTerminal {
         // Keep a separate full-width measurement so an overflowing transcript
         // can switch to the scrollbar-safe width without rendering both widths
         // again on every frame.
-        // A missing viewport cache means the transcript changed. Reusing the
-        // old full-width frame during a keystroke makes the composer flicker
-        // when the normal render catches up with a live transcript update.
-        let stale_full_transcript_render =
-            if input_fast_path && self.transcript_render_cache.is_some() {
-                self.transcript_full_render_cache
-                    .as_ref()
-                    .filter(
-                        |(
-                            cached_width,
-                            cached_tool_run_viewport_height,
-                            cached_goal_tick,
-                            cached_tool_elapsed_tick,
-                            cached_date,
-                            _,
-                        )| {
-                            *cached_width == full_transcript_width
-                                && *cached_tool_run_viewport_height == tool_run_viewport_height
-                                && *cached_goal_tick == goal_tick
-                                && *cached_tool_elapsed_tick == tool_elapsed_tick
-                                && *cached_date == local_date
-                        },
-                    )
-                    .map(|(_, _, _, _, _, render)| Arc::clone(render))
-            } else {
-                None
-            };
+        // Input redraws must not rebuild the transcript while a live event is
+        // invalidating its normal viewport cache. Reuse the last complete
+        // snapshot for the composer frame; the next ordinary frame catches up
+        // the transcript and its elapsed-time projection.
+        let stale_full_transcript_render = if input_fast_path {
+            self.transcript_full_render_cache
+                .as_ref()
+                .filter(
+                    |(cached_width, cached_tool_run_viewport_height, _, _, cached_date, _)| {
+                        *cached_width == full_transcript_width
+                            && *cached_tool_run_viewport_height == tool_run_viewport_height
+                            && *cached_date == local_date
+                    },
+                )
+                .map(|(_, _, _, _, _, render)| Arc::clone(render))
+        } else {
+            None
+        };
         let full_transcript_render = stale_full_transcript_render.unwrap_or_else(|| {
             if self.transcript_render_cache.is_some() {
                 cached_transcript_render(
@@ -5226,7 +5217,7 @@ impl BorgTerminal {
                             &mut header,
                             activity_glyph(SessionStatus::Running),
                         );
-                        apply_running_tool_pulse(&mut header, running_activity_pulse_phase());
+                        apply_running_activity_pulse(&mut header, running_activity_pulse_phase());
                     }
                     (index, header, expandable)
                 });
@@ -5245,7 +5236,7 @@ impl BorgTerminal {
                                     &mut header,
                                     activity_glyph(SessionStatus::Running),
                                 );
-                                apply_running_tool_pulse(
+                                apply_running_activity_pulse(
                                     &mut header,
                                     running_activity_pulse_phase(),
                                 );
@@ -5268,7 +5259,7 @@ impl BorgTerminal {
                         && let Some(line) = visible_transcript.get_mut(*start - scroll_start)
                     {
                         replace_tool_activity_glyph(line, activity_glyph(SessionStatus::Running));
-                        apply_running_tool_pulse(line, running_activity_pulse_phase());
+                        apply_running_activity_pulse(line, running_activity_pulse_phase());
                     }
                     if self.hovered_tool == Some(*index) {
                         apply_viewport_background(
@@ -5696,6 +5687,11 @@ impl BorgTerminal {
                 status_highlight,
                 status_duration.as_deref(),
             );
+            if session_is_active {
+                let mut status_line = Line::from(status_spans);
+                apply_running_activity_pulse(&mut status_line, running_activity_pulse_phase());
+                status_spans = status_line.spans;
+            }
             let status_width = status_spans.iter().map(|span| span.width()).sum::<usize>();
             let agents_status = agents_status_label(active_subagents);
             let agents_status_width = agents_status
@@ -9816,31 +9812,6 @@ fn selection_column_for_offset(line: &Line<'static>, mut offset: usize) -> usize
     ranges.last().map_or(0, |(_, end)| *end)
 }
 
-fn tool_run_separator(in_tool_run: bool) -> Line<'static> {
-    if in_tool_run {
-        Line::from(Span::styled("│", Style::default().fg(Color::DarkGray)))
-    } else {
-        Line::default()
-    }
-}
-
-fn tool_edge_separators(
-    expanded: bool,
-    rich_ui: bool,
-    complete: bool,
-    is_reasoning: bool,
-    in_tool_run: bool,
-    previous_is_tool: bool,
-    next_is_tool: bool,
-) -> (bool, bool) {
-    let current_action = !complete || is_reasoning;
-    let rich_action = expanded && rich_ui;
-    (
-        current_action || (rich_action && (in_tool_run || !previous_is_tool)),
-        current_action || (rich_action && (in_tool_run || !next_is_tool)),
-    )
-}
-
 fn sticky_tool_header_background(hovered: bool) -> Color {
     if hovered {
         MESSAGE_HOVER_BG
@@ -11522,7 +11493,7 @@ fn running_activity_pulse_phase() -> usize {
         .map_or(0, |elapsed| (elapsed.as_millis() / 90) as usize)
 }
 
-fn apply_running_tool_pulse(line: &mut Line<'static>, phase: usize) {
+fn apply_running_activity_pulse(line: &mut Line<'static>, phase: usize) {
     if line.spans.len() < 2 {
         return;
     }

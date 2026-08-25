@@ -1381,8 +1381,8 @@ fn running_tool_pulse_moves_across_text_without_touching_the_gutter() {
     ]);
     let mut second = first.clone();
 
-    apply_running_tool_pulse(&mut first, RUNNING_PULSE_RADIUS);
-    apply_running_tool_pulse(&mut second, RUNNING_PULSE_RADIUS + 6);
+    apply_running_activity_pulse(&mut first, RUNNING_PULSE_RADIUS);
+    apply_running_activity_pulse(&mut second, RUNNING_PULSE_RADIUS + 6);
 
     assert_eq!(first.spans[0].style, resting);
     assert_eq!(second.spans[0].style, resting);
@@ -7040,7 +7040,7 @@ fn adjacent_expanded_thinking_entries_are_compact_but_separate_from_message() {
         .expect("assistant header");
 
     assert_eq!(thinking_rows.len(), 2);
-    assert!(lines[thinking_rows[1] - 1].spans.is_empty());
+    assert!(!lines[thinking_rows[1] - 1].spans.is_empty());
     assert!(lines[message_header - 1].to_string().trim().is_empty());
     assert_eq!(
         lines[message_header - 1]
@@ -7081,8 +7081,8 @@ fn running_actions_keep_edge_spacing_in_compact_and_boxed_runs() {
         .iter()
         .position(|line| line.to_string().contains("running"))
         .expect("compact running action");
-    assert!(compact_lines[compact_running_row - 1].spans.is_empty());
-    assert!(compact_lines[compact_running_row + 1].spans.is_empty());
+    assert!(!compact_lines[compact_running_row - 1].spans.is_empty());
+    assert!(!compact_lines[compact_running_row + 1].spans.is_empty());
 
     let mut boxed = Transcript::default();
     boxed.order.extend((0..9).map(|index| {
@@ -7102,8 +7102,16 @@ fn running_actions_keep_edge_spacing_in_compact_and_boxed_runs() {
         .iter()
         .position(|line| line.to_string().contains("running"))
         .expect("boxed running action");
-    assert_eq!(boxed_lines[boxed_running_row - 1].to_string(), "│");
-    assert_eq!(boxed_lines[boxed_running_row + 1].to_string(), "│");
+    assert!(
+        boxed_lines[boxed_running_row - 1]
+            .to_string()
+            .contains("done-3")
+    );
+    assert!(
+        boxed_lines[boxed_running_row + 1]
+            .to_string()
+            .contains("done-5")
+    );
 }
 
 #[test]
