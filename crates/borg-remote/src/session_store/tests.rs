@@ -817,6 +817,66 @@ async fn stale_in_progress_message_does_not_resurrect_terminal_action() {
 }
 
 #[tokio::test]
+async fn accepted_steer_queue_event_reopens_a_terminal_action_projection() {
+    let (directory, store) = store().await;
+    let session_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+    for kind in [
+        SessionEventKind::SessionStarted,
+        configured(directory.path()),
+        SessionEventKind::Message {
+            message_id,
+            actor: EventActor::User,
+            text: "accepted steer".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Queued,
+            delivery: Some(PromptDelivery::Steer),
+        },
+        SessionEventKind::TurnStarted {
+            message_id,
+            provider: CodingProvider::Codex,
+            model: Some("gpt-test".to_string()),
+            effort: Some("high".to_string()),
+            fast: false,
+        },
+        SessionEventKind::TurnCompleted {
+            message_id,
+            provider_session_id: None,
+            final_text: String::new(),
+            error: None,
+        },
+        SessionEventKind::Message {
+            message_id,
+            actor: EventActor::User,
+            text: "accepted steer".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Queued,
+            delivery: Some(PromptDelivery::Queue),
+        },
+    ] {
+        store
+            .append(SessionEvent::new(session_id, 0, kind))
+            .await
+            .unwrap();
+    }
+
+    let action = store.action(session_id, message_id).await.unwrap().unwrap();
+    assert_eq!(action.kind, crate::SessionActionKind::Prompt);
+    assert_eq!(action.state, SessionActionState::Queued);
+    assert!(
+        store
+            .pending_actions(session_id, 10)
+            .await
+            .unwrap()
+            .iter()
+            .any(|pending| {
+                pending.action_id == message_id && pending.kind == crate::SessionActionKind::Prompt
+            })
+    );
+}
+
+#[tokio::test]
 async fn concurrent_claims_have_one_winner_and_same_owner_claim_is_idempotent() {
     let (_directory, store) = store().await;
     let session_id = Uuid::new_v4();

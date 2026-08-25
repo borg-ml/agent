@@ -2967,10 +2967,9 @@ async fn accepted_codex_steer_is_requeued_when_turn_is_interrupted() {
         transitions,
         [
             (MessageStatus::Queued, PromptDelivery::Steer),
-            (MessageStatus::Complete, PromptDelivery::Steer),
             (MessageStatus::Queued, PromptDelivery::Queue),
         ],
-        "an accepted steer must be retried when its surrounding turn is interrupted"
+        "an accepted steer must stay durable and be retried when its surrounding turn is interrupted"
     );
 
     command_tx
@@ -3078,10 +3077,9 @@ async fn accepted_claude_steer_is_requeued_when_turn_is_interrupted() {
         transitions,
         [
             (MessageStatus::Queued, PromptDelivery::Steer),
-            (MessageStatus::Complete, PromptDelivery::Steer),
             (MessageStatus::Queued, PromptDelivery::Queue),
         ],
-        "an accepted Claude steer must be retried when its surrounding turn is interrupted"
+        "an accepted Claude steer must stay durable and be retried when its surrounding turn is interrupted"
     );
 
     command_tx
@@ -3189,17 +3187,21 @@ async fn rejected_codex_steer_retries_at_the_next_tool_boundary() {
     tokio::time::timeout(Duration::from_secs(1), retry_accepted.notified())
         .await
         .expect("steer retries when the tool completes");
+    command_tx
+        .send(HostCommand::Interrupt { session_id })
+        .await
+        .unwrap();
     loop {
         let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
             .await
-            .expect("committed retry event arrives")
+            .expect("interrupted retry event arrives")
             .expect("session remains open");
         if matches!(
             event.kind,
             SessionEventKind::Message {
                 message_id,
-                status: MessageStatus::Complete,
-                delivery: Some(PromptDelivery::Steer),
+                status: MessageStatus::Queued,
+                delivery: Some(PromptDelivery::Queue),
                 ..
             } if message_id == followup_id
         ) {
@@ -3207,10 +3209,6 @@ async fn rejected_codex_steer_retries_at_the_next_tool_boundary() {
         }
     }
 
-    command_tx
-        .send(HostCommand::Interrupt { session_id })
-        .await
-        .unwrap();
     command_tx
         .send(HostCommand::Stop { session_id })
         .await
@@ -4961,7 +4959,6 @@ fn only_an_uncommitted_steer_is_withdrawable_from_the_active_turn() {
             },
             admission,
             state,
-            status_recorded: false,
             attempt_boundary: 0,
         };
     let accepted = SteerAdmission::pending();
@@ -5904,6 +5901,57 @@ fn prompt_recovery_allows_an_explicit_retry_after_terminal_status() {
     let recovered = recover_queued_prompts(&events);
     assert_eq!(recovered.len(), 1);
     assert_eq!(recovered[0].message_id, message_id);
+    assert_eq!(recovered[0].delivery, PromptDelivery::Queue);
+}
+
+#[test]
+fn accepted_steer_requeue_survives_resume_recovery() {
+    let session_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    let events = vec![
+        SessionEvent::new(
+            session_id,
+            1,
+            SessionEventKind::Message {
+                message_id,
+                actor: EventActor::User,
+                text: "preserve this pending steer".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Queued,
+                delivery: Some(PromptDelivery::Steer),
+            },
+        ),
+        SessionEvent::new(
+            session_id,
+            2,
+            SessionEventKind::Message {
+                message_id,
+                actor: EventActor::User,
+                text: "preserve this pending steer".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: Some(PromptDelivery::Steer),
+            },
+        ),
+        SessionEvent::new(
+            session_id,
+            3,
+            SessionEventKind::Message {
+                message_id,
+                actor: EventActor::User,
+                text: "preserve this pending steer".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Queued,
+                delivery: Some(PromptDelivery::Queue),
+            },
+        ),
+    ];
+
+    let recovered = recover_queued_prompts(&events);
+
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].message_id, message_id);
+    assert_eq!(recovered[0].text, "preserve this pending steer");
     assert_eq!(recovered[0].delivery, PromptDelivery::Queue);
 }
 

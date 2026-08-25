@@ -4650,7 +4650,7 @@ async fn insert_action_row(
             .bind(action.session_id.to_string())
             .execute(&mut **transaction)
             .await?;
-            requeue_failed_action(transaction, existing).await?;
+            requeue_terminal_action(transaction, existing).await?;
             return Ok(());
         }
         if allow_in_progress_payload_rewrite && existing.payload != action.payload {
@@ -4738,6 +4738,26 @@ async fn requeue_failed_action(
     mut action: SessionAction,
 ) -> Result<()> {
     if action.state != SessionActionState::Failed {
+        return Ok(());
+    }
+    let from_state = action.state;
+    action.transition(Some(from_state), SessionActionState::Queued, None)?;
+    append_action_transition(transaction, &action, from_state, None).await?;
+    update_action_row(transaction, &action).await
+}
+
+/// A legacy accepted steer can have a terminal action projection before its
+/// interruption requeues the same message into the FIFO. The durable queue
+/// event is an explicit retry boundary, so reopen both terminal states here;
+/// ordinary prompt duplicates still use `requeue_failed_action`.
+async fn requeue_terminal_action(
+    transaction: &mut Transaction<'_, Sqlite>,
+    mut action: SessionAction,
+) -> Result<()> {
+    if !matches!(
+        action.state,
+        SessionActionState::Completed | SessionActionState::Failed
+    ) {
         return Ok(());
     }
     let from_state = action.state;

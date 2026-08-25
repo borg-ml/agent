@@ -206,7 +206,6 @@ struct PendingSteer {
     prompt: QueuedPrompt,
     admission: SteerAdmission,
     state: PendingSteerState,
-    status_recorded: bool,
     attempt_boundary: u64,
 }
 
@@ -3130,19 +3129,6 @@ async fn run_agent_session_store_kernel(
                         // surrounding turn completes; if that turn is
                         // interrupted immediately afterwards, the user
                         // message still needs a real next-turn admission.
-                        if !pending_steers[index].status_recorded {
-                            let prompt = pending_steers[index].prompt.clone();
-                            record_prompt_status(
-                                &mut journal,
-                                &events,
-                                session_id,
-                                &prompt,
-                                MessageStatus::Complete,
-                                PromptDelivery::Steer,
-                            )
-                            .await?;
-                            pending_steers[index].status_recorded = true;
-                        }
                         pending_steers[index].state = PendingSteerState::Accepted;
                     } else {
                         let error = acknowledgement.err().unwrap_or_else(|| {
@@ -3286,7 +3272,6 @@ async fn run_agent_session_store_kernel(
                                         },
                                     }
                                 },
-                                status_recorded: false,
                                 attempt_boundary: steer_boundary_generation,
                             });
                         }
@@ -5040,9 +5025,10 @@ fn recover_queued_prompts(events: &[SessionEvent]) -> VecDeque<QueuedPrompt> {
     let mut pending = VecDeque::<QueuedPrompt>::new();
     // A crashed actor can leave an older in-progress snapshot after the
     // message's terminal event. Do not resurrect that snapshot on resume;
-    // only an explicit queued event after a failed action starts a new
-    // attempt. Completed and recalled actions are not retryable.
-    let mut settled = HashMap::<Uuid, bool>::new();
+    // only an explicit queued event after a failed action, or after the
+    // legacy accepted-steer completion, starts a new attempt. Completed queue
+    // entries and recalled actions are not retryable.
+    let mut settled = HashMap::<Uuid, (bool, Option<PromptDelivery>)>::new();
     for event in events {
         match &event.kind {
             SessionEventKind::Message {
@@ -5054,13 +5040,18 @@ fn recover_queued_prompts(events: &[SessionEvent]) -> VecDeque<QueuedPrompt> {
                 delivery,
             } if matches!(actor, EventActor::User | EventActor::System) => {
                 let queued = *status == MessageStatus::Queued;
-                if settled
-                    .get(message_id)
-                    .is_some_and(|retryable| !queued || !*retryable)
-                {
+                let delivery = delivery.unwrap_or(PromptDelivery::Queue);
+                let explicit_retry = queued
+                    && settled
+                        .get(message_id)
+                        .is_some_and(|(retryable, previous_delivery)| {
+                            *retryable
+                                || (*previous_delivery == Some(PromptDelivery::Steer)
+                                    && delivery == PromptDelivery::Queue)
+                        });
+                if settled.contains_key(message_id) && !explicit_retry {
                     continue;
                 }
-                let delivery = delivery.unwrap_or(PromptDelivery::Queue);
                 if let Some(prompt) = pending
                     .iter_mut()
                     .find(|prompt| prompt.message_id == *message_id)
@@ -5098,7 +5089,7 @@ fn recover_queued_prompts(events: &[SessionEvent]) -> VecDeque<QueuedPrompt> {
                 delivery,
                 ..
             } => {
-                settled.insert(*message_id, *status == MessageStatus::Failed);
+                settled.insert(*message_id, (*status == MessageStatus::Failed, *delivery));
                 if let Some(admitted) = pending
                     .iter()
                     .position(|prompt| prompt.message_id == *message_id)
@@ -5122,7 +5113,7 @@ fn recover_queued_prompts(events: &[SessionEvent]) -> VecDeque<QueuedPrompt> {
                 }
             }
             SessionEventKind::PromptRecalled { message_id, .. } => {
-                settled.insert(*message_id, false);
+                settled.insert(*message_id, (false, None));
                 pending.retain(|prompt| prompt.message_id != *message_id);
             }
             _ => {}
@@ -5760,17 +5751,15 @@ async fn promote_uncommitted_steers(
     let mut promoted = Vec::new();
     while let Some(steer) = pending_steers.pop_front() {
         if steer.admission.is_accepted() && !after_interrupt {
-            if !steer.status_recorded {
-                record_prompt_status(
-                    journal,
-                    events,
-                    session_id,
-                    &steer.prompt,
-                    MessageStatus::Complete,
-                    PromptDelivery::Steer,
-                )
-                .await?;
-            }
+            record_prompt_status(
+                journal,
+                events,
+                session_id,
+                &steer.prompt,
+                MessageStatus::Complete,
+                PromptDelivery::Steer,
+            )
+            .await?;
         } else {
             promoted.push(steer.prompt);
         }

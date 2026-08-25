@@ -51,6 +51,7 @@ impl SessionActionState {
                 | (Preparing, Committing | Failed | Cancelled)
                 | (Committing, Queued | Running | Failed | Cancelled)
                 | (Running, Queued | Completed | Failed | Cancelled)
+                | (Completed, Queued)
                 | (Failed, Queued | Cancelled)
         )
     }
@@ -312,9 +313,11 @@ mod tests {
     }
 
     #[test]
-    fn failed_actions_can_be_explicitly_requeued_but_not_completed_directly() {
+    fn terminal_actions_can_be_explicitly_requeued_but_not_completed_directly() {
         assert!(SessionActionState::Failed.can_transition(SessionActionState::Queued));
+        assert!(SessionActionState::Completed.can_transition(SessionActionState::Queued));
         assert!(!SessionActionState::Failed.can_transition(SessionActionState::Completed));
+        assert!(!SessionActionState::Cancelled.can_transition(SessionActionState::Queued));
     }
 
     #[test]
