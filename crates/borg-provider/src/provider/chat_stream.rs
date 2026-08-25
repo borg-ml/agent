@@ -2496,6 +2496,8 @@ async fn receive_control(
     controls.as_mut()?.recv().await
 }
 
+const CODEX_COMPACTION_TAIL_SCAN_BYTES: u64 = 4 * 1024 * 1024;
+
 #[derive(Debug, Default)]
 struct CodexCompactionCapture {
     item_id: Option<String>,
@@ -2571,12 +2573,49 @@ impl CodexCompactionCapture {
 }
 
 fn read_latest_codex_compaction_summary(path: &Path) -> Result<Option<String>> {
-    use std::io::BufRead;
+    use std::io::{BufRead, Read, Seek, SeekFrom};
 
-    let reader = std::io::BufReader::new(
-        std::fs::File::open(path)
-            .with_context(|| format!("failed to open Codex rollout {}", path.display()))?,
-    );
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("failed to open Codex rollout {}", path.display()))?;
+    let length = file.metadata()?.len();
+    let tail_start = length.saturating_sub(CODEX_COMPACTION_TAIL_SCAN_BYTES);
+    let starts_mid_line = if tail_start > 0 {
+        file.seek(SeekFrom::Start(tail_start - 1))?;
+        let mut previous = [0_u8; 1];
+        file.read_exact(&mut previous)?;
+        previous[0] != b'\n'
+    } else {
+        false
+    };
+    file.seek(SeekFrom::Start(tail_start))?;
+    let mut tail = Vec::with_capacity((length - tail_start) as usize);
+    file.read_to_end(&mut tail)?;
+
+    // A resumed compaction checkpoint is appended to the active rollout. In
+    // the normal case this avoids rereading hundreds of megabytes of prior
+    // turns just to recover one summary. Drop the first partial line when the
+    // bounded read begins in the middle of the JSONL file.
+    let mut tail_lines = tail.split(|byte| *byte == b'\n').collect::<Vec<_>>();
+    if starts_mid_line && !tail_lines.is_empty() {
+        tail_lines.remove(0);
+    }
+    for line in tail_lines.into_iter().rev() {
+        if !line
+            .windows(b"\"type\":\"compacted\"".len())
+            .any(|window| window == b"\"type\":\"compacted\"")
+        {
+            continue;
+        }
+        let value: Value = serde_json::from_slice(line)?;
+        if let Some(message) = value.pointer("/payload/message").and_then(Value::as_str) {
+            return Ok(Some(message.to_string()));
+        }
+    }
+
+    // Preserve the old behavior for an unusually large checkpoint line or a
+    // rollout where the latest checkpoint is older than the bounded tail.
+    file.seek(SeekFrom::Start(0))?;
+    let reader = std::io::BufReader::new(file);
     let mut summary = None;
     for line in reader.lines() {
         let line = line?;
