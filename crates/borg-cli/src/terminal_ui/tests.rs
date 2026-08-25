@@ -6863,12 +6863,9 @@ fn adjacent_tool_calls_are_compact_but_leave_gap_before_following_message() {
     let rendered = transcript.render(80, None, None, None);
     assert_eq!(rendered.1, vec![(0, 0, 1), (1, 1, 2)]);
     assert!(!rendered.0[1].spans.is_empty());
-    assert_eq!(
-        rendered.0[2].spans.last().and_then(|span| span.style.bg),
-        Some(MESSAGE_BG)
-    );
+    assert!(rendered.0[2].spans.is_empty());
     let (_, message_start, message_end) = rendered.3[0];
-    assert_eq!(message_start, 2);
+    assert_eq!(message_start, 3);
     assert_eq!(
         rendered.0[message_end - 1]
             .spans
@@ -6921,8 +6918,10 @@ fn message_tool_message_edges_have_one_separator_row_each() {
 
     assert_eq!(first_message.2 - first_message.1, 4);
     assert_eq!(second_message.2 - second_message.1, 4);
-    assert_eq!(tool.1, first_message.2);
-    assert_eq!(tool.2, second_message.1);
+    assert_eq!(tool.1, first_message.2 + 1);
+    assert_eq!(second_message.1, tool.2 + 1);
+    assert!(rendered.0[first_message.2].spans.is_empty());
+    assert!(rendered.0[tool.2].spans.is_empty());
     assert!(
         rendered.0[first_message.1]
             .spans
@@ -7058,6 +7057,38 @@ fn running_actions_keep_edge_spacing_in_compact_and_boxed_runs() {
         .expect("boxed running action");
     assert_eq!(boxed_lines[boxed_running_row - 1].to_string(), "│");
     assert_eq!(boxed_lines[boxed_running_row + 1].to_string(), "│");
+}
+
+#[test]
+fn boxed_thinking_rows_keep_one_edge_separator_without_duplicates() {
+    let mut transcript = Transcript::default();
+    transcript
+        .order
+        .extend((0..9).map(|index| TranscriptEntry::Tool {
+            source_name: "reasoning".to_string(),
+            name: "Thinking".to_string(),
+            detail: String::new(),
+            code_view: Some(("reasoning".to_string(), format!("thought {index}"))),
+            output_view: None,
+            payload_refs: Vec::new(),
+            time: "12:00".to_string(),
+            started_at: Utc::now(),
+            completed_at: Some(Utc::now()),
+            complete: true,
+            error: false,
+            user_interrupted: false,
+            backgrounded: false,
+            expanded: true,
+        }));
+
+    let lines = transcript
+        .render_with_tool_run_viewport(80, 40, None, None, None)
+        .0;
+    assert!(
+        lines
+            .windows(2)
+            .all(|rows| { !(rows[0].to_string() == "│" && rows[1].to_string() == "│") })
+    );
 }
 
 #[test]
