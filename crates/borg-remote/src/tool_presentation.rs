@@ -307,6 +307,31 @@ pub fn tool_has_rich_ui(display_name: &str, language: Option<&str>) -> bool {
     )
 }
 
+/// Whether an action is expected to complete quickly enough that animating its
+/// pending state would add noise. Unknown actions stay conservative and use
+/// the long-running presentation until they finish.
+pub fn tool_action_is_instant(display_name: &str, language: Option<&str>) -> bool {
+    if language == Some("reasoning") {
+        return false;
+    }
+    let label = display_name.trim().to_ascii_lowercase();
+    label == "read"
+        || label.starts_with("read ")
+        || label.starts_with("inspect ")
+        || label.starts_with("list ")
+        || label.starts_with("check ")
+        || label.starts_with("get ")
+        || matches!(
+            label.as_str(),
+            "create goal"
+                | "update goal"
+                | "update plan"
+                | "language servers"
+                | "workspace diagnostics"
+                | "view image"
+        )
+}
+
 pub fn is_subagent_tool(display_name: &str) -> bool {
     matches!(
         display_name.to_ascii_lowercase().as_str(),
@@ -2099,6 +2124,32 @@ mod tests {
             assert_eq!(presentation.label, "Generate image", "{name}");
             assert_eq!(presentation.category, ToolPresentationCategory::Image);
         }
+    }
+
+    #[test]
+    fn classifies_instant_and_long_running_action_labels() {
+        for label in [
+            "Read",
+            "Read plan",
+            "Inspect repository",
+            "Workspace diagnostics",
+            "Update plan",
+            "Create goal",
+            "View image",
+        ] {
+            assert!(tool_action_is_instant(label, None), "{label}");
+        }
+        for label in [
+            "Run",
+            "Thinking",
+            "Search",
+            "Search web",
+            "Edit",
+            "Generate image",
+        ] {
+            assert!(!tool_action_is_instant(label, None), "{label}");
+        }
+        assert!(!tool_action_is_instant("Thinking", Some("reasoning")));
     }
 
     #[test]

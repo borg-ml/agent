@@ -61,14 +61,15 @@ fn reasoning_lines(source: &str, width: usize) -> Vec<Line<'static>> {
     }
     items
         .into_iter()
-        .flat_map(|item| {
-            super::wrap_display(&item, width.saturating_sub(2).max(1))
+        .enumerate()
+        .flat_map(|(item_index, item)| {
+            let mut lines = super::wrap_display(&item, width.saturating_sub(2).max(1))
                 .into_iter()
                 .enumerate()
-                .map(|(index, line)| {
+                .map(|(line_index, line)| {
                     Line::from(vec![
                         Span::styled(
-                            if index == 0 { "• " } else { "  " },
+                            if line_index == 0 { "• " } else { "  " },
                             Style::default().fg(super::BORG_ORANGE_HOVER),
                         ),
                         Span::styled(
@@ -79,6 +80,11 @@ fn reasoning_lines(source: &str, width: usize) -> Vec<Line<'static>> {
                         ),
                     ])
                 })
+                .collect::<Vec<_>>();
+            if item_index > 0 {
+                lines.insert(0, Line::default());
+            }
+            lines
         })
         .collect()
 }
@@ -92,30 +98,21 @@ fn reasoning_items(source: &str) -> Vec<String> {
         return thoughts.into_iter().map(str::to_string).collect();
     }
     let cleaned = source.replace("**", "");
-    let mut items = Vec::new();
-    let mut current = String::new();
-    for raw_line in cleaned.lines() {
-        let line = raw_line.trim();
-        if line.is_empty() {
-            if !current.is_empty() {
-                items.push(std::mem::take(&mut current));
+    cleaned
+        .lines()
+        .filter_map(|raw_line| {
+            let line = raw_line.trim();
+            if line.is_empty() {
+                return None;
             }
-            continue;
-        }
-        let line = line
-            .strip_prefix("• ")
-            .or_else(|| line.strip_prefix("- "))
-            .or_else(|| line.strip_prefix("* "))
-            .unwrap_or(line);
-        if !current.is_empty() {
-            current.push(' ');
-        }
-        current.push_str(line);
-    }
-    if !current.is_empty() {
-        items.push(current);
-    }
-    items
+            let line = line
+                .strip_prefix("• ")
+                .or_else(|| line.strip_prefix("- "))
+                .or_else(|| line.strip_prefix("* "))
+                .unwrap_or(line);
+            Some(line.to_string())
+        })
+        .collect()
 }
 
 fn bold_reasoning_thoughts(mut source: &str) -> Option<Vec<&str>> {
@@ -752,14 +749,15 @@ mod tests {
             "  │ ",
         );
 
-        assert_eq!(lines.len(), 2);
+        assert_eq!(lines.len(), 3);
         assert_eq!(lines[0].to_string(), "  │ • Inspecting blank lines");
-        assert_eq!(lines[1].to_string(), "  │ • Restoring card padding");
+        assert_eq!(lines[1].to_string(), "  │ ");
+        assert_eq!(lines[2].to_string(), "  │ • Restoring card padding");
         assert!(lines.iter().all(|line| !line.to_string().contains("**")));
     }
 
     #[test]
-    fn reasoning_renderer_wraps_soft_lines_under_one_bullet() {
+    fn reasoning_renderer_preserves_explicit_lines_and_wraps_each_item() {
         let lines = tool_body_lines(
             "reasoning",
             "First sentence\nsecond sentence that continues the same thought.",
@@ -767,18 +765,13 @@ mod tests {
             "  │ ",
         );
 
-        assert!(
-            lines[0]
-                .to_string()
-                .starts_with("  │ • First sentence second sentence")
-        );
-        assert!(lines[1].to_string().starts_with("  │   "));
-        assert!(
-            lines
-                .iter()
-                .skip(1)
-                .all(|line| !line.to_string().contains("• "))
-        );
+        assert_eq!(lines[0].to_string(), "  │ • First sentence");
+        assert_eq!(lines[1].to_string(), "  │ ");
+        assert!(lines[2].to_string().starts_with("  │ • second sentence"));
+        assert!(lines[3].to_string().starts_with("  │   "));
+        assert!(lines[3..].iter().all(|line| {
+            line.to_string().contains("• ") == (line.to_string() == lines[2].to_string())
+        }));
     }
 
     #[test]

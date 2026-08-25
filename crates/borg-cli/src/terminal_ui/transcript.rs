@@ -2080,12 +2080,17 @@ impl Transcript {
         matches!(
             self.order.get(index),
             Some(TranscriptEntry::Tool {
+                name,
+                code_view,
                 complete: false,
                 error: false,
                 user_interrupted: false,
                 backgrounded: false,
                 ..
-            })
+            }) if !tool_action_is_instant(
+                name,
+                code_view.as_ref().map(|(language, _)| language.as_str()),
+            )
         )
     }
 
@@ -2764,10 +2769,15 @@ impl Transcript {
                         code_view.as_ref(),
                         output_view.as_ref(),
                     );
+                    let is_instant = tool_action_is_instant(
+                        name,
+                        code_view.as_ref().map(|(language, _)| language.as_str()),
+                    );
                     let (separator_before, separator_after) = tool_edge_separators(
                         *expanded,
                         rich_ui,
                         *complete,
+                        is_reasoning,
                         tool_window.is_some(),
                         previous_is_tool,
                         next_is_tool,
@@ -2789,14 +2799,17 @@ impl Transcript {
                     } else if *complete {
                         "✓"
                     } else {
-                        "●"
+                        "◇"
                     };
-                    let style = if *error || *user_interrupted {
-                        Style::default().fg(Color::Red)
-                    } else if hovered_tool == Some(index) {
+                    let gutter_style = if hovered_tool == Some(index) {
                         Style::default().fg(Color::Gray)
                     } else {
                         Style::default().fg(Color::DarkGray)
+                    };
+                    let style = if *error || *user_interrupted {
+                        Style::default().fg(Color::Red)
+                    } else {
+                        gutter_style
                     };
                     let name_style = if is_reasoning {
                         Style::default()
@@ -2815,29 +2828,22 @@ impl Transcript {
                             .fg(Color::White)
                             .add_modifier(Modifier::BOLD)
                     };
+                    let is_edit = is_edit_tool(source_name, name);
                     let lifecycle = if *user_interrupted {
                         Some("user interrupted")
                     } else if *backgrounded {
                         Some("backgrounded")
-                    } else if !*complete && !is_reasoning {
-                        // Say an edit is coming for as long as there is no diff
-                        // to look at — a payload that has not hydrated, or a
-                        // patch still being assembled. Edits take a while, and
-                        // a bare "running" over nothing gives the user no sign
-                        // of what to wait for. Once the diff is on screen it
-                        // speaks for itself.
-                        let awaiting_diff = is_edit_tool(source_name, name)
-                            && !code_view
-                                .as_ref()
-                                .is_some_and(|(language, _)| is_diff_language(language));
-                        Some(if awaiting_diff {
-                            "preparing edit"
-                        } else {
-                            "running"
-                        })
+                    } else if !*complete && is_edit {
+                        // Keep the lifecycle explicit until completion. Even
+                        // when the provider streams the proposed patch with
+                        // the start event, it is not the applied result yet.
+                        Some("preparing edit")
+                    } else if !*complete && !is_reasoning && !is_instant {
+                        Some("running")
                     } else {
                         None
                     };
+                    let show_tool_body = *complete || !is_edit;
                     let mut summary = if detail.is_empty() {
                         format!("{time}  {glyph} {name}")
                     } else {
@@ -2858,12 +2864,16 @@ impl Transcript {
                         {
                             let name_end = name_start + name.len();
                             lines.push(Line::from(vec![
-                                Span::styled(format!("{prefix}{}", &line[..name_start]), style),
+                                Span::styled(prefix.to_string(), gutter_style),
+                                Span::styled(line[..name_start].to_string(), style),
                                 Span::styled(name.clone(), name_style),
                                 Span::styled(line[name_end..].to_string(), style),
                             ]));
                         } else {
-                            lines.push(Line::from(Span::styled(format!("{prefix}{line}"), style)));
+                            lines.push(Line::from(vec![
+                                Span::styled(prefix.to_string(), gutter_style),
+                                Span::styled(line, style),
+                            ]));
                         }
                     }
                     if hovered_tool == Some(index) {
@@ -2871,7 +2881,11 @@ impl Transcript {
                             apply_line_background(line, width, MESSAGE_HOVER_BG);
                         }
                     }
-                    if *expanded && expandable && let Some((language, source)) = code_view {
+                    if show_tool_body
+                        && *expanded
+                        && expandable
+                        && let Some((language, source)) = code_view
+                    {
                         let body_prefix = if tool_window.is_some() {
                             "│   │ "
                         } else {
@@ -2915,7 +2929,11 @@ impl Transcript {
                             ));
                         }
                     }
-                    if *expanded && expandable && let Some((language, source)) = output_view {
+                    if show_tool_body
+                        && *expanded
+                        && expandable
+                        && let Some((language, source)) = output_view
+                    {
                         let body_prefix = if tool_window.is_some() {
                             "│   │ "
                         } else {

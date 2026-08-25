@@ -28,8 +28,8 @@ use borg_remote::{
     SessionEventKind, SessionGoal, SessionPayloadKind, SessionPayloadRef, SessionState,
     SessionStatus, SubagentActivityKind, SubagentSnapshot, SubagentStatus,
     ToolPresentationCategory, compact_text, is_diff_language, is_edit_tool, is_mcp_resource_probe,
-    is_subagent_tool, project_tool_presentation, tool_has_rich_ui, tool_output_code_view,
-    tool_output_is_backgrounded, web_search_query,
+    is_subagent_tool, project_tool_presentation, tool_action_is_instant, tool_has_rich_ui,
+    tool_output_code_view, tool_output_is_backgrounded, web_search_query,
 };
 #[cfg(test)]
 use borg_remote::{tool_call_summary, tool_code_view};
@@ -9184,34 +9184,29 @@ fn selection_line_ranges(line: &Line<'static>) -> Vec<(usize, usize)> {
     if width == 0 || line.spans.iter().all(|span| span.content.trim().is_empty()) {
         return Vec::new();
     }
+    let rendered = line.to_string();
+    let trimmed = rendered.trim();
+    let content_trimmed = trimmed.strip_prefix("│ ").unwrap_or(trimmed);
+    if trimmed.is_empty()
+        || trimmed == "│"
+        || content_trimmed.starts_with('┌')
+        || content_trimmed.starts_with('└')
+        || content_trimmed.starts_with("---")
+        || content_trimmed.starts_with("+++")
+        || content_trimmed.starts_with("@@")
+    {
+        return Vec::new();
+    }
     let first = line
         .spans
         .first()
         .map(|span| span.content.as_ref())
         .unwrap_or_default();
-    if first.contains('▌') {
+    if rendered.contains('▌') {
         return Vec::new();
     }
-    if line.spans.len() >= 3
-        && line.spans[1].content.as_ref() == " │ "
-        && line.spans[0].content.contains('│')
-        && line.spans[2].content.contains('│')
-    {
-        let first_start = diff_code_start(first).unwrap_or(0);
-        let second_start = diff_code_start(line.spans[2].content.as_ref()).unwrap_or(0);
-        let first_width = first.width();
-        let separator_width = line.spans[1].width();
-        return vec![
-            (first_start, first_width),
-            (
-                first_width
-                    .saturating_add(separator_width)
-                    .saturating_add(second_start),
-                first_width
-                    .saturating_add(separator_width)
-                    .saturating_add(line.spans[2].width()),
-            ),
-        ];
+    if let Some(ranges) = diff_selection_ranges(line) {
+        return ranges;
     }
     if first.contains('│')
         && first[..first.find('│').unwrap_or(0)]
@@ -9227,21 +9222,181 @@ fn selection_line_ranges(line: &Line<'static>) -> Vec<(usize, usize)> {
         || matches!(first, "+ " | "− ")
     {
         first.width()
+    } else if first.starts_with("│ ") || first.starts_with("  ") {
+        2
     } else {
         0
     };
-    (prefix < width)
-        .then_some((prefix, width))
-        .into_iter()
-        .collect()
+    let suffix = string_after_cells(&rendered, prefix);
+    let start = prefix.saturating_add(selection_content_start(suffix));
+    let end = prefix.saturating_add(selection_content_end(suffix));
+    (start < end).then_some((start, end)).into_iter().collect()
 }
 
-fn diff_code_start(value: &str) -> Option<usize> {
-    ["│ + ", "│ − ", "│   "].iter().find_map(|marker| {
-        value
-            .find(marker)
-            .map(|start| UnicodeWidthStr::width(&value[..start + marker.len()]))
-    })
+fn diff_selection_ranges(line: &Line<'static>) -> Option<Vec<(usize, usize)>> {
+    let markers = ["│ + ", "│ − ", "│   ", "+ ", "− "];
+    let mut span_start = 0usize;
+    let mut matches = Vec::new();
+    for span in &line.spans {
+        let content = span.content.as_ref();
+        if content.starts_with("│   │ ") {
+            span_start = span_start.saturating_add(span.width());
+            continue;
+        }
+        for marker in markers {
+            let Some(marker_start) = content.find(marker) else {
+                continue;
+            };
+            if marker.contains('│') || content == marker {
+                let start = span_start.saturating_add(UnicodeWidthStr::width(
+                    &content[..marker_start + marker.len()],
+                ));
+                let end = span_start.saturating_add(UnicodeWidthStr::width(content.trim_end()));
+                matches.push((start, end));
+                break;
+            }
+        }
+        span_start = span_start.saturating_add(span.width());
+    }
+    if matches.is_empty() {
+        return None;
+    }
+    let split_layout = line.spans.iter().any(|span| span.content.as_ref() == " │ ");
+    if split_layout {
+        return Some(
+            matches
+                .into_iter()
+                .filter(|(start, end)| start < end)
+                .collect(),
+        );
+    }
+    if matches.len() == 1 {
+        return Some(vec![(
+            matches[0].0,
+            UnicodeWidthStr::width(line.to_string().trim_end()),
+        )]);
+    }
+    Some(
+        matches
+            .into_iter()
+            .filter(|(start, end)| start < end)
+            .collect(),
+    )
+}
+
+fn string_after_cells(value: &str, cells: usize) -> &str {
+    let mut consumed = 0usize;
+    for (byte, grapheme) in value.grapheme_indices(true) {
+        if consumed >= cells {
+            return &value[byte..];
+        }
+        consumed = consumed.saturating_add(grapheme.width());
+        if consumed >= cells {
+            return &value[byte + grapheme.len()..];
+        }
+    }
+    ""
+}
+
+fn selection_content_start(value: &str) -> usize {
+    let leading = value.trim_start();
+    let leading_cells = UnicodeWidthStr::width(&value[..value.len() - leading.len()]);
+    if let Some(gutter_end) = selection_code_gutter_end(leading) {
+        return leading_cells.saturating_add(gutter_end);
+    }
+    let lifecycle_glyphs = "✓◇⠋⠙⠹⠸⠼⠴⠦⠧!■↗?";
+    if let Some((byte, glyph)) = leading
+        .char_indices()
+        .find(|(_, character)| lifecycle_glyphs.contains(*character))
+        && display_time_prefix(&leading[..byte])
+    {
+        let after = &leading[byte + glyph.len_utf8()..];
+        let glyph_width = UnicodeWidthStr::width(&leading[byte..byte + glyph.len_utf8()]);
+        return leading_cells
+            .saturating_add(UnicodeWidthStr::width(&leading[..byte]))
+            .saturating_add(glyph_width)
+            .saturating_add(
+                UnicodeWidthStr::width(after) - UnicodeWidthStr::width(after.trim_start()),
+            );
+    }
+    for marker in ["• ", "✓  ", "●  ", "○  ", "▣ "] {
+        if let Some(rest) = leading.strip_prefix(marker) {
+            return leading_cells
+                .saturating_add(UnicodeWidthStr::width(marker))
+                .saturating_add(
+                    UnicodeWidthStr::width(rest) - UnicodeWidthStr::width(rest.trim_start()),
+                );
+        }
+    }
+    leading_cells
+}
+
+fn selection_code_gutter_end(value: &str) -> Option<usize> {
+    let mut byte = 0usize;
+    while value[byte..]
+        .chars()
+        .next()
+        .is_some_and(|character| character.is_whitespace())
+    {
+        byte = byte.saturating_add(value[byte..].chars().next()?.len_utf8());
+    }
+    let digits_start = byte;
+    while value[byte..]
+        .chars()
+        .next()
+        .is_some_and(|character| character.is_ascii_digit())
+    {
+        byte = byte.saturating_add(value[byte..].chars().next()?.len_utf8());
+    }
+    if byte == digits_start {
+        return None;
+    }
+    while value[byte..]
+        .chars()
+        .next()
+        .is_some_and(|character| character.is_whitespace())
+    {
+        byte = byte.saturating_add(value[byte..].chars().next()?.len_utf8());
+    }
+    value[byte..]
+        .strip_prefix("│ ")
+        .map(|_| UnicodeWidthStr::width(&value[..byte + "│ ".len()]))
+}
+
+fn selection_content_end(value: &str) -> usize {
+    let trimmed = value.trim_end();
+    if let Some((content, elapsed)) = trimmed.rsplit_once("  ")
+        && elapsed.split_whitespace().all(selection_elapsed_token)
+        && !elapsed.is_empty()
+    {
+        return UnicodeWidthStr::width(content);
+    }
+    UnicodeWidthStr::width(trimmed)
+}
+
+fn display_time_prefix(value: &str) -> bool {
+    value
+        .split_whitespace()
+        .last()
+        .is_some_and(display_clock_token)
+}
+
+fn display_clock_token(value: &str) -> bool {
+    let parts = value.split(':').collect::<Vec<_>>();
+    matches!(parts.len(), 2 | 3)
+        && parts.iter().all(|part| {
+            !part.is_empty() && part.chars().all(|character| character.is_ascii_digit())
+        })
+}
+
+fn selection_elapsed_token(value: &str) -> bool {
+    let Some(unit) = value.chars().last() else {
+        return false;
+    };
+    matches!(unit, 's' | 'm' | 'h' | 'd')
+        && value[..value.len() - unit.len_utf8()]
+            .chars()
+            .all(|character| character.is_ascii_digit() || character == '.')
 }
 
 fn action_run_bridge(entry: &TranscriptEntry) -> bool {
@@ -9285,26 +9440,37 @@ fn selected_transcript_text(
             line_width
         };
         let selectable = selection_line_ranges(line);
-        let mut column = 0usize;
-        let mut text = String::new();
-        for span in &line.spans {
-            for grapheme in span.content.graphemes(true) {
-                let grapheme_width = grapheme.width();
-                let selected = selectable.iter().any(|(selectable_start, selectable_end)| {
-                    column < to
-                        && column.saturating_add(grapheme_width) > from
-                        && column < *selectable_end
-                        && column.saturating_add(grapheme_width) > *selectable_start
-                });
-                if selected {
-                    text.push_str(grapheme);
+        let mut chunks = Vec::new();
+        for (selectable_start, selectable_end) in selectable {
+            let chunk_start = from.max(selectable_start);
+            let chunk_end = to.min(selectable_end);
+            if chunk_start >= chunk_end {
+                continue;
+            }
+            let mut column = 0usize;
+            let mut chunk = String::new();
+            for span in &line.spans {
+                for grapheme in span.content.graphemes(true) {
+                    let grapheme_width = grapheme.width();
+                    if column < chunk_end && column.saturating_add(grapheme_width) > chunk_start {
+                        chunk.push_str(grapheme);
+                    }
+                    column = column.saturating_add(grapheme_width);
                 }
-                column = column.saturating_add(grapheme_width);
+            }
+            let chunk = chunk.trim_end().to_string();
+            if !chunk.trim().is_empty() {
+                chunks.push(chunk);
             }
         }
-        selected.push(text.trim_end().to_string());
+        if !chunks.is_empty() {
+            if chunks.len() == 2 && chunks[0] == chunks[1] {
+                chunks.truncate(1);
+            }
+            selected.push(chunks.join("\n"));
+        }
     }
-    let text = selected.join("\n").trim_matches('\n').to_string();
+    let text = selected.join("\n").trim().to_string();
     (!text.is_empty()).then_some(text)
 }
 
@@ -9655,11 +9821,12 @@ fn tool_edge_separators(
     expanded: bool,
     rich_ui: bool,
     complete: bool,
+    is_reasoning: bool,
     in_tool_run: bool,
     previous_is_tool: bool,
     next_is_tool: bool,
 ) -> (bool, bool) {
-    let current_action = !complete;
+    let current_action = !complete || is_reasoning;
     let rich_action = expanded && rich_ui;
     (
         current_action || (rich_action && (in_tool_run || !previous_is_tool)),
@@ -11324,14 +11491,19 @@ fn activity_glyph(status: SessionStatus) -> &'static str {
 }
 
 fn replace_tool_activity_glyph(line: &mut Line<'static>, glyph: &str) {
-    let Some(span) = line.spans.first_mut() else {
+    let Some(span) = line
+        .spans
+        .iter_mut()
+        .find(|span| span.content.contains('◇'))
+    else {
         return;
     };
-    let Some(start) = span.content.find('●') else {
-        return;
-    };
+    let start = span
+        .content
+        .find('◇')
+        .expect("glyph-containing span was selected");
     let mut content = span.content.to_string();
-    content.replace_range(start..start + '●'.len_utf8(), glyph);
+    content.replace_range(start..start + '◇'.len_utf8(), glyph);
     span.content = Cow::Owned(content);
 }
 

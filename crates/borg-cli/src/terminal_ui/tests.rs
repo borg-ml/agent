@@ -1357,18 +1357,44 @@ fn running_tool_uses_a_stable_marker_without_invalidating_transcript_cache() {
         .map(|line| line.to_string())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(rendered.contains('●'));
+    assert!(rendered.contains('◇'));
+    assert!(!rendered.contains('●'));
     assert!(!rendered.chars().any(|glyph| "⠋⠙⠹⠸⠼⠴⠦⠧".contains(glyph)));
     assert!(!rendered.contains('↳'));
 
     let mut summary = transcript
         .lines(100)
         .into_iter()
-        .find(|line| line.to_string().contains('●'))
+        .find(|line| line.to_string().contains('◇'))
         .expect("running tool summary");
     replace_tool_activity_glyph(&mut summary, "⠹");
     assert!(summary.to_string().contains('⠹'));
-    assert!(!summary.to_string().contains('●'));
+    assert!(!summary.to_string().contains('◇'));
+}
+
+#[test]
+fn instant_tools_keep_a_diamond_without_animation() {
+    let mut transcript = Transcript::default();
+    transcript.apply(&SessionEvent::new(
+        Uuid::new_v4(),
+        1,
+        SessionEventKind::ToolStarted {
+            tool_call_id: "instant-1".to_string(),
+            name: "get_plan".to_string(),
+            input: serde_json::json!({}),
+            input_ref: None,
+        },
+    ));
+
+    assert!(!transcript.tool_activity_is_running(0));
+    let rendered = transcript
+        .lines(100)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("◇ Read plan"));
+    assert!(!rendered.chars().any(|glyph| "⠋⠙⠹⠸⠼⠴⠦⠧".contains(glyph)));
 }
 
 #[test]
@@ -2860,7 +2886,8 @@ fn an_edit_reads_as_preparing_until_its_diff_is_on_screen() {
     assert!(no_diff_yet.contains("preparing edit"), "{no_diff_yet}");
     assert!(!no_diff_yet.contains("· running"), "{no_diff_yet}");
 
-    // The diff is on screen and speaks for itself.
+    // A streamed diff is still pending: show the Edit lifecycle row, but hold
+    // the body until the completion receipt arrives.
     let with_diff = started(
         "apply_patch",
         serde_json::json!({
@@ -2876,14 +2903,52 @@ fn an_edit_reads_as_preparing_until_its_diff_is_on_screen() {
         ),
         "the fixture must actually produce a diff body"
     );
+    let mut pending_summary = with_diff
+        .lines(120)
+        .into_iter()
+        .find(|line| line.to_string().contains("◇ Edit"))
+        .expect("pending edit summary");
+    replace_tool_activity_glyph(&mut pending_summary, "⠙");
+    assert!(pending_summary.to_string().contains("⠙ Edit"));
+    assert!(pending_summary.to_string().contains("preparing edit"));
     let with_diff = rendered(&with_diff);
-    assert!(!with_diff.contains("preparing edit"), "{with_diff}");
-    assert!(with_diff.contains("running"), "{with_diff}");
+    assert!(with_diff.contains("◇ Edit"), "{with_diff}");
+    assert!(with_diff.contains("preparing edit"), "{with_diff}");
+    assert!(!with_diff.contains("-one"), "{with_diff}");
+
+    let mut completed = started(
+        "apply_patch",
+        serde_json::json!({
+            "file_path": "src/main.rs",
+            "patch": "--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1 +1 @@\n-one\n+two\n",
+        }),
+    );
+    completed.apply(&SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::ToolCompleted {
+            tool_call_id: "tool-1".to_string(),
+            output: "applied".to_string(),
+            output_ref: None,
+            is_error: false,
+            input: Some(serde_json::json!({
+                "file_path": "src/main.rs",
+                "patch": "--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1 +1 @@\n-one\n+two\n",
+            })),
+            input_ref: None,
+        },
+    ));
+    let completed = rendered(&completed);
+    assert!(completed.contains("✓ Edit"), "{completed}");
+    assert!(!completed.contains("preparing edit"), "{completed}");
+    assert!(completed.contains("− one"), "{completed}");
+    assert!(completed.contains("+ two"), "{completed}");
 
     // A bodyless non-edit tool is never described as preparing one.
     let read = rendered(&started("read_file", serde_json::Value::Null));
     assert!(!read.contains("preparing edit"), "{read}");
-    assert!(read.contains("running"), "{read}");
+    assert!(read.contains("◇ Read"), "{read}");
+    assert!(!read.contains("· running"), "{read}");
 }
 
 #[test]
@@ -6929,7 +6994,7 @@ fn adjacent_expanded_thinking_entries_are_compact_but_separate_from_message() {
         .expect("assistant header");
 
     assert_eq!(thinking_rows.len(), 2);
-    assert!(!lines[thinking_rows[1] - 1].spans.is_empty());
+    assert!(lines[thinking_rows[1] - 1].spans.is_empty());
     assert!(lines[message_header - 1].to_string().trim().is_empty());
     assert_eq!(
         lines[message_header - 1]
@@ -6993,6 +7058,49 @@ fn running_actions_keep_edge_spacing_in_compact_and_boxed_runs() {
         .expect("boxed running action");
     assert_eq!(boxed_lines[boxed_running_row - 1].to_string(), "│");
     assert_eq!(boxed_lines[boxed_running_row + 1].to_string(), "│");
+}
+
+#[test]
+fn action_errors_leave_the_scrollbox_gutter_neutral() {
+    let mut transcript = Transcript::default();
+    transcript
+        .order
+        .extend((0..9).map(|index| TranscriptEntry::Tool {
+            source_name: "command_execution".to_string(),
+            name: if index == 4 {
+                "Run failed".to_string()
+            } else {
+                format!("Read {index}")
+            },
+            detail: String::new(),
+            code_view: None,
+            output_view: None,
+            payload_refs: Vec::new(),
+            time: "12:00".to_string(),
+            started_at: Utc::now(),
+            completed_at: Some(Utc::now()),
+            complete: true,
+            error: index == 4,
+            user_interrupted: false,
+            backgrounded: false,
+            expanded: false,
+        }));
+
+    let lines = transcript
+        .render_with_tool_run_viewport(80, 40, None, None, None)
+        .0;
+    let line = lines
+        .iter()
+        .find(|line| line.to_string().contains("Run failed"))
+        .expect("failed action");
+    assert_eq!(
+        line.spans.first().map(|span| span.content.as_ref()),
+        Some("│ ")
+    );
+    assert_ne!(line.spans[0].style.fg, Some(Color::Red));
+    assert!(line.spans.iter().any(|span| {
+        span.content.contains("Run failed") && span.style.fg == Some(Color::LightRed)
+    }));
 }
 
 #[test]
@@ -7743,13 +7851,15 @@ fn reasoning_is_one_live_muted_disclosure_that_collapses_at_a_tool_boundary() {
             && source == "Checking the source"
     ));
     assert!(transcript.has_running_tool());
+    assert!(transcript.tool_activity_is_running(0));
     let rendered = transcript
         .lines(100)
         .into_iter()
         .map(|line| line.to_string())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(rendered.contains('●'));
+    assert!(rendered.contains('◇'));
+    assert!(!rendered.contains('●'));
 
     transcript.apply(&SessionEvent::new(
         session_id,
@@ -8289,6 +8399,99 @@ fn transcript_selection_skips_headers_and_diff_line_number_gutters() {
             .iter()
             .skip(diff_start)
             .any(|span| span.style.bg.is_some())
+    );
+}
+
+#[test]
+fn transcript_selection_omits_visual_chrome_and_normalizes_diff_copy() {
+    let mut lines = vec![
+        Line::from("┌─ actions · 9 · click to expand"),
+        Line::from("│"),
+        Line::from("│ 02:40  ◇ Read plan  0.3s"),
+    ];
+    lines.extend(rendering::tool_body_lines(
+        "diff:rs",
+        "--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1 +1 @@\n-old\n+new\n",
+        100,
+        "  │ ",
+    ));
+    lines.push(Line::from("│"));
+
+    let start = TranscriptPoint { row: 0, column: 0 };
+    let end = TranscriptPoint {
+        row: lines.len() - 1,
+        column: usize::MAX,
+    };
+
+    assert_eq!(
+        selected_transcript_text(&lines, start, end).as_deref(),
+        Some("Read plan\nold\nnew")
+    );
+    assert!(selection_line_ranges(&lines[0]).is_empty());
+    assert!(selection_line_ranges(&lines[1]).is_empty());
+    assert!(selection_line_ranges(lines.last().unwrap()).is_empty());
+
+    let split_lines =
+        rendering::tool_body_lines("diff:rs", "@@ -1 +1 @@\n-old\n+new\n", 220, "  │ ");
+    let split_copy = selected_transcript_text(
+        &split_lines,
+        TranscriptPoint { row: 0, column: 0 },
+        TranscriptPoint {
+            row: split_lines.len() - 1,
+            column: usize::MAX,
+        },
+    )
+    .expect("split diff copy");
+    assert_eq!(split_copy, "old\nnew");
+    assert!(!split_copy.contains('│'));
+    assert!(!split_copy.contains('−'));
+    assert!(!split_copy.contains('+'));
+
+    let split_context_lines = rendering::tool_body_lines(
+        "diff:rs",
+        "@@ -1,2 +1,2 @@\n same\n-old\n+new\n",
+        220,
+        "  │ ",
+    );
+    assert_eq!(
+        selected_transcript_text(
+            &split_context_lines,
+            TranscriptPoint { row: 0, column: 0 },
+            TranscriptPoint {
+                row: split_context_lines.len() - 1,
+                column: usize::MAX,
+            },
+        )
+        .as_deref(),
+        Some("same\nold\nnew")
+    );
+
+    let code_lines = rendering::tool_body_lines("text", "+ literal text", 100, "  │ ");
+    assert_eq!(
+        selected_transcript_text(
+            &code_lines,
+            TranscriptPoint { row: 0, column: 0 },
+            TranscriptPoint {
+                row: code_lines.len() - 1,
+                column: usize::MAX,
+            },
+        )
+        .as_deref(),
+        Some("+ literal text")
+    );
+
+    let nested_code_lines = rendering::tool_body_lines("text", "let value = 1;", 100, "│   │ ");
+    assert_eq!(
+        selected_transcript_text(
+            &nested_code_lines,
+            TranscriptPoint { row: 0, column: 0 },
+            TranscriptPoint {
+                row: nested_code_lines.len() - 1,
+                column: usize::MAX,
+            },
+        )
+        .as_deref(),
+        Some("let value = 1;")
     );
 }
 
