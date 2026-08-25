@@ -2837,7 +2837,7 @@ async fn rejected_multimodal_steer_falls_back_to_the_front_of_the_fifo() {
 }
 
 #[tokio::test]
-async fn accepted_codex_steer_leaves_pending_at_provider_admission() {
+async fn accepted_codex_steer_is_requeued_when_turn_is_interrupted() {
     let root = tempdir().unwrap();
     let journal_path = root.path().join("session.lock");
     let session_id = Uuid::new_v4();
@@ -2907,10 +2907,14 @@ async fn accepted_codex_steer_leaves_pending_at_provider_admission() {
         .expect("provider accepts steer transport");
 
     let mut transitions = Vec::new();
+    command_tx
+        .send(HostCommand::Interrupt { session_id })
+        .await
+        .unwrap();
     loop {
         let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
             .await
-            .expect("admitted steer status arrives")
+            .expect("interrupted steer status arrives")
             .expect("session remains open");
         if let SessionEventKind::Message {
             message_id,
@@ -2921,7 +2925,7 @@ async fn accepted_codex_steer_leaves_pending_at_provider_admission() {
             && message_id == followup_id
         {
             transitions.push((status, delivery));
-            if status == MessageStatus::Complete {
+            if status == MessageStatus::Queued && delivery == PromptDelivery::Queue {
                 break;
             }
         }
@@ -2930,15 +2934,11 @@ async fn accepted_codex_steer_leaves_pending_at_provider_admission() {
         transitions,
         [
             (MessageStatus::Queued, PromptDelivery::Steer),
-            (MessageStatus::Complete, PromptDelivery::Steer),
+            (MessageStatus::Queued, PromptDelivery::Queue),
         ],
-        "provider admission must move the steer from pending input to a message"
+        "an accepted steer must be retried when its surrounding turn is interrupted"
     );
 
-    command_tx
-        .send(HostCommand::Interrupt { session_id })
-        .await
-        .unwrap();
     command_tx
         .send(HostCommand::Stop { session_id })
         .await
@@ -2947,7 +2947,7 @@ async fn accepted_codex_steer_leaves_pending_at_provider_admission() {
 }
 
 #[tokio::test]
-async fn accepted_claude_steer_leaves_pending_at_provider_admission() {
+async fn accepted_claude_steer_is_requeued_when_turn_is_interrupted() {
     let root = tempdir().unwrap();
     let journal_path = root.path().join("session.lock");
     let session_id = Uuid::new_v4();
@@ -3017,10 +3017,14 @@ async fn accepted_claude_steer_leaves_pending_at_provider_admission() {
         .expect("Claude accepts steer transport");
 
     let mut transitions = Vec::new();
+    command_tx
+        .send(HostCommand::Interrupt { session_id })
+        .await
+        .unwrap();
     loop {
         let event = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
             .await
-            .expect("admitted Claude steer status arrives")
+            .expect("interrupted Claude steer status arrives")
             .expect("session remains open");
         if let SessionEventKind::Message {
             message_id,
@@ -3031,7 +3035,7 @@ async fn accepted_claude_steer_leaves_pending_at_provider_admission() {
             && message_id == followup_id
         {
             transitions.push((status, delivery));
-            if status == MessageStatus::Complete {
+            if status == MessageStatus::Queued && delivery == PromptDelivery::Queue {
                 break;
             }
         }
@@ -3040,15 +3044,11 @@ async fn accepted_claude_steer_leaves_pending_at_provider_admission() {
         transitions,
         [
             (MessageStatus::Queued, PromptDelivery::Steer),
-            (MessageStatus::Complete, PromptDelivery::Steer),
+            (MessageStatus::Queued, PromptDelivery::Queue),
         ],
-        "Claude provider admission must move the steer from pending input to a message"
+        "an accepted Claude steer must be retried when its surrounding turn is interrupted"
     );
 
-    command_tx
-        .send(HostCommand::Interrupt { session_id })
-        .await
-        .unwrap();
     command_tx
         .send(HostCommand::Stop { session_id })
         .await

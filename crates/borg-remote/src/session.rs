@@ -211,6 +211,7 @@ struct PendingSteer {
 
 enum PendingSteerState {
     AwaitingAcknowledgement,
+    Accepted,
     RetryAtBoundary { error: String },
 }
 
@@ -3123,18 +3124,12 @@ async fn run_agent_session_store_kernel(
                         continue;
                     };
                     if pending_steers[index].admission.is_accepted() {
-                        let steer = pending_steers
-                            .remove(index)
-                            .expect("matching pending steer index exists");
-                        record_prompt_status(
-                            &mut journal,
-                            &events,
-                            session_id,
-                            &steer.prompt,
-                            MessageStatus::Complete,
-                            PromptDelivery::Steer,
-                        )
-                        .await?;
+                        // Admission only proves that the provider accepted
+                        // the steer transport. Keep it pending until the
+                        // surrounding turn completes; if that turn is
+                        // interrupted immediately afterwards, the user
+                        // message still needs a real next-turn admission.
+                        pending_steers[index].state = PendingSteerState::Accepted;
                     } else {
                         let error = acknowledgement.err().unwrap_or_else(|| {
                             "provider acknowledged the steer without accepting admission"
@@ -3557,6 +3552,15 @@ async fn run_agent_session_store_kernel(
                                     final_text: String::new(),
                                     error: Some("turn interrupted".to_string()),
                                 },
+                            )
+                            .await?;
+                            promote_uncommitted_steers(
+                                &mut journal,
+                                &events,
+                                session_id,
+                                &mut pending,
+                                &mut pending_steers,
+                                true,
                             )
                             .await?;
                             next_ready_detail = Some("Interrupted".to_string());
@@ -5736,11 +5740,11 @@ async fn promote_uncommitted_steers(
     session_id: Uuid,
     pending: &mut VecDeque<QueuedPrompt>,
     pending_steers: &mut VecDeque<PendingSteer>,
-    _after_interrupt: bool,
+    after_interrupt: bool,
 ) -> Result<()> {
     let mut promoted = Vec::new();
     while let Some(steer) = pending_steers.pop_front() {
-        if steer.admission.is_accepted() {
+        if steer.admission.is_accepted() && !after_interrupt {
             record_prompt_status(
                 journal,
                 events,
