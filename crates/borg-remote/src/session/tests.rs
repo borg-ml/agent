@@ -2015,10 +2015,15 @@ async fn detached_live_projection_cannot_block_durable_turn_terminalization() {
     let (command_tx, command_rx) = mpsc::channel(2);
     let (event_tx, event_rx) = mpsc::channel(1);
     drop(event_rx);
+    let session_store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+        .await
+        .unwrap();
+    session_store.create_session(session_id).await.unwrap();
+    let (actor_result_tx, mut actor_result_rx) = tokio::sync::oneshot::channel();
     let actor = tokio::spawn({
         let cwd = root.path().to_path_buf();
         async move {
-            run_agent_session_with_executor(
+            let result = run_agent_session_with_executor(
                 &journal_path,
                 session_id,
                 LaunchSession {
@@ -2041,16 +2046,39 @@ async fn detached_live_projection_cannot_block_durable_turn_terminalization() {
                 event_tx,
                 Arc::new(HungProviderExecutor),
             )
-            .await
+            .await;
+            let _ = actor_result_tx.send(result.as_ref().map(|_| ()).map_err(ToString::to_string));
+            result
         }
     });
 
-    let session_store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
-        .await
-        .unwrap();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let durable = session_store.read(session_id).await.unwrap();
+            if durable.iter().any(|event| {
+                matches!(
+                    &event.kind,
+                    SessionEventKind::TurnStarted {
+                        message_id: started,
+                        ..
+                    } if *started == message_id
+                )
+            }) {
+                break;
+            }
+            tokio::select! {
+                result = &mut actor_result_rx => {
+                    panic!("detached actor exited before the durable turn boundary: {result:?}");
+                }
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+            }
+        }
+    })
+    .await
+    .expect("detached actor can reach the durable turn boundary");
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
-            let durable = session_store.read(session_id).await.unwrap_or_default();
+            let durable = session_store.read(session_id).await.unwrap();
             if durable.iter().any(|event| {
                 matches!(
                     &event.kind,
@@ -2063,7 +2091,12 @@ async fn detached_live_projection_cannot_block_durable_turn_terminalization() {
             }) {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::select! {
+                result = &mut actor_result_rx => {
+                    panic!("detached actor exited before durable terminalization: {result:?}");
+                }
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+            }
         }
     })
     .await
