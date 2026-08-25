@@ -801,6 +801,18 @@ impl crate::AgentTurnExecutor for CanonicalDogfoodExecutor {
         events: mpsc::Sender<SessionEventKind>,
         _controls: Option<mpsc::Receiver<crate::AgentTurnControl>>,
     ) -> Result<crate::AgentTurnResult> {
+        // The canonical fixture performs several SQLite-backed tool calls
+        // before it can produce its assistant result. Announce provider
+        // progress first so the test-only setup watchdog does not mistake
+        // durable tool work for a dead provider under CI load.
+        events
+            .send(SessionEventKind::ProviderEvent {
+                provider: CodingProvider::Codex,
+                kind: "test_turn_started".to_string(),
+                payload: json!({}),
+            })
+            .await
+            .context("canonical dogfood executor could not announce progress")?;
         let phase = self.phase.fetch_add(1, Ordering::SeqCst);
         let final_text = match phase {
             0 => {
