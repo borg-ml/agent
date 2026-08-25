@@ -820,6 +820,7 @@ pub struct BorgTerminal {
     last_terminal_title: Option<String>,
     transcript_render_cache: Option<CachedTranscriptRender>,
     transcript_full_render_cache: Option<CachedTranscriptRender>,
+    last_committed_viewport_render: Option<CachedTranscriptRender>,
     rendered_transcript_height: usize,
     pending_scroll_anchor_height: Option<usize>,
     pending_transcript_anchor: Option<TranscriptViewportAnchor>,
@@ -1785,6 +1786,7 @@ impl BorgTerminal {
             last_terminal_title: None,
             transcript_render_cache: None,
             transcript_full_render_cache: None,
+            last_committed_viewport_render: None,
             rendered_transcript_height: 0,
             pending_scroll_anchor_height: None,
             pending_transcript_anchor: None,
@@ -4638,11 +4640,23 @@ impl BorgTerminal {
         let local_date = Local::now().date_naive();
         // Keep a separate full-width measurement so an overflowing transcript
         // can switch to the scrollbar-safe width without rendering both widths
-        // again on every frame.
-        // Input redraws must not rebuild the transcript while a live event is
-        // invalidating its normal viewport cache. Reuse the last complete
-        // snapshot for the composer frame; the next ordinary frame catches up
-        // the transcript and its elapsed-time projection.
+        // again on every frame. Input redraws reuse the last complete viewport
+        // snapshot so typing cannot alternate between full-width and
+        // scrollbar-safe wrapping.
+        let committed_viewport_render = if input_fast_path {
+            self.last_committed_viewport_render
+                .as_ref()
+                .filter(
+                    |(cached_width, cached_tool_run_viewport_height, _, _, cached_date, _)| {
+                        *cached_width <= full_transcript_width
+                            && *cached_tool_run_viewport_height == tool_run_viewport_height
+                            && *cached_date == local_date
+                    },
+                )
+                .map(|(_, _, _, _, _, render)| Arc::clone(render))
+        } else {
+            None
+        };
         let stale_full_transcript_render = if input_fast_path {
             self.transcript_full_render_cache
                 .as_ref()
@@ -4657,30 +4671,33 @@ impl BorgTerminal {
         } else {
             None
         };
-        let full_transcript_render = stale_full_transcript_render.unwrap_or_else(|| {
-            if self.transcript_render_cache.is_some() {
-                cached_transcript_render(
-                    &self.transcript,
-                    &mut self.transcript_full_render_cache,
-                    full_transcript_width,
-                    tool_run_viewport_height,
-                    goal_tick,
-                    tool_elapsed_tick,
-                    local_date,
-                )
-            } else {
-                self.transcript_full_render_cache = None;
-                cached_transcript_render(
-                    &self.transcript,
-                    &mut self.transcript_full_render_cache,
-                    full_transcript_width,
-                    tool_run_viewport_height,
-                    goal_tick,
-                    tool_elapsed_tick,
-                    local_date,
-                )
-            }
-        });
+        let full_transcript_render =
+            select_transcript_snapshot(input_fast_path, committed_viewport_render, || {
+                stale_full_transcript_render.unwrap_or_else(|| {
+                    if self.transcript_render_cache.is_some() {
+                        cached_transcript_render(
+                            &self.transcript,
+                            &mut self.transcript_full_render_cache,
+                            full_transcript_width,
+                            tool_run_viewport_height,
+                            goal_tick,
+                            tool_elapsed_tick,
+                            local_date,
+                        )
+                    } else {
+                        self.transcript_full_render_cache = None;
+                        cached_transcript_render(
+                            &self.transcript,
+                            &mut self.transcript_full_render_cache,
+                            full_transcript_width,
+                            tool_run_viewport_height,
+                            goal_tick,
+                            tool_elapsed_tick,
+                            local_date,
+                        )
+                    }
+                })
+            });
         let queued_prompts = self.active_queued_prompts().to_vec();
         // Keep the first draft anchored in the splash composition area. Moving
         // it to the chat footer on the first keystroke makes the whole screen
@@ -6371,6 +6388,16 @@ impl BorgTerminal {
                 );
             }
         })?;
+        if !input_fast_path {
+            self.last_committed_viewport_render = Some((
+                transcript_width,
+                tool_run_viewport_height,
+                goal_tick,
+                tool_elapsed_tick,
+                local_date,
+                Arc::clone(&transcript_render),
+            ));
+        }
         if background_hover_suppressed {
             next_scrollbar_area = None;
             next_scrollbar_thumb_area = None;
@@ -10430,6 +10457,21 @@ fn cached_transcript_render(
             ));
             render
         })
+}
+
+fn select_transcript_snapshot<T, F>(
+    input_fast_path: bool,
+    committed_viewport_render: Option<T>,
+    fallback_render: F,
+) -> T
+where
+    F: FnOnce() -> T,
+{
+    if input_fast_path {
+        committed_viewport_render.unwrap_or_else(fallback_render)
+    } else {
+        fallback_render()
+    }
 }
 
 fn transcript_width_for_viewport(

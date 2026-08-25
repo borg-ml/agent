@@ -5019,6 +5019,13 @@ fn transcript_width_reserves_scrollbar_gutter_only_when_overflowing() {
     assert_eq!(transcript_width_for_viewport(4, 25, 24), 4);
 }
 
+#[test]
+fn input_redraw_reuses_the_last_committed_viewport_snapshot() {
+    assert_eq!(select_transcript_snapshot(true, Some(97), || 100), 97);
+    assert_eq!(select_transcript_snapshot(true, None, || 100), 100);
+    assert_eq!(select_transcript_snapshot(false, Some(97), || 100), 100);
+}
+
 /// Only commands whose bare form is not a command need finishing by hand;
 /// everything else must run outright or the palette is just a typing aid.
 #[test]
