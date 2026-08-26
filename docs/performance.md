@@ -112,6 +112,12 @@ batch until every payload succeeds. The four-payload, 150 ms latency profile
 fell from 605.4 ms to 153.3 ms, saving 452 ms and providing a 4.0× speedup
 without increasing event or cursor concurrency.
 
+Native process cancellation now stops waiting as soon as the isolated process
+group has exited, while retaining the full 750 ms SIGTERM grace period before
+SIGKILL for stubborn descendants. Cancelling a responsive process group fell
+from 751.3 ms to 11.5 ms, saving about 740 ms and providing a 65× speedup for
+interrupts, explicit termination, timeouts, and session cleanup.
+
 For sampled counters, install `perf` and run the command printed by the
 profile script. `cargo-flamegraph` can be used on the same release test binary
 when available.

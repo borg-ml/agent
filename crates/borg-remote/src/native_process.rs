@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::Serialize;
@@ -967,12 +967,29 @@ fn shell_command(command: &str) -> Command {
 #[cfg(unix)]
 async fn terminate_process_tree(pid: u32) {
     terminate_process_tree_now(pid);
-    tokio::time::sleep(Duration::from_millis(750)).await;
+    let deadline = Instant::now() + Duration::from_millis(750);
+    while process_group_is_alive(pid) && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    if !process_group_is_alive(pid) {
+        return;
+    }
     // SAFETY: a negative, checked child process id addresses only the process group
     // created for this command. ESRCH is harmless when the group already exited.
     unsafe {
         libc::kill(-(pid as i32), libc::SIGKILL);
     }
+}
+
+#[cfg(unix)]
+fn process_group_is_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    // SAFETY: signal zero checks whether the isolated child process group still
+    // exists without changing it. EPERM also proves that the group is alive.
+    let result = unsafe { libc::kill(-(pid as i32), 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 #[cfg(windows)]
@@ -1124,6 +1141,59 @@ mod tests {
             .expect_err("cancelled process must not return a snapshot");
         assert!(error.to_string().contains("cancelled"));
         tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            manager
+                .inner
+                .processes
+                .lock()
+                .expect("process registry lock")
+                .values()
+                .all(|entry| entry.session_id != owner)
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "explicit native process cancellation performance gate"]
+    #[cfg(unix)]
+    async fn responsive_process_cancellation_profile() {
+        let root = tempfile::tempdir().expect("workspace");
+        let manager = ProcessManager::default();
+        let owner = Uuid::new_v4();
+        let cancel = CancellationToken::new();
+        let task_manager = manager.clone();
+        let task_cancel = cancel.clone();
+        let task = tokio::spawn(async move {
+            task_manager
+                .exec_with_cancel(
+                    owner,
+                    root.path(),
+                    "sleep 30".to_string(),
+                    None,
+                    Some(30_000),
+                    Some(100),
+                    60_000,
+                    None,
+                    task_cancel,
+                )
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let started = std::time::Instant::now();
+        cancel.cancel();
+        let error = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("cancellation completes")
+            .expect("process task")
+            .expect_err("cancelled process must not return a snapshot");
+        let elapsed = started.elapsed();
+        eprintln!("native process cancellation: {elapsed:?}");
+
+        assert!(error.to_string().contains("cancelled"));
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "native process cancellation exceeded 200 ms: {elapsed:?}"
+        );
         assert!(
             manager
                 .inner
