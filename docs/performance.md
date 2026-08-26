@@ -125,6 +125,11 @@ a responsive 50 ms timeout fell from 600.4 ms to 60.5 ms, a 9.9× speedup. A
 SIGTERM-resistant group still exercised the full 553.9 ms timeout path before
 SIGKILL.
 
+Managed dictation readiness and shared installer-lock handoff now poll every
+25 ms instead of 250 ms without changing their request or overall deadlines.
+A delayed local speech endpoint was detected in 26.6 ms instead of 251.8 ms,
+saving 225 ms and providing a 9.5× speedup for first-use readiness.
+
 For sampled counters, install `perf` and run the command printed by the
 profile script. `cargo-flamegraph` can be used on the same release test binary
 when available.

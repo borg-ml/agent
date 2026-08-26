@@ -27,7 +27,7 @@ const PARAKEET_MODEL_SHA256: &str =
 const DICTATION_TIMEOUT: Duration = Duration::from_secs(120);
 const DICTATION_SETUP_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const DICTATION_STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
-const DICTATION_SETUP_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const DICTATION_SETUP_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const DICTATION_CACHE_LOCK_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const DICTATION_CACHE_LOCK_STALE_AFTER: Duration = Duration::from_secs(2 * 60 * 60);
 const RECORDER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
@@ -891,10 +891,15 @@ fn env_bool(name: &str) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    use std::time::{Duration, Instant};
+
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+    use tokio::process::Command;
 
     use super::{
         LocalDictationConfig, LocalDictationRecorder, ensure_safe_archive_path,
-        transcription_response_text, transcription_text,
+        transcription_response_text, transcription_text, wait_for_endpoint,
     };
 
     fn default_config() -> LocalDictationConfig {
@@ -965,5 +970,42 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("134"), "{message}");
         assert!(message.contains("recorder-disk-quota-failure"), "{message}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "explicit managed dictation readiness performance gate"]
+    async fn managed_dictation_readiness_profile() {
+        let reservation = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve port");
+        let address = reservation.local_addr().expect("reserved address");
+        drop(reservation);
+        let server = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let listener = TcpListener::bind(address).await.expect("bind endpoint");
+            let (mut stream, _) = listener.accept().await.expect("accept health probe");
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .expect("write health response");
+        });
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn backend stand-in");
+
+        let started = Instant::now();
+        wait_for_endpoint(&format!("http://{address}"), &mut child)
+            .await
+            .expect("endpoint becomes ready");
+        let elapsed = started.elapsed();
+        eprintln!("managed dictation readiness: {elapsed:?}");
+
+        child.kill().await.expect("stop backend stand-in");
+        child.wait().await.expect("reap backend stand-in");
+        server.await.expect("health server");
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "managed dictation readiness exceeded 100 ms: {elapsed:?}"
+        );
     }
 }
