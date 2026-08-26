@@ -1593,7 +1593,7 @@ fn instant_tools_keep_a_diamond_without_animation() {
         .map(|line| line.to_string())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(rendered.contains("◇ Read plan"));
+    assert!(rendered.contains("◇ Reading plan"));
     assert!(!rendered.chars().any(|glyph| "⠋⠙⠹⠸⠼⠴⠦⠧".contains(glyph)));
 
     transcript.apply(&SessionEvent::new(
@@ -3076,7 +3076,7 @@ fn goal_management_modal_contains_toggle_clear_and_cancel() {
 /// An edit with no diff on screen yet has nothing for the user to watch, and
 /// edits take a while. The row says one is coming until the diff itself lands.
 #[test]
-fn an_edit_reads_as_preparing_until_its_diff_is_on_screen() {
+fn an_edit_reads_as_active_until_its_diff_is_on_screen() {
     let session_id = Uuid::new_v4();
     let rendered = |transcript: &Transcript| {
         transcript
@@ -3103,8 +3103,7 @@ fn an_edit_reads_as_preparing_until_its_diff_is_on_screen() {
 
     // Nothing at all yet: the payload has not hydrated.
     let bodyless = rendered(&started("apply_patch", serde_json::Value::Null));
-    assert!(bodyless.contains("preparing edit"), "{bodyless}");
-    assert!(!bodyless.contains("· running"), "{bodyless}");
+    assert!(bodyless.contains("◇ Editing"), "{bodyless}");
 
     // A body, but not a diff: the patch is still being assembled, so there is
     // still nothing to look at.
@@ -3112,8 +3111,7 @@ fn an_edit_reads_as_preparing_until_its_diff_is_on_screen() {
         "apply_patch",
         serde_json::json!({ "file_path": "src/main.rs" }),
     ));
-    assert!(no_diff_yet.contains("preparing edit"), "{no_diff_yet}");
-    assert!(!no_diff_yet.contains("· running"), "{no_diff_yet}");
+    assert!(no_diff_yet.contains("◇ Editing"), "{no_diff_yet}");
 
     // A streamed diff is still pending: show the Edit lifecycle row, but hold
     // the body until the completion receipt arrives.
@@ -3135,14 +3133,12 @@ fn an_edit_reads_as_preparing_until_its_diff_is_on_screen() {
     let mut pending_summary = with_diff
         .lines(120)
         .into_iter()
-        .find(|line| line.to_string().contains("◇ Edit"))
+        .find(|line| line.to_string().contains("◇ Editing"))
         .expect("pending edit summary");
     replace_tool_activity_glyph(&mut pending_summary, "⠙");
-    assert!(pending_summary.to_string().contains("⠙ Edit"));
-    assert!(pending_summary.to_string().contains("preparing edit"));
+    assert!(pending_summary.to_string().contains("⠙ Editing"));
     let with_diff = rendered(&with_diff);
-    assert!(with_diff.contains("◇ Edit"), "{with_diff}");
-    assert!(with_diff.contains("preparing edit"), "{with_diff}");
+    assert!(with_diff.contains("◇ Editing"), "{with_diff}");
     assert!(!with_diff.contains("-one"), "{with_diff}");
 
     let mut completed = started(
@@ -3169,15 +3165,13 @@ fn an_edit_reads_as_preparing_until_its_diff_is_on_screen() {
     ));
     let completed = rendered(&completed);
     assert!(completed.contains("✓ Edit"), "{completed}");
-    assert!(!completed.contains("preparing edit"), "{completed}");
+    assert!(!completed.contains("Editing"), "{completed}");
     assert!(completed.contains("− one"), "{completed}");
     assert!(completed.contains("+ two"), "{completed}");
 
-    // A bodyless non-edit tool is never described as preparing one.
+    // A bodyless non-edit tool uses its own active action label.
     let read = rendered(&started("read_file", serde_json::Value::Null));
-    assert!(!read.contains("preparing edit"), "{read}");
-    assert!(read.contains("◇ Read"), "{read}");
-    assert!(!read.contains("· running"), "{read}");
+    assert!(read.contains("◇ Reading"), "{read}");
 }
 
 #[test]
@@ -3203,8 +3197,7 @@ fn streamed_tool_preview_is_replaced_by_the_durable_tool_once() {
         .map(|line| line.to_string())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(pending.contains("◇ Edit"), "{pending}");
-    assert!(pending.contains("preparing edit"), "{pending}");
+    assert!(pending.contains("◇ Editing"), "{pending}");
     assert_eq!(
         transcript
             .order
@@ -3256,7 +3249,7 @@ fn streamed_tool_preview_is_replaced_by_the_durable_tool_once() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(completed.contains("✓ Edit"), "{completed}");
-    assert!(!completed.contains("preparing edit"), "{completed}");
+    assert!(!completed.contains("Editing"), "{completed}");
 
     let mut plan = Transcript::default();
     plan.apply(&SessionEvent::new(
@@ -3278,8 +3271,7 @@ fn streamed_tool_preview_is_replaced_by_the_durable_tool_once() {
         .map(|line| line.to_string())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(plan.contains("◇ Update plan"), "{plan}");
-    assert!(plan.contains("in progress"), "{plan}");
+    assert!(plan.contains("◇ Updating plan"), "{plan}");
 }
 
 #[test]

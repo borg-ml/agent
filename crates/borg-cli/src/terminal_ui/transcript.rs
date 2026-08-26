@@ -301,6 +301,36 @@ fn tool_has_expandable_body(
             .any(|(_, body)| !body.trim().is_empty())
 }
 
+fn pending_tool_label(name: &str) -> Cow<'_, str> {
+    const ACTIONS: [(&str, &str); 13] = [
+        ("Check", "Checking"),
+        ("Create", "Creating"),
+        ("Edit", "Editing"),
+        ("Find", "Finding"),
+        ("Generate", "Generating"),
+        ("Get", "Getting"),
+        ("Inspect", "Inspecting"),
+        ("List", "Listing"),
+        ("Read", "Reading"),
+        ("Run", "Running"),
+        ("Search", "Searching"),
+        ("Spawn", "Spawning"),
+        ("Update", "Updating"),
+    ];
+    for (action, pending) in ACTIONS {
+        if name == action {
+            return Cow::Borrowed(pending);
+        }
+        if let Some(detail) = name
+            .strip_prefix(action)
+            .and_then(|rest| rest.strip_prefix(' '))
+        {
+            return Cow::Owned(format!("{pending} {detail}"));
+        }
+    }
+    Cow::Borrowed(name)
+}
+
 fn transcript_entry_is_turn_output(entry: &TranscriptEntry) -> bool {
     matches!(
         entry,
@@ -2989,23 +3019,24 @@ impl Transcript {
                         Some("user interrupted")
                     } else if *backgrounded {
                         Some("backgrounded")
-                    } else if !*complete && is_edit {
-                        // Keep the lifecycle explicit until completion. Even
-                        // when the provider streams the proposed patch with
-                        // the start event, it is not the applied result yet.
-                        Some("preparing edit")
-                    } else if !*complete && !is_reasoning && !is_instant {
-                        Some("running")
-                    } else if !*complete && is_instant {
+                    } else if !*complete
+                        && !is_reasoning
+                        && pending_tool_label(name).as_ref() == name
+                    {
                         Some("in progress")
                     } else {
                         None
                     };
+                    let display_name = if *complete || is_reasoning {
+                        Cow::Borrowed(name.as_str())
+                    } else {
+                        pending_tool_label(name)
+                    };
                     let show_tool_body = *complete || !is_edit;
                     let mut summary = if detail.is_empty() {
-                        format!("{time}  {glyph} {name}")
+                        format!("{time}  {glyph} {display_name}")
                     } else {
-                        format!("{time}  {glyph} {name}  {detail}")
+                        format!("{time}  {glyph} {display_name}  {detail}")
                     };
                     if let Some(lifecycle) = lifecycle {
                         summary.push_str(&format!(" · {lifecycle}"));
@@ -3018,13 +3049,13 @@ impl Transcript {
                             .enumerate()
                     {
                         if line_index == 0
-                            && let Some(name_start) = line.find(name.as_str())
+                            && let Some(name_start) = line.find(display_name.as_ref())
                         {
-                            let name_end = name_start + name.len();
+                            let name_end = name_start + display_name.len();
                             lines.push(Line::from(vec![
                                 Span::styled(prefix.to_string(), gutter_style),
                                 Span::styled(line[..name_start].to_string(), style),
-                                Span::styled(name.clone(), name_style),
+                                Span::styled(display_name.to_string(), name_style),
                                 Span::styled(line[name_end..].to_string(), style),
                             ]));
                         } else {

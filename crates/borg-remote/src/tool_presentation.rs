@@ -115,6 +115,10 @@ struct EditResultPresentation {
 
 fn edit_result_presentation(name: &str, output: &str) -> Option<EditResultPresentation> {
     let value = serde_json::from_str::<Value>(output).ok()?;
+    edit_value_presentation(name, &value)
+}
+
+fn edit_value_presentation(name: &str, value: &Value) -> Option<EditResultPresentation> {
     let is_edit_tool = matches!(
         tool_leaf_name(name).as_str(),
         "edit" | "apply_patch" | "write" | "write_file"
@@ -242,6 +246,11 @@ pub fn tool_code_view(name: &str, input: &Value) -> Option<(String, String)> {
     }
     if is_mcp_resource_probe(name) {
         return None;
+    }
+    if is_edit_tool(name, "Edit")
+        && let Some(edit) = edit_value_presentation(name, input)
+    {
+        return Some((edit.body.language, edit.body.text));
     }
     if name.to_ascii_lowercase().contains("edit")
         && let Some((path, source)) = claude_edit_diff(input)
@@ -2253,6 +2262,10 @@ mod tests {
         );
 
         assert_eq!(edit.detail, "packed_oblivious_moe_frontier.rs + tests.rs");
+        let input = edit.input.expect("native edit diff");
+        assert_eq!(input.language, "diff");
+        assert!(input.text.contains("-old\n+new"));
+        assert!(input.text.contains("-old test\n+new test"));
     }
 
     #[test]

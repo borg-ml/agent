@@ -2461,6 +2461,10 @@ async fn run_local_agent_session(
                     {
                         history.push(event.clone());
                     }
+                    if terminal_dirty && session_event_needs_immediate_frame(&event.kind) {
+                        terminal.draw()?;
+                        terminal_dirty = terminal.has_pending_scroll_frame();
+                    }
                 } else if !detached_from_terminal {
                     render_event(&event, args.json, &mut rendered)?;
                 }
@@ -6369,6 +6373,11 @@ fn terminal_needs_activity_tick(status: SessionStatus) -> bool {
 
 fn terminal_needs_idle_tick(has_expiring_notice: bool, has_blinking_cursor: bool) -> bool {
     has_expiring_notice || has_blinking_cursor
+}
+
+fn session_event_needs_immediate_frame(kind: &SessionEventKind) -> bool {
+    matches!(kind, SessionEventKind::ToolStarted { .. })
+        || matches!(kind, SessionEventKind::ProviderEvent { kind, .. } if kind == "tool_call_started")
 }
 
 fn should_draw_input_fast_path(
