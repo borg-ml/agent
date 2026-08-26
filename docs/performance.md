@@ -135,6 +135,11 @@ without changing the health request or 90-second startup deadline. A delayed
 loopback endpoint was detected in 26.5 ms instead of 151.7 ms, saving 125 ms
 and providing a 5.7× speedup for local-model readiness.
 
+Wide split-diff rendering now dequeues paired replacement lines in constant
+time while preserving their order and exact rendered rows. A 50,000-line
+replacement fell from 364.2 ms to 36.8 ms, saving 327 ms and providing a 9.9×
+speedup for large expanded diffs and terminal reflows.
+
 For sampled counters, install `perf` and run the command printed by the
 profile script. `cargo-flamegraph` can be used on the same release test binary
 when available.

@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::sync::OnceLock;
 
 use ratatui::style::{Color, Modifier, Style};
@@ -394,7 +395,7 @@ fn split_diff_lines(source: &str, width: usize) -> Vec<Line<'static>> {
     let pane = width.saturating_sub(3) / 2;
     let number_width = diff_number_width(source);
     let mut output = Vec::new();
-    let mut pending_removed: Vec<(Option<usize>, &str)> = Vec::new();
+    let mut pending_removed: VecDeque<(Option<usize>, &str)> = VecDeque::new();
     let (mut old_line, mut new_line) = (None, None);
 
     for raw in source.lines() {
@@ -410,15 +411,12 @@ fn split_diff_lines(source: &str, width: usize) -> Vec<Line<'static>> {
             continue;
         }
         if raw.starts_with('-') {
-            pending_removed.push((old_line, raw.strip_prefix('-').unwrap_or(raw)));
+            pending_removed.push_back((old_line, raw.strip_prefix('-').unwrap_or(raw)));
             old_line = old_line.map(|line| line + 1);
             continue;
         }
         if raw.starts_with('+') {
-            let (before_number, before) = pending_removed.first().copied().unwrap_or((None, ""));
-            if !pending_removed.is_empty() {
-                pending_removed.remove(0);
-            }
+            let (before_number, before) = pending_removed.pop_front().unwrap_or((None, ""));
             output.push(split_diff_row(
                 before_number,
                 before,
@@ -682,6 +680,8 @@ fn pad_cells(value: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
+    use std::time::Instant;
 
     #[test]
     fn diff_layout_tracks_the_available_terminal_width() {
@@ -895,6 +895,30 @@ mod tests {
                 .iter()
                 .any(|line| line.to_string().matches('│').count() == 3),
             "wide numbered diff should use before/after panes: {lines:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "explicit large split-diff rendering performance gate"]
+    fn large_replacement_diff_profile() {
+        const CHANGED_LINES: usize = 50_000;
+        let mut diff = format!("@@ -1,{CHANGED_LINES} +1,{CHANGED_LINES} @@\n");
+        for index in 0..CHANGED_LINES {
+            writeln!(diff, "-before line {index}").expect("write removal");
+        }
+        for index in 0..CHANGED_LINES {
+            writeln!(diff, "+after line {index}").expect("write addition");
+        }
+
+        let started = Instant::now();
+        let lines = diff_lines(&diff, 180, None);
+        let elapsed = started.elapsed();
+        eprintln!("50k-line split replacement diff: {elapsed:?}");
+
+        assert_eq!(lines.len(), CHANGED_LINES);
+        assert!(
+            elapsed < std::time::Duration::from_millis(100),
+            "large split-diff rendering exceeded 100 ms: {elapsed:?}"
         );
     }
 }
