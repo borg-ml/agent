@@ -5,6 +5,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use borg_provider::mcp::ExternalMcpServer;
 use borg_provider::provider::ModelToolDefinition;
+use futures::stream::{FuturesOrdered, StreamExt};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
@@ -39,9 +40,16 @@ impl NativeMcpRuntime {
         let mut configured_servers = Vec::with_capacity(servers.len());
         let mut tools = HashMap::new();
         let mut definitions = Vec::new();
-        for server in servers {
-            let mut client = NativeMcpClient::start(&server).await?;
-            let listed = client.list_tools().await?;
+        let mut startups = servers
+            .into_iter()
+            .map(|server| async move {
+                let mut client = NativeMcpClient::start(&server).await?;
+                let listed = client.list_tools().await?;
+                Ok::<_, anyhow::Error>((server, client, listed))
+            })
+            .collect::<FuturesOrdered<_>>();
+        while let Some(started) = startups.next().await {
+            let (server, client, listed) = started?;
             let client_index = clients.len();
             for listed_tool in listed {
                 let full_name = external_tool_name(&server.name, &listed_tool.name);
@@ -576,6 +584,7 @@ fn truncate(value: &str, max: usize) -> &str {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+    use std::time::Instant;
 
     #[test]
     fn external_names_are_stable_and_namespaced() {
@@ -777,6 +786,51 @@ esac
             error
                 .to_string()
                 .contains("supports no mutually compatible modern protocol version")
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "explicit multi-server native MCP startup performance gate"]
+    async fn multi_server_startup_profile() {
+        const SERVER_COUNT: usize = 4;
+        let script = r#"
+sleep 0.15
+read _discover
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"]}}'
+read _list
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[{"name":"echo","inputSchema":{"type":"object"}}]}}'
+"#;
+        let servers = (0..SERVER_COUNT)
+            .map(|index| ExternalMcpServer {
+                name: format!("profile-{index}"),
+                command: "sh".to_string(),
+                args: vec!["-c".to_string(), script.to_string()],
+                env: BTreeMap::new(),
+                allowed_tools: Vec::new(),
+            })
+            .collect();
+
+        let started = Instant::now();
+        let runtime = NativeMcpRuntime::start(servers).await.unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(runtime.definitions().len(), SERVER_COUNT);
+        assert_eq!(
+            runtime
+                .definitions()
+                .iter()
+                .map(|definition| definition.name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "mcp__profile_0__echo",
+                "mcp__profile_1__echo",
+                "mcp__profile_2__echo",
+                "mcp__profile_3__echo",
+            ]
+        );
+        eprintln!("four-server native MCP startup: {elapsed:?}");
+        assert!(
+            elapsed < Duration::from_millis(400),
+            "independent MCP servers did not initialize concurrently: {elapsed:?}"
         );
     }
 

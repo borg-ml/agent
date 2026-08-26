@@ -80,6 +80,11 @@ for detailed status refreshes. The release profile measured this cold
 admission path at 162.9 µs versus 550.5 ms for detailed discovery, a roughly
 3,400× reduction in the fixed launch gate.
 
+Native MCP startup now negotiates independent external servers concurrently
+while preserving configured tool and error order. The four-server release
+profile fell from 610.1 ms to 153.2 ms, removing 457 ms from affected native
+turn setup and providing a 4.0× speedup without extending server lifetimes.
+
 For sampled counters, install `perf` and run the command printed by the
 profile script. `cargo-flamegraph` can be used on the same release test binary
 when available.
