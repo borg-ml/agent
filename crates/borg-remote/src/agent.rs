@@ -1923,15 +1923,42 @@ fn normalize_reasoning_delta_after_completion(
 }
 
 fn longest_suffix_prefix_overlap(left: &str, right: &str) -> usize {
-    let maximum = left.len().min(right.len());
-    (1..=maximum)
-        .rev()
-        .find(|overlap| {
-            left.is_char_boundary(left.len() - overlap)
-                && right.is_char_boundary(*overlap)
-                && left.as_bytes()[left.len() - overlap..] == right.as_bytes()[..*overlap]
-        })
-        .unwrap_or(0)
+    if left.is_empty() || right.is_empty() {
+        return 0;
+    }
+    let pattern = right.as_bytes();
+    let mut prefix = vec![0; pattern.len()];
+    for index in 1..pattern.len() {
+        let mut matched = prefix[index - 1];
+        while matched > 0 && pattern[index] != pattern[matched] {
+            matched = prefix[matched - 1];
+        }
+        if pattern[index] == pattern[matched] {
+            matched += 1;
+        }
+        prefix[index] = matched;
+    }
+
+    let mut tail_start = left.len().saturating_sub(pattern.len());
+    while !left.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    let tail = &left.as_bytes()[tail_start..];
+    let mut matched = 0;
+    for (index, byte) in tail.iter().enumerate() {
+        while matched > 0 && *byte != pattern[matched] {
+            matched = prefix[matched - 1];
+        }
+        if *byte == pattern[matched] {
+            matched += 1;
+        }
+        if matched == pattern.len() && index + 1 < tail.len() {
+            matched = prefix[matched - 1];
+        }
+    }
+    debug_assert!(right.is_char_boundary(matched));
+    debug_assert!(left.is_char_boundary(left.len() - matched));
+    matched
 }
 
 fn terminal_assistant_text(
@@ -2528,6 +2555,64 @@ mod tests {
         assert_eq!(
             accumulated,
             "Considering code modifications\nI’m checking the repository"
+        );
+    }
+
+    #[test]
+    fn reasoning_overlap_keeps_the_longest_utf8_boundary_match() {
+        let mut samples = Vec::new();
+        for len in 0..=7 {
+            for bits in 0..(1_usize << len) {
+                samples.push(
+                    (0..len)
+                        .map(|index| if bits & (1 << index) == 0 { 'a' } else { 'b' })
+                        .collect::<String>(),
+                );
+            }
+        }
+        samples.extend(["🦀step".to_string(), "step 🦀".to_string()]);
+        for left in &samples {
+            for right in &samples {
+                let expected = (1..=left.len().min(right.len()))
+                    .rev()
+                    .find(|overlap| {
+                        left.is_char_boundary(left.len() - overlap)
+                            && right.is_char_boundary(*overlap)
+                            && left.as_bytes()[left.len() - overlap..]
+                                == right.as_bytes()[..*overlap]
+                    })
+                    .unwrap_or(0);
+                assert_eq!(
+                    longest_suffix_prefix_overlap(left, right),
+                    expected,
+                    "left={left:?}, right={right:?}"
+                );
+            }
+        }
+
+        let mut accumulated = "first step".to_string();
+        assert_eq!(
+            normalize_reasoning_delta(&mut accumulated, "step two"),
+            Some(" two".to_string())
+        );
+        assert_eq!(accumulated, "first step two");
+    }
+
+    #[test]
+    #[ignore = "manual pathological reasoning-overlap profile"]
+    fn reasoning_overlap_profile() {
+        let bytes = 256 * 1024;
+        let mut left = "a".repeat(bytes - 1);
+        left.push('b');
+        let right = "a".repeat(bytes);
+        let started = std::time::Instant::now();
+        let overlap = std::hint::black_box(longest_suffix_prefix_overlap(&left, &right));
+        let elapsed = started.elapsed();
+        eprintln!("256 KiB pathological reasoning overlap: {elapsed:?}");
+        assert_eq!(overlap, 0);
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "reasoning overlap exceeded 50 ms: {elapsed:?}"
         );
     }
 
