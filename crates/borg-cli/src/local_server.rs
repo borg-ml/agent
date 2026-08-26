@@ -16,7 +16,7 @@ const DEFAULT_PORT: u16 = 8000;
 const DEFAULT_CONTEXT_TOKENS: u64 = 32_768;
 const HEALTH_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
 const HEALTH_STARTUP_TIMEOUT: Duration = Duration::from_secs(90);
-const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(150);
+const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_HEALTH_BODY_BYTES: usize = 4 * 1024;
 
@@ -739,6 +739,55 @@ mod tests {
             HealthProbe::Healthy
         ));
         server.await.expect("server");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "explicit local server readiness performance gate"]
+    async fn owned_health_readiness_profile() {
+        let reservation = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve port");
+        let address = reservation.local_addr().expect("reserved address");
+        drop(reservation);
+        let server = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let listener = TcpListener::bind(address).await.expect("bind endpoint");
+            let (mut socket, _) = listener.accept().await.expect("connection");
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request).await.expect("request");
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+                .await
+                .expect("response");
+        });
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn server stand-in");
+        let client = reqwest::Client::builder()
+            .timeout(HEALTH_REQUEST_TIMEOUT)
+            .build()
+            .expect("client");
+
+        let started = Instant::now();
+        let health = wait_for_health(
+            &client,
+            &format!("http://{address}/v1/health"),
+            Duration::from_secs(2),
+            Some(&mut child),
+        )
+        .await
+        .expect("endpoint becomes ready");
+        let elapsed = started.elapsed();
+        eprintln!("local server readiness: {elapsed:?}");
+
+        child.kill().await.expect("stop server stand-in");
+        child.wait().await.expect("reap server stand-in");
+        server.await.expect("health server");
+        assert!(matches!(health, HealthProbe::Healthy));
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "local server readiness exceeded 100 ms: {elapsed:?}"
+        );
     }
 
     #[test]

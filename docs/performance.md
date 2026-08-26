@@ -130,6 +130,11 @@ Managed dictation readiness and shared installer-lock handoff now poll every
 A delayed local speech endpoint was detected in 26.6 ms instead of 251.8 ms,
 saving 225 ms and providing a 9.5× speedup for first-use readiness.
 
+Local llama-server startup readiness now polls every 25 ms instead of 150 ms
+without changing the health request or 90-second startup deadline. A delayed
+loopback endpoint was detected in 26.5 ms instead of 151.7 ms, saving 125 ms
+and providing a 5.7× speedup for local-model readiness.
+
 For sampled counters, install `perf` and run the command printed by the
 profile script. `cargo-flamegraph` can be used on the same release test binary
 when available.
