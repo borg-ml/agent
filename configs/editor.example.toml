@@ -24,7 +24,7 @@ auto_expand_tools = false
 # dictation_icon = "nerd_font"
 
 [layout]
-horizontal_margin = 2
+horizontal_margin = 0
 composer_max_height = 8
 show_footer = true
 

@@ -32,7 +32,7 @@ pub(crate) struct LayoutPreferences {
 impl Default for LayoutPreferences {
     fn default() -> Self {
         Self {
-            horizontal_margin: 2,
+            horizontal_margin: 0,
             composer_max_height: 8,
             show_footer: true,
         }
@@ -391,5 +391,6 @@ mod tests {
         assert_eq!(preferences.transcript.user_message_color, "#c6e4ff");
         assert!(preferences.interaction.prevent_sleep);
         assert_eq!(preferences.presentation.refresh_rate_fps, 60);
+        assert_eq!(preferences.layout.horizontal_margin, 0);
     }
 }
