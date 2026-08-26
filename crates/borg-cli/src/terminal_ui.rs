@@ -437,7 +437,7 @@ const ACTIVE_MESSAGES_SEND_NOW: &str = "Send now and redirect the current turn";
 const ACTIVE_MESSAGES_WAIT: &str = "Wait and send after the current turn finishes";
 
 const SLASH_COMMANDS: &[(&str, &str)] = &[
-    ("/help", "show commands"),
+    ("/help", "open commands and keybindings"),
     ("/copy", "copy the last assistant message"),
     (
         "/ask",

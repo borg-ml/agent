@@ -4527,10 +4527,7 @@ async fn run_local_agent_session(
                                 "/help" if attachments.is_empty() => terminal
                                     .as_mut()
                                     .expect("terminal")
-                                    .show_info(
-                                        "Commands",
-                                        "/settings · /model · /effort · /extensions · /followups · /refresh · /sleep · /icons · /usage · /clear · /compact · /resume · /goal · /todo · /login · /collab · /remote · /quit",
-                                    ),
+                                    .open_command_palette(),
                                 "/collab" | "/collab view" if attachments.is_empty() => {
                                     if collab_child.is_some() {
                                         terminal.as_mut().expect("terminal").set_notice(
