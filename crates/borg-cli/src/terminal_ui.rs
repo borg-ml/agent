@@ -2906,6 +2906,20 @@ impl BorgTerminal {
     pub fn optimistically_apply_goal_action(&mut self, action: &GoalAction) -> bool {
         let changed = self.transcript.optimistically_apply_goal_action(action);
         if changed {
+            if matches!(action, GoalAction::Resume)
+                && self.focused_child.is_none()
+                && !matches!(
+                    self.status,
+                    SessionStatus::Starting
+                        | SessionStatus::Running
+                        | SessionStatus::WaitingForApproval
+                )
+            {
+                self.status = SessionStatus::Starting;
+                self.interrupt_requested = false;
+                self.active_since = Some(Utc::now());
+                self.borging_this_run = borging_for_run(Uuid::new_v4());
+            }
             self.transcript_render_cache = None;
             self.event_redraw_needed = true;
         }

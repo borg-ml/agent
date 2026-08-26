@@ -3199,8 +3199,21 @@ async fn run_local_agent_session(
                     UiAction::None => {}
                     UiAction::ToggleGoal { action } => {
                         let terminal = terminal.as_mut().expect("terminal");
-                        terminal.optimistically_apply_goal_action(&action);
-                        terminal_dirty = true;
+                        let changed = terminal.optimistically_apply_goal_action(&action);
+                        if changed
+                            && matches!(&action, GoalAction::Resume)
+                            && !matches!(
+                                status,
+                                SessionStatus::Starting
+                                    | SessionStatus::Running
+                                    | SessionStatus::WaitingForApproval
+                            )
+                        {
+                            status = SessionStatus::Starting;
+                            sleep_inhibitor.set_turn_active(true);
+                        }
+                        terminal.draw()?;
+                        terminal_dirty = terminal.has_pending_scroll_frame();
                         if !dispatch_host_command_without_blocking(
                             &session_command_tx,
                             HostCommand::Goal {
@@ -3775,6 +3788,8 @@ async fn run_local_agent_session(
                                         PromptDelivery::Queue,
                                     );
                                     terminal.set_notice("Queued message for director".to_string());
+                                    terminal.draw()?;
+                                    terminal_dirty = terminal.has_pending_scroll_frame();
                                     if let Err(error) = persist_prompt_admission(
                                         store.as_ref(),
                                         session_id,
@@ -3805,8 +3820,6 @@ async fn run_local_agent_session(
                                         attachments,
                                         PromptDelivery::Queue,
                                     );
-                                    terminal.draw()?;
-                                    terminal_dirty = terminal.has_pending_scroll_frame();
                                     pending_prompt_ids.insert(message_id);
                                     if session_command_tx.send(command).await.is_err() {
                                         terminal.set_notice(
@@ -3876,6 +3889,11 @@ async fn run_local_agent_session(
                                 },
                             },
                         );
+                        terminal.as_mut().expect("terminal").draw()?;
+                        terminal_dirty = terminal
+                            .as_ref()
+                            .expect("terminal")
+                            .has_pending_scroll_frame();
                         if let Err(error) = persist_prompt_admission(
                             store.as_ref(),
                             target.unwrap_or(session_id),
@@ -3900,11 +3918,6 @@ async fn run_local_agent_session(
                             terminal_dirty = false;
                             continue;
                         }
-                        terminal.as_mut().expect("terminal").draw()?;
-                        terminal_dirty = terminal
-                            .as_ref()
-                            .expect("terminal")
-                            .has_pending_scroll_frame();
                         pending_prompt_ids.insert(message_id);
                         if session_command_tx.send(command).await.is_err() {
                             let terminal = terminal.as_mut().expect("terminal");
@@ -3939,25 +3952,6 @@ async fn run_local_agent_session(
                                         steer_active_turn,
                                     );
                                     let message_id = Uuid::new_v4();
-                                    if let Err(error) = persist_prompt_admission(
-                                        store.as_ref(),
-                                        session_id,
-                                        message_id,
-                                        &prompt,
-                                        &attachments,
-                                        delivery,
-                                    )
-                                    .await
-                                    {
-                                        terminal.restore_composer(
-                                            format!("/director {prompt}"),
-                                            attachments,
-                                        );
-                                        terminal.set_notice(format!(
-                                            "Could not durably send the prompt: {error:#}"
-                                        ));
-                                        continue;
-                                    }
                                     if active {
                                         terminal.project_pending_prompt(
                                             None,
@@ -3976,6 +3970,35 @@ async fn run_local_agent_session(
                                         sleep_inhibitor.set_turn_active(true);
                                     }
                                     terminal.set_notice("Sending to director".to_string());
+                                    terminal.draw()?;
+                                    terminal_dirty = terminal.has_pending_scroll_frame();
+                                    if let Err(error) = persist_prompt_admission(
+                                        store.as_ref(),
+                                        session_id,
+                                        message_id,
+                                        &prompt,
+                                        &attachments,
+                                        delivery,
+                                    )
+                                    .await
+                                    {
+                                        terminal.reject_optimistic_prompt(
+                                            None,
+                                            message_id,
+                                            format!("/director {prompt}"),
+                                            attachments,
+                                        );
+                                        terminal.set_notice(format!(
+                                            "Could not durably send the prompt: {error:#}"
+                                        ));
+                                        if !active {
+                                            status = SessionStatus::Ready;
+                                            sleep_inhibitor.set_turn_active(false);
+                                        }
+                                        terminal.draw()?;
+                                        terminal_dirty = false;
+                                        continue;
+                                    }
                                     let command = director_prompt_host_command(
                                         session_id,
                                         message_id,
@@ -3983,8 +4006,6 @@ async fn run_local_agent_session(
                                         attachments,
                                         delivery,
                                     );
-                                    terminal.draw()?;
-                                    terminal_dirty = terminal.has_pending_scroll_frame();
                                     pending_prompt_ids.insert(message_id);
                                     if session_command_tx.send(command).await.is_err() {
                                         terminal.set_notice(
@@ -4040,6 +4061,20 @@ async fn run_local_agent_session(
                                 .unwrap_or(provider);
                             let delivery =
                                 default_active_delivery(active_provider, steer_active_turn);
+                            terminal
+                                .as_mut()
+                                .expect("terminal")
+                                .project_pending_prompt(
+                                    Some(target),
+                                    message_id,
+                                    text.clone(),
+                                    delivery,
+                                );
+                            terminal.as_mut().expect("terminal").draw()?;
+                            terminal_dirty = terminal
+                                .as_ref()
+                                .expect("terminal")
+                                .has_pending_scroll_frame();
                             if let Err(error) = persist_prompt_admission(
                                 store.as_ref(),
                                 target,
@@ -4051,21 +4086,19 @@ async fn run_local_agent_session(
                             .await
                             {
                                 let terminal = terminal.as_mut().expect("terminal");
-                                terminal.restore_composer(text, attachments);
+                                terminal.reject_optimistic_prompt(
+                                    Some(target),
+                                    message_id,
+                                    text,
+                                    attachments,
+                                );
                                 terminal.set_notice(format!(
                                     "Could not durably send the prompt: {error:#}"
                                 ));
+                                terminal.draw()?;
+                                terminal_dirty = false;
                                 continue;
                             }
-                            terminal
-                                .as_mut()
-                                .expect("terminal")
-                                .project_pending_prompt(
-                                    Some(target),
-                                    message_id,
-                                    text.clone(),
-                                    delivery,
-                                );
                             let command = HostCommand::Subagent {
                                 session_id,
                                 action: SubagentAction::Prompt {
@@ -4077,11 +4110,6 @@ async fn run_local_agent_session(
                                     delivery,
                                 },
                             };
-                            terminal.as_mut().expect("terminal").draw()?;
-                            terminal_dirty = terminal
-                                .as_ref()
-                                .expect("terminal")
-                                .has_pending_scroll_frame();
                             pending_prompt_ids.insert(message_id);
                             if session_command_tx.send(command).await.is_err() {
                                 let terminal = terminal.as_mut().expect("terminal");
@@ -4605,8 +4633,22 @@ async fn run_local_agent_session(
                                     );
                                     let terminal = terminal.as_mut().expect("terminal");
                                     if optimistic {
-                                        terminal.optimistically_apply_goal_action(&action);
-                                        terminal_dirty = true;
+                                        let changed =
+                                            terminal.optimistically_apply_goal_action(&action);
+                                        if changed
+                                            && matches!(&action, GoalAction::Resume)
+                                            && !matches!(
+                                                status,
+                                                SessionStatus::Starting
+                                                    | SessionStatus::Running
+                                                    | SessionStatus::WaitingForApproval
+                                            )
+                                        {
+                                            status = SessionStatus::Starting;
+                                            sleep_inhibitor.set_turn_active(true);
+                                        }
+                                        terminal.draw()?;
+                                        terminal_dirty = terminal.has_pending_scroll_frame();
                                     }
                                     if !dispatch_host_command_without_blocking(
                                         &session_command_tx,
@@ -4940,23 +4982,6 @@ async fn run_local_agent_session(
                                     };
                                     if !text.is_empty() || !attachments.is_empty() {
                                         let message_id = Uuid::new_v4();
-                                        if let Err(error) = persist_prompt_admission(
-                                            store.as_ref(),
-                                            session_id,
-                                            message_id,
-                                            &text,
-                                            &attachments,
-                                            delivery,
-                                        )
-                                        .await
-                                        {
-                                            let terminal = terminal.as_mut().expect("terminal");
-                                            terminal.restore_composer(text, attachments);
-                                            terminal.set_notice(format!(
-                                                "Could not durably send the prompt: {error:#}"
-                                            ));
-                                            continue;
-                                        }
                                         if active {
                                             terminal
                                                 .as_mut()
@@ -4992,6 +5017,34 @@ async fn run_local_agent_session(
                                             .as_ref()
                                             .expect("terminal")
                                             .has_pending_scroll_frame();
+                                        if let Err(error) = persist_prompt_admission(
+                                            store.as_ref(),
+                                            session_id,
+                                            message_id,
+                                            &text,
+                                            &attachments,
+                                            delivery,
+                                        )
+                                        .await
+                                        {
+                                            let terminal = terminal.as_mut().expect("terminal");
+                                            terminal.reject_optimistic_prompt(
+                                                None,
+                                                message_id,
+                                                text,
+                                                attachments,
+                                            );
+                                            terminal.set_notice(format!(
+                                                "Could not durably send the prompt: {error:#}"
+                                            ));
+                                            if !active {
+                                                status = SessionStatus::Ready;
+                                                sleep_inhibitor.set_turn_active(false);
+                                            }
+                                            terminal.draw()?;
+                                            terminal_dirty = false;
+                                            continue;
+                                        }
                                         pending_prompt_ids.insert(message_id);
                                         if session_command_tx.send(HostCommand::Prompt {
                                             session_id,
