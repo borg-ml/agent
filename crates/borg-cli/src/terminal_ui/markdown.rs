@@ -872,3 +872,26 @@ fn quoted_lines(source: &str, width: usize, style: Style, depth: usize) -> Vec<L
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    #[ignore = "explicit oversized markdown table performance gate"]
+    fn oversized_table_width_profile() {
+        let mut table = MarkdownTable::new(vec![MarkdownAlignment::Left, MarkdownAlignment::Left]);
+        table.rows = vec![
+            vec!["Header".to_string(), "Value".to_string()],
+            vec!["x".repeat(2 * 1024 * 1024), "small".to_string()],
+        ];
+
+        let started = Instant::now();
+        let lines = table.render(80, Style::default());
+        let elapsed = started.elapsed();
+        eprintln!("2 MiB markdown table width balancing: {elapsed:?}");
+
+        assert_eq!(lines.len(), 3);
+    }
+}

@@ -23,7 +23,7 @@ agent-client-protocol = "2.0.0"
 async-trait = "0.1.89"
 base64 = "0.22.1"
 borg-core = { path = "crates/borg-core" }
-blu-lang = { git = "https://github.com/borg-ml/blu.git", rev = "9cf2a6b187d868471d50155ad37a5e5342006e66" }
+blu-lang = { git = "https://github.com/borg-ml/blu.git", rev = "801033966232cce081977d961324847adcf5497a" }
 claude-agents = { git = "https://github.com/borg-ml/claude-agents.git", rev = "0e41be9eed5ffe91b77b79c6742b192b0d917f07" }
 chrono = { version = "0.4.42", features = ["serde"] }
 borg-search = { path = "crates/borg-search" }
