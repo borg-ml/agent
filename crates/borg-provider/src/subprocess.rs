@@ -10,8 +10,10 @@
 
 use std::io;
 use std::path::Path;
+#[cfg(any(unix, test))]
+use std::process::Child;
 #[cfg(test)]
-use std::process::{Child, ExitStatus};
+use std::process::ExitStatus;
 use std::process::{Command, Stdio};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -106,7 +108,6 @@ where
     let mut child = command
         .spawn()
         .with_context(|| format!("spawn {program}"))?;
-    let child_pid = child.id();
 
     if let (Some(bytes), Some(mut handle)) = (stdin, child.stdin.take()) {
         use std::io::Write;
@@ -130,15 +131,14 @@ where
     let deadline = timeout.map(|timeout| Instant::now() + timeout);
     let mut timed_out = false;
     let mut kill_wait_error: Option<io::Error> = None;
-    let poll = Duration::from_millis(100);
+    let poll = Duration::from_millis(10);
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {
                 if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                     timed_out = true;
-                    kill_process_group(child_pid);
-                    if let Err(error) = child.wait() {
+                    if let Err(error) = kill_process_group(&mut child) {
                         kill_wait_error = Some(error);
                     }
                     break std::process::ExitStatus::default();
@@ -222,29 +222,48 @@ pub(crate) fn isolate_std_process_from_terminal(command: &mut Command) {
 pub(crate) fn isolate_std_process_from_terminal(_command: &mut Command) {}
 
 #[cfg(unix)]
-fn kill_process_group(pid: u32) {
+fn kill_process_group(child: &mut Child) -> io::Result<()> {
+    let pid = child.id();
     // SAFETY: `killpg` takes a PGID (here the child's PID, since it
     // was set as group leader via `process_group(0)` at spawn) and a
-    // signal number. We ignore the return; the caller will wait() for
-    // the child regardless.
+    // signal number. The probes and wait below establish the outcome.
     let pgid = pid as i32;
     unsafe {
         libc::killpg(pgid, libc::SIGTERM);
     }
-    // Give a short grace period then escalate to SIGKILL if the child
-    // is still there. 500ms is enough for a `git` subprocess to tear
-    // down; cargo will take longer but SIGKILL is fine for us.
-    std::thread::sleep(Duration::from_millis(500));
-    unsafe {
-        libc::killpg(pgid, libc::SIGKILL);
+    let deadline = Instant::now() + Duration::from_millis(500);
+    let mut leader_reaped = child.try_wait()?.is_some();
+    loop {
+        if !process_group_exists(pid) {
+            break;
+        }
+        if Instant::now() >= deadline {
+            // SAFETY: the stored PGID identifies only the isolated child
+            // group. ESRCH is harmless if it exited after the last probe.
+            unsafe {
+                libc::killpg(pgid, libc::SIGKILL);
+            }
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+        if !leader_reaped {
+            leader_reaped = child.try_wait()?.is_some();
+        }
     }
+    if !leader_reaped {
+        child.wait()?;
+    }
+    Ok(())
 }
 
 #[cfg(not(unix))]
-fn kill_process_group(_pid: u32) {}
+fn kill_process_group(child: &mut std::process::Child) -> io::Result<()> {
+    child.kill()?;
+    child.wait()?;
+    Ok(())
+}
 
 #[cfg(unix)]
-#[cfg(test)]
 fn process_group_exists(pid: u32) -> bool {
     // Signal 0 performs existence/permission checking without changing the
     // process group. EPERM still proves that the group exists.
@@ -267,7 +286,7 @@ pub(crate) fn terminate_std_process_tree(child: &mut Child) -> io::Result<ExitSt
     if process_group_exists(pid) {
         // The group can outlive its leader. Always signal the stored PGID when
         // it still exists, even if `try_wait` already reaped the leader.
-        kill_process_group(pid);
+        kill_process_group(child)?;
     }
     #[cfg(not(unix))]
     if status.is_none() {
@@ -312,6 +331,25 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "explicit short provider subprocess performance gate"]
+    fn short_provider_subprocess_completion_profile() {
+        let mut samples = Vec::with_capacity(12);
+        for _ in 0..12 {
+            let out = run_with_timeout("true", &[] as &[&str], None, None, Duration::from_secs(5))
+                .expect("spawn");
+            assert!(out.success);
+            samples.push(out.elapsed);
+        }
+        samples.sort_unstable();
+        let p95 = samples[(samples.len() * 95).div_ceil(100).saturating_sub(1)];
+        eprintln!("short provider subprocess completion p95: {p95:?}");
+        assert!(
+            p95 < Duration::from_millis(50),
+            "short provider subprocess completion p95 exceeded 50 ms: {p95:?}"
+        );
+    }
+
+    #[test]
     fn non_zero_status_reports_failure() {
         let out = run_with_timeout("false", &[] as &[&str], None, None, Duration::from_secs(5))
             .expect("spawn");
@@ -328,6 +366,22 @@ mod tests {
         assert!(
             out.elapsed < Duration::from_secs(3),
             "timeout should fire promptly, got {:?}",
+            out.elapsed
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "explicit provider timeout cleanup performance gate"]
+    fn responsive_provider_timeout_cleanup_profile() {
+        let out = run_with_timeout("sleep", ["30"], None, None, Duration::from_millis(50))
+            .expect("spawn");
+        eprintln!("responsive provider timeout cleanup: {:?}", out.elapsed);
+
+        assert!(out.timed_out);
+        assert!(
+            out.elapsed < Duration::from_millis(250),
+            "responsive provider timeout cleanup exceeded 250 ms: {:?}",
             out.elapsed
         );
     }

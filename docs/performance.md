@@ -118,6 +118,13 @@ SIGKILL for stubborn descendants. Cancelling a responsive process group fell
 from 751.3 ms to 11.5 ms, saving about 740 ms and providing a 65× speedup for
 interrupts, explicit termination, timeouts, and session cleanup.
 
+The synchronous provider subprocess wrapper now polls completion every 10 ms
+instead of 100 ms and reaps an exited leader while retaining its 500 ms group
+grace. Short-command p95 fell from 100.3 ms to 10.5 ms, a 9.6× speedup, while
+a responsive 50 ms timeout fell from 600.4 ms to 60.5 ms, a 9.9× speedup. A
+SIGTERM-resistant group still exercised the full 553.9 ms timeout path before
+SIGKILL.
+
 For sampled counters, install `perf` and run the command printed by the
 profile script. `cargo-flamegraph` can be used on the same release test binary
 when available.
