@@ -27,6 +27,12 @@ tool_mode = "both"
 # declare stdio MCP commands. User-owned manifests remain eligible to start.
 [extensions]
 allow_project_mcp = false
+# User-installed extensions default to trusted. A checkout cannot raise its own
+# authority above this user-owned policy.
+default_access = "trusted"
+project_access = "sandboxed"
+# deny, prompt, or allow. `allow` is prompt-free for users who choose it.
+native_access = "prompt"
 
 # Team concurrency applies to manual and autonomous subagents. Borg defaults
 # to 16; lower it here for smaller machines or tighter provider budgets.

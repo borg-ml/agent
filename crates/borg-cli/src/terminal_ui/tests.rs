@@ -1,6 +1,23 @@
 use super::*;
 
 #[test]
+fn completion_alert_policies_respect_window_focus() {
+    assert!(!completion_alert_enabled(CompletionAlertPolicy::Off, false));
+    assert!(!completion_alert_enabled(
+        CompletionAlertPolicy::Unfocused,
+        true
+    ));
+    assert!(completion_alert_enabled(
+        CompletionAlertPolicy::Unfocused,
+        false
+    ));
+    assert!(completion_alert_enabled(
+        CompletionAlertPolicy::Always,
+        true
+    ));
+}
+
+#[test]
 fn statusline_names_active_workers_as_subagents() {
     assert_eq!(agents_status_label(0), None);
     assert_eq!(agents_status_label(1).as_deref(), Some("1 subagent"));

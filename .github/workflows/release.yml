@@ -37,6 +37,7 @@ jobs:
       - name: Verify tag and release tooling
         shell: bash
         run: |
+          ./scripts/sync-blu.sh --check
           ./scripts/release.sh --verify-tag "$RELEASE_TAG"
           ./scripts/release-test.sh
 
@@ -111,11 +112,13 @@ jobs:
           cp "$sdk_package/manifest.json" "$package_dir/providers/claude/manifest.json"
           cp "$sdk_package/package.json" "$package_dir/providers/claude/package.json"
           chmod 700 "$package_dir/providers/claude/claude"
-          mkdir -p "$package_dir/docs" "$package_dir/configs"
+          mkdir -p "$package_dir/docs" "$package_dir/configs" "$package_dir/include"
           cp docs/blu-extensions.md "$package_dir/docs/"
+          cp docs/customization.md "$package_dir/docs/"
           cp configs/extension.example.toml "$package_dir/configs/"
+          cp include/borg_extension.h "$package_dir/include/"
           cp LICENSE NOTICE.md README.md "$package_dir/"
-          tar -C "$package_dir" -czf "$PWD/$asset" borg providers docs configs LICENSE NOTICE.md README.md
+          tar -C "$package_dir" -czf "$PWD/$asset" borg providers docs configs include LICENSE NOTICE.md README.md
           if command -v sha256sum >/dev/null 2>&1; then
             sha256sum "$asset" >"$asset.sha256"
           else
@@ -138,9 +141,11 @@ jobs:
           Copy-Item (Join-Path $platformPackage.FullName "claude.exe") "$packageDir/providers/claude/claude.exe"
           Copy-Item (Join-Path $sdkPackage "manifest.json") "$packageDir/providers/claude/manifest.json"
           Copy-Item (Join-Path $sdkPackage "package.json") "$packageDir/providers/claude/package.json"
-          New-Item -ItemType Directory -Path "$packageDir/docs", "$packageDir/configs"
+          New-Item -ItemType Directory -Path "$packageDir/docs", "$packageDir/configs", "$packageDir/include"
           Copy-Item "docs/blu-extensions.md" "$packageDir/docs/"
+          Copy-Item "docs/customization.md" "$packageDir/docs/"
           Copy-Item "configs/extension.example.toml" "$packageDir/configs/"
+          Copy-Item "include/borg_extension.h" "$packageDir/include/"
           Copy-Item LICENSE, NOTICE.md, README.md $packageDir
           Compress-Archive -Path "$packageDir/*" -DestinationPath $asset
           $hash = (Get-FileHash -Algorithm SHA256 $asset).Hash.ToLowerInvariant()
@@ -159,7 +164,9 @@ jobs:
           test -n "$native"
           "$native" --version
           test -f "$(dirname "$binary")/docs/blu-extensions.md"
+          test -f "$(dirname "$binary")/docs/customization.md"
           test -f "$(dirname "$binary")/configs/extension.example.toml"
+          test -f "$(dirname "$binary")/include/borg_extension.h"
       - name: Install-smoke the Windows archive
         if: matrix.archive == 'zip'
         shell: pwsh
@@ -174,7 +181,9 @@ jobs:
           if (-not $native) { throw "packaged native claude.exe was not found" }
           & $native.FullName --version
           if (-not (Get-ChildItem -Path $smokeDir -Recurse -Filter "blu-extensions.md")) { throw "Blu documentation was not packaged" }
+          if (-not (Get-ChildItem -Path $smokeDir -Recurse -Filter "customization.md")) { throw "Customization documentation was not packaged" }
           if (-not (Get-ChildItem -Path $smokeDir -Recurse -Filter "extension.example.toml")) { throw "Blu manifest example was not packaged" }
+          if (-not (Get-ChildItem -Path $smokeDir -Recurse -Filter "borg_extension.h")) { throw "Native extension header was not packaged" }
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: borg-${{ matrix.target }}

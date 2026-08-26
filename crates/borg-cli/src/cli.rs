@@ -40,6 +40,8 @@ pub(crate) enum Command {
     Capabilities(CapabilitiesArgs),
     /// Manage Blu live extensions.
     Extensions(ExtensionsArgs),
+    /// Inspect, export, and import the complete customization profile.
+    Customize(CustomizeArgs),
     /// Inspect live local session owners and opt-in runtime profiling data.
     Inspect(InspectArgs),
     /// List local multiplayer workspaces available to this OS user.
@@ -68,6 +70,34 @@ pub(crate) enum Command {
     Limits(LimitsArgs),
     #[command(name = "__agent-mcp", hide = true)]
     AgentMcp,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct CustomizeArgs {
+    #[command(subcommand)]
+    pub(crate) command: CustomizeCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum CustomizeCommand {
+    /// Show effective editor settings, extension authority, and contributing files.
+    Inspect {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Export user and project customization settings as one portable JSON file.
+    Export {
+        output: PathBuf,
+        #[arg(long)]
+        force: bool,
+    },
+    /// Validate and import a customization profile.
+    Import {
+        input: PathBuf,
+        /// Replace customization files that already exist.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Debug, Args)]

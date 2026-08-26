@@ -18,6 +18,25 @@ pub(crate) struct EditorPreferences {
     pub(crate) transcript: TranscriptPreferences,
     pub(crate) interaction: InteractionPreferences,
     pub(crate) presentation: PresentationPreferences,
+    pub(crate) layout: LayoutPreferences,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct LayoutPreferences {
+    pub(crate) horizontal_margin: u16,
+    pub(crate) composer_max_height: u16,
+    pub(crate) show_footer: bool,
+}
+
+impl Default for LayoutPreferences {
+    fn default() -> Self {
+        Self {
+            horizontal_margin: 2,
+            composer_max_height: 8,
+            show_footer: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,6 +72,14 @@ pub(crate) enum ActiveMessageBehavior {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub(crate) enum CompletionAlertPolicy {
+    Off,
+    Unfocused,
+    Always,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum DictationIconStyle {
     NerdFont,
     Emoji,
@@ -63,6 +90,8 @@ pub(crate) enum DictationIconStyle {
 pub(crate) struct InteractionPreferences {
     pub(crate) active_messages: ActiveMessageBehavior,
     pub(crate) prevent_sleep: bool,
+    pub(crate) completion_notifications: CompletionAlertPolicy,
+    pub(crate) completion_sound: CompletionAlertPolicy,
 }
 
 impl Default for InteractionPreferences {
@@ -70,6 +99,8 @@ impl Default for InteractionPreferences {
         Self {
             active_messages: ActiveMessageBehavior::Steer,
             prevent_sleep: true,
+            completion_notifications: CompletionAlertPolicy::Unfocused,
+            completion_sound: CompletionAlertPolicy::Unfocused,
         }
     }
 }
@@ -164,6 +195,14 @@ impl EditorPreferences {
                 .contains(&self.presentation.refresh_rate_fps),
             "refresh rate must be between {MIN_REFRESH_RATE_FPS} and {MAX_REFRESH_RATE_FPS} FPS"
         );
+        anyhow::ensure!(
+            self.layout.horizontal_margin <= 40,
+            "horizontal margin must be at most 40 cells"
+        );
+        anyhow::ensure!(
+            (3..=30).contains(&self.layout.composer_max_height),
+            "composer maximum height must be between 3 and 30 rows"
+        );
         Ok(())
     }
 }
@@ -179,7 +218,7 @@ pub(crate) fn parse_hex_color(value: &str) -> Result<(u8, u8, u8)> {
     Ok((red, green, blue))
 }
 
-fn default_path() -> Result<PathBuf> {
+pub(crate) fn default_path() -> Result<PathBuf> {
     let root = config_root(
         std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
         std::env::var_os("HOME").map(PathBuf::from),
@@ -246,6 +285,8 @@ mod tests {
             interaction: InteractionPreferences {
                 active_messages: ActiveMessageBehavior::Queue,
                 prevent_sleep: false,
+                completion_notifications: CompletionAlertPolicy::Always,
+                completion_sound: CompletionAlertPolicy::Off,
             },
             presentation: PresentationPreferences {
                 refresh_rate_fps: 144,
@@ -253,6 +294,11 @@ mod tests {
                 auto_expand_tools: true,
                 running_sweeps: false,
                 dictation_icon: Some(DictationIconStyle::NerdFont),
+            },
+            layout: LayoutPreferences {
+                horizontal_margin: 5,
+                composer_max_height: 14,
+                show_footer: false,
             },
         };
 

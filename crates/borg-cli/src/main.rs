@@ -3,6 +3,7 @@ mod agent_config;
 mod agent_mcp;
 mod cli;
 mod collab;
+mod customization;
 mod dictation;
 mod editor_preferences;
 mod extensions;
@@ -48,6 +49,7 @@ async fn main() -> Result<()> {
         Command::Update(args) => updater::run(args).await,
         Command::Capabilities(args) => print_capabilities(args),
         Command::Extensions(args) => print_extensions(args),
+        Command::Customize(args) => customization::run(args),
         Command::Inspect(args) => inspect::run(args).await,
         Command::Workspaces(args) => print_local_workspaces(args.json).await,
         Command::Session { command } => session_commands::run(command).await,
@@ -115,12 +117,8 @@ fn print_extensions(args: ExtensionsArgs) -> Result<()> {
     let config = agent_config::AgentConfig::load(None)?;
     let cwd = std::env::current_dir()?;
     let discover = || {
-        extensions::discover(
-            &cwd,
-            &config.capabilities,
-            config.extensions.allow_project_mcp,
-        )
-        .map(|(catalog, _, _)| catalog)
+        extensions::discover(&cwd, &config.capabilities, &config.extensions)
+            .map(|(catalog, _, _)| catalog)
     };
     match args.command.unwrap_or(ExtensionCommand::List) {
         ExtensionCommand::List => print_extension_catalog(&discover()?, args.json)?,
@@ -135,6 +133,7 @@ fn print_extensions(args: ExtensionsArgs) -> Result<()> {
                 println!("{} {}", extension.name, extension.version);
                 println!("  id: {}", extension.id);
                 println!("  scope: {}", extension.scope.label());
+                println!("  runtime access: {}", extension.requested_access.label());
                 println!("  manifest: {}", extension.manifest_path.display());
                 println!(
                     "  state: {}",

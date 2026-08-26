@@ -10,7 +10,7 @@ mod tests;
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
-use std::io::{self, Stdout};
+use std::io::{self, Stdout, Write as _};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -19,7 +19,9 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::editor_preferences::{DictationIconStyle, TranscriptPreferences, parse_hex_color};
+use crate::editor_preferences::{
+    CompletionAlertPolicy, DictationIconStyle, TranscriptPreferences, parse_hex_color,
+};
 use anyhow::{Context, Result};
 use attachments::{AttachmentStore, PasteOutcome};
 use borg_remote::{
@@ -36,8 +38,9 @@ use borg_remote::{tool_call_summary, tool_code_view};
 use chrono::{DateTime, Local, NaiveDate, Utc};
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
-    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -449,6 +452,10 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/gpt", "ask the active model to consult its GPT peer"),
     ("/peer", "message, clear, or replace a persistent peer"),
     ("/settings", "view interactive session settings"),
+    (
+        "/customize",
+        "inspect effective settings and extension authority",
+    ),
     ("/model", "choose the model"),
     ("/effort", "choose reasoning effort"),
     ("/language", "choose response and drafting language"),
@@ -463,6 +470,11 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/sleep", "keep the machine awake during active turns"),
     ("/expand-edits", "auto-expand edit diffs"),
     ("/expand-tools", "auto-expand other tool details"),
+    (
+        "/notifications",
+        "choose when completion notifications appear",
+    ),
+    ("/sound", "choose when the completion sound plays"),
     ("/icons", "choose the dictation icon"),
     ("/colors", "view configurable transcript colours"),
     ("/color", "set a transcript colour"),
@@ -595,6 +607,8 @@ pub enum UiAction {
     SetAutoExpandEdits(bool),
     SetAutoExpandTools(bool),
     SetRunningSweeps(bool),
+    SetCompletionNotifications(CompletionAlertPolicy),
+    SetCompletionSound(CompletionAlertPolicy),
     SetDictationIcon(DictationIconStyle),
     ToggleDictation,
     LoadPayloads(Vec<SessionPayloadRef>),
@@ -764,6 +778,12 @@ pub struct BorgTerminal {
     dictation_state: DictationState,
     dictation_icon: DictationIconStyle,
     running_sweeps: bool,
+    completion_notifications: CompletionAlertPolicy,
+    completion_sound: CompletionAlertPolicy,
+    horizontal_margin: u16,
+    composer_max_height: u16,
+    show_footer: bool,
+    window_focused: bool,
     tool_hit_areas: Vec<(Rect, usize)>,
     tool_run_hit_areas: Vec<(Rect, usize, usize)>,
     tool_run_header_hit_areas: Vec<(Rect, usize)>,
@@ -974,6 +994,8 @@ enum PickerKind {
     AutoExpandEdits,
     AutoExpandTools,
     RunningSweeps,
+    CompletionNotifications,
+    CompletionSound,
     DictationIcon,
     Rewind,
     MessageActions,
@@ -1667,7 +1689,12 @@ impl BorgTerminal {
             let _ = disable_raw_mode();
             return Err(error.into());
         }
-        if let Err(error) = execute!(stdout, EnableMouseCapture, SetCursorStyle::BlinkingBar) {
+        if let Err(error) = execute!(
+            stdout,
+            EnableMouseCapture,
+            EnableFocusChange,
+            SetCursorStyle::BlinkingBar
+        ) {
             let _ = execute!(stdout, DisableBracketedPaste);
             if mode == ScreenMode::Alternate {
                 let _ = execute!(stdout, LeaveAlternateScreen);
@@ -1757,6 +1784,12 @@ impl BorgTerminal {
             dictation_state: DictationState::Idle,
             dictation_icon: dictation_icon_style_for_preference(None),
             running_sweeps: true,
+            completion_notifications: CompletionAlertPolicy::Unfocused,
+            completion_sound: CompletionAlertPolicy::Unfocused,
+            horizontal_margin: HORIZONTAL_MARGIN,
+            composer_max_height: 8,
+            show_footer: true,
+            window_focused: true,
             tool_hit_areas: Vec::new(),
             tool_run_hit_areas: Vec::new(),
             tool_run_header_hit_areas: Vec::new(),
@@ -2292,6 +2325,14 @@ impl BorgTerminal {
     }
 
     pub fn apply_session_event(&mut self, event: &SessionEvent) -> bool {
+        if !self.replaying_history && matches!(event.kind, SessionEventKind::TurnCompleted { .. }) {
+            let notification =
+                completion_alert_enabled(self.completion_notifications, self.window_focused);
+            let sound = completion_alert_enabled(self.completion_sound, self.window_focused);
+            if notification || sound {
+                self.send_completion_alert(notification, sound);
+            }
+        }
         if !self.replaying_history
             && matches!(
                 event.kind,
@@ -2990,6 +3031,8 @@ impl BorgTerminal {
             "Auto-expand edits".to_string(),
             "Auto-expand tools".to_string(),
             "Running sweep animations".to_string(),
+            "Completion notifications".to_string(),
+            "Completion sound".to_string(),
             "Microphone icon".to_string(),
             "Transcript colours".to_string(),
             format!("User label · {user_label}"),
@@ -3007,6 +3050,8 @@ impl BorgTerminal {
             "/expand-edits",
             "/expand-tools",
             "/animations",
+            "/notifications",
+            "/sound",
             "/icons",
             "/colors",
             "/user-label",
@@ -3221,8 +3266,49 @@ impl BorgTerminal {
         ));
     }
 
+    pub fn open_completion_notifications_picker(&mut self) {
+        self.open_completion_alert_picker(
+            PickerKind::CompletionNotifications,
+            "Completion notifications",
+            self.completion_notifications,
+        );
+    }
+
+    pub fn open_completion_sound_picker(&mut self) {
+        self.open_completion_alert_picker(
+            PickerKind::CompletionSound,
+            "Completion sound",
+            self.completion_sound,
+        );
+    }
+
+    fn open_completion_alert_picker(
+        &mut self,
+        kind: PickerKind,
+        title: &'static str,
+        current: CompletionAlertPolicy,
+    ) {
+        self.picker = Some(Picker::new(
+            kind,
+            title,
+            ["When unfocused", "Always", "Off"],
+            Some(completion_alert_policy_label(current)),
+        ));
+    }
+
     pub fn set_running_sweeps(&mut self, enabled: bool) {
         self.running_sweeps = enabled;
+    }
+
+    pub fn set_layout_preferences(
+        &mut self,
+        preferences: &crate::editor_preferences::LayoutPreferences,
+    ) {
+        self.horizontal_margin = preferences.horizontal_margin;
+        self.composer_max_height = preferences.composer_max_height;
+        self.show_footer = preferences.show_footer;
+        self.transcript_render_cache = None;
+        self.transcript_full_render_cache = None;
     }
 
     pub fn open_dictation_icon_picker(&mut self) {
@@ -3414,6 +3500,14 @@ impl BorgTerminal {
             Event::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Moved)
         );
         match event {
+            Event::FocusGained => {
+                self.window_focused = true;
+                Ok(UiAction::None)
+            }
+            Event::FocusLost => {
+                self.window_focused = false;
+                Ok(UiAction::None)
+            }
             Event::Resize(width, height) => {
                 let area = Rect::new(0, 0, width, height);
                 if self.terminal.size()? == area.into() {
@@ -4024,6 +4118,30 @@ impl BorgTerminal {
 
     pub fn take_event_redraw_needed(&mut self) -> bool {
         std::mem::take(&mut self.event_redraw_needed)
+    }
+
+    pub fn set_completion_alerts(
+        &mut self,
+        notifications: CompletionAlertPolicy,
+        sound: CompletionAlertPolicy,
+    ) {
+        self.completion_notifications = notifications;
+        self.completion_sound = sound;
+    }
+
+    fn send_completion_alert(&mut self, notification: bool, sound: bool) {
+        // OSC 9 is understood by modern terminal emulators as a desktop
+        // notification. BEL requests the user's configured terminal sound.
+        if notification {
+            let _ = write!(
+                self.terminal.backend_mut(),
+                "\x1b]9;Borg Agent finished working\x1b\\"
+            );
+        }
+        if sound {
+            let _ = write!(self.terminal.backend_mut(), "\x07");
+        }
+        let _ = io::Write::flush(self.terminal.backend_mut());
     }
 
     pub fn advance_scroll_frame(&mut self) {
@@ -4642,6 +4760,12 @@ impl BorgTerminal {
             PickerKind::RunningSweeps => {
                 UiAction::SetRunningSweeps(picker.selected_value() == "On")
             }
+            PickerKind::CompletionNotifications => UiAction::SetCompletionNotifications(
+                completion_alert_policy_from_picker(&picker.selected_value()),
+            ),
+            PickerKind::CompletionSound => UiAction::SetCompletionSound(
+                completion_alert_policy_from_picker(&picker.selected_value()),
+            ),
             PickerKind::DictationIcon => match picker.selected_value().as_str() {
                 "nerd_font" => UiAction::SetDictationIcon(DictationIconStyle::NerdFont),
                 "emoji" => UiAction::SetDictationIcon(DictationIconStyle::Emoji),
@@ -4961,7 +5085,9 @@ impl BorgTerminal {
             inset_control_lines(controls)
         };
         let controls_height = controls.len().min(u16::MAX as usize) as u16;
-        let footer_height = if is_launch_screen {
+        let footer_height = if !self.show_footer {
+            0
+        } else if is_launch_screen {
             1
         } else {
             controls_height + 1
@@ -5044,11 +5170,15 @@ impl BorgTerminal {
                 selection.focus,
             );
         }
-        let composer_max_height = if resume_picker_open { 18 } else { 8 };
+        let composer_max_height = if resume_picker_open {
+            18.max(self.composer_max_height)
+        } else {
+            self.composer_max_height
+        };
         let composer_height = composer_panel_height(
             composer_line_count,
             composer_cursor.0,
-            composer_max_height,
+            usize::from(composer_max_height),
             is_launch_screen && resume_picker_open,
         );
         let composer_height = if is_launch_screen {
@@ -5070,8 +5200,10 @@ impl BorgTerminal {
         let transcript_viewport_height = if is_launch_screen {
             0
         } else {
-            let area =
-                centered_content_area(Rect::new(0, 0, terminal_size.width, terminal_size.height));
+            let area = centered_content_area_with_margin(
+                Rect::new(0, 0, terminal_size.width, terminal_size.height),
+                self.horizontal_margin,
+            );
             let chunks = terminal_vertical_chunks(
                 area,
                 queued_prompt_panel_height(&queued_prompts, area.width),
@@ -5158,7 +5290,7 @@ impl BorgTerminal {
         let mut restored_scroll_from_bottom = None;
         let cursor_visible = cursor_blink_visible(self.cursor_blink_started_at.elapsed());
         self.terminal.draw(|frame| {
-            let area = centered_content_area(frame.area());
+            let area = centered_content_area_with_margin(frame.area(), self.horizontal_margin);
             let chunks = terminal_vertical_chunks(
                 area,
                 queued_prompt_panel_height(&queued_prompts, area.width),
@@ -7129,6 +7261,30 @@ impl Drop for BorgTerminal {
     }
 }
 
+fn completion_alert_enabled(policy: CompletionAlertPolicy, window_focused: bool) -> bool {
+    match policy {
+        CompletionAlertPolicy::Off => false,
+        CompletionAlertPolicy::Unfocused => !window_focused,
+        CompletionAlertPolicy::Always => true,
+    }
+}
+
+fn completion_alert_policy_label(policy: CompletionAlertPolicy) -> &'static str {
+    match policy {
+        CompletionAlertPolicy::Off => "Off",
+        CompletionAlertPolicy::Unfocused => "When unfocused",
+        CompletionAlertPolicy::Always => "Always",
+    }
+}
+
+fn completion_alert_policy_from_picker(value: &str) -> CompletionAlertPolicy {
+    match value {
+        "Off" => CompletionAlertPolicy::Off,
+        "Always" => CompletionAlertPolicy::Always,
+        _ => CompletionAlertPolicy::Unfocused,
+    }
+}
+
 impl BorgTerminal {
     fn restore_terminal(&mut self) {
         if self.terminal_restored {
@@ -7145,6 +7301,7 @@ impl BorgTerminal {
         }
         let _ = execute!(self.terminal.backend_mut(), SetTitle("Borg Agent"));
         let _ = execute!(self.terminal.backend_mut(), DisableMouseCapture);
+        let _ = execute!(self.terminal.backend_mut(), DisableFocusChange);
         let _ = execute!(self.terminal.backend_mut(), DisableBracketedPaste);
         if self.mode == ScreenMode::Alternate {
             let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
@@ -10699,8 +10856,8 @@ fn terminal_vertical_chunks(
     [chunks[0], chunks[1], chunks[2], chunks[3], chunks[4]]
 }
 
-fn centered_content_area(area: Rect) -> Rect {
-    let width = terminal_content_width(area.width);
+fn centered_content_area_with_margin(area: Rect, margin: u16) -> Rect {
+    let width = area.width.saturating_sub(margin.saturating_mul(2)).max(1);
     Rect {
         x: area.x.saturating_add(area.width.saturating_sub(width) / 2),
         y: area.y,

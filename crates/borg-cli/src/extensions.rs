@@ -5,16 +5,18 @@
 //! hooks. Catalog reloads are transactional: callers keep the last-known-good
 //! runtime when a changed package does not validate.
 
-use crate::agent_config::CapabilityConfig;
+use crate::agent_config::{CapabilityConfig, ExtensionAccess, ExtensionConfig, NativeAccessPolicy};
 use anyhow::{Context, Result, bail, ensure};
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
+    ffi::{CStr, CString, c_char, c_void},
     fs,
     path::{Component, Path, PathBuf},
     process::Command,
+    sync::{Mutex, OnceLock},
 };
 use uuid::Uuid;
 
@@ -51,6 +53,46 @@ pub(crate) struct ExtensionCatalog {
 }
 
 impl ExtensionCatalog {
+    pub(crate) fn apply_editor_customization(
+        &self,
+        editor: &mut crate::editor_preferences::EditorPreferences,
+        agent: &mut crate::agent_config::AgentConfig,
+    ) -> Result<()> {
+        let mut editor_value = toml::Value::try_from(editor.clone())?;
+        for id in &self.load_order {
+            let Some(extension) = self.extensions.iter().find(|extension| &extension.id == id)
+            else {
+                continue;
+            };
+            if !extension.active {
+                continue;
+            }
+            merge_toml(
+                &mut editor_value,
+                toml::Value::Table(toml::map::Map::from_iter(extension.api.editor.clone())),
+            );
+            for (action, bindings) in &extension.api.keybindings {
+                agent.keybindings.replace(action, bindings.clone())?;
+            }
+            for (alias, target) in &extension.api.aliases {
+                ensure!(
+                    valid_id(alias),
+                    "invalid command alias `{alias}` in extension {}",
+                    extension.id
+                );
+                ensure!(
+                    target.starts_with('/'),
+                    "extension alias `{alias}` must target a slash command"
+                );
+                agent.commands.aliases.insert(alias.clone(), target.clone());
+            }
+        }
+        let customized: crate::editor_preferences::EditorPreferences = editor_value.try_into()?;
+        customized.validate()?;
+        *editor = customized;
+        Ok(())
+    }
+
     pub(crate) fn active_skill_roots(&self) -> Vec<PathBuf> {
         self.load_order
             .iter()
@@ -162,6 +204,21 @@ impl ExtensionCatalog {
     }
 }
 
+fn merge_toml(base: &mut toml::Value, overlay: toml::Value) {
+    match (base, overlay) {
+        (toml::Value::Table(base), toml::Value::Table(overlay)) => {
+            for (key, value) in overlay {
+                if let Some(existing) = base.get_mut(&key) {
+                    merge_toml(existing, value);
+                } else {
+                    base.insert(key, value);
+                }
+            }
+        }
+        (base, overlay) => *base = overlay,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ExtensionDiagnosticLevel {
@@ -192,6 +249,7 @@ pub(crate) struct EffectiveExtension {
     pub version: String,
     pub description: Option<String>,
     pub scope: ExtensionScope,
+    pub requested_access: ExtensionAccess,
     pub manifest_path: PathBuf,
     pub enabled: bool,
     pub active: bool,
@@ -220,6 +278,8 @@ struct Manifest {
     description: Option<String>,
     #[serde(default = "yes")]
     enabled: bool,
+    #[serde(default = "trusted_access")]
+    runtime_access: ExtensionAccess,
     #[serde(default)]
     borg_version: Option<String>,
     #[serde(default)]
@@ -236,12 +296,33 @@ struct Manifest {
     workflows: BTreeMap<String, Workflow>,
     #[serde(default)]
     api: ApiManifest,
+    #[serde(default)]
+    native: Option<NativeManifest>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeManifest {
+    library: PathBuf,
+    sha256: String,
+    #[serde(default = "native_abi_version")]
+    abi_version: u32,
+}
+
+fn native_abi_version() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct ApiManifest {
     pub version: u32,
+    /// Partial editor.toml tree merged in catalog order for active packages.
+    pub editor: BTreeMap<String, toml::Value>,
+    /// Keybinding action names mapped to complete chord lists.
+    pub keybindings: BTreeMap<String, Vec<String>>,
+    /// Slash-command aliases contributed by this package.
+    pub aliases: BTreeMap<String, String>,
     pub transforms: BTreeMap<String, ApiTransform>,
     pub hooks: BTreeMap<String, ApiHook>,
     pub tools: BTreeMap<String, ApiTool>,
@@ -396,10 +477,14 @@ fn string_kind() -> String {
     "string".to_string()
 }
 
+fn trusted_access() -> ExtensionAccess {
+    ExtensionAccess::Trusted
+}
+
 pub(crate) fn discover(
     cwd: &Path,
     capabilities: &CapabilityConfig,
-    allow_project_mcp: bool,
+    extension_config: &ExtensionConfig,
 ) -> Result<(
     ExtensionCatalog,
     Vec<borg_provider::mcp::ExternalMcpServer>,
@@ -412,7 +497,7 @@ pub(crate) fn discover(
         Some(cwd.join(".borg/blu.toml")),
         Some(user_root.join("blu.toml")),
         capabilities,
-        allow_project_mcp,
+        extension_config,
     )
 }
 
@@ -423,7 +508,7 @@ fn discover_in_dirs(
     project_state_path: Option<PathBuf>,
     user_state_path: Option<PathBuf>,
     capabilities: &CapabilityConfig,
-    allow_project_mcp: bool,
+    extension_config: &ExtensionConfig,
 ) -> Result<(
     ExtensionCatalog,
     Vec<borg_provider::mcp::ExternalMcpServer>,
@@ -431,7 +516,7 @@ fn discover_in_dirs(
 )> {
     let mut diagnostics = Vec::new();
     let mut digest = Sha256::new();
-    digest.update(format!("{capabilities:?}:{allow_project_mcp}").as_bytes());
+    digest.update(format!("{capabilities:?}:{extension_config:?}").as_bytes());
     let project_state =
         load_state_for_discovery(project_state_path.as_deref(), &mut diagnostics, &mut digest);
     let user_state =
@@ -513,7 +598,7 @@ fn discover_in_dirs(
                         .get(&candidate.manifest.id)
                         .cloned()
                         .unwrap_or_default();
-                    match evaluate_candidate(&mut candidate, capabilities, allow_project_mcp) {
+                    match evaluate_candidate(&mut candidate, capabilities, extension_config) {
                         Ok(()) => candidates.push(candidate),
                         Err(error) => diagnostics.push(ExtensionDiagnostic {
                             level: ExtensionDiagnosticLevel::Error,
@@ -636,7 +721,7 @@ fn load_candidate(
 fn evaluate_candidate(
     candidate: &mut Candidate,
     capabilities: &CapabilityConfig,
-    allow_project_mcp: bool,
+    extension_config: &ExtensionConfig,
 ) -> Result<()> {
     candidate.active = true;
     candidate.reason = None;
@@ -669,14 +754,35 @@ fn evaluate_candidate(
     {
         deactivate(candidate, format!("requires capability `{missing}`"));
     }
-    if candidate.scope == ExtensionScope::Project && !allow_project_mcp && !manifest.mcp.is_empty()
-    {
+    let allowed_access = match candidate.scope {
+        ExtensionScope::User => extension_config.default_access,
+        ExtensionScope::Project if extension_config.allow_project_mcp => extension_config
+            .project_access
+            .max(ExtensionAccess::Trusted),
+        ExtensionScope::Project => extension_config.project_access,
+    };
+    if manifest.runtime_access > allowed_access {
         deactivate(
             candidate,
-            "project extension trust is disabled; set [extensions].allow_project_mcp = true",
+            format!(
+                "requests {:?} access but user policy allows {:?}",
+                manifest.runtime_access, allowed_access
+            )
+            .to_lowercase(),
         );
     }
-
+    if manifest.runtime_access == ExtensionAccess::Native
+        && extension_config.native_access != NativeAccessPolicy::Allow
+    {
+        let reason = match extension_config.native_access {
+            NativeAccessPolicy::Deny => "native extension access is denied by user policy",
+            NativeAccessPolicy::Prompt => {
+                "native extension awaits approval; set [extensions].native_access = \"allow\" for prompt-free loading"
+            }
+            NativeAccessPolicy::Allow => unreachable!(),
+        };
+        deactivate(candidate, reason);
+    }
     // Disabled, untrusted, or capability-gated packages stay inspectable but
     // do not require runtime-only settings or environment variables to exist.
     if !candidate.active {
@@ -689,6 +795,16 @@ fn evaluate_candidate(
             return Ok(());
         }
     };
+    if let Some(native) = &manifest.native
+        && let Err(error) =
+            load_native_extension(&candidate.package_root, native, &manifest.id, &config)
+    {
+        deactivate(
+            candidate,
+            format!("native extension failed to load: {error:#}"),
+        );
+        return Ok(());
+    }
     let mut servers = Vec::new();
     for (name, server) in &manifest.mcp {
         let rendered = (|| -> Result<_> {
@@ -747,6 +863,84 @@ fn evaluate_candidate(
 }
 
 fn validate_candidate_declarations(candidate: &mut Candidate, manifest: &Manifest) -> Result<()> {
+    ensure!(
+        (manifest.runtime_access == ExtensionAccess::Native) == manifest.native.is_some(),
+        "extension `{}` must declare both runtime_access = \"native\" and [native]",
+        manifest.id
+    );
+    if let Some(native) = &manifest.native {
+        ensure!(
+            matches!(native.abi_version, 1 | 2),
+            "extension `{}` requests native ABI {}; Borg supports 1 and 2",
+            manifest.id,
+            native.abi_version
+        );
+        ensure!(
+            native.sha256.len() == 64 && native.sha256.chars().all(|ch| ch.is_ascii_hexdigit()),
+            "extension `{}` native sha256 must be 64 hexadecimal characters",
+            manifest.id
+        );
+        validate_relative_path(&native.library, "native library")?;
+        let library = candidate.package_root.join(&native.library);
+        ensure!(
+            library.is_file(),
+            "native library does not exist: {}",
+            library.display()
+        );
+        ensure!(
+            library.canonicalize()?.starts_with(&candidate.package_root),
+            "native library escapes its package"
+        );
+    }
+    if !manifest.api.editor.is_empty() {
+        let mut editor =
+            toml::Value::try_from(crate::editor_preferences::EditorPreferences::default())?;
+        merge_toml(
+            &mut editor,
+            toml::Value::Table(toml::map::Map::from_iter(manifest.api.editor.clone())),
+        );
+        let editor: crate::editor_preferences::EditorPreferences =
+            editor.try_into().with_context(|| {
+                format!(
+                    "extension `{}` has invalid editor customization",
+                    manifest.id
+                )
+            })?;
+        editor.validate()?;
+    }
+    let mut keybindings = crate::agent_config::KeybindingConfig::default();
+    for (action, bindings) in &manifest.api.keybindings {
+        keybindings
+            .replace(action, bindings.clone())
+            .with_context(|| format!("extension `{}` has invalid keybindings", manifest.id))?;
+    }
+    for (alias, target) in &manifest.api.aliases {
+        ensure!(
+            valid_id(alias),
+            "extension `{}` has invalid alias `{alias}`",
+            manifest.id
+        );
+        ensure!(
+            target.starts_with('/'),
+            "extension `{}` alias `{alias}` must target a slash command",
+            manifest.id
+        );
+    }
+    if manifest.runtime_access == ExtensionAccess::Sandboxed {
+        ensure!(
+            manifest.mcp.is_empty(),
+            "sandboxed extension `{}` cannot launch MCP processes",
+            manifest.id
+        );
+        ensure!(
+            manifest
+                .workflows
+                .values()
+                .all(|workflow| workflow.runtime == borg_remote::WorkflowRuntime::Blu),
+            "sandboxed extension `{}` can only run embedded Blu/Lua/Luau workflows",
+            manifest.id
+        );
+    }
     if let Some(requirement) = &manifest.borg_version {
         VersionReq::parse(requirement)
             .with_context(|| format!("extension `{}` has invalid borg_version", manifest.id))?;
@@ -971,6 +1165,153 @@ fn validate_candidate_declarations(candidate: &mut Candidate, manifest: &Manifes
             );
         }
     }
+    Ok(())
+}
+
+type NativeShutdown = unsafe extern "C" fn(*mut c_void);
+
+struct LoadedNative {
+    hash: String,
+    _library: libloading::Library,
+    shutdown: Option<NativeShutdown>,
+    handle: usize,
+}
+
+unsafe impl Send for LoadedNative {}
+
+impl Drop for LoadedNative {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown {
+            // SAFETY: callback and opaque handle came from this loaded library.
+            unsafe { shutdown(self.handle as *mut c_void) };
+        }
+    }
+}
+
+#[repr(C)]
+struct NativeHostV2 {
+    abi_version: u32,
+    struct_size: usize,
+    extension_id: *const c_char,
+    config_json: *const c_char,
+    log: unsafe extern "C" fn(u32, *const c_char),
+    emit_event: unsafe extern "C" fn(*const c_char) -> i32,
+}
+
+unsafe extern "C" fn native_log(level: u32, message: *const c_char) {
+    if message.is_null() {
+        return;
+    }
+    // SAFETY: ABI callers provide a NUL-terminated string for this call.
+    let message = unsafe { CStr::from_ptr(message) }.to_string_lossy();
+    match level {
+        0 => tracing::debug!(target: "borg::native_extension", "{message}"),
+        1 => tracing::info!(target: "borg::native_extension", "{message}"),
+        2 => tracing::warn!(target: "borg::native_extension", "{message}"),
+        _ => tracing::error!(target: "borg::native_extension", "{message}"),
+    }
+}
+
+unsafe extern "C" fn native_emit_event(event_json: *const c_char) -> i32 {
+    if event_json.is_null() {
+        return 1;
+    }
+    // SAFETY: ABI callers provide a NUL-terminated string for this call.
+    let event = unsafe { CStr::from_ptr(event_json) }.to_bytes();
+    if event.len() > borg_remote::MAX_HOOK_ARGUMENT_BYTES {
+        return 2;
+    }
+    match serde_json::from_slice::<serde_json::Value>(event) {
+        Ok(event) => {
+            tracing::info!(target: "borg::native_extension", event = %event, "native extension event");
+            0
+        }
+        Err(_) => 3,
+    }
+}
+
+static NATIVE_LIBRARIES: OnceLock<Mutex<HashMap<PathBuf, LoadedNative>>> = OnceLock::new();
+
+fn load_native_extension(
+    package_root: &Path,
+    native: &NativeManifest,
+    extension_id: &str,
+    config: &BTreeMap<String, toml::Value>,
+) -> Result<()> {
+    let path = package_root.join(&native.library).canonicalize()?;
+    let actual = format!("{:x}", Sha256::digest(fs::read(&path)?));
+    ensure!(
+        actual.eq_ignore_ascii_case(&native.sha256),
+        "native library hash mismatch for {}",
+        path.display()
+    );
+    let libraries = NATIVE_LIBRARIES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut libraries = libraries
+        .lock()
+        .map_err(|_| anyhow::anyhow!("native extension registry lock is poisoned"))?;
+    if let Some(loaded) = libraries.get(&path) {
+        ensure!(
+            loaded.hash == actual,
+            "native library changed after loading; restart Borg to load the new bytes"
+        );
+        return Ok(());
+    }
+    // SAFETY: native mode is an explicit user grant for in-process execution.
+    // Hash pinning binds that grant to these exact bytes, and the versioned C
+    // entrypoint avoids relying on Rust's unstable ABI.
+    let library = unsafe { libloading::Library::new(&path) }
+        .with_context(|| format!("open native library {}", path.display()))?;
+    let mut shutdown = None;
+    let mut handle = std::ptr::null_mut();
+    unsafe {
+        if native.abi_version == 1 {
+            let initialize: libloading::Symbol<'_, unsafe extern "C" fn(u32) -> i32> = library
+                .get(b"borg_extension_init\0")
+                .context("missing borg_extension_init symbol")?;
+            let status = initialize(1);
+            ensure!(status == 0, "borg_extension_init returned status {status}");
+        } else {
+            ensure!(
+                native.abi_version == 2,
+                "unsupported native ABI {}; expected 1 or 2",
+                native.abi_version
+            );
+            let id = CString::new(extension_id)?;
+            let config_json = CString::new(serde_json::to_string(config)?)?;
+            let host = NativeHostV2 {
+                abi_version: 2,
+                struct_size: std::mem::size_of::<NativeHostV2>(),
+                extension_id: id.as_ptr(),
+                config_json: config_json.as_ptr(),
+                log: native_log,
+                emit_event: native_emit_event,
+            };
+            let initialize: libloading::Symbol<
+                '_,
+                unsafe extern "C" fn(*const NativeHostV2, *mut *mut c_void) -> i32,
+            > = library
+                .get(b"borg_extension_init_v2\0")
+                .context("missing borg_extension_init_v2 symbol")?;
+            let status = initialize(&host, &mut handle);
+            ensure!(
+                status == 0,
+                "borg_extension_init_v2 returned status {status}"
+            );
+            shutdown = library
+                .get::<NativeShutdown>(b"borg_extension_shutdown_v2\0")
+                .ok()
+                .map(|symbol| *symbol);
+        }
+    }
+    libraries.insert(
+        path,
+        LoadedNative {
+            hash: actual,
+            _library: library,
+            shutdown,
+            handle: handle as usize,
+        },
+    );
     Ok(())
 }
 
@@ -1291,6 +1632,7 @@ fn effective(candidate: Candidate) -> EffectiveExtension {
         version: candidate.manifest.version,
         description: candidate.manifest.description,
         scope: candidate.scope,
+        requested_access: candidate.manifest.runtime_access,
         manifest_path: candidate.manifest_path,
         enabled,
         active: candidate.active,
@@ -2003,13 +2345,22 @@ mod tests {
         user: Option<PathBuf>,
         trusted: bool,
     ) -> (ExtensionCatalog, Vec<borg_provider::mcp::ExternalMcpServer>) {
+        let extension_config = ExtensionConfig {
+            allow_project_mcp: trusted,
+            project_access: if trusted {
+                ExtensionAccess::Trusted
+            } else {
+                ExtensionAccess::Sandboxed
+            },
+            ..ExtensionConfig::default()
+        };
         discover_in_dirs(
             project,
             user,
             None,
             None,
             &CapabilityConfig::default(),
-            trusted,
+            &extension_config,
         )
         .map(|(catalog, servers, _)| (catalog, servers))
         .unwrap()
@@ -2028,6 +2379,66 @@ mod tests {
         assert_eq!(catalog.load_order, ["docs"]);
         assert_eq!(servers[0].name, "docs__docs");
         assert_eq!(catalog.active_skill_roots().len(), 1);
+    }
+
+    #[test]
+    fn native_package_waits_for_user_policy_before_loading() {
+        let root = tempfile::tempdir().unwrap();
+        let package = root.path().join("native-example");
+        fs::create_dir_all(&package).unwrap();
+        let library = package.join("example.bin");
+        fs::write(&library, b"not loaded while approval is pending").unwrap();
+        let sha256 = format!("{:x}", Sha256::digest(fs::read(&library).unwrap()));
+        fs::write(
+            package.join("blu.toml"),
+            format!(
+                r#"manifest_version = 1
+id = "native-example"
+version = "1.0.0"
+runtime_access = "native"
+
+[native]
+library = "example.bin"
+sha256 = "{sha256}"
+abi_version = 1
+"#
+            ),
+        )
+        .unwrap();
+        let policy = ExtensionConfig {
+            default_access: ExtensionAccess::Native,
+            native_access: NativeAccessPolicy::Prompt,
+            ..ExtensionConfig::default()
+        };
+        let (catalog, _, _) = discover_in_dirs(
+            None,
+            Some(root.path().to_path_buf()),
+            None,
+            None,
+            &CapabilityConfig::default(),
+            &policy,
+        )
+        .unwrap();
+        assert_eq!(catalog.extensions.len(), 1);
+        assert!(!catalog.extensions[0].active);
+        assert!(
+            catalog.extensions[0]
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("awaits approval"))
+        );
+    }
+
+    #[test]
+    fn native_v2_event_boundary_accepts_only_bounded_json() {
+        let valid = CString::new(r#"{"event":"ready"}"#).unwrap();
+        let invalid = CString::new("not-json").unwrap();
+        // SAFETY: both C strings remain alive for the duration of each call.
+        unsafe {
+            assert_eq!(native_emit_event(valid.as_ptr()), 0);
+            assert_eq!(native_emit_event(invalid.as_ptr()), 3);
+            assert_eq!(native_emit_event(std::ptr::null()), 1);
+        }
     }
 
     #[test]
@@ -2062,7 +2473,7 @@ description = "Review the current change"
             None,
             None,
             &CapabilityConfig::default(),
-            false,
+            &ExtensionConfig::default(),
         )
         .unwrap();
         assert!(servers.is_empty());
@@ -2127,7 +2538,7 @@ description = "Run review"
             None,
             None,
             &CapabilityConfig::default(),
-            false,
+            &ExtensionConfig::default(),
         )
         .unwrap();
         assert!(!catalog.has_errors(), "{:#?}", catalog.diagnostics);
@@ -2174,7 +2585,7 @@ args = ["--no-banner"]
             None,
             None,
             &CapabilityConfig::default(),
-            false,
+            &ExtensionConfig::default(),
         )
         .unwrap();
         assert!(!catalog.has_errors(), "{:#?}", catalog.diagnostics);
@@ -2228,7 +2639,7 @@ entrypoint = "workflows/luau.luau"
             None,
             None,
             &CapabilityConfig::default(),
-            false,
+            &ExtensionConfig::default(),
         )
         .unwrap();
         assert!(!catalog.has_errors(), "{:#?}", catalog.diagnostics);
@@ -2265,7 +2676,7 @@ entrypoint = "workflows/luau.luau"
             None,
             Some(state_path),
             &CapabilityConfig::default(),
-            false,
+            &ExtensionConfig::default(),
         )
         .unwrap();
         assert_eq!(catalog.extensions.len(), 1);
@@ -2375,11 +2786,43 @@ entrypoint = "workflows/luau.luau"
             None,
             Some(state_path),
             &CapabilityConfig::default(),
-            false,
+            &ExtensionConfig::default(),
         )
         .unwrap();
         assert_eq!(servers[0].env["TOKEN"], "secret");
         assert_eq!(catalog.extensions[0].settings["token"], "<redacted>");
+    }
+
+    #[test]
+    fn active_packages_customize_editor_keybindings_and_aliases() {
+        let workspace = tempfile::tempdir().unwrap();
+        let packages = workspace.path().join("extensions");
+        package(
+            &packages,
+            "visuals",
+            r##"
+[api.editor.transcript]
+assistant_label = "friend"
+assistant_label_color = "#112233"
+
+[api.keybindings]
+send = ["ctrl+enter"]
+
+[api.aliases]
+ship = "/fast on"
+"##,
+        );
+        let (catalog, _) = discover_test(None, Some(packages), true);
+        assert!(!catalog.has_errors());
+        let mut editor = crate::editor_preferences::EditorPreferences::default();
+        let mut agent = crate::agent_config::AgentConfig::default();
+        catalog
+            .apply_editor_customization(&mut editor, &mut agent)
+            .unwrap();
+        assert_eq!(editor.transcript.assistant_label, "friend");
+        assert_eq!(editor.transcript.assistant_label_color, "#112233");
+        assert_eq!(agent.keybindings.send, ["ctrl+enter"]);
+        assert_eq!(agent.commands.aliases["ship"], "/fast on");
     }
 
     #[test]

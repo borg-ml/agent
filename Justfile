@@ -3,6 +3,14 @@ set shell := ["bash", "-eu", "-o", "pipefail", "-c"]
 default:
     @just --list
 
+# Update the pinned Blu runtime to current upstream HEAD and refresh Cargo.lock.
+blu-update:
+    ./scripts/sync-blu.sh --update
+
+# Release/CI freshness gate for the embedded Blu runtime.
+blu-check:
+    ./scripts/sync-blu.sh --check
+
 # Install only the Claude binary used by the native Rust runtime.
 claude-native:
     #!/usr/bin/env bash

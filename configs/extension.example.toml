@@ -17,6 +17,8 @@ name = "Documentation tools"
 version = "1.0.0"
 description = "Search and read the project's documentation index."
 enabled = true
+# sandboxed, trusted, or native. Authority is capped by the user's agent.toml.
+runtime_access = "trusted"
 borg_version = ">=0.1.34"
 required_capabilities = ["multiplayer"]
 skill_roots = ["skills"]
@@ -63,6 +65,26 @@ description = "Review the current change"
 [api]
 version = 1
 
+# Active packages can override any validated editor preference, keybinding,
+# and slash alias. Later packages in dependency-first load order win.
+[api.editor.transcript]
+assistant_label = "borg"
+assistant_label_color = "#ff8e24"
+
+[api.editor.presentation]
+auto_expand_tools = false
+
+[api.editor.layout]
+horizontal_margin = 2
+composer_max_height = 8
+show_footer = true
+
+[api.keybindings]
+# send = ["ctrl+enter"]
+
+[api.aliases]
+# ship = "/fast on"
+
 [api.transforms.concise]
 append_system_prompt = "Prefer concise release notes."
 append_context = "Keep the release checklist in view."
@@ -87,6 +109,13 @@ description = "Run the durable review command"
 # [workflows.lua_review]
 # runtime = "blu"
 # entrypoint = "workflows/lua_review.lua"
+
+# Native packages load a hash-pinned C ABI library in Borg's process only when
+# runtime_access = "native" and the user's native_access policy is "allow".
+# [native]
+# library = "lib/example.so"
+# sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+# abi_version = 2
 #
 # [workflows.luau_review]
 # runtime = "blu"

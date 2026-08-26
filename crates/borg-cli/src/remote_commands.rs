@@ -43,7 +43,9 @@ use crate::dictation::{
     LocalDictationBackend, LocalDictationConfig, LocalDictationRecorder, ensure_backend,
     parakeet_is_installed,
 };
-use crate::editor_preferences::{ActiveMessageBehavior, DictationIconStyle, EditorPreferences};
+use crate::editor_preferences::{
+    ActiveMessageBehavior, CompletionAlertPolicy, DictationIconStyle, EditorPreferences,
+};
 use crate::sleep_inhibitor::SleepInhibitor;
 use crate::terminal_ui::{
     BorgTerminal, DictationState, ProviderAuthChoice, ResumeSessionOption, TerminalInputEvent,
@@ -380,7 +382,7 @@ fn blu_host_executor_factory() -> HostExecutorFactory {
         let (catalog, extension_servers, extension_workflows) = crate::extensions::discover(
             &launch.cwd,
             &agent_config.capabilities,
-            agent_config.extensions.allow_project_mcp,
+            &agent_config.extensions,
         )?;
         let mut servers = agent_config.external_mcp_servers();
         servers.extend(extension_servers);
@@ -397,7 +399,7 @@ fn blu_host_executor_factory() -> HostExecutorFactory {
             let (catalog, extension_servers, _extension_workflows) = crate::extensions::discover(
                 &reload_cwd,
                 &agent_config.capabilities,
-                agent_config.extensions.allow_project_mcp,
+                &agent_config.extensions,
             )?;
             anyhow::ensure!(
                 !catalog.has_errors(),
@@ -1300,11 +1302,8 @@ async fn run_local_agent_session(
         tool_mode: agent_config.capabilities.tool_mode,
     };
     let (mut extension_catalog, extension_servers, extension_workflows) =
-        crate::extensions::discover(
-            &cwd,
-            &agent_config.capabilities,
-            agent_config.extensions.allow_project_mcp,
-        )?;
+        crate::extensions::discover(&cwd, &agent_config.capabilities, &agent_config.extensions)?;
+    extension_catalog.apply_editor_customization(&mut editor_preferences, &mut agent_config)?;
     let extension_skill_roots = extension_catalog.active_skill_roots();
     let mut observed_extension_revision = extension_catalog.revision.clone();
     let mut last_blu_discovery_error: Option<String> = None;
@@ -1670,6 +1669,11 @@ async fn run_local_agent_session(
         terminal.set_auto_expand_edits(editor_preferences.presentation.auto_expand_edits);
         terminal.set_auto_expand_tools(editor_preferences.presentation.auto_expand_tools);
         terminal.set_running_sweeps(editor_preferences.presentation.running_sweeps);
+        terminal.set_layout_preferences(&editor_preferences.layout);
+        terminal.set_completion_alerts(
+            editor_preferences.interaction.completion_notifications,
+            editor_preferences.interaction.completion_sound,
+        );
         terminal.set_transcript_labels(
             editor_preferences.transcript.user_label.clone(),
             editor_preferences.transcript.assistant_label.clone(),
@@ -2137,12 +2141,12 @@ async fn run_local_agent_session(
             _ = blu_tick.tick(), if interactive && blu_discovery_task.is_none() => {
                 let discovery_cwd = cwd.clone();
                 let discovery_capabilities = agent_config.capabilities.clone();
-                let allow_project_mcp = agent_config.extensions.allow_project_mcp;
+                let extension_config = agent_config.extensions.clone();
                 blu_discovery_task = Some(tokio::task::spawn_blocking(move || {
                     crate::extensions::discover(
                         &discovery_cwd,
                         &discovery_capabilities,
-                        allow_project_mcp,
+                        &extension_config,
                     )
                 }));
             }
@@ -2160,6 +2164,13 @@ async fn run_local_agent_session(
                         observed_extension_revision = next_catalog.revision.clone();
                         if !next_catalog.has_errors() {
                             last_blu_discovery_error = None;
+                            let mut next_agent_config =
+                                AgentConfig::load(args.config.as_deref())?;
+                            let mut next_editor_preferences = EditorPreferences::load()?;
+                            next_catalog.apply_editor_customization(
+                                &mut next_editor_preferences,
+                                &mut next_agent_config,
+                            )?;
                             let mut servers = agent_config.external_mcp_servers();
                             servers.extend(next_extension_servers);
                             live_extension_executor.replace_runtime_extensions_with_api(
@@ -2169,12 +2180,41 @@ async fn run_local_agent_session(
                                 next_catalog.api_snapshot(),
                             );
                             extension_catalog = next_catalog;
+                            agent_config.keybindings = next_agent_config.keybindings;
+                            agent_config.commands.aliases = next_agent_config.commands.aliases;
+                            editor_preferences = next_editor_preferences;
+                            tui_fps = tui_refresh_rate(u64::from(
+                                editor_preferences.presentation.refresh_rate_fps,
+                            ));
+                            prevent_sleep = editor_preferences.interaction.prevent_sleep;
+                            steer_active_turn = editor_preferences.interaction.active_messages
+                                == ActiveMessageBehavior::Steer;
                             if let Some(terminal) = terminal.as_mut() {
+                                terminal.reload_keybindings(&agent_config.keybindings)?;
+                                terminal.set_auto_expand_edits(
+                                    editor_preferences.presentation.auto_expand_edits,
+                                );
+                                terminal.set_auto_expand_tools(
+                                    editor_preferences.presentation.auto_expand_tools,
+                                );
+                                terminal.set_running_sweeps(
+                                    editor_preferences.presentation.running_sweeps,
+                                );
+                                terminal.set_layout_preferences(&editor_preferences.layout);
+                                terminal.set_completion_alerts(
+                                    editor_preferences.interaction.completion_notifications,
+                                    editor_preferences.interaction.completion_sound,
+                                );
+                                terminal.set_transcript_labels(
+                                    editor_preferences.transcript.user_label.clone(),
+                                    editor_preferences.transcript.assistant_label.clone(),
+                                );
+                                terminal.set_transcript_colors(&editor_preferences.transcript);
                                 terminal.set_extension_commands(
                                     extension_catalog.api_snapshot().commands,
                                 );
                                 terminal.set_notice(
-                                    "Blu reloaded · extensions apply at the next turn boundary"
+                                    "Blu reloaded · editor and extension APIs are live · runtime applies next turn"
                                         .to_string(),
                                 );
                                 terminal_dirty = true;
@@ -3553,6 +3593,32 @@ async fn run_local_agent_session(
                             if enabled { "on" } else { "off" }
                         ));
                     }
+                    UiAction::SetCompletionNotifications(policy) => {
+                        editor_preferences.interaction.completion_notifications = policy;
+                        editor_preferences.save()?;
+                        let terminal = terminal.as_mut().expect("terminal");
+                        terminal.set_completion_alerts(
+                            policy,
+                            editor_preferences.interaction.completion_sound,
+                        );
+                        terminal.set_notice(format!(
+                            "Completion notifications: {}",
+                            completion_alert_policy_name(policy)
+                        ));
+                    }
+                    UiAction::SetCompletionSound(policy) => {
+                        editor_preferences.interaction.completion_sound = policy;
+                        editor_preferences.save()?;
+                        let terminal = terminal.as_mut().expect("terminal");
+                        terminal.set_completion_alerts(
+                            editor_preferences.interaction.completion_notifications,
+                            policy,
+                        );
+                        terminal.set_notice(format!(
+                            "Completion sound: {}",
+                            completion_alert_policy_name(policy)
+                        ));
+                    }
                     UiAction::SetDictationIcon(style) => {
                         editor_preferences.presentation.dictation_icon = Some(style);
                         editor_preferences.save()?;
@@ -4144,6 +4210,16 @@ async fn run_local_agent_session(
                                 .as_mut()
                                 .expect("terminal")
                                 .open_running_sweeps_picker();
+                        } else if line == "/notifications" && attachments.is_empty() {
+                            terminal
+                                .as_mut()
+                                .expect("terminal")
+                                .open_completion_notifications_picker();
+                        } else if line == "/sound" && attachments.is_empty() {
+                            terminal
+                                .as_mut()
+                                .expect("terminal")
+                                .open_completion_sound_picker();
                         } else if line == "/icons" && attachments.is_empty() {
                             terminal
                                 .as_mut()
@@ -4193,6 +4269,15 @@ async fn run_local_agent_session(
                                 live_extension_summary(
                                     &extension_catalog,
                                     last_blu_discovery_error.as_deref(),
+                                ),
+                            );
+                        } else if line == "/customize" && attachments.is_empty() {
+                            terminal.as_mut().expect("terminal").show_info(
+                                "Effective customization",
+                                live_customization_summary(
+                                    &editor_preferences,
+                                    &agent_config,
+                                    &extension_catalog,
                                 ),
                             );
                         } else if line == "/colors" && attachments.is_empty() {
@@ -4438,6 +4523,47 @@ async fn run_local_agent_session(
                                 terminal.as_mut().expect("terminal").set_notice(
                                     "Choose /animations on or /animations off",
                                 );
+                            }
+                        } else if let Some(value) = line.strip_prefix("/notifications ")
+                            && attachments.is_empty()
+                        {
+                            if let Some(policy) = parse_completion_alert_policy(value) {
+                                editor_preferences.interaction.completion_notifications = policy;
+                                editor_preferences.save()?;
+                                let terminal = terminal.as_mut().expect("terminal");
+                                terminal.set_completion_alerts(
+                                    policy,
+                                    editor_preferences.interaction.completion_sound,
+                                );
+                                terminal.set_notice(format!(
+                                    "Completion notifications: {}",
+                                    completion_alert_policy_name(policy)
+                                ));
+                            } else {
+                                terminal.as_mut().expect("terminal").set_notice(
+                                    "Choose /notifications off, unfocused, or always",
+                                );
+                            }
+                        } else if let Some(value) = line.strip_prefix("/sound ")
+                            && attachments.is_empty()
+                        {
+                            if let Some(policy) = parse_completion_alert_policy(value) {
+                                editor_preferences.interaction.completion_sound = policy;
+                                editor_preferences.save()?;
+                                let terminal = terminal.as_mut().expect("terminal");
+                                terminal.set_completion_alerts(
+                                    editor_preferences.interaction.completion_notifications,
+                                    policy,
+                                );
+                                terminal.set_notice(format!(
+                                    "Completion sound: {}",
+                                    completion_alert_policy_name(policy)
+                                ));
+                            } else {
+                                terminal
+                                    .as_mut()
+                                    .expect("terminal")
+                                    .set_notice("Choose /sound off, unfocused, or always");
                             }
                         } else if let Some(value) = line.strip_prefix("/followups ")
                             && attachments.is_empty()
@@ -6102,6 +6228,23 @@ fn parse_on_off(value: &str) -> Option<bool> {
     }
 }
 
+fn parse_completion_alert_policy(value: &str) -> Option<CompletionAlertPolicy> {
+    match value.trim() {
+        "off" => Some(CompletionAlertPolicy::Off),
+        "unfocused" => Some(CompletionAlertPolicy::Unfocused),
+        "always" => Some(CompletionAlertPolicy::Always),
+        _ => None,
+    }
+}
+
+fn completion_alert_policy_name(policy: CompletionAlertPolicy) -> &'static str {
+    match policy {
+        CompletionAlertPolicy::Off => "off",
+        CompletionAlertPolicy::Unfocused => "when unfocused",
+        CompletionAlertPolicy::Always => "always",
+    }
+}
+
 fn parse_dictation_icon_style(value: &str) -> Option<DictationIconStyle> {
     match value.trim().to_ascii_lowercase().as_str() {
         "nerd" | "nerd_font" => Some(DictationIconStyle::NerdFont),
@@ -6671,6 +6814,7 @@ fn print_agent_help() {
     println!(
         r#"
   /settings         show interactive settings
+  /customize        inspect effective settings and extension authority
   /ask PROFILE TEXT ask another model through its persistent peer thread
   /director TEXT    send a message to the persistent director thread
   /claude TEXT      ask the active model to consult its persistent Claude peer
@@ -7117,10 +7261,11 @@ fn live_extension_summary(
                 extension.reason.as_deref().unwrap_or("inactive")
             };
             lines.push(format!(
-                "{} {} · {} · {}",
+                "{} {} · {} · {} · {}",
                 extension.id,
                 extension.version,
                 extension.scope.label(),
+                extension.requested_access.label(),
                 state,
             ));
         }
@@ -7153,6 +7298,55 @@ fn live_extension_summary(
         workflow_count,
         &catalog.revision[..catalog.revision.len().min(12)],
     ));
+    lines.join("\n")
+}
+
+fn live_customization_summary(
+    editor: &EditorPreferences,
+    agent: &AgentConfig,
+    catalog: &crate::extensions::ExtensionCatalog,
+) -> String {
+    let mut lines = vec![
+        format!(
+            "layout: margin {} · composer {} rows · footer {}",
+            editor.layout.horizontal_margin,
+            editor.layout.composer_max_height,
+            if editor.layout.show_footer {
+                "shown"
+            } else {
+                "hidden"
+            }
+        ),
+        format!(
+            "rendering: {} FPS · edits {} · tools {} · sweeps {}",
+            editor.presentation.refresh_rate_fps,
+            editor.presentation.auto_expand_edits,
+            editor.presentation.auto_expand_tools,
+            editor.presentation.running_sweeps
+        ),
+        format!(
+            "theme: user {} / {} · assistant {} / {}",
+            editor.transcript.user_label_color,
+            editor.transcript.user_message_color,
+            editor.transcript.assistant_label_color,
+            editor.transcript.assistant_message_color
+        ),
+        format!(
+            "alerts: notifications {:?} · sound {:?}",
+            editor.interaction.completion_notifications, editor.interaction.completion_sound
+        )
+        .to_lowercase(),
+        format!(
+            "commands: {} aliases · keymaps: {} actions",
+            agent.commands.aliases.len(),
+            agent.keybindings.entries().len()
+        ),
+    ];
+    lines.push(live_extension_summary(catalog, None));
+    lines.push(
+        "Export/import: `borg customize export|import`; full JSON: `borg customize inspect --json`"
+            .to_string(),
+    );
     lines.join("\n")
 }
 

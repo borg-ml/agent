@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -181,12 +181,59 @@ impl Drop for LocalProviderEnvGuard {
     }
 }
 
-/// Trust controls for declarative extension catalogs.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ExtensionAccess {
+    Sandboxed,
+    Trusted,
+    Native,
+}
+
+impl ExtensionAccess {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Sandboxed => "sandboxed",
+            Self::Trusted => "trusted",
+            Self::Native => "native",
+        }
+    }
+}
+
+impl Default for ExtensionAccess {
+    fn default() -> Self {
+        Self::Trusted
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NativeAccessPolicy {
+    Deny,
+    #[default]
+    Prompt,
+    Allow,
+}
+
+/// User-owned trust controls for extension catalogs.
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct ExtensionConfig {
-    /// Project checkouts are not trusted to launch local MCP processes by default.
+    /// Compatibility switch for project MCP packages.
     pub(crate) allow_project_mcp: bool,
+    pub(crate) default_access: ExtensionAccess,
+    pub(crate) project_access: ExtensionAccess,
+    pub(crate) native_access: NativeAccessPolicy,
+}
+
+impl Default for ExtensionConfig {
+    fn default() -> Self {
+        Self {
+            allow_project_mcp: false,
+            default_access: ExtensionAccess::Trusted,
+            project_access: ExtensionAccess::Sandboxed,
+            native_access: NativeAccessPolicy::Prompt,
+        }
+    }
 }
 
 /// Opt-in autonomous-team policy. Leaving `preset` unset keeps the existing
@@ -500,7 +547,7 @@ impl AgentConfig {
             .collect()
     }
 
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         if let Some(worker_concurrency) = self.team.worker_concurrency {
             anyhow::ensure!(
                 worker_concurrency > 0,
@@ -887,6 +934,37 @@ impl AgentConfig {
 }
 
 impl KeybindingConfig {
+    pub(crate) fn replace(&mut self, action: &str, bindings: Vec<String>) -> Result<()> {
+        let target = match action {
+            "send" => &mut self.send,
+            "queue" => &mut self.queue,
+            "newline" => &mut self.newline,
+            "keybindings" => &mut self.keybindings,
+            "interrupt" => &mut self.interrupt,
+            "clear_or_exit" => &mut self.clear_or_exit,
+            "exit" => &mut self.exit,
+            "attach_image" => &mut self.attach_image,
+            "dictate" => &mut self.dictate,
+            "copy" => &mut self.copy,
+            "scroll_up" => &mut self.scroll_up,
+            "scroll_down" => &mut self.scroll_down,
+            "select_previous" => &mut self.select_previous,
+            "select_next" => &mut self.select_next,
+            "approve" => &mut self.approve,
+            "deny" => &mut self.deny,
+            _ => anyhow::bail!("unknown keybinding action `{action}`"),
+        };
+        anyhow::ensure!(
+            !bindings.is_empty(),
+            "keybinding action `{action}` cannot be empty"
+        );
+        for binding in &bindings {
+            validate_key_chord(binding)?;
+        }
+        *target = bindings;
+        Ok(())
+    }
+
     pub(crate) fn entries(&self) -> [(&'static str, &[String]); 16] {
         [
             ("send", &self.send),
@@ -1218,6 +1296,9 @@ reasoning_format = "deepseek"
         assert!(config.capabilities.autonomous_team);
         assert!(!config.capabilities.telemetry);
         assert!(!config.extensions.allow_project_mcp);
+        assert_eq!(config.extensions.default_access, ExtensionAccess::Trusted);
+        assert_eq!(config.extensions.project_access, ExtensionAccess::Sandboxed);
+        assert_eq!(config.extensions.native_access, NativeAccessPolicy::Prompt);
         assert_eq!(config.capabilities.tool_mode, borg_remote::ToolMode::Both);
     }
 
@@ -1256,6 +1337,22 @@ reasoning_format = "deepseek"
         )
         .unwrap();
         assert!(config.extensions.allow_project_mcp);
+    }
+
+    #[test]
+    fn extension_access_policy_can_be_made_prompt_free() {
+        let config: AgentConfig = toml::from_str(
+            r#"
+            [extensions]
+            default_access = "native"
+            project_access = "native"
+            native_access = "allow"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.extensions.default_access, ExtensionAccess::Native);
+        assert_eq!(config.extensions.project_access, ExtensionAccess::Native);
+        assert_eq!(config.extensions.native_access, NativeAccessPolicy::Allow);
     }
 
     #[test]

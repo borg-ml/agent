@@ -55,8 +55,12 @@ if [[ -f "$repo_root/.github/workflows/release.yml" ]]; then
   fi
   grep -Fq 'docs/blu-extensions.md' "$release_workflow" ||
     fail "release archive does not package the Blu guide"
+  grep -Fq 'docs/customization.md' "$release_workflow" ||
+    fail "release archive does not package the customization guide"
   grep -Fq 'configs/extension.example.toml' "$release_workflow" ||
     fail "release archive does not package the Blu manifest example"
+  grep -Fq 'include/borg_extension.h' "$release_workflow" ||
+    fail "release archive does not package the native extension header"
   if grep -Eq 'providers/claude-sdk|BORG_CLAUDE_NATIVE|borg-claude-sdk' "$release_workflow"; then
     fail "release workflow still contains the removed Claude fallback"
   fi
@@ -97,6 +101,8 @@ if [[ -f "$repo_root/.github/workflows/platform-ci.yml" ]]; then
     fail "platform archive does not package the Blu guide"
   grep -Fq 'configs/extension.example.toml' "$platform_workflow" ||
     fail "platform archive does not package the Blu manifest example"
+  grep -Fq 'include/borg_extension.h' "$platform_workflow" ||
+    fail "platform archive does not package the native extension header"
   if grep -Eq 'providers/claude-sdk|BORG_CLAUDE_NATIVE|borg-claude-sdk' "$platform_workflow"; then
     fail "platform workflow still contains the removed Claude fallback"
   fi

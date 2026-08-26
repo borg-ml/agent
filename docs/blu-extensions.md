@@ -1,5 +1,8 @@
 # Blu extensions
 
+For the user-facing editor, keybinding, notification, access-policy, and native
+extension guide, start with [`customization.md`](customization.md).
+
 Blu is Borg's live extension package system. It combines the discoverability
 of an editor package manager with a deliberately small, auditable execution
 surface.
@@ -33,8 +36,31 @@ installation, and every declared skill root must remain inside the package.
 - versioned declarative API transforms, turn hooks, workflow-backed tools,
   and commands; and
 - `${config.name}`, `${env.NAME}`, and `${extension_dir}` interpolation.
+- user-capped `sandboxed`, `trusted`, and in-process `native` access modes.
 
 See [`configs/extension.example.toml`](../configs/extension.example.toml).
+
+## Runtime access
+
+Packages declare `runtime_access = "sandboxed" | "trusted" | "native"`.
+The user's `[extensions]` policy in `agent.toml` is authoritative: user packages
+default to trusted, project packages default to sandboxed, and native loading
+defaults to approval. Setting `native_access = "allow"` is an explicit,
+prompt-free choice. Repository configuration cannot raise its own authority
+above that policy.
+
+Native packages also declare `[native]` with `library`, `sha256`, and
+`abi_version = 2`. Borg verifies that the library remains inside the package
+and pins its exact bytes before calling `borg_extension_init_v2` from the
+published [`borg_extension.h`](../include/borg_extension.h). ABI v2 provides
+resolved settings, logging, bounded JSON event emission, an opaque instance
+handle, and optional shutdown. ABI v1 remains supported. Native code runs in
+Borg's process and therefore has the user's full authority.
+
+`borg_extension.h` is not part of the Blu/Lua/Luau workflow API. It is a
+language-neutral C ABI description for compiled native libraries, including
+libraries authored in Rust, C++, Zig, or other languages that can export C ABI
+symbols. Ordinary Blu packages use the declarative `[api.*]` surface below.
 
 ## Lifecycle
 
@@ -48,7 +74,9 @@ Borg hashes manifests, package contents, declared skill roots, state, effective
 capabilities, trust, and explicit reload signals. Running local TUI sessions check that revision twice per
 second; enrolled Remote hosts revalidate immediately before every turn. A valid
 change updates skill roots, MCP server definitions, and executable workflow
-source for the next turn without restarting the session. The current turn is
+source for the next turn without restarting the session. Editor, theme,
+keybinding, and alias contributions apply immediately after the validated
+catalog swap. The current turn is
 never mutated underneath a provider. If validation fails, Borg keeps the
 previous runtime and points the user to `borg extensions doctor`.
 
@@ -63,6 +91,20 @@ An extension can expose declarative registrations alongside its workflows:
 ```toml
 [api]
 version = 1
+
+[api.editor.layout]
+horizontal_margin = 4
+composer_max_height = 12
+show_footer = true
+
+[api.editor.transcript]
+assistant_label_color = "#c084fc"
+
+[api.keybindings]
+send = ["ctrl+enter"]
+
+[api.aliases]
+ship = "/fast on"
 
 [api.transforms.concise]
 append_system_prompt = "Prefer concise release notes."
@@ -83,6 +125,13 @@ effect = "at_most_once"
 workflow = "review"
 description = "Run the durable review command"
 ```
+
+`api.editor` is a partial, typed `editor.toml` tree. It covers layout,
+rendering/presentation, theme/transcript, interaction, and future public editor
+preferences without requiring a manifest-version change. Unknown or invalid
+fields isolate the package. Keybindings replace the named action's chord list;
+aliases target slash commands. Active packages merge in dependency-first load
+order, so the later package is the visible override.
 
 The supported hook events are `turn_started`, `turn_completed`,
 `tool_execute_before`, `tool_execute_after`, `command_execute_before`,

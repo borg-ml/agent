@@ -51,8 +51,10 @@ borg extensions list
 - Full Access, Auto, and Manual command-approval modes.
 - Borg Remote hosts that use the same durable session and tool runtime.
 
-Native tools and extension workflows run with the user's operating-system
-authority; they are not sandboxes.
+Extension authority is user-controlled. Packages can request `sandboxed`,
+`trusted`, or `native` runtime access; user policy caps project and user
+packages independently. Native mode loads hash-pinned, versioned C ABI code
+inside Borg's process and is never enabled by repository configuration alone.
 
 ## Configuration
 
@@ -67,6 +69,11 @@ Use `$XDG_CONFIG_HOME/borg` instead when `XDG_CONFIG_HOME` is set. The agent
 configuration covers providers, capabilities, MCP servers, aliases, and team
 settings. The editor configuration covers the TUI and input behavior.
 
+See [`docs/customization.md`](docs/customization.md) for editor settings,
+keybindings, alerts, extension authority, and native extension authoring.
+Use `borg customize inspect`, `borg customize export`, and
+`borg customize import` to inspect or move the complete effective setup.
+
 `borg capabilities --json` shows the effective runtime capabilities. Automated
 checks can use `borg agent --ephemeral --local-only` to avoid changing resume
 history.
@@ -77,7 +84,8 @@ history.
 runtime. Its source and documentation live in the separate
 [`borg-ml/blu`](https://github.com/borg-ml/blu) repository. Borg embeds Blu for
 bounded workflows and uses it in the live extension package system. A package
-can provide skills, namespaced MCP servers, and workflows.
+can provide skills, namespaced MCP servers, workflows, or an explicitly
+admitted native runtime.
 
 ```sh
 borg extensions install <PATH-or-GIT-URL>
@@ -91,6 +99,9 @@ contract. Blu workflow files may use `.blu`, `.lua`, or `.luau` entrypoints.
 
 ## Documentation
 
+- [`docs/customization.md`](docs/customization.md) — editor settings,
+  keybindings, alerts, trust policy, and native extensions
+- [`TODO.md`](TODO.md) — remaining customization surface and extension API work
 - [`docs/blu-extensions.md`](docs/blu-extensions.md) — extension packages and
   workflows
 - [`docs/web-search.md`](docs/web-search.md) — web-search providers

@@ -11,6 +11,10 @@ active_messages = "steer"
 # prevents the desktop from handling a lid close during the turn; use
 # `/sleep off` or set this to false if the laptop should suspend when closed.
 prevent_sleep = true
+# Independently choose when Borg sends a desktop notification and plays the
+# terminal alert sound after finishing a turn. Valid values: off, unfocused, always.
+completion_notifications = "unfocused"
+completion_sound = "unfocused"
 
 [presentation]
 refresh_rate_fps = 60
@@ -18,6 +22,11 @@ auto_expand_edits = true
 auto_expand_tools = false
 # Omit to choose the microphone icon on first use. Valid values: nerd_font, emoji.
 # dictation_icon = "nerd_font"
+
+[layout]
+horizontal_margin = 2
+composer_max_height = 8
+show_footer = true
 
 [transcript]
 user_label = "user"

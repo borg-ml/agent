@@ -100,15 +100,17 @@ jobs:
           cp "$sdk_package/manifest.json" "$stage/borg-${{ matrix.target }}/providers/claude/manifest.json"
           cp "$sdk_package/package.json" "$stage/borg-${{ matrix.target }}/providers/claude/package.json"
           chmod 700 "$stage/borg-${{ matrix.target }}/providers/claude/claude"
-          mkdir -p "$stage/borg-${{ matrix.target }}/docs" "$stage/borg-${{ matrix.target }}/configs"
+          mkdir -p "$stage/borg-${{ matrix.target }}/docs" "$stage/borg-${{ matrix.target }}/configs" "$stage/borg-${{ matrix.target }}/include"
           cp docs/blu-extensions.md "$stage/borg-${{ matrix.target }}/docs/"
           cp configs/extension.example.toml "$stage/borg-${{ matrix.target }}/configs/"
+          cp include/borg_extension.h "$stage/borg-${{ matrix.target }}/include/"
           tar -C "$stage" -czf "$asset" "borg-${{ matrix.target }}"
           tar -xzf "$asset" -C "$extract"
           "$extract/borg-${{ matrix.target }}/borg" --version
           "$extract/borg-${{ matrix.target }}/providers/claude/claude" --version
           test -f "$extract/borg-${{ matrix.target }}/docs/blu-extensions.md"
           test -f "$extract/borg-${{ matrix.target }}/configs/extension.example.toml"
+          test -f "$extract/borg-${{ matrix.target }}/include/borg_extension.h"
       - name: Package and extract-smoke the Windows archive
         if: matrix.archive == 'zip'
         shell: pwsh
@@ -129,9 +131,10 @@ jobs:
           Copy-Item (Join-Path $platformPackage.FullName "claude.exe") "$stage/providers/claude/claude.exe"
           Copy-Item (Join-Path $sdkPackage "manifest.json") "$stage/providers/claude/manifest.json"
           Copy-Item (Join-Path $sdkPackage "package.json") "$stage/providers/claude/package.json"
-          New-Item -ItemType Directory -Path "$stage/docs", "$stage/configs"
+          New-Item -ItemType Directory -Path "$stage/docs", "$stage/configs", "$stage/include"
           Copy-Item "docs/blu-extensions.md" "$stage/docs/"
           Copy-Item "configs/extension.example.toml" "$stage/configs/"
+          Copy-Item "include/borg_extension.h" "$stage/include/"
           Compress-Archive -Path "$stage/*" -DestinationPath $asset
           Expand-Archive -Path $asset -DestinationPath $extract
           $binary = Get-ChildItem -Path $extract -Filter "borg.exe" | Select-Object -First 1
@@ -142,3 +145,4 @@ jobs:
           & $native.FullName --version
           if (-not (Get-ChildItem -Path $extract -Recurse -Filter "blu-extensions.md")) { throw "Blu documentation was not packaged" }
           if (-not (Get-ChildItem -Path $extract -Recurse -Filter "extension.example.toml")) { throw "Blu manifest example was not packaged" }
+          if (-not (Get-ChildItem -Path $extract -Recurse -Filter "borg_extension.h")) { throw "Native extension header was not packaged" }

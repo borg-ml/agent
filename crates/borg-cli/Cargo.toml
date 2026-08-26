@@ -36,6 +36,7 @@ crossterm = { version = "0.29", features = ["bracketed-paste", "event-stream"] }
 futures-util = "0.3"
 getrandom = "0.3.4"
 image = { version = "0.25.9", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+libloading = "0.8.9"
 pulldown-cmark = "0.13"
 qrcode = { version = "0.14.1", default-features = false }
 regex.workspace = true
