@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 use chrono::{DateTime, Utc};
+use futures::{StreamExt, stream};
 use reqwest::{Client, StatusCode, header::RETRY_AFTER};
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
@@ -292,6 +293,7 @@ impl RuntimeEventBatch {
 // smaller limit or a single event is unusually large.
 const TARGET_EVENT_BATCH_BYTES: usize = 384 * 1024;
 const MAX_EVENT_BATCH_EVENTS: usize = 256;
+const MAX_CONCURRENT_EVENT_PAYLOAD_UPLOADS: usize = 4;
 
 #[derive(Serialize)]
 struct LiveStateBatch<'a> {
@@ -340,50 +342,58 @@ async fn upload_event_payloads(
             payloads.push((remote_session_id, source, remote));
         }
     }
-    for (session_id, source, remote) in payloads {
-        let bytes = store.load_payload(&source).await?;
-        let response = client
-            .post(endpoint(
-                &config.server,
-                &format!(
-                    "/api/remote/host/sessions/{session_id}/payloads/{}",
-                    remote.id
-                ),
-            ))
-            .bearer_auth(&config.host_token)
-            .timeout(Duration::from_secs(30))
-            .query(&[
-                ("kind", remote.kind.as_str().to_string()),
-                ("byte_len", remote.byte_len.to_string()),
-            ])
-            .body(bytes)
-            .send()
-            .await;
-        match response {
-            Ok(response) if response.status().is_success() => {}
-            Ok(response) if response.status() == StatusCode::UNAUTHORIZED => {
-                bail!("remote host token was rejected; enroll this host again");
+    let uploads = stream::iter(payloads)
+        .map(|(session_id, source, remote)| async move {
+            let bytes = store.load_payload(&source).await?;
+            let response = client
+                .post(endpoint(
+                    &config.server,
+                    &format!(
+                        "/api/remote/host/sessions/{session_id}/payloads/{}",
+                        remote.id
+                    ),
+                ))
+                .bearer_auth(&config.host_token)
+                .timeout(Duration::from_secs(30))
+                .query(&[
+                    ("kind", remote.kind.as_str().to_string()),
+                    ("byte_len", remote.byte_len.to_string()),
+                ])
+                .body(bytes)
+                .send()
+                .await;
+            match response {
+                Ok(response) if response.status().is_success() => Ok(true),
+                Ok(response) if response.status() == StatusCode::UNAUTHORIZED => {
+                    bail!("remote host token was rejected; enroll this host again");
+                }
+                Ok(response) => {
+                    tracing::warn!(
+                        status = %response.status(),
+                        %session_id,
+                        payload_id = %remote.id,
+                        source_payload_id = %source.id,
+                        "remote session payload upload failed; retained for replay"
+                    );
+                    Ok(false)
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        %session_id,
+                        payload_id = %remote.id,
+                        source_payload_id = %source.id,
+                        "remote session payload upload failed; retained for replay"
+                    );
+                    Ok(false)
+                }
             }
-            Ok(response) => {
-                tracing::warn!(
-                    status = %response.status(),
-                    %session_id,
-                    payload_id = %remote.id,
-                    source_payload_id = %source.id,
-                    "remote session payload upload failed; retained for replay"
-                );
-                return Ok(false);
-            }
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    %session_id,
-                    payload_id = %remote.id,
-                    source_payload_id = %source.id,
-                    "remote session payload upload failed; retained for replay"
-                );
-                return Ok(false);
-            }
+        })
+        .buffered(MAX_CONCURRENT_EVENT_PAYLOAD_UPLOADS);
+    futures::pin_mut!(uploads);
+    while let Some(uploaded) = uploads.next().await {
+        if !uploaded? {
+            return Ok(false);
         }
     }
     Ok(true)
@@ -4247,6 +4257,95 @@ mod tests {
         assert!(event_body.len() < TARGET_EVENT_BATCH_BYTES);
         assert_eq!(uploaded_sequence, 1);
         assert_eq!(root_event.kind.payload_refs().len(), 0);
+    }
+
+    #[tokio::test]
+    #[ignore = "explicit remote payload upload concurrency profile"]
+    async fn remote_payload_upload_concurrency_profile() {
+        let root = tempdir().unwrap();
+        let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+            .await
+            .unwrap();
+        let session_id = Uuid::new_v4();
+        store.create_session(session_id).await.unwrap();
+        for index in 0..4 {
+            store
+                .append(SessionEvent::new(
+                    session_id,
+                    0,
+                    crate::SessionEventKind::ToolCompleted {
+                        tool_call_id: format!("large-{index}"),
+                        output: "x".repeat(crate::session_store::INLINE_SESSION_PAYLOAD_BYTES + 1),
+                        output_ref: None,
+                        is_error: false,
+                        input: None,
+                        input_ref: None,
+                    },
+                ))
+                .await
+                .unwrap();
+        }
+        let events = store.events_after(session_id, 0, 8).await.unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut handlers = tokio::task::JoinSet::new();
+            for _ in 0..5 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                handlers.spawn(async move {
+                    let (path, _) = read_http_request(&mut stream).await;
+                    if path.contains("/payloads/") {
+                        tokio::time::sleep(Duration::from_millis(150)).await;
+                    }
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                        )
+                        .await
+                        .unwrap();
+                    path
+                });
+            }
+            let mut paths = Vec::new();
+            while let Some(path) = handlers.join_next().await {
+                paths.push(path.unwrap());
+            }
+            paths
+        });
+        let config = HostConfig {
+            server: format!("http://{address}"),
+            ..test_config(root.path())
+        };
+        let mut uploaded_sequence = 0;
+        let started = Instant::now();
+        let outcome = upload_event_page(
+            &Client::new(),
+            &config,
+            &store,
+            &events,
+            &mut uploaded_sequence,
+            Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+        let elapsed = started.elapsed();
+        let paths = server.await.unwrap();
+
+        eprintln!("four delayed remote payload uploads: {elapsed:?}");
+        assert_eq!(outcome, EventUploadOutcome::Complete);
+        assert_eq!(uploaded_sequence, 4);
+        assert_eq!(
+            paths
+                .iter()
+                .filter(|path| path.contains("/payloads/"))
+                .count(),
+            4
+        );
+        assert!(
+            elapsed < Duration::from_millis(400),
+            "remote payload upload exceeded 400 ms: {elapsed:?}"
+        );
     }
 
     #[tokio::test]

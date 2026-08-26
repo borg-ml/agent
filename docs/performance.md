@@ -91,6 +91,12 @@ near-match profile fell from 433.7 ms to 1.8 ms, roughly 240× faster, while an
 exhaustive small-input equivalence check preserves the exact deduplication and
 UTF-8 boundary behavior.
 
+Remote host synchronization now uploads immutable detached event payloads
+through a four-wide bounded pipeline and still withholds the ordered event
+batch until every payload succeeds. The four-payload, 150 ms latency profile
+fell from 605.4 ms to 153.3 ms, saving 452 ms and providing a 4.0× speedup
+without increasing event or cursor concurrency.
+
 For sampled counters, install `perf` and run the command printed by the
 profile script. `cargo-flamegraph` can be used on the same release test binary
 when available.
