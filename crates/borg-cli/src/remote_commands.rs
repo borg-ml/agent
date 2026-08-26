@@ -3795,16 +3795,15 @@ async fn run_local_agent_session(
                                 },
                             },
                         );
-                        if target.is_none()
-                            && let Err(error) = persist_prompt_admission(
-                                store.as_ref(),
-                                session_id,
-                                message_id,
-                                &text,
-                                &attachments,
-                                PromptDelivery::Queue,
-                            )
-                            .await
+                        if let Err(error) = persist_prompt_admission(
+                            store.as_ref(),
+                            target.unwrap_or(session_id),
+                            message_id,
+                            &text,
+                            &attachments,
+                            PromptDelivery::Queue,
+                        )
+                        .await
                         {
                             let terminal = terminal.as_mut().expect("terminal");
                             terminal.reject_optimistic_prompt(
@@ -3828,20 +3827,10 @@ async fn run_local_agent_session(
                         pending_prompt_ids.insert(message_id);
                         if session_command_tx.send(command).await.is_err() {
                             let terminal = terminal.as_mut().expect("terminal");
-                            if target.is_some() {
-                                pending_prompt_ids.remove(&message_id);
-                                terminal.reject_optimistic_prompt(
-                                    target,
-                                    message_id,
-                                    text,
-                                    attachments,
-                                );
-                            } else {
-                                terminal.set_notice(
-                                    "Prompt saved durably · waiting for the session actor to reconnect"
-                                        .to_string(),
-                                );
-                            }
+                            terminal.set_notice(
+                                "Prompt saved durably · waiting for the session coordinator to reconnect"
+                                    .to_string(),
+                            );
                             terminal.draw()?;
                             terminal_dirty = false;
                         }
@@ -3970,6 +3959,23 @@ async fn run_local_agent_session(
                                 .unwrap_or(provider);
                             let delivery =
                                 default_active_delivery(active_provider, steer_active_turn);
+                            if let Err(error) = persist_prompt_admission(
+                                store.as_ref(),
+                                target,
+                                message_id,
+                                &text,
+                                &attachments,
+                                delivery,
+                            )
+                            .await
+                            {
+                                let terminal = terminal.as_mut().expect("terminal");
+                                terminal.restore_composer(text, attachments);
+                                terminal.set_notice(format!(
+                                    "Could not durably send the prompt: {error:#}"
+                                ));
+                                continue;
+                            }
                             terminal
                                 .as_mut()
                                 .expect("terminal")
@@ -3997,17 +4003,12 @@ async fn run_local_agent_session(
                                 .has_pending_scroll_frame();
                             pending_prompt_ids.insert(message_id);
                             if session_command_tx.send(command).await.is_err() {
-                                pending_prompt_ids.remove(&message_id);
-                                terminal
-                                    .as_mut()
-                                    .expect("terminal")
-                                    .reject_optimistic_prompt(
-                                        Some(target),
-                                        message_id,
-                                        text,
-                                        attachments,
-                                    );
-                                terminal.as_mut().expect("terminal").draw()?;
+                                let terminal = terminal.as_mut().expect("terminal");
+                                terminal.set_notice(
+                                    "Prompt saved durably · waiting for the session coordinator to reconnect"
+                                        .to_string(),
+                                );
+                                terminal.draw()?;
                                 terminal_dirty = false;
                             }
                             continue;
