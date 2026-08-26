@@ -1003,15 +1003,16 @@ async fn read_compatible_model_stream(
             ));
         }
         pending.extend_from_slice(&chunk);
-        while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
-            let mut line = pending.drain(..=newline).collect::<Vec<_>>();
-            if line.last() == Some(&b'\n') {
-                line.pop();
-            }
+        let mut consumed = 0_usize;
+        while let Some(newline) = pending[consumed..].iter().position(|byte| *byte == b'\n') {
+            let line_start = consumed;
+            let line_end = line_start + newline;
+            consumed = line_end + 1;
+            let mut line = &pending[line_start..line_end];
             if line.last() == Some(&b'\r') {
-                line.pop();
+                line = &line[..line.len() - 1];
             }
-            let line = std::str::from_utf8(&line)
+            let line = std::str::from_utf8(line)
                 .map_err(|error| format!("stream contained invalid UTF-8: {error}"))?;
             let Some(data) = line.strip_prefix("data:") else {
                 continue;
@@ -1113,6 +1114,11 @@ async fn read_compatible_model_stream(
             {
                 usage = Some(chunk_usage.clone());
             }
+        }
+        if consumed == pending.len() {
+            pending.clear();
+        } else if consumed > 0 {
+            pending.drain(..consumed);
         }
         if saw_done {
             break;
@@ -1318,6 +1324,8 @@ fn merge_object(target: &mut Value, extra: Map<String, Value>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
+
     #[test]
     fn native_images_use_chat_completions_multimodal_blocks() {
         let message = ModelMessage::user_with_attachments(
@@ -1678,6 +1686,63 @@ mod tests {
         assert_eq!(tool_calls[0].function.name, "read_file");
         assert_eq!(tool_calls[0].function.arguments, r#"{"path":"src/lib.rs"}"#);
         assert_eq!(streamed.raw["usage"]["prompt_tokens"], 10);
+    }
+
+    #[tokio::test]
+    #[ignore = "explicit compatible SSE framing performance gate"]
+    async fn compatible_sse_framing_profile() {
+        const DELTAS: usize = 50_000;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let mut body = String::with_capacity(DELTAS * 72);
+        for _ in 0..DELTAS {
+            body.push_str(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"x\"},\"finish_reason\":null}]}\n",
+            );
+        }
+        writeln!(
+            body,
+            "data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}"
+        )
+        .expect("write final delta");
+        body.push_str("data: [DONE]\n");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept request");
+            let mut request = [0_u8; 2048];
+            let _ = socket.read(&mut request).await.expect("read request");
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(), body
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("write response");
+        });
+        let response = reqwest::get(format!("http://{address}"))
+            .await
+            .expect("request test stream");
+
+        let started = Instant::now();
+        let streamed = read_compatible_model_stream(response, None, "local-model", None)
+            .await
+            .expect("parse stream");
+        let elapsed = started.elapsed();
+        eprintln!("50k compatible SSE deltas: {elapsed:?}");
+
+        server.await.expect("test server task");
+        let ModelMessage::Assistant { content, .. } = streamed.message else {
+            panic!("expected assistant response");
+        };
+        assert_eq!(content.expect("stream content").len(), DELTAS);
+        assert!(
+            elapsed < Duration::from_millis(120),
+            "compatible SSE parsing exceeded 120 ms: {elapsed:?}"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

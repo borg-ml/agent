@@ -140,6 +140,12 @@ time while preserving their order and exact rendered rows. A 50,000-line
 replacement fell from 364.2 ms to 36.8 ms, saving 327 ms and providing a 9.9×
 speedup for large expanded diffs and terminal reflows.
 
+OpenAI-compatible SSE framing now advances through each received buffer with
+one cursor and compacts it at most once, instead of reallocating and shifting
+the tail for every event. Parsing 50,000 streamed deltas fell from 166.4 ms to
+85.7 ms, saving 81 ms and providing a 1.9× speedup without changing emitted
+progress, response limits, or UTF-8 validation.
+
 For sampled counters, install `perf` and run the command printed by the
 profile script. `cargo-flamegraph` can be used on the same release test binary
 when available.
