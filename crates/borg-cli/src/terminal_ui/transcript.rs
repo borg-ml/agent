@@ -290,6 +290,12 @@ fn transcript_entry_is_turn_output(entry: &TranscriptEntry) -> bool {
 }
 
 impl Transcript {
+    fn message_id_at(&self, index: usize) -> Option<Uuid> {
+        self.messages
+            .iter()
+            .find_map(|(message_id, message_index)| (*message_index == index).then_some(*message_id))
+    }
+
     fn upsert_subagent_snapshot(&mut self, agent: &SubagentSnapshot) {
         self.upsert_subagent_snapshot_with_status(agent, agent.status);
     }

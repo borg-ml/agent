@@ -3009,6 +3009,15 @@ async fn run_local_agent_session(
                         };
                         if !text.is_empty() {
                             let message_id = Uuid::new_v4();
+                            persist_prompt_admission(
+                                store.as_ref(),
+                                session_id,
+                                message_id,
+                                &text,
+                                &[],
+                                delivery,
+                            )
+                            .await?;
                             pending_prompt_ids.insert(message_id);
                             if session_command_tx.send(HostCommand::Prompt {
                                 session_id,
@@ -3018,7 +3027,10 @@ async fn run_local_agent_session(
                                 output_schema: None,
                                 delivery,
                             }).await.is_err() {
-                                pending_prompt_ids.remove(&message_id);
+                                tracing::warn!(
+                                    %message_id,
+                                    "durably admitted prompt is waiting for the session actor to reconnect"
+                                );
                             }
                         }
                     }
@@ -3682,6 +3694,29 @@ async fn run_local_agent_session(
                                         PromptDelivery::Queue,
                                     );
                                     terminal.set_notice("Queued message for director".to_string());
+                                    if let Err(error) = persist_prompt_admission(
+                                        store.as_ref(),
+                                        session_id,
+                                        message_id,
+                                        &prompt,
+                                        &attachments,
+                                        PromptDelivery::Queue,
+                                    )
+                                    .await
+                                    {
+                                        terminal.reject_optimistic_prompt(
+                                            None,
+                                            message_id,
+                                            format!("/director {prompt}"),
+                                            attachments,
+                                        );
+                                        terminal.set_notice(format!(
+                                            "Could not durably queue the prompt: {error:#}"
+                                        ));
+                                        terminal.draw()?;
+                                        terminal_dirty = false;
+                                        continue;
+                                    }
                                     let command = director_prompt_host_command(
                                         session_id,
                                         message_id,
@@ -3692,22 +3727,10 @@ async fn run_local_agent_session(
                                     terminal.draw()?;
                                     terminal_dirty = terminal.has_pending_scroll_frame();
                                     pending_prompt_ids.insert(message_id);
-                                    if let Err(error) = session_command_tx.send(command).await {
-                                        pending_prompt_ids.remove(&message_id);
-                                        let HostCommand::Prompt {
-                                            text, attachments, ..
-                                        } = error.0
-                                        else {
-                                            unreachable!("director submission always sends a prompt");
-                                        };
-                                        terminal.reject_optimistic_prompt(
-                                            None,
-                                            message_id,
-                                            format!("/director {text}"),
-                                            attachments,
-                                        );
+                                    if session_command_tx.send(command).await.is_err() {
                                         terminal.set_notice(
-                                            "Could not reach the director thread".to_string(),
+                                            "Prompt saved durably · waiting for the director thread to reconnect"
+                                                .to_string(),
                                         );
                                         terminal.draw()?;
                                         terminal_dirty = false;
@@ -3772,6 +3795,31 @@ async fn run_local_agent_session(
                                 },
                             },
                         );
+                        if target.is_none()
+                            && let Err(error) = persist_prompt_admission(
+                                store.as_ref(),
+                                session_id,
+                                message_id,
+                                &text,
+                                &attachments,
+                                PromptDelivery::Queue,
+                            )
+                            .await
+                        {
+                            let terminal = terminal.as_mut().expect("terminal");
+                            terminal.reject_optimistic_prompt(
+                                target,
+                                message_id,
+                                text,
+                                attachments,
+                            );
+                            terminal.set_notice(format!(
+                                "Could not durably queue the prompt: {error:#}"
+                            ));
+                            terminal.draw()?;
+                            terminal_dirty = false;
+                            continue;
+                        }
                         terminal.as_mut().expect("terminal").draw()?;
                         terminal_dirty = terminal
                             .as_ref()
@@ -3779,17 +3827,22 @@ async fn run_local_agent_session(
                             .has_pending_scroll_frame();
                         pending_prompt_ids.insert(message_id);
                         if session_command_tx.send(command).await.is_err() {
-                            pending_prompt_ids.remove(&message_id);
-                            terminal
-                                .as_mut()
-                                .expect("terminal")
-                                .reject_optimistic_prompt(
+                            let terminal = terminal.as_mut().expect("terminal");
+                            if target.is_some() {
+                                pending_prompt_ids.remove(&message_id);
+                                terminal.reject_optimistic_prompt(
                                     target,
                                     message_id,
                                     text,
                                     attachments,
                                 );
-                            terminal.as_mut().expect("terminal").draw()?;
+                            } else {
+                                terminal.set_notice(
+                                    "Prompt saved durably · waiting for the session actor to reconnect"
+                                        .to_string(),
+                                );
+                            }
+                            terminal.draw()?;
                             terminal_dirty = false;
                         }
                     }
@@ -3816,6 +3869,25 @@ async fn run_local_agent_session(
                                         steer_active_turn,
                                     );
                                     let message_id = Uuid::new_v4();
+                                    if let Err(error) = persist_prompt_admission(
+                                        store.as_ref(),
+                                        session_id,
+                                        message_id,
+                                        &prompt,
+                                        &attachments,
+                                        delivery,
+                                    )
+                                    .await
+                                    {
+                                        terminal.restore_composer(
+                                            format!("/director {prompt}"),
+                                            attachments,
+                                        );
+                                        terminal.set_notice(format!(
+                                            "Could not durably send the prompt: {error:#}"
+                                        ));
+                                        continue;
+                                    }
                                     if active {
                                         terminal.project_pending_prompt(
                                             None,
@@ -3844,26 +3916,10 @@ async fn run_local_agent_session(
                                     terminal.draw()?;
                                     terminal_dirty = terminal.has_pending_scroll_frame();
                                     pending_prompt_ids.insert(message_id);
-                                    if let Err(error) = session_command_tx.send(command).await {
-                                        pending_prompt_ids.remove(&message_id);
-                                        let HostCommand::Prompt {
-                                            text, attachments, ..
-                                        } = error.0
-                                        else {
-                                            unreachable!("director submission always sends a prompt");
-                                        };
-                                        terminal.reject_optimistic_prompt(
-                                            None,
-                                            message_id,
-                                            format!("/director {text}"),
-                                            attachments,
-                                        );
-                                        if !active {
-                                            status = SessionStatus::Ready;
-                                            sleep_inhibitor.set_turn_active(false);
-                                        }
+                                    if session_command_tx.send(command).await.is_err() {
                                         terminal.set_notice(
-                                            "Could not reach the director thread".to_string(),
+                                            "Prompt saved durably · waiting for the director thread to reconnect"
+                                                .to_string(),
                                         );
                                         terminal.draw()?;
                                         terminal_dirty = false;
@@ -4723,6 +4779,23 @@ async fn run_local_agent_session(
                                     };
                                     if !text.is_empty() || !attachments.is_empty() {
                                         let message_id = Uuid::new_v4();
+                                        if let Err(error) = persist_prompt_admission(
+                                            store.as_ref(),
+                                            session_id,
+                                            message_id,
+                                            &text,
+                                            &attachments,
+                                            delivery,
+                                        )
+                                        .await
+                                        {
+                                            let terminal = terminal.as_mut().expect("terminal");
+                                            terminal.restore_composer(text, attachments);
+                                            terminal.set_notice(format!(
+                                                "Could not durably send the prompt: {error:#}"
+                                            ));
+                                            continue;
+                                        }
                                         if active {
                                             terminal
                                                 .as_mut()
@@ -4759,35 +4832,20 @@ async fn run_local_agent_session(
                                             .expect("terminal")
                                             .has_pending_scroll_frame();
                                         pending_prompt_ids.insert(message_id);
-                                        if let Err(error) = session_command_tx.send(HostCommand::Prompt {
+                                        if session_command_tx.send(HostCommand::Prompt {
                                             session_id,
                                             message_id,
                                             text,
                                             attachments,
                                             output_schema: None,
                                             delivery,
-                                        }).await {
-                                            pending_prompt_ids.remove(&message_id);
-                                            let HostCommand::Prompt {
-                                                text, attachments, ..
-                                            } = error.0
-                                            else {
-                                                unreachable!("submission always sends a prompt command");
-                                            };
-                                            terminal
-                                                .as_mut()
-                                                .expect("terminal")
-                                                .reject_optimistic_prompt(
-                                                    None,
-                                                    message_id,
-                                                    text,
-                                                    attachments,
-                                                );
-                                            if !active {
-                                                status = SessionStatus::Ready;
-                                                sleep_inhibitor.set_turn_active(false);
-                                            }
-                                            terminal.as_mut().expect("terminal").draw()?;
+                                        }).await.is_err() {
+                                            let terminal = terminal.as_mut().expect("terminal");
+                                            terminal.set_notice(
+                                                "Prompt saved durably · waiting for the session actor to reconnect"
+                                                    .to_string(),
+                                            );
+                                            terminal.draw()?;
                                             terminal_dirty = false;
                                         }
                                     }
@@ -4930,7 +4988,9 @@ async fn run_local_agent_session(
         }
         None => None,
     };
-    let discarded_empty_session = if session_access == LocalSessionAccess::Owned && !args.ephemeral
+    let discarded_empty_session = if !force_exit_requested
+        && session_access == LocalSessionAccess::Owned
+        && !args.ephemeral
     {
         match sqlite_store.discard_empty_session(session_id).await {
             Ok(discarded) => discarded,
@@ -4975,20 +5035,30 @@ async fn run_local_agent_session(
         ));
     }
     drop(control_server);
-    if let Some(mut child) = collab_child {
-        child.kill().await.ok();
-    }
     if let Some(shutdown) = mirror_shutdown {
         shutdown.send(true).ok();
     }
-    if let Some(task) = mirror_task {
-        task.await.context("remote mirror task failed")?;
-    }
-    if let Some(server) = local_server {
-        server
-            .shutdown()
-            .await
-            .context("failed to stop Borg-owned local llama-server")?;
+    if force_exit_requested {
+        // The terminal is already restored. Do not keep the foreground shell
+        // behind remote-mirror or child-process teardown after double Ctrl-C.
+        drop(collab_child);
+        if let Some(task) = mirror_task {
+            task.abort();
+        }
+        drop(local_server);
+    } else {
+        if let Some(mut child) = collab_child {
+            child.kill().await.ok();
+        }
+        if let Some(task) = mirror_task {
+            task.await.context("remote mirror task failed")?;
+        }
+        if let Some(server) = local_server {
+            server
+                .shutdown()
+                .await
+                .context("failed to stop Borg-owned local llama-server")?;
+        }
     }
     if resume_session == Some(session_id)
         && !user_requested_exit
@@ -6111,6 +6181,31 @@ fn idle_input(line: &str) -> (PromptDelivery, String) {
         return (PromptDelivery::Steer, text.trim().to_string());
     }
     (PromptDelivery::Steer, line.to_string())
+}
+
+async fn persist_prompt_admission(
+    store: &dyn SessionStore,
+    session_id: Uuid,
+    message_id: Uuid,
+    text: &str,
+    attachments: &[PathBuf],
+    delivery: PromptDelivery,
+) -> Result<()> {
+    store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::Message {
+                message_id,
+                actor: EventActor::User,
+                text: text.to_string(),
+                attachments: attachments.to_vec(),
+                status: MessageStatus::Queued,
+                delivery: Some(delivery),
+            },
+        ))
+        .await?;
+    Ok(())
 }
 
 fn running_input(

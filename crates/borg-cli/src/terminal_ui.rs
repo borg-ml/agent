@@ -730,6 +730,7 @@ pub struct BorgTerminal {
     extension_commands: Vec<borg_remote::ExtensionApiCommand>,
     git_status_cache: GitStatusCache,
     status: SessionStatus,
+    interrupt_requested: bool,
     steer_active_turn: bool,
     /// Highest durable root sequence incorporated into this projection.
     /// Asynchronous history/state hydration may finish after live events, so
@@ -907,6 +908,7 @@ fn session_state_snapshot_is_stale(projected_sequence: u64, state: &SessionState
 
 #[derive(Clone)]
 struct RewindTarget {
+    message_id: Uuid,
     sequence: u64,
     text: String,
     attachments: Vec<PathBuf>,
@@ -1701,6 +1703,7 @@ impl BorgTerminal {
             extension_commands: Vec::new(),
             git_status_cache: GitStatusCache::default(),
             status: SessionStatus::Starting,
+            interrupt_requested: false,
             steer_active_turn: false,
             session_state_sequence: 0,
             pending_approval: false,
@@ -1833,6 +1836,7 @@ impl BorgTerminal {
         self.extension_commands.clear();
         self.git_status_cache = GitStatusCache::default();
         self.status = SessionStatus::Starting;
+        self.interrupt_requested = false;
         self.session_state_sequence = 0;
         self.pending_approval = false;
         self.pending_provider_interaction = false;
@@ -2091,6 +2095,9 @@ impl BorgTerminal {
         root_transcript.reconcile_session_status(state);
         if let Some(status) = state.status {
             self.status = status;
+            if !status_control_is_actionable(status) {
+                self.interrupt_requested = false;
+            }
         }
         self.session_state_sequence = state.latest_sequence;
         self.pending_approval = state.pending_approval_id.is_some();
@@ -2188,6 +2195,7 @@ impl BorgTerminal {
         );
         self.transcript.project_optimistic_message(&event);
         self.status = SessionStatus::Starting;
+        self.interrupt_requested = false;
         self.active_since = Some(event.created_at);
         self.transcript.follow_tail = true;
         self.transcript_render_cache = None;
@@ -2309,21 +2317,45 @@ impl BorgTerminal {
                 self.borging_this_run = borging_for_run(Uuid::new_v4());
             }
             self.status = status;
+            if !status_control_is_actionable(status) {
+                self.interrupt_requested = false;
+            }
             if matches!(status, SessionStatus::Starting | SessionStatus::Running) {
                 self.active_since.get_or_insert(event.created_at);
             } else {
                 self.active_since = None;
             }
         }
+        if matches!(event.kind, SessionEventKind::TurnStarted { .. }) {
+            self.interrupt_requested = false;
+        }
         if event.sequence > 0 {
             self.session_state_sequence = self.session_state_sequence.max(event.sequence);
         }
         update_queued_prompts(&mut self.queued_prompts, &event.kind);
+        if let SessionEventKind::Message {
+            message_id,
+            actor: EventActor::User,
+            text,
+            attachments,
+            ..
+        } = &event.kind
+            && event.sequence > 0
+            && !self
+                .rewind_targets
+                .iter()
+                .any(|target| target.message_id == *message_id)
+        {
+            self.rewind_targets.push(RewindTarget {
+                message_id: *message_id,
+                sequence: event.sequence,
+                text: text.clone(),
+                attachments: attachments.clone(),
+            });
+        }
         match &event.kind {
             SessionEventKind::Message {
                 actor: EventActor::User,
-                text,
-                attachments,
                 status: MessageStatus::Complete,
                 ..
             } => {
@@ -2333,17 +2365,6 @@ impl BorgTerminal {
                 // with Up in this running instance and future resumes.
                 self.composer
                     .seed_session_events(std::slice::from_ref(event));
-                if self
-                    .rewind_targets
-                    .last()
-                    .is_none_or(|target| target.sequence != event.sequence)
-                {
-                    self.rewind_targets.push(RewindTarget {
-                        sequence: event.sequence,
-                        text: text.clone(),
-                        attachments: attachments.clone(),
-                    });
-                }
             }
             SessionEventKind::ApprovalRequested { .. } => self.pending_approval = true,
             SessionEventKind::ApprovalResolved { .. } => self.pending_approval = false,
@@ -2475,6 +2496,16 @@ impl BorgTerminal {
                 child_event.created_at,
             );
         }
+        if self.focused_child == Some(child_id)
+            && (matches!(child_event.kind, SessionEventKind::TurnStarted { .. })
+                || matches!(
+                    child_event.kind,
+                    SessionEventKind::StatusChanged { status, .. }
+                        if !status_control_is_actionable(status)
+                ))
+        {
+            self.interrupt_requested = false;
+        }
         update_queued_prompts(
             self.child_queued_prompts.entry(child_id).or_default(),
             &child_event.kind,
@@ -2537,6 +2568,7 @@ impl BorgTerminal {
             );
         }
         self.focused_child = Some(child_id);
+        self.interrupt_requested = false;
         self.team_switcher_open = false;
         self.reset_transcript_focus();
         let name = self
@@ -2555,6 +2587,7 @@ impl BorgTerminal {
             self.notice = None;
             return;
         };
+        self.interrupt_requested = false;
         switch_to_director_transcript(
             &mut self.transcript,
             &mut self.director_transcript,
@@ -2762,19 +2795,23 @@ impl BorgTerminal {
         self.steer_active_turn = steer_active;
     }
 
-    fn record_user_interrupt(&mut self) {
-        if self.active_status() != SessionStatus::Running {
-            return;
+    fn begin_user_interrupt(&mut self) -> bool {
+        let status = self.active_status();
+        if !claim_interrupt(&mut self.interrupt_requested, status) {
+            return false;
         }
-        self.transcript.order.push(TranscriptEntry::Activity {
-            text: USER_INTERRUPT_ACTIVITY.to_string(),
-            time: canonical_local_time(Local::now()),
-        });
-        self.transcript.follow_tail = true;
-        self.scroll_from_bottom = 0;
-        self.transcript_render_cache = None;
-        self.transcript_full_render_cache = None;
-        self.event_redraw_needed = true;
+        if status == SessionStatus::Running {
+            self.transcript.order.push(TranscriptEntry::Activity {
+                text: USER_INTERRUPT_ACTIVITY.to_string(),
+                time: canonical_local_time(Local::now()),
+            });
+            self.transcript.follow_tail = true;
+            self.scroll_from_bottom = 0;
+            self.transcript_render_cache = None;
+            self.transcript_full_render_cache = None;
+            self.event_redraw_needed = true;
+        }
+        true
     }
 
     pub fn hydrate_payload(&mut self, payload: &SessionPayloadRef, bytes: Vec<u8>) -> Result<()> {
@@ -3515,8 +3552,12 @@ impl BorgTerminal {
                         if self.status_area.is_some_and(|area| area.contains(pointer))
                             && status_control_is_actionable(self.active_status())
                         {
-                            return Ok(UiAction::Interrupt {
-                                target: self.focused_child,
+                            return Ok(if self.begin_user_interrupt() {
+                                UiAction::Interrupt {
+                                    target: self.focused_child,
+                                }
+                            } else {
+                                UiAction::None
                             });
                         }
                         if self
@@ -4413,23 +4454,15 @@ impl BorgTerminal {
     }
 
     fn rewind_action_for_output(&mut self, index: usize) -> UiAction {
-        let user_message_count = self
+        let Some(target) = self
             .transcript
-            .order
-            .iter()
-            .take(index.saturating_add(1))
-            .filter(|entry| {
-                matches!(
-                    entry,
-                    TranscriptEntry::Message {
-                        actor: EventActor::User,
-                        status: MessageStatus::Complete,
-                        ..
-                    }
-                )
+            .message_id_at(index)
+            .and_then(|message_id| {
+                self.rewind_targets
+                    .iter()
+                    .find(|target| target.message_id == message_id)
             })
-            .count();
-        let Some(target) = rewind_target_for_output(user_message_count, &self.rewind_targets)
+            .cloned()
         else {
             self.notice = Some("No user message precedes this response".to_string());
             return UiAction::None;
@@ -6659,9 +6692,12 @@ impl BorgTerminal {
         }
         if let Some(target) = focused_child_interrupt_target(&self.keymap, &key, self.focused_child)
         {
-            self.record_user_interrupt();
-            return Ok(UiAction::Interrupt {
-                target: Some(target),
+            return Ok(if self.begin_user_interrupt() {
+                UiAction::Interrupt {
+                    target: Some(target),
+                }
+            } else {
+                UiAction::None
             });
         }
         if self.keymap.matches(KeyAction::Interrupt, &key)
@@ -6858,9 +6894,12 @@ impl BorgTerminal {
             return Ok(UiAction::None);
         }
         if self.keymap.matches(KeyAction::Interrupt, &key) {
-            self.record_user_interrupt();
-            return Ok(UiAction::Interrupt {
-                target: self.focused_child,
+            return Ok(if self.begin_user_interrupt() {
+                UiAction::Interrupt {
+                    target: self.focused_child,
+                }
+            } else {
+                UiAction::None
             });
         }
         match key.code {
@@ -7252,16 +7291,18 @@ fn transcript_turn_has_terminal_boundary(event: &SessionEvent) -> bool {
 }
 
 fn rewind_targets_from_history(events: &[SessionEvent]) -> Vec<RewindTarget> {
+    let mut seen = HashSet::new();
     transcript_history_in_display_order(events)
         .into_iter()
         .filter_map(|event| match event.kind {
             SessionEventKind::Message {
+                message_id,
                 actor: EventActor::User,
                 text,
                 attachments,
-                status: MessageStatus::Complete,
                 ..
-            } => Some(RewindTarget {
+            } if event.sequence > 0 && seen.insert(message_id) => Some(RewindTarget {
+                message_id,
                 sequence: event.sequence,
                 text,
                 attachments,
@@ -7269,15 +7310,6 @@ fn rewind_targets_from_history(events: &[SessionEvent]) -> Vec<RewindTarget> {
             _ => None,
         })
         .collect()
-}
-
-fn rewind_target_for_output(
-    preceding_user_messages: usize,
-    targets: &[RewindTarget],
-) -> Option<RewindTarget> {
-    targets
-        .get(preceding_user_messages.saturating_sub(1))
-        .cloned()
 }
 
 fn replace_root_transcript_history(
@@ -11343,6 +11375,14 @@ fn status_control_is_actionable(status: SessionStatus) -> bool {
         status,
         SessionStatus::Starting | SessionStatus::Running | SessionStatus::WaitingForApproval
     )
+}
+
+fn claim_interrupt(requested: &mut bool, status: SessionStatus) -> bool {
+    if *requested || !status_control_is_actionable(status) {
+        return false;
+    }
+    *requested = true;
+    true
 }
 
 fn status_control_spans(

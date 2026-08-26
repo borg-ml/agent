@@ -211,8 +211,14 @@ struct PendingSteer {
 
 enum PendingSteerState {
     AwaitingAcknowledgement,
-    Accepted,
     RetryAtBoundary { error: String },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PromptAdmissionState {
+    New,
+    Pending,
+    Settled,
 }
 
 struct RuntimeSessionStore {
@@ -545,6 +551,32 @@ impl RuntimeSessionStore {
 
     async fn contains_message(&self, session_id: Uuid, message_id: Uuid) -> Result<bool> {
         self.store.contains_message(session_id, message_id).await
+    }
+
+    async fn prompt_admission_state(
+        &self,
+        session_id: Uuid,
+        message_id: Uuid,
+    ) -> Result<PromptAdmissionState> {
+        if !self.contains_message(session_id, message_id).await? {
+            return Ok(PromptAdmissionState::New);
+        }
+        let state = match self.store.action(session_id, message_id).await? {
+            Some(action) if !action.state.is_terminal() => PromptAdmissionState::Pending,
+            _ => PromptAdmissionState::Settled,
+        };
+        if state == PromptAdmissionState::Pending
+            && let Some(projection) = &self.workspace_projection
+            && let Err(error) = projection.repair(Arc::clone(&self.store), session_id).await
+        {
+            tracing::warn!(
+                %session_id,
+                %message_id,
+                %error,
+                "workspace projection could not catch up to externally admitted prompt"
+            );
+        }
+        Ok(state)
     }
 
     fn take_projection_diagnostics(&mut self) -> VecDeque<SessionEvent> {
@@ -1251,7 +1283,15 @@ async fn run_agent_session_store_kernel(
         .is_some_and(|goal| goal.status.is_active())
         .then(Instant::now);
     let mut goal_turn_failures = ConsecutiveGoalTurnFailures::default();
-    let mut pending = recover_prompts_on_resume(&recovery.queue_events);
+    let mut primary_turn_starts = HashMap::new();
+    for event in journal.context_events() {
+        if let SessionEventKind::TurnStarted { message_id, .. } = event.kind {
+            primary_turn_starts
+                .entry(message_id)
+                .or_insert(event.sequence);
+        }
+    }
+    let mut pending = recover_prompts_on_resume(&recovery.queue_events, &primary_turn_starts);
     for action in recovered_actions {
         if let Some(prompt) = queued_prompt_from_action(&action)
             && !pending
@@ -1606,9 +1646,10 @@ async fn run_agent_session_store_kernel(
                         delivery,
                     }) if command_session_id == session_id => {
                         let is_autonomy = autonomy_prompt_ids.contains(&message_id);
-                        let already_recorded =
-                            journal.contains_message(session_id, message_id).await?;
-                        if already_recorded && !is_autonomy {
+                        let admission = journal
+                            .prompt_admission_state(session_id, message_id)
+                            .await?;
+                        if admission == PromptAdmissionState::Settled && !is_autonomy {
                             continue;
                         }
                         if owns_team {
@@ -2725,7 +2766,6 @@ async fn run_agent_session_store_kernel(
                         session_id,
                         &mut pending,
                         &mut pending_steers,
-                        interrupted,
                     )
                     .await?;
                         match result {
@@ -3039,7 +3079,6 @@ async fn run_agent_session_store_kernel(
                         session_id,
                         &mut pending,
                         &mut pending_steers,
-                        true,
                     )
                     .await?;
                     next_ready_detail = Some("Interrupted".to_string());
@@ -3074,7 +3113,6 @@ async fn run_agent_session_store_kernel(
                         session_id,
                         &mut pending,
                         &mut pending_steers,
-                        false,
                     ).await?;
                     let error = format!(
                         "turn liveness timeout while {}",
@@ -3124,21 +3162,30 @@ async fn run_agent_session_store_kernel(
                         continue;
                     };
                     if pending_steers[index].admission.is_accepted() {
-                        // The provider has admitted the steer into the active
-                        // turn. Project it into the timeline now; the later
-                        // turn boundary still owns the terminal Complete
-                        // event, and interruption can still requeue it.
-                        let prompt = pending_steers[index].prompt.clone();
+                        // Admission is the provider transport's irreversible
+                        // delivery boundary. Settle it now so a much later
+                        // interruption cannot resurrect already-sent input.
+                        let steer = pending_steers
+                            .remove(index)
+                            .expect("steer index was found");
                         record_prompt_status(
                             &mut journal,
                             &events,
                             session_id,
-                            &prompt,
+                            &steer.prompt,
                             MessageStatus::InProgress,
                             PromptDelivery::Steer,
                         )
                         .await?;
-                        pending_steers[index].state = PendingSteerState::Accepted;
+                        record_prompt_status(
+                            &mut journal,
+                            &events,
+                            session_id,
+                            &steer.prompt,
+                            MessageStatus::Complete,
+                            PromptDelivery::Steer,
+                        )
+                        .await?;
                     } else {
                         let error = acknowledgement.err().unwrap_or_else(|| {
                             "provider acknowledged the steer without accepting admission"
@@ -3227,7 +3274,20 @@ async fn run_agent_session_store_kernel(
                             delivery,
                             ..
                         } if steers_active_provider_turn(launch.provider, delivery) => {
-                            if journal.contains_message(session_id, message_id).await? {
+                            if prompt.message_id == message_id
+                                || pending
+                                    .iter()
+                                    .any(|queued| queued.message_id == message_id)
+                                || pending_steers
+                                    .iter()
+                                    .any(|steer| steer.prompt.message_id == message_id)
+                            {
+                                continue;
+                            }
+                            let admission_state = journal
+                                .prompt_admission_state(session_id, message_id)
+                                .await?;
+                            if admission_state == PromptAdmissionState::Settled {
                                 continue;
                             }
                             let actor = if team_message_ids.remove(&message_id) {
@@ -3246,15 +3306,17 @@ async fn run_agent_session_store_kernel(
                                 interrupt_batch: actor == EventActor::User,
                                 batch: Vec::new(),
                             };
-                            record_prompt_status(
-                                &mut journal,
-                                &events,
-                                session_id,
-                                &prompt,
-                                MessageStatus::Queued,
-                                PromptDelivery::Steer,
-                            )
-                            .await?;
+                            if admission_state == PromptAdmissionState::New {
+                                record_prompt_status(
+                                    &mut journal,
+                                    &events,
+                                    session_id,
+                                    &prompt,
+                                    MessageStatus::Queued,
+                                    PromptDelivery::Steer,
+                                )
+                                .await?;
+                            }
                             let admission = SteerAdmission::pending();
                             let sent = if context_compaction_in_progress {
                                 false
@@ -3291,7 +3353,20 @@ async fn run_agent_session_store_kernel(
                             output_schema,
                             ..
                         } => {
-                            if journal.contains_message(session_id, message_id).await? {
+                            if prompt.message_id == message_id
+                                || pending
+                                    .iter()
+                                    .any(|queued| queued.message_id == message_id)
+                                || pending_steers
+                                    .iter()
+                                    .any(|steer| steer.prompt.message_id == message_id)
+                            {
+                                continue;
+                            }
+                            let admission_state = journal
+                                .prompt_admission_state(session_id, message_id)
+                                .await?;
+                            if admission_state == PromptAdmissionState::Settled {
                                 continue;
                             }
                             let actor = if team_message_ids.remove(&message_id) {
@@ -3299,19 +3374,22 @@ async fn run_agent_session_store_kernel(
                             } else {
                                 EventActor::User
                             };
-                            record(
-                                &mut journal,
-                                &events,
-                                session_id,
-                                SessionEventKind::Message {
-                                    message_id,
-                                    actor,
-                                    text: text.clone(),
-                                    attachments: attachments.clone(),
-                                    status: MessageStatus::Queued,
-                                    delivery: Some(PromptDelivery::Queue),
-                                },
-                            ).await?;
+                            if admission_state == PromptAdmissionState::New {
+                                record(
+                                    &mut journal,
+                                    &events,
+                                    session_id,
+                                    SessionEventKind::Message {
+                                        message_id,
+                                        actor,
+                                        text: text.clone(),
+                                        attachments: attachments.clone(),
+                                        status: MessageStatus::Queued,
+                                        delivery: Some(PromptDelivery::Queue),
+                                    },
+                                )
+                                .await?;
+                            }
                             pending.push_back(QueuedPrompt {
                                 message_id,
                                 text,
@@ -3485,6 +3563,7 @@ async fn run_agent_session_store_kernel(
                             )
                             .await?;
                         }
+                        HostCommand::Interrupt { .. } if interrupted => {}
                         HostCommand::Interrupt { .. }
                             if provider_supports_active_turn_control(launch.provider) =>
                         {
@@ -3569,7 +3648,6 @@ async fn run_agent_session_store_kernel(
                                 session_id,
                                 &mut pending,
                                 &mut pending_steers,
-                                true,
                             )
                             .await?;
                             next_ready_detail = Some("Interrupted".to_string());
@@ -5023,20 +5101,26 @@ fn retained_compaction_prompt(context: &str) -> String {
     )
 }
 
-fn recover_prompts_on_resume(events: &[SessionEvent]) -> VecDeque<QueuedPrompt> {
+fn recover_prompts_on_resume(
+    events: &[SessionEvent],
+    primary_turn_starts: &HashMap<Uuid, u64>,
+) -> VecDeque<QueuedPrompt> {
     // A queued message is durable user input, not a disposable snapshot. Keep
     // every unresolved entry and let the normal boundary drain admit it
     // without interrupting any provider turn that may still be running.
-    recover_queued_prompts(events)
+    recover_queued_prompts(events, primary_turn_starts)
 }
 
-fn recover_queued_prompts(events: &[SessionEvent]) -> VecDeque<QueuedPrompt> {
+fn recover_queued_prompts(
+    events: &[SessionEvent],
+    primary_turn_starts: &HashMap<Uuid, u64>,
+) -> VecDeque<QueuedPrompt> {
     let mut pending = VecDeque::<QueuedPrompt>::new();
     // A crashed actor can leave an older in-progress snapshot after the
     // message's terminal event. Do not resurrect that snapshot on resume;
-    // only an explicit queued event after a failed action, or after the
-    // legacy accepted-steer completion, starts a new attempt. Completed queue
-    // entries and recalled actions are not retryable.
+    // only an explicit queued event after a failed action starts a new
+    // attempt. Completed queue entries, provider-accepted steers, and recalled
+    // actions are not retryable.
     let mut settled = HashMap::<Uuid, (bool, Option<PromptDelivery>)>::new();
     for event in events {
         match &event.kind {
@@ -5050,14 +5134,22 @@ fn recover_queued_prompts(events: &[SessionEvent]) -> VecDeque<QueuedPrompt> {
             } if matches!(actor, EventActor::User | EventActor::System) => {
                 let queued = *status == MessageStatus::Queued;
                 let delivery = delivery.unwrap_or(PromptDelivery::Queue);
+                // A primary prompt has its own earlier TurnStarted boundary.
+                // Without one, InProgress is the provider's active-steer ack.
+                if *status == MessageStatus::InProgress
+                    && delivery == PromptDelivery::Steer
+                    && primary_turn_starts
+                        .get(message_id)
+                        .is_none_or(|turn_sequence| event.sequence < *turn_sequence)
+                {
+                    settled.insert(*message_id, (false, Some(delivery)));
+                    pending.retain(|prompt| prompt.message_id != *message_id);
+                    continue;
+                }
                 let explicit_retry = queued
                     && settled
                         .get(message_id)
-                        .is_some_and(|(retryable, previous_delivery)| {
-                            *retryable
-                                || (*previous_delivery == Some(PromptDelivery::Steer)
-                                    && delivery == PromptDelivery::Queue)
-                        });
+                        .is_some_and(|(retryable, _)| *retryable);
                 if settled.contains_key(message_id) && !explicit_retry {
                     continue;
                 }
@@ -5398,7 +5490,13 @@ async fn queue_pending_prompt(
     attachments: Vec<PathBuf>,
     output_schema: Option<Value>,
 ) -> Result<()> {
-    if journal.contains_message(session_id, message_id).await? {
+    if pending.iter().any(|queued| queued.message_id == message_id) {
+        return Ok(());
+    }
+    let admission_state = journal
+        .prompt_admission_state(session_id, message_id)
+        .await?;
+    if admission_state == PromptAdmissionState::Settled {
         return Ok(());
     }
     let actor = if team_message_ids.remove(&message_id) {
@@ -5417,15 +5515,17 @@ async fn queue_pending_prompt(
         interrupt_batch: actor == EventActor::User,
         batch: Vec::new(),
     };
-    record_prompt_status(
-        journal,
-        events,
-        session_id,
-        &prompt,
-        MessageStatus::Queued,
-        PromptDelivery::Queue,
-    )
-    .await?;
+    if admission_state == PromptAdmissionState::New {
+        record_prompt_status(
+            journal,
+            events,
+            session_id,
+            &prompt,
+            MessageStatus::Queued,
+            PromptDelivery::Queue,
+        )
+        .await?;
+    }
     pending.push_back(prompt);
     Ok(())
 }
@@ -5755,11 +5855,21 @@ async fn promote_uncommitted_steers(
     session_id: Uuid,
     pending: &mut VecDeque<QueuedPrompt>,
     pending_steers: &mut VecDeque<PendingSteer>,
-    after_interrupt: bool,
 ) -> Result<()> {
     let mut promoted = Vec::new();
     while let Some(steer) = pending_steers.pop_front() {
-        if steer.admission.is_accepted() && !after_interrupt {
+        if steer.admission.is_accepted() {
+            if matches!(steer.state, PendingSteerState::AwaitingAcknowledgement) {
+                record_prompt_status(
+                    journal,
+                    events,
+                    session_id,
+                    &steer.prompt,
+                    MessageStatus::InProgress,
+                    PromptDelivery::Steer,
+                )
+                .await?;
+            }
             record_prompt_status(
                 journal,
                 events,

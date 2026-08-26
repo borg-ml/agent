@@ -546,17 +546,39 @@ fn history_replacement_rebuilds_rewind_targets_for_the_full_transcript() {
 }
 
 #[test]
-fn first_response_rewind_uses_the_first_prompt_as_its_fork_target() {
-    let target = rewind_target_for_output(
-        0,
-        &[RewindTarget {
-            sequence: 7,
+fn failed_first_prompt_remains_a_rewind_target() {
+    let session_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    let queued = SessionEvent::new(
+        session_id,
+        7,
+        SessionEventKind::Message {
+            message_id,
+            actor: EventActor::User,
             text: "first prompt".to_string(),
             attachments: Vec::new(),
-        }],
-    )
-    .expect("the first prompt is a rewind target");
+            status: MessageStatus::Queued,
+            delivery: Some(PromptDelivery::Queue),
+        },
+    );
+    let failed = SessionEvent::new(
+        session_id,
+        8,
+        SessionEventKind::Message {
+            message_id,
+            actor: EventActor::User,
+            text: "first prompt".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Failed,
+            delivery: Some(PromptDelivery::Queue),
+        },
+    );
 
+    let targets = rewind_targets_from_history(&[queued, failed]);
+    let target = targets.first().expect("the failed prompt is rewindable");
+
+    assert_eq!(targets.len(), 1);
+    assert_eq!(target.message_id, message_id);
     assert_eq!(target.sequence, 7);
     assert_eq!(target.text, "first prompt");
 }
@@ -3440,6 +3462,18 @@ fn ctrl_c_only_exits_when_repeated_quickly() {
         &mut last,
         start + DOUBLE_CTRL_C_WINDOW + Duration::from_millis(1)
     ));
+}
+
+#[test]
+fn repeated_escape_claims_only_one_interrupt_until_the_turn_changes() {
+    let mut requested = false;
+
+    assert!(claim_interrupt(&mut requested, SessionStatus::Running));
+    assert!(!claim_interrupt(&mut requested, SessionStatus::Running));
+    requested = false;
+    assert!(claim_interrupt(&mut requested, SessionStatus::Starting));
+    requested = false;
+    assert!(!claim_interrupt(&mut requested, SessionStatus::Ready));
 }
 
 #[test]

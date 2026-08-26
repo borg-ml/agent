@@ -4346,6 +4346,25 @@ async fn sync_session_action(
             action.created_at = event.created_at;
             insert_action_row(transaction, &action, *status == MessageStatus::InProgress).await?;
         }
+        SessionEventKind::Message {
+            message_id,
+            actor: crate::EventActor::User | crate::EventActor::System,
+            status: status @ (MessageStatus::Complete | MessageStatus::Failed),
+            ..
+        } => {
+            advance_action(
+                transaction,
+                event.session_id,
+                *message_id,
+                if *status == MessageStatus::Complete {
+                    SessionActionState::Completed
+                } else {
+                    SessionActionState::Failed
+                },
+                None,
+            )
+            .await?;
+        }
         SessionEventKind::TurnStarted { message_id, .. } => {
             advance_action(
                 transaction,
