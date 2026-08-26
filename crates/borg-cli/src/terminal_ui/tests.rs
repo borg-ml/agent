@@ -3424,6 +3424,34 @@ fn command_palette_keybinding_columns_keep_a_space_before_chords() {
 }
 
 #[test]
+fn command_palette_reuses_keybinding_tooltip_colors() {
+    let keymap = KeyMap::from_config(&KeybindingConfig::default()).expect("default keymap");
+    let mut picker = Picker {
+        kind: PickerKind::Commands,
+        title: "Commands and keybindings",
+        options: command_palette_options(&keymap, &[]),
+        selected: 0,
+        query: Some(String::new()),
+        viewport_offset: Cell::new(0),
+    };
+    picker.set_query("scroll transcript".to_string());
+    let line = picker
+        .styled_lines(72, Color::White, Color::White)
+        .into_iter()
+        .find(|line| line.to_string().contains("pageup/pagedown"))
+        .expect("scroll keybinding row");
+
+    assert!(line.spans.iter().any(|span| {
+        span.content.contains("scroll transcript") && span.style.fg == Some(Color::White)
+    }));
+    assert!(line.spans.iter().any(|span| {
+        span.content == "pageup/pagedown"
+            && span.style.fg == Some(BORG_ORANGE_HOVER)
+            && span.style.add_modifier.contains(Modifier::BOLD)
+    }));
+}
+
+#[test]
 fn completed_goal_crosses_out_only_its_objective() {
     let mut transcript = Transcript::default();
     let mut goal = SessionGoal::new("Ship the terminal polish".to_string(), None);
@@ -5121,12 +5149,14 @@ fn resume_picker_uses_a_balanced_two_column_layout() {
                         .to_string(),
                     ),
                     section: Some("Current directory".to_string()),
+                    key_hint: None,
                 },
                 PickerOption {
                     label: "Jul 26 18:56 · No user prompt recorded".to_string(),
                     value: "two".to_string(),
                     preview: None,
                     section: Some("All directories".to_string()),
+                    key_hint: None,
                 },
             ],
             selected: 0,
@@ -5272,18 +5302,21 @@ fn picker_hit_offsets_match_rendered_rows_with_sections() {
                 value: "codex-1".to_string(),
                 preview: None,
                 section: Some("Codex".to_string()),
+                key_hint: None,
             },
             PickerOption {
                 label: "codex-2".to_string(),
                 value: "codex-2".to_string(),
                 preview: None,
                 section: None,
+                key_hint: None,
             },
             PickerOption {
                 label: "claude-1".to_string(),
                 value: "claude-1".to_string(),
                 preview: None,
                 section: Some("Claude".to_string()),
+                key_hint: None,
             },
         ],
         selected: 2,

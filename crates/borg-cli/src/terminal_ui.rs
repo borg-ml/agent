@@ -933,6 +933,7 @@ struct PickerOption {
     value: String,
     preview: Option<String>,
     section: Option<String>,
+    key_hint: Option<String>,
 }
 
 impl PickerOption {
@@ -942,6 +943,7 @@ impl PickerOption {
             value: value.into(),
             preview: None,
             section: None,
+            key_hint: None,
         }
     }
 }
@@ -1298,7 +1300,7 @@ impl Picker {
         preview_message_color: Color,
     ) -> Vec<Line<'static>> {
         if !matches!(self.kind, PickerKind::Resume) || width < 60 {
-            let rows = self.styled_option_rows();
+            let rows = self.displayed_option_rows();
             let empty = rows.is_empty().then(|| {
                 (
                     "  no match".to_string(),
@@ -1318,13 +1320,32 @@ impl Picker {
             )))
             .chain(
                 rows.into_iter()
-                    .chain(empty)
-                    .map(|(row, style)| Line::from(Span::styled(row, style))),
+                    .map(|(index, row, style)| self.styled_option_line(index, row, style))
+                    .chain(empty.map(|(row, style)| Line::from(Span::styled(row, style)))),
             )
             .collect();
         }
 
         self.styled_resume_lines(width, preview_label_color, preview_message_color)
+    }
+
+    fn styled_option_line(&self, index: Option<usize>, row: String, style: Style) -> Line<'static> {
+        let Some(key_hint) = index
+            .filter(|_| matches!(self.kind, PickerKind::Commands))
+            .and_then(|index| self.options[index].key_hint.as_deref())
+        else {
+            return Line::from(Span::styled(row, style));
+        };
+        let Some(action) = row.strip_suffix(key_hint) else {
+            return Line::from(Span::styled(row, style));
+        };
+        Line::from(vec![
+            Span::styled(action.to_string(), style.fg(Color::White)),
+            Span::styled(
+                key_hint.to_string(),
+                style.fg(BORG_ORANGE_HOVER).add_modifier(Modifier::BOLD),
+            ),
+        ])
     }
 
     fn styled_resume_lines(
@@ -3020,6 +3041,7 @@ impl BorgTerminal {
                         value: session.id.to_string(),
                         preview: Some(session.preview.clone()),
                         section,
+                        key_hint: None,
                     }
                 })
                 .collect(),
@@ -5269,7 +5291,7 @@ impl BorgTerminal {
                             &mut header,
                             activity_glyph(SessionStatus::Running),
                         );
-                        apply_running_activity_pulse(&mut header, running_activity_pulse_phase());
+                        apply_running_activity_pulse(&mut header, tool_activity_pulse_phase());
                     }
                     (index, header, expandable)
                 });
@@ -5290,7 +5312,7 @@ impl BorgTerminal {
                                 );
                                 apply_running_activity_pulse(
                                     &mut header,
-                                    running_activity_pulse_phase(),
+                                    tool_activity_pulse_phase(),
                                 );
                             }
                             (*index, header)
@@ -5311,7 +5333,7 @@ impl BorgTerminal {
                         && let Some(line) = visible_transcript.get_mut(*start - scroll_start)
                     {
                         replace_tool_activity_glyph(line, activity_glyph(SessionStatus::Running));
-                        apply_running_activity_pulse(line, running_activity_pulse_phase());
+                        apply_running_activity_pulse(line, tool_activity_pulse_phase());
                     }
                     if self.hovered_tool == Some(*index) {
                         apply_viewport_background(
@@ -5736,7 +5758,7 @@ impl BorgTerminal {
             );
             if session_is_active {
                 let mut status_line = Line::from(status_spans);
-                apply_running_activity_pulse(&mut status_line, running_activity_pulse_phase());
+                apply_running_activity_pulse(&mut status_line, running_status_pulse_phase());
                 status_spans = status_line.spans;
             }
             let status_width = status_spans.iter().map(|span| span.width()).sum::<usize>();
@@ -10233,6 +10255,7 @@ fn command_palette_options(
     for (index, (action, chord)) in keybinding_reference(keymap).into_iter().enumerate() {
         // An empty value marks a row with nothing to run; Enter just closes.
         let mut option = PickerOption::new(format!("{action:<26} {chord}"), String::new());
+        option.key_hint = Some(chord);
         if index == 0 {
             option.section = Some("Keybindings".to_string());
         }
@@ -11663,15 +11686,22 @@ fn replace_tool_activity_glyph(line: &mut Line<'static>, glyph: &str) {
 }
 
 const RUNNING_PULSE_RADIUS: usize = 2;
-const RUNNING_PULSE_STEP_MILLIS: u128 = 40;
+const TOOL_ACTIVITY_PULSE_STEP_MILLIS: u128 = 40;
+const RUNNING_STATUS_PULSE_STEP_MILLIS: u128 = 80;
 const RUNNING_PULSE_PAUSE_STEPS: usize = 32;
 
-fn running_activity_pulse_phase() -> usize {
+fn tool_activity_pulse_phase() -> usize {
+    activity_pulse_phase(TOOL_ACTIVITY_PULSE_STEP_MILLIS)
+}
+
+fn running_status_pulse_phase() -> usize {
+    activity_pulse_phase(RUNNING_STATUS_PULSE_STEP_MILLIS)
+}
+
+fn activity_pulse_phase(step_millis: u128) -> usize {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| {
-            (elapsed.as_millis() / RUNNING_PULSE_STEP_MILLIS) as usize
-        })
+        .map_or(0, |elapsed| (elapsed.as_millis() / step_millis) as usize)
 }
 
 fn apply_running_activity_pulse(line: &mut Line<'static>, phase: usize) {

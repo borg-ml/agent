@@ -236,6 +236,7 @@ fn unified_diff_lines(
 ) -> Vec<Line<'static>> {
     let mut output = Vec::new();
     let (mut old_line, mut new_line) = (None, None);
+    let number_width = diff_number_width(source);
     let (syntaxes, theme) = syntax_assets();
     let mut highlighter = source_language
         .and_then(|language| {
@@ -299,6 +300,7 @@ fn unified_diff_lines(
             syntaxes,
             width,
             show_line_numbers,
+            number_width,
         ));
     }
     output
@@ -315,12 +317,13 @@ fn highlighted_diff_line(
     syntaxes: &SyntaxSet,
     width: usize,
     show_line_numbers: bool,
+    number_width: usize,
 ) -> Line<'static> {
     let prefix = if show_line_numbers {
         format!(
             "{} {} │ {marker} ",
-            diff_number(old_number),
-            diff_number(new_number)
+            diff_number(old_number, number_width),
+            diff_number(new_number, number_width)
         )
     } else {
         format!("{marker} ")
@@ -389,6 +392,7 @@ fn is_apply_patch_control_line(line: &str) -> bool {
 
 fn split_diff_lines(source: &str, width: usize) -> Vec<Line<'static>> {
     let pane = width.saturating_sub(3) / 2;
+    let number_width = diff_number_width(source);
     let mut output = Vec::new();
     let mut pending_removed: Vec<(Option<usize>, &str)> = Vec::new();
     let (mut old_line, mut new_line) = (None, None);
@@ -399,7 +403,7 @@ fn split_diff_lines(source: &str, width: usize) -> Vec<Line<'static>> {
         }
         if let Some((old, new)) = hunk_starts(raw) {
             for (number, before) in pending_removed.drain(..) {
-                output.push(split_diff_row(number, before, None, "", pane));
+                output.push(split_diff_row(number, before, None, "", pane, number_width));
             }
             old_line = Some(old);
             new_line = Some(new);
@@ -421,20 +425,27 @@ fn split_diff_lines(source: &str, width: usize) -> Vec<Line<'static>> {
                 new_line,
                 raw.strip_prefix('+').unwrap_or(raw),
                 pane,
+                number_width,
             ));
             new_line = new_line.map(|line| line + 1);
             continue;
         }
         for (number, before) in pending_removed.drain(..) {
-            output.push(split_diff_row(number, before, None, "", pane));
+            output.push(split_diff_row(number, before, None, "", pane, number_width));
         }
         let text = raw.strip_prefix(' ').unwrap_or(raw);
-        output.push(split_context_row(old_line, new_line, text, pane));
+        output.push(split_context_row(
+            old_line,
+            new_line,
+            text,
+            pane,
+            number_width,
+        ));
         old_line = old_line.map(|line| line + 1);
         new_line = new_line.map(|line| line + 1);
     }
     for (number, before) in pending_removed {
-        output.push(split_diff_row(number, before, None, "", pane));
+        output.push(split_diff_row(number, before, None, "", pane, number_width));
     }
     output
 }
@@ -445,11 +456,12 @@ fn split_diff_row(
     after_number: Option<usize>,
     after: &str,
     pane: usize,
+    number_width: usize,
 ) -> Line<'static> {
     Line::from(vec![
         Span::styled(
             pad_cells(
-                &format!("{} │ − {before}", diff_number(before_number)),
+                &format!("{} │ − {before}", diff_number(before_number, number_width)),
                 pane,
             ),
             before_number.map_or_else(
@@ -459,7 +471,10 @@ fn split_diff_row(
         ),
         Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
         Span::styled(
-            pad_cells(&format!("{} │ + {after}", diff_number(after_number)), pane),
+            pad_cells(
+                &format!("{} │ + {after}", diff_number(after_number, number_width)),
+                pane,
+            ),
             after_number.map_or_else(
                 || Style::default().fg(Color::DarkGray),
                 |_| Style::default().fg(Color::White).bg(DIFF_ADDED_BG),
@@ -473,9 +488,16 @@ fn split_context_row(
     new_number: Option<usize>,
     text: &str,
     pane: usize,
+    number_width: usize,
 ) -> Line<'static> {
-    let before = pad_cells(&format!("{} │   {text}", diff_number(old_number)), pane);
-    let after = pad_cells(&format!("{} │   {text}", diff_number(new_number)), pane);
+    let before = pad_cells(
+        &format!("{} │   {text}", diff_number(old_number, number_width)),
+        pane,
+    );
+    let after = pad_cells(
+        &format!("{} │   {text}", diff_number(new_number, number_width)),
+        pane,
+    );
     Line::from(vec![
         Span::styled(before, Style::default().fg(Color::Gray)),
         Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
@@ -575,11 +597,36 @@ fn hunk_starts(line: &str) -> Option<(usize, usize)> {
     Some((old, new))
 }
 
-fn diff_number(number: Option<usize>) -> String {
-    number.map_or_else(
-        || " ".repeat(DIFF_NUMBER_WIDTH),
-        |number| format!("{number:>DIFF_NUMBER_WIDTH$}"),
-    )
+fn diff_number_width(source: &str) -> usize {
+    let (mut old_line, mut new_line) = (None, None);
+    let mut largest = 0;
+    for raw in source.lines() {
+        if let Some((old, new)) = hunk_starts(raw) {
+            old_line = Some(old);
+            new_line = Some(new);
+            continue;
+        }
+        if raw.starts_with("---")
+            || raw.starts_with("+++")
+            || diff_file_path(raw).is_some()
+            || is_apply_patch_control_line(raw)
+        {
+            continue;
+        }
+        if let Some(line) = old_line.filter(|_| !raw.starts_with('+')) {
+            largest = largest.max(line);
+            old_line = Some(line + 1);
+        }
+        if let Some(line) = new_line.filter(|_| !raw.starts_with('-')) {
+            largest = largest.max(line);
+            new_line = Some(line + 1);
+        }
+    }
+    largest.to_string().len().max(DIFF_NUMBER_WIDTH)
+}
+
+fn diff_number(number: Option<usize>, width: usize) -> String {
+    number.map_or_else(|| " ".repeat(width), |number| format!("{number:>width$}"))
 }
 
 fn terminal_color(color: SyntectColor) -> Color {
@@ -643,6 +690,26 @@ mod tests {
         let wide = diff_lines(diff, 180, None);
         assert_eq!(narrow[0].to_string().matches('│').count(), 1);
         assert_eq!(wide[0].to_string().matches('│').count(), 3);
+    }
+
+    #[test]
+    fn five_digit_diff_numbers_keep_one_aligned_gutter() {
+        let diff = "@@ -5294 +5292 @@\n-old\n+new\n@@ -11701 +11694 @@\n context";
+        let lines = diff_lines(diff, 120, None);
+        let gutters = lines
+            .iter()
+            .map(|line| line.to_string().find('│').expect("number gutter"))
+            .collect::<Vec<_>>();
+
+        assert!(
+            gutters.iter().all(|gutter| *gutter == gutters[0]),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.to_string().starts_with(" 5294"))
+        );
     }
 
     #[test]
