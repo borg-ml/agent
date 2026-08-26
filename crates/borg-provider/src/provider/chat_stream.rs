@@ -2719,26 +2719,47 @@ struct CodexReasoningState {
     /// summaryIndex is a separate summary part and needs an explicit boundary.
     streams: HashMap<(String, Option<u64>), String>,
     aggregates: HashMap<String, String>,
+    aligned_single_streams: HashSet<String>,
 }
 
 impl CodexReasoningState {
     fn observe_delta(&mut self, value: &Value, incoming: &str) -> Option<String> {
         let (item_id, summary_index) = codex_reasoning_stream_key(value);
         let key = (item_id.clone(), summary_index);
-        let previous = self.streams.get(&key).cloned().unwrap_or_default();
-        let emitted = normalize_provider_delta(&previous, incoming);
-        if incoming.starts_with(previous.as_str()) {
-            self.streams.insert(key, incoming.to_string());
-        } else if previous.starts_with(incoming) {
+        let only_stream = !self
+            .streams
+            .keys()
+            .any(|existing| existing.0 == item_id && existing != &key);
+        let (emitted, previous_len, replayed_prefix) = {
+            let previous = self.streams.get(&key).map(String::as_str).unwrap_or("");
+            (
+                normalize_provider_delta(previous, incoming),
+                previous.len(),
+                previous.starts_with(incoming),
+            )
+        };
+        if replayed_prefix {
             // A reconnect or lifecycle boundary replayed an older snapshot.
         } else {
-            self.streams.insert(key, format!("{previous}{emitted}"));
+            self.streams.entry(key).or_default().push_str(&emitted);
         }
+        let aggregate_aligned = (previous_len == 0 && !self.aggregates.contains_key(&item_id))
+            || self.aligned_single_streams.contains(&item_id);
+        if only_stream && aggregate_aligned {
+            self.aggregates
+                .entry(item_id.clone())
+                .or_default()
+                .push_str(&emitted);
+            self.aligned_single_streams.insert(item_id);
+            return (!emitted.is_empty()).then_some(emitted);
+        }
+        self.aligned_single_streams.remove(&item_id);
         self.emit_aggregate_delta(&item_id)
     }
 
     fn completion_suffix(&mut self, value: &Value, aggregate: &str) -> Option<String> {
         let item_id = codex_reasoning_item_id(value);
+        self.aligned_single_streams.remove(&item_id);
         let previous = self
             .aggregates
             .get(&item_id)
@@ -2764,10 +2785,28 @@ impl CodexReasoningState {
         let previous = self.aggregates.get(item_id).cloned().unwrap_or_default();
         let emitted = normalize_provider_delta(&previous, &assembled);
         if assembled.starts_with(previous.as_str()) {
-            self.aggregates.insert(item_id.to_string(), assembled);
+            self.aggregates
+                .insert(item_id.to_string(), assembled.clone());
         } else if !previous.starts_with(assembled.as_str()) {
             self.aggregates
                 .insert(item_id.to_string(), format!("{previous}{emitted}"));
+        }
+        let only_stream = self
+            .streams
+            .keys()
+            .filter(|(stream_item_id, _)| stream_item_id == item_id)
+            .take(2)
+            .count()
+            == 1;
+        if only_stream
+            && self
+                .aggregates
+                .get(item_id)
+                .is_some_and(|aggregate| aggregate == &assembled)
+        {
+            self.aligned_single_streams.insert(item_id.to_string());
+        } else {
+            self.aligned_single_streams.remove(item_id);
         }
         (!emitted.is_empty()).then_some(emitted)
     }
@@ -4409,6 +4448,19 @@ mod tests {
     }
 
     #[test]
+    fn post_completion_delta_uses_full_reconciliation() {
+        let value = serde_json::json!({
+            "method": "item/reasoning/summaryTextDelta",
+            "params": {"itemId": "reasoning-1", "summaryIndex": 0}
+        });
+        let mut state = CodexReasoningState::default();
+
+        assert_eq!(state.observe_delta(&value, "a"), Some("a".to_string()));
+        assert_eq!(state.completion_suffix(&value, "ab"), Some("b".to_string()));
+        assert_eq!(state.observe_delta(&value, "c"), Some("ac".to_string()));
+    }
+
+    #[test]
     #[ignore = "explicit provider reasoning-overlap performance gate"]
     fn provider_reasoning_overlap_profile() {
         let bytes = 256 * 1024;
@@ -4424,6 +4476,35 @@ mod tests {
         assert!(
             elapsed < Duration::from_millis(50),
             "provider reasoning overlap exceeded 50 ms: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "explicit incremental provider reasoning performance gate"]
+    fn incremental_provider_reasoning_profile() {
+        let value = serde_json::json!({
+            "method": "item/reasoning/summaryTextDelta",
+            "params": {"itemId": "reasoning-profile", "summaryIndex": 0}
+        });
+        let chunks = (0..4_096)
+            .map(|index| format!("|{index:08}|{}", "x".repeat(53)))
+            .collect::<Vec<_>>();
+        let expected = chunks.concat();
+        let mut state = CodexReasoningState::default();
+        let mut emitted = String::with_capacity(expected.len());
+        let started = Instant::now();
+        for chunk in chunks {
+            if let Some(delta) = state.observe_delta(&value, &chunk) {
+                emitted.push_str(&delta);
+            }
+        }
+        let elapsed = started.elapsed();
+
+        eprintln!("256 KiB incremental provider reasoning: {elapsed:?}");
+        assert_eq!(emitted, expected);
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "incremental provider reasoning exceeded 50 ms: {elapsed:?}"
         );
     }
 

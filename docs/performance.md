@@ -96,6 +96,11 @@ reasoning chunk reaches the agent normalizer. Its independent 256 KiB
 near-match profile fell from 446.1 ms to 2.0 ms, a 223× speedup; overlapping
 chunk output remains byte-for-byte identical.
 
+The normal single-part incremental reasoning path now appends to its stream
+and aligned aggregate in place, retaining full reconciliation for multipart or
+replayed snapshots. A 256 KiB stream delivered as 4,096 ordinary chunks fell
+from 52.5 ms to 2.9 ms, an 18× speedup.
+
 Remote host synchronization now uploads immutable detached event payloads
 through a four-wide bounded pipeline and still withholds the ordered event
 batch until every payload succeeds. The four-payload, 150 ms latency profile
