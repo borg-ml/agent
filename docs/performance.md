@@ -96,6 +96,11 @@ reasoning chunk reaches the agent normalizer. Its independent 256 KiB
 near-match profile fell from 446.1 ms to 2.0 ms, a 223× speedup; overlapping
 chunk output remains byte-for-byte identical.
 
+The rich TUI now applies the same linear overlap bound when it reconciles
+replayed reasoning snapshots into the transcript. Its 256 KiB near-match
+profile fell from 433.1 ms to 1.84 ms, roughly 236× faster, while preserving
+the exact deduplicated transcript text and UTF-8 boundaries.
+
 The normal single-part incremental reasoning path now appends to its stream
 and aligned aggregate in place, retaining full reconciliation for multipart or
 replayed snapshots. A 256 KiB stream delivered as 4,096 ordinary chunks fell

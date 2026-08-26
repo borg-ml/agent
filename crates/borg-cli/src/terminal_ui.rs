@@ -8801,15 +8801,60 @@ fn format_action_text(label: &str, detail: &str, body: Option<&str>) -> String {
 }
 
 fn longest_suffix_prefix_overlap(left: &str, right: &str) -> usize {
-    let maximum = left.len().min(right.len());
-    (1..=maximum)
-        .rev()
-        .find(|overlap| {
-            left.is_char_boundary(left.len() - overlap)
-                && right.is_char_boundary(*overlap)
-                && left.as_bytes()[left.len() - overlap..] == right.as_bytes()[..*overlap]
-        })
-        .unwrap_or(0)
+    if left.is_empty() || right.is_empty() {
+        return 0;
+    }
+    let pattern = right.as_bytes();
+    let mut prefix = vec![0; pattern.len()];
+    for index in 1..pattern.len() {
+        let mut matched = prefix[index - 1];
+        while matched > 0 && pattern[index] != pattern[matched] {
+            matched = prefix[matched - 1];
+        }
+        if pattern[index] == pattern[matched] {
+            matched += 1;
+        }
+        prefix[index] = matched;
+    }
+
+    let mut tail_start = left.len().saturating_sub(pattern.len());
+    while !left.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    let tail = &left.as_bytes()[tail_start..];
+    let mut matched = 0;
+    for (index, byte) in tail.iter().enumerate() {
+        while matched > 0 && *byte != pattern[matched] {
+            matched = prefix[matched - 1];
+        }
+        if *byte == pattern[matched] {
+            matched += 1;
+        }
+        if matched == pattern.len() && index + 1 < tail.len() {
+            matched = prefix[matched - 1];
+        }
+    }
+    debug_assert!(right.is_char_boundary(matched));
+    debug_assert!(left.is_char_boundary(left.len() - matched));
+    matched
+}
+
+#[test]
+#[ignore = "manual pathological TUI reasoning-overlap profile"]
+fn large_reasoning_snapshot_overlap_stays_linear() {
+    let bytes = 256 * 1024;
+    let left = format!("{}b", "a".repeat(bytes - 1));
+    let right = "a".repeat(bytes);
+
+    let started = Instant::now();
+    assert_eq!(longest_suffix_prefix_overlap(&left, &right), 0);
+    let elapsed = started.elapsed();
+    eprintln!("256 KiB pathological TUI reasoning overlap: {elapsed:?}");
+
+    assert!(
+        elapsed < Duration::from_millis(50),
+        "TUI reasoning overlap exceeded 50 ms: {elapsed:?}"
+    );
 }
 
 fn terminal_agent_summary(task: &str, outcome: &str, final_text: Option<&str>) -> String {
