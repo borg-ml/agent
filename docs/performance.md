@@ -1,5 +1,24 @@
 # Performance profiles
 
+Run the end-to-end responsiveness stress harness with:
+
+```bash
+just tui-stress
+```
+
+The opt-in harness combines the large-session frontend profile with a real
+Borg process running in a 120×40 pseudo-terminal at 165 FPS. A local mock
+OpenAI-compatible provider streams 1,500 reasoning updates while a bounded
+copy-on-write file workload creates storage pressure. The harness types 24
+unique input probes into the live composer and measures input-to-paint p50,
+p95, and maximum latency from the PTY output. It also reports bytes written
+and the Linux full-I/O-pressure delta. The interactive contract is p95 at or
+below 100 ms and every probe at or below 250 ms.
+
+This test intentionally writes and synchronizes a temporary 256 MiB file under
+`target/tui-responsiveness`; it is ignored by the ordinary test suite and
+removes the fixture after the run.
+
 Run the repeatable terminal profile with:
 
 ```bash

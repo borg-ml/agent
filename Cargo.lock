@@ -527,6 +527,7 @@ dependencies = [
  "tar",
  "tempfile",
  "term-maths",
+ "termwiz",
  "tokio",
  "tokio-tungstenite",
  "tokio-util",

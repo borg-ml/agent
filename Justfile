@@ -44,6 +44,10 @@ release-check version="":
 release-test:
     ./scripts/release-test.sh
 
+# Profile frontend input latency with a large session, live output, and bounded disk pressure.
+tui-stress:
+    ./scripts/stress-terminal-ui.sh
+
 # Run the repository quality gates used by local development and CI.
 verify:
     cargo fmt --all -- --check
