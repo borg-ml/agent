@@ -881,16 +881,17 @@ mod tests {
     #[test]
     #[ignore = "explicit oversized markdown table performance gate"]
     fn oversized_table_width_profile() {
-        let mut table = MarkdownTable::new(vec![MarkdownAlignment::Left, MarkdownAlignment::Left]);
+        const COLUMNS: usize = 64;
+        let mut table = MarkdownTable::new(vec![MarkdownAlignment::Left; COLUMNS]);
         table.rows = vec![
-            vec!["Header".to_string(), "Value".to_string()],
-            vec!["x".repeat(2 * 1024 * 1024), "small".to_string()],
+            vec!["H".to_string(); COLUMNS],
+            vec!["x".repeat((2 * 1024 * 1024) / COLUMNS); COLUMNS],
         ];
 
         let started = Instant::now();
-        let lines = table.render(80, Style::default());
+        let lines = table.render(COLUMNS * 4 + 1, Style::default());
         let elapsed = started.elapsed();
-        eprintln!("2 MiB markdown table width balancing: {elapsed:?}");
+        eprintln!("64-column 2 MiB markdown table balancing: {elapsed:?}");
 
         assert_eq!(lines.len(), 3);
     }
