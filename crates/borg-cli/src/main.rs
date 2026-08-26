@@ -17,7 +17,6 @@ mod terminal_ui;
 mod updater;
 
 use anyhow::{Context, Result};
-use clap::Parser;
 use std::fs::{self, OpenOptions};
 use std::sync::Mutex;
 use tracing_subscriber::fmt::writer::BoxMakeWriter;
@@ -29,7 +28,7 @@ use crate::remote_commands::{print_local_workspaces, run_local_agent, run_remote
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let cli = Cli::parse_borg();
     let no_limits = cli.no_limits;
     let command = cli.command_or_agent();
     limits::reexec_local_agent_if_enabled(&command, no_limits)?;

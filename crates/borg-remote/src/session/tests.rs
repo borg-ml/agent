@@ -8638,11 +8638,7 @@ fn consultation_profiles_resolve_aliases_and_catalog_models() {
     );
     assert_eq!(
         resolve_consultation_profile("gpt").unwrap(),
-        (
-            CodingProvider::Codex,
-            Some("gpt-5.6-sol".to_string()),
-            None
-        )
+        (CodingProvider::Codex, Some("gpt-5.6-sol".to_string()), None)
     );
     assert_eq!(
         resolve_consultation_profile("claude/claude-opus-5").unwrap(),

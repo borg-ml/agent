@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::{env, ffi::OsString};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use uuid::Uuid;
@@ -16,6 +17,49 @@ pub(crate) struct Cli {
 }
 
 impl Cli {
+    pub(crate) fn parse_borg() -> Self {
+        Self::parse_from(Self::agent_default_args(env::args_os()))
+    }
+
+    fn agent_default_args(args: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
+        let mut args = args.into_iter().collect::<Vec<_>>();
+        if args.len() <= 1 {
+            return args;
+        }
+        let command_index = 1 + usize::from(args.get(1).is_some_and(|arg| arg == "--no-limits"));
+        let Some(command) = args.get(command_index).and_then(|arg| arg.to_str()) else {
+            return args;
+        };
+        let is_command = matches!(
+            command,
+            "__agent"
+                | "resume"
+                | "remote"
+                | "update"
+                | "install"
+                | "capabilities"
+                | "extensions"
+                | "customize"
+                | "inspect"
+                | "workspaces"
+                | "session"
+                | "acp"
+                | "collab"
+                | "doctor"
+                | "limits"
+                | "help"
+                | "__agent-mcp"
+                | "-h"
+                | "--help"
+                | "-V"
+                | "--version"
+        );
+        if !is_command {
+            args.insert(command_index, OsString::from("__agent"));
+        }
+        args
+    }
+
     pub(crate) fn command_or_agent(self) -> Command {
         self.command
             .unwrap_or_else(|| Command::Agent(LocalAgentCliArgs::interactive()))
@@ -25,6 +69,7 @@ impl Cli {
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
     /// Start a local agent session.
+    #[command(name = "__agent", hide = true, bin_name = "borg")]
     Agent(LocalAgentCliArgs),
     /// Resume the latest local session, or a specific session by id.
     Resume { session: Option<Uuid> },
@@ -468,6 +513,12 @@ impl LocalAgentCliArgs {
 mod tests {
     use super::*;
 
+    fn try_parse_direct<const N: usize>(args: [&str; N]) -> clap::error::Result<Cli> {
+        Cli::try_parse_from(Cli::agent_default_args(
+            args.into_iter().map(OsString::from),
+        ))
+    }
+
     #[test]
     fn no_subcommand_launches_the_interactive_agent() {
         let command = Cli::try_parse_from(["borg"])
@@ -480,6 +531,48 @@ mod tests {
         assert!(args.prompt.is_empty());
         assert!(!args.continue_latest);
         assert!(args.resume.is_none());
+    }
+
+    #[test]
+    fn agent_options_and_prompts_do_not_require_the_agent_subcommand() {
+        let args = Cli::agent_default_args(
+            [
+                "borg",
+                "--cwd",
+                "/tmp/project",
+                "--ephemeral",
+                "--model",
+                "gpt-5.6-luna",
+                "write the message",
+            ]
+            .into_iter()
+            .map(OsString::from),
+        );
+        let command = Cli::try_parse_from(args)
+            .expect("direct agent invocation parses")
+            .command_or_agent();
+        let Command::Agent(args) = command else {
+            panic!("agent command expected");
+        };
+        assert_eq!(
+            args.cwd.as_deref(),
+            Some(std::path::Path::new("/tmp/project"))
+        );
+        assert!(args.ephemeral);
+        assert_eq!(args.model.as_deref(), Some("gpt-5.6-luna"));
+        assert_eq!(args.prompt, ["write the message"]);
+    }
+
+    #[test]
+    fn explicit_commands_stay_explicit_without_the_agent_subcommand() {
+        let args = Cli::agent_default_args(
+            ["borg", "--no-limits", "capabilities", "--json"]
+                .into_iter()
+                .map(OsString::from),
+        );
+        let cli = Cli::try_parse_from(args).expect("explicit command parses");
+        assert!(cli.no_limits);
+        assert!(matches!(cli.command, Some(Command::Capabilities(_))));
     }
 
     #[test]
@@ -665,11 +758,10 @@ mod tests {
 
     #[test]
     fn ephemeral_agents_cannot_claim_a_persistent_resume_target() {
-        assert!(Cli::try_parse_from(["borg", "agent", "--ephemeral"]).is_ok());
+        assert!(try_parse_direct(["borg", "--ephemeral"]).is_ok());
         assert!(
-            Cli::try_parse_from([
+            try_parse_direct([
                 "borg",
-                "agent",
                 "--ephemeral",
                 "--resume",
                 "00000000-0000-0000-0000-000000000000"
@@ -682,31 +774,20 @@ mod tests {
     fn a_new_agent_can_join_a_selected_workspace_but_a_resume_cannot_move() {
         let workspace = "11111111-1111-1111-1111-111111111111";
         let session = "22222222-2222-2222-2222-222222222222";
-        let command = Cli::try_parse_from(["borg", "agent", "--workspace", workspace])
+        let command = try_parse_direct(["borg", "--workspace", workspace])
             .expect("selected workspace parses")
             .command_or_agent();
         let Command::Agent(args) = command else {
             panic!("agent command expected");
         };
         assert_eq!(args.workspace, Some(Uuid::parse_str(workspace).unwrap()));
-        assert!(
-            Cli::try_parse_from([
-                "borg",
-                "agent",
-                "--workspace",
-                workspace,
-                "--resume",
-                session
-            ])
-            .is_err()
-        );
+        assert!(try_parse_direct(["borg", "--workspace", workspace, "--resume", session]).is_err());
     }
 
     #[test]
     fn mixed_provider_peer_requires_a_new_thread_prompt() {
-        let command = Cli::try_parse_from([
+        let command = try_parse_direct([
             "borg",
-            "agent",
             "--provider",
             "codex",
             "--peer-provider",
@@ -727,9 +808,8 @@ mod tests {
         assert_eq!(args.prompt, ["compare", "approaches"]);
 
         assert!(
-            Cli::try_parse_from([
+            try_parse_direct([
                 "borg",
-                "agent",
                 "--peer-provider",
                 "claude",
                 "--resume",
@@ -741,9 +821,8 @@ mod tests {
 
     #[test]
     fn openrouter_accepts_arbitrary_root_and_peer_model_slugs() {
-        let command = Cli::try_parse_from([
+        let command = try_parse_direct([
             "borg",
-            "agent",
             "--provider",
             "open-router",
             "--model",
