@@ -7146,7 +7146,7 @@ impl BorgTerminal {
             }
             KeyCode::Up => {
                 let slash_matches = slash_matches(&self.composer.text).len();
-                if slash_matches > 0 {
+                if self.composer.history_index.is_none() && slash_matches > 0 {
                     self.slash_selection = self
                         .slash_selection
                         .checked_sub(1)
@@ -7178,7 +7178,7 @@ impl BorgTerminal {
             }
             KeyCode::Down => {
                 let slash_matches = slash_matches(&self.composer.text).len();
-                if slash_matches > 0 {
+                if self.composer.history_index.is_none() && slash_matches > 0 {
                     self.slash_selection = (self.slash_selection + 1) % slash_matches;
                     return Ok(UiAction::None);
                 }
