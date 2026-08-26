@@ -8,10 +8,11 @@ use serde_json::{Map, json};
 #[cfg(windows)]
 use uuid::Uuid;
 
-// Persistent peer consultations wait for at most two hours. Claude's default
-// MCP tool deadline can be five minutes, so leave a minute of headroom for the
-// peer result to cross the local bridge before the provider gives up.
-const BORG_AGENT_MCP_TOOL_TIMEOUT_MS: u64 = (2 * 60 * 60 + 60) * 1_000;
+// Persistent peer consultations wait for at most two hours. Provider MCP tool
+// deadlines can be five minutes, so leave a minute of headroom for the peer
+// result to cross the local bridge before the provider gives up.
+pub(crate) const BORG_AGENT_MCP_TOOL_TIMEOUT_SECS: u64 = 2 * 60 * 60 + 60;
+const BORG_AGENT_MCP_TOOL_TIMEOUT_MS: u64 = BORG_AGENT_MCP_TOOL_TIMEOUT_SECS * 1_000;
 
 #[derive(Debug, Clone, Default)]
 pub struct ProviderMcpSetup {

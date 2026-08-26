@@ -11663,7 +11663,7 @@ fn replace_tool_activity_glyph(line: &mut Line<'static>, glyph: &str) {
 }
 
 const RUNNING_PULSE_RADIUS: usize = 2;
-const RUNNING_PULSE_STEP_MILLIS: u128 = 80;
+const RUNNING_PULSE_STEP_MILLIS: u128 = 40;
 const RUNNING_PULSE_PAUSE_STEPS: usize = 32;
 
 fn running_activity_pulse_phase() -> usize {

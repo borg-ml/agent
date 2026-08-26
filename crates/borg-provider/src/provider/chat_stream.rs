@@ -7,7 +7,10 @@
 
 #![cfg_attr(not(any(feature = "codex", feature = "claude")), allow(dead_code))]
 
-use crate::mcp::{ExternalMcpServer, ProviderMcpSetup, prepare_external_provider_mcp};
+use crate::mcp::{
+    BORG_AGENT_MCP_TOOL_TIMEOUT_SECS, ExternalMcpServer, ProviderMcpSetup,
+    prepare_external_provider_mcp,
+};
 use crate::runtime::ProviderCallUsage;
 use crate::{ProviderAuthBundle, ProviderAuthProvider, ProviderChannel};
 use anyhow::{Context, Result, bail};
@@ -2376,6 +2379,7 @@ fn codex_app_server_mcp_config(servers: &[ExternalMcpServer]) -> Value {
             // "not ready for this step" resource failure.
             config["required"] = Value::Bool(true);
             config["startup_timeout_sec"] = Value::from(10);
+            config["tool_timeout_sec"] = Value::from(BORG_AGENT_MCP_TOOL_TIMEOUT_SECS);
         }
         if !server.allowed_tools.is_empty() {
             config["enabled_tools"] = Value::Array(
@@ -3794,6 +3798,10 @@ mod tests {
         assert_eq!(
             borg_agent_config.get("startup_timeout_sec"),
             Some(&Value::from(10))
+        );
+        assert_eq!(
+            borg_agent_config.get("tool_timeout_sec"),
+            Some(&Value::from(BORG_AGENT_MCP_TOOL_TIMEOUT_SECS))
         );
         assert_eq!(
             codex_config.get("developerInstructions"),
