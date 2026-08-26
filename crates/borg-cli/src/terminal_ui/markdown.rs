@@ -655,17 +655,7 @@ impl MarkdownTable {
                     .max(1)
             })
             .collect::<Vec<_>>();
-        while column_widths.iter().sum::<usize>() > available {
-            let Some((widest, _)) = column_widths
-                .iter()
-                .enumerate()
-                .filter(|(_, width)| **width > 1)
-                .max_by_key(|(_, width)| **width)
-            else {
-                break;
-            };
-            column_widths[widest] -= 1;
-        }
+        fit_table_columns(&mut column_widths, available);
 
         let mut output = Vec::new();
         for (row_index, row) in self.rows.iter().enumerate() {
@@ -684,6 +674,40 @@ impl MarkdownTable {
             }
         }
         output
+    }
+}
+
+fn fit_table_columns(widths: &mut [usize], available: usize) {
+    if widths.iter().sum::<usize>() <= available {
+        return;
+    }
+    if available <= widths.len() {
+        widths.fill(1);
+        return;
+    }
+
+    let mut lower = 1;
+    let mut upper = widths.iter().copied().max().unwrap_or(1);
+    while lower < upper {
+        let cap = lower + (upper - lower).div_ceil(2);
+        if widths.iter().map(|width| (*width).min(cap)).sum::<usize>() <= available {
+            lower = cap;
+        } else {
+            upper = cap - 1;
+        }
+    }
+
+    let cap = lower;
+    let fitted = widths.iter().map(|width| (*width).min(cap)).sum::<usize>();
+    let mut extra = available - fitted;
+    for width in widths {
+        if *width > cap {
+            *width = cap;
+            if extra > 0 {
+                *width += 1;
+                extra -= 1;
+            }
+        }
     }
 }
 
@@ -894,5 +918,22 @@ mod tests {
         eprintln!("64-column 2 MiB markdown table balancing: {elapsed:?}");
 
         assert_eq!(lines.len(), 3);
+        assert!(
+            elapsed < std::time::Duration::from_millis(25),
+            "oversized markdown table balancing exceeded 25 ms: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn table_width_fitting_preserves_rightmost_tie_decrements() {
+        for (mut widths, available, expected) in [
+            (vec![5, 5], 9, vec![5, 4]),
+            (vec![2, 5], 6, vec![2, 4]),
+            (vec![5, 4, 5], 13, vec![5, 4, 4]),
+            (vec![4, 5, 5], 13, vec![4, 5, 4]),
+        ] {
+            fit_table_columns(&mut widths, available);
+            assert_eq!(widths, expected);
+        }
     }
 }

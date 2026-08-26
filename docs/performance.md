@@ -146,6 +146,11 @@ the tail for every event. Parsing 50,000 streamed deltas fell from 166.4 ms to
 85.7 ms, saving 81 ms and providing a 1.9× speedup without changing emitted
 progress, response limits, or UTF-8 validation.
 
+Markdown table sizing now computes the same capped, rightmost-tie column
+allocation directly instead of decrementing the widest column one cell at a
+time. Balancing a 64-column, 2 MiB table fell from 99.9 ms to 5.9 ms, saving
+94 ms and providing a 16.9× speedup for oversized table reflows.
+
 For sampled counters, install `perf` and run the command printed by the
 profile script. `cargo-flamegraph` can be used on the same release test binary
 when available.
