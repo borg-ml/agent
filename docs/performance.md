@@ -91,6 +91,11 @@ near-match profile fell from 433.7 ms to 1.8 ms, roughly 240× faster, while an
 exhaustive small-input equivalence check preserves the exact deduplication and
 UTF-8 boundary behavior.
 
+The subscription-provider decoder now uses the same linear bound before a
+reasoning chunk reaches the agent normalizer. Its independent 256 KiB
+near-match profile fell from 446.1 ms to 2.0 ms, a 223× speedup; overlapping
+chunk output remains byte-for-byte identical.
+
 Remote host synchronization now uploads immutable detached event payloads
 through a four-wide bounded pipeline and still withholds the ordered event
 batch until every payload succeeds. The four-payload, 150 ms latency profile

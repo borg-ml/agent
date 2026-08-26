@@ -2808,15 +2808,42 @@ fn normalize_provider_delta(previous: &str, incoming: &str) -> String {
 }
 
 fn longest_suffix_prefix_overlap(left: &str, right: &str) -> usize {
-    let maximum = left.len().min(right.len());
-    (1..=maximum)
-        .rev()
-        .find(|overlap| {
-            left.is_char_boundary(left.len() - overlap)
-                && right.is_char_boundary(*overlap)
-                && left.as_bytes()[left.len() - overlap..] == right.as_bytes()[..*overlap]
-        })
-        .unwrap_or(0)
+    if left.is_empty() || right.is_empty() {
+        return 0;
+    }
+    let pattern = right.as_bytes();
+    let mut prefix = vec![0; pattern.len()];
+    for index in 1..pattern.len() {
+        let mut matched = prefix[index - 1];
+        while matched > 0 && pattern[index] != pattern[matched] {
+            matched = prefix[matched - 1];
+        }
+        if pattern[index] == pattern[matched] {
+            matched += 1;
+        }
+        prefix[index] = matched;
+    }
+
+    let mut tail_start = left.len().saturating_sub(pattern.len());
+    while !left.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    let tail = &left.as_bytes()[tail_start..];
+    let mut matched = 0;
+    for (index, byte) in tail.iter().enumerate() {
+        while matched > 0 && *byte != pattern[matched] {
+            matched = prefix[matched - 1];
+        }
+        if *byte == pattern[matched] {
+            matched += 1;
+        }
+        if matched == pattern.len() && index + 1 < tail.len() {
+            matched = prefix[matched - 1];
+        }
+    }
+    debug_assert!(right.is_char_boundary(matched));
+    debug_assert!(left.is_char_boundary(left.len() - matched));
+    matched
 }
 
 fn codex_reasoning_stream_key(value: &Value) -> (String, Option<u64>) {
@@ -4378,6 +4405,25 @@ mod tests {
         assert_eq!(
             state.observe_delta(&second, "repository for duplicate output"),
             Some(" for duplicate output".to_string())
+        );
+    }
+
+    #[test]
+    #[ignore = "explicit provider reasoning-overlap performance gate"]
+    fn provider_reasoning_overlap_profile() {
+        let bytes = 256 * 1024;
+        let mut previous = "a".repeat(bytes - 1);
+        previous.push('b');
+        let incoming = "a".repeat(bytes);
+        let started = Instant::now();
+        let delta = std::hint::black_box(normalize_provider_delta(&previous, &incoming));
+        let elapsed = started.elapsed();
+
+        eprintln!("256 KiB provider reasoning overlap: {elapsed:?}");
+        assert_eq!(delta, incoming);
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "provider reasoning overlap exceeded 50 ms: {elapsed:?}"
         );
     }
 
