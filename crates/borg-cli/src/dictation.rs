@@ -272,6 +272,19 @@ fn dictation_cache_dir() -> Result<PathBuf> {
         .context("unable to determine a cache directory for local dictation")
 }
 
+pub(crate) fn parakeet_is_installed() -> bool {
+    let Ok(cache_dir) = dictation_cache_dir() else {
+        return false;
+    };
+    let model_path = cache_dir.join(PARAKEET_MODEL_FILE);
+    let marker_path = verification_marker(&model_path);
+    fs::metadata(&model_path).is_ok_and(|metadata| metadata.len() == PARAKEET_MODEL_SIZE)
+        && fs::read_to_string(marker_path)
+            .is_ok_and(|marker| marker.trim() == PARAKEET_MODEL_SHA256)
+        && find_file(&cache_dir.join("runtime"), runtime_binary_name())
+            .is_ok_and(|path| path.is_some())
+}
+
 #[cfg(not(any(unix, windows)))]
 fn dictation_cache_dir() -> Result<PathBuf> {
     bail!("automatic Parakeet dictation setup is not supported on this platform")
@@ -837,9 +850,15 @@ async fn transcribe(config: &LocalDictationConfig, path: &std::path::Path) -> Re
         "local dictation model returned {status}: {}",
         body.trim()
     );
-    let text = transcription_text(&body).unwrap_or_else(|| body.trim().to_string());
-    anyhow::ensure!(!text.is_empty(), "local dictation model returned no text");
-    Ok(text)
+    Ok(transcription_response_text(&body))
+}
+
+fn transcription_response_text(body: &str) -> String {
+    if serde_json::from_str::<Value>(body).is_ok() {
+        transcription_text(body).unwrap_or_default()
+    } else {
+        body.trim().to_string()
+    }
 }
 
 fn transcription_text(body: &str) -> Option<String> {
@@ -874,7 +893,8 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        LocalDictationConfig, LocalDictationRecorder, ensure_safe_archive_path, transcription_text,
+        LocalDictationConfig, LocalDictationRecorder, ensure_safe_archive_path,
+        transcription_response_text, transcription_text,
     };
 
     fn default_config() -> LocalDictationConfig {
@@ -920,6 +940,7 @@ mod tests {
             Some("hello")
         );
         assert_eq!(transcription_text(r#"{"text":""}"#), None);
+        assert_eq!(transcription_response_text(r#"{"text":""}"#), "");
     }
 
     #[cfg(unix)]

@@ -60,7 +60,7 @@ use uuid::Uuid;
 
 use self::cache_diagnostics::{CacheDiagnostics, CacheSignature, CacheStatus, CacheUsage};
 use self::markdown::{
-    markdown_lines, markdown_link_ranges, markdown_plain_text, open_http_link, truncate_table_cell,
+    markdown_lines, markdown_link_ranges, markdown_plain_text, open_link, truncate_table_cell,
 };
 use self::terminal_input::TerminalInput;
 pub(crate) use self::terminal_input::TerminalInputEvent;
@@ -100,6 +100,8 @@ const NESTED_WHEEL_SCROLL_FULL_HEIGHT_ROWS: usize = 72;
 const MAX_PENDING_WHEEL_SCROLL_LINES: isize = 160;
 const TOOL_RUN_BOX_THRESHOLD: usize = 8;
 const MAX_COLLAPSED_PLAN_ITEMS: usize = 5;
+#[cfg(test)]
+const LARGE_PASTE_CHAR_THRESHOLD: usize = 1000;
 
 #[cfg(test)]
 const DEFAULT_TOOL_RUN_VIEWPORT_HEIGHT: usize = 8;
@@ -108,7 +110,6 @@ const MAX_TOOL_RUN_VIEWPORT_HEIGHT: usize = 30;
 const TOOL_RUN_CHROME_HEIGHT: usize = 2;
 const MIN_SCROLLBAR_THUMB_ROWS: u16 = 5;
 const TRANSCRIPT_SCROLLBAR_GUTTER_WIDTH: u16 = 3;
-const LARGE_PASTE_CHAR_THRESHOLD: usize = 1000;
 const DICTATION_BUTTON_WIDTH: u16 = 6;
 const DICTATION_EMOJI_ICON: &str = "🎤";
 const DICTATION_NERD_FONT_ICON: &str = "󰍬";
@@ -466,6 +467,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/colors", "view configurable transcript colours"),
     ("/color", "set a transcript colour"),
     ("/usage", "view account limits and session usage"),
+    ("/status", "alias for /usage"),
     ("/clear", "clear conversation context"),
     ("/compact", "compact the current conversation context"),
     ("/resume", "resume a saved Borg session"),
@@ -592,6 +594,7 @@ pub enum UiAction {
     SetSteerActive(bool),
     SetAutoExpandEdits(bool),
     SetAutoExpandTools(bool),
+    SetRunningSweeps(bool),
     SetDictationIcon(DictationIconStyle),
     ToggleDictation,
     LoadPayloads(Vec<SessionPayloadRef>),
@@ -760,6 +763,7 @@ pub struct BorgTerminal {
     dictation_button_hovered: bool,
     dictation_state: DictationState,
     dictation_icon: DictationIconStyle,
+    running_sweeps: bool,
     tool_hit_areas: Vec<(Rect, usize)>,
     tool_run_hit_areas: Vec<(Rect, usize, usize)>,
     tool_run_header_hit_areas: Vec<(Rect, usize)>,
@@ -969,6 +973,7 @@ enum PickerKind {
     ActiveMessages,
     AutoExpandEdits,
     AutoExpandTools,
+    RunningSweeps,
     DictationIcon,
     Rewind,
     MessageActions,
@@ -1751,6 +1756,7 @@ impl BorgTerminal {
             dictation_button_hovered: false,
             dictation_state: DictationState::Idle,
             dictation_icon: dictation_icon_style_for_preference(None),
+            running_sweeps: true,
             tool_hit_areas: Vec::new(),
             tool_run_hit_areas: Vec::new(),
             tool_run_header_hit_areas: Vec::new(),
@@ -2983,6 +2989,7 @@ impl BorgTerminal {
             "Keep machine awake".to_string(),
             "Auto-expand edits".to_string(),
             "Auto-expand tools".to_string(),
+            "Running sweep animations".to_string(),
             "Microphone icon".to_string(),
             "Transcript colours".to_string(),
             format!("User label · {user_label}"),
@@ -2999,6 +3006,7 @@ impl BorgTerminal {
             "/sleep",
             "/expand-edits",
             "/expand-tools",
+            "/animations",
             "/icons",
             "/colors",
             "/user-label",
@@ -3202,6 +3210,19 @@ impl BorgTerminal {
                 "Off"
             }),
         ));
+    }
+
+    pub fn open_running_sweeps_picker(&mut self) {
+        self.picker = Some(Picker::new(
+            PickerKind::RunningSweeps,
+            "Running sweep animations",
+            ["On", "Off"],
+            Some(if self.running_sweeps { "On" } else { "Off" }),
+        ));
+    }
+
+    pub fn set_running_sweeps(&mut self, enabled: bool) {
+        self.running_sweeps = enabled;
     }
 
     pub fn open_dictation_icon_picker(&mut self) {
@@ -3408,12 +3429,7 @@ impl BorgTerminal {
                 let value = normalize_terminal_capture_paste(&value);
                 let PasteOutcome { text, attachments } =
                     self.attachment_store.stage_paste(&value, &self.cwd)?;
-                let pasted_text_label = if text.chars().count() > LARGE_PASTE_CHAR_THRESHOLD {
-                    Some(self.composer.insert_pasted_text(text))
-                } else {
-                    self.composer.insert(&text);
-                    None
-                };
+                self.composer.insert(&text);
                 for path in attachments {
                     self.composer.insert_attachment(path);
                 }
@@ -3421,8 +3437,7 @@ impl BorgTerminal {
                     .composer
                     .attachments
                     .last()
-                    .map(|attachment| format!("Attached {}", attachment.label))
-                    .or_else(|| pasted_text_label.map(|label| format!("Added {label}")));
+                    .map(|attachment| format!("Attached {}", attachment.label));
                 Ok(UiAction::None)
             }
             Event::Mouse(mouse) => {
@@ -4146,7 +4161,7 @@ impl BorgTerminal {
     fn run_pending_transcript_click(&mut self, click: PendingTranscriptClick) -> UiAction {
         match click {
             PendingTranscriptClick::Link(url) => {
-                if let Err(error) = open_http_link(&url) {
+                if let Err(error) = open_link(&url) {
                     self.notice = Some(format!("Could not open link: {error}"));
                 }
             }
@@ -4623,6 +4638,9 @@ impl BorgTerminal {
             }
             PickerKind::AutoExpandTools => {
                 UiAction::SetAutoExpandTools(picker.selected_value() == "On")
+            }
+            PickerKind::RunningSweeps => {
+                UiAction::SetRunningSweeps(picker.selected_value() == "On")
             }
             PickerKind::DictationIcon => match picker.selected_value().as_str() {
                 "nerd_font" => UiAction::SetDictationIcon(DictationIconStyle::NerdFont),
@@ -5286,7 +5304,7 @@ impl BorgTerminal {
                 )
                 .map(|(index, row, expandable)| {
                     let mut header = transcript[row].clone();
-                    if self.transcript.tool_activity_is_running(index) {
+                    if self.running_sweeps && self.transcript.tool_activity_is_running(index) {
                         replace_tool_activity_glyph(
                             &mut header,
                             activity_glyph(SessionStatus::Running),
@@ -5305,7 +5323,9 @@ impl BorgTerminal {
                         .filter(|(_, _, end)| *end > scroll_start)
                         .map(|(index, start, _)| {
                             let mut header = transcript[*start].clone();
-                            if self.transcript.tool_activity_is_running(*index) {
+                            if self.running_sweeps
+                                && self.transcript.tool_activity_is_running(*index)
+                            {
                                 replace_tool_activity_glyph(
                                     &mut header,
                                     activity_glyph(SessionStatus::Running),
@@ -5325,15 +5345,32 @@ impl BorgTerminal {
                     .cloned()
                     .collect::<Vec<_>>();
                 let mut visible_transcript = visible_transcript;
+                let tool_activity_phase = tool_activity_pulse_phase();
+                let visible_end = scroll_start.saturating_add(visible_height);
                 for (index, start, end) in
                     visible_row_ranges(tool_rows, scroll_start, visible_height)
                 {
-                    if *start >= scroll_start
-                        && self.transcript.tool_activity_is_running(*index)
-                        && let Some(line) = visible_transcript.get_mut(*start - scroll_start)
-                    {
-                        replace_tool_activity_glyph(line, activity_glyph(SessionStatus::Running));
-                        apply_running_activity_pulse(line, tool_activity_pulse_phase());
+                    if self.running_sweeps && self.transcript.tool_activity_is_running(*index) {
+                        let content_width = transcript[*start..*end]
+                            .iter()
+                            .map(running_activity_content_width)
+                            .max()
+                            .unwrap_or(0);
+                        for row in (*start).max(scroll_start)..(*end).min(visible_end) {
+                            if let Some(line) = visible_transcript.get_mut(row - scroll_start) {
+                                if row == *start {
+                                    replace_tool_activity_glyph(
+                                        line,
+                                        activity_glyph(SessionStatus::Running),
+                                    );
+                                }
+                                apply_running_activity_pulse_with_width(
+                                    line,
+                                    tool_activity_phase,
+                                    content_width,
+                                );
+                            }
+                        }
                     }
                     if self.hovered_tool == Some(*index) {
                         apply_viewport_background(
@@ -5350,7 +5387,6 @@ impl BorgTerminal {
                         *index,
                     ));
                 }
-                let visible_end = scroll_start.saturating_add(visible_height);
                 for (start_index, start, end, max_offset, expandable) in tool_run_rows
                     .iter()
                     .filter(|(_, start, end, _, _)| *end > scroll_start && *start < visible_end)
@@ -5756,7 +5792,7 @@ impl BorgTerminal {
                 status_highlight,
                 status_duration.as_deref(),
             );
-            if session_is_active {
+            if session_is_active && self.running_sweeps {
                 let mut status_line = Line::from(status_spans);
                 apply_running_activity_pulse(&mut status_line, running_status_pulse_phase());
                 status_spans = status_line.spans;
@@ -7573,6 +7609,7 @@ struct Composer {
     attachments: Vec<ComposerAttachment>,
     pasted_texts: Vec<ComposerPastedText>,
     next_image_number: usize,
+    #[cfg(test)]
     next_pasted_text_number: usize,
     history: Vec<String>,
     history_message_ids: HashSet<Uuid>,
@@ -7648,6 +7685,7 @@ impl Composer {
         label
     }
 
+    #[cfg(test)]
     fn insert_pasted_text(&mut self, content: String) -> String {
         self.next_pasted_text_number += 1;
         let label = format!("Pasted Text {}", self.next_pasted_text_number);
@@ -11705,15 +11743,26 @@ fn activity_pulse_phase(step_millis: u128) -> usize {
 }
 
 fn apply_running_activity_pulse(line: &mut Line<'static>, phase: usize) {
-    if line.spans.len() < 2 {
-        return;
-    }
-    let content_width = line
-        .spans
+    let content_width = running_activity_content_width(line);
+    apply_running_activity_pulse_with_width(line, phase, content_width);
+}
+
+fn running_activity_content_width(line: &Line<'static>) -> usize {
+    line.spans
         .iter()
         .skip(1)
         .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
-        .sum::<usize>();
+        .sum()
+}
+
+fn apply_running_activity_pulse_with_width(
+    line: &mut Line<'static>,
+    phase: usize,
+    content_width: usize,
+) {
+    if line.spans.len() < 2 {
+        return;
+    }
     if content_width == 0 {
         return;
     }

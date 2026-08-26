@@ -8640,7 +8640,7 @@ fn consultation_profiles_resolve_aliases_and_catalog_models() {
         resolve_consultation_profile("gpt").unwrap(),
         (
             CodingProvider::Codex,
-            Some("gpt-5.6-luna".to_string()),
+            Some("gpt-5.6-sol".to_string()),
             None
         )
     );

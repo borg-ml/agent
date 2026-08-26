@@ -70,6 +70,13 @@ fn input_fast_path_waits_for_a_pending_transcript_frame() {
     assert!(!should_draw_input_fast_path(false, true, true, false, true));
 }
 
+#[test]
+fn status_is_an_alias_for_usage() {
+    assert!(is_usage_command("/usage"));
+    assert!(is_usage_command("/status"));
+    assert!(!is_usage_command("/status extra"));
+}
+
 #[cfg(unix)]
 fn short_socket_tempdir() -> tempfile::TempDir {
     let temp_root = std::env::var_os("TMPDIR")
@@ -401,6 +408,71 @@ fn first_resume_scan_is_bounded_before_history_is_selected() {
     assert_eq!(recent_tui_history_after(10), 0);
     assert_eq!(recent_tui_history_after(100), 0);
     assert_eq!(recent_tui_history_after(60_000), 59_488);
+}
+
+#[tokio::test]
+async fn first_resume_frame_keeps_latest_updates_from_a_long_autonomous_turn() {
+    let directory = tempdir().unwrap();
+    let store = SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
+        .await
+        .unwrap();
+    let session_id = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+    store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::Message {
+                message_id: Uuid::new_v4(),
+                actor: EventActor::User,
+                text: "keep working until the goal is complete".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            },
+        ))
+        .await
+        .unwrap();
+    for _ in 0..RICH_TUI_HISTORY_BOOTSTRAP_SCAN_LIMIT {
+        store
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::ReasoningCompleted,
+            ))
+            .await
+            .unwrap();
+    }
+    let latest = store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::Message {
+                message_id: Uuid::new_v4(),
+                actor: EventActor::Assistant,
+                text: "latest autonomous update".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            },
+        ))
+        .await
+        .unwrap();
+
+    let history = recent_tui_history(&store, session_id, latest.sequence)
+        .await
+        .unwrap();
+
+    assert!(history.events.iter().any(|event| matches!(
+        &event.kind,
+        SessionEventKind::Message { actor: EventActor::User, text, .. }
+            if text == "keep working until the goal is complete"
+    )));
+    assert!(history.events.iter().any(|event| matches!(
+        &event.kind,
+        SessionEventKind::Message { actor: EventActor::Assistant, text, .. }
+            if text == "latest autonomous update"
+    )));
 }
 
 #[test]
@@ -2310,4 +2382,6 @@ fn usage_screen_keeps_account_limits_and_session_usage_distinct() {
     assert!(generic.contains("Account limits · OpenRouter"));
     assert!(generic.contains("not exposed by OpenRouter"));
     assert!(!generic.contains("Codex"));
+    assert!(generic.contains("No provider token usage was reported"));
+    assert!(!generic.contains("Calls            0"));
 }

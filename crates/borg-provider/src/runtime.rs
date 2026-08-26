@@ -31,7 +31,7 @@ pub const CODEX_SELECTABLE_MODELS: [(&str, &str); 3] = [
 pub const CODEX_EFFORT_LEVELS: [&str; 6] = ["low", "medium", "high", "xhigh", "max", "ultra"];
 pub const CODEX_MODEL_CATALOG: ProviderModelCatalog = ProviderModelCatalog {
     backend: "codex",
-    default_model: "gpt-5.6-luna",
+    default_model: "gpt-5.6-sol",
     selectable_models: &CODEX_SELECTABLE_MODELS,
     effort_levels: &CODEX_EFFORT_LEVELS,
 };
@@ -67,7 +67,7 @@ pub fn codex_product_model() -> &'static str {
 }
 
 pub fn codex_default_effort() -> &'static str {
-    "max"
+    "low"
 }
 
 pub fn codex_effort_levels() -> Vec<String> {
@@ -269,9 +269,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn codex_defaults_use_luna_at_max_effort() {
-        assert_eq!(codex_product_model(), "gpt-5.6-luna");
-        assert_eq!(codex_default_effort(), "max");
+    fn codex_defaults_use_sol_at_low_effort() {
+        assert_eq!(codex_product_model(), "gpt-5.6-sol");
+        assert_eq!(codex_default_effort(), "low");
         assert!(codex_effort_supported(codex_default_effort()));
     }
 

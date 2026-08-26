@@ -389,8 +389,12 @@ fn safe_http_url(value: &str) -> Option<String> {
     matches!(parsed.scheme(), "http" | "https").then(|| parsed.to_string())
 }
 
-pub(super) fn open_http_link(url: &str) -> Result<()> {
-    let url = safe_http_url(url).context("only HTTP(S) links can be opened")?;
+pub(super) fn open_link(url: &str) -> Result<()> {
+    let parsed = url::Url::parse(url).context("invalid link target")?;
+    anyhow::ensure!(
+        matches!(parsed.scheme(), "http" | "https" | "file"),
+        "only HTTP(S) links and local files can be opened"
+    );
     let mut command = if cfg!(target_os = "macos") {
         std::process::Command::new("open")
     } else if cfg!(target_os = "windows") {
@@ -401,7 +405,7 @@ pub(super) fn open_http_link(url: &str) -> Result<()> {
         std::process::Command::new("xdg-open")
     };
     command
-        .arg(url)
+        .arg(parsed.as_str())
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

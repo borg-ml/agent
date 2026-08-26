@@ -80,6 +80,7 @@ pub(crate) struct PresentationPreferences {
     pub(crate) refresh_rate_fps: u16,
     pub(crate) auto_expand_edits: bool,
     pub(crate) auto_expand_tools: bool,
+    pub(crate) running_sweeps: bool,
     pub(crate) dictation_icon: Option<DictationIconStyle>,
 }
 
@@ -89,6 +90,7 @@ impl Default for PresentationPreferences {
             refresh_rate_fps: DEFAULT_REFRESH_RATE_FPS,
             auto_expand_edits: true,
             auto_expand_tools: false,
+            running_sweeps: true,
             dictation_icon: None,
         }
     }
@@ -249,6 +251,7 @@ mod tests {
                 refresh_rate_fps: 144,
                 auto_expand_edits: false,
                 auto_expand_tools: true,
+                running_sweeps: false,
                 dictation_icon: Some(DictationIconStyle::NerdFont),
             },
         };

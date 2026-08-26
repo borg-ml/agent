@@ -1,6 +1,28 @@
 const USER_INTERRUPT_ACTIVITY: &str = "agent interrupted by user";
 const TOOL_ELAPSED_REFRESH_MILLIS: i64 = 100;
 
+fn user_message_has_structured_whitespace(text: &str) -> bool {
+    text.contains('\n')
+        && text.lines().any(|line| {
+            line.contains('\t')
+                || line.starts_with(' ')
+                || line.contains("  ")
+                || line.chars().any(|character| "│┃┌┐└┘┬┴┼╭╮╰╯".contains(character))
+        })
+}
+
+fn structured_user_message_lines(
+    text: &str,
+    width: usize,
+    text_color: Option<Color>,
+) -> Vec<Line<'static>> {
+    let style = text_color.map_or_else(Style::default, |color| Style::default().fg(color));
+    display_ranges(text, width.max(1), false)
+        .into_iter()
+        .map(|(start, end)| Line::from(Span::styled(text[start..end].to_string(), style)))
+        .collect()
+}
+
 fn goal_status_label(status: GoalStatus) -> &'static str {
     match status {
         GoalStatus::Active => "active",
@@ -2454,12 +2476,20 @@ impl Transcript {
                                 {
                                     missed = true;
                                 }
-                                let mut lines = markdown_lines(
-                                    text,
-                                    width.saturating_sub(MESSAGE_HORIZONTAL_PADDING * 2),
-                                    text_color,
-                                );
-                                let mut links = markdown_link_ranges(text, &lines);
+                                let content_width =
+                                    width.saturating_sub(MESSAGE_HORIZONTAL_PADDING * 2);
+                                let preserve_structure = *actor == EventActor::User
+                                    && user_message_has_structured_whitespace(text);
+                                let mut lines = if preserve_structure {
+                                    structured_user_message_lines(text, content_width, text_color)
+                                } else {
+                                    markdown_lines(text, content_width, text_color)
+                                };
+                                let mut links = if preserve_structure {
+                                    Vec::new()
+                                } else {
+                                    markdown_link_ranges(text, &lines)
+                                };
                                 for link in &mut links {
                                     link.start += MESSAGE_HORIZONTAL_PADDING;
                                     link.end += MESSAGE_HORIZONTAL_PADDING;
@@ -2491,7 +2521,7 @@ impl Transcript {
                                     .add_modifier(Modifier::BOLD),
                             )));
                         }
-                        lines.push(Line::from(vec![
+                        let attachment_line = Line::from(vec![
                             Span::styled("    ▣ ", Style::default().fg(Color::LightCyan)),
                             Span::styled(
                                 format!("Image {number}"),
@@ -2501,7 +2531,16 @@ impl Transcript {
                                 format!("  {}", display_name(path)),
                                 Style::default().fg(Color::DarkGray),
                             ),
-                        ]));
+                        ]);
+                        if let Ok(url) = url::Url::from_file_path(path) {
+                            link_rows.push(LinkRowRange {
+                                row: lines.len(),
+                                start: 4,
+                                end: attachment_line.width(),
+                                url: url.to_string(),
+                            });
+                        }
+                        lines.push(attachment_line);
                     }
                     if *actor == EventActor::Assistant && !complete && !running_tool {
                         lines.push(Line::from(Span::styled(

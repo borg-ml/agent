@@ -720,6 +720,29 @@ fn transcript_attachments_preserve_the_explicit_image_number() {
 }
 
 #[test]
+fn transcript_attachment_rows_link_to_the_local_image() {
+    let path = PathBuf::from("/tmp/borg-clickable-image.png");
+    let mut transcript = Transcript::default();
+    transcript.order.push(TranscriptEntry::Message {
+        actor: EventActor::User,
+        text: "inspect [Image 1]".to_string(),
+        attachments: vec![(1, path.clone())],
+        model: None,
+        effort: None,
+        time: "2026-08-26 12:00".to_string(),
+        status: MessageStatus::Complete,
+        complete: true,
+    });
+
+    let rendered = transcript.render(100, None, None, None);
+
+    assert!(rendered.5.iter().any(|link| {
+        link.url == url::Url::from_file_path(&path).unwrap().to_string()
+            && rendered.0[link.row].to_string().contains("Image 1")
+    }));
+}
+
+#[test]
 fn subagent_activity_rows_use_the_shared_hot_pink_identity_colour() {
     let mut transcript = Transcript::default();
     transcript.order.push(TranscriptEntry::Activity {
@@ -1517,6 +1540,19 @@ fn running_tool_pulse_moves_across_text_without_touching_the_gutter() {
     let sweep_width = "running action".width() + RUNNING_PULSE_RADIUS * 2;
     apply_running_activity_pulse(&mut paused, sweep_width + RUNNING_PULSE_PAUSE_STEPS);
     assert_eq!(paused.spans, paused_before.spans);
+}
+
+#[test]
+fn structured_user_message_lines_preserve_column_spacing() {
+    let text = "NAME      VALUE\nalpha     10\nbeta      20";
+    assert!(user_message_has_structured_whitespace(text));
+
+    let rendered = structured_user_message_lines(text, 80, Some(Color::White));
+
+    assert_eq!(
+        rendered.iter().map(Line::to_string).collect::<Vec<_>>(),
+        vec!["NAME      VALUE", "alpha     10", "beta      20"]
+    );
 }
 
 #[test]
@@ -3737,10 +3773,11 @@ fn slash_command_picker_selects_the_highlighted_match() {
     assert_eq!(slash_matches("/int")[0].0, "/interrupt");
     assert_eq!(slash_matches("/dir")[0].0, "/director");
     assert_eq!(slash_matches("/pe")[0].0, "/peer");
+    assert_eq!(slash_matches("/status")[0].0, "/status");
     assert_eq!(slash_selected_command("/mo", 0), Some("/model"));
     assert_eq!(slash_selected_command("/eff", 0), Some("/effort"));
     assert_eq!(slash_selected_command("/lang", 0), Some("/language"));
-    assert_eq!(slash_selected_command("/st", 1), Some("/stop"));
+    assert_eq!(slash_selected_command("/st", 2), Some("/stop"));
     assert_eq!(slash_selected_command("/goal add", 0), None);
     assert!(slash_matches("/todo add").is_empty());
     assert!(slash_matches("plain prompt").is_empty());

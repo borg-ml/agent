@@ -41,6 +41,7 @@ use crate::agent_config::AgentConfig;
 use crate::cli::{LocalAgentCliArgs, RemoteCommand};
 use crate::dictation::{
     LocalDictationBackend, LocalDictationConfig, LocalDictationRecorder, ensure_backend,
+    parakeet_is_installed,
 };
 use crate::editor_preferences::{ActiveMessageBehavior, DictationIconStyle, EditorPreferences};
 use crate::sleep_inhibitor::SleepInhibitor;
@@ -1668,6 +1669,7 @@ async fn run_local_agent_session(
         }
         terminal.set_auto_expand_edits(editor_preferences.presentation.auto_expand_edits);
         terminal.set_auto_expand_tools(editor_preferences.presentation.auto_expand_tools);
+        terminal.set_running_sweeps(editor_preferences.presentation.running_sweeps);
         terminal.set_transcript_labels(
             editor_preferences.transcript.user_label.clone(),
             editor_preferences.transcript.assistant_label.clone(),
@@ -1862,7 +1864,8 @@ async fn run_local_agent_session(
                 if let Some(terminal) = terminal.as_mut() {
                     terminal.set_dictation_state(DictationState::Idle);
                     match result {
-                        Ok(Ok(text)) => terminal.insert_dictation(&text),
+                        Ok(Ok(text)) if !text.is_empty() => terminal.insert_dictation(&text),
+                        Ok(Ok(_)) => {}
                         Ok(Err(error)) => {
                             terminal.set_notice(format!("Dictation failed: {error:#}"));
                         }
@@ -2675,7 +2678,7 @@ async fn run_local_agent_session(
                     }
                     continue;
                 }
-                if line == "/usage" {
+                if is_usage_command(line) {
                     let summary = usage_summary(provider, &session_usage).await;
                     println!(
                         "\n  Usage\n{}\n",
@@ -3540,6 +3543,16 @@ async fn run_local_agent_session(
                             if enabled { "on" } else { "off" }
                         ));
                     }
+                    UiAction::SetRunningSweeps(enabled) => {
+                        editor_preferences.presentation.running_sweeps = enabled;
+                        editor_preferences.save()?;
+                        let terminal = terminal.as_mut().expect("terminal");
+                        terminal.set_running_sweeps(enabled);
+                        terminal.set_notice(format!(
+                            "Running sweep animations: {}",
+                            if enabled { "on" } else { "off" }
+                        ));
+                    }
                     UiAction::SetDictationIcon(style) => {
                         editor_preferences.presentation.dictation_icon = Some(style);
                         editor_preferences.save()?;
@@ -3576,10 +3589,12 @@ async fn run_local_agent_session(
                                 .as_mut()
                                 .expect("terminal")
                                 .set_dictation_state(DictationState::Installing);
-                            terminal.as_mut().expect("terminal").set_notice(
+                            terminal.as_mut().expect("terminal").set_notice(if parakeet_is_installed() {
+                                "Starting Parakeet V2".to_string()
+                            } else {
                                 "Preparing Parakeet V2 · may download about 609 MiB on first use"
-                                    .to_string(),
-                            );
+                                    .to_string()
+                            });
                             let config = dictation_config.clone();
                             dictation_setup_task = Some(tokio::spawn(async move {
                                 ensure_backend(config).await
@@ -4124,6 +4139,11 @@ async fn run_local_agent_session(
                                 .as_mut()
                                 .expect("terminal")
                                 .open_auto_expand_tools_picker();
+                        } else if line == "/animations" && attachments.is_empty() {
+                            terminal
+                                .as_mut()
+                                .expect("terminal")
+                                .open_running_sweeps_picker();
                         } else if line == "/icons" && attachments.is_empty() {
                             terminal
                                 .as_mut()
@@ -4205,7 +4225,7 @@ async fn run_local_agent_session(
                                 .as_mut()
                                 .expect("terminal")
                                 .set_notice("Type the assistant transcript label and press Enter");
-                        } else if line == "/usage" && attachments.is_empty() {
+                        } else if is_usage_command(line) && attachments.is_empty() {
                             let summary = usage_summary(provider, &session_usage).await;
                             terminal
                                 .as_mut()
@@ -4400,6 +4420,23 @@ async fn run_local_agent_session(
                             } else {
                                 terminal.as_mut().expect("terminal").set_notice(
                                     "Choose /expand-tools on or /expand-tools off",
+                                );
+                            }
+                        } else if let Some(value) = line.strip_prefix("/animations ")
+                            && attachments.is_empty()
+                        {
+                            if let Some(enabled) = parse_on_off(value) {
+                                editor_preferences.presentation.running_sweeps = enabled;
+                                editor_preferences.save()?;
+                                let terminal = terminal.as_mut().expect("terminal");
+                                terminal.set_running_sweeps(enabled);
+                                terminal.set_notice(format!(
+                                    "Running sweep animations: {}",
+                                    if enabled { "on" } else { "off" }
+                                ));
+                            } else {
+                                terminal.as_mut().expect("terminal").set_notice(
+                                    "Choose /animations on or /animations off",
                                 );
                             }
                         } else if let Some(value) = line.strip_prefix("/followups ")
@@ -5575,16 +5612,22 @@ async fn recent_tui_history(
     session_id: Uuid,
     latest_sequence: u64,
 ) -> Result<ResumeBootstrapHistory> {
-    let checkpoint = store
-        .latest_completed_context_compaction(session_id)
-        .await?;
-    let scanned = store
-        .events_after(
+    let (checkpoint, latest_user_messages, scanned) = tokio::try_join!(
+        store.latest_completed_context_compaction(session_id),
+        store.recent_user_messages(session_id, 1),
+        store.events_after(
             session_id,
             recent_tui_history_after(latest_sequence),
             RICH_TUI_HISTORY_BOOTSTRAP_SCAN_LIMIT,
-        )
-        .await?;
+        ),
+    )?;
+    let mut scanned = scanned;
+    if let Some(latest_user) = latest_user_messages.into_iter().next()
+        && !scanned.iter().any(|event| event.id == latest_user.id)
+    {
+        let index = scanned.partition_point(|event| event.sequence < latest_user.sequence);
+        scanned.insert(index, latest_user);
+    }
     let selection = select_resume_bootstrap_history(scanned);
     let mut selected = selection.events;
     if let Some(checkpoint) = checkpoint
@@ -5680,11 +5723,23 @@ fn select_resume_bootstrap_history(events: Vec<SessionEvent>) -> ResumeBootstrap
         })
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
-    let retained_messages = message_indices
+    let mut retained_messages = message_indices
         .into_iter()
         .rev()
         .take(RICH_TUI_HISTORY_MESSAGE_LIMIT)
         .collect::<HashSet<_>>();
+    if let Some(latest_user) = events.iter().rposition(|event| {
+        matches!(
+            event.kind,
+            SessionEventKind::Message {
+                actor: EventActor::User,
+                status: MessageStatus::Complete | MessageStatus::Failed | MessageStatus::InProgress,
+                ..
+            }
+        )
+    }) {
+        retained_messages.insert(latest_user);
+    }
 
     // Keep a bounded event tail for current lifecycle/tool state and splice in
     // the latest real conversation messages even when a high-volume child or
@@ -6630,6 +6685,7 @@ fn print_agent_help() {
   /color TARGET HEX set a transcript colour
   /icons            choose the dictation icon (nerd or emoji)
   /usage            view account limits and session usage
+  /status           alias for /usage
   /clear            clear the conversation context
   /compact          compact the current provider context
   /goal             show the durable session goal
@@ -6784,9 +6840,15 @@ fn format_usage_summary(
         ));
     }
 
+    lines.extend([String::new(), "Session".to_string()]);
+    if session.calls == 0 {
+        lines.push(
+            "  Usage unavailable No provider token usage was reported for this session."
+                .to_string(),
+        );
+        return lines.join("\n");
+    }
     lines.extend([
-        String::new(),
-        "Session".to_string(),
         format!("  {:<16} {}", "Calls", format_count(session.calls)),
         format!(
             "  {:<16} {}",
@@ -6811,9 +6873,6 @@ fn format_usage_summary(
     ]);
     if let Some(cost) = session.cost_usd {
         lines.push(format!("  {:<16} ${cost:.4}", "Estimated cost"));
-    }
-    if session.calls == 0 {
-        lines.push("  Status           No completed provider turns yet.".to_string());
     }
     lines.join("\n")
 }
@@ -6883,6 +6942,10 @@ fn format_count(value: u64) -> String {
         formatted.push(character);
     }
     formatted
+}
+
+fn is_usage_command(line: &str) -> bool {
+    matches!(line, "/usage" | "/status")
 }
 
 fn parse_todo_action(line: &str, items: &[PlanItem]) -> Result<TodoAction> {
