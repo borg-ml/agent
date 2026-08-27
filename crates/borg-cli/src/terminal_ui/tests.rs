@@ -7518,6 +7518,51 @@ fn running_actions_keep_edge_spacing_in_compact_and_boxed_runs() {
 }
 
 #[test]
+fn provider_progress_marks_an_unfinished_tool_as_background_work() {
+    let session_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::ToolStarted {
+            tool_call_id: "long-build".to_string(),
+            name: "command_execution".to_string(),
+            input: serde_json::json!({"command": "cargo run --bin long-build"}),
+            input_ref: None,
+        },
+    ));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::ReasoningCompleted,
+    ));
+
+    let tool = transcript
+        .order
+        .iter()
+        .find(|entry| matches!(entry, TranscriptEntry::Tool { .. }))
+        .expect("tool entry");
+    assert!(matches!(
+        tool,
+        TranscriptEntry::Tool {
+            complete: false,
+            backgrounded: true,
+            ..
+        }
+    ));
+    let row = transcript
+        .lines(120)
+        .into_iter()
+        .find(|line| line.to_string().contains("running in background"))
+        .expect("background lifecycle row");
+    assert!(
+        row.spans
+            .iter()
+            .any(|span| span.style.fg == Some(USER_LABEL_BLUE))
+    );
+}
+
+#[test]
 fn boxed_thinking_rows_keep_one_edge_separator_without_duplicates() {
     let mut transcript = Transcript::default();
     transcript

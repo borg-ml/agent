@@ -50,6 +50,7 @@ struct Transcript {
     order: Vec<TranscriptEntry>,
     messages: HashMap<Uuid, usize>,
     tools: HashMap<String, usize>,
+    foreground_tool: Option<String>,
     goal: Option<SessionGoal>,
     todos: Vec<PlanItem>,
     config: Option<SessionDisplayConfig>,
@@ -112,6 +113,7 @@ impl Default for Transcript {
             order: Vec::new(),
             messages: HashMap::new(),
             tools: HashMap::new(),
+            foreground_tool: None,
             goal: None,
             todos: Vec::new(),
             config: None,
@@ -842,6 +844,22 @@ impl Transcript {
         event: &SessionEvent,
         reorder_late_user_messages: bool,
     ) -> Option<usize> {
+        let provider_advanced = matches!(
+            &event.kind,
+            SessionEventKind::Message {
+                actor: EventActor::Assistant,
+                ..
+            } | SessionEventKind::ReasoningDelta { .. }
+                | SessionEventKind::ReasoningCompleted
+                | SessionEventKind::ToolStarted { .. }
+        ) || matches!(
+            &event.kind,
+            SessionEventKind::ProviderEvent { kind, payload, .. }
+                if Self::provider_reasoning_lifecycle(kind, payload).is_some()
+        );
+        if provider_advanced {
+            self.mark_running_tools_backgrounded();
+        }
         let completed_turn = match &event.kind {
             SessionEventKind::TurnCompleted { message_id, .. }
             | SessionEventKind::PromptRecalled { message_id, .. } => Some(*message_id),
@@ -1176,6 +1194,7 @@ impl Transcript {
                 let code_view = presentation.input.map(|body| (body.language, body.text));
                 let tool_index = self.order.len();
                 self.tools.insert(tool_call_id.to_string(), tool_index);
+                self.foreground_tool = Some(tool_call_id.to_string());
                 self.order.push(TranscriptEntry::Tool {
                     source_name: raw_name.to_string(),
                     name: display_name,
@@ -1212,6 +1231,7 @@ impl Transcript {
                     &display_name,
                     code_view.as_ref().map(|(language, _)| language.as_str()),
                 );
+                self.foreground_tool = Some(tool_call_id.clone());
                 if is_edit_diff {
                     self.collapse_previous_edit();
                 }
@@ -1285,6 +1305,9 @@ impl Transcript {
                 input,
                 input_ref,
             } => {
+                if self.foreground_tool.as_deref() == Some(tool_call_id) {
+                    self.foreground_tool = None;
+                }
                 let auto_expand_edits = self.auto_expand_edits;
                 if let Some(index) = self.tools.get(tool_call_id).copied()
                     && let TranscriptEntry::Tool {
@@ -1908,6 +1931,7 @@ impl Transcript {
 
     fn mark_running_tools_user_interrupted(&mut self, completed_at: DateTime<Utc>) {
         self.finish_reasoning(completed_at);
+        self.foreground_tool = None;
         for entry in &mut self.order {
             if let TranscriptEntry::Tool {
                 complete,
@@ -1924,6 +1948,28 @@ impl Transcript {
         }
     }
 
+    fn mark_running_tools_backgrounded(&mut self) {
+        let Some(tool_call_id) = self.foreground_tool.take() else {
+            return;
+        };
+        let Some(index) = self.tools.get(&tool_call_id).copied() else {
+            return;
+        };
+        if let Some(TranscriptEntry::Tool {
+            complete,
+            error,
+            user_interrupted,
+            backgrounded,
+            ..
+        }) = self.order.get_mut(index)
+            && !*complete
+            && !*error
+            && !*user_interrupted
+        {
+            *backgrounded = true;
+        }
+    }
+
     fn finish_running_tools(
         &mut self,
         completed_at: DateTime<Utc>,
@@ -1931,6 +1977,7 @@ impl Transcript {
         error_detail: &str,
     ) {
         self.finish_reasoning(completed_at);
+        self.foreground_tool = None;
         for entry in &mut self.order {
             if let TranscriptEntry::Tool {
                 detail,
@@ -3002,6 +3049,8 @@ impl Transcript {
                     };
                     let style = if *error || *user_interrupted {
                         Style::default().fg(Color::Red)
+                    } else if *backgrounded {
+                        Style::default().fg(USER_LABEL_BLUE)
                     } else {
                         gutter_style
                     };
@@ -3012,6 +3061,10 @@ impl Transcript {
                     } else if *error || *user_interrupted {
                         Style::default()
                             .fg(Color::LightRed)
+                            .add_modifier(Modifier::BOLD)
+                    } else if *backgrounded {
+                        Style::default()
+                            .fg(USER_LABEL_BLUE)
                             .add_modifier(Modifier::BOLD)
                     } else if is_subagent_tool(name) {
                         Style::default()
@@ -3026,7 +3079,7 @@ impl Transcript {
                     let lifecycle = if *user_interrupted {
                         Some("user interrupted")
                     } else if *backgrounded {
-                        Some("backgrounded")
+                        Some("running in background")
                     } else if !*complete
                         && !is_reasoning
                         && pending_tool_label(name).as_ref() == name
