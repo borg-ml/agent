@@ -57,7 +57,7 @@ mod local_server;
 
 const MIN_TUI_FPS: u64 = 15;
 const MAX_TUI_FPS: u64 = 240;
-const ACTIVITY_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(80);
+const ACTIVITY_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
 const IDLE_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 const MAX_RENDER_BACKOFF_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 const LOCAL_RESUME_RETRY_INITIAL_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
@@ -2042,10 +2042,15 @@ async fn run_local_agent_session(
                 }
                 let draw_started = std::time::Instant::now();
                 terminal.draw()?;
+                let activity_frame = terminal_needs_activity_tick(status)
+                    || terminal.has_running_tool()
+                    || terminal.has_active_splash_animation()
+                    || terminal.is_history_page_loading();
                 let next_interval = responsive_tui_frame_interval(
                     tui_fps,
                     draw_started.elapsed(),
                     interaction_frame,
+                    activity_frame,
                 );
                 if next_interval != render_frame_interval {
                     render_frame_interval = next_interval;
@@ -5890,7 +5895,7 @@ fn select_resume_bootstrap_history(events: Vec<SessionEvent>) -> ResumeBootstrap
         };
     }
     let floor = events.len() - RICH_TUI_HISTORY_EVENT_LIMIT;
-    let page_before = events.get(floor).map(|event| event.sequence);
+    let tail_start = events.get(floor).map(|event| event.sequence);
     let message_indices = events
         .iter()
         .enumerate()
@@ -5935,9 +5940,19 @@ fn select_resume_bootstrap_history(events: Vec<SessionEvent>) -> ResumeBootstrap
         .filter_map(|(index, event)| {
             (index >= floor || retained_messages.contains(&index)).then_some(event)
         })
-        .collect();
+        .collect::<Vec<_>>();
+    let selected = trim_resume_bootstrap_to_user_boundary(selected);
+    // Trimming can move the first contiguous tail event forward. Paging must
+    // end immediately before that retained event, or the removed interval is
+    // never loaded and completed messages/tools silently disappear on resume.
+    let page_before = tail_start.and_then(|tail_start| {
+        selected
+            .iter()
+            .find(|event| event.sequence >= tail_start)
+            .map(|event| event.sequence)
+    });
     ResumeBootstrapSelection {
-        events: trim_resume_bootstrap_to_user_boundary(selected),
+        events: selected,
         page_before,
     }
 }
@@ -6261,14 +6276,20 @@ fn responsive_tui_frame_interval(
     fps: u64,
     last_draw: std::time::Duration,
     interaction_frame: bool,
+    activity_frame: bool,
 ) -> std::time::Duration {
+    let max_interval = if activity_frame {
+        ACTIVITY_FRAME_INTERVAL
+    } else {
+        MAX_RENDER_BACKOFF_INTERVAL
+    };
     tui_frame_interval(fps)
         .max(if interaction_frame {
             last_draw
         } else {
             last_draw.saturating_mul(3)
         })
-        .min(MAX_RENDER_BACKOFF_INTERVAL)
+        .min(max_interval)
 }
 
 fn parse_on_off(value: &str) -> Option<bool> {

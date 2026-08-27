@@ -557,6 +557,52 @@ fn first_resume_frame_keeps_real_recent_conversation_before_lazy_pages() {
     )));
 }
 
+#[test]
+fn trimmed_resume_tail_keeps_paging_contiguous() {
+    let session_id = Uuid::new_v4();
+    let mut events = (1..=1_024)
+        .map(|sequence| {
+            SessionEvent::new(session_id, sequence, SessionEventKind::ReasoningCompleted)
+        })
+        .collect::<Vec<_>>();
+    events[949] = SessionEvent::new(
+        session_id,
+        950,
+        SessionEventKind::Message {
+            message_id: Uuid::new_v4(),
+            actor: EventActor::Assistant,
+            text: "latest response shown by the resume picker".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: None,
+        },
+    );
+    events[999] = SessionEvent::new(
+        session_id,
+        1_000,
+        SessionEventKind::Message {
+            message_id: Uuid::new_v4(),
+            actor: EventActor::User,
+            text: "later user boundary".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: None,
+        },
+    );
+
+    let selected = select_resume_bootstrap_history(events);
+
+    assert_eq!(selected.events.first().unwrap().sequence, 1_000);
+    assert_eq!(selected.page_before, Some(1_000));
+    let after = older_tui_history_after(selected.page_before.unwrap()).unwrap();
+    let limit = older_tui_history_limit(selected.page_before.unwrap(), after);
+    assert_eq!(after + limit as u64, 999);
+    assert!(
+        after < 950,
+        "the next page must recover the latest response"
+    );
+}
+
 #[tokio::test]
 async fn first_resume_frame_splices_in_the_latest_completed_compaction() {
     let directory = tempdir().unwrap();
@@ -644,7 +690,7 @@ async fn first_resume_frame_splices_in_the_latest_completed_compaction() {
         .unwrap();
 
     assert!(history.page_before > history.events[0].sequence);
-    assert!(history.page_before < history.events.last().unwrap().sequence);
+    assert!(history.page_before <= history.events.last().unwrap().sequence);
     let older = older_tui_history(&store, session_id, history.page_before)
         .await
         .unwrap();
@@ -1716,24 +1762,28 @@ fn tui_frame_interval_preserves_supported_high_refresh_and_caps_extremes() {
 #[test]
 fn expensive_draws_leave_time_for_input_and_animation_events() {
     assert_eq!(
-        responsive_tui_frame_interval(165, std::time::Duration::from_millis(5), false),
+        responsive_tui_frame_interval(165, std::time::Duration::from_millis(5), false, false),
         std::time::Duration::from_millis(15)
     );
     assert_eq!(
-        responsive_tui_frame_interval(60, std::time::Duration::from_millis(40), false),
+        responsive_tui_frame_interval(60, std::time::Duration::from_millis(40), false, false),
         std::time::Duration::from_millis(120)
     );
     assert_eq!(
-        responsive_tui_frame_interval(60, std::time::Duration::ZERO, false),
+        responsive_tui_frame_interval(60, std::time::Duration::ZERO, false, false),
         tui_frame_interval(60)
     );
     assert_eq!(
-        responsive_tui_frame_interval(60, std::time::Duration::from_millis(40), true),
+        responsive_tui_frame_interval(60, std::time::Duration::from_millis(40), true, false),
         std::time::Duration::from_millis(40)
     );
     assert_eq!(
-        responsive_tui_frame_interval(60, std::time::Duration::from_millis(500), false),
+        responsive_tui_frame_interval(60, std::time::Duration::from_millis(500), false, false),
         MAX_RENDER_BACKOFF_INTERVAL
+    );
+    assert_eq!(
+        responsive_tui_frame_interval(60, std::time::Duration::from_millis(500), false, true),
+        ACTIVITY_FRAME_INTERVAL
     );
 }
 
