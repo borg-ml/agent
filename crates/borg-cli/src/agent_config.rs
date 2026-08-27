@@ -181,10 +181,11 @@ impl Drop for LocalProviderEnvGuard {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ExtensionAccess {
     Sandboxed,
+    #[default]
     Trusted,
     Native,
 }
@@ -196,12 +197,6 @@ impl ExtensionAccess {
             Self::Trusted => "trusted",
             Self::Native => "native",
         }
-    }
-}
-
-impl Default for ExtensionAccess {
-    fn default() -> Self {
-        Self::Trusted
     }
 }
 

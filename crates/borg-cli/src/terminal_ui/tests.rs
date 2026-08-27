@@ -738,7 +738,7 @@ fn transcript_attachments_preserve_the_explicit_image_number() {
 
 #[test]
 fn transcript_attachment_rows_link_to_the_local_image() {
-    let path = PathBuf::from("/tmp/borg-clickable-image.png");
+    let path = std::env::temp_dir().join("borg-clickable-image.png");
     let mut transcript = Transcript::default();
     transcript.order.push(TranscriptEntry::Message {
         actor: EventActor::User,
