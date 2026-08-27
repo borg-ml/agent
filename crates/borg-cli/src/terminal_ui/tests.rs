@@ -1597,6 +1597,13 @@ fn instant_tools_keep_a_diamond_without_animation() {
         .join("\n");
     assert!(rendered.contains("◇ Reading plan…"));
     assert!(!rendered.chars().any(|glyph| "⠋⠙⠹⠸⠼⠴⠦⠧".contains(glyph)));
+    let foreground_label = transcript
+        .lines(100)
+        .into_iter()
+        .flat_map(|line| line.spans)
+        .find(|span| span.content == "Reading plan…")
+        .expect("foreground lifecycle label");
+    assert_ne!(foreground_label.style.fg, Some(BACKGROUND_RUNNING_TEXT));
 
     transcript.apply(&SessionEvent::new(
         Uuid::new_v4(),

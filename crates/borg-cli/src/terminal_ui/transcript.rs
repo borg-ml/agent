@@ -3319,7 +3319,7 @@ impl Transcript {
                                 Span::styled(prefix.to_string(), gutter_style),
                                 Span::styled(line[..name_start].to_string(), style),
                             ];
-                            if !lifecycle_complete && !is_reasoning {
+                            if *backgrounded && !is_reasoning {
                                 let verb_end = display_name.find(' ').unwrap_or(display_name.len());
                                 let (verb, rest) = display_name.split_at(verb_end);
                                 spans.push(Span::styled(
