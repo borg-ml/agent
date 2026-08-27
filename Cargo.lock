@@ -514,7 +514,7 @@ dependencies = [
 
 [[package]]
 name = "borg"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "aes-gcm",
  "agent-client-protocol",
@@ -566,7 +566,7 @@ dependencies = [
 
 [[package]]
 name = "borg-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -574,7 +574,7 @@ dependencies = [
 
 [[package]]
 name = "borg-provider"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -600,7 +600,7 @@ dependencies = [
 
 [[package]]
 name = "borg-remote"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -631,7 +631,7 @@ dependencies = [
 
 [[package]]
 name = "borg-search"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "async-trait",
