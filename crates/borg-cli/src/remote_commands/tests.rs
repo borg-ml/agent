@@ -71,6 +71,19 @@ fn input_fast_path_waits_for_a_pending_transcript_frame() {
 }
 
 #[test]
+fn queued_live_events_coalesce_tool_start_frames() {
+    let tool_started = SessionEventKind::ToolStarted {
+        tool_call_id: "tool-1".to_string(),
+        name: "command_execution".to_string(),
+        input: serde_json::json!({"command": "true"}),
+        input_ref: None,
+    };
+
+    assert!(session_event_needs_immediate_frame(&tool_started, 0));
+    assert!(!session_event_needs_immediate_frame(&tool_started, 1));
+}
+
+#[test]
 fn status_is_an_alias_for_usage() {
     assert!(is_usage_command("/usage"));
     assert!(is_usage_command("/status"));

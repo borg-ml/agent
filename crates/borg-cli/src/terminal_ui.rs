@@ -4937,7 +4937,9 @@ impl BorgTerminal {
         let pending_provider_interaction_secret =
             self.focused_child.is_none() && self.pending_provider_interaction_secret;
         let status = self.active_status();
-        let status_label = if self.borging_this_run
+        let status_label = if self.interrupt_requested && status_control_is_actionable(status) {
+            "stopping"
+        } else if self.borging_this_run
             && matches!(status, SessionStatus::Starting | SessionStatus::Running)
         {
             "borging"
