@@ -86,6 +86,7 @@ struct Transcript {
     subagent_snapshots: HashMap<Uuid, SubagentSnapshot>,
     subagent_entries: HashMap<Uuid, usize>,
     runtime_processes: HashMap<Uuid, RuntimeProcessProjection>,
+    provider_backgrounds: HashMap<String, ProviderBackgroundProjection>,
     queued_messages: HashSet<Uuid>,
     queued_message_sequences: HashMap<Uuid, u64>,
     follow_tail: bool,
@@ -118,6 +119,12 @@ struct RuntimeProcessProjection {
     pid: u32,
     tool_index: Option<usize>,
     running: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ProviderBackgroundProjection {
+    command: String,
+    tool_index: usize,
 }
 
 #[derive(Default)]
@@ -158,6 +165,7 @@ impl Default for Transcript {
             subagent_snapshots: HashMap::new(),
             subagent_entries: HashMap::new(),
             runtime_processes: HashMap::new(),
+            provider_backgrounds: HashMap::new(),
             queued_messages: HashSet::new(),
             queued_message_sequences: HashMap::new(),
             follow_tail: true,
@@ -342,6 +350,13 @@ fn tool_has_expandable_body(
 }
 
 fn tool_lifecycle_label(name: &str, complete: bool) -> Cow<'_, str> {
+    if name == "Git add" {
+        return Cow::Borrowed(if complete {
+            "Updated Git index"
+        } else {
+            "Updating Git index…"
+        });
+    }
     let (verb, rest) = name.split_once(' ').unwrap_or((name, ""));
     let forms = match verb {
         "Run" => Some(("Running", "Ran")),
@@ -360,12 +375,14 @@ fn tool_lifecycle_label(name: &str, complete: bool) -> Cow<'_, str> {
         "Delete" => Some(("Deleting", "Deleted")),
         "Wait" => Some(("Waiting", "Waited")),
         "Send" => Some(("Sending", "Sent")),
+        "Follow" => Some(("Following", "Followed")),
+        "Message" => Some(("Messaging", "Messaged")),
         "Spawn" => Some(("Spawning", "Spawned")),
         "Interrupt" => Some(("Interrupting", "Interrupted")),
         "Stop" => Some(("Stopping", "Stopped")),
         "Compare" => Some(("Comparing", "Compared")),
         "Review" => Some(("Reviewing", "Reviewed")),
-        "Show" => Some(("Showing", "Showed")),
+        "Show" => Some(("Showing", "Shown")),
         "Add" => Some(("Adding", "Added")),
         "Remove" => Some(("Removing", "Removed")),
         "Prune" => Some(("Pruning", "Pruned")),
@@ -1300,7 +1317,27 @@ impl Transcript {
                     self.foreground_tool = None;
                 }
                 let auto_expand_edits = self.auto_expand_edits;
-                if let Some(index) = self.tools.get(tool_call_id).copied()
+                let tool_index = self.tools.get(tool_call_id).copied();
+                let (source_name_for_process, command_for_process) = tool_index
+                    .and_then(|index| self.order.get(index))
+                    .and_then(|entry| match entry {
+                        TranscriptEntry::Tool {
+                            source_name,
+                            detail,
+                            ..
+                        } => Some((source_name.clone(), detail.clone())),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                let followup_handle = tool_process_followup_handle(
+                    &source_name_for_process,
+                    input.as_ref(),
+                );
+                let output_handle = (!*is_error
+                    && tool_can_start_background_process(&source_name_for_process))
+                    .then(|| tool_output_background_handle(output))
+                    .flatten();
+                if let Some(index) = tool_index
                     && let TranscriptEntry::Tool {
                         source_name,
                         name,
@@ -1430,6 +1467,38 @@ impl Transcript {
                     }
                     let _ = name;
                 }
+                if let (Some(index), Some(handle)) = (tool_index, output_handle.as_ref()) {
+                    let is_native_process = Uuid::parse_str(handle)
+                        .ok()
+                        .is_some_and(|process_id| self.runtime_processes.contains_key(&process_id));
+                    if !is_native_process {
+                        self.provider_backgrounds
+                            .entry(handle.clone())
+                            .or_insert_with(|| ProviderBackgroundProjection {
+                                command: command_for_process.clone(),
+                                tool_index: index,
+                            });
+                    }
+                }
+                if output_handle.is_none()
+                    && let Some(handle) = followup_handle
+                    && let Some(process) = self.provider_backgrounds.remove(&handle)
+                    && let Some(TranscriptEntry::Tool {
+                        output_view,
+                        backgrounded,
+                        ..
+                    }) = self.order.get_mut(process.tool_index)
+                {
+                    self.tool_body_cache
+                        .get_mut()
+                        .lines
+                        .retain(|(tool_index, _, _), _| *tool_index != process.tool_index);
+                    let output = tool_process_output_text(output);
+                    if !output.trim().is_empty() {
+                        *output_view = Some(("text".to_string(), output));
+                    }
+                    *backgrounded = false;
+                }
             }
             SessionEventKind::StatusChanged {
                 status: SessionStatus::Ready,
@@ -1520,7 +1589,12 @@ impl Transcript {
                     },
                 );
             }
-            SessionEventKind::RuntimeProcessCompleted { process_id, .. } => {
+            SessionEventKind::RuntimeProcessCompleted {
+                process_id,
+                stdout,
+                stderr,
+                ..
+            } => {
                 let tool_index = self.runtime_processes.get(process_id).and_then(|process| process.tool_index);
                 if let Some(process) = self.runtime_processes.get_mut(process_id) {
                     process.running = false;
@@ -1529,9 +1603,24 @@ impl Transcript {
                     && !self.runtime_processes.values().any(|process| {
                         process.running && process.tool_index == Some(tool_index)
                     })
-                    && let Some(TranscriptEntry::Tool { backgrounded, .. }) =
-                        self.order.get_mut(tool_index)
+                    && let Some(TranscriptEntry::Tool {
+                        output_view,
+                        backgrounded,
+                        ..
+                    }) = self.order.get_mut(tool_index)
                 {
+                    self.tool_body_cache
+                        .get_mut()
+                        .lines
+                        .retain(|(index, _, _), _| *index != tool_index);
+                    let output = [stdout.as_str(), stderr.as_str()]
+                        .into_iter()
+                        .filter(|text| !text.is_empty())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if !output.trim().is_empty() {
+                        *output_view = Some(("text".to_string(), output));
+                    }
                     *backgrounded = false;
                 }
             }
@@ -1726,6 +1815,14 @@ impl Transcript {
                     .then_some(tool_index - usize::from(tool_index > index))
             });
         }
+        self.provider_backgrounds.retain(|_, process| {
+            if process.tool_index == index {
+                false
+            } else {
+                process.tool_index -= usize::from(process.tool_index > index);
+                true
+            }
+        });
         self.selected = self.selected.and_then(|selected| {
             if selected == index {
                 None
@@ -1830,6 +1927,11 @@ impl Transcript {
                 && *tool_index >= index
             {
                 *tool_index += 1;
+            }
+        }
+        for process in self.provider_backgrounds.values_mut() {
+            if process.tool_index >= index {
+                process.tool_index += 1;
             }
         }
         self.selected = self.selected.map(|selected| {
@@ -2366,11 +2468,12 @@ impl Transcript {
     }
 
     fn shell_status(&self) -> Option<String> {
-        let active = self
+        let native = self
             .runtime_processes
             .values()
             .filter(|process| process.running)
             .count();
+        let active = native.saturating_add(self.provider_backgrounds.len());
         (active > 0).then(|| format!("{active} shell{}", if active == 1 { "" } else { "s" }))
     }
 
@@ -2386,6 +2489,16 @@ impl Transcript {
                 )
             })
             .collect::<Vec<_>>();
+        rows.extend(self.provider_backgrounds.iter().map(|(handle, process)| {
+            (
+                format!(
+                    "{}  {}",
+                    compact_text(handle, 18),
+                    compact_text(&process.command, 100)
+                ),
+                Some(process.tool_index),
+            )
+        }));
         rows.sort_by(|left, right| left.0.cmp(&right.0));
         rows
     }

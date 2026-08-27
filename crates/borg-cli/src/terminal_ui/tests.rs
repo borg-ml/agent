@@ -10098,3 +10098,87 @@ fn runtime_process_lifecycle_drives_active_shell_status() {
     assert!(completed.contains("Ran"), "{completed}");
     assert!(!completed.contains("Running in background"), "{completed}");
 }
+
+#[test]
+fn provider_background_handle_drives_shell_status_and_full_output() {
+    let session_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::ToolStarted {
+            tool_call_id: "exec-1".to_string(),
+            name: "exec_command".to_string(),
+            input: serde_json::json!({"cmd": "bun run build"}),
+            input_ref: None,
+        },
+    ));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::ToolCompleted {
+            tool_call_id: "exec-1".to_string(),
+            output: "Script running with cell ID build-1".to_string(),
+            output_ref: None,
+            is_error: false,
+            input: Some(serde_json::json!({"cmd": "bun run build"})),
+            input_ref: None,
+        },
+    ));
+
+    assert_eq!(transcript.shell_status().as_deref(), Some("1 shell"));
+    assert_eq!(
+        transcript.active_shell_rows(),
+        vec![("build-1  bun run build".to_string(), Some(0))]
+    );
+
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        3,
+        SessionEventKind::ToolStarted {
+            tool_call_id: "wait-1".to_string(),
+            name: "wait".to_string(),
+            input: serde_json::json!({"cell_id": "build-1"}),
+            input_ref: None,
+        },
+    ));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        4,
+        SessionEventKind::ToolCompleted {
+            tool_call_id: "wait-1".to_string(),
+            output: serde_json::json!({
+                "output": "first line\nsecond line\nlast line",
+                "exit_code": 0
+            })
+            .to_string(),
+            output_ref: None,
+            is_error: false,
+            input: Some(serde_json::json!({"cell_id": "build-1"})),
+            input_ref: None,
+        },
+    ));
+
+    assert_eq!(transcript.shell_status(), None);
+    let TranscriptEntry::Tool {
+        output_view,
+        backgrounded,
+        ..
+    } = &transcript.order[0]
+    else {
+        panic!("originating command tool");
+    };
+    assert!(!backgrounded);
+    assert_eq!(
+        output_view.as_ref().map(|(_, output)| output.as_str()),
+        Some("first line\nsecond line\nlast line")
+    );
+    let fullscreen = transcript.render_tool_for_cache(0, 100, 8).0;
+    let fullscreen = fullscreen
+        .iter()
+        .map(Line::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(fullscreen.contains("first line"), "{fullscreen}");
+    assert!(fullscreen.contains("last line"), "{fullscreen}");
+}

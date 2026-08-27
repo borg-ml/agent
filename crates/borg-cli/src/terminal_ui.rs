@@ -30,8 +30,10 @@ use borg_remote::{
     SessionEventKind, SessionGoal, SessionPayloadKind, SessionPayloadRef, SessionState,
     SessionStatus, SubagentActivityKind, SubagentSnapshot, SubagentStatus,
     ToolPresentationCategory, compact_text, is_diff_language, is_edit_tool, is_mcp_resource_probe,
-    is_subagent_tool, project_tool_presentation, tool_action_is_instant, tool_has_rich_ui,
-    tool_output_code_view, tool_output_is_backgrounded, web_search_query,
+    is_subagent_tool, project_tool_presentation, tool_action_is_instant,
+    tool_can_start_background_process, tool_has_rich_ui, tool_output_background_handle,
+    tool_output_code_view, tool_output_is_backgrounded, tool_process_followup_handle,
+    tool_process_output_text, web_search_query,
 };
 #[cfg(test)]
 use borg_remote::{tool_call_summary, tool_code_view};
@@ -861,6 +863,7 @@ pub struct BorgTerminal {
     last_terminal_title: Option<String>,
     transcript_render_cache: Option<CachedTranscriptRender>,
     transcript_full_render_cache: Option<CachedTranscriptRender>,
+    active_transcript_render: Option<Arc<TranscriptRender>>,
     last_committed_viewport_render: Option<CachedTranscriptRender>,
     rendered_transcript_height: usize,
     pending_scroll_anchor_height: Option<usize>,
@@ -1880,6 +1883,7 @@ impl BorgTerminal {
             last_terminal_title: None,
             transcript_render_cache: None,
             transcript_full_render_cache: None,
+            active_transcript_render: None,
             last_committed_viewport_render: None,
             rendered_transcript_height: 0,
             pending_scroll_anchor_height: None,
@@ -2911,6 +2915,7 @@ impl BorgTerminal {
         self.transcript.follow_tail = true;
         self.transcript_render_cache = None;
         self.transcript_full_render_cache = None;
+        self.active_transcript_render = None;
         self.last_committed_viewport_render = None;
         self.text_selection = None;
         self.composer_selection = None;
@@ -4580,7 +4585,7 @@ impl BorgTerminal {
 
     fn selection_point_at(&self, pointer: Position) -> Option<SelectionPoint> {
         let point = self.transcript_point_at(pointer)?;
-        let (.., render) = self.transcript_render_cache.as_ref()?;
+        let render = self.active_transcript_render.as_ref()?;
         Some(selection_point_for_row_in_lines(
             &render.6,
             &render.0,
@@ -4657,7 +4662,7 @@ impl BorgTerminal {
         let scroll_start = self
             .transcript_scroll_max
             .saturating_sub(self.scroll_from_bottom.min(self.transcript_scroll_max));
-        let Some((.., render)) = self.transcript_render_cache.as_ref() else {
+        let Some(render) = self.active_transcript_render.as_ref() else {
             return;
         };
         let ranges = render.6.as_slice();
@@ -4678,7 +4683,7 @@ impl BorgTerminal {
         if self.copy_composer_selection() {
             return true;
         }
-        let Some((.., render)) = self.transcript_render_cache.as_ref() else {
+        let Some(render) = self.active_transcript_render.as_ref() else {
             return false;
         };
         let Some((start, end)) = self
@@ -5462,6 +5467,7 @@ impl BorgTerminal {
                 local_date,
             )
         };
+        self.active_transcript_render = Some(Arc::clone(&transcript_render));
         let (
             transcript,
             tool_rows,
@@ -6422,7 +6428,7 @@ impl BorgTerminal {
             }
             if self.focused_child.is_some() || self.focused_tool.is_some() {
                 let (label, idle_color) = if self.focused_tool.is_some() {
-                    (" ↩ Back ", BORG_ORANGE)
+                    (" ← Back to actions ", BACKGROUND_RUNNING_TEXT)
                 } else {
                     (" ↩ Return ", SUBAGENT_PINK)
                 };

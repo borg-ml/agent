@@ -675,11 +675,90 @@ pub fn tool_output_code_view(name: &str, output: &str) -> Option<(String, String
 }
 
 pub fn tool_output_is_backgrounded(output: &str) -> bool {
-    serde_json::from_str::<Value>(output)
-        .ok()
-        .is_some_and(|value| value.get("session_id").is_some() || value.get("cell_id").is_some())
-        || output.contains("Process running with session ID")
-        || output.contains("Script running with cell ID")
+    tool_output_background_handle(output).is_some()
+}
+
+pub fn tool_can_start_background_process(name: &str) -> bool {
+    matches!(
+        tool_leaf_name(name).as_str(),
+        "bash" | "command_execution" | "exec" | "exec_command"
+    )
+}
+
+fn process_handle_value(value: &Value) -> Option<String> {
+    ["session_id", "cell_id"]
+        .into_iter()
+        .find_map(|key| value.get(key))
+        .and_then(|value| match value {
+            Value::String(value) => Some(value.clone()),
+            Value::Number(value) => Some(value.to_string()),
+            _ => None,
+        })
+}
+
+pub fn tool_output_background_handle(output: &str) -> Option<String> {
+    if let Ok(value) = serde_json::from_str::<Value>(output)
+        && let Some(handle) = process_handle_value(&value).or_else(|| {
+            value
+                .get("structuredContent")
+                .and_then(process_handle_value)
+        })
+    {
+        return Some(handle);
+    }
+    [
+        "Process running with session ID ",
+        "Script running with cell ID ",
+    ]
+    .into_iter()
+    .find_map(|marker| {
+        output.find(marker).map(|start| {
+            output[start + marker.len()..]
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .trim_matches(|character: char| !character.is_alphanumeric() && character != '-')
+                .to_string()
+        })
+    })
+    .filter(|handle| !handle.is_empty())
+}
+
+pub fn tool_process_followup_handle(name: &str, input: Option<&Value>) -> Option<String> {
+    matches!(tool_leaf_name(name).as_str(), "wait" | "write_stdin")
+        .then(|| input.and_then(process_handle_value))
+        .flatten()
+}
+
+pub fn tool_process_output_text(output: &str) -> String {
+    if let Ok(value) = serde_json::from_str::<Value>(output) {
+        let process = value.get("structuredContent").unwrap_or(&value);
+        if let Some(stdout) = process.get("output").and_then(Value::as_str) {
+            return stdout.to_string();
+        }
+        if let Some(stdout) = process.get("stdout").and_then(Value::as_str) {
+            let stderr = process
+                .get("stderr")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            return [stdout, stderr]
+                .into_iter()
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+        }
+        if let Some(content) = value.get("content").and_then(Value::as_array) {
+            let text = content
+                .iter()
+                .filter_map(|item| item.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !text.is_empty() && text != output {
+                return tool_process_output_text(&text);
+            }
+        }
+    }
+    output.to_string()
 }
 
 fn product_tool_summary(name: &str, input: &Value) -> Option<(String, String)> {
@@ -2768,5 +2847,24 @@ mod tests {
             failed.output.as_ref().map(|body| body.text.as_str()),
             Some("fatal: '../old' is not a working tree")
         );
+    }
+
+    #[test]
+    fn background_process_helpers_share_provider_handle_and_output_contracts() {
+        assert!(tool_can_start_background_process("functions.exec"));
+        assert!(!tool_can_start_background_process("spawn_agent"));
+        assert_eq!(
+            tool_output_background_handle("Script running with cell ID build-1"),
+            Some("build-1".to_string())
+        );
+        assert_eq!(
+            tool_process_followup_handle("functions.wait", Some(&json!({"cell_id": "build-1"}))),
+            Some("build-1".to_string())
+        );
+        let wrapped = json!({
+            "content": [{"type": "text", "text": json!({"output": "one\ntwo"}).to_string()}]
+        })
+        .to_string();
+        assert_eq!(tool_process_output_text(&wrapped), "one\ntwo");
     }
 }
