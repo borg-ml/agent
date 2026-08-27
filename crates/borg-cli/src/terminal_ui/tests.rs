@@ -1723,6 +1723,40 @@ fn running_tool_elapsed_cache_tick_changes_each_tenth() {
 }
 
 #[test]
+fn large_transcript_throttles_running_tool_elapsed_cache_refreshes() {
+    let session_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::ToolStarted {
+            tool_call_id: "timed-1".to_string(),
+            name: "command_execution".to_string(),
+            input: serde_json::json!({"command": "sleep 1"}),
+            input_ref: None,
+        },
+    ));
+    for sequence in 2..=LARGE_TRANSCRIPT_ENTRY_THRESHOLD {
+        transcript.order.push(TranscriptEntry::Activity {
+            text: format!("load fixture {sequence}"),
+            time: "2026-07-29 10:00".to_string(),
+        });
+    }
+    let started_at = DateTime::parse_from_rfc3339("2026-07-29T10:00:00.000Z")
+        .unwrap()
+        .with_timezone(&Utc);
+
+    assert_eq!(
+        transcript.tool_elapsed_cache_tick_at(started_at),
+        transcript.tool_elapsed_cache_tick_at(started_at + chrono::Duration::milliseconds(999))
+    );
+    assert_ne!(
+        transcript.tool_elapsed_cache_tick_at(started_at),
+        transcript.tool_elapsed_cache_tick_at(started_at + chrono::Duration::seconds(1))
+    );
+}
+
+#[test]
 fn a_new_edit_or_message_collapses_the_previous_diff() {
     let session_id = Uuid::new_v4();
     let mut transcript = Transcript::default();

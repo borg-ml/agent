@@ -1,5 +1,7 @@
 const USER_INTERRUPT_ACTIVITY: &str = "agent interrupted by user";
 const TOOL_ELAPSED_REFRESH_MILLIS: i64 = 100;
+const LARGE_TRANSCRIPT_TOOL_ELAPSED_REFRESH_MILLIS: i64 = 1_000;
+const LARGE_TRANSCRIPT_ENTRY_THRESHOLD: usize = 256;
 
 fn user_message_has_structured_whitespace(text: &str) -> bool {
     text.contains('\n')
@@ -2246,8 +2248,14 @@ impl Transcript {
     }
 
     fn tool_elapsed_cache_tick_at(&self, now: DateTime<Utc>) -> Option<i64> {
-        self.has_running_tool()
-            .then(|| now.timestamp_millis().div_euclid(TOOL_ELAPSED_REFRESH_MILLIS))
+        self.has_running_tool().then(|| {
+            let refresh_millis = if self.order.len() >= LARGE_TRANSCRIPT_ENTRY_THRESHOLD {
+                LARGE_TRANSCRIPT_TOOL_ELAPSED_REFRESH_MILLIS
+            } else {
+                TOOL_ELAPSED_REFRESH_MILLIS
+            };
+            now.timestamp_millis().div_euclid(refresh_millis)
+        })
     }
 
     fn has_running_tool(&self) -> bool {
