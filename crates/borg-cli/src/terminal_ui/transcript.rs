@@ -85,6 +85,7 @@ struct Transcript {
     subagents: HashMap<Uuid, SubagentStatus>,
     subagent_snapshots: HashMap<Uuid, SubagentSnapshot>,
     subagent_entries: HashMap<Uuid, usize>,
+    runtime_processes: HashMap<Uuid, RuntimeProcessProjection>,
     queued_messages: HashSet<Uuid>,
     queued_message_sequences: HashMap<Uuid, u64>,
     follow_tail: bool,
@@ -109,6 +110,14 @@ struct Transcript {
     next_image_number: usize,
     message_markdown_cache: RefCell<MessageMarkdownCache>,
     tool_body_cache: RefCell<ToolBodyCache>,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeProcessProjection {
+    command: String,
+    pid: u32,
+    tool_index: Option<usize>,
+    running: bool,
 }
 
 #[derive(Default)]
@@ -148,6 +157,7 @@ impl Default for Transcript {
             subagents: HashMap::new(),
             subagent_snapshots: HashMap::new(),
             subagent_entries: HashMap::new(),
+            runtime_processes: HashMap::new(),
             queued_messages: HashSet::new(),
             queued_message_sequences: HashMap::new(),
             follow_tail: true,
@@ -1424,6 +1434,32 @@ impl Transcript {
                 self.todos = items.clone();
                 self.upsert_plan(items.clone(), local_event_time(event));
             }
+            SessionEventKind::RuntimeProcessStarted {
+                process_id,
+                pid,
+                command,
+                ..
+            } => {
+                let tool_index = self
+                    .foreground_tool
+                    .as_ref()
+                    .and_then(|tool_call_id| self.tools.get(tool_call_id))
+                    .copied();
+                self.runtime_processes.insert(
+                    *process_id,
+                    RuntimeProcessProjection {
+                        command: command.clone(),
+                        pid: *pid,
+                        tool_index,
+                        running: true,
+                    },
+                );
+            }
+            SessionEventKind::RuntimeProcessCompleted { process_id, .. } => {
+                if let Some(process) = self.runtime_processes.get_mut(process_id) {
+                    process.running = false;
+                }
+            }
             SessionEventKind::ProviderEvent { kind, payload, .. }
                 if Self::provider_reasoning_lifecycle(kind, payload) == Some(true) =>
             {
@@ -1609,6 +1645,12 @@ impl Transcript {
                 *stored_index -= 1;
             }
         }
+        for process in self.runtime_processes.values_mut() {
+            process.tool_index = process.tool_index.and_then(|tool_index| {
+                (tool_index != index)
+                    .then_some(tool_index - usize::from(tool_index > index))
+            });
+        }
         self.selected = self.selected.and_then(|selected| {
             if selected == index {
                 None
@@ -1706,6 +1748,13 @@ impl Transcript {
         {
             if *stored_index >= index {
                 *stored_index += 1;
+            }
+        }
+        for process in self.runtime_processes.values_mut() {
+            if let Some(tool_index) = process.tool_index.as_mut()
+                && *tool_index >= index
+            {
+                *tool_index += 1;
             }
         }
         self.selected = self.selected.map(|selected| {
@@ -2239,6 +2288,31 @@ impl Transcript {
             .filter(|item| item.status != PlanItemStatus::Completed)
             .count();
         (open > 0).then(|| format!("{open} to-do{}", if open == 1 { "" } else { "s" }))
+    }
+
+    fn shell_status(&self) -> Option<String> {
+        let active = self
+            .runtime_processes
+            .values()
+            .filter(|process| process.running)
+            .count();
+        (active > 0).then(|| format!("{active} shell{}", if active == 1 { "" } else { "s" }))
+    }
+
+    fn active_shell_rows(&self) -> Vec<(String, Option<usize>)> {
+        let mut rows = self
+            .runtime_processes
+            .values()
+            .filter(|process| process.running)
+            .map(|process| {
+                (
+                    format!("pid {}  {}", process.pid, compact_text(&process.command, 100)),
+                    process.tool_index,
+                )
+            })
+            .collect::<Vec<_>>();
+        rows.sort_by(|left, right| left.0.cmp(&right.0));
+        rows
     }
 
     #[cfg(test)]

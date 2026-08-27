@@ -896,6 +896,8 @@ fn hover_redraw_gate_ignores_motion_inside_one_target() {
         status_hovered: false,
         goal_status_hovered: false,
         todo_status_hovered: false,
+        shell_status_hovered: false,
+        hovered_shell_row: None,
         agents_status_hovered: false,
         model_status_hovered: false,
         effort_status_hovered: false,
@@ -9983,4 +9985,47 @@ fn released_selection_follows_expanded_tool_text_during_nested_scroll() {
             .contains("file-8.rs"),
         "the synthetic pinned row must keep selecting the tool header"
     );
+}
+#[test]
+fn runtime_process_lifecycle_drives_active_shell_status() {
+    let session_id = Uuid::new_v4();
+    let process_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::RuntimeProcessStarted {
+            process_id,
+            pid: 4242,
+            command: "cargo test".to_string(),
+            cwd: PathBuf::from("/workspace"),
+        },
+    ));
+
+    assert_eq!(transcript.shell_status().as_deref(), Some("1 shell"));
+    assert_eq!(
+        transcript.active_shell_rows(),
+        vec![("pid 4242  cargo test".to_string(), None)]
+    );
+
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::RuntimeProcessCompleted {
+            process_id,
+            pid: 4242,
+            status: borg_remote::RuntimeProcessStatus::Exited,
+            exit_code: Some(0),
+            timed_out: false,
+            stdout: String::new(),
+            stderr: String::new(),
+            stdout_omitted_bytes: 0,
+            stderr_omitted_bytes: 0,
+            error: None,
+        },
+    ));
+
+    assert_eq!(transcript.shell_status(), None);
+    assert!(transcript.active_shell_rows().is_empty());
 }

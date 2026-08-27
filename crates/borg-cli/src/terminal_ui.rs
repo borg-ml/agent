@@ -814,6 +814,11 @@ pub struct BorgTerminal {
     todo_status_area: Option<Rect>,
     todo_status_hovered: bool,
     todo_status_expanded: bool,
+    shell_status_area: Option<Rect>,
+    shell_status_hovered: bool,
+    shell_menu_open: bool,
+    shell_row_hit_areas: Vec<(Rect, Option<usize>)>,
+    hovered_shell_row: Option<usize>,
     agents_status_area: Option<Rect>,
     agents_status_hovered: bool,
     model_status_area: Option<Rect>,
@@ -879,6 +884,8 @@ struct HoverState {
     status_hovered: bool,
     goal_status_hovered: bool,
     todo_status_hovered: bool,
+    shell_status_hovered: bool,
+    hovered_shell_row: Option<usize>,
     agents_status_hovered: bool,
     model_status_hovered: bool,
     effort_status_hovered: bool,
@@ -908,6 +915,8 @@ impl BorgTerminal {
             status_hovered: self.status_hovered,
             goal_status_hovered: self.goal_status_hovered,
             todo_status_hovered: self.todo_status_hovered,
+            shell_status_hovered: self.shell_status_hovered,
+            hovered_shell_row: self.hovered_shell_row,
             agents_status_hovered: self.agents_status_hovered,
             model_status_hovered: self.model_status_hovered,
             effort_status_hovered: self.effort_status_hovered,
@@ -1826,6 +1835,11 @@ impl BorgTerminal {
             todo_status_area: None,
             todo_status_hovered: false,
             todo_status_expanded: false,
+            shell_status_area: None,
+            shell_status_hovered: false,
+            shell_menu_open: false,
+            shell_row_hit_areas: Vec::new(),
+            hovered_shell_row: None,
             agents_status_area: None,
             agents_status_hovered: false,
             model_status_area: None,
@@ -1959,6 +1973,11 @@ impl BorgTerminal {
         self.todo_status_area = None;
         self.todo_status_hovered = false;
         self.todo_status_expanded = false;
+        self.shell_status_area = None;
+        self.shell_status_hovered = false;
+        self.shell_menu_open = false;
+        self.shell_row_hit_areas.clear();
+        self.hovered_shell_row = None;
         self.agents_status_area = None;
         self.agents_status_hovered = false;
         self.model_status_area = None;
@@ -2954,6 +2973,8 @@ impl BorgTerminal {
         self.status_hovered = false;
         self.goal_status_hovered = false;
         self.todo_status_hovered = false;
+        self.shell_status_hovered = false;
+        self.hovered_shell_row = None;
         self.agents_status_hovered = false;
         self.model_status_hovered = false;
         self.effort_status_hovered = false;
@@ -3739,6 +3760,13 @@ impl BorgTerminal {
                 self.todo_status_hovered = self
                     .todo_status_area
                     .is_some_and(|area| area.contains(pointer));
+                self.shell_status_hovered = self
+                    .shell_status_area
+                    .is_some_and(|area| area.contains(pointer));
+                self.hovered_shell_row = self
+                    .shell_row_hit_areas
+                    .iter()
+                    .position(|(area, _)| area.contains(pointer));
                 self.agents_status_hovered = self
                     .agents_status_area
                     .is_some_and(|area| area.contains(pointer));
@@ -3869,6 +3897,25 @@ impl BorgTerminal {
                                 return Ok(UiAction::ToggleGoal { action });
                             }
                             self.open_goal_picker();
+                            return Ok(UiAction::None);
+                        }
+                        if self
+                            .shell_status_area
+                            .is_some_and(|area| area.contains(pointer))
+                        {
+                            self.shell_menu_open = !self.shell_menu_open;
+                            return Ok(UiAction::None);
+                        }
+                        if let Some(row) = self.hovered_shell_row
+                            && let Some(tool_index) = self
+                                .shell_row_hit_areas
+                                .get(row)
+                                .and_then(|(_, tool_index)| *tool_index)
+                        {
+                            let payloads = self.open_tool_inspector(tool_index);
+                            if !payloads.is_empty() {
+                                return Ok(UiAction::LoadPayloads(payloads));
+                            }
                             return Ok(UiAction::None);
                         }
                         if self
@@ -5140,6 +5187,11 @@ impl BorgTerminal {
         let active_status_started_at = self.active_status_started_at();
         let active_goal = self.active_goal().cloned();
         let goal_status = self.transcript.goal_status();
+        let shell_status = self.transcript.shell_status();
+        let shell_rows = self.transcript.active_shell_rows();
+        if shell_rows.is_empty() {
+            self.shell_menu_open = false;
+        }
         let todo_status = self.transcript.todo_status();
         let slash_suggestions = (self.picker.is_none())
             .then(|| slash_suggestion_lines(&self.composer.text, self.slash_selection))
@@ -5450,6 +5502,7 @@ impl BorgTerminal {
         let mut next_status_area = None;
         let mut next_goal_status_area = None;
         let mut next_todo_status_area = None;
+        let mut next_shell_status_area = None;
         let mut next_agents_status_area = None;
         let mut next_model_status_area = None;
         let mut next_effort_status_area = None;
@@ -5457,6 +5510,7 @@ impl BorgTerminal {
         let mut next_fast_status_area = None;
         let mut next_permission_status_area = None;
         let mut next_team_roster_hit_areas = Vec::new();
+        let mut next_shell_row_hit_areas = Vec::new();
         let mut next_back_to_director_area = None;
         let mut next_keybindings_hint_area = None;
         let mut next_dictation_button_area = None;
@@ -5555,16 +5609,33 @@ impl BorgTerminal {
                     .saturating_sub(u16::from(!is_launch_screen)),
             });
             next_composer_area = Some(composer_area);
-            if !is_launch_screen && let Some(todo_status) = todo_status.as_ref() {
+            if !is_launch_screen && (shell_status.is_some() || todo_status.is_some()) {
+                let combined_status =
+                    footer_status_text(shell_status.as_deref(), todo_status.as_deref());
                 let metadata_width =
-                    footer_metadata_text(todo_status, &cwd_status, usize::MAX).width() as u16;
+                    footer_metadata_text(&combined_status, &cwd_status, usize::MAX).width() as u16;
                 let visible_metadata_width = metadata_width.min(footer_area.width);
-                next_todo_status_area = Some(Rect {
-                    x: footer_area.right().saturating_sub(visible_metadata_width),
-                    y: footer_area.y,
-                    width: (todo_status.width() as u16).min(visible_metadata_width),
-                    height: 1,
-                });
+                let metadata_x = footer_area.right().saturating_sub(visible_metadata_width);
+                if let Some(shell_status) = shell_status.as_deref() {
+                    next_shell_status_area = Some(Rect {
+                        x: metadata_x,
+                        y: footer_area.y,
+                        width: (shell_status.width() as u16).min(visible_metadata_width),
+                        height: 1,
+                    });
+                }
+                if let Some(todo_status) = todo_status.as_deref() {
+                    let shell_prefix_width = shell_status
+                        .as_deref()
+                        .map(|status| status.width() + STATUS_SEPARATOR.width())
+                        .unwrap_or(0) as u16;
+                    next_todo_status_area = Some(Rect {
+                        x: metadata_x.saturating_add(shell_prefix_width),
+                        y: footer_area.y,
+                        width: (todo_status.width() as u16).min(visible_metadata_width),
+                        height: 1,
+                    });
+                }
             }
             if !is_launch_screen {
                 frame.render_widget(
@@ -6414,6 +6485,62 @@ impl BorgTerminal {
                     tooltip,
                 );
             }
+            if (self.shell_status_hovered
+                || self.shell_menu_open
+                || self.hovered_shell_row.is_some())
+                && !shell_rows.is_empty()
+            {
+                let tooltip_width = shell_rows
+                    .iter()
+                    .map(|(row, _)| row.width() as u16)
+                    .max()
+                    .unwrap_or(24)
+                    .saturating_add(4)
+                    .clamp(30, status_area.width.min(96));
+                let tooltip_height = (shell_rows.len() as u16)
+                    .saturating_add(2)
+                    .min(status_area.y.saturating_sub(area.y).max(1));
+                let shell_anchor = next_shell_status_area.unwrap_or(status_area);
+                let tooltip = Rect {
+                    x: shell_anchor
+                        .x
+                        .min(area.right().saturating_sub(tooltip_width)),
+                    y: shell_anchor.y.saturating_sub(tooltip_height),
+                    width: tooltip_width,
+                    height: tooltip_height,
+                };
+                frame.render_widget(Clear, tooltip);
+                let lines = shell_rows
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (row, _))| {
+                        Line::from(format!("  {row}"))
+                            .style(shell_row_style(self.hovered_shell_row == Some(index)))
+                    })
+                    .collect::<Vec<_>>();
+                frame.render_widget(
+                    Paragraph::new(lines)
+                        .style(Style::default().fg(Color::White).bg(COMMAND_PANEL_BG))
+                        .block(
+                            Block::default()
+                                .borders(Borders::ALL)
+                                .border_style(Style::default().fg(BORG_ORANGE))
+                                .title(" Shells · click to inspect "),
+                        ),
+                    tooltip,
+                );
+                for (index, (_, tool_index)) in shell_rows.iter().enumerate() {
+                    next_shell_row_hit_areas.push((
+                        Rect {
+                            x: tooltip.x.saturating_add(1),
+                            y: tooltip.y.saturating_add(1 + index as u16),
+                            width: tooltip.width.saturating_sub(2),
+                            height: 1,
+                        },
+                        *tool_index,
+                    ));
+                }
+            }
             if self.todo_status_hovered && !self.transcript.todos.is_empty() {
                 let rows = self
                     .transcript
@@ -6512,7 +6639,7 @@ impl BorgTerminal {
             }
             if !is_launch_screen {
                 let footer_metadata = Some(footer_metadata_text(
-                    todo_status.as_deref().unwrap_or(""),
+                    &footer_status_text(shell_status.as_deref(), todo_status.as_deref()),
                     &cwd_status,
                     usize::MAX,
                 ))
@@ -6535,10 +6662,12 @@ impl BorgTerminal {
                     controls_area,
                 );
                 if footer_metadata.is_some() && metadata_width > 0 {
-                    let metadata_line = if let Some(todo_status) = todo_status.as_deref() {
-                        footer_todo_metadata_line(
-                            todo_status,
+                    let metadata_line = if shell_status.is_some() || todo_status.is_some() {
+                        footer_shell_todo_metadata_line(
+                            shell_status.as_deref(),
+                            todo_status.as_deref(),
                             &cwd_status,
+                            self.shell_status_hovered,
                             self.todo_status_hovered,
                             metadata_width as usize,
                         )
@@ -6751,7 +6880,7 @@ impl BorgTerminal {
                 && !footer_area.is_empty()
             {
                 let metadata_width = Some(footer_metadata_text(
-                    todo_status.as_deref().unwrap_or(""),
+                    &footer_status_text(shell_status.as_deref(), todo_status.as_deref()),
                     &cwd_status,
                     usize::MAX,
                 ))
@@ -6793,6 +6922,7 @@ impl BorgTerminal {
             next_status_area = None;
             next_goal_status_area = None;
             next_todo_status_area = None;
+            next_shell_status_area = None;
             next_agents_status_area = None;
             next_model_status_area = None;
             next_effort_status_area = None;
@@ -6805,6 +6935,7 @@ impl BorgTerminal {
         }
         if picker_open || self.keybindings_open {
             next_team_roster_hit_areas.clear();
+            next_shell_row_hit_areas.clear();
         }
         self.scrollbar_area = next_scrollbar_area;
         self.scrollbar_thumb_area = next_scrollbar_thumb_area;
@@ -6825,6 +6956,8 @@ impl BorgTerminal {
         self.status_area = next_status_area;
         self.goal_status_area = next_goal_status_area;
         self.todo_status_area = next_todo_status_area;
+        self.shell_status_area = next_shell_status_area;
+        self.shell_row_hit_areas = next_shell_row_hit_areas;
         self.agents_status_area = next_agents_status_area;
         self.model_status_area = next_model_status_area;
         self.effort_status_area = next_effort_status_area;
@@ -11140,6 +11273,16 @@ fn footer_metadata_line(
     ])
 }
 
+fn footer_status_text(shell_status: Option<&str>, todo_status: Option<&str>) -> String {
+    [shell_status, todo_status]
+        .into_iter()
+        .flatten()
+        .filter(|status| !status.is_empty())
+        .collect::<Vec<_>>()
+        .join(STATUS_SEPARATOR)
+}
+
+#[cfg(test)]
 fn footer_todo_metadata_line(
     todo_status: &str,
     cwd_status: &str,
@@ -11166,6 +11309,69 @@ fn footer_todo_metadata_line(
         Span::styled(STATUS_SEPARATOR, Style::default().fg(Color::Gray)),
         Span::styled(cwd.to_string(), Style::default().fg(Color::Gray)),
     ])
+}
+
+fn footer_shell_todo_metadata_line(
+    shell_status: Option<&str>,
+    todo_status: Option<&str>,
+    cwd_status: &str,
+    shell_hovered: bool,
+    todo_hovered: bool,
+    max_width: usize,
+) -> Line<'static> {
+    let status = footer_status_text(shell_status, todo_status);
+    let metadata = footer_metadata_text(&status, cwd_status, max_width);
+    if !metadata.starts_with(&status) {
+        return Line::from(Span::styled(metadata, Style::default().fg(Color::Gray)));
+    }
+    let interactive_style = |hovered: bool, color| {
+        Style::default()
+            .fg(if hovered { Color::White } else { color })
+            .add_modifier(if hovered {
+                Modifier::BOLD | Modifier::UNDERLINED
+            } else {
+                Modifier::empty()
+            })
+    };
+    let mut spans = Vec::new();
+    if let Some(shell) = shell_status {
+        spans.push(Span::styled(
+            shell.to_string(),
+            interactive_style(shell_hovered, BORG_ORANGE),
+        ));
+    }
+    if shell_status.is_some() && todo_status.is_some() {
+        spans.push(Span::styled(
+            STATUS_SEPARATOR,
+            Style::default().fg(Color::Gray),
+        ));
+    }
+    if let Some(todo) = todo_status {
+        spans.push(Span::styled(
+            todo.to_string(),
+            interactive_style(todo_hovered, Color::LightGreen),
+        ));
+    }
+    spans.push(Span::styled(
+        metadata[status.len()..].to_string(),
+        Style::default().fg(Color::Gray),
+    ));
+    Line::from(spans)
+}
+
+fn shell_row_style(hovered: bool) -> Style {
+    Style::default()
+        .fg(if hovered { Color::White } else { BORG_ORANGE })
+        .bg(if hovered {
+            MESSAGE_HOVER_BG
+        } else {
+            COMMAND_PANEL_BG
+        })
+        .add_modifier(if hovered {
+            Modifier::BOLD
+        } else {
+            Modifier::empty()
+        })
 }
 
 fn tool_run_viewport_height(viewport_height: usize) -> usize {
