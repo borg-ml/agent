@@ -1626,6 +1626,17 @@ async fn run_borg_provider_turn(
                     profiler.set_phase("tool_execution");
                 }
             }
+            ChatStreamEvent::ToolCallUpdate { id, name, input } => {
+                send(
+                    &events,
+                    SessionEventKind::ToolUpdated {
+                        tool_call_id: id,
+                        name,
+                        input,
+                    },
+                )
+                .await;
+            }
             ChatStreamEvent::ToolResult {
                 tool_use_id,
                 output,

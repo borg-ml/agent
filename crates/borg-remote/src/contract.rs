@@ -1879,6 +1879,14 @@ pub enum SessionEventKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         input_ref: Option<SessionPayloadRef>,
     },
+    /// A provider supplied a newer snapshot of an in-progress tool call.
+    /// Updates replace the pending presentation and never create another
+    /// model-context tool call.
+    ToolUpdated {
+        tool_call_id: String,
+        name: String,
+        input: Value,
+    },
     ToolCompleted {
         tool_call_id: String,
         output: String,

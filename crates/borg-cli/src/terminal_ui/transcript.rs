@@ -1,7 +1,5 @@
 const USER_INTERRUPT_ACTIVITY: &str = "agent interrupted by user";
 const TOOL_ELAPSED_REFRESH_MILLIS: i64 = 100;
-const LARGE_TRANSCRIPT_TOOL_ELAPSED_REFRESH_MILLIS: i64 = 1_000;
-const LARGE_TRANSCRIPT_ENTRY_THRESHOLD: usize = 256;
 
 fn user_message_has_structured_whitespace(text: &str) -> bool {
     text.contains('\n')
@@ -334,33 +332,7 @@ fn tool_has_expandable_body(
 }
 
 fn pending_tool_label(name: &str) -> Cow<'_, str> {
-    const ACTIONS: [(&str, &str); 13] = [
-        ("Check", "Checking"),
-        ("Create", "Creating"),
-        ("Edit", "Editing"),
-        ("Find", "Finding"),
-        ("Generate", "Generating"),
-        ("Get", "Getting"),
-        ("Inspect", "Inspecting"),
-        ("List", "Listing"),
-        ("Read", "Reading"),
-        ("Run", "Running"),
-        ("Search", "Searching"),
-        ("Spawn", "Spawning"),
-        ("Update", "Updating"),
-    ];
-    for (action, pending) in ACTIONS {
-        if name == action {
-            return Cow::Borrowed(pending);
-        }
-        if let Some(detail) = name
-            .strip_prefix(action)
-            .and_then(|rest| rest.strip_prefix(' '))
-        {
-            return Cow::Owned(format!("{pending} {detail}"));
-        }
-    }
-    Cow::Borrowed(name)
+    Cow::Owned(format!("{name} in progress…"))
 }
 
 fn transcript_entry_is_turn_output(entry: &TranscriptEntry) -> bool {
@@ -649,6 +621,7 @@ impl Transcript {
         )
     }
 
+    #[cfg(test)]
     fn tool_is_expandable(&self, index: usize) -> bool {
         matches!(
             self.order.get(index),
@@ -661,6 +634,7 @@ impl Transcript {
         )
     }
 
+    #[cfg(test)]
     fn toggle_tool(&mut self, index: usize) -> Vec<SessionPayloadRef> {
         if !self.tool_is_expandable(index) {
             return Vec::new();
@@ -679,6 +653,7 @@ impl Transcript {
         Vec::new()
     }
 
+    #[cfg(test)]
     fn tool_is_expanded(&self, index: usize) -> bool {
         matches!(
             self.order.get(index),
@@ -710,22 +685,22 @@ impl Transcript {
             .as_ref()
             .is_some_and(|(language, body)| is_diff_language(language) && !body.trim().is_empty())
         {
-            Some("left click expand · right click copy diff")
+            Some("left click inspect · right click copy diff")
         } else if output_view
             .as_ref()
             .is_some_and(|(_, body)| !body.trim().is_empty())
         {
-            Some("left click expand · right click copy output")
+            Some("left click inspect · right click copy output")
         } else if code_view
             .as_ref()
             .is_some_and(|(language, body)| language == "reasoning" && !body.trim().is_empty())
         {
-            Some("left click expand · right click copy thinking")
+            Some("left click inspect · right click copy thinking")
         } else if code_view
             .as_ref()
             .is_some_and(|(_, body)| !body.trim().is_empty())
         {
-            Some("left click expand · right click copy tool call")
+            Some("left click inspect · right click copy tool call")
         } else if !detail.trim().is_empty() {
             Some("right click copy tool details")
         } else {
@@ -1212,36 +1187,10 @@ impl Transcript {
                 else {
                     return removed_entry;
                 };
-                if self.tools.contains_key(tool_call_id) {
-                    return removed_entry;
-                }
-                self.finish_reasoning(event.created_at);
                 let input = payload
                     .get("input")
                     .unwrap_or(&serde_json::Value::Null);
-                let presentation = project_tool_presentation(raw_name, input, None, false);
-                let display_name = presentation.label;
-                let detail = presentation.detail;
-                let code_view = presentation.input.map(|body| (body.language, body.text));
-                let tool_index = self.order.len();
-                self.tools.insert(tool_call_id.to_string(), tool_index);
-                self.foreground_tool = Some(tool_call_id.to_string());
-                self.order.push(TranscriptEntry::Tool {
-                    source_name: raw_name.to_string(),
-                    name: display_name,
-                    detail,
-                    code_view,
-                    output_view: None,
-                    payload_refs: Vec::new(),
-                    time: local_event_time(event),
-                    started_at: event.created_at,
-                    completed_at: None,
-                    complete: false,
-                    error: false,
-                    user_interrupted: false,
-                    backgrounded: false,
-                    expanded: false,
-                });
+                self.upsert_running_tool(event, tool_call_id, raw_name, input, None);
             }
             SessionEventKind::ToolStarted {
                 tool_call_id,
@@ -1249,84 +1198,20 @@ impl Transcript {
                 input,
                 input_ref,
             } => {
-                self.finish_reasoning(event.created_at);
-                let presentation = project_tool_presentation(name, input, None, false);
-                let display_name = presentation.label;
-                let detail = presentation.detail;
-                let code_view = presentation.input.map(|body| (body.language, body.text));
-                let is_edit_diff = matches!(
-                    code_view.as_ref(),
-                    Some((language, _)) if is_diff_language(language)
+                self.upsert_running_tool(
+                    event,
+                    tool_call_id,
+                    name,
+                    input,
+                    input_ref.as_ref(),
                 );
-                let rich_ui = tool_has_rich_ui(
-                    &display_name,
-                    code_view.as_ref().map(|(language, _)| language.as_str()),
-                );
-                self.foreground_tool = Some(tool_call_id.clone());
-                if is_edit_diff {
-                    self.collapse_previous_edit();
-                }
-                let expanded = input_ref.is_none()
-                    && ((is_edit_diff && self.auto_expand_edits)
-                        || (!is_edit_diff
-                            && code_view.is_some()
-                            && (rich_ui || self.auto_expand_tools)));
-                if let Some(tool_index) = self.tools.get(tool_call_id).copied()
-                    && let Some(TranscriptEntry::Tool {
-                        source_name: stored_source_name,
-                        name: stored_name,
-                        detail: stored_detail,
-                        code_view: stored_code_view,
-                        output_view: stored_output_view,
-                        payload_refs: stored_payload_refs,
-                        complete: stored_complete,
-                        error: stored_error,
-                        user_interrupted: stored_user_interrupted,
-                        backgrounded: stored_backgrounded,
-                        expanded: stored_expanded,
-                        completed_at: stored_completed_at,
-                        ..
-                    }) = self.order.get_mut(tool_index)
-                    && !*stored_complete
-                {
-                    *stored_source_name = name.clone();
-                    *stored_name = display_name;
-                    *stored_detail = detail;
-                    *stored_code_view = code_view;
-                    *stored_output_view = None;
-                    *stored_payload_refs = input_ref.iter().cloned().collect();
-                    *stored_complete = false;
-                    *stored_error = false;
-                    *stored_user_interrupted = false;
-                    *stored_backgrounded = false;
-                    *stored_expanded = expanded;
-                    *stored_completed_at = None;
-                    if is_edit_diff {
-                        self.last_edit = Some(tool_index);
-                    }
-                    return removed_entry;
-                }
-                let tool_index = self.order.len();
-                self.tools.insert(tool_call_id.clone(), tool_index);
-                self.order.push(TranscriptEntry::Tool {
-                    source_name: name.clone(),
-                    name: display_name,
-                    detail,
-                    code_view,
-                    output_view: None,
-                    payload_refs: input_ref.iter().cloned().collect(),
-                    time: local_event_time(event),
-                    started_at: event.created_at,
-                    completed_at: None,
-                    complete: false,
-                    error: false,
-                    user_interrupted: false,
-                    backgrounded: false,
-                    expanded,
-                });
-                if is_edit_diff {
-                    self.last_edit = Some(tool_index);
-                }
+            }
+            SessionEventKind::ToolUpdated {
+                tool_call_id,
+                name,
+                input,
+            } => {
+                self.upsert_running_tool(event, tool_call_id, name, input, None);
             }
             SessionEventKind::ToolCompleted {
                 tool_call_id,
@@ -1973,6 +1858,93 @@ impl Transcript {
         }
     }
 
+    fn upsert_running_tool(
+        &mut self,
+        event: &SessionEvent,
+        tool_call_id: &str,
+        name: &str,
+        input: &serde_json::Value,
+        input_ref: Option<&SessionPayloadRef>,
+    ) {
+        self.finish_reasoning(event.created_at);
+        let presentation = project_tool_presentation(name, input, None, false);
+        let display_name = presentation.label;
+        let detail = presentation.detail;
+        let code_view = presentation.input.map(|body| (body.language, body.text));
+        let is_edit_diff = matches!(
+            code_view.as_ref(),
+            Some((language, _)) if is_diff_language(language)
+        );
+        let rich_ui = tool_has_rich_ui(
+            &display_name,
+            code_view.as_ref().map(|(language, _)| language.as_str()),
+        );
+        self.foreground_tool = Some(tool_call_id.to_string());
+        if is_edit_diff {
+            self.collapse_previous_edit();
+        }
+        let expanded = input_ref.is_none()
+            && ((is_edit_diff && self.auto_expand_edits)
+                || (!is_edit_diff
+                    && code_view.is_some()
+                    && (rich_ui || self.auto_expand_tools)));
+        if let Some(tool_index) = self.tools.get(tool_call_id).copied()
+            && let Some(TranscriptEntry::Tool {
+                source_name: stored_source_name,
+                name: stored_name,
+                detail: stored_detail,
+                code_view: stored_code_view,
+                output_view: stored_output_view,
+                payload_refs: stored_payload_refs,
+                complete: stored_complete,
+                error: stored_error,
+                user_interrupted: stored_user_interrupted,
+                backgrounded: stored_backgrounded,
+                expanded: stored_expanded,
+                completed_at: stored_completed_at,
+                ..
+            }) = self.order.get_mut(tool_index)
+            && !*stored_complete
+        {
+            *stored_source_name = name.to_string();
+            *stored_name = display_name;
+            *stored_detail = detail;
+            *stored_code_view = code_view;
+            *stored_output_view = None;
+            *stored_payload_refs = input_ref.cloned().into_iter().collect();
+            *stored_error = false;
+            *stored_user_interrupted = false;
+            *stored_backgrounded = false;
+            *stored_expanded = expanded;
+            *stored_completed_at = None;
+            if is_edit_diff {
+                self.last_edit = Some(tool_index);
+            }
+            return;
+        }
+        let tool_index = self.order.len();
+        self.tools.insert(tool_call_id.to_string(), tool_index);
+        self.order.push(TranscriptEntry::Tool {
+            source_name: name.to_string(),
+            name: display_name,
+            detail,
+            code_view,
+            output_view: None,
+            payload_refs: input_ref.cloned().into_iter().collect(),
+            time: local_event_time(event),
+            started_at: event.created_at,
+            completed_at: None,
+            complete: false,
+            error: false,
+            user_interrupted: false,
+            backgrounded: false,
+            expanded,
+        });
+        if is_edit_diff {
+            self.last_edit = Some(tool_index);
+        }
+    }
+
     fn mark_running_tools_user_interrupted(&mut self, completed_at: DateTime<Utc>) {
         self.finish_reasoning(completed_at);
         self.foreground_tool = None;
@@ -2339,14 +2311,8 @@ impl Transcript {
     }
 
     fn tool_elapsed_cache_tick_at(&self, now: DateTime<Utc>) -> Option<i64> {
-        self.has_running_tool().then(|| {
-            let refresh_millis = if self.order.len() >= LARGE_TRANSCRIPT_ENTRY_THRESHOLD {
-                LARGE_TRANSCRIPT_TOOL_ELAPSED_REFRESH_MILLIS
-            } else {
-                TOOL_ELAPSED_REFRESH_MILLIS
-            };
-            now.timestamp_millis().div_euclid(refresh_millis)
-        })
+        self.has_running_tool()
+            .then(|| now.timestamp_millis().div_euclid(TOOL_ELAPSED_REFRESH_MILLIS))
     }
 
     fn has_running_tool(&self) -> bool {
@@ -2428,6 +2394,7 @@ impl Transcript {
             hovered_message,
             hovered_entry,
             false,
+            None,
         )
     }
 
@@ -2443,6 +2410,24 @@ impl Transcript {
             None,
             None,
             true,
+            None,
+        )
+    }
+
+    fn render_tool_for_cache(
+        &self,
+        index: usize,
+        width: usize,
+        tool_run_viewport_height: usize,
+    ) -> TranscriptRender {
+        self.render_with_tool_run_viewport_mode(
+            width,
+            tool_run_viewport_height,
+            None,
+            None,
+            None,
+            true,
+            Some(index),
         )
     }
 
@@ -2455,10 +2440,13 @@ impl Transcript {
         hovered_message: Option<usize>,
         hovered_entry: Option<usize>,
         defer_completed_message_backgrounds: bool,
+        focused_tool: Option<usize>,
     ) -> TranscriptRender {
         let today = Local::now().date_naive();
         let today_prefix = today.format("%Y-%m-%d ").to_string();
-        self.prepare_message_markdown_cache(width);
+        if focused_tool.is_none() {
+            self.prepare_message_markdown_cache(width);
+        }
         {
             let mut cache = self.tool_body_cache.borrow_mut();
             if cache.width != width {
@@ -2476,8 +2464,29 @@ impl Transcript {
         let mut tool_run_starts = HashMap::new();
         let tool_run_windows = self.tool_run_windows();
         let running_tool = self.has_running_tool();
+        if let Some(index) = focused_tool
+            && let Some(TranscriptEntry::Tool { name, complete, .. }) = self.order.get(index)
+        {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "  Tool output",
+                    Style::default()
+                        .fg(BORG_ORANGE)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(" · {name} · {}", if *complete { "complete" } else { "live" }),
+                    Style::default().fg(Color::Gray),
+                ),
+                Span::styled(" · Esc to return", Style::default().fg(Color::DarkGray)),
+            ]));
+            lines.push(Line::default());
+        }
         for (index, entry) in self.order.iter().enumerate() {
-            let tool_window = tool_run_windows[index];
+            if focused_tool.is_some_and(|focused| focused != index) {
+                continue;
+            }
+            let tool_window = focused_tool.is_none().then_some(tool_run_windows[index]).flatten();
             if let Some(window) = tool_window.filter(|window| index == window.start) {
                 let row = lines.len();
                 lines.push(Line::from(Span::styled(
@@ -3055,10 +3064,11 @@ impl Transcript {
                     expanded,
                     ..
                 } => {
-                    let next_is_tool = matches!(
-                        self.order.get(index + 1),
-                        Some(TranscriptEntry::Tool { .. })
-                    );
+                    let next_is_tool = focused_tool.is_none()
+                        && matches!(
+                            self.order.get(index + 1),
+                            Some(TranscriptEntry::Tool { .. })
+                        );
                     let time = display_local_time(time, &today_prefix);
                     let is_reasoning = matches!(
                         code_view.as_ref(),
@@ -3123,11 +3133,6 @@ impl Transcript {
                         Some("user interrupted")
                     } else if *backgrounded {
                         Some("Running in background")
-                    } else if !*complete
-                        && !is_reasoning
-                        && pending_tool_label(name).as_ref() == name
-                    {
-                        Some("in progress")
                     } else {
                         None
                     };
@@ -3190,8 +3195,9 @@ impl Transcript {
                             apply_line_background(line, width, MESSAGE_HOVER_BG);
                         }
                     }
+                    let body_expanded = *expanded || focused_tool == Some(index);
                     if show_tool_body
-                        && *expanded
+                        && body_expanded
                         && expandable
                         && let Some((language, source)) = code_view
                     {
@@ -3239,7 +3245,7 @@ impl Transcript {
                         }
                     }
                     if show_tool_body
-                        && *expanded
+                        && body_expanded
                         && expandable
                         && let Some((language, source)) = output_view
                     {

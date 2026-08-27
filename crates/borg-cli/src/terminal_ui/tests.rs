@@ -1390,7 +1390,7 @@ fn tool_hover_hint_names_the_copy_target() {
     });
     assert_eq!(
         transcript.tool_copy_hint(0),
-        Some("left click expand · right click copy output")
+        Some("left click inspect · right click copy output")
     );
 
     if let Some(TranscriptEntry::Tool {
@@ -1404,7 +1404,7 @@ fn tool_hover_hint_names_the_copy_target() {
     }
     assert_eq!(
         transcript.tool_copy_hint(0),
-        Some("left click expand · right click copy diff")
+        Some("left click inspect · right click copy diff")
     );
 }
 
@@ -1593,7 +1593,7 @@ fn instant_tools_keep_a_diamond_without_animation() {
         .map(|line| line.to_string())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(rendered.contains("◇ Reading plan"));
+    assert!(rendered.contains("◇ Read plan in progress…"));
     assert!(!rendered.chars().any(|glyph| "⠋⠙⠹⠸⠼⠴⠦⠧".contains(glyph)));
 
     transcript.apply(&SessionEvent::new(
@@ -1723,7 +1723,7 @@ fn running_tool_elapsed_cache_tick_changes_each_tenth() {
 }
 
 #[test]
-fn large_transcript_throttles_running_tool_elapsed_cache_refreshes() {
+fn large_transcript_keeps_running_tool_elapsed_at_tenth_second_cadence() {
     let session_id = Uuid::new_v4();
     let mut transcript = Transcript::default();
     transcript.apply(&SessionEvent::new(
@@ -1736,7 +1736,7 @@ fn large_transcript_throttles_running_tool_elapsed_cache_refreshes() {
             input_ref: None,
         },
     ));
-    for sequence in 2..=LARGE_TRANSCRIPT_ENTRY_THRESHOLD {
+    for sequence in 2..=256 {
         transcript.order.push(TranscriptEntry::Activity {
             text: format!("load fixture {sequence}"),
             time: "2026-07-29 10:00".to_string(),
@@ -1746,13 +1746,38 @@ fn large_transcript_throttles_running_tool_elapsed_cache_refreshes() {
         .unwrap()
         .with_timezone(&Utc);
 
-    assert_eq!(
-        transcript.tool_elapsed_cache_tick_at(started_at),
-        transcript.tool_elapsed_cache_tick_at(started_at + chrono::Duration::milliseconds(999))
-    );
     assert_ne!(
         transcript.tool_elapsed_cache_tick_at(started_at),
-        transcript.tool_elapsed_cache_tick_at(started_at + chrono::Duration::seconds(1))
+        transcript.tool_elapsed_cache_tick_at(started_at + chrono::Duration::milliseconds(100))
+    );
+}
+
+#[test]
+fn background_tool_elapsed_cache_tick_also_changes_each_tenth() {
+    let started_at = DateTime::parse_from_rfc3339("2026-07-29T10:00:00.000Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let mut transcript = Transcript::default();
+    transcript.order.push(TranscriptEntry::Tool {
+        source_name: "Run".to_string(),
+        name: "Run".to_string(),
+        detail: "sleep 1".to_string(),
+        code_view: None,
+        output_view: None,
+        payload_refs: Vec::new(),
+        time: "10:00".to_string(),
+        started_at,
+        completed_at: None,
+        complete: false,
+        error: false,
+        user_interrupted: false,
+        backgrounded: true,
+        expanded: false,
+    });
+
+    assert_ne!(
+        transcript.tool_elapsed_cache_tick_at(started_at),
+        transcript.tool_elapsed_cache_tick_at(started_at + chrono::Duration::milliseconds(100))
     );
 }
 
@@ -3141,7 +3166,7 @@ fn an_edit_reads_as_active_until_its_diff_is_on_screen() {
 
     // Nothing at all yet: the payload has not hydrated.
     let bodyless = rendered(&started("apply_patch", serde_json::Value::Null));
-    assert!(bodyless.contains("◇ Editing"), "{bodyless}");
+    assert!(bodyless.contains("◇ Edit in progress…"), "{bodyless}");
 
     // A body, but not a diff: the patch is still being assembled, so there is
     // still nothing to look at.
@@ -3149,15 +3174,39 @@ fn an_edit_reads_as_active_until_its_diff_is_on_screen() {
         "apply_patch",
         serde_json::json!({ "file_path": "src/main.rs" }),
     ));
-    assert!(no_diff_yet.contains("◇ Editing"), "{no_diff_yet}");
+    assert!(no_diff_yet.contains("◇ Edit in progress…"), "{no_diff_yet}");
 
-    // Once a streamed diff exists, show it while the edit is still pending.
-    let with_diff = started(
-        "apply_patch",
-        serde_json::json!({
-            "file_path": "src/main.rs",
-            "patch": "--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1 +1 @@\n-one\n+two\n",
-        }),
+    // Each pre-execution snapshot replaces the same pending row and grows its
+    // parsed diff while the provider is still producing the patch.
+    let mut with_diff = started("apply_patch", serde_json::Value::Null);
+    for (sequence, diff) in [
+        (2, "@@ -1 +1 @@\n-one\n+two"),
+        (3, "@@ -1 +1,2 @@\n-one\n+two\n+three"),
+    ] {
+        with_diff.apply(&SessionEvent::new(
+            session_id,
+            sequence,
+            SessionEventKind::ToolUpdated {
+                tool_call_id: "tool-1".to_string(),
+                name: "Edit".to_string(),
+                input: serde_json::json!({
+                    "changes": [{
+                        "path": "src/main.rs",
+                        "kind": {"type": "update", "move_path": null},
+                        "diff": diff,
+                    }]
+                }),
+            },
+        ));
+    }
+    assert_eq!(
+        with_diff
+            .order
+            .iter()
+            .filter(|entry| matches!(entry, TranscriptEntry::Tool { .. }))
+            .count(),
+        1,
+        "streamed snapshots must update one pending tool row"
     );
     assert!(
         matches!(
@@ -3170,14 +3219,15 @@ fn an_edit_reads_as_active_until_its_diff_is_on_screen() {
     let mut pending_summary = with_diff
         .lines(120)
         .into_iter()
-        .find(|line| line.to_string().contains("◇ Editing"))
+        .find(|line| line.to_string().contains("◇ Edit in progress…"))
         .expect("pending edit summary");
     replace_tool_activity_glyph(&mut pending_summary, "⠙");
-    assert!(pending_summary.to_string().contains("⠙ Editing"));
+    assert!(pending_summary.to_string().contains("⠙ Edit in progress…"));
     let with_diff = rendered(&with_diff);
-    assert!(with_diff.contains("◇ Editing"), "{with_diff}");
+    assert!(with_diff.contains("◇ Edit in progress…"), "{with_diff}");
     assert!(with_diff.contains("− one"), "{with_diff}");
     assert!(with_diff.contains("+ two"), "{with_diff}");
+    assert!(with_diff.contains("+ three"), "{with_diff}");
 
     let mut completed = started(
         "apply_patch",
@@ -3203,13 +3253,13 @@ fn an_edit_reads_as_active_until_its_diff_is_on_screen() {
     ));
     let completed = rendered(&completed);
     assert!(completed.contains("✓ Edit"), "{completed}");
-    assert!(!completed.contains("Editing"), "{completed}");
+    assert!(!completed.contains("in progress"), "{completed}");
     assert!(completed.contains("− one"), "{completed}");
     assert!(completed.contains("+ two"), "{completed}");
 
     // A bodyless non-edit tool uses its own active action label.
     let read = rendered(&started("read_file", serde_json::Value::Null));
-    assert!(read.contains("◇ Reading"), "{read}");
+    assert!(read.contains("◇ Read in progress…"), "{read}");
 }
 
 #[test]
@@ -3289,7 +3339,7 @@ fn streamed_tool_preview_is_replaced_by_the_durable_tool_once() {
         .map(|line| line.to_string())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(pending.contains("◇ Editing"), "{pending}");
+    assert!(pending.contains("◇ Edit in progress…"), "{pending}");
     assert_eq!(
         transcript
             .order
@@ -3341,7 +3391,7 @@ fn streamed_tool_preview_is_replaced_by_the_durable_tool_once() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(completed.contains("✓ Edit"), "{completed}");
-    assert!(!completed.contains("Editing"), "{completed}");
+    assert!(!completed.contains("in progress"), "{completed}");
 
     let mut plan = Transcript::default();
     plan.apply(&SessionEvent::new(
@@ -3363,7 +3413,7 @@ fn streamed_tool_preview_is_replaced_by_the_durable_tool_once() {
         .map(|line| line.to_string())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(plan.contains("◇ Updating plan"), "{plan}");
+    assert!(plan.contains("◇ Update plan in progress…"), "{plan}");
 }
 
 #[test]
@@ -8021,6 +8071,66 @@ fn expanded_tool_run_shows_every_action_and_collapses_again() {
         collapsed.contains("actions · 20 · click to expand · ↑ scroll"),
         "{collapsed}"
     );
+}
+
+#[test]
+fn focused_tool_inspector_isolates_one_tool_and_forces_its_live_body_open() {
+    let started_at = Utc::now();
+    let mut transcript = Transcript::default();
+    transcript.order.push(TranscriptEntry::Activity {
+        text: "conversation context that must stay hidden".to_string(),
+        time: "12:00".to_string(),
+    });
+    transcript.order.push(TranscriptEntry::Tool {
+        source_name: "Run".to_string(),
+        name: "Run".to_string(),
+        detail: "unrelated-tool".to_string(),
+        code_view: Some(("text".to_string(), "unrelated body".to_string())),
+        output_view: None,
+        payload_refs: Vec::new(),
+        time: "12:00".to_string(),
+        started_at,
+        completed_at: Some(started_at),
+        complete: true,
+        error: false,
+        user_interrupted: false,
+        backgrounded: false,
+        expanded: false,
+    });
+    transcript.order.push(TranscriptEntry::Tool {
+        source_name: "Edit".to_string(),
+        name: "Edit".to_string(),
+        detail: "config.toml".to_string(),
+        code_view: Some((
+            "diff:toml".to_string(),
+            "@@ -1 +1 @@\n-enabled = false\n+enabled = true".to_string(),
+        )),
+        output_view: None,
+        payload_refs: Vec::new(),
+        time: "12:00".to_string(),
+        started_at,
+        completed_at: None,
+        complete: false,
+        error: false,
+        user_interrupted: false,
+        backgrounded: false,
+        expanded: false,
+    });
+
+    let (lines, tool_rows, ..) = transcript.render_tool_for_cache(2, 100, 24);
+    let rendered = lines
+        .iter()
+        .map(Line::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(rendered.contains("Tool output · Edit · live"), "{rendered}");
+    assert!(rendered.contains("Edit in progress…"), "{rendered}");
+    assert!(rendered.contains("enabled = true"), "{rendered}");
+    assert!(!rendered.contains("conversation context"), "{rendered}");
+    assert!(!rendered.contains("unrelated-tool"), "{rendered}");
+    assert_eq!(tool_rows.len(), 1);
+    assert_eq!(tool_rows[0].0, 2);
 }
 
 #[test]

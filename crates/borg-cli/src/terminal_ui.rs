@@ -734,6 +734,9 @@ pub struct BorgTerminal {
     /// and child projections, but do not turn them into root transcript cards.
     suppress_bootstrap_subagent_activity: bool,
     focused_child: Option<Uuid>,
+    focused_tool: Option<usize>,
+    tool_return_scroll_from_bottom: usize,
+    tool_return_follow_tail: bool,
     sidecar_focus_request: Option<String>,
     team_switcher_open: bool,
     team_roster_hit_areas: Vec<(Rect, Option<Uuid>)>,
@@ -1743,6 +1746,9 @@ impl BorgTerminal {
             child_pending_approvals: HashSet::new(),
             suppress_bootstrap_subagent_activity: true,
             focused_child: None,
+            focused_tool: None,
+            tool_return_scroll_from_bottom: 0,
+            tool_return_follow_tail: true,
             sidecar_focus_request: None,
             team_switcher_open: false,
             team_roster_hit_areas: Vec::new(),
@@ -1886,6 +1892,9 @@ impl BorgTerminal {
         self.child_pending_approvals.clear();
         self.suppress_bootstrap_subagent_activity = true;
         self.focused_child = None;
+        self.focused_tool = None;
+        self.tool_return_scroll_from_bottom = 0;
+        self.tool_return_follow_tail = true;
         self.sidecar_focus_request = None;
         self.team_switcher_open = false;
         self.team_roster_hit_areas.clear();
@@ -2819,9 +2828,12 @@ impl BorgTerminal {
     }
 
     fn reset_transcript_focus(&mut self) {
+        self.focused_tool = None;
         self.scroll_from_bottom = 0;
         self.transcript.follow_tail = true;
         self.transcript_render_cache = None;
+        self.transcript_full_render_cache = None;
+        self.last_committed_viewport_render = None;
         self.text_selection = None;
         self.composer_selection = None;
         self.pending_transcript_click = None;
@@ -2831,6 +2843,46 @@ impl BorgTerminal {
         self.hovered_tool = None;
         self.hovered_tool_run = None;
         self.hovered_tool_run_header = None;
+    }
+
+    fn open_tool_inspector(&mut self, index: usize) -> Vec<SessionPayloadRef> {
+        let complete = match self.transcript.order.get(index) {
+            Some(TranscriptEntry::Tool { complete, .. }) => *complete,
+            _ => return Vec::new(),
+        };
+        if self.focused_tool == Some(index) {
+            return Vec::new();
+        }
+        self.tool_return_scroll_from_bottom = self.scroll_from_bottom;
+        self.tool_return_follow_tail = self.transcript.follow_tail;
+        self.focused_tool = Some(index);
+        self.transcript.follow_tail = !complete;
+        self.scroll_from_bottom = if complete { usize::MAX } else { 0 };
+        self.cancel_scroll_motion();
+        self.text_selection = None;
+        self.pending_transcript_click = None;
+        self.hovered_tool = None;
+        self.hovered_tool_run = None;
+        self.hovered_tool_run_header = None;
+        self.transcript_render_cache = None;
+        self.transcript_full_render_cache = None;
+        self.last_committed_viewport_render = None;
+        self.transcript.tool_payloads(index)
+    }
+
+    fn close_tool_inspector(&mut self) {
+        if self.focused_tool.take().is_none() {
+            return;
+        }
+        self.scroll_from_bottom = self.tool_return_scroll_from_bottom;
+        self.transcript.follow_tail = self.tool_return_follow_tail;
+        self.cancel_scroll_motion();
+        self.text_selection = None;
+        self.pending_transcript_click = None;
+        self.hovered_tool = None;
+        self.transcript_render_cache = None;
+        self.transcript_full_render_cache = None;
+        self.last_committed_viewport_render = None;
     }
 
     fn clear_background_hover(&mut self) {
@@ -2936,6 +2988,13 @@ impl BorgTerminal {
     }
 
     fn remap_selection_after_entry_removal(&mut self, removed: usize) {
+        if self.focused_tool == Some(removed) {
+            self.close_tool_inspector();
+        } else if let Some(index) = self.focused_tool.as_mut()
+            && *index > removed
+        {
+            *index -= 1;
+        }
         let Some(mut selection) = self.text_selection else {
             return;
         };
@@ -3690,7 +3749,11 @@ impl BorgTerminal {
                             .back_to_director_area
                             .is_some_and(|area| area.contains(pointer))
                         {
-                            self.focus_director_transcript();
+                            if self.focused_tool.is_some() {
+                                self.close_tool_inspector();
+                            } else {
+                                self.focus_director_transcript();
+                            }
                             return Ok(UiAction::None);
                         }
                         if self.status_area.is_some_and(|area| area.contains(pointer))
@@ -4039,7 +4102,7 @@ impl BorgTerminal {
                             false
                         };
                         if !consumed {
-                            self.history_page_requested = true;
+                            self.history_page_requested = self.focused_tool.is_none();
                             let viewport_height =
                                 self.transcript_viewport_area.map_or(1, |area| area.height);
                             self.queue_wheel_scroll(wheel_scroll_distance(
@@ -4306,14 +4369,10 @@ impl BorgTerminal {
             }
             PendingTranscriptClick::Tool { index, run } => {
                 self.nested_scroll_motion = None;
-                if self.transcript.tool_is_expanded(index) {
-                    self.capture_transcript_anchor_for_collapse();
-                }
                 if let Some((start, max_offset)) = run {
                     self.transcript.anchor_tool_run(start, max_offset);
                 }
-                let payloads = self.transcript.toggle_tool(index);
-                self.transcript_render_cache = None;
+                let payloads = self.open_tool_inspector(index);
                 if !payloads.is_empty() {
                     return UiAction::LoadPayloads(payloads);
                 }
@@ -4881,7 +4940,13 @@ impl BorgTerminal {
         } else {
             None
         };
-        let full_transcript_render =
+        let full_transcript_render = if let Some(index) = self.focused_tool {
+            Arc::new(self.transcript.render_tool_for_cache(
+                index,
+                full_transcript_width,
+                tool_run_viewport_height,
+            ))
+        } else {
             select_transcript_snapshot(input_fast_path, committed_viewport_render, || {
                 stale_full_transcript_render.unwrap_or_else(|| {
                     if self.transcript_render_cache.is_some() {
@@ -4907,7 +4972,8 @@ impl BorgTerminal {
                         )
                     }
                 })
-            });
+            })
+        };
         let queued_prompts = self.active_queued_prompts().to_vec();
         // Keep the first draft anchored in the splash composition area. Moving
         // it to the chat footer on the first keystroke makes the whole screen
@@ -5236,8 +5302,16 @@ impl BorgTerminal {
         let transcript_render = if input_fast_path {
             Arc::clone(&full_transcript_render)
         } else if transcript_width == full_transcript_width {
-            self.transcript_render_cache = self.transcript_full_render_cache.clone();
+            if self.focused_tool.is_none() {
+                self.transcript_render_cache = self.transcript_full_render_cache.clone();
+            }
             Arc::clone(&full_transcript_render)
+        } else if let Some(index) = self.focused_tool {
+            Arc::new(self.transcript.render_tool_for_cache(
+                index,
+                transcript_width,
+                tool_run_viewport_height,
+            ))
         } else {
             cached_transcript_render(
                 &self.transcript,
@@ -5443,7 +5517,7 @@ impl BorgTerminal {
                     None
                 };
                 let scroll_start = scroll;
-                let show_history_loader = self.history_page_loading;
+                let show_history_loader = self.history_page_loading && self.focused_tool.is_none();
                 let visible_height = content_area.height as usize;
                 let sticky_tool_run_header =
                     sticky_tool_run_header_row(tool_run_rows, scroll_start).map(
@@ -6188,8 +6262,12 @@ impl BorgTerminal {
                     ));
                 }
             }
-            if self.focused_child.is_some() {
-                let label = " ↩ Return ";
+            if self.focused_child.is_some() || self.focused_tool.is_some() {
+                let (label, idle_color) = if self.focused_tool.is_some() {
+                    (" ↩ Back ", BORG_ORANGE)
+                } else {
+                    (" ↩ Return ", SUBAGENT_PINK)
+                };
                 let button = Rect {
                     x: status_area.right().saturating_sub(label.width() as u16),
                     y: status_area.y,
@@ -6202,7 +6280,7 @@ impl BorgTerminal {
                             .fg(if self.back_to_director_hovered {
                                 Color::White
                             } else {
-                                SUBAGENT_PINK
+                                idle_color
                             })
                             .bg(if self.back_to_director_hovered {
                                 MESSAGE_HOVER_BG
@@ -6871,6 +6949,13 @@ impl BorgTerminal {
                 _ => UiAction::None,
             });
         }
+        if self.focused_tool.is_some()
+            && key.code == KeyCode::Esc
+            && key.modifiers == KeyModifiers::NONE
+        {
+            self.close_tool_inspector();
+            return Ok(UiAction::None);
+        }
         if self.keymap.matches(KeyAction::Keybindings, &key) && self.composer.text.is_empty() {
             self.open_command_palette();
             return Ok(UiAction::None);
@@ -7071,7 +7156,7 @@ impl BorgTerminal {
             });
         }
         if self.keymap.matches(KeyAction::ScrollUp, &key) {
-            self.history_page_requested = true;
+            self.history_page_requested = self.focused_tool.is_none();
             self.transcript.follow_tail = false;
             self.scroll_from_bottom = self.scroll_from_bottom.saturating_add(8);
             return Ok(UiAction::None);
@@ -7486,6 +7571,7 @@ fn transcript_turn_output(event: &SessionEvent) -> bool {
             ..
         } | SessionEventKind::ReasoningDelta { .. }
             | SessionEventKind::ToolStarted { .. }
+            | SessionEventKind::ToolUpdated { .. }
             | SessionEventKind::ToolCompleted { .. }
     )
 }
@@ -8662,6 +8748,7 @@ fn session_event_changes_transcript(kind: &SessionEventKind) -> bool {
         | SessionEventKind::ReasoningDelta { .. }
         | SessionEventKind::ReasoningCompleted
         | SessionEventKind::ToolStarted { .. }
+        | SessionEventKind::ToolUpdated { .. }
         | SessionEventKind::ToolCompleted { .. }
         | SessionEventKind::ApprovalRequested { .. }
         | SessionEventKind::ProviderInteractionRequested { .. }

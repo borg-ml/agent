@@ -191,6 +191,14 @@ fn replay_update(kind: SessionEventKind) -> Option<SessionUpdate> {
                 .status(ToolCallStatus::InProgress)
                 .raw_input(input),
         )),
+        SessionEventKind::ToolUpdated {
+            tool_call_id,
+            input,
+            ..
+        } => Some(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+            tool_call_id,
+            ToolCallUpdateFields::new().raw_input(input),
+        ))),
         SessionEventKind::ToolCompleted {
             tool_call_id,
             output,
@@ -301,6 +309,19 @@ async fn respond_prompt(
                             .status(ToolCallStatus::InProgress)
                             .raw_input(input),
                     ),
+                ))?;
+            }
+            SessionEventKind::ToolUpdated {
+                tool_call_id,
+                input,
+                ..
+            } => {
+                connection.send_notification(SessionNotification::new(
+                    request.session_id.clone(),
+                    SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                        tool_call_id,
+                        ToolCallUpdateFields::new().raw_input(input),
+                    )),
                 ))?;
             }
             SessionEventKind::ToolCompleted {

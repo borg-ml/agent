@@ -345,7 +345,6 @@ pub fn tool_action_is_instant(display_name: &str, language: Option<&str>) -> boo
             label.as_str(),
             "create goal"
                 | "update goal"
-                | "update plan"
                 | "language servers"
                 | "workspace diagnostics"
                 | "view image"
@@ -2153,7 +2152,6 @@ mod tests {
             "Read plan",
             "Inspect repository",
             "Workspace diagnostics",
-            "Update plan",
             "Create goal",
             "View image",
         ] {
@@ -2165,6 +2163,7 @@ mod tests {
             "Search",
             "Search web",
             "Edit",
+            "Update plan",
             "Generate image",
         ] {
             assert!(!tool_action_is_instant(label, None), "{label}");

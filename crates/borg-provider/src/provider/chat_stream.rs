@@ -233,6 +233,11 @@ pub enum ChatStreamEvent {
         name: String,
         input: Value,
     },
+    ToolCallUpdate {
+        id: String,
+        name: String,
+        input: Value,
+    },
     ToolResult {
         tool_use_id: String,
         output: String,
@@ -2258,12 +2263,13 @@ fn codex_thread_start_params(
     {
         config.extend(mcp_config.clone());
     }
-    if request.web_search_allowed {
-        config.insert(
-            "features".to_string(),
-            serde_json::json!({"web_search_request": true}),
-        );
-    }
+    config.insert(
+        "features".to_string(),
+        serde_json::json!({
+            "apply_patch_streaming_events": true,
+            "web_search_request": request.web_search_allowed,
+        }),
+    );
     if !config.is_empty() {
         params["config"] = Value::Object(config);
     }
@@ -2938,6 +2944,28 @@ async fn emit_codex_events_with_state(
             let (name, input) = codex_tool_signature(item_type, item);
             events
                 .send(ChatStreamEvent::ToolCall { id, name, input })
+                .await
+                .ok();
+        }
+        "item/filechange/patchupdated" => {
+            let Some(id) = value
+                .pointer("/params/itemId")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+            else {
+                tracing::warn!("Codex patch update without an item id");
+                return;
+            };
+            let Some(changes) = value.pointer("/params/changes").and_then(Value::as_array) else {
+                tracing::warn!(item_id = id, "Codex patch update without changes");
+                return;
+            };
+            events
+                .send(ChatStreamEvent::ToolCallUpdate {
+                    id: id.to_string(),
+                    name: "Edit".to_string(),
+                    input: serde_json::json!({"changes": changes}),
+                })
                 .await
                 .ok();
         }
@@ -3877,6 +3905,10 @@ mod tests {
             codex_config.get("experimentalRawEvents"),
             Some(&Value::Bool(true))
         );
+        assert_eq!(
+            codex_config.pointer("/config/features/apply_patch_streaming_events"),
+            Some(&Value::Bool(true))
+        );
         assert!(codex_config.get("baseInstructions").is_none());
         let codex_auto_config = codex_thread_start_params(&request, LocalAgentPermission::Auto);
         assert_eq!(
@@ -4762,6 +4794,37 @@ mod tests {
                 is_error: false,
                 ..
             }) if tool_use_id == "item-1" && output == "/home/shulgin/borg-cli\n"
+        ));
+    }
+
+    #[tokio::test]
+    async fn codex_streamed_patch_snapshots_become_tool_updates_before_completion() {
+        let (sender, mut receiver) = mpsc::channel(8);
+        emit_codex_events(
+            &sender,
+            &serde_json::json!({
+                "method": "item/fileChange/patchUpdated",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "itemId": "edit-1",
+                    "changes": [{
+                        "path": "src/main.rs",
+                        "kind": {"type": "update", "move_path": null},
+                        "diff": "@@ -1 +1,2 @@\n-old\n+new\n+still streaming"
+                    }]
+                }
+            }),
+        )
+        .await;
+
+        assert!(matches!(
+            receiver.recv().await,
+            Some(ChatStreamEvent::ToolCallUpdate { id, name, input })
+                if id == "edit-1"
+                    && name == "Edit"
+                    && input["changes"][0]["path"] == "src/main.rs"
+                    && input["changes"][0]["diff"].as_str().is_some_and(|diff| diff.contains("still streaming"))
         ));
     }
 

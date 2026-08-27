@@ -6392,8 +6392,10 @@ fn terminal_needs_idle_tick(has_expiring_notice: bool, has_blinking_cursor: bool
 
 fn session_event_needs_immediate_frame(kind: &SessionEventKind, queued_event_count: usize) -> bool {
     queued_event_count == 0
-        && (matches!(kind, SessionEventKind::ToolStarted { .. })
-            || matches!(kind, SessionEventKind::ProviderEvent { kind, .. } if kind == "tool_call_started"))
+        && (matches!(
+            kind,
+            SessionEventKind::ToolStarted { .. } | SessionEventKind::ToolUpdated { .. }
+        ) || matches!(kind, SessionEventKind::ProviderEvent { kind, .. } if kind == "tool_call_started"))
 }
 
 fn should_draw_input_fast_path(
