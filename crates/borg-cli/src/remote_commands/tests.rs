@@ -1703,28 +1703,24 @@ fn tui_frame_interval_preserves_supported_high_refresh_and_caps_extremes() {
 #[test]
 fn expensive_draws_leave_time_for_input_and_animation_events() {
     assert_eq!(
-        responsive_tui_frame_interval(165, std::time::Duration::from_millis(5), false, false),
+        responsive_tui_frame_interval(165, std::time::Duration::from_millis(5), false),
         std::time::Duration::from_millis(15)
     );
     assert_eq!(
-        responsive_tui_frame_interval(60, std::time::Duration::from_millis(40), false, true),
-        ACTIVITY_FRAME_INTERVAL
+        responsive_tui_frame_interval(60, std::time::Duration::from_millis(40), false),
+        std::time::Duration::from_millis(120)
     );
     assert_eq!(
-        responsive_tui_frame_interval(60, std::time::Duration::ZERO, false, false),
+        responsive_tui_frame_interval(60, std::time::Duration::ZERO, false),
         tui_frame_interval(60)
     );
     assert_eq!(
-        responsive_tui_frame_interval(60, std::time::Duration::from_millis(40), true, false),
+        responsive_tui_frame_interval(60, std::time::Duration::from_millis(40), true),
         std::time::Duration::from_millis(40)
     );
     assert_eq!(
-        responsive_tui_frame_interval(60, std::time::Duration::from_millis(500), false, false),
+        responsive_tui_frame_interval(60, std::time::Duration::from_millis(500), false),
         MAX_RENDER_BACKOFF_INTERVAL
-    );
-    assert_eq!(
-        responsive_tui_frame_interval(60, std::time::Duration::from_millis(500), false, true),
-        ACTIVITY_FRAME_INTERVAL
     );
 }
 

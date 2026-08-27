@@ -2042,15 +2042,10 @@ async fn run_local_agent_session(
                 }
                 let draw_started = std::time::Instant::now();
                 terminal.draw()?;
-                let activity_frame = terminal_needs_activity_tick(status)
-                    || terminal.has_running_tool()
-                    || terminal.has_active_splash_animation()
-                    || terminal.is_history_page_loading();
                 let next_interval = responsive_tui_frame_interval(
                     tui_fps,
                     draw_started.elapsed(),
                     interaction_frame,
-                    activity_frame,
                 );
                 if next_interval != render_frame_interval {
                     render_frame_interval = next_interval;
@@ -6261,20 +6256,14 @@ fn responsive_tui_frame_interval(
     fps: u64,
     last_draw: std::time::Duration,
     interaction_frame: bool,
-    activity_frame: bool,
 ) -> std::time::Duration {
-    let max_interval = if activity_frame {
-        ACTIVITY_FRAME_INTERVAL
-    } else {
-        MAX_RENDER_BACKOFF_INTERVAL
-    };
     tui_frame_interval(fps)
         .max(if interaction_frame {
             last_draw
         } else {
             last_draw.saturating_mul(3)
         })
-        .min(max_interval)
+        .min(MAX_RENDER_BACKOFF_INTERVAL)
 }
 
 fn parse_on_off(value: &str) -> Option<bool> {
