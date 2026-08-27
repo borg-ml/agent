@@ -1595,7 +1595,7 @@ fn instant_tools_keep_a_diamond_without_animation() {
         .map(|line| line.to_string())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(rendered.contains("◇ Read plan in progress…"));
+    assert!(rendered.contains("◇ Reading plan…"));
     assert!(!rendered.chars().any(|glyph| "⠋⠙⠹⠸⠼⠴⠦⠧".contains(glyph)));
 
     transcript.apply(&SessionEvent::new(
@@ -1618,6 +1618,20 @@ fn instant_tools_keep_a_diamond_without_animation() {
         .join("\n");
     assert!(completed.contains("◇ Read plan"));
     assert!(!completed.contains("✓ Read plan"));
+}
+
+#[test]
+fn tool_lifecycle_labels_use_progressive_and_past_tense() {
+    assert_eq!(tool_lifecycle_label("Run", false), "Running…");
+    assert_eq!(tool_lifecycle_label("Run", true), "Ran");
+    assert_eq!(
+        tool_lifecycle_label("Inspect repository", false),
+        "Inspecting repository…"
+    );
+    assert_eq!(
+        tool_lifecycle_label("Inspect repository", true),
+        "Inspected repository"
+    );
 }
 
 #[test]
@@ -3168,7 +3182,7 @@ fn an_edit_reads_as_active_until_its_diff_is_on_screen() {
 
     // Nothing at all yet: the payload has not hydrated.
     let bodyless = rendered(&started("apply_patch", serde_json::Value::Null));
-    assert!(bodyless.contains("◇ Edit in progress…"), "{bodyless}");
+    assert!(bodyless.contains("◇ Editing…"), "{bodyless}");
 
     // A body, but not a diff: the patch is still being assembled, so there is
     // still nothing to look at.
@@ -3176,7 +3190,7 @@ fn an_edit_reads_as_active_until_its_diff_is_on_screen() {
         "apply_patch",
         serde_json::json!({ "file_path": "src/main.rs" }),
     ));
-    assert!(no_diff_yet.contains("◇ Edit in progress…"), "{no_diff_yet}");
+    assert!(no_diff_yet.contains("◇ Editing…"), "{no_diff_yet}");
 
     // Each pre-execution snapshot replaces the same pending row and grows its
     // parsed diff while the provider is still producing the patch.
@@ -3221,12 +3235,12 @@ fn an_edit_reads_as_active_until_its_diff_is_on_screen() {
     let mut pending_summary = with_diff
         .lines(120)
         .into_iter()
-        .find(|line| line.to_string().contains("◇ Edit in progress…"))
+        .find(|line| line.to_string().contains("◇ Editing…"))
         .expect("pending edit summary");
     replace_tool_activity_glyph(&mut pending_summary, "⠙");
-    assert!(pending_summary.to_string().contains("⠙ Edit in progress…"));
+    assert!(pending_summary.to_string().contains("⠙ Editing…"));
     let with_diff = rendered(&with_diff);
-    assert!(with_diff.contains("◇ Edit in progress…"), "{with_diff}");
+    assert!(with_diff.contains("◇ Editing…"), "{with_diff}");
     assert!(with_diff.contains("− one"), "{with_diff}");
     assert!(with_diff.contains("+ two"), "{with_diff}");
     assert!(with_diff.contains("+ three"), "{with_diff}");
@@ -3254,14 +3268,14 @@ fn an_edit_reads_as_active_until_its_diff_is_on_screen() {
         },
     ));
     let completed = rendered(&completed);
-    assert!(completed.contains("✓ Edit"), "{completed}");
+    assert!(completed.contains("✓ Edited"), "{completed}");
     assert!(!completed.contains("in progress"), "{completed}");
     assert!(completed.contains("− one"), "{completed}");
     assert!(completed.contains("+ two"), "{completed}");
 
     // A bodyless non-edit tool uses its own active action label.
     let read = rendered(&started("read_file", serde_json::Value::Null));
-    assert!(read.contains("◇ Read in progress…"), "{read}");
+    assert!(read.contains("◇ Reading…"), "{read}");
 }
 
 #[test]
@@ -3310,7 +3324,7 @@ fn completed_edit_replaces_a_stale_json_preview_with_the_authoritative_diff() {
         .map(|line| line.to_string())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(rendered.contains("✓ Edit"), "{rendered}");
+    assert!(rendered.contains("✓ Edited"), "{rendered}");
     assert!(rendered.contains("+ # Long edit"), "{rendered}");
     assert!(rendered.contains("− old"), "{rendered}");
     assert!(rendered.contains("+ new"), "{rendered}");
@@ -3341,7 +3355,7 @@ fn streamed_tool_preview_is_replaced_by_the_durable_tool_once() {
         .map(|line| line.to_string())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(pending.contains("◇ Edit in progress…"), "{pending}");
+    assert!(pending.contains("◇ Editing…"), "{pending}");
     assert_eq!(
         transcript
             .order
@@ -3392,7 +3406,7 @@ fn streamed_tool_preview_is_replaced_by_the_durable_tool_once() {
         .map(|line| line.to_string())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(completed.contains("✓ Edit"), "{completed}");
+    assert!(completed.contains("✓ Edited"), "{completed}");
     assert!(!completed.contains("in progress"), "{completed}");
 
     let mut plan = Transcript::default();
@@ -3415,7 +3429,7 @@ fn streamed_tool_preview_is_replaced_by_the_durable_tool_once() {
         .map(|line| line.to_string())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(plan.contains("◇ Update plan in progress…"), "{plan}");
+    assert!(plan.contains("◇ Updating plan…"), "{plan}");
 }
 
 #[test]
@@ -7780,7 +7794,7 @@ fn action_errors_leave_the_scrollbox_gutter_neutral() {
         .0;
     let line = lines
         .iter()
-        .find(|line| line.to_string().contains("Run failed"))
+        .find(|line| line.to_string().contains("Ran failed"))
         .expect("failed action");
     assert_eq!(
         line.spans.first().map(|span| span.content.as_ref()),
@@ -7788,7 +7802,7 @@ fn action_errors_leave_the_scrollbox_gutter_neutral() {
     );
     assert_ne!(line.spans[0].style.fg, Some(Color::Red));
     assert!(line.spans.iter().any(|span| {
-        span.content.contains("Run failed") && span.style.fg == Some(Color::LightRed)
+        span.content.contains("Ran failed") && span.style.fg == Some(Color::LightRed)
     }));
 }
 
@@ -8152,7 +8166,7 @@ fn focused_tool_inspector_isolates_one_tool_and_forces_its_live_body_open() {
         .join("\n");
 
     assert!(rendered.contains("Tool output · Edit · live"), "{rendered}");
-    assert!(rendered.contains("Edit in progress…"), "{rendered}");
+    assert!(rendered.contains("Editing…"), "{rendered}");
     assert!(rendered.contains("enabled = true"), "{rendered}");
     assert!(!rendered.contains("conversation context"), "{rendered}");
     assert!(!rendered.contains("unrelated-tool"), "{rendered}");
@@ -9995,6 +10009,16 @@ fn runtime_process_lifecycle_drives_active_shell_status() {
     transcript.apply(&SessionEvent::new(
         session_id,
         1,
+        SessionEventKind::ToolStarted {
+            tool_call_id: "shell-1".to_string(),
+            name: "exec_command".to_string(),
+            input: serde_json::json!({"cmd": "cargo test"}),
+            input_ref: None,
+        },
+    ));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        2,
         SessionEventKind::RuntimeProcessStarted {
             process_id,
             pid: 4242,
@@ -10006,12 +10030,42 @@ fn runtime_process_lifecycle_drives_active_shell_status() {
     assert_eq!(transcript.shell_status().as_deref(), Some("1 shell"));
     assert_eq!(
         transcript.active_shell_rows(),
-        vec![("pid 4242  cargo test".to_string(), None)]
+        vec![("pid 4242  cargo test".to_string(), Some(0))]
     );
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        3,
+        SessionEventKind::ToolCompleted {
+            tool_call_id: "shell-1".to_string(),
+            output: serde_json::json!({"session_id": process_id, "running": true}).to_string(),
+            output_ref: None,
+            is_error: false,
+            input: Some(serde_json::json!({"cmd": "cargo test"})),
+            input_ref: None,
+        },
+    ));
+    let backgrounded = transcript
+        .lines(120)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(backgrounded.contains("Running…"), "{backgrounded}");
+    assert!(
+        backgrounded.contains("Running in background"),
+        "{backgrounded}"
+    );
+    let running_verb = transcript
+        .lines(120)
+        .into_iter()
+        .flat_map(|line| line.spans)
+        .find(|span| span.content == "Running…")
+        .expect("running lifecycle verb");
+    assert_eq!(running_verb.style.fg, Some(BACKGROUND_RUNNING_TEXT));
 
     transcript.apply(&SessionEvent::new(
         session_id,
-        2,
+        4,
         SessionEventKind::RuntimeProcessCompleted {
             process_id,
             pid: 4242,
@@ -10028,4 +10082,12 @@ fn runtime_process_lifecycle_drives_active_shell_status() {
 
     assert_eq!(transcript.shell_status(), None);
     assert!(transcript.active_shell_rows().is_empty());
+    let completed = transcript
+        .lines(120)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(completed.contains("Ran"), "{completed}");
+    assert!(!completed.contains("Running in background"), "{completed}");
 }

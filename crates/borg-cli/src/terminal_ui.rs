@@ -8960,7 +8960,6 @@ fn session_event_changes_transcript(kind: &SessionEventKind) -> bool {
         | SessionEventKind::ProviderSessionLinked { .. }
         | SessionEventKind::RuntimeProcessStarted { .. }
         | SessionEventKind::RuntimeProcessOutput { .. }
-        | SessionEventKind::RuntimeProcessCompleted { .. }
         | SessionEventKind::BluWorkflowStarted { .. }
         | SessionEventKind::BluWorkflowCallRequested { .. }
         | SessionEventKind::BluWorkflowCallCompleted { .. }
@@ -8970,6 +8969,7 @@ fn session_event_changes_transcript(kind: &SessionEventKind) -> bool {
         | SessionEventKind::RuntimeWorkflowCallCompleted { .. }
         | SessionEventKind::RuntimeWorkflowCompleted { .. }
         | SessionEventKind::TurnStarted { .. } => false,
+        SessionEventKind::RuntimeProcessCompleted { .. } => true,
         SessionEventKind::StatusChanged {
             status:
                 SessionStatus::Ready

@@ -341,8 +341,73 @@ fn tool_has_expandable_body(
             .any(|(_, body)| !body.trim().is_empty())
 }
 
-fn pending_tool_label(name: &str) -> Cow<'_, str> {
-    Cow::Owned(format!("{name} in progress…"))
+fn tool_lifecycle_label(name: &str, complete: bool) -> Cow<'_, str> {
+    let (verb, rest) = name.split_once(' ').unwrap_or((name, ""));
+    let forms = match verb {
+        "Run" => Some(("Running", "Ran")),
+        "Inspect" => Some(("Inspecting", "Inspected")),
+        "Read" => Some(("Reading", "Read")),
+        "Edit" => Some(("Editing", "Edited")),
+        "Update" => Some(("Updating", "Updated")),
+        "Search" => Some(("Searching", "Searched")),
+        "List" => Some(("Listing", "Listed")),
+        "Check" => Some(("Checking", "Checked")),
+        "Find" => Some(("Finding", "Found")),
+        "Go" => Some(("Going", "Went")),
+        "Generate" => Some(("Generating", "Generated")),
+        "View" => Some(("Viewing", "Viewed")),
+        "Create" => Some(("Creating", "Created")),
+        "Delete" => Some(("Deleting", "Deleted")),
+        "Wait" => Some(("Waiting", "Waited")),
+        "Send" => Some(("Sending", "Sent")),
+        "Spawn" => Some(("Spawning", "Spawned")),
+        "Interrupt" => Some(("Interrupting", "Interrupted")),
+        "Stop" => Some(("Stopping", "Stopped")),
+        "Compare" => Some(("Comparing", "Compared")),
+        "Review" => Some(("Reviewing", "Reviewed")),
+        "Show" => Some(("Showing", "Showed")),
+        "Add" => Some(("Adding", "Added")),
+        "Remove" => Some(("Removing", "Removed")),
+        "Prune" => Some(("Pruning", "Pruned")),
+        "Lock" => Some(("Locking", "Locked")),
+        "Unlock" => Some(("Unlocking", "Unlocked")),
+        "Switch" => Some(("Switching", "Switched")),
+        "Commit" => Some(("Committing", "Committed")),
+        "Fetch" => Some(("Fetching", "Fetched")),
+        "Pull" => Some(("Pulling", "Pulled")),
+        "Push" => Some(("Pushing", "Pushed")),
+        "Merge" => Some(("Merging", "Merged")),
+        "Rebase" => Some(("Rebasing", "Rebased")),
+        _ => None,
+    };
+    if let Some((running, completed)) = forms {
+        let form = if complete { completed } else { running };
+        return Cow::Owned(format!(
+            "{form}{}{}",
+            if rest.is_empty() { "" } else { " " },
+            rest
+        ) + if complete { "" } else { "…" });
+    }
+    let phrase = match name {
+        "Git status" | "Git diff" | "Git log" | "Git branch" | "Git tags" | "Git remotes" => {
+            Some(if complete { "Inspected" } else { "Inspecting" })
+        }
+        "Repository info" => Some(if complete { "Inspected" } else { "Inspecting" }),
+        "Language servers" | "Workspace diagnostics" => {
+            Some(if complete { "Checked" } else { "Checking" })
+        }
+        _ => None,
+    };
+    phrase.map_or_else(
+        || {
+            if complete {
+                Cow::Borrowed(name)
+            } else {
+                Cow::Owned(format!("{name}…"))
+            }
+        },
+        |form| Cow::Owned(format!("{form} {name}{}", if complete { "" } else { "…" })),
+    )
 }
 
 fn transcript_entry_is_turn_output(entry: &TranscriptEntry) -> bool {
@@ -1456,8 +1521,18 @@ impl Transcript {
                 );
             }
             SessionEventKind::RuntimeProcessCompleted { process_id, .. } => {
+                let tool_index = self.runtime_processes.get(process_id).and_then(|process| process.tool_index);
                 if let Some(process) = self.runtime_processes.get_mut(process_id) {
                     process.running = false;
+                }
+                if let Some(tool_index) = tool_index
+                    && !self.runtime_processes.values().any(|process| {
+                        process.running && process.tool_index == Some(tool_index)
+                    })
+                    && let Some(TranscriptEntry::Tool { backgrounded, .. }) =
+                        self.order.get_mut(tool_index)
+                {
+                    *backgrounded = false;
                 }
             }
             SessionEventKind::ProviderEvent { kind, payload, .. }
@@ -3210,10 +3285,11 @@ impl Transcript {
                     } else {
                         None
                     };
-                    let display_name = if *complete || is_reasoning {
+                    let lifecycle_complete = *complete && !*backgrounded;
+                    let display_name = if is_reasoning {
                         Cow::Borrowed(name.as_str())
                     } else {
-                        pending_tool_label(name)
+                        tool_lifecycle_label(name, lifecycle_complete)
                     };
                     let show_tool_body = *complete
                         || !is_edit
@@ -3242,8 +3318,22 @@ impl Transcript {
                             let mut spans = vec![
                                 Span::styled(prefix.to_string(), gutter_style),
                                 Span::styled(line[..name_start].to_string(), style),
-                                Span::styled(display_name.to_string(), name_style),
                             ];
+                            if !lifecycle_complete && !is_reasoning {
+                                let verb_end = display_name.find(' ').unwrap_or(display_name.len());
+                                let (verb, rest) = display_name.split_at(verb_end);
+                                spans.push(Span::styled(
+                                    verb.to_string(),
+                                    Style::default()
+                                        .fg(BACKGROUND_RUNNING_TEXT)
+                                        .add_modifier(Modifier::BOLD),
+                                ));
+                                if !rest.is_empty() {
+                                    spans.push(Span::styled(rest.to_string(), name_style));
+                                }
+                            } else {
+                                spans.push(Span::styled(display_name.to_string(), name_style));
+                            }
                             extend_tool_lifecycle_spans(
                                 &mut spans,
                                 &line[name_end..],
