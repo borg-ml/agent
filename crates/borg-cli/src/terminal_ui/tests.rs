@@ -2935,6 +2935,10 @@ fn goal_toggle_updates_the_visible_status_before_the_durable_event() {
         transcript.goal.as_ref().map(|goal| goal.status),
         Some(GoalStatus::Active)
     );
+
+    assert!(transcript.optimistically_apply_goal_action(&GoalAction::Clear));
+    assert!(transcript.goal.is_none());
+    assert_eq!(transcript.goal_status(), None);
 }
 
 #[test]
@@ -3147,8 +3151,7 @@ fn an_edit_reads_as_active_until_its_diff_is_on_screen() {
     ));
     assert!(no_diff_yet.contains("◇ Editing"), "{no_diff_yet}");
 
-    // A streamed diff is still pending: show the Edit lifecycle row, but hold
-    // the body until the completion receipt arrives.
+    // Once a streamed diff exists, show it while the edit is still pending.
     let with_diff = started(
         "apply_patch",
         serde_json::json!({
@@ -3173,7 +3176,8 @@ fn an_edit_reads_as_active_until_its_diff_is_on_screen() {
     assert!(pending_summary.to_string().contains("⠙ Editing"));
     let with_diff = rendered(&with_diff);
     assert!(with_diff.contains("◇ Editing"), "{with_diff}");
-    assert!(!with_diff.contains("-one"), "{with_diff}");
+    assert!(with_diff.contains("− one"), "{with_diff}");
+    assert!(with_diff.contains("+ two"), "{with_diff}");
 
     let mut completed = started(
         "apply_patch",
@@ -3206,6 +3210,60 @@ fn an_edit_reads_as_active_until_its_diff_is_on_screen() {
     // A bodyless non-edit tool uses its own active action label.
     let read = rendered(&started("read_file", serde_json::Value::Null));
     assert!(read.contains("◇ Reading"), "{read}");
+}
+
+#[test]
+fn completed_edit_replaces_a_stale_json_preview_with_the_authoritative_diff() {
+    let session_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::ToolStarted {
+            tool_call_id: "edit-1".to_string(),
+            name: "Edit".to_string(),
+            input: serde_json::json!({"changes": "still assembling"}),
+            input_ref: None,
+        },
+    ));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::ToolCompleted {
+            tool_call_id: "edit-1".to_string(),
+            output: String::new(),
+            output_ref: None,
+            is_error: false,
+            input: Some(serde_json::json!({
+                "changes": [
+                    {
+                        "path": "docs/long-edit.md",
+                        "kind": {"type": "add"},
+                        "diff": "# Long edit\n\nFirst paragraph.\nSecond paragraph.\n"
+                    },
+                    {
+                        "path": "src/main.rs",
+                        "kind": {"type": "update", "move_path": null},
+                        "diff": "@@ -1 +1 @@\n-old\n+new"
+                    }
+                ]
+            })),
+            input_ref: None,
+        },
+    ));
+
+    let rendered = transcript
+        .lines(120)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("✓ Edit"), "{rendered}");
+    assert!(rendered.contains("+ # Long edit"), "{rendered}");
+    assert!(rendered.contains("− old"), "{rendered}");
+    assert!(rendered.contains("+ new"), "{rendered}");
+    assert!(!rendered.contains("still assembling"), "{rendered}");
+    assert!(!rendered.contains("\"changes\""), "{rendered}");
 }
 
 #[test]
@@ -7553,12 +7611,32 @@ fn provider_progress_marks_an_unfinished_tool_as_background_work() {
     let row = transcript
         .lines(120)
         .into_iter()
-        .find(|line| line.to_string().contains("running in background"))
+        .find(|line| line.to_string().contains("Running in background"))
         .expect("background lifecycle row");
+    assert!(transcript.tool_activity_is_running(0));
     assert!(
         row.spans
             .iter()
             .any(|span| span.style.fg == Some(USER_LABEL_BLUE))
+    );
+    assert!(row.spans.iter().any(|span| {
+        span.content.contains("Running in background")
+            && span.style.fg == Some(BACKGROUND_RUNNING_TEXT)
+    }));
+
+    let mut animated = row.clone();
+    ToolActivityAnimation {
+        glyph: "⠹",
+        pulse_phase: RUNNING_PULSE_RADIUS,
+    }
+    .apply_header(&mut animated);
+    assert!(animated.to_string().contains('⠹'));
+    assert!(!animated.to_string().contains('↗'));
+    assert!(
+        animated
+            .spans
+            .iter()
+            .any(|span| { span.style.fg == Some(brighten_color(USER_LABEL_BLUE, 2)) })
     );
 }
 

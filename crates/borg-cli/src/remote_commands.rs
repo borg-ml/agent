@@ -4638,7 +4638,7 @@ async fn run_local_agent_session(
                                 Ok(action) => {
                                     let optimistic = matches!(
                                         &action,
-                                        GoalAction::Pause | GoalAction::Resume
+                                        GoalAction::Pause | GoalAction::Resume | GoalAction::Clear
                                     );
                                     let terminal = terminal.as_mut().expect("terminal");
                                     if optimistic {

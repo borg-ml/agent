@@ -155,6 +155,7 @@ fn edit_value_presentation(name: &str, value: &Value) -> Option<EditResultPresen
         _ => "Edit",
     };
     let detail = summarize_edit_paths(&paths).unwrap_or_else(|| "files".to_string());
+    let multi_file = paths.len() > 1;
     let language = if paths.len() == 1 {
         Path::new(paths[0])
             .extension()
@@ -171,7 +172,17 @@ fn edit_value_presentation(name: &str, value: &Value) -> Option<EditResultPresen
             language,
             text: rendered
                 .into_iter()
-                .map(|entry| entry.diff)
+                .map(|entry| {
+                    if multi_file {
+                        // Preserve each file boundary in a multi-file edit so
+                        // the terminal renderer can select the right syntax
+                        // grammar for every hunk. These control lines are not
+                        // shown as diff content.
+                        format!("*** Update File: {}\n{}", entry.path, entry.diff)
+                    } else {
+                        entry.diff
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join("\n"),
         },
@@ -2264,6 +2275,16 @@ mod tests {
         assert_eq!(edit.detail, "packed_oblivious_moe_frontier.rs + tests.rs");
         let input = edit.input.expect("native edit diff");
         assert_eq!(input.language, "diff");
+        assert!(
+            input.text.contains(
+                "*** Update File: /home/user/project/src/packed_oblivious_moe_frontier.rs"
+            )
+        );
+        assert!(
+            input
+                .text
+                .contains("*** Update File: /home/user/project/src/tests.rs")
+        );
         assert!(input.text.contains("-old\n+new"));
         assert!(input.text.contains("-old test\n+new test"));
     }

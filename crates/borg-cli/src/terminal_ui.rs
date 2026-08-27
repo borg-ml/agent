@@ -78,6 +78,7 @@ const SUBAGENT_PINK: Color = Color::Rgb(255, 105, 180);
 const SUBAGENT_PINK_HOVER: Color = Color::Rgb(255, 170, 215);
 const USER_LABEL_BLUE: Color = Color::Rgb(74, 163, 255);
 const USER_TEXT: Color = Color::Rgb(198, 228, 255);
+const BACKGROUND_RUNNING_TEXT: Color = Color::Rgb(142, 199, 255);
 const MESSAGE_BG: Color = Color::Rgb(33, 25, 29);
 const MESSAGE_HOVER_BG: Color = Color::Rgb(48, 36, 41);
 const MESSAGE_HORIZONTAL_PADDING: usize = 2;
@@ -3645,10 +3646,8 @@ impl BorgTerminal {
                         .goal_status_area
                         .is_some_and(|area| area.contains(pointer))
                 {
-                    return Ok(UiAction::Submit {
-                        target: None,
-                        text: GOAL_CLEAR_COMMAND.to_string(),
-                        attachments: Vec::new(),
+                    return Ok(UiAction::ToggleGoal {
+                        action: GoalAction::Clear,
                     });
                 }
                 if !background_hover_suppressed
@@ -5446,21 +5445,19 @@ impl BorgTerminal {
                 let scroll_start = scroll;
                 let show_history_loader = self.history_page_loading;
                 let visible_height = content_area.height as usize;
-                let sticky_tool_run_header = sticky_tool_run_header_row(
-                    tool_run_rows,
-                    scroll_start,
-                )
-                .map(|(index, row, expandable)| {
-                    let mut header = transcript[row].clone();
-                    if self.running_sweeps && self.transcript.tool_activity_is_running(index) {
-                        replace_tool_activity_glyph(
-                            &mut header,
-                            activity_glyph(SessionStatus::Running),
-                        );
-                        apply_running_activity_pulse(&mut header, tool_activity_pulse_phase());
-                    }
-                    (index, header, expandable)
-                });
+                let sticky_tool_run_header =
+                    sticky_tool_run_header_row(tool_run_rows, scroll_start).map(
+                        |(index, row, expandable)| {
+                            let mut header = transcript[row].clone();
+                            if let Some(animation) = tool_activity_animation(
+                                self.running_sweeps,
+                                self.transcript.tool_activity_is_running(index),
+                            ) {
+                                animation.apply_header(&mut header);
+                            }
+                            (index, header, expandable)
+                        },
+                    );
                 let sticky_index = tool_rows.partition_point(|(_, start, _)| *start < scroll_start);
                 let sticky_tool_header = if sticky_tool_run_header.is_some() {
                     None
@@ -5471,17 +5468,11 @@ impl BorgTerminal {
                         .filter(|(_, _, end)| *end > scroll_start)
                         .map(|(index, start, _)| {
                             let mut header = transcript[*start].clone();
-                            if self.running_sweeps
-                                && self.transcript.tool_activity_is_running(*index)
-                            {
-                                replace_tool_activity_glyph(
-                                    &mut header,
-                                    activity_glyph(SessionStatus::Running),
-                                );
-                                apply_running_activity_pulse(
-                                    &mut header,
-                                    tool_activity_pulse_phase(),
-                                );
+                            if let Some(animation) = tool_activity_animation(
+                                self.running_sweeps,
+                                self.transcript.tool_activity_is_running(*index),
+                            ) {
+                                animation.apply_header(&mut header);
                             }
                             (*index, header)
                         })
@@ -5493,12 +5484,14 @@ impl BorgTerminal {
                     .cloned()
                     .collect::<Vec<_>>();
                 let mut visible_transcript = visible_transcript;
-                let tool_activity_phase = tool_activity_pulse_phase();
                 let visible_end = scroll_start.saturating_add(visible_height);
                 for (index, start, end) in
                     visible_row_ranges(tool_rows, scroll_start, visible_height)
                 {
-                    if self.running_sweeps && self.transcript.tool_activity_is_running(*index) {
+                    if let Some(animation) = tool_activity_animation(
+                        self.running_sweeps,
+                        self.transcript.tool_activity_is_running(*index),
+                    ) {
                         let content_width = transcript[*start..*end]
                             .iter()
                             .map(running_activity_content_width)
@@ -5506,17 +5499,7 @@ impl BorgTerminal {
                             .unwrap_or(0);
                         for row in (*start).max(scroll_start)..(*end).min(visible_end) {
                             if let Some(line) = visible_transcript.get_mut(row - scroll_start) {
-                                if row == *start {
-                                    replace_tool_activity_glyph(
-                                        line,
-                                        activity_glyph(SessionStatus::Running),
-                                    );
-                                }
-                                apply_running_activity_pulse_with_width(
-                                    line,
-                                    tool_activity_phase,
-                                    content_width,
-                                );
+                                animation.apply(line, row == *start, content_width);
                             }
                         }
                     }
@@ -9652,9 +9635,13 @@ fn selection_line_ranges(line: &Line<'static>) -> Vec<(usize, usize)> {
 fn diff_selection_ranges(line: &Line<'static>) -> Option<Vec<(usize, usize)>> {
     let markers = ["│ + ", "│ − ", "│   ", "+ ", "− "];
     let mut span_start = 0usize;
-    let mut matches = Vec::new();
+    let mut starts = Vec::new();
+    let mut split_separator = None;
     for span in &line.spans {
         let content = span.content.as_ref();
+        if content == " │ " {
+            split_separator = Some(span_start);
+        }
         if content.starts_with("│   │ ") {
             span_start = span_start.saturating_add(span.width());
             continue;
@@ -9667,37 +9654,45 @@ fn diff_selection_ranges(line: &Line<'static>) -> Option<Vec<(usize, usize)>> {
                 let start = span_start.saturating_add(UnicodeWidthStr::width(
                     &content[..marker_start + marker.len()],
                 ));
-                let end = span_start.saturating_add(UnicodeWidthStr::width(content.trim_end()));
-                matches.push((start, end));
+                starts.push(start);
                 break;
             }
         }
         span_start = span_start.saturating_add(span.width());
     }
-    if matches.is_empty() {
+    if starts.is_empty() {
         return None;
     }
-    let split_layout = line.spans.iter().any(|span| span.content.as_ref() == " │ ");
-    if split_layout {
-        return Some(
-            matches
-                .into_iter()
-                .filter(|(start, end)| start < end)
-                .collect(),
-        );
-    }
-    if matches.len() == 1 {
-        return Some(vec![(
-            matches[0].0,
-            UnicodeWidthStr::width(line.to_string().trim_end()),
-        )]);
-    }
+    let rendered = line.to_string();
+    let width = line.width();
     Some(
-        matches
+        starts
             .into_iter()
+            .map(|start| {
+                let pane_end = split_separator
+                    .filter(|separator| start < *separator)
+                    .unwrap_or(width);
+                (start, trimmed_cell_end(&rendered, start, pane_end))
+            })
             .filter(|(start, end)| start < end)
             .collect(),
     )
+}
+
+fn trimmed_cell_end(value: &str, start: usize, end: usize) -> usize {
+    let mut column = 0usize;
+    let mut trimmed_end = start;
+    for grapheme in value.graphemes(true) {
+        let next = column.saturating_add(grapheme.width());
+        if column >= end {
+            break;
+        }
+        if next > start && !grapheme.chars().all(char::is_whitespace) {
+            trimmed_end = next.min(end);
+        }
+        column = next;
+    }
+    trimmed_end
 }
 
 fn string_after_cells(value: &str, cells: usize) -> &str {
@@ -11925,19 +11920,20 @@ fn activity_glyph(status: SessionStatus) -> &'static str {
 }
 
 fn replace_tool_activity_glyph(line: &mut Line<'static>, glyph: &str) {
-    let Some(span) = line
-        .spans
-        .iter_mut()
-        .find(|span| span.content.contains('◇'))
-    else {
+    let Some((span, marker)) = line.spans.iter_mut().find_map(|span| {
+        ['◇', '↗']
+            .into_iter()
+            .find(|marker| span.content.contains(*marker))
+            .map(|marker| (span, marker))
+    }) else {
         return;
     };
     let start = span
         .content
-        .find('◇')
+        .find(marker)
         .expect("glyph-containing span was selected");
     let mut content = span.content.to_string();
-    content.replace_range(start..start + '◇'.len_utf8(), glyph);
+    content.replace_range(start..start + marker.len_utf8(), glyph);
     span.content = Cow::Owned(content);
 }
 
@@ -11945,6 +11941,37 @@ const RUNNING_PULSE_RADIUS: usize = 2;
 const TOOL_ACTIVITY_PULSE_STEP_MILLIS: u128 = 20;
 const RUNNING_STATUS_PULSE_STEP_MILLIS: u128 = 80;
 const RUNNING_PULSE_PAUSE_STEPS: usize = 32;
+
+#[derive(Clone, Copy)]
+struct ToolActivityAnimation {
+    glyph: &'static str,
+    pulse_phase: usize,
+}
+
+impl ToolActivityAnimation {
+    fn current() -> Self {
+        Self {
+            glyph: activity_glyph(SessionStatus::Running),
+            pulse_phase: tool_activity_pulse_phase(),
+        }
+    }
+
+    fn apply_header(self, line: &mut Line<'static>) {
+        let content_width = running_activity_content_width(line);
+        self.apply(line, true, content_width);
+    }
+
+    fn apply(self, line: &mut Line<'static>, replace_glyph: bool, content_width: usize) {
+        if replace_glyph {
+            replace_tool_activity_glyph(line, self.glyph);
+        }
+        apply_running_activity_pulse_with_width(line, self.pulse_phase, content_width);
+    }
+}
+
+fn tool_activity_animation(enabled: bool, running: bool) -> Option<ToolActivityAnimation> {
+    (enabled && running).then(ToolActivityAnimation::current)
+}
 
 fn tool_activity_pulse_phase() -> usize {
     activity_pulse_phase(TOOL_ACTIVITY_PULSE_STEP_MILLIS)

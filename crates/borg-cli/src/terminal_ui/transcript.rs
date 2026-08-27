@@ -46,6 +46,34 @@ fn line_is_unstyled_blank(line: &Line<'static>) -> bool {
     line.spans.is_empty()
 }
 
+fn extend_tool_lifecycle_spans(
+    spans: &mut Vec<Span<'static>>,
+    text: &str,
+    lifecycle: Option<&str>,
+    style: Style,
+    backgrounded: bool,
+) {
+    let lifecycle_match = backgrounded
+        .then_some(lifecycle)
+        .flatten()
+        .and_then(|lifecycle| text.rfind(lifecycle).map(|start| (lifecycle, start)));
+    let Some((lifecycle, lifecycle_start)) = lifecycle_match else {
+        spans.push(Span::styled(text.to_string(), style));
+        return;
+    };
+    let lifecycle_end = lifecycle_start + lifecycle.len();
+    if lifecycle_start > 0 {
+        spans.push(Span::styled(text[..lifecycle_start].to_string(), style));
+    }
+    spans.push(Span::styled(
+        text[lifecycle_start..lifecycle_end].to_string(),
+        Style::default().fg(BACKGROUND_RUNNING_TEXT),
+    ));
+    if lifecycle_end < text.len() {
+        spans.push(Span::styled(text[lifecycle_end..].to_string(), style));
+    }
+}
+
 struct Transcript {
     order: Vec<TranscriptEntry>,
     messages: HashMap<Uuid, usize>,
@@ -481,6 +509,9 @@ impl Transcript {
     }
 
     fn optimistically_apply_goal_action(&mut self, action: &GoalAction) -> bool {
+        if matches!(action, GoalAction::Clear) {
+            return self.goal.take().is_some();
+        }
         let updated_goal = {
             let Some(goal) = self.goal.as_mut() else {
                 return false;
@@ -1379,6 +1410,19 @@ impl Transcript {
                             .output
                             .filter(|body| is_diff_language(&body.language))
                         {
+                            *name = completion_presentation.label;
+                            *detail = completion_presentation.detail;
+                            *code_view = Some((body.language, body.text));
+                            *output_view = None;
+                            *expanded = auto_expand_edits;
+                        } else if let Some(body) = completion_presentation
+                            .input
+                            .filter(|body| is_diff_language(&body.language))
+                        {
+                            // Some providers start a tool before its input is
+                            // complete, then attach the authoritative edit
+                            // envelope to ToolCompleted. Replace the stale
+                            // JSON preview with the parsed diff.
                             *name = completion_presentation.label;
                             *detail = completion_presentation.detail;
                             *code_view = Some((body.language, body.text));
@@ -2326,7 +2370,6 @@ impl Transcript {
                 complete: false,
                 error: false,
                 user_interrupted: false,
-                backgrounded: false,
                 ..
             }) if !tool_action_is_instant(
                 name,
@@ -3079,7 +3122,7 @@ impl Transcript {
                     let lifecycle = if *user_interrupted {
                         Some("user interrupted")
                     } else if *backgrounded {
-                        Some("running in background")
+                        Some("Running in background")
                     } else if !*complete
                         && !is_reasoning
                         && pending_tool_label(name).as_ref() == name
@@ -3093,7 +3136,11 @@ impl Transcript {
                     } else {
                         pending_tool_label(name)
                     };
-                    let show_tool_body = *complete || !is_edit;
+                    let show_tool_body = *complete
+                        || !is_edit
+                        || code_view
+                            .as_ref()
+                            .is_some_and(|(language, _)| is_diff_language(language));
                     let mut summary = if detail.is_empty() {
                         format!("{time}  {glyph} {display_name}")
                     } else {
@@ -3113,17 +3160,29 @@ impl Transcript {
                             && let Some(name_start) = line.find(display_name.as_ref())
                         {
                             let name_end = name_start + display_name.len();
-                            lines.push(Line::from(vec![
+                            let mut spans = vec![
                                 Span::styled(prefix.to_string(), gutter_style),
                                 Span::styled(line[..name_start].to_string(), style),
                                 Span::styled(display_name.to_string(), name_style),
-                                Span::styled(line[name_end..].to_string(), style),
-                            ]));
+                            ];
+                            extend_tool_lifecycle_spans(
+                                &mut spans,
+                                &line[name_end..],
+                                lifecycle,
+                                style,
+                                *backgrounded,
+                            );
+                            lines.push(Line::from(spans));
                         } else {
-                            lines.push(Line::from(vec![
-                                Span::styled(prefix.to_string(), gutter_style),
-                                Span::styled(line, style),
-                            ]));
+                            let mut spans = vec![Span::styled(prefix.to_string(), gutter_style)];
+                            extend_tool_lifecycle_spans(
+                                &mut spans,
+                                &line,
+                                lifecycle,
+                                style,
+                                *backgrounded,
+                            );
+                            lines.push(Line::from(spans));
                         }
                     }
                     if hovered_tool == Some(index) {

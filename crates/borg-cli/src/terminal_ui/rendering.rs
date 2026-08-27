@@ -5,7 +5,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Color as SyntectColor, Theme, ThemeSet};
-use syntect::parsing::SyntaxSet;
+use syntect::parsing::{SyntaxDefinition, SyntaxReference, SyntaxSet};
 use unicode_width::UnicodeWidthStr;
 
 const SPLIT_DIFF_MIN_WIDTH: usize = 160;
@@ -13,6 +13,47 @@ const CODE_GUTTER_WIDTH: usize = 5;
 const DIFF_NUMBER_WIDTH: usize = 4;
 const DIFF_ADDED_BG: Color = Color::Rgb(25, 57, 39);
 const DIFF_REMOVED_BG: Color = Color::Rgb(67, 31, 34);
+const TOML_SYNTAX: &str = r#"%YAML 1.2
+---
+name: TOML
+file_extensions: [toml, tml]
+scope: source.toml
+contexts:
+  main:
+    - match: '#.*$'
+      scope: comment.line.number-sign.toml
+    - match: '^\s*(\[+)([^\]]+)(\]+)'
+      captures:
+        1: punctuation.section.brackets.begin.toml
+        2: entity.name.section.toml
+        3: punctuation.section.brackets.end.toml
+    - match: '^\s*([A-Za-z0-9_.-]+)\s*(=)'
+      captures:
+        1: meta.mapping.key.toml
+        2: punctuation.separator.key-value.toml
+    - match: '"'
+      scope: punctuation.definition.string.begin.toml
+      push: double-quoted-string
+    - match: "'"
+      scope: punctuation.definition.string.begin.toml
+      push: single-quoted-string
+    - match: '\b(?:true|false)\b'
+      scope: constant.language.boolean.toml
+    - match: '[-+]?\b(?:0x[0-9A-Fa-f_]+|0o[0-7_]+|0b[01_]+|[0-9][0-9_.eE+-]*)\b'
+      scope: constant.numeric.toml
+  double-quoted-string:
+    - meta_scope: string.quoted.double.toml
+    - match: '\\.'
+      scope: constant.character.escape.toml
+    - match: '"'
+      scope: punctuation.definition.string.end.toml
+      pop: true
+  single-quoted-string:
+    - meta_scope: string.quoted.single.toml
+    - match: "'"
+      scope: punctuation.definition.string.end.toml
+      pop: true
+"#;
 
 pub(super) fn code_block_lines(language: &str, source: &str, width: usize) -> Vec<Line<'static>> {
     let language = language
@@ -151,9 +192,7 @@ fn colored_plain_lines(source: &str, width: usize, color: Color) -> Vec<Line<'st
 
 fn syntax_lines(language: &str, source: &str, width: usize) -> Vec<Line<'static>> {
     let (syntaxes, theme) = syntax_assets();
-    let syntax = syntaxes
-        .find_syntax_by_token(language)
-        .or_else(|| syntaxes.find_syntax_by_extension(language))
+    let syntax = syntax_for_language(syntaxes, language)
         .unwrap_or_else(|| syntaxes.find_syntax_plain_text());
     let mut highlighter = HighlightLines::new(syntax, theme);
     let digits = source.lines().count().max(1).to_string().len();
@@ -196,9 +235,31 @@ fn syntax_lines(language: &str, source: &str, width: usize) -> Vec<Line<'static>
 fn syntax_assets() -> (&'static SyntaxSet, &'static Theme) {
     static SYNTAXES: OnceLock<SyntaxSet> = OnceLock::new();
     static THEMES: OnceLock<ThemeSet> = OnceLock::new();
-    let syntaxes = SYNTAXES.get_or_init(SyntaxSet::load_defaults_newlines);
+    let syntaxes = SYNTAXES.get_or_init(|| {
+        let mut builder = SyntaxSet::load_defaults_newlines().into_builder();
+        builder.add(
+            SyntaxDefinition::load_from_str(TOML_SYNTAX, true, Some("TOML"))
+                .expect("embedded TOML syntax definition must parse"),
+        );
+        builder.build()
+    });
     let themes = THEMES.get_or_init(ThemeSet::load_defaults);
     (syntaxes, &themes.themes["base16-ocean.dark"])
+}
+
+fn syntax_for_language<'a>(syntaxes: &'a SyntaxSet, language: &str) -> Option<&'a SyntaxReference> {
+    syntaxes
+        .find_syntax_by_token(language)
+        .or_else(|| syntaxes.find_syntax_by_extension(language))
+        .or_else(|| match language {
+            // Syntect's compact default catalog omits TypeScript. JavaScript
+            // still highlights the shared syntax instead of dropping these
+            // very common diffs to plain text.
+            "ts" | "tsx" | "mts" | "cts" | "typescript" => syntaxes
+                .find_syntax_by_extension("js")
+                .or_else(|| syntaxes.find_syntax_by_token("javascript")),
+            _ => None,
+        })
 }
 
 fn diff_lines(source: &str, width: usize, source_language: Option<&str>) -> Vec<Line<'static>> {
@@ -207,7 +268,7 @@ fn diff_lines(source: &str, width: usize, source_language: Option<&str>) -> Vec<
         && source.lines().any(|line| hunk_starts(line).is_some())
         && !source.lines().any(is_apply_patch_control_line)
     {
-        split_diff_lines(source, width)
+        split_diff_lines(source, width, source_language)
     } else {
         unified_diff_lines(source, width, source_language)
     }
@@ -240,18 +301,14 @@ fn unified_diff_lines(
     let number_width = diff_number_width(source);
     let (syntaxes, theme) = syntax_assets();
     let mut highlighter = source_language
-        .and_then(|language| {
-            syntaxes
-                .find_syntax_by_token(language)
-                .or_else(|| syntaxes.find_syntax_by_extension(language))
-        })
+        .and_then(|language| syntax_for_language(syntaxes, language))
         .map(|syntax| HighlightLines::new(syntax, theme));
     let show_line_numbers = source.lines().any(|line| hunk_starts(line).is_some());
     for raw in source.lines() {
         if let Some(path) = diff_file_path(raw) {
             highlighter = path
                 .rsplit_once('.')
-                .and_then(|(_, extension)| syntaxes.find_syntax_by_extension(extension))
+                .and_then(|(_, extension)| syntax_for_language(syntaxes, extension))
                 .map(|syntax| HighlightLines::new(syntax, theme));
             continue;
         }
@@ -341,7 +398,28 @@ fn highlighted_diff_line(
         prefix.clone(),
         base_style.fg(marker_color).add_modifier(Modifier::BOLD),
     )];
-    let mut remaining = width.saturating_sub(UnicodeWidthStr::width(prefix.as_str()));
+    let remaining = width.saturating_sub(UnicodeWidthStr::width(prefix.as_str()));
+    spans.extend(highlighted_source_spans(
+        text,
+        highlighter,
+        syntaxes,
+        base_style,
+        Color::Gray,
+        remaining,
+    ));
+    Line::from(spans)
+}
+
+fn highlighted_source_spans(
+    text: &str,
+    highlighter: Option<&mut HighlightLines<'static>>,
+    syntaxes: &SyntaxSet,
+    base_style: Style,
+    fallback_color: Color,
+    width: usize,
+) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut remaining = width;
     let line = format!("{text}\n");
     let highlighted =
         highlighter.and_then(|highlighter| highlighter.highlight_line(&line, syntaxes).ok());
@@ -361,16 +439,16 @@ fn highlighted_diff_line(
     } else {
         let content = truncate_cells(text, remaining);
         remaining = remaining.saturating_sub(UnicodeWidthStr::width(content.as_str()));
-        spans.push(Span::styled(content, base_style.fg(Color::Gray)));
+        spans.push(Span::styled(content, base_style.fg(fallback_color)));
     }
     if remaining > 0 {
         spans.push(Span::styled(" ".repeat(remaining), base_style));
     }
-    Line::from(spans)
+    spans
 }
 
 fn diff_file_path(line: &str) -> Option<&str> {
-    [
+    let path = [
         "*** Update File: ",
         "*** Add File: ",
         "*** Delete File: ",
@@ -378,7 +456,8 @@ fn diff_file_path(line: &str) -> Option<&str> {
     ]
     .into_iter()
     .find_map(|prefix| line.strip_prefix(prefix))
-    .filter(|path| *path != "/dev/null")
+    .or_else(|| line.strip_prefix("+++ "))?;
+    (path != "/dev/null").then_some(path)
 }
 
 fn is_apply_patch_control_line(line: &str) -> bool {
@@ -391,12 +470,17 @@ fn is_apply_patch_control_line(line: &str) -> bool {
         || line.starts_with("*** Move to: ")
 }
 
-fn split_diff_lines(source: &str, width: usize) -> Vec<Line<'static>> {
+fn split_diff_lines(
+    source: &str,
+    width: usize,
+    source_language: Option<&str>,
+) -> Vec<Line<'static>> {
     let pane = width.saturating_sub(3) / 2;
     let number_width = diff_number_width(source);
     let mut output = Vec::new();
     let mut pending_removed: VecDeque<(Option<usize>, &str)> = VecDeque::new();
     let (mut old_line, mut new_line) = (None, None);
+    let mut syntax = SplitDiffSyntax::new(source_language);
 
     for raw in source.lines() {
         if raw.starts_with("---") || raw.starts_with("+++") || diff_file_path(raw).is_some() {
@@ -404,7 +488,15 @@ fn split_diff_lines(source: &str, width: usize) -> Vec<Line<'static>> {
         }
         if let Some((old, new)) = hunk_starts(raw) {
             for (number, before) in pending_removed.drain(..) {
-                output.push(split_diff_row(number, before, None, "", pane, number_width));
+                output.push(split_diff_row(
+                    number,
+                    before,
+                    None,
+                    "",
+                    pane,
+                    number_width,
+                    &mut syntax,
+                ));
             }
             old_line = Some(old);
             new_line = Some(new);
@@ -424,12 +516,21 @@ fn split_diff_lines(source: &str, width: usize) -> Vec<Line<'static>> {
                 raw.strip_prefix('+').unwrap_or(raw),
                 pane,
                 number_width,
+                &mut syntax,
             ));
             new_line = new_line.map(|line| line + 1);
             continue;
         }
         for (number, before) in pending_removed.drain(..) {
-            output.push(split_diff_row(number, before, None, "", pane, number_width));
+            output.push(split_diff_row(
+                number,
+                before,
+                None,
+                "",
+                pane,
+                number_width,
+                &mut syntax,
+            ));
         }
         let text = raw.strip_prefix(' ').unwrap_or(raw);
         output.push(split_context_row(
@@ -438,14 +539,41 @@ fn split_diff_lines(source: &str, width: usize) -> Vec<Line<'static>> {
             text,
             pane,
             number_width,
+            &mut syntax,
         ));
         old_line = old_line.map(|line| line + 1);
         new_line = new_line.map(|line| line + 1);
     }
     for (number, before) in pending_removed {
-        output.push(split_diff_row(number, before, None, "", pane, number_width));
+        output.push(split_diff_row(
+            number,
+            before,
+            None,
+            "",
+            pane,
+            number_width,
+            &mut syntax,
+        ));
     }
     output
+}
+
+struct SplitDiffSyntax {
+    syntaxes: &'static SyntaxSet,
+    before: Option<HighlightLines<'static>>,
+    after: Option<HighlightLines<'static>>,
+}
+
+impl SplitDiffSyntax {
+    fn new(source_language: Option<&str>) -> Self {
+        let (syntaxes, theme) = syntax_assets();
+        let syntax = source_language.and_then(|language| syntax_for_language(syntaxes, language));
+        Self {
+            syntaxes,
+            before: syntax.map(|syntax| HighlightLines::new(syntax, theme)),
+            after: syntax.map(|syntax| HighlightLines::new(syntax, theme)),
+        }
+    }
 }
 
 fn split_diff_row(
@@ -455,30 +583,70 @@ fn split_diff_row(
     after: &str,
     pane: usize,
     number_width: usize,
+    syntax: &mut SplitDiffSyntax,
 ) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(
-            pad_cells(
-                &format!("{} │ − {before}", diff_number(before_number, number_width)),
-                pane,
-            ),
-            before_number.map_or_else(
-                || Style::default().fg(Color::DarkGray),
-                |_| Style::default().fg(Color::White).bg(DIFF_REMOVED_BG),
-            ),
-        ),
-        Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            pad_cells(
-                &format!("{} │ + {after}", diff_number(after_number, number_width)),
-                pane,
-            ),
-            after_number.map_or_else(
-                || Style::default().fg(Color::DarkGray),
-                |_| Style::default().fg(Color::White).bg(DIFF_ADDED_BG),
-            ),
-        ),
-    ])
+    let mut spans = split_diff_pane(
+        before_number,
+        '−',
+        before,
+        pane,
+        number_width,
+        DIFF_REMOVED_BG,
+        syntax.before.as_mut(),
+        syntax.syntaxes,
+    );
+    spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
+    spans.extend(split_diff_pane(
+        after_number,
+        '+',
+        after,
+        pane,
+        number_width,
+        DIFF_ADDED_BG,
+        syntax.after.as_mut(),
+        syntax.syntaxes,
+    ));
+    Line::from(spans)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn split_diff_pane(
+    number: Option<usize>,
+    marker: char,
+    text: &str,
+    width: usize,
+    number_width: usize,
+    background: Color,
+    highlighter: Option<&mut HighlightLines<'static>>,
+    syntaxes: &SyntaxSet,
+) -> Vec<Span<'static>> {
+    let prefix = format!("{} │ {marker} ", diff_number(number, number_width));
+    let content_width = width.saturating_sub(UnicodeWidthStr::width(prefix.as_str()));
+    let Some(_) = number else {
+        return vec![Span::styled(
+            pad_cells(&prefix, width),
+            Style::default().fg(Color::DarkGray),
+        )];
+    };
+    let base_style = Style::default().bg(background);
+    let marker_color = if marker == '+' {
+        Color::LightGreen
+    } else {
+        Color::LightRed
+    };
+    let mut spans = vec![Span::styled(
+        prefix,
+        base_style.fg(marker_color).add_modifier(Modifier::BOLD),
+    )];
+    spans.extend(highlighted_source_spans(
+        text,
+        highlighter,
+        syntaxes,
+        base_style,
+        Color::White,
+        content_width,
+    ));
+    spans
 }
 
 fn split_context_row(
@@ -487,20 +655,48 @@ fn split_context_row(
     text: &str,
     pane: usize,
     number_width: usize,
+    syntax: &mut SplitDiffSyntax,
 ) -> Line<'static> {
-    let before = pad_cells(
-        &format!("{} │   {text}", diff_number(old_number, number_width)),
+    let mut spans = split_context_pane(
+        old_number,
+        text,
         pane,
+        number_width,
+        syntax.before.as_mut(),
+        syntax.syntaxes,
     );
-    let after = pad_cells(
-        &format!("{} │   {text}", diff_number(new_number, number_width)),
+    spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
+    spans.extend(split_context_pane(
+        new_number,
+        text,
         pane,
-    );
-    Line::from(vec![
-        Span::styled(before, Style::default().fg(Color::Gray)),
-        Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
-        Span::styled(after, Style::default().fg(Color::Gray)),
-    ])
+        number_width,
+        syntax.after.as_mut(),
+        syntax.syntaxes,
+    ));
+    Line::from(spans)
+}
+
+fn split_context_pane(
+    number: Option<usize>,
+    text: &str,
+    width: usize,
+    number_width: usize,
+    highlighter: Option<&mut HighlightLines<'static>>,
+    syntaxes: &SyntaxSet,
+) -> Vec<Span<'static>> {
+    let prefix = format!("{} │   ", diff_number(number, number_width));
+    let content_width = width.saturating_sub(UnicodeWidthStr::width(prefix.as_str()));
+    let mut spans = vec![Span::styled(prefix, Style::default().fg(Color::DarkGray))];
+    spans.extend(highlighted_source_spans(
+        text,
+        highlighter,
+        syntaxes,
+        Style::default(),
+        Color::Gray,
+        content_width,
+    ));
+    spans
 }
 
 fn diagnostic_lines(source: &str, width: usize) -> Vec<Line<'static>> {
@@ -886,6 +1082,47 @@ mod tests {
     }
 
     #[test]
+    fn multi_file_diff_switches_syntax_for_yaml_and_toml_hunks() {
+        let diff = "*** Update File: config/app.yaml\n@@ -1 +1 @@\n-enabled: false\n+enabled: true\n*** Update File: Cargo.toml\n@@ -1 +1 @@\n-name = \"old\"\n+name = \"borg\"";
+        let lines = code_block_lines("diff", diff, 100);
+
+        for content in ["enabled: true", "name = \"borg\""] {
+            let added = lines
+                .iter()
+                .find(|line| line.to_string().contains(content))
+                .unwrap_or_else(|| panic!("missing highlighted line: {content}"));
+            assert!(
+                added
+                    .spans
+                    .iter()
+                    .any(|span| matches!(span.style.fg, Some(Color::Rgb(_, _, _)))),
+                "{content} should retain a syntax foreground: {added:?}"
+            );
+            assert!(
+                added
+                    .spans
+                    .iter()
+                    .any(|span| span.style.bg == Some(DIFF_ADDED_BG)),
+                "{content} should retain the addition background: {added:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_syntax_catalog_covers_common_diff_filetypes() {
+        let (syntaxes, _) = syntax_assets();
+        for extension in [
+            "yaml", "yml", "toml", "rs", "py", "js", "ts", "tsx", "go", "java", "c", "cpp", "cs",
+            "rb", "php", "sh",
+        ] {
+            assert!(
+                syntax_for_language(syntaxes, extension).is_some(),
+                "missing syntax grammar for .{extension}"
+            );
+        }
+    }
+
+    #[test]
     fn wide_numbered_diff_uses_split_layout_with_a_language_hint() {
         let diff = "@@ -1 +1 @@\n-fn old() {}\n+fn main() {}";
         let lines = code_block_lines("diff:rs", diff, 180);
@@ -895,6 +1132,17 @@ mod tests {
                 .iter()
                 .any(|line| line.to_string().matches('│').count() == 3),
             "wide numbered diff should use before/after panes: {lines:?}"
+        );
+        let changed = lines
+            .iter()
+            .find(|line| line.to_string().contains("fn main"))
+            .expect("split changed row");
+        assert!(
+            changed.spans.iter().any(|span| {
+                span.style.bg == Some(DIFF_ADDED_BG)
+                    && matches!(span.style.fg, Some(Color::Rgb(_, _, _)))
+            }),
+            "split diff should retain syntax and change colors: {changed:?}"
         );
     }
 
