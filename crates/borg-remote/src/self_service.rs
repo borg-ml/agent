@@ -1822,7 +1822,7 @@ fn retrieval_adapter_revision(
     if let Some(tests) = tests {
         digest.update(tests.as_bytes());
     }
-    format!("{:x}", digest.finalize())
+    hex::encode(digest.finalize())
 }
 
 fn retrieval_adapter_package_revision(package: &Path) -> Result<String> {
@@ -1935,7 +1935,7 @@ fn extension_revision(
         "workflow_name": workflow_name,
         "workflow_source": workflow_source,
     });
-    format!("{:x}", Sha256::digest(input.to_string().as_bytes()))
+    hex::encode(Sha256::digest(input.to_string().as_bytes()))
 }
 
 fn plugin_revision(args: &CreatePluginArgs, version: &str) -> String {
@@ -1945,7 +1945,7 @@ fn plugin_revision(args: &CreatePluginArgs, version: &str) -> String {
         "description": args.description,
         "instructions": args.instructions,
     });
-    format!("{:x}", Sha256::digest(input.to_string().as_bytes()))
+    hex::encode(Sha256::digest(input.to_string().as_bytes()))
 }
 
 fn plugin_version_and_revision(content: &str) -> (Option<String>, Option<String>) {
@@ -1971,7 +1971,10 @@ fn plugin_package_revision(package: &Path) -> Result<String> {
         validate_extension_revision(&revision)?;
         return Ok(revision);
     }
-    Ok(format!("legacy-{:x}", Sha256::digest(content.as_bytes())))
+    Ok(format!(
+        "legacy-{}",
+        hex::encode(Sha256::digest(content.as_bytes()))
+    ))
 }
 
 fn package_revision(package: &Path) -> Result<String> {
@@ -1984,7 +1987,10 @@ fn package_revision(package: &Path) -> Result<String> {
         validate_extension_revision(revision)?;
         return Ok(revision.to_string());
     }
-    Ok(format!("legacy-{:x}", Sha256::digest(source.as_bytes())))
+    Ok(format!(
+        "legacy-{}",
+        hex::encode(Sha256::digest(source.as_bytes()))
+    ))
 }
 
 fn yaml_scalar(value: &str) -> String {

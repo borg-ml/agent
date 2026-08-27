@@ -1935,7 +1935,7 @@ impl SqliteSessionStore {
             state_json.len() <= MAX_RUNTIME_CHECKPOINT_BYTES,
             "runtime checkpoint exceeds {MAX_RUNTIME_CHECKPOINT_BYTES} bytes"
         );
-        let content_hash = format!("sha256:{:x}", Sha256::digest(&state_json));
+        let content_hash = format!("sha256:{}", hex::encode(Sha256::digest(&state_json)));
         let mut transaction = self.begin_write().await?;
         let manifest_exists: i64 = sqlx::query_scalar(
             "select exists(select 1 from runtime_manifests where session_id=? and worker_id=?)",
@@ -2083,7 +2083,7 @@ impl SqliteSessionStore {
             state_json.len() <= MAX_RUNTIME_CHECKPOINT_BYTES,
             "harness state exceeds {MAX_RUNTIME_CHECKPOINT_BYTES} bytes"
         );
-        let content_hash = format!("sha256:{:x}", Sha256::digest(&state_json));
+        let content_hash = format!("sha256:{}", hex::encode(Sha256::digest(&state_json)));
         let mut transaction = self.begin_write().await?;
         let revision: i64 = sqlx::query_scalar(
             "select coalesce(max(revision), 0) + 1 from runtime_checkpoints where session_id=?",
@@ -4219,7 +4219,11 @@ fn decode_runtime_checkpoint(row: &SqliteRow) -> Result<RuntimeCheckpoint> {
     );
     let content_hash: String = row.try_get("content_hash")?;
     ensure!(
-        content_hash == format!("sha256:{:x}", Sha256::digest(state_json.as_bytes())),
+        content_hash
+            == format!(
+                "sha256:{}",
+                hex::encode(Sha256::digest(state_json.as_bytes()))
+            ),
         "runtime checkpoint content hash does not match its state"
     );
     Ok(RuntimeCheckpoint {

@@ -651,7 +651,7 @@ fn discover_in_dirs(
 
     let extensions = candidates.into_iter().map(effective).collect();
     let catalog = ExtensionCatalog {
-        revision: format!("{:x}", digest.finalize()),
+        revision: hex::encode(digest.finalize()),
         load_order,
         extensions,
         diagnostics,
@@ -1239,7 +1239,7 @@ fn load_native_extension(
     config: &BTreeMap<String, toml::Value>,
 ) -> Result<()> {
     let path = package_root.join(&native.library).canonicalize()?;
-    let actual = format!("{:x}", Sha256::digest(fs::read(&path)?));
+    let actual = hex::encode(Sha256::digest(fs::read(&path)?));
     ensure!(
         actual.eq_ignore_ascii_case(&native.sha256),
         "native library hash mismatch for {}",
@@ -2388,7 +2388,7 @@ mod tests {
         fs::create_dir_all(&package).unwrap();
         let library = package.join("example.bin");
         fs::write(&library, b"not loaded while approval is pending").unwrap();
-        let sha256 = format!("{:x}", Sha256::digest(fs::read(&library).unwrap()));
+        let sha256 = hex::encode(Sha256::digest(fs::read(&library).unwrap()));
         fs::write(
             package.join("blu.toml"),
             format!(

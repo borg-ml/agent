@@ -1748,7 +1748,7 @@ return borg_plugin_store(2, "{\"op\":\"commit\",\"scope\":\"session\",\"idempote
         assert_eq!(receipt["replayed"], false);
         assert_eq!(
             receipt["artifacts"][0]["content_hash"],
-            format!("sha256:{:x}", Sha256::digest(br#"{"ok":true}"#))
+            format!("sha256:{}", hex::encode(Sha256::digest(br#"{"ok":true}"#)))
         );
         assert_eq!(first, runner.run(request).await.expect("workflow replay"));
 

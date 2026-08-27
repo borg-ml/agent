@@ -763,7 +763,7 @@ impl NativeModelClient for CompatibleModelClient {
             | crate::CodingProvider::OpenCode => {
                 return Err(ProviderCallError {
                     message: format!("{provider:?} does not use Borg's native model client"),
-                    trace: ProviderAttemptTrace {
+                    trace: Box::new(ProviderAttemptTrace {
                         invocation: ProviderInvocation {
                             provider_label: "native".to_string(),
                             executable: String::new(),
@@ -775,7 +775,7 @@ impl NativeModelClient for CompatibleModelClient {
                         exit_status: Some(1),
                         stdout: String::new(),
                         stderr: "invalid native provider".to_string(),
-                    },
+                    }),
                     session_id: None,
                 });
             }

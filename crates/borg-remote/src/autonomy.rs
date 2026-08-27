@@ -1273,7 +1273,7 @@ fn checkpoint_hash(state_json: &str, evidence_json: &str) -> String {
     hasher.update(state_json.as_bytes());
     hasher.update([0]);
     hasher.update(evidence_json.as_bytes());
-    format!("sha256:{:x}", hasher.finalize())
+    format!("sha256:{}", hex::encode(hasher.finalize()))
 }
 
 fn add_duration(now: DateTime<Utc>, duration: Duration) -> Result<DateTime<Utc>> {

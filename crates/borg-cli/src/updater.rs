@@ -206,7 +206,7 @@ fn verify_checksum(asset_name: &str, archive: &[u8], checksum_file: &[u8]) -> Re
         expected.len() == 64 && expected.bytes().all(|byte| byte.is_ascii_hexdigit()),
         "checksum is not SHA-256"
     );
-    let actual = format!("{:x}", Sha256::digest(archive));
+    let actual = hex::encode(Sha256::digest(archive));
     anyhow::ensure!(
         actual.eq_ignore_ascii_case(expected),
         "Borg update checksum did not match"
@@ -740,7 +740,7 @@ mod tests {
     #[test]
     fn checksum_binds_hash_and_asset_name() {
         let bytes = b"release";
-        let hash = format!("{:x}", Sha256::digest(bytes));
+        let hash = hex::encode(Sha256::digest(bytes));
         verify_checksum(
             "borg-test.tar.gz",
             bytes,

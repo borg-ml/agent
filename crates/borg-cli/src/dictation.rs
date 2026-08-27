@@ -532,7 +532,7 @@ async fn ensure_file_hash(
         }
         hasher.update(&buffer[..read]);
     }
-    let actual = format!("{:x}", hasher.finalize());
+    let actual = hex::encode(hasher.finalize());
     ensure!(
         actual.eq_ignore_ascii_case(expected_sha256),
         "{label} failed SHA-256 verification"

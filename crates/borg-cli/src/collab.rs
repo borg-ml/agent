@@ -219,9 +219,10 @@ impl CollabLink {
         fill(&mut nonce).context("failed to generate collaboration frame nonce")?;
         let aad = aad(self.room_id, epoch, sequence);
         let cipher = Aes256Gcm::new_from_slice(&self.key).expect("AES-256 key length");
+        let nonce = Nonce::try_from(nonce.as_slice()).expect("AES-GCM nonce length");
         let ciphertext = cipher
             .encrypt(
-                Nonce::from_slice(&nonce),
+                &nonce,
                 Payload {
                     msg: &plaintext,
                     aad: &aad,
@@ -255,9 +256,10 @@ impl CollabLink {
             "collaboration frame exceeds the 1 MiB limit"
         );
         let cipher = Aes256Gcm::new_from_slice(&self.key).expect("AES-256 key length");
+        let nonce = Nonce::try_from(nonce.as_slice()).expect("AES-GCM nonce length");
         let plaintext = cipher
             .decrypt(
-                Nonce::from_slice(&nonce),
+                &nonce,
                 Payload {
                     msg: &ciphertext,
                     aad: &aad(self.room_id, frame.epoch, frame.sequence),

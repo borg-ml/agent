@@ -235,7 +235,7 @@ impl OpenAiCompatibleProvider {
                     }
                     OpenAiCompatibleProfile::Generic => unreachable!(),
                 },
-                trace,
+                trace: Box::new(trace),
                 session_id: None,
             });
         }
@@ -302,7 +302,7 @@ impl OpenAiCompatibleProvider {
                 if let Some(extra) =
                     openai_compatible_extra_body().map_err(|message| ProviderCallError {
                         message,
-                        trace: trace.clone(),
+                        trace: Box::new(trace.clone()),
                         session_id: None,
                     })?
                 {
@@ -438,7 +438,7 @@ impl OpenAiCompatibleProvider {
                     trace.stderr = error.to_string();
                     return Err(ProviderCallError {
                         message: format!("{provider_label} request failed: {error}"),
-                        trace,
+                        trace: Box::new(trace),
                         session_id: None,
                     });
                 }
@@ -458,7 +458,7 @@ impl OpenAiCompatibleProvider {
                     status.as_u16(),
                     truncate_provider_text(&raw_text, 500)
                 ),
-                trace,
+                trace: Box::new(trace),
                 session_id: None,
             });
         }
@@ -472,7 +472,7 @@ impl OpenAiCompatibleProvider {
         .await
         .map_err(|error| ProviderCallError {
             message: format!("{provider_label} streaming response failed: {error}"),
-            trace: trace.clone(),
+            trace: Box::new(trace.clone()),
             session_id: None,
         })?;
         trace.stdout = streamed.raw.to_string();
@@ -578,7 +578,7 @@ impl OpenAiCompatibleProvider {
         if let Some(extra_body) =
             openai_compatible_extra_body().map_err(|error| ProviderCallError {
                 message: error,
-                trace: trace.clone(),
+                trace: Box::new(trace.clone()),
                 session_id: None,
             })?
         {
@@ -600,7 +600,7 @@ impl OpenAiCompatibleProvider {
                 trace.stderr = error.to_string();
                 ProviderCallError {
                     message: format!("OpenAI-compatible request failed: {error}"),
-                    trace: trace.clone(),
+                    trace: Box::new(trace.clone()),
                     session_id: None,
                 }
             })?;
@@ -615,7 +615,7 @@ impl OpenAiCompatibleProvider {
                     trace.stderr = error.to_string();
                     return Err(ProviderCallError {
                         message: format!("OpenAI-compatible response read failed: {error}"),
-                        trace,
+                        trace: Box::new(trace),
                         session_id: None,
                     });
                 }
@@ -628,7 +628,7 @@ impl OpenAiCompatibleProvider {
                     trace.stderr = error.to_string();
                     return Err(ProviderCallError {
                         message: format!("OpenAI-compatible error response read failed: {error}"),
-                        trace,
+                        trace: Box::new(trace),
                         session_id: None,
                     });
                 }
@@ -644,7 +644,7 @@ impl OpenAiCompatibleProvider {
                     status.as_u16(),
                     truncate_provider_text(&raw_text, 500)
                 ),
-                trace,
+                trace: Box::new(trace),
                 session_id: None,
             });
         }
@@ -655,7 +655,7 @@ impl OpenAiCompatibleProvider {
                 trace.stderr = error.to_string();
                 return Err(ProviderCallError {
                     message: format!("OpenAI-compatible endpoint returned invalid JSON: {error}"),
-                    trace,
+                    trace: Box::new(trace),
                     session_id: None,
                 });
             }

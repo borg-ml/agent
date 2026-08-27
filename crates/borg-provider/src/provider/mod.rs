@@ -319,7 +319,7 @@ pub struct ProviderCallResult {
 #[derive(Debug, Clone)]
 pub struct ProviderCallError {
     pub message: String,
-    pub trace: ProviderAttemptTrace,
+    pub trace: Box<ProviderAttemptTrace>,
     pub session_id: Option<String>,
 }
 
@@ -335,7 +335,7 @@ impl ProviderCallError {
     fn new(message: impl Into<String>, trace: ProviderAttemptTrace) -> Self {
         Self {
             message: message.into(),
-            trace,
+            trace: Box::new(trace),
             session_id: None,
         }
     }

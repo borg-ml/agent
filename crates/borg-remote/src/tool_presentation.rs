@@ -2604,8 +2604,8 @@ mod tests {
             assert_eq!(presentation.category, ToolPresentationCategory::Execute);
             assert_eq!(
                 presentation.input.as_ref().map(|body| body.text.as_str()),
-                Some(command)
-                    .filter(|_| !command.starts_with("bash "))
+                (!command.starts_with("bash "))
+                    .then_some(command)
                     .or(Some("git worktree list --porcelain")),
                 "{command}"
             );

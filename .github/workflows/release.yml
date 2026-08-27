@@ -28,7 +28,7 @@ jobs:
           ref: ${{ env.RELEASE_TAG }}
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
-          toolchain: "1.94.0"
+          toolchain: "1.98.0"
           components: rustfmt, clippy
       - name: Install quality tools
         run: cargo install --locked just cargo-deny cargo-audit
@@ -71,7 +71,7 @@ jobs:
           ref: ${{ env.RELEASE_TAG }}
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
-          toolchain: "1.94.0"
+          toolchain: "1.98.0"
           targets: ${{ matrix.target }}
       - name: Build Borg Agent
         run: cargo build --locked --release --target ${{ matrix.target }} -p borg

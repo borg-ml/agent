@@ -24,8 +24,8 @@ borg-core.workspace = true
 claude-agents = { workspace = true, optional = true }
 chrono.workspace = true
 futures = "0.3"
-getrandom = "0.2"
-hex = "0.4"
+getrandom = "0.4"
+hex.workspace = true
 libc = "0.2"
 reqwest.workspace = true
 serde.workspace = true
@@ -33,7 +33,7 @@ serde_json.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
-toml = "0.8.23"
+toml = "1.1.4"
 tracing.workspace = true
 uuid.workspace = true
 

@@ -680,7 +680,10 @@ async fn apply_write(
     let now = Utc::now().to_rfc3339();
     let value_json = value.map(serde_json::to_string).transpose()?;
     let content_hash = match &value_json {
-        Some(value_json) => format!("sha256:{:x}", Sha256::digest(value_json.as_bytes())),
+        Some(value_json) => format!(
+            "sha256:{}",
+            hex::encode(Sha256::digest(value_json.as_bytes())),
+        ),
         None => DELETED_CONTENT_HASH.to_string(),
     };
     let provenance_json = serde_json::to_string(provenance)?;
@@ -881,7 +884,7 @@ async fn hash_file(path: &Path) -> Result<(u64, String)> {
         );
         hasher.update(&buffer[..read]);
     }
-    Ok((bytes, format!("sha256:{:x}", hasher.finalize())))
+    Ok((bytes, format!("sha256:{}", hex::encode(hasher.finalize()))))
 }
 
 fn validate_plugin_call(request: &PluginCall) -> Result<()> {
@@ -961,8 +964,8 @@ fn mutation_request_hash(
         "provenance": provenance,
     });
     Ok(format!(
-        "sha256:{:x}",
-        Sha256::digest(serde_json::to_vec(&request)?)
+        "sha256:{}",
+        hex::encode(Sha256::digest(serde_json::to_vec(&request)?))
     ))
 }
 

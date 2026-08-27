@@ -309,7 +309,7 @@ impl PersistentRuntimeWorker {
             result
         };
 
-        let code_hash = format!("sha256:{:x}", Sha256::digest(code.as_bytes()));
+        let code_hash = format!("sha256:{}", hex::encode(Sha256::digest(code.as_bytes())));
         if let Some(store) = &self.store {
             let execution_error = result.as_ref().err().map(ToString::to_string);
             store
