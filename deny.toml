@@ -1,8 +1,8 @@
 [advisories]
-# syntect 5.3 uses bincode 1.3 only for compiled syntax-set data. The advisory
-# reports upstream maintenance status, not a vulnerability, and bincode has no
-# maintained 1.x replacement that syntect can adopt without a format change.
-ignore = ["RUSTSEC-2025-0141"]
+# syntect 5.3 uses bincode 1.3 only for compiled syntax-set data and yaml-rust
+# to load its bundled syntax definitions. These advisories report upstream
+# maintenance status, not vulnerabilities, and syntect has no safe upgrade.
+ignore = ["RUSTSEC-2024-0320", "RUSTSEC-2025-0141"]
 
 [licenses]
 confidence-threshold = 0.8

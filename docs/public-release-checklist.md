@@ -9,7 +9,7 @@ focused on release boundaries rather than broad refactors.
 - `cargo test --workspace --locked --no-fail-fast`
 - `cargo clippy --workspace --all-targets --locked -- -D warnings`
 - `cargo deny check advisories bans licenses sources`
-- `cargo audit --ignore RUSTSEC-2025-0141`
+- `cargo audit --ignore RUSTSEC-2024-0320 --ignore RUSTSEC-2025-0141`
 - `git diff --check`
 
 Run the workspace test command at least twice with its default parallelism;

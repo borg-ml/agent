@@ -3099,7 +3099,7 @@ async fn escape_flush_keeps_the_turn_running_after_admission_and_steers_queued_i
 
     loop {
         let notified = steer_seen.notified();
-        if steers.lock().unwrap().len() >= 1 {
+        if !steers.lock().unwrap().is_empty() {
             break;
         }
         tokio::time::timeout(Duration::from_secs(1), notified)

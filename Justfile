@@ -58,9 +58,9 @@ verify:
     # Keep the RSA dependency check explicit so a future database feature
     # cannot reintroduce the Marvin-attack edge into the active graph.
     if cargo tree --workspace --target all -e features -i rsa 2>/dev/null | grep -q 'rsa'; then echo 'active rsa dependency detected' >&2; exit 1; fi
-    # syntect currently brings bincode 1.x, which is covered by deny.toml's
-    # documented unmaintained-dependency exception.
-    cargo audit --ignore RUSTSEC-2025-0141
+    # syntect's unmaintained transitive dependencies are covered by deny.toml's
+    # documented exceptions.
+    cargo audit --ignore RUSTSEC-2024-0320 --ignore RUSTSEC-2025-0141
     git diff --check
 
 # Bump, verify, commit, tag, and publish a release. Defaults to the next patch.
