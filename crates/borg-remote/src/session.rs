@@ -1720,6 +1720,7 @@ async fn run_agent_session_store_kernel(
                         });
                     }
                     Some(HostCommand::RecallQueuedPrompt { .. }) => {}
+                    Some(HostCommand::FlushPendingInput { .. }) => {}
                     Some(HostCommand::ExtensionCommand {
                         session_id: command_session_id,
                         invocation_id,
@@ -3418,6 +3419,18 @@ async fn run_agent_session_store_kernel(
                                 )
                                 .await?;
                             }
+                        }
+                        HostCommand::FlushPendingInput { .. } => {
+                            flush_pending_input_into_active_turn(
+                                launch.provider,
+                                &control_tx,
+                                &steer_result_tx,
+                                &mut pending,
+                                &mut pending_steers,
+                                steer_boundary_generation,
+                                context_compaction_in_progress,
+                            )
+                            .await;
                         }
                         command @ HostCommand::ExtensionCommand { .. } => {
                             deferred_commands.push_back(command);
@@ -5676,6 +5689,9 @@ async fn collect_input_at_turn_boundary(
                     record_recalled_prompt(journal, events, session_id, &recalled).await?;
                 }
             }
+            HostCommand::FlushPendingInput {
+                session_id: command_session_id,
+            } if command_session_id == session_id => {}
             HostCommand::Interrupt {
                 session_id: command_session_id,
             } if command_session_id == session_id => {
@@ -5817,6 +5833,59 @@ async fn retry_pending_steers(
             steer.state = PendingSteerState::AwaitingAcknowledgement;
             steer.attempt_boundary = boundary_generation;
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn flush_pending_input_into_active_turn(
+    provider: CodingProvider,
+    control_tx: &mpsc::Sender<AgentTurnControl>,
+    steer_result_tx: &mpsc::Sender<(Uuid, std::result::Result<(), String>)>,
+    pending: &mut VecDeque<QueuedPrompt>,
+    pending_steers: &mut VecDeque<PendingSteer>,
+    boundary_generation: u64,
+    context_compaction_in_progress: bool,
+) {
+    if !provider_supports_active_turn_control(provider) {
+        return;
+    }
+
+    let mut retained = VecDeque::with_capacity(pending.len());
+    while let Some(mut prompt) = pending.pop_front() {
+        if prompt.actor != EventActor::User {
+            retained.push_back(prompt);
+            continue;
+        }
+        prompt.delivery = PromptDelivery::Steer;
+        let admission = SteerAdmission::pending();
+        let sent = !context_compaction_in_progress
+            && dispatch_steer(control_tx, steer_result_tx, &prompt, admission.clone()).await;
+        pending_steers.push_back(PendingSteer {
+            prompt,
+            admission,
+            state: if sent {
+                PendingSteerState::AwaitingAcknowledgement
+            } else {
+                PendingSteerState::RetryAtBoundary {
+                    error: if context_compaction_in_progress {
+                        "provider is compacting context".to_string()
+                    } else {
+                        "provider turn control was unavailable".to_string()
+                    },
+                }
+            },
+            attempt_boundary: boundary_generation,
+        });
+    }
+    *pending = retained;
+    if !context_compaction_in_progress {
+        retry_pending_steers(
+            control_tx,
+            steer_result_tx,
+            pending_steers,
+            boundary_generation,
+        )
+        .await;
     }
 }
 
@@ -6325,6 +6394,12 @@ async fn apply_subagent_action(
                 target, message_id, ..
             } => {
                 subagents.recall_child_prompt(&target, message_id).await?;
+                Ok(SubagentControlOutcome::Accepted {
+                    agent: Box::new(subagents.resolve_snapshot(&target).await?),
+                })
+            }
+            SubagentAction::FlushPendingInput { target, .. } => {
+                subagents.flush_pending_input(&target).await?;
                 Ok(SubagentControlOutcome::Accepted {
                     agent: Box::new(subagents.resolve_snapshot(&target).await?),
                 })

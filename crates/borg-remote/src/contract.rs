@@ -970,6 +970,11 @@ pub enum HostCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message_id: Option<Uuid>,
     },
+    /// Promote every queued human prompt into the active provider turn.
+    /// Unlike `Interrupt`, this never cancels the turn.
+    FlushPendingInput {
+        session_id: Uuid,
+    },
     Configure {
         session_id: Uuid,
         action: SessionConfigAction,
@@ -1043,6 +1048,7 @@ impl HostCommand {
             Self::Launch { session_id, .. }
             | Self::Prompt { session_id, .. }
             | Self::RecallQueuedPrompt { session_id, .. }
+            | Self::FlushPendingInput { session_id }
             | Self::Configure { session_id, .. }
             | Self::Approve { session_id, .. }
             | Self::RespondToProviderInteraction { session_id, .. }
@@ -1151,6 +1157,10 @@ pub enum SubagentAction {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message_id: Option<Uuid>,
     },
+    FlushPendingInput {
+        request_id: Uuid,
+        target: String,
+    },
     /// Clear a child session's provider context while preserving its durable
     /// identity, journal, and lane routing.
     ClearContext {
@@ -1182,6 +1192,7 @@ impl SubagentAction {
             | Self::Message { request_id, .. }
             | Self::Prompt { request_id, .. }
             | Self::RecallPrompt { request_id, .. }
+            | Self::FlushPendingInput { request_id, .. }
             | Self::ClearContext { request_id, .. }
             | Self::Interrupt { request_id, .. }
             | Self::Stop { request_id, .. }

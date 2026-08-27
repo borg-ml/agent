@@ -4676,6 +4676,35 @@ async fn insert_action_row(
             requeue_terminal_action(transaction, existing).await?;
             return Ok(());
         }
+        if allow_in_progress_payload_rewrite
+            && existing.kind == crate::SessionActionKind::Prompt
+            && action.kind == crate::SessionActionKind::Steering
+            && same_prompt_payload_ignoring_delivery(&existing.payload, &action.payload)
+        {
+            // Escape can promote a queued prompt into the active provider
+            // turn. The provider's admission event is the durable routing
+            // boundary; preserve the action identity and current state while
+            // changing only its delivery class.
+            anyhow::ensure!(
+                !existing.state.is_terminal(),
+                "action {} completed before its queued input was flushed",
+                action.action_id
+            );
+            sqlx::query(
+                "update session_actions set action_kind=?, delivery_policy=?, wake_policy=?, \
+                 payload_json=?, updated_at=? where action_id=? and session_id=?",
+            )
+            .bind(enum_text(&action.kind)?)
+            .bind(enum_text(&action.delivery)?)
+            .bind(enum_text(&action.wake)?)
+            .bind(serde_json::to_string(&action.payload)?)
+            .bind(action.updated_at.to_rfc3339())
+            .bind(action.action_id.to_string())
+            .bind(action.session_id.to_string())
+            .execute(&mut **transaction)
+            .await?;
+            return Ok(());
+        }
         if allow_in_progress_payload_rewrite && existing.payload != action.payload {
             // Queue coalescing combines several durable queue entries under
             // the last message id immediately before execution. The

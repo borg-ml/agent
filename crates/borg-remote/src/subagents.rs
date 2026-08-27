@@ -4477,6 +4477,13 @@ impl SubagentCoordinator {
             .await
     }
 
+    pub async fn flush_pending_input(&self, target: &str) -> Result<()> {
+        self.send_command(target, |session_id| HostCommand::FlushPendingInput {
+            session_id,
+        })
+        .await
+    }
+
     pub async fn stop(&self, target: &str) -> Result<()> {
         self.send_command(target, |session_id| HostCommand::Stop { session_id })
             .await

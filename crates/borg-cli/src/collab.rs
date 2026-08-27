@@ -507,6 +507,7 @@ async fn host(session_id: Uuid, relay: &str) -> Result<()> {
                     matches!(
                         command,
                         HostCommand::Prompt { .. }
+                            | HostCommand::FlushPendingInput { .. }
                             | HostCommand::Interrupt { .. }
                             | HostCommand::Approve { .. }
                     ),
@@ -518,6 +519,7 @@ async fn host(session_id: Uuid, relay: &str) -> Result<()> {
                     capability = "control",
                     command = match &command {
                         HostCommand::Prompt { .. } => "prompt",
+                        HostCommand::FlushPendingInput { .. } => "flush pending input",
                         HostCommand::Interrupt { .. } => "interrupt",
                         HostCommand::Approve { .. } => "approve",
                         _ => unreachable!("command allowlist checked"),

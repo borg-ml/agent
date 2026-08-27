@@ -91,7 +91,7 @@ const STATUS_SEPARATOR: &str = " · ";
 const GIT_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const GOAL_CLEAR_COMMAND: &str = "/goal clear";
 const DIRECTOR_CONTEXT_BOUNDARY: &str = "— context provided by director agent —";
-const DOUBLE_CTRL_C_WINDOW: Duration = Duration::from_secs(1);
+const CTRL_C_SEQUENCE_WINDOW: Duration = Duration::from_secs(1);
 const COPY_NOTICE_DURATION: Duration = Duration::from_secs(5);
 const SPLASH_ANIMATION_DURATION: Duration = Duration::from_millis(1_500);
 const NESTED_SCROLL_GESTURE_GAP: Duration = Duration::from_millis(200);
@@ -581,6 +581,10 @@ pub enum UiAction {
     RecallQueuedPrompts {
         target: Option<Uuid>,
     },
+    FlushPendingInput {
+        target: Option<Uuid>,
+        prompt: Option<(Uuid, String, Vec<PathBuf>)>,
+    },
     Rewind {
         sequence: u64,
         text: String,
@@ -833,7 +837,10 @@ pub struct BorgTerminal {
     copy_notice_expires_at: Option<Instant>,
     clipboard_lease: Option<clipboard::ClipboardLease>,
     last_ctrl_c: Option<Instant>,
+    ctrl_c_count: u8,
     queued_prompts: Vec<PendingPromptProjection>,
+    active_turn_followup: bool,
+    child_active_turn_followups: HashSet<Uuid>,
     replaying_history: bool,
     history_page_requested: bool,
     history_page_loading: bool,
@@ -1842,7 +1849,10 @@ impl BorgTerminal {
             copy_notice_expires_at: None,
             clipboard_lease: None,
             last_ctrl_c: None,
+            ctrl_c_count: 0,
             queued_prompts: Vec::new(),
+            active_turn_followup: false,
+            child_active_turn_followups: HashSet::new(),
             replaying_history: false,
             history_page_requested: false,
             history_page_loading: false,
@@ -1971,7 +1981,10 @@ impl BorgTerminal {
         self.copy_notice_expires_at = None;
         self.clipboard_lease = None;
         self.last_ctrl_c = None;
+        self.ctrl_c_count = 0;
         self.queued_prompts.clear();
+        self.active_turn_followup = false;
+        self.child_active_turn_followups.clear();
         self.replaying_history = false;
         self.history_page_requested = false;
         self.history_page_loading = false;
@@ -2218,6 +2231,7 @@ impl BorgTerminal {
         delivery: PromptDelivery,
     ) {
         if let Some(child) = target {
+            self.child_active_turn_followups.insert(child);
             push_queued_prompt(
                 self.child_queued_prompts.entry(child).or_default(),
                 message_id,
@@ -2225,6 +2239,7 @@ impl BorgTerminal {
                 delivery,
             );
         } else {
+            self.active_turn_followup = true;
             push_queued_prompt(&mut self.queued_prompts, message_id, text, delivery);
         }
     }
@@ -2385,6 +2400,22 @@ impl BorgTerminal {
             }
             _ => true,
         };
+        if matches!(
+            &event.kind,
+            SessionEventKind::Message {
+                actor: EventActor::User,
+                status: MessageStatus::Queued,
+                ..
+            }
+        ) && matches!(
+            self.status,
+            SessionStatus::Running | SessionStatus::WaitingForApproval
+        ) {
+            self.active_turn_followup = true;
+        }
+        if turn_completion_clears_followup_marker(&event.kind, self.queued_prompts.is_empty()) {
+            self.active_turn_followup = false;
+        }
         if let SessionEventKind::StatusChanged { status, .. } = event.kind {
             let was_active = matches!(
                 self.status,
@@ -2564,6 +2595,34 @@ impl BorgTerminal {
                 .entry(child_id)
                 .or_default()
                 .push(child_event.as_ref().clone());
+        }
+        if matches!(
+            &child_event.kind,
+            SessionEventKind::Message {
+                actor: EventActor::User,
+                status: MessageStatus::Queued,
+                ..
+            }
+        ) && self
+            .child_statuses
+            .get(&child_id)
+            .copied()
+            .is_some_and(|status| {
+                matches!(
+                    status,
+                    SessionStatus::Running | SessionStatus::WaitingForApproval
+                )
+            })
+        {
+            self.child_active_turn_followups.insert(child_id);
+        }
+        if turn_completion_clears_followup_marker(
+            &child_event.kind,
+            self.child_queued_prompts
+                .get(&child_id)
+                .is_none_or(Vec::is_empty),
+        ) {
+            self.child_active_turn_followups.remove(&child_id);
         }
         if let SessionEventKind::StatusChanged { status, .. } = child_event.kind {
             self.child_statuses.insert(child_id, status);
@@ -2933,6 +2992,34 @@ impl BorgTerminal {
             self.event_redraw_needed = true;
         }
         true
+    }
+
+    fn has_pending_input_for_escape(&self) -> bool {
+        !self.composer.text.trim().is_empty()
+            || !self.composer.attachments.is_empty()
+            || !self.active_queued_prompts().is_empty()
+            || self
+                .focused_child
+                .map_or(self.active_turn_followup, |child| {
+                    self.child_active_turn_followups.contains(&child)
+                })
+    }
+
+    fn flush_pending_input(&mut self) -> UiAction {
+        let target = self.focused_child;
+        let (text, attachments) = self.composer.take();
+        let prompt = (!text.trim().is_empty() || !attachments.is_empty()).then(|| {
+            let message_id = Uuid::new_v4();
+            self.project_pending_prompt(target, message_id, text.clone(), PromptDelivery::Steer);
+            (message_id, text, attachments)
+        });
+        if let Some(child) = target {
+            self.child_active_turn_followups.remove(&child);
+        } else {
+            self.active_turn_followup = false;
+        }
+        self.notice = Some("Sending pending input".to_string());
+        UiAction::FlushPendingInput { target, prompt }
     }
 
     pub fn hydrate_payload(&mut self, payload: &SessionPayloadRef, bytes: Vec<u8>) -> Result<()> {
@@ -3593,6 +3680,7 @@ impl BorgTerminal {
             }
             Event::Paste(value) => {
                 self.last_ctrl_c = None;
+                self.ctrl_c_count = 0;
                 self.composer_selection = None;
                 let value = normalize_terminal_capture_paste(&value);
                 let PasteOutcome { text, attachments } =
@@ -3610,7 +3698,6 @@ impl BorgTerminal {
             }
             Event::Mouse(mouse) => {
                 let previous_hover = self.hover_state();
-                self.last_ctrl_c = None;
                 let pointer = Position::new(mouse.column, mouse.row);
                 let pointer_moved =
                     update_mouse_position(&mut self.last_mouse_position, &mouse.kind, pointer);
@@ -6757,7 +6844,23 @@ impl BorgTerminal {
         Ok(())
     }
 
-    fn handle_key(&mut self, key: KeyEvent) -> Result<UiAction> {
+    fn handle_key(&mut self, mut key: KeyEvent) -> Result<UiAction> {
+        if is_ctrl_c(&key) {
+            if key.kind == KeyEventKind::Press
+                && third_ctrl_c(
+                    &mut self.last_ctrl_c,
+                    &mut self.ctrl_c_count,
+                    Instant::now(),
+                )
+            {
+                return Ok(UiAction::ForceQuit);
+            }
+            key.code = KeyCode::Esc;
+            key.modifiers = KeyModifiers::NONE;
+        } else {
+            self.last_ctrl_c = None;
+            self.ctrl_c_count = 0;
+        }
         if matches!(
             self.picker.as_ref().map(|picker| picker.kind),
             Some(PickerKind::Commands)
@@ -6966,6 +7069,9 @@ impl BorgTerminal {
         }
         if let Some(target) = focused_child_interrupt_target(&self.keymap, &key, self.focused_child)
         {
+            if self.has_pending_input_for_escape() {
+                return Ok(self.flush_pending_input());
+            }
             return Ok(if self.begin_user_interrupt() {
                 UiAction::Interrupt {
                     target: Some(target),
@@ -6998,22 +7104,6 @@ impl BorgTerminal {
         if self.rewind_primed {
             self.rewind_primed = false;
         }
-        if self.keymap.matches(KeyAction::ClearOrExit, &key) {
-            if self.copy_text_selection() {
-                return Ok(UiAction::None);
-            }
-            if repeated_ctrl_c(&mut self.last_ctrl_c, Instant::now()) {
-                return Ok(UiAction::ForceQuit);
-            }
-            self.composer.clear();
-            self.composer_selection = None;
-            self.notice = Some(format!(
-                "Prompt cleared · press {} again to exit",
-                self.keymap.label(KeyAction::ClearOrExit)
-            ));
-            return Ok(UiAction::None);
-        }
-        self.last_ctrl_c = None;
         self.composer_selection = None;
         if self.pending_approval {
             return Ok(if self.keymap.matches(KeyAction::Approve, &key) {
@@ -7168,6 +7258,11 @@ impl BorgTerminal {
             return Ok(UiAction::None);
         }
         if self.keymap.matches(KeyAction::Interrupt, &key) {
+            if status_control_is_actionable(self.active_status())
+                && self.has_pending_input_for_escape()
+            {
+                return Ok(self.flush_pending_input());
+            }
             return Ok(if self.begin_user_interrupt() {
                 UiAction::Interrupt {
                     target: self.focused_child,
@@ -8372,11 +8467,26 @@ impl Composer {
     }
 }
 
-fn repeated_ctrl_c(last: &mut Option<Instant>, now: Instant) -> bool {
-    let repeated = last
-        .is_some_and(|previous| now.saturating_duration_since(previous) <= DOUBLE_CTRL_C_WINDOW);
-    *last = (!repeated).then_some(now);
-    repeated
+fn is_ctrl_c(key: &KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('c' | 'C' | '\u{3}'))
+}
+
+fn third_ctrl_c(last: &mut Option<Instant>, count: &mut u8, now: Instant) -> bool {
+    if last
+        .is_some_and(|previous| now.saturating_duration_since(previous) <= CTRL_C_SEQUENCE_WINDOW)
+    {
+        *count = count.saturating_add(1);
+    } else {
+        *count = 1;
+    }
+    *last = Some(now);
+    if *count < 3 {
+        return false;
+    }
+    *last = None;
+    *count = 0;
+    true
 }
 
 fn deletes_previous_word(key: &KeyEvent) -> bool {
@@ -9248,6 +9358,13 @@ fn update_queued_prompts(
     }
 }
 
+fn turn_completion_clears_followup_marker(
+    event: &SessionEventKind,
+    pending_queue_is_empty: bool,
+) -> bool {
+    matches!(event, SessionEventKind::TurnCompleted { .. }) && pending_queue_is_empty
+}
+
 fn pending_prompt_projection_from_events(events: &[SessionEvent]) -> Vec<PendingPromptProjection> {
     let mut queued_prompts = Vec::new();
     for event in events {
@@ -9412,10 +9529,8 @@ fn queued_prompt_lines(
         .iter()
         .any(|prompt| prompt.delivery == PromptDelivery::Queue);
     let mut hints = Vec::new();
-    if has_steers {
-        hints.push("esc interrupt + send now");
-    }
     if has_queue || has_steers {
+        hints.push("esc send now · keep running");
         hints.push("↑ edit / recall pending");
     }
     lines.push(Line::from(Span::styled(
@@ -10672,7 +10787,7 @@ fn keybinding_reference(keymap: &KeyMap) -> Vec<(&'static str, String)> {
         ("newline", keymap.label(KeyAction::Newline)),
         ("commands", "/".to_string()),
         ("interrupt or close", keymap.label(KeyAction::Interrupt)),
-        ("clear · twice exit", keymap.label(KeyAction::ClearOrExit)),
+        ("escape · third exits", keymap.label(KeyAction::ClearOrExit)),
         ("exit", keymap.label(KeyAction::Exit)),
         ("attach image", keymap.label(KeyAction::AttachImage)),
         ("start/stop dictation", keymap.label(KeyAction::Dictate)),

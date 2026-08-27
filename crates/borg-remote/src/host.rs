@@ -2765,6 +2765,7 @@ fn authorize_workspace_command(
     let kind = match command {
         HostCommand::Prompt { .. } => crate::ParticipantCommandKind::Prompt,
         HostCommand::RecallQueuedPrompt { .. } => crate::ParticipantCommandKind::RecallQueuedPrompt,
+        HostCommand::FlushPendingInput { .. } => crate::ParticipantCommandKind::Prompt,
         HostCommand::Configure { .. } => crate::ParticipantCommandKind::Configure,
         HostCommand::Approve { .. } => crate::ParticipantCommandKind::Approve,
         HostCommand::RespondToProviderInteraction { .. } => {

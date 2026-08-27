@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde_json::json;
@@ -892,6 +892,13 @@ struct CommittingSteerExecutor {
     steer_accepted: Arc<Notify>,
 }
 
+struct FlushingQueueExecutor {
+    turn_started: Arc<Notify>,
+    steers: Arc<Mutex<Vec<String>>>,
+    steer_seen: Arc<Notify>,
+    interrupted: Arc<AtomicBool>,
+}
+
 struct BoundaryRetrySteerExecutor {
     turn_started: Arc<Notify>,
     first_attempt_rejected: Arc<Notify>,
@@ -1166,6 +1173,44 @@ impl AgentTurnExecutor for CommittingSteerExecutor {
             controls.recv().await,
             Some(AgentTurnControl::Interrupt) | None
         ) {}
+        Ok(AgentTurnResult {
+            provider_session_id: Some("provider-session".to_string()),
+            final_text: String::new(),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentTurnExecutor for FlushingQueueExecutor {
+    async fn execute(
+        &self,
+        _turn: AgentTurn,
+        _events: mpsc::Sender<SessionEventKind>,
+        controls: Option<mpsc::Receiver<AgentTurnControl>>,
+    ) -> Result<AgentTurnResult> {
+        self.turn_started.notify_one();
+        let mut controls = controls.expect("active turn has controls");
+        while let Some(control) = controls.recv().await {
+            match control {
+                AgentTurnControl::Steer {
+                    text,
+                    admission,
+                    ack,
+                    ..
+                } => {
+                    assert!(admission.accept());
+                    self.steers.lock().unwrap().push(text);
+                    let _ = ack.send(Ok(()));
+                    self.steer_seen.notify_one();
+                }
+                AgentTurnControl::Interrupt => {
+                    self.interrupted.store(true, Ordering::Release);
+                    break;
+                }
+                AgentTurnControl::Approval { .. }
+                | AgentTurnControl::ProviderInteractionResponse { .. } => {}
+            }
+        }
         Ok(AgentTurnResult {
             provider_session_id: Some("provider-session".to_string()),
             final_text: String::new(),
@@ -2972,6 +3017,189 @@ async fn accepted_codex_steer_is_settled_before_turn_is_interrupted() {
         ],
         "provider-accepted input must settle before a later interruption can resurrect it"
     );
+
+    command_tx
+        .send(HostCommand::Stop { session_id })
+        .await
+        .unwrap();
+    actor.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn escape_flush_keeps_the_turn_running_after_admission_and_steers_queued_input_fifo() {
+    let root = tempdir().unwrap();
+    let journal_path = root.path().join("session.lock");
+    let session_id = Uuid::new_v4();
+    let admitted_id = Uuid::new_v4();
+    let queued_ids = [Uuid::new_v4(), Uuid::new_v4()];
+    let (command_tx, command_rx) = mpsc::channel(16);
+    let (event_tx, mut event_rx) = mpsc::channel(64);
+    let turn_started = Arc::new(Notify::new());
+    let steer_seen = Arc::new(Notify::new());
+    let steers = Arc::new(Mutex::new(Vec::new()));
+    let interrupted = Arc::new(AtomicBool::new(false));
+    let executor = Arc::new(FlushingQueueExecutor {
+        turn_started: Arc::clone(&turn_started),
+        steers: Arc::clone(&steers),
+        steer_seen: Arc::clone(&steer_seen),
+        interrupted: Arc::clone(&interrupted),
+    });
+    let actor = tokio::spawn(async move {
+        run_agent_session_with_executor(
+            &journal_path,
+            session_id,
+            LaunchSession {
+                request_id: Uuid::new_v4(),
+                cwd: root.path().to_path_buf(),
+                provider: CodingProvider::Codex,
+                model: Some("gpt-5.6-luna".to_string()),
+                effort: None,
+                fast: Some(false),
+                response_language: crate::ResponseLanguage::Auto,
+                permission_mode: PermissionMode::Manual,
+                name: None,
+                initial_prompt: None,
+                capabilities: Default::default(),
+                subagent_concurrency_limit: None,
+                extension_skill_roots: Vec::new(),
+                team_policy: None,
+            },
+            command_rx,
+            event_tx,
+            executor,
+        )
+        .await
+    });
+
+    command_tx
+        .send(HostCommand::Prompt {
+            session_id,
+            message_id: Uuid::new_v4(),
+            text: "keep working".to_string(),
+            attachments: Vec::new(),
+            output_schema: None,
+            delivery: PromptDelivery::Steer,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), turn_started.notified())
+        .await
+        .expect("active turn starts");
+    command_tx
+        .send(HostCommand::Prompt {
+            session_id,
+            message_id: admitted_id,
+            text: "already admitted before escape".to_string(),
+            attachments: Vec::new(),
+            output_schema: None,
+            delivery: PromptDelivery::Steer,
+        })
+        .await
+        .unwrap();
+
+    loop {
+        let notified = steer_seen.notified();
+        if steers.lock().unwrap().len() >= 1 {
+            break;
+        }
+        tokio::time::timeout(Duration::from_secs(1), notified)
+            .await
+            .expect("provider accepts the first follow-up");
+    }
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+            .await
+            .expect("admission status arrives")
+            .expect("session remains open");
+        if matches!(
+            event.kind,
+            SessionEventKind::Message {
+                message_id,
+                status: MessageStatus::Complete,
+                delivery: Some(PromptDelivery::Steer),
+                ..
+            } if message_id == admitted_id
+        ) {
+            break;
+        }
+    }
+
+    command_tx
+        .send(HostCommand::FlushPendingInput { session_id })
+        .await
+        .unwrap();
+    for (message_id, text) in queued_ids.into_iter().zip(["queued one", "queued two"]) {
+        command_tx
+            .send(HostCommand::Prompt {
+                session_id,
+                message_id,
+                text: text.to_string(),
+                attachments: Vec::new(),
+                output_schema: None,
+                delivery: PromptDelivery::Queue,
+            })
+            .await
+            .unwrap();
+    }
+    command_tx
+        .send(HostCommand::FlushPendingInput { session_id })
+        .await
+        .unwrap();
+
+    loop {
+        let notified = steer_seen.notified();
+        if steers.lock().unwrap().len() >= 3 {
+            break;
+        }
+        if tokio::time::timeout(Duration::from_secs(1), notified)
+            .await
+            .is_err()
+        {
+            let events = std::iter::from_fn(|| event_rx.try_recv().ok())
+                .map(|event| event.kind)
+                .collect::<Vec<_>>();
+            panic!(
+                "every queued input reaches the active provider turn: {:?}; events: {events:?}",
+                *steers.lock().unwrap(),
+            );
+        }
+    }
+    assert_eq!(
+        *steers.lock().unwrap(),
+        ["already admitted before escape", "queued one", "queued two"]
+    );
+    assert!(
+        !interrupted.load(Ordering::Acquire),
+        "flushing input must never send provider cancellation"
+    );
+
+    let mut completed = HashSet::new();
+    while completed.len() < queued_ids.len() {
+        let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+            .await
+            .expect("flushed input settles durably")
+            .expect("session remains open");
+        assert!(
+            !matches!(
+                &event.kind,
+                SessionEventKind::StatusChanged {
+                    detail: Some(detail),
+                    ..
+                } if detail.contains("cancelling")
+            ),
+            "Escape flush changed the active turn into cancellation"
+        );
+        if let SessionEventKind::Message {
+            message_id,
+            status: MessageStatus::Complete,
+            delivery: Some(PromptDelivery::Steer),
+            ..
+        } = event.kind
+            && queued_ids.contains(&message_id)
+        {
+            completed.insert(message_id);
+        }
+    }
 
     command_tx
         .send(HostCommand::Stop { session_id })

@@ -3279,8 +3279,80 @@ async fn run_local_agent_session(
                                     message_id: None,
                                 })
                                 .await
-                                .ok();
+                            .ok();
                         }
+                    }
+                    UiAction::FlushPendingInput { target, prompt } => {
+                        terminal.as_mut().expect("terminal").draw()?;
+                        terminal_dirty = terminal
+                            .as_ref()
+                            .expect("terminal")
+                            .has_pending_scroll_frame();
+                        if let Some((message_id, text, attachments)) = prompt {
+                            if let Err(error) = persist_prompt_admission(
+                                store.as_ref(),
+                                target.unwrap_or(session_id),
+                                message_id,
+                                &text,
+                                &attachments,
+                                PromptDelivery::Steer,
+                            )
+                            .await
+                            {
+                                let terminal = terminal.as_mut().expect("terminal");
+                                terminal.reject_optimistic_prompt(
+                                    target,
+                                    message_id,
+                                    text,
+                                    attachments,
+                                );
+                                terminal.set_notice(format!(
+                                    "Could not durably send the pending input: {error:#}"
+                                ));
+                                terminal.draw()?;
+                                terminal_dirty = false;
+                            } else {
+                                pending_prompt_ids.insert(message_id);
+                                let command = target.map_or_else(
+                                    || HostCommand::Prompt {
+                                        session_id,
+                                        message_id,
+                                        text: text.clone(),
+                                        attachments: attachments.clone(),
+                                        output_schema: None,
+                                        delivery: PromptDelivery::Steer,
+                                    },
+                                    |target| HostCommand::Subagent {
+                                        session_id,
+                                        action: SubagentAction::Prompt {
+                                            request_id: Uuid::new_v4(),
+                                            target: target.to_string(),
+                                            message_id,
+                                            text: text.clone(),
+                                            attachments: attachments.clone(),
+                                            delivery: PromptDelivery::Steer,
+                                        },
+                                    },
+                                );
+                                if session_command_tx.send(command).await.is_err() {
+                                    terminal.as_mut().expect("terminal").set_notice(
+                                        "Prompt saved durably · waiting for the session actor to reconnect"
+                                            .to_string(),
+                                    );
+                                }
+                            }
+                        }
+                        let command = target.map_or_else(
+                            || HostCommand::FlushPendingInput { session_id },
+                            |target| HostCommand::Subagent {
+                                session_id,
+                                action: SubagentAction::FlushPendingInput {
+                                    request_id: Uuid::new_v4(),
+                                    target: target.to_string(),
+                                },
+                            },
+                        );
+                        session_command_tx.send(command).await.ok();
                     }
                     UiAction::Rewind {
                         sequence,
@@ -7607,6 +7679,7 @@ fn remote_command_name(command: &HostCommand) -> &'static str {
             PromptDelivery::Queue => "queue",
         },
         HostCommand::RecallQueuedPrompt { .. } => "recall queued prompt",
+        HostCommand::FlushPendingInput { .. } => "flush pending input",
         HostCommand::Configure { .. } => "configure",
         HostCommand::Approve { .. } => "approval",
         HostCommand::RespondToProviderInteraction { .. } => "provider interaction response",

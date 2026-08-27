@@ -3666,17 +3666,42 @@ fn completed_goal_crosses_out_only_its_objective() {
 }
 
 #[test]
-fn ctrl_c_only_exits_when_repeated_quickly() {
+fn ctrl_c_only_exits_on_the_third_quick_press() {
     let start = Instant::now();
     let mut last = None;
+    let mut count = 0;
 
-    assert!(!repeated_ctrl_c(&mut last, start));
-    assert!(repeated_ctrl_c(&mut last, start + DOUBLE_CTRL_C_WINDOW));
-    assert!(last.is_none());
-    assert!(!repeated_ctrl_c(
+    assert!(!third_ctrl_c(&mut last, &mut count, start));
+    assert!(!third_ctrl_c(
         &mut last,
-        start + DOUBLE_CTRL_C_WINDOW + Duration::from_millis(1)
+        &mut count,
+        start + CTRL_C_SEQUENCE_WINDOW / 2
     ));
+    assert!(third_ctrl_c(
+        &mut last,
+        &mut count,
+        start + CTRL_C_SEQUENCE_WINDOW
+    ));
+    assert!(last.is_none());
+    assert_eq!(count, 0);
+    assert!(!third_ctrl_c(
+        &mut last,
+        &mut count,
+        start + CTRL_C_SEQUENCE_WINDOW + Duration::from_millis(1)
+    ));
+}
+
+#[test]
+fn turn_completion_keeps_the_escape_flush_marker_while_input_is_queued() {
+    let event = SessionEventKind::TurnCompleted {
+        message_id: Uuid::new_v4(),
+        provider_session_id: None,
+        final_text: String::new(),
+        error: None,
+    };
+
+    assert!(!turn_completion_clears_followup_marker(&event, false));
+    assert!(turn_completion_clears_followup_marker(&event, true));
 }
 
 #[test]
@@ -6631,7 +6656,7 @@ fn pending_input_wraps_the_entire_prompt_instead_of_compacting_it() {
 }
 
 #[test]
-fn pending_steer_ui_uses_the_shared_next_label_and_interrupt_action() {
+fn pending_steer_ui_uses_the_shared_next_label_and_live_flush_action() {
     let prompts = [PendingPromptProjection {
         message_id: Uuid::new_v4(),
         text: "focus on the failing test".to_string(),
@@ -6647,7 +6672,7 @@ fn pending_steer_ui_uses_the_shared_next_label_and_interrupt_action() {
     assert!(!rendered.contains("NEXT TOOL"));
     assert!(!rendered.contains("NEXT TURN"));
     assert!(rendered.contains("focus on the failing test"));
-    assert!(rendered.contains("esc interrupt + send now"));
+    assert!(rendered.contains("esc send now · keep running"));
     // ↑ asks the session to recall the steer; it decides whether the provider
     // has acknowledged it yet.
     assert!(rendered.contains("recall pending"));
