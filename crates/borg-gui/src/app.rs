@@ -285,12 +285,18 @@ impl BorgGui {
                                     this.transcript_state.reset(presentation.timeline.len());
                                     this.expanded_entries.clear();
                                 } else {
-                                    let common_prefix = this
-                                        .timeline
-                                        .iter()
-                                        .zip(presentation.timeline.iter())
-                                        .take_while(|(old, new)| Arc::ptr_eq(old, new))
-                                        .count();
+                                    // Projection preserves Arc identity for the unchanged prefix and
+                                    // replaces only its suffix, so walk the usually tiny changed tail.
+                                    let mut common_prefix =
+                                        this.timeline.len().min(presentation.timeline.len());
+                                    while common_prefix > 0
+                                        && !Arc::ptr_eq(
+                                            &this.timeline[common_prefix - 1],
+                                            &presentation.timeline[common_prefix - 1],
+                                        )
+                                    {
+                                        common_prefix -= 1;
+                                    }
                                     this.transcript_state.splice(
                                         common_prefix..this.timeline.len(),
                                         presentation.timeline.len() - common_prefix,
