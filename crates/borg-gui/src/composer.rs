@@ -82,6 +82,14 @@ impl Composer {
         cx.notify();
     }
 
+    pub fn append_recalled(&mut self, text: &str, cx: &mut Context<Self>) {
+        let separator = if self.content.is_empty() { "" } else { "\n\n" };
+        self.content = format!("{}{separator}{text}", self.content).into();
+        self.selected = self.content.len()..self.content.len();
+        self.marked = None;
+        cx.notify();
+    }
+
     pub fn set_text(&mut self, text: impl Into<SharedString>, cx: &mut Context<Self>) {
         self.content = text.into();
         self.selected = self.content.len()..self.content.len();

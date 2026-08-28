@@ -258,6 +258,11 @@ impl BorgGui {
                                 this.view = Some(view);
                             }
                             LocalSessionUpdate::Sessions(sessions) => this.sessions = sessions,
+                            LocalSessionUpdate::RestoreComposer { text, attachments } => {
+                                this.composer
+                                    .update(cx, |composer, cx| composer.append_recalled(&text, cx));
+                                this.attachments.extend(attachments);
+                            }
                             LocalSessionUpdate::Error(error) => this.error = Some(error),
                         }
                         cx.notify();
@@ -602,8 +607,15 @@ impl BorgGui {
 
 impl Drop for BorgGui {
     fn drop(&mut self) {
-        for path in &self.temporary_attachments {
-            let _ = std::fs::remove_file(path);
+        if !self.temporary_attachments.is_empty() {
+            let paths = std::mem::take(&mut self.temporary_attachments);
+            let _ = std::thread::Builder::new()
+                .name("borg-gui-cleanup".into())
+                .spawn(move || {
+                    for path in paths {
+                        let _ = std::fs::remove_file(path);
+                    }
+                });
         }
     }
 }
@@ -744,9 +756,13 @@ impl Render for BorgGui {
             ("/fast on|off", "toggle priority mode", "/fast "),
             ("/compact", "compact conversation context", "/compact"),
             ("/clear", "clear conversation context", "/clear"),
+            ("/recall", "return queued input to the composer", "/recall"),
+            ("/flush", "discard pending queued input", "/flush"),
             ("/copy", "copy the latest response", "/copy"),
             ("/dictate", "start or stop dictation", "/dictate"),
+            ("/ext:ID:COMMAND", "run an extension command", "/ext:"),
             ("/resume", "open recent sessions", "/resume"),
+            ("/interrupt", "interrupt the active turn", "/interrupt"),
             ("/quit", "stop this session", "/quit"),
         ];
         let palette_composer = self.composer.clone();

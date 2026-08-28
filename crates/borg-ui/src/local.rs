@@ -17,6 +17,10 @@ use crate::{
 pub enum LocalSessionUpdate {
     Presentation(SessionPresentation),
     Sessions(Vec<LocalSessionOption>),
+    RestoreComposer {
+        text: String,
+        attachments: Vec<PathBuf>,
+    },
     Error(String),
 }
 
@@ -196,6 +200,17 @@ impl LocalSessionWorker {
                         }
                         match client.refresh().await {
                             Ok(true) => {
+                                for (text, attachments) in client.take_recalled_prompts() {
+                                    if update_tx
+                                        .send_blocking(LocalSessionUpdate::RestoreComposer {
+                                            text,
+                                            attachments,
+                                        })
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                }
                                 if update_tx
                                     .send_blocking(LocalSessionUpdate::Presentation(
                                         client.presentation(),
@@ -328,6 +343,7 @@ pub struct LocalSessionClient {
     live_revision: u64,
     root_session_id: Uuid,
     timeline: TimelineProjector,
+    recalled_prompts: Vec<(String, Vec<PathBuf>)>,
 }
 
 impl LocalSessionClient {
@@ -396,6 +412,7 @@ impl LocalSessionClient {
             live_revision: 0,
             root_session_id,
             timeline,
+            recalled_prompts: Vec::new(),
         };
         client.refresh_live().await?;
         client.rebuild_history();
@@ -425,6 +442,13 @@ impl LocalSessionClient {
             .await?;
         let mut changed = !events.is_empty();
         for event in events {
+            if let SessionEventKind::PromptRecalled {
+                text, attachments, ..
+            } = &event.kind
+            {
+                self.recalled_prompts
+                    .push((text.clone(), attachments.clone()));
+            }
             for key in event.kind.cleared_live_state_keys() {
                 self.live_events.remove(&key);
             }
@@ -448,6 +472,10 @@ impl LocalSessionClient {
         }
         rebuild_agents(&mut self.view);
         Ok(true)
+    }
+
+    fn take_recalled_prompts(&mut self) -> Vec<(String, Vec<PathBuf>)> {
+        std::mem::take(&mut self.recalled_prompts)
     }
 
     async fn list_sessions(&self) -> Result<Vec<LocalSessionOption>> {
