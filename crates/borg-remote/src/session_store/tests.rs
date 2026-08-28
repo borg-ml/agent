@@ -214,6 +214,32 @@ async fn writer_contention_has_a_bounded_escape_hatch() {
 }
 
 #[tokio::test]
+async fn production_writer_admission_survives_repeated_contention_timeouts() {
+    let (_directory, store) = store().await;
+    let blocker = store.begin_write().await.unwrap();
+    let pool = store.pool().clone();
+    let writer = tokio::spawn(async move {
+        SqliteSessionStore::begin_sqlite_write_resilient(&pool, Duration::from_millis(100)).await
+    });
+
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert!(
+        !writer.is_finished(),
+        "production writer admission must not fail a session while contention persists"
+    );
+
+    blocker.rollback().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), writer)
+        .await
+        .expect("writer did not resume after contention cleared")
+        .expect("writer task panicked")
+        .expect("writer admission failed after contention cleared")
+        .rollback()
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn writer_contention_does_not_exhaust_the_pool() {
     let (_directory, store) = store().await;
     let session_id = Uuid::new_v4();

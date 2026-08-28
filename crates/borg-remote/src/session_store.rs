@@ -31,8 +31,8 @@ pub(crate) const SESSION_PAYLOAD_PREVIEW_BYTES: usize = 4 * 1024;
 // A blocked SQLite connection must return to the pool quickly. The writer
 // admission loop below owns the longer wait; keeping that wait in SQLite
 // would strand a pooled connection and starve unrelated reads.
-const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_millis(100);
-const SQLITE_SCHEMA_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(1);
+const SQLITE_SCHEMA_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 const SQLITE_WRITE_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 const SQLITE_WRITE_TRANSACTION: &str = "BEGIN IMMEDIATE";
 const SQLITE_JOURNAL_SIZE_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
@@ -2225,7 +2225,29 @@ impl SqliteSessionStore {
     pub(crate) async fn begin_sqlite_write(
         pool: &SqlitePool,
     ) -> Result<Transaction<'static, Sqlite>, sqlx::Error> {
-        Self::begin_sqlite_write_with_timeout(pool, SQLITE_WRITE_WAIT_TIMEOUT).await
+        Self::begin_sqlite_write_resilient(pool, SQLITE_WRITE_WAIT_TIMEOUT).await
+    }
+
+    async fn begin_sqlite_write_resilient(
+        pool: &SqlitePool,
+        attempt_timeout: Duration,
+    ) -> Result<Transaction<'static, Sqlite>, sqlx::Error> {
+        loop {
+            match Self::begin_sqlite_write_with_timeout(pool, attempt_timeout).await {
+                Err(sqlx::Error::PoolTimedOut) => {
+                    // The journal is the durable source of truth, so restarting
+                    // a healthy session cannot make progress while the same
+                    // external writer or I/O stall remains. Keep the caller
+                    // alive and retry; cancellation still drops this future
+                    // immediately when the session is explicitly stopped.
+                    warn!(
+                        retry_seconds = attempt_timeout.as_secs(),
+                        "SQLite session journal remains busy; continuing to wait"
+                    );
+                }
+                result => return result,
+            }
+        }
     }
 
     async fn begin_sqlite_write_with_timeout(
