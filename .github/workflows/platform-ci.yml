@@ -61,7 +61,7 @@ jobs:
           toolchain: "1.98.0"
           targets: ${{ matrix.target }}
       - name: Build Borg Agent
-        run: cargo build --locked --release --target ${{ matrix.target }} -p borg
+        run: cargo build --locked --release --target ${{ matrix.target }} -p borg -p borg-gui
       - name: Run native Borg Agent core-flow tests
         run: cargo test --locked --target ${{ matrix.target }} -p borg --no-fail-fast
       - name: Smoke-test the native Borg Agent binary
@@ -86,6 +86,7 @@ jobs:
           trap 'rm -rf "$stage" "$extract"' EXIT
           mkdir "$stage/borg-${{ matrix.target }}"
           cp "target/${{ matrix.target }}/release/borg" "$stage/borg-${{ matrix.target }}/"
+          cp "target/${{ matrix.target }}/release/borg-gui" "$stage/borg-${{ matrix.target }}/"
           native_package=""
           for candidate in packages/claude-native-runtime/node_modules/@anthropic-ai/claude-agent-sdk-*; do
             if [[ -x "$candidate/claude" ]]; then
@@ -107,6 +108,7 @@ jobs:
           tar -C "$stage" -czf "$asset" "borg-${{ matrix.target }}"
           tar -xzf "$asset" -C "$extract"
           "$extract/borg-${{ matrix.target }}/borg" --version
+          test -x "$extract/borg-${{ matrix.target }}/borg-gui"
           "$extract/borg-${{ matrix.target }}/providers/claude/claude" --version
           test -f "$extract/borg-${{ matrix.target }}/docs/blu-extensions.md"
           test -f "$extract/borg-${{ matrix.target }}/configs/extension.example.toml"
@@ -122,6 +124,7 @@ jobs:
           if (Test-Path $extract) { Remove-Item -Recurse -Force $extract }
           New-Item -ItemType Directory -Path $stage | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/borg.exe" $stage
+          Copy-Item "target/${{ matrix.target }}/release/borg-gui.exe" $stage
           $platformPackage = Get-ChildItem "packages/claude-native-runtime/node_modules/@anthropic-ai" -Directory |
             Where-Object { $_.Name -like "claude-agent-sdk-*" -and (Test-Path (Join-Path $_.FullName "claude.exe")) } |
             Select-Object -First 1
@@ -140,6 +143,7 @@ jobs:
           $binary = Get-ChildItem -Path $extract -Filter "borg.exe" | Select-Object -First 1
           if (-not $binary) { throw "packaged borg.exe was not found" }
           & $binary.FullName --version
+          if (-not (Get-ChildItem -Path $extract -Filter "borg-gui.exe")) { throw "packaged borg-gui.exe was not found" }
           $native = Get-ChildItem -Path $extract -Recurse -Filter "claude.exe" | Select-Object -First 1
           if (-not $native) { throw "packaged native claude.exe was not found" }
           & $native.FullName --version

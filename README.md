@@ -1,8 +1,8 @@
 # Borg Agent
 
 Borg Agent is a Rust-based agent harness and orchestrator. It provides a
-terminal UI, durable sessions, native tools, provider adapters, and optional
-remote hosts. The executable is `borg`.
+terminal and native GPUI frontends, durable sessions, native tools, provider
+adapters, and optional remote hosts. Releases include `borg` and `borg-gui`.
 
 [Repository](https://github.com/borg-ml/agent) ·
 [Blu language](https://github.com/borg-ml/blu) ·
@@ -24,7 +24,8 @@ irm https://borg.ml/install.ps1 | iex
 
 The installer chooses the platform and CPU, verifies the release checksum, and
 installs `borg` in a user-local binary directory. Run `borg update` to update
-an existing installation.
+an existing installation. The same release also installs the native GUI
+launcher.
 
 ## Use Borg
 
@@ -33,14 +34,16 @@ include:
 
 ```sh
 borg resume
+borg gui
 borg capabilities
 borg extensions list
 ```
 
 ## What it provides
 
-- A responsive terminal UI with resumable sessions, compaction, image input,
-  transcript navigation, and configurable keybindings.
+- Responsive TUI and native GPU-rendered frontends over the same durable
+  session runtime, with resumable sessions, compaction, image input, transcript
+  navigation, dictation, goals, plans, and subagent controls.
 - Codex and Claude subscription adapters, OpenCode, Kimi, OpenRouter, and
   configured OpenAI-compatible providers.
 - A provider-neutral `borg-core` crate with no provider SDK, HTTP, MCP, or
@@ -67,7 +70,8 @@ cp configs/editor.example.toml ~/.config/borg/editor.toml
 
 Use `$XDG_CONFIG_HOME/borg` instead when `XDG_CONFIG_HOME` is set. The agent
 configuration covers providers, capabilities, MCP servers, aliases, and team
-settings. The editor configuration covers the TUI and input behavior.
+settings. The editor configuration covers TUI presentation and input behavior;
+the native frontend uses platform-native input and rendering.
 
 See [`docs/customization.md`](docs/customization.md) for editor settings,
 keybindings, alerts, extension authority, and native extension authoring.
@@ -118,7 +122,11 @@ contract. Blu workflow files may use `.blu`, `.lua`, or `.luau` entrypoints.
 - `borg-provider` — model gateways and provider adapters
 - `borg-remote` — durable sessions, hosts, protocols, and native tools
 - `borg-search` — bounded web-search contracts and backends
-- `borg-cli` — public commands and terminal UI
+- `borg-ui` — frontend-neutral commands, projections, preferences, and local
+  session bridge
+- `borg-tui` — Ratatui terminal frontend
+- `borg-gui` — GPUI native frontend
+- `borg-cli` — public command shell and frontend launchers
 
 ## Development
 

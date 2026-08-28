@@ -50,6 +50,7 @@ async fn main() -> Result<()> {
     match command {
         Command::Agent(args) => run_local_agent(args).await,
         Command::Resume { session } => run_local_agent(LocalAgentCliArgs::resume(session)).await,
+        Command::Gui { session } => run_gui(session).await,
         Command::Remote { command } => run_remote_command(command).await,
         Command::Update(args) => updater::run(args).await,
         Command::Capabilities(args) => print_capabilities(args),
@@ -64,6 +65,29 @@ async fn main() -> Result<()> {
         Command::Limits(args) => limits::run(args).await,
         Command::AgentMcp => agent_mcp::run().await,
     }
+}
+
+async fn run_gui(session: Option<uuid::Uuid>) -> Result<()> {
+    let executable_name = if cfg!(windows) {
+        "borg-gui.exe"
+    } else {
+        "borg-gui"
+    };
+    let executable = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|parent| parent.join(executable_name)))
+        .filter(|path| path.is_file())
+        .unwrap_or_else(|| executable_name.into());
+    let mut command = tokio::process::Command::new(&executable);
+    if let Some(session) = session {
+        command.args(["--session", &session.to_string()]);
+    }
+    let status = command
+        .status()
+        .await
+        .with_context(|| format!("failed to start {}", executable.display()))?;
+    anyhow::ensure!(status.success(), "native GUI exited with {status}");
+    Ok(())
 }
 
 async fn doctor(json: bool, deep: bool) -> Result<()> {

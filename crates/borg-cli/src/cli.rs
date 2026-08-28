@@ -34,6 +34,7 @@ impl Cli {
             command,
             "__agent"
                 | "resume"
+                | "gui"
                 | "remote"
                 | "update"
                 | "install"
@@ -73,6 +74,12 @@ pub(crate) enum Command {
     Agent(LocalAgentCliArgs),
     /// Resume the latest local session, or a specific session by id.
     Resume { session: Option<Uuid> },
+    /// Open the native GPUI frontend.
+    Gui {
+        /// Open a specific durable session by id.
+        #[arg(long)]
+        session: Option<Uuid>,
+    },
     /// Enrol and operate this machine through Borg Remote.
     Remote {
         #[command(subcommand)]

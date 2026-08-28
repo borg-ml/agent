@@ -689,6 +689,8 @@ impl BorgGui {
         let header = div()
             .flex()
             .items_center()
+            .min_w_0()
+            .overflow_hidden()
             .gap_2()
             .text_sm()
             .child(
@@ -698,7 +700,14 @@ impl BorgGui {
                     .child(entry.title),
             )
             .when_some(entry.detail, |row, detail| {
-                row.child(div().text_color(rgb(palette::TEXT_MUTED)).child(detail))
+                row.child(
+                    div()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .text_color(rgb(palette::TEXT_MUTED))
+                        .child(detail),
+                )
             })
             .child(div().text_color(rgb(palette::TEXT_MUTED)).child(time))
             .child(div().text_color(rgb(color)).child(indicator));
@@ -707,6 +716,9 @@ impl BorgGui {
             .id(SharedString::from(entry.id))
             .flex()
             .flex_col()
+            .w_full()
+            .min_w_0()
+            .overflow_hidden()
             .gap_1()
             .border_l_2()
             .border_color(rgb(color))
@@ -735,6 +747,8 @@ impl BorgGui {
             .when(!body.is_empty(), |card| {
                 card.child(
                     div()
+                        .w_full()
+                        .min_w_0()
                         .text_color(rgb(if compact {
                             palette::TEXT_MUTED
                         } else {
@@ -1062,6 +1076,8 @@ impl Render for BorgGui {
                                         .into_any_element()
                                 })
                                 .flex_1()
+                                .w_full()
+                                .min_w_0()
                                 .gap_3(),
                             ),
                     )
