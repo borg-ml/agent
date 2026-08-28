@@ -7241,54 +7241,7 @@ fn is_usage_command(line: &str) -> bool {
 }
 
 fn parse_todo_action(line: &str, items: &[PlanItem]) -> Result<TodoAction> {
-    let value = line
-        .strip_prefix("/todo ")
-        .or_else(|| line.strip_prefix("/todos "))
-        .context("usage: /todo [add|start|done|pending|remove|clear]")?
-        .trim();
-    if value == "clear" {
-        return Ok(TodoAction::Clear);
-    }
-    let (command, argument) = value
-        .split_once(char::is_whitespace)
-        .context("usage: /todo [add TEXT|start ID|done ID|pending ID|remove ID|clear]")?;
-    let argument = argument.trim();
-    anyhow::ensure!(!argument.is_empty(), "todo command requires a value");
-    match command {
-        "add" => Ok(TodoAction::Add {
-            content: argument.to_string(),
-        }),
-        "start" => Ok(TodoAction::SetStatus {
-            id: resolve_todo_id(items, argument)?,
-            status: PlanItemStatus::InProgress,
-        }),
-        "done" | "complete" => Ok(TodoAction::SetStatus {
-            id: resolve_todo_id(items, argument)?,
-            status: PlanItemStatus::Completed,
-        }),
-        "pending" | "reset" => Ok(TodoAction::SetStatus {
-            id: resolve_todo_id(items, argument)?,
-            status: PlanItemStatus::Pending,
-        }),
-        "remove" | "rm" => Ok(TodoAction::Remove {
-            id: resolve_todo_id(items, argument)?,
-        }),
-        _ => anyhow::bail!("usage: /todo [add TEXT|start ID|done ID|pending ID|remove ID|clear]"),
-    }
-}
-
-fn resolve_todo_id(items: &[PlanItem], value: &str) -> Result<Uuid> {
-    let normalized = value.to_ascii_lowercase();
-    let matches = items
-        .iter()
-        .filter(|item| item.id.to_string().starts_with(&normalized))
-        .map(|item| item.id)
-        .collect::<Vec<_>>();
-    match matches.as_slice() {
-        [id] => Ok(*id),
-        [] => anyhow::bail!("no todo item matches ID {value}"),
-        _ => anyhow::bail!("todo ID prefix {value} is ambiguous"),
-    }
+    borg_ui::parse_todo_action(line, items)
 }
 
 fn print_todos(items: &[PlanItem]) {

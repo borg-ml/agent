@@ -10,7 +10,7 @@ use borg_remote::{
 };
 use uuid::Uuid;
 
-use crate::{FrontendCommand, SessionPresentation, SessionView};
+use crate::{FrontendCommand, SessionPresentation, SessionView, timeline::TimelineProjector};
 
 pub enum LocalSessionUpdate {
     Presentation(SessionPresentation),
@@ -78,9 +78,8 @@ impl LocalSessionWorker {
                     if let Ok(sessions) = client.list_sessions().await {
                         let _ = update_tx.send_blocking(LocalSessionUpdate::Sessions(sessions));
                     }
-                    let _ = update_tx.send_blocking(LocalSessionUpdate::Presentation(
-                        SessionPresentation::new(client.view().clone()),
-                    ));
+                    let _ = update_tx
+                        .send_blocking(LocalSessionUpdate::Presentation(client.presentation()));
                     loop {
                         let wait = if matches!(
                             client.view().state.status,
@@ -146,10 +145,9 @@ impl LocalSessionWorker {
                             };
                             match result {
                                 Ok(true) => {
-                                    let _ =
-                                        update_tx.send_blocking(LocalSessionUpdate::Presentation(
-                                            SessionPresentation::new(client.view().clone()),
-                                        ));
+                                    let _ = update_tx.send_blocking(
+                                        LocalSessionUpdate::Presentation(client.presentation()),
+                                    );
                                 }
                                 Ok(false) => {}
                                 Err(error) => {
@@ -163,7 +161,7 @@ impl LocalSessionWorker {
                             Ok(true) => {
                                 if update_tx
                                     .send_blocking(LocalSessionUpdate::Presentation(
-                                        SessionPresentation::new(client.view().clone()),
+                                        client.presentation(),
                                     ))
                                     .is_err()
                                 {
@@ -255,6 +253,7 @@ pub struct LocalSessionClient {
     live_events: HashMap<String, borg_remote::SessionEvent>,
     live_revision: u64,
     root_session_id: Uuid,
+    timeline: TimelineProjector,
 }
 
 impl LocalSessionClient {
@@ -307,12 +306,13 @@ impl LocalSessionClient {
             session_id,
             goal: state.goal.clone(),
             state,
-            history,
+            history: Arc::new(history),
             agents: Vec::new(),
             cwd,
         };
         rebuild_agents(&mut view);
-        let durable_history = view.history.clone();
+        let durable_history = view.history.as_ref().clone();
+        let timeline = TimelineProjector::from_events(&durable_history);
         let mut client = Self {
             store,
             sessions_dir,
@@ -321,6 +321,7 @@ impl LocalSessionClient {
             live_events: HashMap::new(),
             live_revision: 0,
             root_session_id,
+            timeline,
         };
         client.refresh_live().await?;
         client.rebuild_history();
@@ -329,6 +330,17 @@ impl LocalSessionClient {
 
     pub fn view(&self) -> &SessionView {
         &self.view
+    }
+
+    fn presentation(&self) -> SessionPresentation {
+        let mut timeline = self.timeline.clone();
+        let mut live = self.live_events.values().cloned().collect::<Vec<_>>();
+        live.sort_by_key(|event| event.created_at);
+        timeline.extend(&live);
+        SessionPresentation {
+            view: self.view.clone(),
+            timeline: Arc::new(timeline.into_shared_entries()),
+        }
     }
 
     pub async fn refresh(&mut self) -> Result<bool> {
@@ -342,11 +354,13 @@ impl LocalSessionClient {
                 self.live_events.remove(&key);
             }
             self.view.state.apply(&event)?;
+            self.timeline.push(&event);
             self.durable_history.push(event);
         }
         if self.durable_history.len() > 2_000 {
             self.durable_history
                 .drain(..self.durable_history.len() - 2_000);
+            self.timeline = TimelineProjector::from_events(&self.durable_history);
         }
         changed |= self.refresh_live().await?;
         if !changed {
@@ -406,10 +420,11 @@ impl LocalSessionClient {
     }
 
     fn rebuild_history(&mut self) {
-        self.view.history.clone_from(&self.durable_history);
+        let history = Arc::make_mut(&mut self.view.history);
+        history.clone_from(&self.durable_history);
         let mut live = self.live_events.values().cloned().collect::<Vec<_>>();
         live.sort_by_key(|event| event.created_at);
-        self.view.history.extend(live);
+        history.extend(live);
     }
 
     async fn load_older_history(&mut self) -> Result<bool> {
@@ -429,6 +444,7 @@ impl LocalSessionClient {
         }
         older.append(&mut self.durable_history);
         self.durable_history = older;
+        self.timeline = TimelineProjector::from_events(&self.durable_history);
         self.rebuild_history();
         rebuild_agents(&mut self.view);
         Ok(true)
@@ -481,6 +497,7 @@ impl LocalSessionClient {
                 }
             }
             FrontendCommand::ApplyGoal(action) => HostCommand::Goal { session_id, action },
+            FrontendCommand::ApplyTodo(action) => HostCommand::Todo { session_id, action },
             FrontendCommand::SetModel { provider, model } => HostCommand::Configure {
                 session_id,
                 action: SessionConfigAction::SetProvider {
@@ -508,8 +525,8 @@ impl LocalSessionClient {
             FrontendCommand::Compact => HostCommand::Compact { session_id },
             FrontendCommand::FocusAgent(_)
             | FrontendCommand::OpenSession(_)
-            | FrontendCommand::LoadOlderHistory
-            | FrontendCommand::Quit => return Ok(()),
+            | FrontendCommand::LoadOlderHistory => return Ok(()),
+            FrontendCommand::Quit => HostCommand::Stop { session_id },
         };
         send_local_session_command(
             &session_control_socket_path(&self.sessions_dir, session_id),
@@ -571,7 +588,7 @@ impl LocalSessionClient {
 
 fn rebuild_agents(view: &mut SessionView) {
     view.agents.clear();
-    for event in &view.history {
+    for event in view.history.iter() {
         if let SessionEventKind::SubagentActivity { agent, .. } = &event.kind {
             if let Some(existing) = view
                 .agents

@@ -5,8 +5,9 @@
 use std::path::PathBuf;
 
 pub use borg_remote::{
-    ApprovalDecision, CodingProvider, GoalAction, PermissionMode, PlanItemStatus, PromptDelivery,
-    ResponseLanguage, SessionEvent, SessionGoal, SessionState, SessionStatus, SubagentSnapshot,
+    ApprovalDecision, CodingProvider, GoalAction, PermissionMode, PlanItem, PlanItemStatus,
+    PromptDelivery, ResponseLanguage, SessionEvent, SessionGoal, SessionState, SessionStatus,
+    SubagentSnapshot, TodoAction,
 };
 use uuid::Uuid;
 
@@ -160,6 +161,7 @@ pub enum FrontendCommand {
     Approve(ApprovalDecision),
     RespondToProviderInteraction(serde_json::Value),
     ApplyGoal(GoalAction),
+    ApplyTodo(TodoAction),
     SetModel {
         provider: CodingProvider,
         model: String,
@@ -180,6 +182,7 @@ pub fn parse_submission(
     text: &str,
     provider: CodingProvider,
     delivery: PromptDelivery,
+    todos: &[PlanItem],
 ) -> anyhow::Result<FrontendCommand> {
     let text = text.trim();
     if text == "/interrupt" || text == "/stop" {
@@ -197,8 +200,14 @@ pub fn parse_submission(
     if text == "/recall" {
         return Ok(FrontendCommand::RecallQueuedPrompt(None));
     }
+    if text == "/quit" || text == "/exit" {
+        return Ok(FrontendCommand::Quit);
+    }
     if text.starts_with("/goal ") {
         return Ok(FrontendCommand::ApplyGoal(parse_goal_action(text)?));
+    }
+    if text.starts_with("/todo ") || text.starts_with("/todos ") {
+        return Ok(FrontendCommand::ApplyTodo(parse_todo_action(text, todos)?));
     }
     if let Some(model) = text.strip_prefix("/model ").map(str::trim) {
         anyhow::ensure!(!model.is_empty(), "usage: /model MODEL");
@@ -238,6 +247,56 @@ pub fn parse_submission(
         attachments: Vec::new(),
         delivery,
     })
+}
+
+pub fn parse_todo_action(line: &str, items: &[PlanItem]) -> anyhow::Result<TodoAction> {
+    use anyhow::Context as _;
+
+    let value = line
+        .strip_prefix("/todo ")
+        .or_else(|| line.strip_prefix("/todos "))
+        .context("usage: /todo [add|start|done|pending|remove|clear]")?
+        .trim();
+    if value == "clear" {
+        return Ok(TodoAction::Clear);
+    }
+    let (command, argument) = value
+        .split_once(char::is_whitespace)
+        .context("usage: /todo [add TEXT|start ID|done ID|pending ID|remove ID|clear]")?;
+    let argument = argument.trim();
+    anyhow::ensure!(!argument.is_empty(), "todo command requires a value");
+    let resolve_id = || {
+        let normalized = argument.to_ascii_lowercase();
+        let matches = items
+            .iter()
+            .filter(|item| item.id.to_string().starts_with(&normalized))
+            .map(|item| item.id)
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [id] => Ok(*id),
+            [] => anyhow::bail!("no todo item matches ID {argument}"),
+            _ => anyhow::bail!("todo ID prefix {argument} is ambiguous"),
+        }
+    };
+    match command {
+        "add" => Ok(TodoAction::Add {
+            content: argument.to_string(),
+        }),
+        "start" => Ok(TodoAction::SetStatus {
+            id: resolve_id()?,
+            status: PlanItemStatus::InProgress,
+        }),
+        "done" | "complete" => Ok(TodoAction::SetStatus {
+            id: resolve_id()?,
+            status: PlanItemStatus::Completed,
+        }),
+        "pending" | "reset" => Ok(TodoAction::SetStatus {
+            id: resolve_id()?,
+            status: PlanItemStatus::Pending,
+        }),
+        "remove" | "rm" => Ok(TodoAction::Remove { id: resolve_id()? }),
+        _ => anyhow::bail!("usage: /todo [add TEXT|start ID|done ID|pending ID|remove ID|clear]"),
+    }
 }
 
 pub fn cancelled_provider_interaction_response(kind: &str) -> serde_json::Value {
@@ -345,7 +404,7 @@ pub fn provider_interaction_response(
 pub struct SessionView {
     pub session_id: Uuid,
     pub state: SessionState,
-    pub history: Vec<SessionEvent>,
+    pub history: std::sync::Arc<Vec<SessionEvent>>,
     pub goal: Option<SessionGoal>,
     pub agents: Vec<SubagentSnapshot>,
     pub cwd: PathBuf,
@@ -354,12 +413,14 @@ pub struct SessionView {
 #[derive(Clone, Debug)]
 pub struct SessionPresentation {
     pub view: SessionView,
-    pub timeline: std::sync::Arc<Vec<timeline::TimelineEntry>>,
+    pub timeline: std::sync::Arc<Vec<std::sync::Arc<timeline::TimelineEntry>>>,
 }
 
 impl SessionPresentation {
     pub fn new(view: SessionView) -> Self {
-        let timeline = std::sync::Arc::new(timeline::project_timeline(&view.history));
+        let timeline = std::sync::Arc::new(
+            timeline::TimelineProjector::from_events(&view.history).into_shared_entries(),
+        );
         Self { view, timeline }
     }
 }
@@ -369,7 +430,7 @@ impl SessionView {
         Self {
             session_id,
             state: SessionState::default(),
-            history: Vec::new(),
+            history: std::sync::Arc::new(Vec::new()),
             goal: None,
             agents: Vec::new(),
             cwd,
@@ -436,15 +497,22 @@ mod tests {
             parse_submission(
                 "/permission manual",
                 CodingProvider::Codex,
-                PromptDelivery::Steer
+                PromptDelivery::Steer,
+                &[]
             ),
             Ok(FrontendCommand::SetPermission(PermissionMode::Manual))
         ));
         assert!(
-            parse_submission("/unknown", CodingProvider::Codex, PromptDelivery::Steer).is_err()
+            parse_submission(
+                "/unknown",
+                CodingProvider::Codex,
+                PromptDelivery::Steer,
+                &[]
+            )
+            .is_err()
         );
         assert!(matches!(
-            parse_submission("ship it", CodingProvider::Codex, PromptDelivery::Queue),
+            parse_submission("ship it", CodingProvider::Codex, PromptDelivery::Queue, &[]),
             Ok(FrontendCommand::SubmitPrompt {
                 delivery: PromptDelivery::Queue,
                 ..

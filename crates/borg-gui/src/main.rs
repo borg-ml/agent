@@ -26,7 +26,7 @@ struct BorgGui {
     error: Option<String>,
     delivery: PromptDelivery,
     root_session_id: Option<Uuid>,
-    timeline: Arc<Vec<TimelineEntry>>,
+    timeline: Arc<Vec<Arc<TimelineEntry>>>,
     transcript_state: ListState,
     attachments: Vec<PathBuf>,
     sessions: Vec<LocalSessionOption>,
@@ -67,7 +67,12 @@ impl BorgGui {
                 .and_then(|view| view.state.configuration.as_ref())
                 .map(|configuration| configuration.provider)
                 .unwrap_or(CodingProvider::Codex);
-            match borg_ui::parse_submission(&event.0, provider, this.delivery) {
+            let todos = this
+                .view
+                .as_ref()
+                .map(|view| view.state.todos.as_slice())
+                .unwrap_or_default();
+            match borg_ui::parse_submission(&event.0, provider, this.delivery, todos) {
                 Ok(FrontendCommand::SubmitPrompt { text, delivery, .. }) => {
                     let attachments = std::mem::take(&mut this.attachments);
                     this.send(FrontendCommand::SubmitPrompt {
@@ -520,58 +525,58 @@ impl Render for BorgGui {
                                 .child(goal),
                         ),
                 )
-                .when(self.sessions_open, |root| {
-                    root.child(
-                        div()
-                            .id("session-menu")
-                            .absolute()
-                            .top(px(46.))
-                            .left(px(12.))
-                            .w(px(460.))
-                            .max_h(px(520.))
-                            .overflow_y_scroll()
-                            .border_1()
-                            .border_color(rgb(palette::BORDER))
-                            .bg(rgb(palette::SURFACE))
-                            .p_2()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .px_2()
-                                    .py_1()
-                                    .text_xs()
-                                    .text_color(rgb(palette::TEXT_MUTED))
-                                    .child("RECENT SESSIONS"),
-                            )
-                            .children(session_options.into_iter().map(|session| {
-                                let session_id = session.session_id;
-                                let title = session.title.chars().take(72).collect::<String>();
-                                let detail =
-                                    format!("{}  ·  {:?}", session.cwd.display(), session.status)
-                                        .to_lowercase();
-                                div()
-                                    .id(SharedString::from(format!("session-{session_id}")))
-                                    .px_3()
-                                    .py_2()
-                                    .cursor_pointer()
-                                    .hover(|style| style.bg(rgb(palette::SURFACE_RAISED)))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.send(FrontendCommand::OpenSession(session_id));
-                                        this.sessions_open = false;
-                                        cx.notify();
-                                    }))
-                                    .child(div().text_sm().child(title))
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(rgb(palette::TEXT_MUTED))
-                                            .child(detail),
-                                    )
-                            })),
-                    )
-                })
+            })
+            .when(self.sessions_open, |root| {
+                root.child(
+                    div()
+                        .id("session-menu")
+                        .absolute()
+                        .top(px(46.))
+                        .left(px(12.))
+                        .w(px(460.))
+                        .max_h(px(520.))
+                        .overflow_y_scroll()
+                        .border_1()
+                        .border_color(rgb(palette::BORDER))
+                        .bg(rgb(palette::SURFACE))
+                        .p_2()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .px_2()
+                                .py_1()
+                                .text_xs()
+                                .text_color(rgb(palette::TEXT_MUTED))
+                                .child("RECENT SESSIONS"),
+                        )
+                        .children(session_options.into_iter().map(|session| {
+                            let session_id = session.session_id;
+                            let title = session.title.chars().take(72).collect::<String>();
+                            let detail =
+                                format!("{}  ·  {:?}", session.cwd.display(), session.status)
+                                    .to_lowercase();
+                            div()
+                                .id(SharedString::from(format!("session-{session_id}")))
+                                .px_3()
+                                .py_2()
+                                .cursor_pointer()
+                                .hover(|style| style.bg(rgb(palette::SURFACE_RAISED)))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.send(FrontendCommand::OpenSession(session_id));
+                                    this.sessions_open = false;
+                                    cx.notify();
+                                }))
+                                .child(div().text_sm().child(title))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(palette::TEXT_MUTED))
+                                        .child(detail),
+                                )
+                        })),
+                )
             })
             .child(
                 div()
@@ -601,7 +606,8 @@ impl Render for BorgGui {
                             )
                             .child(
                                 list(transcript_state, move |index, _, _| {
-                                    Self::render_entry(timeline[index].clone()).into_any_element()
+                                    Self::render_entry(timeline[index].as_ref().clone())
+                                        .into_any_element()
                                 })
                                 .flex_1()
                                 .gap_3(),
