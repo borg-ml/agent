@@ -17,5 +17,6 @@ chrono.workspace = true
 dirs.workspace = true
 serde.workspace = true
 tempfile.workspace = true
+tokio.workspace = true
 toml.workspace = true
 uuid.workspace = true

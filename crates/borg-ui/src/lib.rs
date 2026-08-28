@@ -5,12 +5,14 @@
 use std::path::PathBuf;
 
 use borg_remote::{
-    ApprovalDecision, CodingProvider, GoalAction, PermissionMode, PromptDelivery,
-    ResponseLanguage, SessionEvent, SessionGoal, SessionState, SubagentSnapshot,
+    ApprovalDecision, CodingProvider, GoalAction, PermissionMode, PromptDelivery, ResponseLanguage,
+    SessionEvent, SessionGoal, SessionState, SubagentSnapshot,
 };
 use uuid::Uuid;
 
+pub mod local;
 pub mod preferences;
+pub mod timeline;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
