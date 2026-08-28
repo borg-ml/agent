@@ -33,8 +33,8 @@ pub struct LocalSessionWorker {
 
 impl LocalSessionWorker {
     pub fn start(session_id: Option<Uuid>) -> Result<Option<Self>> {
-        let (command_tx, command_rx) = async_channel::unbounded();
-        let (update_tx, update_rx) = async_channel::unbounded();
+        let (command_tx, command_rx) = async_channel::bounded(64);
+        let (update_tx, update_rx) = async_channel::bounded(8);
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         std::thread::Builder::new()
             .name("borg-gui-session".into())
@@ -50,8 +50,32 @@ impl LocalSessionWorker {
                     }
                 };
                 runtime.block_on(async move {
-                    let mut client = match LocalSessionClient::open(session_id).await {
-                        Ok(Some(client)) => client,
+                    let (mut client, mut _owner) = match LocalSessionClient::open(session_id).await
+                    {
+                        Ok(Some(client)) => {
+                            let owner = match ensure_session_owner(
+                                &client.sessions_dir,
+                                client.view().session_id,
+                            )
+                            .await
+                            {
+                                Ok(owner) => owner,
+                                Err(error) => {
+                                    let _ = ready_tx.send(Err(error));
+                                    return;
+                                }
+                            };
+                            (client, owner)
+                        }
+                        Ok(None) if session_id.is_none() => {
+                            match launch_new_session_owner().await {
+                                Ok(value) => value,
+                                Err(error) => {
+                                    let _ = ready_tx.send(Err(error));
+                                    return;
+                                }
+                            }
+                        }
                         Ok(None) => {
                             let _ = ready_tx.send(Ok(false));
                             return;
@@ -61,16 +85,6 @@ impl LocalSessionWorker {
                             return;
                         }
                     };
-                    let mut _owner =
-                        match ensure_session_owner(&client.sessions_dir, client.view().session_id)
-                            .await
-                        {
-                            Ok(owner) => owner,
-                            Err(error) => {
-                                let _ = ready_tx.send(Err(error));
-                                return;
-                            }
-                        };
                     if ready_tx.send(Ok(true)).is_err() {
                         return;
                     }
@@ -96,6 +110,17 @@ impl LocalSessionWorker {
                         if let Ok(command) = tokio::time::timeout(wait, command_rx.recv()).await {
                             let Ok(command) = command else { return };
                             let result = match command {
+                                FrontendCommand::NewSession => {
+                                    match launch_new_session_owner().await {
+                                        Ok((next, next_owner)) => {
+                                            _owner = next_owner;
+                                            root_session_id = next.view().session_id;
+                                            client = next;
+                                            Ok(true)
+                                        }
+                                        Err(error) => Err(error),
+                                    }
+                                }
                                 FrontendCommand::OpenSession(session_id) => {
                                     match LocalSessionClient::open(Some(session_id)).await {
                                         Ok(Some(next)) => {
@@ -196,8 +221,8 @@ impl LocalSessionWorker {
 
     pub fn send(&self, command: FrontendCommand) -> Result<()> {
         self.commands
-            .send_blocking(command)
-            .context("Borg session worker is no longer running")
+            .try_send(command)
+            .context("Borg session command queue is unavailable")
     }
 
     pub fn updates(&self) -> async_channel::Receiver<LocalSessionUpdate> {
@@ -213,15 +238,7 @@ async fn ensure_session_owner(
     if local_session_owner_is_active(sessions_dir, session_id)? {
         return Ok(None);
     }
-    let executable_name = if cfg!(windows) { "borg.exe" } else { "borg" };
-    let borg = std::env::current_exe()
-        .context("failed to locate the Borg GUI executable")?
-        .with_file_name(executable_name);
-    anyhow::ensure!(
-        borg.is_file(),
-        "session is not running and the Borg owner executable was not found at {}",
-        borg.display()
-    );
+    let borg = borg_executable()?;
     let mut child = tokio::process::Command::new(&borg)
         .arg("--gui-owner")
         .arg("--resume")
@@ -243,6 +260,51 @@ async fn ensure_session_owner(
     }
     child.kill().await.ok();
     anyhow::bail!("timed out waiting for the Borg session owner")
+}
+
+async fn launch_new_session_owner() -> Result<(LocalSessionClient, Option<tokio::process::Child>)> {
+    let borg = borg_executable()?;
+    let previous_session_id = LocalSessionClient::open(None)
+        .await?
+        .map(|client| client.view().session_id);
+    let mut child = tokio::process::Command::new(&borg)
+        .arg("--gui-owner")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .with_context(|| format!("failed to start session owner {}", borg.display()))?;
+    for _ in 0..200 {
+        if let Some(client) = LocalSessionClient::open(None).await?
+            && Some(client.view().session_id) != previous_session_id
+        {
+            let socket =
+                session_control_socket_path(&client.sessions_dir, client.view().session_id);
+            if socket.exists() {
+                return Ok((client, Some(child)));
+            }
+        }
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!("Borg session owner exited during startup with {status}");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    child.kill().await.ok();
+    anyhow::bail!("timed out waiting for a new Borg session owner")
+}
+
+fn borg_executable() -> Result<PathBuf> {
+    let executable_name = if cfg!(windows) { "borg.exe" } else { "borg" };
+    let borg = std::env::current_exe()
+        .context("failed to locate the Borg GUI executable")?
+        .with_file_name(executable_name);
+    anyhow::ensure!(
+        borg.is_file(),
+        "the Borg owner executable was not found at {}",
+        borg.display()
+    );
+    Ok(borg)
 }
 
 pub struct LocalSessionClient {
@@ -524,6 +586,7 @@ impl LocalSessionClient {
             FrontendCommand::ClearContext => HostCommand::ClearContext { session_id },
             FrontendCommand::Compact => HostCommand::Compact { session_id },
             FrontendCommand::FocusAgent(_)
+            | FrontendCommand::NewSession
             | FrontendCommand::OpenSession(_)
             | FrontendCommand::LoadOlderHistory => return Ok(()),
             FrontendCommand::Quit => HostCommand::Stop { session_id },

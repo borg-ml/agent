@@ -6820,24 +6820,7 @@ fn sidecar_notice(sidecar: PersistentSidecar, intent: &PersistentSidecarIntent) 
 /// explicit GPT peer consultation; the active model still chooses the useful
 /// briefing. Direct sidecar controls are handled before this normalizer.
 pub(crate) fn normalize_consultation_command(line: &str) -> String {
-    let trimmed = line.trim();
-    for (alias, profile) in [
-        ("/claude", "claude"),
-        ("/gpt", "gpt"),
-        ("/codex", "gpt-5.6-sol@xhigh"),
-    ] {
-        if trimmed == alias {
-            return format!("/ask {profile}");
-        }
-        if let Some(request) = trimmed.strip_prefix(alias).filter(|rest| {
-            rest.chars()
-                .next()
-                .is_some_and(|character| character.is_whitespace())
-        }) {
-            return format!("/ask {profile}{}", request);
-        }
-    }
-    line.to_string()
+    borg_ui::normalize_consultation_command(line)
 }
 
 fn director_prompt_command(line: &str) -> Option<Result<String>> {

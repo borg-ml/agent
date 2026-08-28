@@ -173,6 +173,7 @@ pub enum FrontendCommand {
     ClearContext,
     Compact,
     FocusAgent(Option<Uuid>),
+    NewSession,
     OpenSession(Uuid),
     LoadOlderHistory,
     Quit,
@@ -184,7 +185,32 @@ pub fn parse_submission(
     delivery: PromptDelivery,
     todos: &[PlanItem],
 ) -> anyhow::Result<FrontendCommand> {
-    let text = text.trim();
+    let normalized = normalize_consultation_command(text);
+    let text = normalized.trim();
+    if let Some(text) = text.strip_prefix("/queue ").map(str::trim) {
+        anyhow::ensure!(!text.is_empty(), "usage: /queue TEXT");
+        return Ok(FrontendCommand::SubmitPrompt {
+            text: text.to_string(),
+            attachments: Vec::new(),
+            delivery: PromptDelivery::Queue,
+        });
+    }
+    if let Some(text) = text.strip_prefix("/steer ").map(str::trim) {
+        anyhow::ensure!(!text.is_empty(), "usage: /steer TEXT");
+        return Ok(FrontendCommand::SubmitPrompt {
+            text: text.to_string(),
+            attachments: Vec::new(),
+            delivery: PromptDelivery::Steer,
+        });
+    }
+    if let Some(text) = text.strip_prefix("/director ").map(str::trim) {
+        anyhow::ensure!(!text.is_empty(), "usage: /director TEXT");
+        return Ok(FrontendCommand::SubmitPrompt {
+            text: text.to_string(),
+            attachments: Vec::new(),
+            delivery,
+        });
+    }
     if text == "/interrupt" || text == "/stop" {
         return Ok(FrontendCommand::Interrupt);
     }
@@ -241,12 +267,36 @@ pub fn parse_submission(
             .ok_or_else(|| anyhow::anyhow!("unknown response language `{language}`"))?;
         return Ok(FrontendCommand::SetLanguage(language));
     }
-    anyhow::ensure!(!text.starts_with('/'), "unknown command `{text}`");
+    anyhow::ensure!(
+        !text.starts_with('/') || text.starts_with("/ask "),
+        "unknown command `{text}`"
+    );
     Ok(FrontendCommand::SubmitPrompt {
         text: text.to_string(),
         attachments: Vec::new(),
         delivery,
     })
+}
+
+pub fn normalize_consultation_command(line: &str) -> String {
+    let trimmed = line.trim();
+    for (alias, profile) in [
+        ("/claude", "claude"),
+        ("/gpt", "gpt"),
+        ("/codex", "gpt-5.6-sol@xhigh"),
+    ] {
+        if trimmed == alias {
+            return format!("/ask {profile}");
+        }
+        if let Some(request) = trimmed.strip_prefix(alias).filter(|rest| {
+            rest.chars()
+                .next()
+                .is_some_and(|character| character.is_whitespace())
+        }) {
+            return format!("/ask {profile}{request}");
+        }
+    }
+    line.to_string()
 }
 
 pub fn parse_todo_action(line: &str, items: &[PlanItem]) -> anyhow::Result<TodoAction> {
@@ -517,6 +567,15 @@ mod tests {
                 delivery: PromptDelivery::Queue,
                 ..
             })
+        ));
+        assert!(matches!(
+            parse_submission(
+                "/claude review this",
+                CodingProvider::Codex,
+                PromptDelivery::Steer,
+                &[]
+            ),
+            Ok(FrontendCommand::SubmitPrompt { text, .. }) if text == "/ask claude review this"
         ));
     }
 }

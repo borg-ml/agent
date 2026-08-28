@@ -7,17 +7,18 @@ use borg_ui::{
     palette,
     timeline::{TimelineEntry, TimelineKind},
 };
-use composer::{Composer, Submitted};
+use composer::{Composer, PastedImage, Submitted};
 use gpui::{
     App, Application, Bounds, Context, Entity, Focusable, FontWeight, KeyBinding, ListAlignment,
     ListState, PathPromptOptions, SharedString, Window, WindowBounds, WindowOptions, div, list,
     prelude::*, px, rgb, size,
 };
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use uuid::Uuid;
 
-gpui::actions!(borg_gui, [Interrupt]);
+gpui::actions!(borg_gui, [Interrupt, Escape, ToggleHelp]);
 
 struct BorgGui {
     worker: Option<LocalSessionWorker>,
@@ -33,6 +34,9 @@ struct BorgGui {
     sessions_open: bool,
     dictation: Option<DictationWorker>,
     dictation_status: SharedString,
+    help_open: bool,
+    expanded_entries: HashSet<String>,
+    temporary_attachments: HashSet<PathBuf>,
 }
 
 impl BorgGui {
@@ -61,6 +65,51 @@ impl BorgGui {
                 cx.notify();
                 return;
             }
+            match event.0.trim() {
+                "/copy" => {
+                    if let Some(entry) = this
+                        .timeline
+                        .iter()
+                        .rev()
+                        .find(|entry| entry.kind == TimelineKind::Assistant)
+                    {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(entry.body.clone()));
+                    } else {
+                        this.error = Some("There is no assistant response to copy".into());
+                    }
+                    cx.notify();
+                    return;
+                }
+                "/dictate" => {
+                    match this.dictation.as_ref() {
+                        Some(dictation) => {
+                            if let Err(error) = dictation.toggle() {
+                                this.error = Some(error.to_string());
+                            }
+                        }
+                        None => this.error = Some("Dictation is unavailable".into()),
+                    }
+                    cx.notify();
+                    return;
+                }
+                "/resume" => {
+                    this.sessions_open = true;
+                    cx.notify();
+                    return;
+                }
+                "/help" | "/settings" => {
+                    this.help_open = true;
+                    cx.notify();
+                    return;
+                }
+                "/goal" | "/goal view" | "/todo" | "/todos" | "/todo view" | "/todos view"
+                | "/usage" | "/status" => {
+                    this.help_open = true;
+                    cx.notify();
+                    return;
+                }
+                _ => {}
+            }
             let provider = this
                 .view
                 .as_ref()
@@ -87,6 +136,42 @@ impl BorgGui {
             cx.notify();
         })
         .detach();
+        cx.subscribe(&composer, |_this, _, event: &PastedImage, cx| {
+            let extension = match event.0.format {
+                gpui::ImageFormat::Png => "png",
+                gpui::ImageFormat::Jpeg => "jpg",
+                gpui::ImageFormat::Webp => "webp",
+                gpui::ImageFormat::Gif => "gif",
+                gpui::ImageFormat::Svg => "svg",
+                gpui::ImageFormat::Bmp => "bmp",
+                gpui::ImageFormat::Tiff => "tiff",
+            };
+            let directory = std::env::temp_dir().join("borg-gui-attachments");
+            let path = directory.join(format!("{}.{}", Uuid::new_v4(), extension));
+            let bytes = event.0.bytes.clone();
+            let write = cx.background_executor().spawn(async move {
+                std::fs::create_dir_all(&directory)
+                    .and_then(|_| std::fs::write(&path, bytes))
+                    .map(|_| path)
+            });
+            cx.spawn(async move |this, cx| {
+                let result = write.await;
+                let _ = this.update(cx, |this, cx| {
+                    match result {
+                        Ok(path) => {
+                            this.temporary_attachments.insert(path.clone());
+                            this.attachments.push(path);
+                        }
+                        Err(error) => {
+                            this.error = Some(format!("Could not save pasted image: {error}"))
+                        }
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
+        })
+        .detach();
         let updates = worker.as_ref().map(LocalSessionWorker::updates);
         let dictation = DictationWorker::start().ok();
         let dictation_updates = dictation.as_ref().map(DictationWorker::updates);
@@ -104,6 +189,9 @@ impl BorgGui {
             sessions_open: false,
             dictation,
             dictation_status: "dictate".into(),
+            help_open: false,
+            expanded_entries: HashSet::new(),
+            temporary_attachments: HashSet::new(),
         };
         if let Some(updates) = updates {
             this.schedule_updates(updates, cx);
@@ -127,7 +215,25 @@ impl BorgGui {
                             LocalSessionUpdate::Presentation(presentation) => {
                                 let view = presentation.view;
                                 this.root_session_id.get_or_insert(view.session_id);
-                                this.transcript_state.reset(presentation.timeline.len());
+                                if this
+                                    .view
+                                    .as_ref()
+                                    .is_none_or(|current| current.session_id != view.session_id)
+                                {
+                                    this.transcript_state.reset(presentation.timeline.len());
+                                    this.expanded_entries.clear();
+                                } else {
+                                    let common_prefix = this
+                                        .timeline
+                                        .iter()
+                                        .zip(presentation.timeline.iter())
+                                        .take_while(|(old, new)| Arc::ptr_eq(old, new))
+                                        .count();
+                                    this.transcript_state.splice(
+                                        common_prefix..this.timeline.len(),
+                                        presentation.timeline.len() - common_prefix,
+                                    );
+                                }
                                 this.timeline = presentation.timeline;
                                 let secret = view
                                     .state
@@ -208,6 +314,24 @@ impl BorgGui {
         self.send(FrontendCommand::Interrupt);
         cx.notify();
     }
+    fn escape_action(&mut self, _: &Escape, _: &mut Window, cx: &mut Context<Self>) {
+        if self.help_open {
+            self.help_open = false;
+        } else if self.sessions_open {
+            self.sessions_open = false;
+        } else {
+            self.send(FrontendCommand::Interrupt);
+        }
+        cx.notify();
+    }
+    fn toggle_help_action(&mut self, _: &ToggleHelp, _: &mut Window, cx: &mut Context<Self>) {
+        self.help_open = !self.help_open;
+        cx.notify();
+    }
+    fn toggle_help(&mut self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.help_open = !self.help_open;
+        cx.notify();
+    }
     fn approve_once(&mut self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.send(FrontendCommand::Approve(ApprovalDecision::AllowOnce));
         cx.notify();
@@ -273,6 +397,11 @@ impl BorgGui {
         self.sessions_open = !self.sessions_open;
         cx.notify();
     }
+    fn new_session(&mut self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.send(FrontendCommand::NewSession);
+        self.sessions_open = false;
+        cx.notify();
+    }
     fn toggle_dictation(&mut self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
         match self.dictation.as_ref() {
             Some(dictation) => {
@@ -297,7 +426,11 @@ impl BorgGui {
             .child(div().text_color(rgb(color)).child(value.into()))
     }
 
-    fn render_entry(entry: TimelineEntry) -> impl IntoElement {
+    fn render_entry(
+        entry: TimelineEntry,
+        expanded: bool,
+        view: Entity<BorgGui>,
+    ) -> impl IntoElement {
         let color = match entry.kind {
             TimelineKind::User => palette::BLUE,
             TimelineKind::Assistant => palette::ORANGE,
@@ -312,14 +445,19 @@ impl BorgGui {
             TimelineKind::Reasoning | TimelineKind::Tool | TimelineKind::Status
         );
         let time = entry.created_at.format("%H:%M").to_string();
-        let indicator = if entry.running {
+        let indicator = if entry.kind == TimelineKind::Tool && !entry.body.is_empty() {
+            if expanded { "▾" } else { "▸" }
+        } else if entry.running {
             "◆"
         } else if entry.failed {
             "×"
         } else {
             ""
         };
-        let body = if entry.body.len() > 12_000 {
+        let copy_body = entry.body.clone();
+        let body = if entry.kind == TimelineKind::Tool && !expanded {
+            String::new()
+        } else if entry.body.len() > 12_000 {
             let boundary = entry.body.floor_char_boundary(12_000);
             format!("{}\n… output truncated", &entry.body[..boundary])
         } else {
@@ -341,7 +479,9 @@ impl BorgGui {
             })
             .child(div().text_color(rgb(palette::TEXT_MUTED)).child(time))
             .child(div().text_color(rgb(color)).child(indicator));
+        let entry_id = entry.id.clone();
         div()
+            .id(SharedString::from(entry.id))
             .flex()
             .flex_col()
             .gap_1()
@@ -355,6 +495,20 @@ impl BorgGui {
             .px_3()
             .py_2()
             .child(header)
+            .when(entry.kind == TimelineKind::Tool, |card| {
+                card.cursor_pointer()
+                    .on_click(move |_, _, cx| {
+                        let _ = view.update(cx, |this, cx| {
+                            if !this.expanded_entries.remove(&entry_id) {
+                                this.expanded_entries.insert(entry_id.clone());
+                            }
+                            cx.notify();
+                        });
+                    })
+                    .on_mouse_up(gpui::MouseButton::Right, move |_, _, cx| {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy_body.clone()));
+                    })
+            })
             .when(!body.is_empty(), |card| {
                 card.child(
                     div()
@@ -370,6 +524,14 @@ impl BorgGui {
     }
 }
 
+impl Drop for BorgGui {
+    fn drop(&mut self) {
+        for path in &self.temporary_attachments {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 impl Render for BorgGui {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let cwd: SharedString = self
@@ -380,6 +542,8 @@ impl Render for BorgGui {
             .into();
         let timeline = Arc::clone(&self.timeline);
         let transcript_state = self.transcript_state.clone();
+        let expanded_entries = self.expanded_entries.clone();
+        let view_entity = cx.entity();
         let agents = self
             .view
             .as_ref()
@@ -407,7 +571,11 @@ impl Render for BorgGui {
             .unwrap_or_else(|| "default".into())
             .into();
         let access: SharedString = configuration
-            .map(|c| format!("{:?}", c.permission_mode).to_lowercase())
+            .map(|c| match c.permission_mode {
+                borg_ui::PermissionMode::FullAccess => "full access",
+                borg_ui::PermissionMode::Auto => "auto",
+                borg_ui::PermissionMode::Manual => "manual",
+            })
             .unwrap_or_else(|| "unknown".into())
             .into();
         let fast = configuration.is_some_and(|c| c.fast);
@@ -416,9 +584,11 @@ impl Render for BorgGui {
             .as_ref()
             .and_then(|v| {
                 Some(format!(
-                    "{}% context",
-                    v.state.usage.context_tokens? * 100
-                        / v.state.usage.context_window_tokens?.max(1)
+                    "{}% context left",
+                    100_u64.saturating_sub(
+                        v.state.usage.context_tokens? * 100
+                            / v.state.usage.context_window_tokens?.max(1)
+                    )
                 ))
             })
             .unwrap_or_else(|| "context —".into())
@@ -426,7 +596,8 @@ impl Render for BorgGui {
         let status: SharedString = self
             .view
             .as_ref()
-            .map(|v| format!("{:?}", v.state.status).to_lowercase())
+            .and_then(|v| v.state.status)
+            .map(|status| format!("{status:?}").to_lowercase())
             .unwrap_or_else(|| "offline".into())
             .into();
         let goal = self
@@ -466,8 +637,36 @@ impl Render for BorgGui {
             .collect::<Vec<_>>();
         let session_options = self.sessions.clone();
         let dictation_status = self.dictation_status.clone();
+        let command_help = [
+            ("/ask PROFILE TEXT", "consult a second model", "/ask "),
+            ("/director TEXT", "message the director", "/director "),
+            ("/claude TEXT", "consult the Claude peer", "/claude "),
+            ("/gpt TEXT", "consult the GPT peer", "/gpt "),
+            ("/queue TEXT", "send after the active turn", "/queue "),
+            ("/steer TEXT", "redirect the active turn", "/steer "),
+            (
+                "/goal OBJECTIVE",
+                "set or control the durable goal",
+                "/goal ",
+            ),
+            ("/todo add TEXT", "update the durable plan", "/todo add "),
+            ("/model MODEL", "switch model", "/model "),
+            ("/effort LEVEL", "change reasoning effort", "/effort "),
+            ("/permission MODE", "full, auto, or manual", "/permission "),
+            ("/language NAME", "change response language", "/language "),
+            ("/fast on|off", "toggle priority mode", "/fast "),
+            ("/compact", "compact conversation context", "/compact"),
+            ("/clear", "clear conversation context", "/clear"),
+            ("/copy", "copy the latest response", "/copy"),
+            ("/dictate", "start or stop dictation", "/dictate"),
+            ("/resume", "open recent sessions", "/resume"),
+            ("/quit", "stop this session", "/quit"),
+        ];
+        let palette_composer = self.composer.clone();
         div()
             .on_action(cx.listener(Self::interrupt_action))
+            .on_action(cx.listener(Self::escape_action))
+            .on_action(cx.listener(Self::toggle_help_action))
             .relative()
             .flex()
             .flex_col()
@@ -522,7 +721,7 @@ impl Render for BorgGui {
                                 .flex()
                                 .gap_2()
                                 .child(div().text_color(rgb(palette::GREEN)).child("GOAL"))
-                                .child(goal),
+                                .child(div().min_w_0().overflow_hidden().text_ellipsis().child(goal)),
                         ),
                 )
             })
@@ -551,6 +750,7 @@ impl Render for BorgGui {
                                 .text_color(rgb(palette::TEXT_MUTED))
                                 .child("RECENT SESSIONS"),
                         )
+                        .child(div().id("new-session").px_3().py_2().mb_1().cursor_pointer().text_color(rgb(palette::ORANGE)).hover(|style| style.bg(rgb(palette::SURFACE_RAISED))).on_click(cx.listener(Self::new_session)).child("+ New session"))
                         .children(session_options.into_iter().map(|session| {
                             let session_id = session.session_id;
                             let title = session.title.chars().take(72).collect::<String>();
@@ -606,7 +806,9 @@ impl Render for BorgGui {
                             )
                             .child(
                                 list(transcript_state, move |index, _, _| {
-                                    Self::render_entry(timeline[index].as_ref().clone())
+                                    let entry = timeline[index].as_ref().clone();
+                                    let expanded = expanded_entries.contains(&entry.id);
+                                    Self::render_entry(entry, expanded, view_entity.clone())
                                         .into_any_element()
                                 })
                                 .flex_1()
@@ -710,6 +912,9 @@ impl Render for BorgGui {
                                                     )
                                                     .child(
                                                         div()
+                                                            .min_w_0()
+                                                            .flex_1()
+                                                            .whitespace_normal()
                                                             .text_color(rgb(palette::TEXT))
                                                             .child(item.content),
                                                     )
@@ -963,7 +1168,7 @@ impl Render for BorgGui {
                             .pb_3()
                             .text_xs()
                             .text_color(rgb(palette::TEXT_MUTED))
-                            .child("send  enter  ·  commands  /  ·  click steer/queue")
+                        .child(div().id("command-help").cursor_pointer().on_click(cx.listener(Self::toggle_help)).child("send  enter  ·  commands  ctrl-shift-p  ·  click steer/queue"))
                             .child(
                                 self.view
                                     .as_ref()
@@ -972,6 +1177,23 @@ impl Render for BorgGui {
                             ),
                     ),
             )
+            .when(self.help_open, |root| {
+                root.child(
+                    div().absolute().inset_0().bg(gpui::rgba(0x00000088)).flex().items_center().justify_center()
+                        .child(div().id("help-panel").w(px(620.)).max_h(px(620.)).overflow_y_scroll().border_1().border_color(rgb(palette::BORDER)).bg(rgb(palette::SURFACE)).p_5().flex().flex_col().gap_2()
+                            .child(div().flex().items_center().justify_between().mb_2().child(div().font_weight(FontWeight::SEMIBOLD).text_color(rgb(palette::ORANGE)).child("COMMANDS")).child(div().id("close-help").cursor_pointer().text_color(rgb(palette::TEXT_MUTED)).on_click(cx.listener(Self::toggle_help)).child("esc / close")))
+                            .children(command_help.into_iter().enumerate().map(|(index, (command, detail, insertion))| {
+                                let composer = palette_composer.clone();
+                                div().id(SharedString::from(format!("command-{index}"))).flex().gap_4().px_2().py_1().text_sm().cursor_pointer().hover(|style| style.bg(rgb(palette::SURFACE_RAISED))).on_click(cx.listener(move |this, _, window, cx| {
+                                    composer.update(cx, |composer, cx| composer.set_text(insertion, cx));
+                                    this.help_open = false;
+                                    window.focus(&composer.focus_handle(cx));
+                                    cx.notify();
+                                })).child(div().w(px(190.)).text_color(rgb(palette::BLUE)).child(command)).child(div().text_color(rgb(palette::TEXT_MUTED)).child(detail))
+                            }))
+                    )
+                )
+            })
     }
 }
 
@@ -1005,7 +1227,9 @@ fn main() {
             KeyBinding::new("home", composer::Home, Some("Composer")),
             KeyBinding::new("end", composer::End, Some("Composer")),
             KeyBinding::new("enter", composer::Submit, Some("Composer")),
-            KeyBinding::new("escape", Interrupt, Some("Composer")),
+            KeyBinding::new("escape", Escape, Some("Composer")),
+            KeyBinding::new("ctrl-shift-p", ToggleHelp, Some("Composer")),
+            KeyBinding::new("cmd-shift-p", ToggleHelp, Some("Composer")),
             KeyBinding::new("cmd-a", composer::SelectAll, Some("Composer")),
             KeyBinding::new("cmd-v", composer::Paste, Some("Composer")),
             KeyBinding::new("cmd-c", composer::Copy, Some("Composer")),

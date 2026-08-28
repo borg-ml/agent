@@ -53,6 +53,25 @@ Terminal cells and a retained GPU scene have different layout and interaction
 needs. Sharing widgets would couple both frontends while producing a worse API
 for each.
 
+## Performance boundary
+
+Session ingestion and projection are frontend-neutral. `borg-ui` incrementally
+reduces durable and live events into shared session state, timeline entries,
+goals, plans, and agent snapshots on a worker thread. Timeline entries and
+history are shared by `Arc`, so a live update does not clone the full transcript
+or perform projection work on the window thread.
+
+Only the final rendering strategy is frontend-specific:
+
+- GPUI uses its variable-height virtual list, retained scene, and background
+  executor for file/clipboard work. Long transcripts do not create an
+  unbounded element tree.
+- The TUI keeps terminal viewport, cell-diff, and refresh-rate optimizations.
+
+This is the intended split: state/model performance improvements benefit every
+frontend, while native renderers retain the optimizations appropriate to their
+output device.
+
 ## Layout
 
 1. A narrow native header identifies the session and workspace.
@@ -65,3 +84,11 @@ for each.
    cards.
 
 The baseline reference is `artifacts/gui-port/tui-baseline-focused.png`.
+
+## Running the native frontend
+
+From the workspace, run `cargo run -p borg-gui`. The application resumes the
+latest durable local session and starts a headless Borg owner when that session
+is not already running. On a fresh installation it creates and owns a new
+session. Use `--session UUID` to open a specific session; the native session
+menu can switch or create sessions after launch.

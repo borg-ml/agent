@@ -31,6 +31,7 @@ actions!(
 );
 
 pub struct Submitted(pub String);
+pub struct PastedImage(pub gpui::Image);
 
 pub struct Composer {
     focus: FocusHandle,
@@ -77,6 +78,13 @@ impl Composer {
         };
         self.content = format!("{}{separator}{text}", self.content).into();
         self.selected = self.content.len()..self.content.len();
+        cx.notify();
+    }
+
+    pub fn set_text(&mut self, text: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.content = text.into();
+        self.selected = self.content.len()..self.content.len();
+        self.marked = None;
         cx.notify();
     }
 
@@ -165,8 +173,15 @@ impl Composer {
         self.replace_text_in_range(None, "", window, cx);
     }
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-            self.replace_text_in_range(None, &text, window, cx);
+        if let Some(item) = cx.read_from_clipboard() {
+            if let Some(text) = item.text() {
+                self.replace_text_in_range(None, &text, window, cx);
+            } else if let Some(image) = item.into_entries().find_map(|entry| match entry {
+                gpui::ClipboardEntry::Image(image) => Some(image),
+                gpui::ClipboardEntry::String(_) => None,
+            }) {
+                cx.emit(PastedImage(image));
+            }
         }
     }
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
@@ -249,6 +264,7 @@ impl Composer {
 }
 
 impl gpui::EventEmitter<Submitted> for Composer {}
+impl gpui::EventEmitter<PastedImage> for Composer {}
 impl Focusable for Composer {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus.clone()
