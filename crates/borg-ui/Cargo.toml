@@ -12,6 +12,7 @@ publish = false
 
 [dependencies]
 anyhow.workspace = true
+async-channel = "2.5"
 borg-remote = { path = "../borg-remote", default-features = false }
 chrono.workspace = true
 dirs.workspace = true

@@ -1,24 +1,35 @@
 mod composer;
 
 use borg_ui::{
-    FrontendCommand, SessionView,
-    local::{LocalSessionUpdate, LocalSessionWorker},
+    ApprovalDecision, CodingProvider, FrontendCommand, PromptDelivery, SessionView,
+    local::{LocalSessionOption, LocalSessionUpdate, LocalSessionWorker},
     palette,
-    timeline::{TimelineEntry, TimelineKind, project_timeline},
+    timeline::{TimelineEntry, TimelineKind},
 };
 use composer::{Composer, Submitted};
 use gpui::{
-    App, Application, Bounds, Context, Entity, Focusable, FontWeight, KeyBinding, SharedString,
-    Timer, Window, WindowBounds, WindowOptions, div, prelude::*, px, rgb, size,
+    App, Application, Bounds, Context, Entity, Focusable, FontWeight, KeyBinding, ListAlignment,
+    ListState, PathPromptOptions, SharedString, Window, WindowBounds, WindowOptions, div, list,
+    prelude::*, px, rgb, size,
 };
-use std::time::Duration;
+use std::path::PathBuf;
+use std::sync::Arc;
 use uuid::Uuid;
+
+gpui::actions!(borg_gui, [Interrupt]);
 
 struct BorgGui {
     worker: Option<LocalSessionWorker>,
     view: Option<SessionView>,
     composer: Entity<Composer>,
     error: Option<String>,
+    delivery: PromptDelivery,
+    root_session_id: Option<Uuid>,
+    timeline: Arc<Vec<TimelineEntry>>,
+    transcript_state: ListState,
+    attachments: Vec<PathBuf>,
+    sessions: Vec<LocalSessionOption>,
+    sessions_open: bool,
 }
 
 impl BorgGui {
@@ -28,46 +39,69 @@ impl BorgGui {
         cx: &mut Context<Self>,
     ) -> Self {
         cx.subscribe(&composer, |this, _, event: &Submitted, cx| {
-            this.send(FrontendCommand::SubmitPrompt {
-                text: event.0.clone(),
-                attachments: Vec::new(),
-                delivery: borg_remote::PromptDelivery::Steer,
-            });
+            let provider = this
+                .view
+                .as_ref()
+                .and_then(|view| view.state.configuration.as_ref())
+                .map(|configuration| configuration.provider)
+                .unwrap_or(CodingProvider::Codex);
+            match borg_ui::parse_submission(&event.0, provider, this.delivery) {
+                Ok(FrontendCommand::SubmitPrompt { text, delivery, .. }) => {
+                    let attachments = std::mem::take(&mut this.attachments);
+                    this.send(FrontendCommand::SubmitPrompt {
+                        text,
+                        attachments,
+                        delivery,
+                    });
+                }
+                Ok(command) => this.send(command),
+                Err(error) => this.error = Some(error.to_string()),
+            }
             cx.notify();
         })
         .detach();
+        let updates = worker.as_ref().map(LocalSessionWorker::updates);
         let mut this = Self {
             worker,
             view: None,
             composer,
             error: None,
+            delivery: PromptDelivery::Steer,
+            root_session_id: None,
+            timeline: Arc::new(Vec::new()),
+            transcript_state: ListState::new(0, ListAlignment::Bottom, px(320.)),
+            attachments: Vec::new(),
+            sessions: Vec::new(),
+            sessions_open: false,
         };
-        this.schedule_poll(cx);
+        if let Some(updates) = updates {
+            this.schedule_updates(updates, cx);
+        }
         this
     }
 
-    fn schedule_poll(&mut self, cx: &mut Context<Self>) {
+    fn schedule_updates(
+        &mut self,
+        updates: async_channel::Receiver<LocalSessionUpdate>,
+        cx: &mut Context<Self>,
+    ) {
         cx.spawn(async move |this, cx| {
-            loop {
-                Timer::after(Duration::from_millis(100)).await;
+            while let Ok(update) = updates.recv().await {
                 if this
                     .update(cx, |this, cx| {
-                        let mut changed = false;
-                        if let Some(worker) = &this.worker {
-                            while let Some(update) = worker.try_recv() {
-                                match update {
-                                    LocalSessionUpdate::View(view) => {
-                                        this.view = Some(view);
-                                        this.error = None;
-                                    }
-                                    LocalSessionUpdate::Error(error) => this.error = Some(error),
-                                }
-                                changed = true;
+                        match update {
+                            LocalSessionUpdate::Presentation(presentation) => {
+                                let view = presentation.view;
+                                this.root_session_id.get_or_insert(view.session_id);
+                                this.transcript_state.reset(presentation.timeline.len());
+                                this.timeline = presentation.timeline;
+                                this.view = Some(view);
+                                this.error = None;
                             }
+                            LocalSessionUpdate::Sessions(sessions) => this.sessions = sessions,
+                            LocalSessionUpdate::Error(error) => this.error = Some(error),
                         }
-                        if changed {
-                            cx.notify();
-                        }
+                        cx.notify();
                     })
                     .is_err()
                 {
@@ -89,16 +123,56 @@ impl BorgGui {
         self.send(FrontendCommand::Interrupt);
         cx.notify();
     }
+    fn interrupt_action(&mut self, _: &Interrupt, _: &mut Window, cx: &mut Context<Self>) {
+        self.send(FrontendCommand::Interrupt);
+        cx.notify();
+    }
     fn approve_once(&mut self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.send(FrontendCommand::Approve(
-            borg_remote::ApprovalDecision::AllowOnce,
-        ));
+        self.send(FrontendCommand::Approve(ApprovalDecision::AllowOnce));
         cx.notify();
     }
     fn deny(&mut self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.send(FrontendCommand::Approve(
-            borg_remote::ApprovalDecision::Deny,
-        ));
+        self.send(FrontendCommand::Approve(ApprovalDecision::Deny));
+        cx.notify();
+    }
+    fn approve_session(&mut self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.send(FrontendCommand::Approve(ApprovalDecision::AllowSession));
+        cx.notify();
+    }
+    fn toggle_delivery(&mut self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.delivery = match self.delivery {
+            PromptDelivery::Steer => PromptDelivery::Queue,
+            PromptDelivery::Queue => PromptDelivery::Steer,
+        };
+        cx.notify();
+    }
+    fn load_older(&mut self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.send(FrontendCommand::LoadOlderHistory);
+        cx.notify();
+    }
+    fn focus_root(&mut self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.send(FrontendCommand::FocusAgent(None));
+        cx.notify();
+    }
+    fn choose_attachments(&mut self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("Attach to prompt".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = receiver.await {
+                let _ = this.update(cx, |this, cx| {
+                    this.attachments.extend(paths);
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+    fn toggle_sessions(&mut self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.sessions_open = !self.sessions_open;
         cx.notify();
     }
 
@@ -195,11 +269,17 @@ impl Render for BorgGui {
             .map(|v| v.cwd.display().to_string())
             .unwrap_or_else(|| "No local Borg session".into())
             .into();
-        let entries = self
+        let timeline = Arc::clone(&self.timeline);
+        let transcript_state = self.transcript_state.clone();
+        let agents = self
             .view
             .as_ref()
-            .map(|v| project_timeline(&v.history))
+            .map(|v| v.agents.clone())
             .unwrap_or_default();
+        let focused_child = self.view.as_ref().is_some_and(|view| {
+            self.root_session_id
+                .is_some_and(|root| root != view.session_id)
+        });
         let configuration = self
             .view
             .as_ref()
@@ -207,6 +287,27 @@ impl Render for BorgGui {
         let model: SharedString = configuration
             .and_then(|c| c.model.clone())
             .unwrap_or_else(|| "unconfigured".into())
+            .into();
+        let effort: SharedString = configuration
+            .and_then(|c| c.effort.clone())
+            .unwrap_or_else(|| "default".into())
+            .into();
+        let access: SharedString = configuration
+            .map(|c| format!("{:?}", c.permission_mode).to_lowercase())
+            .unwrap_or_else(|| "unknown".into())
+            .into();
+        let fast = configuration.is_some_and(|c| c.fast);
+        let context: SharedString = self
+            .view
+            .as_ref()
+            .and_then(|v| {
+                Some(format!(
+                    "{}% context",
+                    v.state.usage.context_tokens? * 100
+                        / v.state.usage.context_window_tokens?.max(1)
+                ))
+            })
+            .unwrap_or_else(|| "context —".into())
             .into();
         let status: SharedString = self
             .view
@@ -223,7 +324,23 @@ impl Render for BorgGui {
             .view
             .as_ref()
             .is_some_and(|v| v.state.pending_approval_id.is_some());
+        let delivery = match self.delivery {
+            PromptDelivery::Steer => "steer",
+            PromptDelivery::Queue => "queue",
+        };
+        let attachment_labels = self
+            .attachments
+            .iter()
+            .map(|path| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string())
+            })
+            .collect::<Vec<_>>();
+        let session_options = self.sessions.clone();
         div()
+            .on_action(cx.listener(Self::interrupt_action))
+            .relative()
             .flex()
             .flex_col()
             .size_full()
@@ -249,8 +366,11 @@ impl Render for BorgGui {
                             .child(div().font_weight(FontWeight::SEMIBOLD).child("BORG"))
                             .child(
                                 div()
+                                    .id("session-switcher")
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(Self::toggle_sessions))
                                     .text_color(rgb(palette::TEXT_MUTED))
-                                    .child("native session"),
+                                    .child("native session  ▾"),
                             ),
                     )
                     .child(
@@ -277,20 +397,157 @@ impl Render for BorgGui {
                                 .child(goal),
                         ),
                 )
+                .when(self.sessions_open, |root| {
+                    root.child(
+                        div()
+                            .id("session-menu")
+                            .absolute()
+                            .top(px(46.))
+                            .left(px(12.))
+                            .w(px(460.))
+                            .max_h(px(520.))
+                            .overflow_y_scroll()
+                            .border_1()
+                            .border_color(rgb(palette::BORDER))
+                            .bg(rgb(palette::SURFACE))
+                            .p_2()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .px_2()
+                                    .py_1()
+                                    .text_xs()
+                                    .text_color(rgb(palette::TEXT_MUTED))
+                                    .child("RECENT SESSIONS"),
+                            )
+                            .children(session_options.into_iter().map(|session| {
+                                let session_id = session.session_id;
+                                let title = session.title.chars().take(72).collect::<String>();
+                                let detail =
+                                    format!("{}  ·  {:?}", session.cwd.display(), session.status)
+                                        .to_lowercase();
+                                div()
+                                    .id(SharedString::from(format!("session-{session_id}")))
+                                    .px_3()
+                                    .py_2()
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(rgb(palette::SURFACE_RAISED)))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.send(FrontendCommand::OpenSession(session_id));
+                                        this.sessions_open = false;
+                                        cx.notify();
+                                    }))
+                                    .child(div().text_sm().child(title))
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(palette::TEXT_MUTED))
+                                            .child(detail),
+                                    )
+                            })),
+                    )
+                })
             })
             .child(
-                div().flex_1().overflow_hidden().child(
-                    div()
-                        .id("transcript")
-                        .size_full()
-                        .overflow_y_scroll()
-                        .px_5()
-                        .py_4()
-                        .flex()
-                        .flex_col()
-                        .gap_3()
-                        .children(entries.into_iter().map(Self::render_entry)),
-                ),
+                div()
+                    .flex_1()
+                    .overflow_hidden()
+                    .flex()
+                    .child(
+                        div()
+                            .size_full()
+                            .flex()
+                            .flex_col()
+                            .px_5()
+                            .py_4()
+                            .child(
+                                div()
+                                    .id("older")
+                                    .mx_auto()
+                                    .px_3()
+                                    .py_1()
+                                    .mb_2()
+                                    .text_xs()
+                                    .text_color(rgb(palette::TEXT_MUTED))
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(rgb(palette::SURFACE_RAISED)))
+                                    .on_click(cx.listener(Self::load_older))
+                                    .child("load earlier history"),
+                            )
+                            .child(
+                                list(transcript_state, move |index, _, _| {
+                                    Self::render_entry(timeline[index].clone()).into_any_element()
+                                })
+                                .flex_1()
+                                .gap_3(),
+                            ),
+                    )
+                    .when(!agents.is_empty() || focused_child, |body| {
+                        body.child(
+                            div()
+                                .w(px(238.))
+                                .flex_none()
+                                .border_l_1()
+                                .border_color(rgb(palette::BORDER))
+                                .bg(rgb(palette::SURFACE))
+                                .p_3()
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .text_xs()
+                                        .text_color(rgb(palette::TEXT_MUTED))
+                                        .child("TEAM")
+                                        .when(focused_child, |header| {
+                                            header.child(
+                                                div()
+                                                    .id("focus-root")
+                                                    .cursor_pointer()
+                                                    .text_color(rgb(palette::BLUE))
+                                                    .on_click(cx.listener(Self::focus_root))
+                                                    .child("back to root"),
+                                            )
+                                        }),
+                                )
+                                .children(agents.into_iter().map(|agent| {
+                                    let session_id = agent.session_id;
+                                    let status = format!("{:?}", agent.status).to_lowercase();
+                                    div()
+                                        .id(SharedString::from(format!("agent-{session_id}")))
+                                        .border_1()
+                                        .border_color(rgb(palette::BORDER))
+                                        .bg(rgb(palette::CANVAS))
+                                        .px_3()
+                                        .py_2()
+                                        .cursor_pointer()
+                                        .hover(|s| s.border_color(rgb(palette::PINK)))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.send(FrontendCommand::FocusAgent(Some(
+                                                session_id,
+                                            )));
+                                            cx.notify();
+                                        }))
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .text_color(rgb(palette::PINK))
+                                                .child(agent.task_name),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(palette::TEXT_MUTED))
+                                                .child(status),
+                                        )
+                                })),
+                        )
+                    }),
             )
             .when_some(self.error.clone(), |root, error| {
                 root.child(
@@ -329,17 +586,50 @@ impl Render for BorgGui {
                                         "model",
                                         model,
                                         palette::TEXT_MUTED,
-                                    )),
+                                    ))
+                                    .child("·")
+                                    .child(Self::status_segment(
+                                        "effort",
+                                        effort,
+                                        palette::TEXT_MUTED,
+                                    ))
+                                    .when(fast, |row| {
+                                        row.child("·").child(
+                                            div().text_color(rgb(palette::PEACH)).child("fast"),
+                                        )
+                                    })
+                                    .child("·")
+                                    .child(Self::status_segment("access", access, palette::PEACH))
+                                    .child("·")
+                                    .child(
+                                        div().text_color(rgb(palette::TEXT_MUTED)).child(context),
+                                    ),
                             )
                             .child(
                                 div()
-                                    .id("interrupt")
-                                    .px_2()
-                                    .rounded_sm()
-                                    .hover(|s| s.bg(rgb(palette::SURFACE_RAISED)))
-                                    .cursor_pointer()
-                                    .on_click(cx.listener(Self::interrupt))
-                                    .child("stop"),
+                                    .flex()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .id("delivery")
+                                            .px_2()
+                                            .rounded_sm()
+                                            .text_color(rgb(palette::BLUE))
+                                            .hover(|s| s.bg(rgb(palette::SURFACE_RAISED)))
+                                            .cursor_pointer()
+                                            .on_click(cx.listener(Self::toggle_delivery))
+                                            .child(delivery),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("interrupt")
+                                            .px_2()
+                                            .rounded_sm()
+                                            .hover(|s| s.bg(rgb(palette::SURFACE_RAISED)))
+                                            .cursor_pointer()
+                                            .on_click(cx.listener(Self::interrupt))
+                                            .child("stop"),
+                                    ),
                             ),
                     )
                     .when(approval, |footer| {
@@ -383,10 +673,37 @@ impl Render for BorgGui {
                                                 .cursor_pointer()
                                                 .on_click(cx.listener(Self::approve_once))
                                                 .child("Approve once"),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("approve-session")
+                                                .px_3()
+                                                .py_1()
+                                                .border_1()
+                                                .border_color(rgb(palette::ORANGE))
+                                                .text_color(rgb(palette::ORANGE))
+                                                .cursor_pointer()
+                                                .on_click(cx.listener(Self::approve_session))
+                                                .child("Allow session"),
                                         ),
                                 ),
                         )
                     })
+                    .child(div().mx_4().when(!attachment_labels.is_empty(), |row| {
+                        row.flex()
+                            .gap_2()
+                            .pb_2()
+                            .children(attachment_labels.into_iter().map(|label| {
+                                div()
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_sm()
+                                    .bg(rgb(palette::SURFACE_RAISED))
+                                    .text_xs()
+                                    .text_color(rgb(palette::BLUE))
+                                    .child(label)
+                            }))
+                    }))
                     .child(
                         div()
                             .mx_4()
@@ -398,7 +715,19 @@ impl Render for BorgGui {
                             .bg(rgb(palette::CANVAS))
                             .px_3()
                             .py_3()
-                            .child(self.composer.clone()),
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id("attach")
+                                    .px_2()
+                                    .text_color(rgb(palette::BLUE))
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(Self::choose_attachments))
+                                    .child("+"),
+                            )
+                            .child(div().flex_1().child(self.composer.clone())),
                     )
                     .child(
                         div()
@@ -408,7 +737,7 @@ impl Render for BorgGui {
                             .pb_3()
                             .text_xs()
                             .text_color(rgb(palette::TEXT_MUTED))
-                            .child("send  enter  ·  interrupt  esc")
+                            .child("send  enter  ·  commands  /  ·  click steer/queue")
                             .child(
                                 self.view
                                     .as_ref()
@@ -450,6 +779,11 @@ fn main() {
             KeyBinding::new("home", composer::Home, Some("Composer")),
             KeyBinding::new("end", composer::End, Some("Composer")),
             KeyBinding::new("enter", composer::Submit, Some("Composer")),
+            KeyBinding::new("escape", Interrupt, Some("Composer")),
+            KeyBinding::new("cmd-a", composer::SelectAll, Some("Composer")),
+            KeyBinding::new("cmd-v", composer::Paste, Some("Composer")),
+            KeyBinding::new("cmd-c", composer::Copy, Some("Composer")),
+            KeyBinding::new("cmd-x", composer::Cut, Some("Composer")),
         ]);
         let bounds = Bounds::centered(None, size(px(1120.), px(760.)), cx);
         let window = cx

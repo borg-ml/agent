@@ -4,9 +4,9 @@
 
 use std::path::PathBuf;
 
-use borg_remote::{
+pub use borg_remote::{
     ApprovalDecision, CodingProvider, GoalAction, PermissionMode, PromptDelivery, ResponseLanguage,
-    SessionEvent, SessionGoal, SessionState, SubagentSnapshot,
+    SessionEvent, SessionGoal, SessionState, SessionStatus, SubagentSnapshot,
 };
 use uuid::Uuid;
 
@@ -154,6 +154,8 @@ pub enum FrontendCommand {
         attachments: Vec<PathBuf>,
         delivery: PromptDelivery,
     },
+    RecallQueuedPrompt(Option<Uuid>),
+    FlushPendingInput,
     Interrupt,
     Approve(ApprovalDecision),
     ApplyGoal(GoalAction),
@@ -163,9 +165,78 @@ pub enum FrontendCommand {
     },
     SetPermission(PermissionMode),
     SetLanguage(ResponseLanguage),
+    SetEffort(String),
+    SetFast(bool),
+    ClearContext,
+    Compact,
     FocusAgent(Option<Uuid>),
+    OpenSession(Uuid),
     LoadOlderHistory,
     Quit,
+}
+
+pub fn parse_submission(
+    text: &str,
+    provider: CodingProvider,
+    delivery: PromptDelivery,
+) -> anyhow::Result<FrontendCommand> {
+    let text = text.trim();
+    if text == "/interrupt" || text == "/stop" {
+        return Ok(FrontendCommand::Interrupt);
+    }
+    if text == "/compact" {
+        return Ok(FrontendCommand::Compact);
+    }
+    if text == "/clear" {
+        return Ok(FrontendCommand::ClearContext);
+    }
+    if text == "/flush" {
+        return Ok(FrontendCommand::FlushPendingInput);
+    }
+    if text == "/recall" {
+        return Ok(FrontendCommand::RecallQueuedPrompt(None));
+    }
+    if text.starts_with("/goal ") {
+        return Ok(FrontendCommand::ApplyGoal(parse_goal_action(text)?));
+    }
+    if let Some(model) = text.strip_prefix("/model ").map(str::trim) {
+        anyhow::ensure!(!model.is_empty(), "usage: /model MODEL");
+        return Ok(FrontendCommand::SetModel {
+            provider,
+            model: model.to_string(),
+        });
+    }
+    if let Some(mode) = text.strip_prefix("/permission ").map(str::trim) {
+        let mode = match mode {
+            "full" | "full-access" => PermissionMode::FullAccess,
+            "auto" => PermissionMode::Auto,
+            "manual" => PermissionMode::Manual,
+            _ => anyhow::bail!("usage: /permission [full|auto|manual]"),
+        };
+        return Ok(FrontendCommand::SetPermission(mode));
+    }
+    if let Some(effort) = text.strip_prefix("/effort ").map(str::trim) {
+        anyhow::ensure!(!effort.is_empty(), "usage: /effort LEVEL");
+        return Ok(FrontendCommand::SetEffort(effort.to_string()));
+    }
+    if let Some(value) = text.strip_prefix("/fast ").map(str::trim) {
+        return Ok(FrontendCommand::SetFast(match value {
+            "on" | "true" => true,
+            "off" | "false" => false,
+            _ => anyhow::bail!("usage: /fast [on|off]"),
+        }));
+    }
+    if let Some(language) = text.strip_prefix("/language ").map(str::trim) {
+        let language = ResponseLanguage::parse(language)
+            .ok_or_else(|| anyhow::anyhow!("unknown response language `{language}`"))?;
+        return Ok(FrontendCommand::SetLanguage(language));
+    }
+    anyhow::ensure!(!text.starts_with('/'), "unknown command `{text}`");
+    Ok(FrontendCommand::SubmitPrompt {
+        text: text.to_string(),
+        attachments: Vec::new(),
+        delivery,
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -176,6 +247,19 @@ pub struct SessionView {
     pub goal: Option<SessionGoal>,
     pub agents: Vec<SubagentSnapshot>,
     pub cwd: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+pub struct SessionPresentation {
+    pub view: SessionView,
+    pub timeline: std::sync::Arc<Vec<timeline::TimelineEntry>>,
+}
+
+impl SessionPresentation {
+    pub fn new(view: SessionView) -> Self {
+        let timeline = std::sync::Arc::new(timeline::project_timeline(&view.history));
+        Self { view, timeline }
+    }
 }
 
 impl SessionView {
@@ -238,4 +322,31 @@ pub fn parse_goal_action(line: &str) -> anyhow::Result<GoalAction> {
         objective: objective.to_string(),
         token_budget,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn submission_parser_keeps_commands_out_of_prompts() {
+        assert!(matches!(
+            parse_submission(
+                "/permission manual",
+                CodingProvider::Codex,
+                PromptDelivery::Steer
+            ),
+            Ok(FrontendCommand::SetPermission(PermissionMode::Manual))
+        ));
+        assert!(
+            parse_submission("/unknown", CodingProvider::Codex, PromptDelivery::Steer).is_err()
+        );
+        assert!(matches!(
+            parse_submission("ship it", CodingProvider::Codex, PromptDelivery::Queue),
+            Ok(FrontendCommand::SubmitPrompt {
+                delivery: PromptDelivery::Queue,
+                ..
+            })
+        ));
+    }
 }

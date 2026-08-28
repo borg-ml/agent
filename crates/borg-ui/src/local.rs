@@ -5,26 +5,36 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use borg_remote::{
     HostCommand, SessionConfigAction, SessionEventKind, SessionStore, SqliteSessionStore,
-    default_host_config_path, send_local_session_command, session_control_socket_path,
+    SubagentAction, default_host_config_path, send_local_session_command,
+    session_control_socket_path,
 };
 use uuid::Uuid;
 
-use crate::{FrontendCommand, SessionView};
+use crate::{FrontendCommand, SessionPresentation, SessionView};
 
 pub enum LocalSessionUpdate {
-    View(SessionView),
+    Presentation(SessionPresentation),
+    Sessions(Vec<LocalSessionOption>),
     Error(String),
 }
 
+#[derive(Clone, Debug)]
+pub struct LocalSessionOption {
+    pub session_id: Uuid,
+    pub title: String,
+    pub cwd: PathBuf,
+    pub status: Option<crate::SessionStatus>,
+}
+
 pub struct LocalSessionWorker {
-    commands: std::sync::mpsc::Sender<FrontendCommand>,
-    updates: std::sync::mpsc::Receiver<LocalSessionUpdate>,
+    commands: async_channel::Sender<FrontendCommand>,
+    updates: async_channel::Receiver<LocalSessionUpdate>,
 }
 
 impl LocalSessionWorker {
     pub fn start(session_id: Option<Uuid>) -> Result<Option<Self>> {
-        let (command_tx, command_rx) = std::sync::mpsc::channel();
-        let (update_tx, update_rx) = std::sync::mpsc::channel();
+        let (command_tx, command_rx) = async_channel::unbounded();
+        let (update_tx, update_rx) = async_channel::unbounded();
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         std::thread::Builder::new()
             .name("borg-gui-session".into())
@@ -54,18 +64,81 @@ impl LocalSessionWorker {
                     if ready_tx.send(Ok(true)).is_err() {
                         return;
                     }
-                    let _ = update_tx.send(LocalSessionUpdate::View(client.view().clone()));
+                    let mut root_session_id = client.view().session_id;
+                    if let Ok(sessions) = client.list_sessions().await {
+                        let _ = update_tx.send_blocking(LocalSessionUpdate::Sessions(sessions));
+                    }
+                    let _ = update_tx.send_blocking(LocalSessionUpdate::Presentation(
+                        SessionPresentation::new(client.view().clone()),
+                    ));
                     loop {
-                        while let Ok(command) = command_rx.try_recv() {
-                            if let Err(error) = client.dispatch(command).await {
-                                let _ =
-                                    update_tx.send(LocalSessionUpdate::Error(error.to_string()));
+                        let wait = if matches!(
+                            client.view().state.status,
+                            Some(
+                                crate::SessionStatus::Starting
+                                    | crate::SessionStatus::Running
+                                    | crate::SessionStatus::WaitingForApproval
+                            )
+                        ) {
+                            std::time::Duration::from_millis(50)
+                        } else {
+                            std::time::Duration::from_millis(750)
+                        };
+                        if let Ok(command) = tokio::time::timeout(wait, command_rx.recv()).await {
+                            let Ok(command) = command else { return };
+                            let result = match command {
+                                FrontendCommand::OpenSession(session_id) => {
+                                    match LocalSessionClient::open(Some(session_id)).await {
+                                        Ok(Some(next)) => {
+                                            client = next;
+                                            root_session_id = session_id;
+                                            Ok(true)
+                                        }
+                                        Ok(None) => Ok(false),
+                                        Err(error) => Err(error),
+                                    }
+                                }
+                                FrontendCommand::FocusAgent(target) => {
+                                    match LocalSessionClient::open_for_root(
+                                        target.unwrap_or(root_session_id),
+                                        root_session_id,
+                                    )
+                                    .await
+                                    {
+                                        Ok(Some(next)) => {
+                                            client = next;
+                                            Ok(true)
+                                        }
+                                        Ok(None) => Ok(false),
+                                        Err(error) => Err(error),
+                                    }
+                                }
+                                FrontendCommand::LoadOlderHistory => {
+                                    client.load_older_history().await
+                                }
+                                command => client.dispatch(command).await.map(|_| false),
+                            };
+                            match result {
+                                Ok(true) => {
+                                    let _ =
+                                        update_tx.send_blocking(LocalSessionUpdate::Presentation(
+                                            SessionPresentation::new(client.view().clone()),
+                                        ));
+                                }
+                                Ok(false) => {}
+                                Err(error) => {
+                                    let _ = update_tx.send_blocking(LocalSessionUpdate::Error(
+                                        error.to_string(),
+                                    ));
+                                }
                             }
                         }
                         match client.refresh().await {
                             Ok(true) => {
                                 if update_tx
-                                    .send(LocalSessionUpdate::View(client.view().clone()))
+                                    .send_blocking(LocalSessionUpdate::Presentation(
+                                        SessionPresentation::new(client.view().clone()),
+                                    ))
                                     .is_err()
                                 {
                                     return;
@@ -74,14 +147,13 @@ impl LocalSessionWorker {
                             Ok(false) => {}
                             Err(error) => {
                                 if update_tx
-                                    .send(LocalSessionUpdate::Error(error.to_string()))
+                                    .send_blocking(LocalSessionUpdate::Error(error.to_string()))
                                     .is_err()
                                 {
                                     return;
                                 }
                             }
                         }
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     }
                 });
             })
@@ -100,12 +172,12 @@ impl LocalSessionWorker {
 
     pub fn send(&self, command: FrontendCommand) -> Result<()> {
         self.commands
-            .send(command)
+            .send_blocking(command)
             .context("Borg session worker is no longer running")
     }
 
-    pub fn try_recv(&self) -> Option<LocalSessionUpdate> {
-        self.updates.try_recv().ok()
+    pub fn updates(&self) -> async_channel::Receiver<LocalSessionUpdate> {
+        self.updates.clone()
     }
 }
 
@@ -116,6 +188,7 @@ pub struct LocalSessionClient {
     durable_history: Vec<borg_remote::SessionEvent>,
     live_events: HashMap<String, borg_remote::SessionEvent>,
     live_revision: u64,
+    root_session_id: Uuid,
 }
 
 impl LocalSessionClient {
@@ -133,6 +206,25 @@ impl LocalSessionClient {
                 None => return Ok(None),
             },
         };
+        Self::open_from_store(store, sessions_dir, session_id, session_id).await
+    }
+
+    async fn open_for_root(session_id: Uuid, root_session_id: Uuid) -> Result<Option<Self>> {
+        let sessions_dir = default_host_config_path()
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("sessions");
+        let store =
+            Arc::new(SqliteSessionStore::open(sessions_dir.join("sessions.sqlite3")).await?);
+        Self::open_from_store(store, sessions_dir, session_id, root_session_id).await
+    }
+
+    async fn open_from_store(
+        store: Arc<SqliteSessionStore>,
+        sessions_dir: PathBuf,
+        session_id: Uuid,
+        root_session_id: Uuid,
+    ) -> Result<Option<Self>> {
         anyhow::ensure!(
             store.contains_session(session_id).await?,
             "Borg session {session_id} does not exist"
@@ -162,6 +254,7 @@ impl LocalSessionClient {
             durable_history,
             live_events: HashMap::new(),
             live_revision: 0,
+            root_session_id,
         };
         client.refresh_live().await?;
         client.rebuild_history();
@@ -202,6 +295,33 @@ impl LocalSessionClient {
         Ok(true)
     }
 
+    async fn list_sessions(&self) -> Result<Vec<LocalSessionOption>> {
+        Ok(self
+            .store
+            .list_sessions(24)
+            .await?
+            .into_iter()
+            .map(|summary| {
+                let cwd = summary
+                    .state
+                    .configuration
+                    .as_ref()
+                    .map(|configuration| configuration.cwd.clone())
+                    .unwrap_or_default();
+                LocalSessionOption {
+                    session_id: summary.session_id,
+                    title: summary
+                        .state
+                        .first_prompt
+                        .clone()
+                        .unwrap_or_else(|| "Untitled session".into()),
+                    cwd,
+                    status: summary.state.status,
+                }
+            })
+            .collect())
+    }
+
     async fn refresh_live(&mut self) -> Result<bool> {
         let events = self
             .store
@@ -226,8 +346,33 @@ impl LocalSessionClient {
         self.view.history.extend(live);
     }
 
+    async fn load_older_history(&mut self) -> Result<bool> {
+        let Some(first) = self.durable_history.first().map(|event| event.sequence) else {
+            return Ok(false);
+        };
+        if first <= 1 {
+            return Ok(false);
+        }
+        let mut older = self
+            .store
+            .events_after(self.view.session_id, first.saturating_sub(501), 500)
+            .await?;
+        older.retain(|event| event.sequence < first);
+        if older.is_empty() {
+            return Ok(false);
+        }
+        older.append(&mut self.durable_history);
+        self.durable_history = older;
+        self.rebuild_history();
+        rebuild_agents(&mut self.view);
+        Ok(true)
+    }
+
     pub async fn dispatch(&self, command: FrontendCommand) -> Result<()> {
-        let session_id = self.view.session_id;
+        if self.view.session_id != self.root_session_id {
+            return self.dispatch_to_child(command).await;
+        }
+        let session_id = self.root_session_id;
         let command = match command {
             FrontendCommand::SubmitPrompt {
                 text,
@@ -241,6 +386,11 @@ impl LocalSessionClient {
                 output_schema: None,
                 delivery,
             },
+            FrontendCommand::RecallQueuedPrompt(message_id) => HostCommand::RecallQueuedPrompt {
+                session_id,
+                message_id,
+            },
+            FrontendCommand::FlushPendingInput => HostCommand::FlushPendingInput { session_id },
             FrontendCommand::Interrupt => HostCommand::Interrupt { session_id },
             FrontendCommand::Approve(decision) => HostCommand::Approve {
                 session_id,
@@ -268,13 +418,74 @@ impl LocalSessionClient {
                 session_id,
                 action: SessionConfigAction::SetResponseLanguage { language },
             },
-            FrontendCommand::FocusAgent(_) | FrontendCommand::LoadOlderHistory => return Ok(()),
-            FrontendCommand::Quit => HostCommand::Stop { session_id },
+            FrontendCommand::SetEffort(effort) => HostCommand::Configure {
+                session_id,
+                action: SessionConfigAction::SetEffort { effort },
+            },
+            FrontendCommand::SetFast(enabled) => HostCommand::Configure {
+                session_id,
+                action: SessionConfigAction::SetFast { enabled },
+            },
+            FrontendCommand::ClearContext => HostCommand::ClearContext { session_id },
+            FrontendCommand::Compact => HostCommand::Compact { session_id },
+            FrontendCommand::FocusAgent(_)
+            | FrontendCommand::OpenSession(_)
+            | FrontendCommand::LoadOlderHistory
+            | FrontendCommand::Quit => return Ok(()),
         };
         send_local_session_command(
             &session_control_socket_path(&self.sessions_dir, session_id),
             session_id,
             command,
+        )
+        .await
+    }
+
+    async fn dispatch_to_child(&self, command: FrontendCommand) -> Result<()> {
+        let session_id = self.root_session_id;
+        let target = self.view.session_id.to_string();
+        let request_id = Uuid::new_v4();
+        let action = match command {
+            FrontendCommand::SubmitPrompt {
+                text,
+                attachments,
+                delivery,
+            } => SubagentAction::Prompt {
+                request_id,
+                target,
+                message_id: Uuid::new_v4(),
+                text,
+                attachments,
+                delivery,
+            },
+            FrontendCommand::RecallQueuedPrompt(message_id) => SubagentAction::RecallPrompt {
+                request_id,
+                target,
+                message_id,
+            },
+            FrontendCommand::FlushPendingInput => {
+                SubagentAction::FlushPendingInput { request_id, target }
+            }
+            FrontendCommand::Interrupt => SubagentAction::Interrupt { request_id, target },
+            FrontendCommand::Approve(decision) => SubagentAction::Approve {
+                request_id,
+                target,
+                approval_id: self
+                    .view
+                    .state
+                    .pending_approval_id
+                    .clone()
+                    .context("this agent is not waiting for approval")?,
+                decision,
+            },
+            FrontendCommand::ClearContext => SubagentAction::ClearContext { request_id, target },
+            FrontendCommand::Quit => SubagentAction::Stop { request_id, target },
+            _ => anyhow::bail!("this setting can only be changed from the root session"),
+        };
+        send_local_session_command(
+            &session_control_socket_path(&self.sessions_dir, session_id),
+            session_id,
+            HostCommand::Subagent { session_id, action },
         )
         .await
     }

@@ -15,7 +15,7 @@ name = "borg-gui"
 path = "src/main.rs"
 
 [dependencies]
-borg-remote = { path = "../borg-remote" }
+async-channel = "2.5"
 borg-ui.workspace = true
 gpui = "0.2.2"
 unicode-segmentation = "1"
