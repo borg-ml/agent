@@ -10348,6 +10348,7 @@ fn provider_background_handle_drives_shell_status_and_full_output() {
         SessionEventKind::ToolCompleted {
             tool_call_id: "wait-1".to_string(),
             output: serde_json::json!({
+                "cell_id": "build-1",
                 "output": "first line\nsecond line\nlast line",
                 "exit_code": 0
             })

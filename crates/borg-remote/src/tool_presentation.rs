@@ -701,13 +701,27 @@ fn process_handle_value(value: &Value) -> Option<String> {
         })
 }
 
+fn process_result_is_running(value: &Value) -> bool {
+    if value.get("running").and_then(Value::as_bool) == Some(false)
+        || value.get("exit_code").is_some()
+        || value.get("timed_out").and_then(Value::as_bool) == Some(true)
+    {
+        return false;
+    }
+    !matches!(
+        value.get("status").and_then(Value::as_str),
+        Some("completed" | "exited" | "failed" | "terminated" | "timed_out")
+    )
+}
+
 pub fn tool_output_background_handle(output: &str) -> Option<String> {
     if let Ok(value) = serde_json::from_str::<Value>(output)
-        && let Some(handle) = process_handle_value(&value).or_else(|| {
-            value
-                .get("structuredContent")
-                .and_then(process_handle_value)
-        })
+        && let Some(process) = value
+            .get("structuredContent")
+            .filter(|process| process.is_object())
+            .or_else(|| value.is_object().then_some(&value))
+        && process_result_is_running(process)
+        && let Some(handle) = process_handle_value(process)
     {
         return Some(handle);
     }
@@ -2866,6 +2880,27 @@ mod tests {
         assert_eq!(
             tool_process_followup_handle("functions.wait", Some(&json!({"cell_id": "build-1"}))),
             Some("build-1".to_string())
+        );
+        assert_eq!(
+            tool_output_background_handle(
+                &json!({"session_id": "build-1", "exit_code": 0, "output": "done"}).to_string()
+            ),
+            None,
+            "a terminal command result must not remain in the active-shell counter"
+        );
+        assert_eq!(
+            tool_output_background_handle(
+                &json!({
+                    "structuredContent": {
+                        "cell_id": "build-1",
+                        "running": false,
+                        "output": "done"
+                    }
+                })
+                .to_string()
+            ),
+            None,
+            "a completed structured process result must not remain active"
         );
         let wrapped = json!({
             "content": [{"type": "text", "text": json!({"output": "one\ntwo"}).to_string()}]
