@@ -1,9 +1,92 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use borg_remote::{EventActor, MessageStatus, SessionEvent, SessionEventKind, tool_call_summary};
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
+
+pub fn tool_lifecycle_label(name: &str, complete: bool) -> Cow<'_, str> {
+    if name == "Git add" {
+        return Cow::Borrowed(if complete {
+            "Updated Git index"
+        } else {
+            "Updating Git index…"
+        });
+    }
+    let (verb, rest) = name.split_once(' ').unwrap_or((name, ""));
+    let forms = match verb {
+        "Run" => Some(("Running", "Ran")),
+        "Prepare" => Some(("Preparing", "Prepared")),
+        "Consult" => Some(("Consulting", "Consulted")),
+        "Inspect" => Some(("Inspecting", "Inspected")),
+        "Read" => Some(("Reading", "Read")),
+        "Edit" => Some(("Editing", "Edited")),
+        "Update" => Some(("Updating", "Updated")),
+        "Search" => Some(("Searching", "Searched")),
+        "List" => Some(("Listing", "Listed")),
+        "Check" => Some(("Checking", "Checked")),
+        "Find" => Some(("Finding", "Found")),
+        "Go" => Some(("Going", "Went")),
+        "Generate" => Some(("Generating", "Generated")),
+        "View" => Some(("Viewing", "Viewed")),
+        "Create" => Some(("Creating", "Created")),
+        "Delete" => Some(("Deleting", "Deleted")),
+        "Wait" => Some(("Waiting", "Finished waiting")),
+        "Send" => Some(("Sending", "Sent")),
+        "Follow" => Some(("Following", "Followed")),
+        "Message" => Some(("Sending message to", "Sent message to")),
+        "Use" => Some(("Using", "Used")),
+        "Spawn" => Some(("Spawning", "Spawned")),
+        "Interrupt" => Some(("Interrupting", "Interrupted")),
+        "Stop" => Some(("Stopping", "Stopped")),
+        "Compare" => Some(("Comparing", "Compared")),
+        "Review" => Some(("Reviewing", "Reviewed")),
+        "Show" => Some(("Showing", "Shown")),
+        "Add" => Some(("Adding", "Added")),
+        "Remove" => Some(("Removing", "Removed")),
+        "Prune" => Some(("Pruning", "Pruned")),
+        "Lock" => Some(("Locking", "Locked")),
+        "Unlock" => Some(("Unlocking", "Unlocked")),
+        "Switch" => Some(("Switching", "Switched")),
+        "Commit" => Some(("Committing", "Committed")),
+        "Fetch" => Some(("Fetching", "Fetched")),
+        "Pull" => Some(("Pulling", "Pulled")),
+        "Push" => Some(("Pushing", "Pushed")),
+        "Merge" => Some(("Merging", "Merged")),
+        "Rebase" => Some(("Rebasing", "Rebased")),
+        _ => None,
+    };
+    if let Some((running, completed)) = forms {
+        let form = if complete { completed } else { running };
+        return Cow::Owned(format!(
+            "{form}{}{}{}",
+            if rest.is_empty() { "" } else { " " },
+            rest,
+            if complete { "" } else { "…" }
+        ));
+    }
+    let phrase = match name {
+        "Git status" | "Git diff" | "Git log" | "Git branch" | "Git tags" | "Git remotes" => {
+            Some(if complete { "Inspected" } else { "Inspecting" })
+        }
+        "Repository info" => Some(if complete { "Inspected" } else { "Inspecting" }),
+        "Language servers" | "Workspace diagnostics" => {
+            Some(if complete { "Checked" } else { "Checking" })
+        }
+        _ => None,
+    };
+    phrase.map_or_else(
+        || {
+            if complete {
+                Cow::Borrowed(name)
+            } else {
+                Cow::Owned(format!("{name}…"))
+            }
+        },
+        |form| Cow::Owned(format!("{form} {name}{}", if complete { "" } else { "…" })),
+    )
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TimelineKind {

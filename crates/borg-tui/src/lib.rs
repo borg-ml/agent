@@ -37,6 +37,7 @@ use borg_remote::{tool_call_summary, tool_code_view};
 use borg_ui::preferences::{
     CompletionAlertPolicy, DictationIconStyle, TranscriptPreferences, parse_hex_color,
 };
+use borg_ui::timeline::tool_lifecycle_label;
 use chrono::{DateTime, Local, NaiveDate, Utc};
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{

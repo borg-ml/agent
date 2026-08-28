@@ -1657,6 +1657,19 @@ fn tool_lifecycle_labels_use_progressive_and_past_tense() {
     );
     assert_eq!(tool_lifecycle_label("Search web", false), "Searching web…");
     assert_eq!(tool_lifecycle_label("Search web", true), "Searched web");
+    assert_eq!(
+        tool_lifecycle_label("Consult peer", false),
+        "Consulting peer…"
+    );
+    assert_eq!(tool_lifecycle_label("Consult peer", true), "Consulted peer");
+    assert_eq!(
+        tool_lifecycle_label("Message agent", false),
+        "Sending message to agent…"
+    );
+    assert_eq!(
+        tool_lifecycle_label("Wait for agents", true),
+        "Finished waiting for agents"
+    );
 }
 
 #[test]
@@ -1678,7 +1691,8 @@ fn action_preparation_promotes_into_the_same_tool_card() {
         .map(|line| line.to_string())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(preparing.contains("Preparing edit…"), "{preparing}");
+    assert!(preparing.contains("Preparing next action…"), "{preparing}");
+    assert!(preparing.contains("edit"), "{preparing}");
 
     transcript.apply(&SessionEvent::new(
         session_id,
@@ -1698,7 +1712,7 @@ fn action_preparation_promotes_into_the_same_tool_card() {
         .join("\n");
     assert_eq!(transcript.order.len(), 1);
     assert!(editing.contains("Editing…"), "{editing}");
-    assert!(!editing.contains("Preparing edit…"), "{editing}");
+    assert!(!editing.contains("Preparing next action"), "{editing}");
 }
 
 #[test]
@@ -1735,7 +1749,7 @@ fn action_preparation_completes_when_the_start_event_is_missing() {
         .join("\n");
     assert_eq!(transcript.order.len(), 1);
     assert!(completed.contains("Ran command"), "{completed}");
-    assert!(!completed.contains("Preparing command"), "{completed}");
+    assert!(!completed.contains("Preparing next action"), "{completed}");
     assert!(!transcript.has_running_tool());
 }
 

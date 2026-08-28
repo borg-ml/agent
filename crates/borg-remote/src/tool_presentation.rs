@@ -381,7 +381,7 @@ pub fn tool_call_summary(name: &str, input: &Value) -> (String, String) {
 
     if tool == "action_preparing" {
         let label = string_field(input, "label").unwrap_or("action");
-        return (format!("Prepare {label}"), String::new());
+        return ("Prepare next action".to_string(), compact_text(label, 64));
     }
 
     if is_mcp_resource_probe(name) {

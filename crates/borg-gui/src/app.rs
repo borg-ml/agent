@@ -5,7 +5,7 @@ use borg_ui::{
     SessionView,
     local::{LocalSessionOption, LocalSessionUpdate, LocalSessionWorker},
     palette,
-    timeline::{TimelineEntry, TimelineKind},
+    timeline::{TimelineEntry, TimelineKind, tool_lifecycle_label},
 };
 use gpui::{
     App, Application, Bounds, Context, Entity, Focusable, FontWeight, KeyBinding, ListAlignment,
@@ -714,6 +714,11 @@ impl BorgGui {
             ""
         };
         let copy_body = entry.body.clone();
+        let title = if entry.kind == TimelineKind::Tool {
+            tool_lifecycle_label(&entry.title, !entry.running).into_owned()
+        } else {
+            entry.title.clone()
+        };
         let body = if entry.kind == TimelineKind::Tool && !expanded {
             String::new()
         } else if entry.body.len() > 12_000 {
@@ -736,7 +741,7 @@ impl BorgGui {
                 div()
                     .text_color(rgb(color))
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child(entry.title),
+                    .child(title),
             )
             .when_some(entry.detail, |row, detail| {
                 row.child(
