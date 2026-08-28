@@ -196,6 +196,13 @@ pub enum PeerTarget {
 }
 
 impl PeerTarget {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Claude => "Claude",
+            Self::Gpt => "GPT",
+        }
+    }
+
     pub const fn task_name(self) -> &'static str {
         match self {
             Self::Claude => "/root/claude",
@@ -241,6 +248,65 @@ pub enum PeerIntent {
         effort: Option<String>,
     },
     Prompt(String),
+}
+
+pub fn parse_peer_command(line: &str) -> Option<anyhow::Result<(PeerTarget, PeerIntent)>> {
+    let trimmed = line.trim();
+    let rest = trimmed.strip_prefix("/peer")?;
+    if rest
+        .chars()
+        .next()
+        .is_some_and(|character| !character.is_whitespace())
+    {
+        return None;
+    }
+    Some((|| {
+        let mut parts = rest.trim().splitn(2, char::is_whitespace);
+        let target = match parts
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "claude" => PeerTarget::Claude,
+            "gpt" => PeerTarget::Gpt,
+            _ => anyhow::bail!("usage: /peer claude|gpt [TEXT|clear|new [MODEL@EFFORT]]"),
+        };
+        let request = parts.next().unwrap_or_default().trim();
+        let mut words = request.split_whitespace();
+        let first = words.next().unwrap_or_default();
+        let intent = if first.is_empty() {
+            PeerIntent::Ensure
+        } else if first.eq_ignore_ascii_case("clear") && words.next().is_none() {
+            PeerIntent::Clear
+        } else if first.eq_ignore_ascii_case("new") || first.eq_ignore_ascii_case("rotate") {
+            let profile = words.next();
+            anyhow::ensure!(
+                words.next().is_none(),
+                "usage: /peer claude|gpt new [MODEL@EFFORT]"
+            );
+            let (model, effort) = match profile {
+                Some(profile) => match profile.rsplit_once('@') {
+                    Some((model, effort)) => {
+                        anyhow::ensure!(
+                            !effort.is_empty() && !model.contains('@'),
+                            "peer profile must be MODEL@EFFORT or @EFFORT"
+                        );
+                        (
+                            (!model.is_empty()).then(|| model.to_string()),
+                            Some(effort.to_string()),
+                        )
+                    }
+                    None => (Some(profile.to_string()), None),
+                },
+                None => (None, None),
+            };
+            PeerIntent::Rotate { model, effort }
+        } else {
+            PeerIntent::Prompt(request.to_string())
+        };
+        Ok((target, intent))
+    })())
 }
 
 pub fn parse_submission(
@@ -299,53 +365,8 @@ pub fn parse_submission(
     if text.starts_with("/todo ") || text.starts_with("/todos ") {
         return Ok(FrontendCommand::ApplyTodo(parse_todo_action(text, todos)?));
     }
-    if let Some(rest) = text.strip_prefix("/peer")
-        && rest.chars().next().is_none_or(char::is_whitespace)
-    {
-        let mut parts = rest.trim().splitn(2, char::is_whitespace);
-        let target = match parts
-            .next()
-            .unwrap_or_default()
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "claude" => PeerTarget::Claude,
-            "gpt" => PeerTarget::Gpt,
-            _ => anyhow::bail!("usage: /peer claude|gpt [TEXT|clear|new [MODEL@EFFORT]]"),
-        };
-        let request = parts.next().unwrap_or_default().trim();
-        let mut words = request.split_whitespace();
-        let first = words.next().unwrap_or_default();
-        let intent = if first.is_empty() {
-            PeerIntent::Ensure
-        } else if first.eq_ignore_ascii_case("clear") && words.next().is_none() {
-            PeerIntent::Clear
-        } else if first.eq_ignore_ascii_case("new") || first.eq_ignore_ascii_case("rotate") {
-            let profile = words.next();
-            anyhow::ensure!(
-                words.next().is_none(),
-                "usage: /peer claude|gpt new [MODEL@EFFORT]"
-            );
-            let (model, effort) = match profile {
-                Some(profile) => match profile.rsplit_once('@') {
-                    Some((model, effort)) => {
-                        anyhow::ensure!(
-                            !effort.is_empty() && !model.contains('@'),
-                            "peer profile must be MODEL@EFFORT or @EFFORT"
-                        );
-                        (
-                            (!model.is_empty()).then(|| model.to_string()),
-                            Some(effort.to_string()),
-                        )
-                    }
-                    None => (Some(profile.to_string()), None),
-                },
-                None => (None, None),
-            };
-            PeerIntent::Rotate { model, effort }
-        } else {
-            PeerIntent::Prompt(request.to_string())
-        };
+    if let Some(command) = parse_peer_command(text) {
+        let (target, intent) = command?;
         return Ok(FrontendCommand::ControlPeer {
             target,
             intent,

@@ -6621,38 +6621,10 @@ impl PersistentSidecar {
         }
     }
 
-    const fn task_name_argument(self) -> &'static str {
-        match self {
-            Self::Claude => "claude",
-            Self::Gpt => "gpt",
-        }
-    }
-
     const fn label(self) -> &'static str {
         match self {
             Self::Claude => "Claude",
             Self::Gpt => "GPT",
-        }
-    }
-
-    const fn provider(self) -> CodingProvider {
-        match self {
-            Self::Claude => CodingProvider::Claude,
-            Self::Gpt => CodingProvider::Codex,
-        }
-    }
-
-    const fn model(self) -> &'static str {
-        match self {
-            Self::Claude => "claude-opus-5",
-            Self::Gpt => "gpt-5.6-sol",
-        }
-    }
-
-    const fn effort(self) -> &'static str {
-        match self {
-            Self::Claude => "high",
-            Self::Gpt => "xhigh",
         }
     }
 }
@@ -6674,67 +6646,23 @@ enum PersistentSidecarIntent {
 fn persistent_sidecar_command(
     line: &str,
 ) -> Option<Result<(PersistentSidecar, PersistentSidecarIntent)>> {
-    let trimmed = line.trim();
-    let rest = trimmed.strip_prefix("/peer")?;
-    if rest
-        .chars()
-        .next()
-        .is_some_and(|character| !character.is_whitespace())
-    {
-        return None;
-    }
-
-    let mut parts = rest.trim().splitn(2, char::is_whitespace);
-    let sidecar = match parts
-        .next()
-        .unwrap_or_default()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "claude" => PersistentSidecar::Claude,
-        "gpt" => PersistentSidecar::Gpt,
-        _ => {
-            return Some(Err(anyhow::anyhow!(
-                "usage: /peer claude|gpt [TEXT|clear|new [MODEL@EFFORT]]"
-            )));
-        }
-    };
-    let request = parts.next().unwrap_or_default().trim();
-    let mut words = request.split_whitespace();
-    let first = words.next().unwrap_or_default();
-    let intent = if first.is_empty() {
-        PersistentSidecarIntent::Ensure
-    } else if first.eq_ignore_ascii_case("clear") && words.next().is_none() {
-        PersistentSidecarIntent::Clear
-    } else if first.eq_ignore_ascii_case("new") || first.eq_ignore_ascii_case("rotate") {
-        let profile = words.next();
-        if words.next().is_some() {
-            return Some(Err(anyhow::anyhow!(
-                "usage: /peer claude|gpt new [MODEL@EFFORT]"
-            )));
-        }
-        let (model, effort) = match profile {
-            Some(profile) => match profile.rsplit_once('@') {
-                Some((model, effort)) => {
-                    if effort.is_empty() || model.contains('@') {
-                        return Some(Err(anyhow::anyhow!(
-                            "peer profile must be MODEL@EFFORT or @EFFORT"
-                        )));
-                    }
-                    (
-                        (!model.is_empty()).then(|| model.to_string()),
-                        Some(effort.to_string()),
-                    )
+    borg_ui::parse_peer_command(line).map(|result| {
+        result.map(|(target, intent)| {
+            let sidecar = match target {
+                borg_ui::PeerTarget::Claude => PersistentSidecar::Claude,
+                borg_ui::PeerTarget::Gpt => PersistentSidecar::Gpt,
+            };
+            let intent = match intent {
+                borg_ui::PeerIntent::Ensure => PersistentSidecarIntent::Ensure,
+                borg_ui::PeerIntent::Clear => PersistentSidecarIntent::Clear,
+                borg_ui::PeerIntent::Rotate { model, effort } => {
+                    PersistentSidecarIntent::Rotate { model, effort }
                 }
-                None => (Some(profile.to_string()), None),
-            },
-            None => (None, None),
-        };
-        PersistentSidecarIntent::Rotate { model, effort }
-    } else {
-        PersistentSidecarIntent::Prompt(request.to_string())
-    };
-    Some(Ok((sidecar, intent)))
+                borg_ui::PeerIntent::Prompt(prompt) => PersistentSidecarIntent::Prompt(prompt),
+            };
+            (sidecar, intent)
+        })
+    })
 }
 
 fn persistent_sidecar_commands(
@@ -6745,57 +6673,27 @@ fn persistent_sidecar_commands(
     attachments: &[PathBuf],
     delivery: PromptDelivery,
 ) -> Vec<HostCommand> {
-    let ensure = HostCommand::Subagent {
-        session_id,
-        action: SubagentAction::Ensure {
-            request_id: Uuid::new_v4(),
-            task_name: sidecar.task_name_argument().to_string(),
-            provider: sidecar.provider(),
-            model: Some(sidecar.model().to_string()),
-            effort: Some(sidecar.effort().to_string()),
-        },
+    let target = match sidecar {
+        PersistentSidecar::Claude => borg_ui::PeerTarget::Claude,
+        PersistentSidecar::Gpt => borg_ui::PeerTarget::Gpt,
     };
-    match intent {
-        PersistentSidecarIntent::Ensure => vec![ensure],
-        PersistentSidecarIntent::Clear => vec![
-            ensure,
-            HostCommand::Subagent {
-                session_id,
-                action: SubagentAction::ClearContext {
-                    request_id: Uuid::new_v4(),
-                    target: sidecar.task_name().to_string(),
-                },
-            },
-        ],
-        PersistentSidecarIntent::Rotate { model, effort } => vec![HostCommand::Subagent {
-            session_id,
-            action: SubagentAction::Rotate {
-                request_id: Uuid::new_v4(),
-                task_name: sidecar.task_name_argument().to_string(),
-                provider: sidecar.provider(),
-                model: Some(model.clone().unwrap_or_else(|| sidecar.model().to_string())),
-                effort: Some(
-                    effort
-                        .clone()
-                        .unwrap_or_else(|| sidecar.effort().to_string()),
-                ),
-            },
-        }],
-        PersistentSidecarIntent::Prompt(prompt) => vec![
-            ensure,
-            HostCommand::Subagent {
-                session_id,
-                action: SubagentAction::Prompt {
-                    request_id: Uuid::new_v4(),
-                    target: sidecar.task_name().to_string(),
-                    message_id,
-                    text: prompt.clone(),
-                    attachments: attachments.to_vec(),
-                    delivery,
-                },
-            },
-        ],
-    }
+    let intent = match intent {
+        PersistentSidecarIntent::Ensure => borg_ui::PeerIntent::Ensure,
+        PersistentSidecarIntent::Clear => borg_ui::PeerIntent::Clear,
+        PersistentSidecarIntent::Rotate { model, effort } => borg_ui::PeerIntent::Rotate {
+            model: model.clone(),
+            effort: effort.clone(),
+        },
+        PersistentSidecarIntent::Prompt(prompt) => borg_ui::PeerIntent::Prompt(prompt.clone()),
+    };
+    borg_ui::local::peer_host_commands(
+        session_id,
+        target,
+        &intent,
+        message_id,
+        attachments,
+        delivery,
+    )
 }
 
 fn sidecar_notice(sidecar: PersistentSidecar, intent: &PersistentSidecarIntent) -> String {

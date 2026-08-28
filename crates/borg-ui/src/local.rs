@@ -11,7 +11,8 @@ use borg_remote::{
 use uuid::Uuid;
 
 use crate::{
-    FrontendCommand, PeerIntent, SessionPresentation, SessionView, timeline::TimelineProjector,
+    FrontendCommand, PeerIntent, PeerTarget, PromptDelivery, SessionPresentation, SessionView,
+    timeline::TimelineProjector,
 };
 
 pub enum LocalSessionUpdate {
@@ -565,58 +566,14 @@ impl LocalSessionClient {
                 attachments,
                 delivery,
             } => {
-                let ensure = HostCommand::Subagent {
+                for command in peer_host_commands(
                     session_id,
-                    action: SubagentAction::Ensure {
-                        request_id: Uuid::new_v4(),
-                        task_name: target.task_name_argument().to_string(),
-                        provider: target.provider(),
-                        model: Some(target.default_model().to_string()),
-                        effort: Some(target.default_effort().to_string()),
-                    },
-                };
-                let commands = match intent {
-                    PeerIntent::Ensure => vec![ensure],
-                    PeerIntent::Clear => vec![
-                        ensure,
-                        HostCommand::Subagent {
-                            session_id,
-                            action: SubagentAction::ClearContext {
-                                request_id: Uuid::new_v4(),
-                                target: target.task_name().to_string(),
-                            },
-                        },
-                    ],
-                    PeerIntent::Rotate { model, effort } => vec![HostCommand::Subagent {
-                        session_id,
-                        action: SubagentAction::Rotate {
-                            request_id: Uuid::new_v4(),
-                            task_name: target.task_name_argument().to_string(),
-                            provider: target.provider(),
-                            model: Some(
-                                model.unwrap_or_else(|| target.default_model().to_string()),
-                            ),
-                            effort: Some(
-                                effort.unwrap_or_else(|| target.default_effort().to_string()),
-                            ),
-                        },
-                    }],
-                    PeerIntent::Prompt(text) => vec![
-                        ensure,
-                        HostCommand::Subagent {
-                            session_id,
-                            action: SubagentAction::Prompt {
-                                request_id: Uuid::new_v4(),
-                                target: target.task_name().to_string(),
-                                message_id: Uuid::new_v4(),
-                                text,
-                                attachments,
-                                delivery,
-                            },
-                        },
-                    ],
-                };
-                for command in commands {
+                    target,
+                    &intent,
+                    Uuid::new_v4(),
+                    &attachments,
+                    delivery,
+                ) {
                     send_local_session_command(
                         &session_control_socket_path(&self.sessions_dir, session_id),
                         session_id,
@@ -764,6 +721,71 @@ impl LocalSessionClient {
             HostCommand::Subagent { session_id, action },
         )
         .await
+    }
+}
+
+pub fn peer_host_commands(
+    session_id: Uuid,
+    target: PeerTarget,
+    intent: &PeerIntent,
+    message_id: Uuid,
+    attachments: &[PathBuf],
+    delivery: PromptDelivery,
+) -> Vec<HostCommand> {
+    let ensure = HostCommand::Subagent {
+        session_id,
+        action: SubagentAction::Ensure {
+            request_id: Uuid::new_v4(),
+            task_name: target.task_name_argument().to_string(),
+            provider: target.provider(),
+            model: Some(target.default_model().to_string()),
+            effort: Some(target.default_effort().to_string()),
+        },
+    };
+    match intent {
+        PeerIntent::Ensure => vec![ensure],
+        PeerIntent::Clear => vec![
+            ensure,
+            HostCommand::Subagent {
+                session_id,
+                action: SubagentAction::ClearContext {
+                    request_id: Uuid::new_v4(),
+                    target: target.task_name().to_string(),
+                },
+            },
+        ],
+        PeerIntent::Rotate { model, effort } => vec![HostCommand::Subagent {
+            session_id,
+            action: SubagentAction::Rotate {
+                request_id: Uuid::new_v4(),
+                task_name: target.task_name_argument().to_string(),
+                provider: target.provider(),
+                model: Some(
+                    model
+                        .clone()
+                        .unwrap_or_else(|| target.default_model().to_string()),
+                ),
+                effort: Some(
+                    effort
+                        .clone()
+                        .unwrap_or_else(|| target.default_effort().to_string()),
+                ),
+            },
+        }],
+        PeerIntent::Prompt(text) => vec![
+            ensure,
+            HostCommand::Subagent {
+                session_id,
+                action: SubagentAction::Prompt {
+                    request_id: Uuid::new_v4(),
+                    target: target.task_name().to_string(),
+                    message_id,
+                    text: text.clone(),
+                    attachments: attachments.to_vec(),
+                    delivery,
+                },
+            },
+        ],
     }
 }
 
