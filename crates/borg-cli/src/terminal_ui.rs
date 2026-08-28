@@ -647,15 +647,16 @@ struct GitWorktreeStatus {
 
 impl GitWorktreeStatus {
     fn compact_label(&self) -> String {
-        let mut segments = vec![format!("git:{}", self.branch)];
+        let mut segments = vec![format!(
+            "{}{}",
+            self.branch,
+            if self.dirty { "*" } else { "" }
+        )];
         if self.ahead > 0 {
             segments.push(format!("↑{}", self.ahead));
         }
         if self.behind > 0 {
             segments.push(format!("↓{}", self.behind));
-        }
-        if self.dirty {
-            segments.push("dirty".to_string());
         }
         segments.join(STATUS_SEPARATOR)
     }
@@ -5237,6 +5238,7 @@ impl BorgTerminal {
             status_is_interruptible,
             goal_status_hovered: self.goal_status_hovered,
             goal_available: active_goal.is_some(),
+            shell_status_hovered: self.shell_status_hovered,
             agents_status_hovered: self.agents_status_hovered,
             model_status_hovered: self.model_status_hovered,
             effort_status_hovered: self.effort_status_hovered,
@@ -6491,10 +6493,7 @@ impl BorgTerminal {
                     tooltip,
                 );
             }
-            if (self.shell_status_hovered
-                || self.shell_menu_open
-                || self.hovered_shell_row.is_some())
-                && !shell_rows.is_empty()
+            if (self.shell_menu_open || self.hovered_shell_row.is_some()) && !shell_rows.is_empty()
             {
                 let tooltip_width = shell_rows
                     .iter()
@@ -12173,6 +12172,7 @@ struct BottomInteractionHintState {
     status_is_interruptible: bool,
     goal_status_hovered: bool,
     goal_available: bool,
+    shell_status_hovered: bool,
     agents_status_hovered: bool,
     model_status_hovered: bool,
     effort_status_hovered: bool,
@@ -12184,6 +12184,8 @@ fn bottom_interaction_hint(state: BottomInteractionHintState) -> Option<&'static
         Some("left click interrupt")
     } else if state.goal_status_hovered && state.goal_available {
         Some("left click toggle/manage · right click clear goal")
+    } else if state.shell_status_hovered {
+        Some("left click to open shells menu")
     } else if state.agents_status_hovered {
         Some("left click to open subagents menu")
     } else if state.model_status_hovered {

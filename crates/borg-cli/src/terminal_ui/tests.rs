@@ -1639,14 +1639,8 @@ fn tool_lifecycle_labels_use_progressive_and_past_tense() {
         tool_lifecycle_label("Inspect repository", true),
         "Inspected repository"
     );
-    assert_eq!(
-        tool_lifecycle_label("Search web in progress", false),
-        "Searching web…"
-    );
-    assert_eq!(
-        tool_lifecycle_label("Search web in progress", true),
-        "Searched web"
-    );
+    assert_eq!(tool_lifecycle_label("Search web", false), "Searching web…");
+    assert_eq!(tool_lifecycle_label("Search web", true), "Searched web");
 }
 
 #[test]
@@ -3571,6 +3565,23 @@ fn footer_shell_metadata_uses_the_blue_background_action_identity() {
     assert_eq!(line.spans[1].content, STATUS_SEPARATOR);
     assert_eq!(line.spans[2].style.fg, Some(Color::LightGreen));
     assert_eq!(shell_row_style(false).fg, Some(USER_LABEL_BLUE));
+
+    let hovered = footer_shell_todo_metadata_line(
+        Some("1 shell"),
+        None,
+        "~/borg-cli",
+        true,
+        false,
+        usize::MAX,
+    );
+    assert_eq!(hovered.spans[0].style.fg, Some(Color::White));
+    assert!(hovered.spans[0].style.add_modifier.contains(Modifier::BOLD));
+    assert!(
+        hovered.spans[0]
+            .style
+            .add_modifier
+            .contains(Modifier::UNDERLINED)
+    );
 }
 
 #[test]
@@ -3602,12 +3613,12 @@ fn git_worktree_status_is_compact_and_includes_divergence_and_dirty_state() {
 
     assert_eq!(status.branch, "feature/ui");
     assert!(status.dirty);
-    assert_eq!(status.compact_label(), "git:feature/ui · ↑2 · ↓1 · dirty");
+    assert_eq!(status.compact_label(), "feature/ui* · ↑2 · ↓1");
     assert_eq!(
         parse_git_worktree_status("## HEAD (no branch)\n")
             .expect("detached status")
             .compact_label(),
-        "git:detached"
+        "detached"
     );
     assert!(parse_git_worktree_status("not a git status header").is_none());
 }
@@ -4650,8 +4661,9 @@ fn agents_status_hover_underlines_only_the_label() {
 
 #[test]
 fn actionable_status_segments_show_bottom_interaction_hints() {
-    let hint = |agents, model, effort, permission| {
+    let hint = |shells, agents, model, effort, permission| {
         bottom_interaction_hint(BottomInteractionHintState {
+            shell_status_hovered: shells,
             agents_status_hovered: agents,
             model_status_hovered: model,
             effort_status_hovered: effort,
@@ -4661,22 +4673,26 @@ fn actionable_status_segments_show_bottom_interaction_hints() {
     };
 
     assert_eq!(
-        hint(true, false, false, false),
+        hint(false, true, false, false, false),
         Some("left click to open subagents menu")
     );
     assert_eq!(
-        hint(false, true, false, false),
+        hint(false, false, true, false, false),
         Some("left click change model")
     );
     assert_eq!(
-        hint(false, false, true, false),
+        hint(false, false, false, true, false),
         Some("left click change effort")
     );
     assert_eq!(
-        hint(false, false, false, true),
+        hint(false, false, false, false, true),
         Some("left click change permissions")
     );
-    assert_eq!(hint(false, false, false, false), None);
+    assert_eq!(
+        hint(true, false, false, false, false),
+        Some("left click to open shells menu")
+    );
+    assert_eq!(hint(false, false, false, false, false), None);
 }
 
 #[test]
@@ -7749,6 +7765,8 @@ fn provider_progress_marks_an_unfinished_tool_as_background_work() {
         .into_iter()
         .find(|line| line.to_string().contains("Running in background"))
         .expect("background lifecycle row");
+    assert!(row.to_string().contains("Running…"), "{row}");
+    assert!(!row.to_string().contains("Run in progress"), "{row}");
     assert!(transcript.tool_activity_is_running(0));
     assert!(
         row.spans
@@ -7795,6 +7813,7 @@ fn provider_progress_marks_an_unfinished_tool_as_background_work() {
         .map(|line| line.to_string())
         .collect::<Vec<_>>()
         .join("\n");
+    assert!(completed.contains("Ran"), "{completed}");
     assert!(!completed.contains("Running in background"), "{completed}");
 }
 
@@ -9129,6 +9148,14 @@ fn completed_web_search_updates_the_started_card_with_the_late_query() {
             input_ref: None,
         },
     ));
+    let running = transcript
+        .lines(100)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(running.contains("Searching web…"), "{running}");
+    assert!(!running.contains("in progress"), "{running}");
     transcript.apply(&SessionEvent::new(
         session_id,
         2,
@@ -9147,6 +9174,14 @@ fn completed_web_search_updates_the_started_card_with_the_late_query() {
         Some(TranscriptEntry::Tool { name, detail, complete: true, .. })
             if name == "Search web" && detail == "“Borg Agent queue”"
     ));
+    let completed = transcript
+        .lines(100)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(completed.contains("Searched web"), "{completed}");
+    assert!(!completed.contains("in progress"), "{completed}");
 }
 
 #[test]

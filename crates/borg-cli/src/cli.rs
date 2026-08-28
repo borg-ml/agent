@@ -449,6 +449,9 @@ pub(crate) struct LocalAgentCliArgs {
     pub(crate) permission: RemotePermissionArg,
     #[arg(long)]
     pub(crate) json: bool,
+    /// Print only the final response to stdout.
+    #[arg(short = 'p', long, requires = "prompt", conflicts_with = "json")]
+    pub(crate) print: bool,
     #[arg(long, conflicts_with = "continue_latest")]
     pub(crate) resume: Option<Uuid>,
     #[arg(long = "continue", conflicts_with = "resume")]
@@ -478,6 +481,7 @@ impl LocalAgentCliArgs {
             config: None,
             permission: RemotePermissionArg::FullAccess,
             json: false,
+            print: false,
             resume: None,
             continue_latest: false,
             workspace: None,
@@ -500,6 +504,7 @@ impl LocalAgentCliArgs {
             config: None,
             permission: RemotePermissionArg::FullAccess,
             json: false,
+            print: false,
             resume: session,
             continue_latest: session.is_none(),
             workspace: None,
@@ -561,6 +566,20 @@ mod tests {
         assert!(args.ephemeral);
         assert_eq!(args.model.as_deref(), Some("gpt-5.6-luna"));
         assert_eq!(args.prompt, ["write the message"]);
+    }
+
+    #[test]
+    fn print_mode_requires_a_prompt_and_conflicts_with_json_events() {
+        let command = try_parse_direct(["borg", "-p", "write the message"])
+            .expect("print mode with a prompt parses")
+            .command_or_agent();
+        let Command::Agent(args) = command else {
+            panic!("agent command expected");
+        };
+        assert!(args.print);
+        assert_eq!(args.prompt, ["write the message"]);
+        assert!(try_parse_direct(["borg", "-p"]).is_err());
+        assert!(try_parse_direct(["borg", "-p", "--json", "write the message"]).is_err());
     }
 
     #[test]

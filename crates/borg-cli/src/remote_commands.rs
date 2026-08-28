@@ -1331,10 +1331,13 @@ async fn run_local_agent_session(
     let lifecycle_executor = Arc::clone(&executor);
     let mut rendered = HashMap::new();
     let stdin_is_terminal = io::stdin().is_terminal();
-    let can_prompt = stdin_is_terminal && !args.json;
-    let rich_tui_allowed =
-        rich_terminal_can_prompt(stdin_is_terminal, io::stdout().is_terminal(), args.json)
-            && !BorgTerminal::fallback_requested();
+    let machine_output = args.json || args.print;
+    let can_prompt = stdin_is_terminal && !machine_output;
+    let rich_tui_allowed = rich_terminal_can_prompt(
+        stdin_is_terminal,
+        io::stdout().is_terminal(),
+        machine_output,
+    ) && !BorgTerminal::fallback_requested();
     if rich_tui_allowed {
         tokio::spawn(async {
             if let Err(error) = borg_provider::refresh_openrouter_model_catalog().await {
@@ -2336,7 +2339,7 @@ async fn run_local_agent_session(
                             history.insert(insertion, repaired_event);
                         }
                     } else if !detached_from_terminal {
-                        render_event(&repaired_event, args.json, &mut rendered)?;
+                        render_event(&repaired_event, args.json, args.print, &mut rendered)?;
                     }
                 }
                 if let Some(message_id) = committed_prompt_id(&event.kind) {
@@ -2477,7 +2480,7 @@ async fn run_local_agent_session(
                         );
                     }
                 } else if !detached_from_terminal {
-                    render_event(&event, args.json, &mut rendered)?;
+                    render_event(&event, args.json, args.print, &mut rendered)?;
                 }
                 if handoff_stale_owner {
                     match send_local_session_command(
@@ -7557,10 +7560,23 @@ fn lsp_support_summary() -> String {
 fn render_event(
     event: &SessionEvent,
     json: bool,
+    print: bool,
     rendered: &mut HashMap<Uuid, String>,
 ) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string(event)?);
+        return Ok(());
+    }
+    if print {
+        if let SessionEventKind::TurnCompleted {
+            final_text, error, ..
+        } = &event.kind
+        {
+            if let Some(error) = error {
+                anyhow::bail!("{error}");
+            }
+            println!("{final_text}");
+        }
         return Ok(());
     }
     match &event.kind {

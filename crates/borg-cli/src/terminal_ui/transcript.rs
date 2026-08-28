@@ -350,7 +350,6 @@ fn tool_has_expandable_body(
 }
 
 fn tool_lifecycle_label(name: &str, complete: bool) -> Cow<'_, str> {
-    let name = name.strip_suffix(" in progress").unwrap_or(name);
     if name == "Git add" {
         return Cow::Borrowed(if complete {
             "Updated Git index"
