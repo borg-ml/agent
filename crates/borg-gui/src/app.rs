@@ -1290,7 +1290,7 @@ impl Render for BorgGui {
                             .pb_3()
                             .text_xs()
                             .text_color(rgb(palette::TEXT_MUTED))
-                        .child(div().id("command-help").cursor_pointer().on_click(cx.listener(Self::toggle_help)).child("send  enter  ·  commands  ctrl-shift-p  ·  click steer/queue"))
+                        .child(div().id("command-help").cursor_pointer().on_click(cx.listener(Self::toggle_help)).child("send  enter  ·  newline  shift-enter  ·  commands  ctrl-shift-p"))
                             .child(
                                 self.view
                                     .as_ref()
@@ -1348,6 +1348,8 @@ pub fn run() {
             KeyBinding::new("ctrl-x", composer::Cut, Some("Composer")),
             KeyBinding::new("home", composer::Home, Some("Composer")),
             KeyBinding::new("end", composer::End, Some("Composer")),
+            KeyBinding::new("shift-enter", composer::Newline, Some("Composer")),
+            KeyBinding::new("alt-enter", composer::Newline, Some("Composer")),
             KeyBinding::new("enter", composer::Submit, Some("Composer")),
             KeyBinding::new("escape", Escape, Some("Composer")),
             KeyBinding::new("ctrl-shift-p", ToggleHelp, Some("Composer")),

@@ -3,9 +3,9 @@ use std::ops::Range;
 use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, Element, ElementId, ElementInputHandler,
     Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId, LayoutId, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, ShapedLine,
-    SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div, fill, hsla,
-    point, prelude::*, px, relative, rgb, rgba, size,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, SharedString, Style,
+    TextAlign, TextRun, UTF16Selection, UnderlineStyle, Window, WrappedLine, actions, div, fill,
+    hsla, point, prelude::*, px, relative, rgb, rgba, size,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -26,6 +26,7 @@ actions!(
         Paste,
         Cut,
         Copy,
+        Newline,
         Submit
     ]
 );
@@ -39,7 +40,7 @@ pub struct Composer {
     selected: Range<usize>,
     reversed: bool,
     marked: Option<Range<usize>>,
-    last_layout: Option<ShapedLine>,
+    last_layout: Vec<(usize, WrappedLine)>,
     last_bounds: Option<Bounds<Pixels>>,
     selecting: bool,
     secret: bool,
@@ -53,7 +54,7 @@ impl Composer {
             selected: 0..0,
             reversed: false,
             marked: None,
-            last_layout: None,
+            last_layout: Vec::new(),
             last_bounds: None,
             selecting: false,
             secret: false,
@@ -208,8 +209,30 @@ impl Composer {
         cx.emit(Submitted(text));
         cx.notify();
     }
+
+    fn newline(&mut self, _: &Newline, window: &mut Window, cx: &mut Context<Self>) {
+        self.replace_text_in_range(None, "\n", window, cx);
+    }
+
+    fn position_for_index(&self, index: usize) -> Option<Point<Pixels>> {
+        let bounds = self.last_bounds?;
+        let line_height = px(24.);
+        let mut top = bounds.top();
+        let (start, line) = self
+            .last_layout
+            .iter()
+            .rev()
+            .find(|(start, _)| *start <= index)?;
+        for (_, preceding) in self.last_layout.iter().take_while(|item| item.0 < *start) {
+            top += preceding.size(line_height).height;
+        }
+        let local = index.saturating_sub(*start).min(line.len());
+        let position = line.position_for_index(local, line_height)?;
+        Some(point(bounds.left() + position.x, top + position.y))
+    }
+
     fn index_at(&self, position: Point<Pixels>) -> usize {
-        let (Some(bounds), Some(line)) = (&self.last_bounds, &self.last_layout) else {
+        let Some(bounds) = self.last_bounds else {
             return 0;
         };
         if position.y < bounds.top() {
@@ -217,7 +240,22 @@ impl Composer {
         } else if position.y > bounds.bottom() {
             self.content.len()
         } else {
-            line.closest_index_for_x(position.x - bounds.left())
+            let line_height = px(24.);
+            let mut top = bounds.top();
+            for (start, line) in &self.last_layout {
+                let height = line.size(line_height).height;
+                if position.y <= top + height {
+                    let local = line
+                        .closest_index_for_position(
+                            point(position.x - bounds.left(), position.y - top),
+                            line_height,
+                        )
+                        .unwrap_or_else(|index| index);
+                    return (start + local).min(self.content.len());
+                }
+                top += height;
+            }
+            self.content.len()
         }
     }
     fn mouse_down(&mut self, event: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -344,11 +382,15 @@ impl EntityInputHandler for Composer {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
-        let line = self.last_layout.as_ref()?;
         let range = self.range_from_utf16(&range);
+        let start = self.position_for_index(range.start)?;
+        let end = self.position_for_index(range.end)?;
         Some(Bounds::from_corners(
-            point(bounds.left() + line.x_for_index(range.start), bounds.top()),
-            point(bounds.left() + line.x_for_index(range.end), bounds.bottom()),
+            start,
+            point(
+                end.x.max(start.x + px(1.)),
+                (end.y + px(24.)).min(bounds.bottom()),
+            ),
         ))
     }
     fn character_index_for_point(
@@ -365,9 +407,8 @@ struct ComposerElement {
     input: Entity<Composer>,
 }
 struct Prepaint {
-    line: ShapedLine,
+    lines: Vec<(usize, WrappedLine)>,
     cursor: Option<PaintQuad>,
-    selection: Option<PaintQuad>,
 }
 impl IntoElement for ComposerElement {
     type Element = Self;
@@ -393,7 +434,7 @@ impl Element for ComposerElement {
     ) -> (LayoutId, ()) {
         let mut style = Style::default();
         style.size.width = relative(1.).into();
-        style.size.height = window.line_height().into();
+        style.size.height = px(72.).into();
         (window.request_layout(style, [], cx), ())
     }
     fn prepaint(
@@ -420,7 +461,7 @@ impl Element for ComposerElement {
         } else {
             (content, style.color)
         };
-        let run = TextRun {
+        let base_run = TextRun {
             len: display.len(),
             font: style.font(),
             color,
@@ -428,67 +469,79 @@ impl Element for ComposerElement {
             underline: None,
             strikethrough: None,
         };
-        let runs = if let Some(marked) = &input.marked {
-            vec![
-                TextRun {
-                    len: marked.start,
-                    ..run.clone()
-                },
-                TextRun {
-                    len: marked.len(),
-                    underline: Some(UnderlineStyle {
-                        color: Some(run.color),
-                        thickness: px(1.),
-                        wavy: false,
+        let mut boundaries = vec![0, display.len()];
+        if !input.content.is_empty() {
+            boundaries.extend([selected.start, selected.end]);
+            if let Some(marked) = &input.marked {
+                boundaries.extend([marked.start, marked.end]);
+            }
+        }
+        boundaries.sort_unstable();
+        boundaries.dedup();
+        let runs = boundaries
+            .windows(2)
+            .filter_map(|range| {
+                let start = range[0];
+                let end = range[1];
+                (end > start).then(|| TextRun {
+                    len: end - start,
+                    background_color: (!selected.is_empty()
+                        && start < selected.end
+                        && end > selected.start)
+                        .then(|| rgba(0x4aa3ff44).into()),
+                    underline: input.marked.as_ref().and_then(|marked| {
+                        (start < marked.end && end > marked.start).then(|| UnderlineStyle {
+                            color: Some(base_run.color),
+                            thickness: px(1.),
+                            wavy: false,
+                        })
                     }),
-                    ..run.clone()
-                },
-                TextRun {
-                    len: display.len() - marked.end,
-                    ..run
-                },
-            ]
-            .into_iter()
-            .filter(|r| r.len > 0)
-            .collect()
-        } else {
-            vec![run]
-        };
-        let line = window.text_system().shape_line(
-            display,
-            style.font_size.to_pixels(window.rem_size()),
-            &runs,
-            None,
-        );
-        let selection = (!selected.is_empty()).then(|| {
-            fill(
-                Bounds::from_corners(
-                    point(
-                        bounds.left() + line.x_for_index(selected.start),
-                        bounds.top(),
-                    ),
-                    point(
-                        bounds.left() + line.x_for_index(selected.end),
-                        bounds.bottom(),
-                    ),
-                ),
-                rgba(0x4aa3ff44),
+                    ..base_run.clone()
+                })
+            })
+            .collect::<Vec<_>>();
+        let shaped = window
+            .text_system()
+            .shape_text(
+                display.clone(),
+                style.font_size.to_pixels(window.rem_size()),
+                &runs,
+                Some(bounds.size.width),
+                Some(3),
             )
-        });
+            .unwrap_or_default();
+        let mut offset = 0;
+        let lines = shaped
+            .into_iter()
+            .map(|line| {
+                let start = offset;
+                offset += line.len();
+                if display.as_bytes().get(offset) == Some(&b'\n') {
+                    offset += 1;
+                }
+                (start, line)
+            })
+            .collect::<Vec<_>>();
         let cursor = selected.is_empty().then(|| {
+            let line_height = px(24.);
+            let mut top = bounds.top();
+            let mut position = point(bounds.left(), bounds.top());
+            if let Some((start, line)) = lines.iter().rev().find(|(start, _)| *start <= cursor) {
+                for (_, preceding) in lines.iter().take_while(|item| item.0 < *start) {
+                    top += preceding.size(line_height).height;
+                }
+                if let Some(local) = line
+                    .position_for_index(cursor.saturating_sub(*start).min(line.len()), line_height)
+                {
+                    position = point(bounds.left() + local.x, top + local.y);
+                }
+            }
             fill(
-                Bounds::new(
-                    point(bounds.left() + line.x_for_index(cursor), bounds.top()),
-                    size(px(1.5), bounds.bottom() - bounds.top()),
-                ),
+                Bounds::new(position, size(px(1.5), line_height)),
                 rgb(palette::ORANGE),
             )
         });
-        Prepaint {
-            line,
-            cursor,
-            selection,
-        }
+        Prepaint { lines, cursor }
     }
     fn paint(
         &mut self,
@@ -506,20 +559,27 @@ impl Element for ComposerElement {
             ElementInputHandler::new(bounds, self.input.clone()),
             cx,
         );
-        if let Some(q) = state.selection.take() {
-            window.paint_quad(q);
-        }
-        state
-            .line
-            .paint(bounds.origin, window.line_height(), window, cx)
+        let line_height = px(24.);
+        let mut top = bounds.top();
+        for (_, line) in &state.lines {
+            line.paint(
+                point(bounds.left(), top),
+                line_height,
+                TextAlign::Left,
+                Some(bounds),
+                window,
+                cx,
+            )
             .ok();
+            top += line.size(line_height).height;
+        }
         if focus.is_focused(window)
             && let Some(q) = state.cursor.take()
         {
             window.paint_quad(q);
         }
         self.input.update(cx, |input, _| {
-            input.last_layout = Some(state.line.clone());
+            input.last_layout = state.lines.clone();
             input.last_bounds = Some(bounds);
         });
     }
@@ -543,12 +603,14 @@ impl Render for Composer {
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::cut))
             .on_action(cx.listener(Self::copy))
+            .on_action(cx.listener(Self::newline))
             .on_action(cx.listener(Self::submit))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::mouse_up))
             .on_mouse_move(cx.listener(Self::mouse_move))
             .w_full()
+            .h(px(72.))
             .line_height(px(24.))
             .text_size(px(14.))
             .child(ComposerElement { input: cx.entity() })
