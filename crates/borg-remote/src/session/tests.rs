@@ -9005,6 +9005,7 @@ async fn parent_stream_preserves_full_child_transcript_events() {
         .await
         .unwrap();
 
+    let persisted = sqlite.clone();
     let store: Arc<dyn SessionStore> = sqlite;
     let mut journal = RuntimeSessionStore::new(store, Vec::new(), true);
     let (events, mut event_rx) = mpsc::channel(4);
@@ -9048,6 +9049,15 @@ async fn parent_stream_preserves_full_child_transcript_events() {
             } if tool_call_id == "call-1" && name == "exec"
         )
     ));
+    assert!(
+        persisted
+            .read(parent_id)
+            .await
+            .unwrap()
+            .iter()
+            .all(|event| !matches!(event.kind, SessionEventKind::SubagentActivity { .. })),
+        "routine child transcript updates must not be duplicated into the parent journal"
+    );
 
     let message_id = Uuid::new_v4();
     let child_message = |sequence, text: &str, status| SubagentActivity::SessionEvent {
@@ -9115,6 +9125,17 @@ async fn parent_stream_preserves_full_child_transcript_events() {
             } if text == "I am complete"
         )
     ));
+    assert_eq!(
+        persisted
+            .read(parent_id)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|event| matches!(event.kind, SessionEventKind::SubagentActivity { .. }))
+            .count(),
+        1,
+        "the completed child message remains a durable parent boundary"
+    );
 
     record_subagent_activity(
         &mut journal,

@@ -6292,21 +6292,49 @@ async fn record_subagent_activity(
             (SubagentActivityKind::Updated, agent, Some(Box::new(event)))
         }
     };
-    record(
-        journal,
-        events,
-        session_id,
-        SessionEventKind::SubagentActivity {
-            activity: kind,
-            agent,
-            event,
-        },
-    )
-    .await?;
+    let kind = SessionEventKind::SubagentActivity {
+        activity: kind,
+        agent,
+        event,
+    };
+    if !durable_subagent_projection(&kind) {
+        deliver_recorded_event(
+            events,
+            session_id,
+            SessionEvent::new(session_id, 0, kind),
+            crate::EventPersistence::Ephemeral,
+        )
+        .await;
+        return Ok(());
+    }
+    record(journal, events, session_id, kind).await?;
     if let Some(message_id) = projected_message_id {
         subagents.mark_root_message_projected(message_id).await;
     }
     Ok(())
+}
+
+fn durable_subagent_projection(kind: &SessionEventKind) -> bool {
+    let SessionEventKind::SubagentActivity {
+        activity, event, ..
+    } = kind
+    else {
+        return true;
+    };
+    if *activity != SubagentActivityKind::Updated {
+        return true;
+    }
+    matches!(
+        event.as_deref().map(|event| &event.kind),
+        Some(SessionEventKind::Message {
+            status: MessageStatus::Complete,
+            ..
+        }) | Some(SessionEventKind::ApprovalRequested { .. })
+            | Some(SessionEventKind::StatusChanged {
+                status: SessionStatus::Failed | SessionStatus::Stopped,
+                ..
+            })
+    )
 }
 
 async fn refresh_durable_root_inbox(
