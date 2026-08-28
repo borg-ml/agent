@@ -32,7 +32,6 @@ required-features = ["tui-stress"]
 agent-client-protocol.workspace = true
 aes-gcm = "0.11.1"
 anyhow.workspace = true
-arboard = { version = "3.6", features = ["wayland-data-control"] }
 base64.workspace = true
 borg-provider = { path = "../borg-provider", default-features = false }
 borg-dictation.workspace = true
@@ -45,20 +44,16 @@ crossterm = { version = "0.29", features = ["bracketed-paste", "event-stream"] }
 futures-util = "0.3"
 getrandom = "0.4.3"
 hex.workspace = true
-image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 libloading = "0.9.0"
 pulldown-cmark = "0.13"
 qrcode = { version = "0.14.1", default-features = false }
 regex.workspace = true
-ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache", "macros", "underline-color"] }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 semver = "1"
 sha2.workspace = true
 shlex = "2.0"
-syntect = { version = "5.3", default-features = false, features = ["default-syntaxes", "default-themes", "parsing", "regex-fancy", "yaml-load"] }
-term-maths = "1.0.0"
 termwiz = { version = "0.23.3", optional = true }
 tempfile.workspace = true
 tokio.workspace = true
@@ -67,7 +62,6 @@ tokio-util = { version = "0.7", features = ["io", "rt"] }
 toml = "1.1.4"
 tracing.workspace = true
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-unicode-segmentation = "1.13"
 unicode-width = "0.2"
 url.workspace = true
 urlencoding = "2.1.3"

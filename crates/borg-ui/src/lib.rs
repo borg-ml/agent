@@ -162,6 +162,10 @@ pub enum FrontendCommand {
     RespondToProviderInteraction(serde_json::Value),
     ApplyGoal(GoalAction),
     ApplyTodo(TodoAction),
+    RunExtension {
+        command: String,
+        arguments: serde_json::Value,
+    },
     SetModel {
         provider: CodingProvider,
         model: String,
@@ -235,10 +239,41 @@ pub fn parse_submission(
     if text.starts_with("/todo ") || text.starts_with("/todos ") {
         return Ok(FrontendCommand::ApplyTodo(parse_todo_action(text, todos)?));
     }
+    if let Some(rest) = text.strip_prefix("/ext:") {
+        let (qualified, argument_text) = rest
+            .split_once(char::is_whitespace)
+            .map_or((rest, ""), |(qualified, arguments)| {
+                (qualified, arguments.trim())
+            });
+        let (extension_id, name) = qualified
+            .split_once(':')
+            .ok_or_else(|| anyhow::anyhow!("usage: /ext:EXTENSION:COMMAND [JSON|TEXT]"))?;
+        anyhow::ensure!(
+            !extension_id.is_empty() && !name.is_empty(),
+            "usage: /ext:EXTENSION:COMMAND [JSON|TEXT]"
+        );
+        let arguments = if argument_text.is_empty() {
+            serde_json::json!({})
+        } else if argument_text.starts_with('{') {
+            let value: serde_json::Value = serde_json::from_str(argument_text)
+                .map_err(|error| anyhow::anyhow!("invalid extension command JSON: {error}"))?;
+            anyhow::ensure!(
+                value.is_object(),
+                "extension arguments must be a JSON object"
+            );
+            value
+        } else {
+            serde_json::json!({ "arguments": argument_text })
+        };
+        return Ok(FrontendCommand::RunExtension {
+            command: format!("extcmd__{extension_id}__{name}"),
+            arguments,
+        });
+    }
     if let Some(model) = text.strip_prefix("/model ").map(str::trim) {
         anyhow::ensure!(!model.is_empty(), "usage: /model MODEL");
         return Ok(FrontendCommand::SetModel {
-            provider,
+            provider: CodingProvider::for_model(model).unwrap_or(provider),
             model: model.to_string(),
         });
     }
@@ -463,6 +498,7 @@ pub struct SessionView {
 #[derive(Clone, Debug)]
 pub struct SessionPresentation {
     pub view: SessionView,
+    pub root_session_id: Uuid,
     pub timeline: std::sync::Arc<Vec<std::sync::Arc<timeline::TimelineEntry>>>,
 }
 
@@ -471,7 +507,12 @@ impl SessionPresentation {
         let timeline = std::sync::Arc::new(
             timeline::TimelineProjector::from_events(&view.history).into_shared_entries(),
         );
-        Self { view, timeline }
+        let root_session_id = view.session_id;
+        Self {
+            view,
+            root_session_id,
+            timeline,
+        }
     }
 }
 

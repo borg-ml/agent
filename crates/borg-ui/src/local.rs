@@ -116,6 +116,11 @@ impl LocalSessionWorker {
                                             _owner = next_owner;
                                             root_session_id = next.view().session_id;
                                             client = next;
+                                            if let Ok(sessions) = client.list_sessions().await {
+                                                let _ = update_tx.send_blocking(
+                                                    LocalSessionUpdate::Sessions(sessions),
+                                                );
+                                            }
                                             Ok(true)
                                         }
                                         Err(error) => Err(error),
@@ -142,6 +147,11 @@ impl LocalSessionWorker {
                                             }
                                             client = next;
                                             root_session_id = session_id;
+                                            if let Ok(sessions) = client.list_sessions().await {
+                                                let _ = update_tx.send_blocking(
+                                                    LocalSessionUpdate::Sessions(sessions),
+                                                );
+                                            }
                                             Ok(true)
                                         }
                                         Ok(None) => Ok(false),
@@ -401,6 +411,7 @@ impl LocalSessionClient {
         timeline.extend(&live);
         SessionPresentation {
             view: self.view.clone(),
+            root_session_id: self.root_session_id,
             timeline: Arc::new(timeline.into_shared_entries()),
         }
     }
@@ -560,6 +571,12 @@ impl LocalSessionClient {
             }
             FrontendCommand::ApplyGoal(action) => HostCommand::Goal { session_id, action },
             FrontendCommand::ApplyTodo(action) => HostCommand::Todo { session_id, action },
+            FrontendCommand::RunExtension { command, arguments } => HostCommand::ExtensionCommand {
+                session_id,
+                invocation_id: Uuid::new_v4(),
+                command,
+                arguments,
+            },
             FrontendCommand::SetModel { provider, model } => HostCommand::Configure {
                 session_id,
                 action: SessionConfigAction::SetProvider {
