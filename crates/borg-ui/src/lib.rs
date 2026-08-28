@@ -166,6 +166,12 @@ pub enum FrontendCommand {
         command: String,
         arguments: serde_json::Value,
     },
+    ControlPeer {
+        target: PeerTarget,
+        intent: PeerIntent,
+        attachments: Vec<PathBuf>,
+        delivery: PromptDelivery,
+    },
     SetModel {
         provider: CodingProvider,
         model: String,
@@ -181,6 +187,60 @@ pub enum FrontendCommand {
     OpenSession(Uuid),
     LoadOlderHistory,
     Quit,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PeerTarget {
+    Claude,
+    Gpt,
+}
+
+impl PeerTarget {
+    pub const fn task_name(self) -> &'static str {
+        match self {
+            Self::Claude => "/root/claude",
+            Self::Gpt => "/root/gpt",
+        }
+    }
+
+    pub const fn task_name_argument(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Gpt => "gpt",
+        }
+    }
+
+    pub const fn provider(self) -> CodingProvider {
+        match self {
+            Self::Claude => CodingProvider::Claude,
+            Self::Gpt => CodingProvider::Codex,
+        }
+    }
+
+    pub const fn default_model(self) -> &'static str {
+        match self {
+            Self::Claude => "claude-opus-5",
+            Self::Gpt => "gpt-5.6-sol",
+        }
+    }
+
+    pub const fn default_effort(self) -> &'static str {
+        match self {
+            Self::Claude => "high",
+            Self::Gpt => "xhigh",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PeerIntent {
+    Ensure,
+    Clear,
+    Rotate {
+        model: Option<String>,
+        effort: Option<String>,
+    },
+    Prompt(String),
 }
 
 pub fn parse_submission(
@@ -238,6 +298,60 @@ pub fn parse_submission(
     }
     if text.starts_with("/todo ") || text.starts_with("/todos ") {
         return Ok(FrontendCommand::ApplyTodo(parse_todo_action(text, todos)?));
+    }
+    if let Some(rest) = text.strip_prefix("/peer")
+        && rest.chars().next().is_none_or(char::is_whitespace)
+    {
+        let mut parts = rest.trim().splitn(2, char::is_whitespace);
+        let target = match parts
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "claude" => PeerTarget::Claude,
+            "gpt" => PeerTarget::Gpt,
+            _ => anyhow::bail!("usage: /peer claude|gpt [TEXT|clear|new [MODEL@EFFORT]]"),
+        };
+        let request = parts.next().unwrap_or_default().trim();
+        let mut words = request.split_whitespace();
+        let first = words.next().unwrap_or_default();
+        let intent = if first.is_empty() {
+            PeerIntent::Ensure
+        } else if first.eq_ignore_ascii_case("clear") && words.next().is_none() {
+            PeerIntent::Clear
+        } else if first.eq_ignore_ascii_case("new") || first.eq_ignore_ascii_case("rotate") {
+            let profile = words.next();
+            anyhow::ensure!(
+                words.next().is_none(),
+                "usage: /peer claude|gpt new [MODEL@EFFORT]"
+            );
+            let (model, effort) = match profile {
+                Some(profile) => match profile.rsplit_once('@') {
+                    Some((model, effort)) => {
+                        anyhow::ensure!(
+                            !effort.is_empty() && !model.contains('@'),
+                            "peer profile must be MODEL@EFFORT or @EFFORT"
+                        );
+                        (
+                            (!model.is_empty()).then(|| model.to_string()),
+                            Some(effort.to_string()),
+                        )
+                    }
+                    None => (Some(profile.to_string()), None),
+                },
+                None => (None, None),
+            };
+            PeerIntent::Rotate { model, effort }
+        } else {
+            PeerIntent::Prompt(request.to_string())
+        };
+        return Ok(FrontendCommand::ControlPeer {
+            target,
+            intent,
+            attachments: Vec::new(),
+            delivery,
+        });
     }
     if let Some(rest) = text.strip_prefix("/ext:") {
         let (qualified, argument_text) = rest
@@ -617,6 +731,23 @@ mod tests {
                 &[]
             ),
             Ok(FrontendCommand::SubmitPrompt { text, .. }) if text == "/ask claude review this"
+        ));
+        assert!(matches!(
+            parse_submission(
+                "/peer gpt new gpt-5.6-sol@xhigh",
+                CodingProvider::Claude,
+                PromptDelivery::Queue,
+                &[]
+            ),
+            Ok(FrontendCommand::ControlPeer {
+                target: PeerTarget::Gpt,
+                intent: PeerIntent::Rotate {
+                    model: Some(model),
+                    effort: Some(effort),
+                },
+                delivery: PromptDelivery::Queue,
+                ..
+            }) if model == "gpt-5.6-sol" && effort == "xhigh"
         ));
     }
 }

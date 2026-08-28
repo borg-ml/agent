@@ -129,6 +129,20 @@ impl BorgGui {
                         delivery,
                     });
                 }
+                Ok(FrontendCommand::ControlPeer {
+                    target,
+                    intent,
+                    delivery,
+                    ..
+                }) => {
+                    let attachments = std::mem::take(&mut this.attachments);
+                    this.send(FrontendCommand::ControlPeer {
+                        target,
+                        intent,
+                        attachments,
+                        delivery,
+                    });
+                }
                 Ok(command) => this.send(command),
                 Err(error) => this.error = Some(error.to_string()),
             }
@@ -710,6 +724,11 @@ impl Render for BorgGui {
             ("/director TEXT", "message the director", "/director "),
             ("/claude TEXT", "consult the Claude peer", "/claude "),
             ("/gpt TEXT", "consult the GPT peer", "/gpt "),
+            (
+                "/peer claude|gpt",
+                "control a durable peer directly",
+                "/peer ",
+            ),
             ("/queue TEXT", "send after the active turn", "/queue "),
             ("/steer TEXT", "redirect the active turn", "/steer "),
             (

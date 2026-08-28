@@ -10,7 +10,9 @@ use borg_remote::{
 };
 use uuid::Uuid;
 
-use crate::{FrontendCommand, SessionPresentation, SessionView, timeline::TimelineProjector};
+use crate::{
+    FrontendCommand, PeerIntent, SessionPresentation, SessionView, timeline::TimelineProjector,
+};
 
 pub enum LocalSessionUpdate {
     Presentation(SessionPresentation),
@@ -529,6 +531,76 @@ impl LocalSessionClient {
         }
         let session_id = self.root_session_id;
         let command = match command {
+            FrontendCommand::ControlPeer {
+                target,
+                intent,
+                attachments,
+                delivery,
+            } => {
+                let ensure = HostCommand::Subagent {
+                    session_id,
+                    action: SubagentAction::Ensure {
+                        request_id: Uuid::new_v4(),
+                        task_name: target.task_name_argument().to_string(),
+                        provider: target.provider(),
+                        model: Some(target.default_model().to_string()),
+                        effort: Some(target.default_effort().to_string()),
+                    },
+                };
+                let commands = match intent {
+                    PeerIntent::Ensure => vec![ensure],
+                    PeerIntent::Clear => vec![
+                        ensure,
+                        HostCommand::Subagent {
+                            session_id,
+                            action: SubagentAction::ClearContext {
+                                request_id: Uuid::new_v4(),
+                                target: target.task_name().to_string(),
+                            },
+                        },
+                    ],
+                    PeerIntent::Rotate { model, effort } => vec![HostCommand::Subagent {
+                        session_id,
+                        action: SubagentAction::Rotate {
+                            request_id: Uuid::new_v4(),
+                            task_name: target.task_name_argument().to_string(),
+                            provider: target.provider(),
+                            model: Some(
+                                model.unwrap_or_else(|| target.default_model().to_string()),
+                            ),
+                            effort: Some(
+                                effort.unwrap_or_else(|| target.default_effort().to_string()),
+                            ),
+                        },
+                    }],
+                    PeerIntent::Prompt(text) => vec![
+                        ensure,
+                        HostCommand::Subagent {
+                            session_id,
+                            action: SubagentAction::Prompt {
+                                request_id: Uuid::new_v4(),
+                                target: target.task_name().to_string(),
+                                message_id: Uuid::new_v4(),
+                                text,
+                                attachments,
+                                delivery,
+                            },
+                        },
+                    ],
+                };
+                for command in commands {
+                    send_local_session_command(
+                        &session_control_socket_path(&self.sessions_dir, session_id),
+                        session_id,
+                        command,
+                    )
+                    .await?;
+                }
+                return Ok(());
+            }
+            command => command,
+        };
+        let command = match command {
             FrontendCommand::SubmitPrompt {
                 text,
                 attachments,
@@ -577,6 +649,7 @@ impl LocalSessionClient {
                 command,
                 arguments,
             },
+            FrontendCommand::ControlPeer { .. } => unreachable!(),
             FrontendCommand::SetModel { provider, model } => HostCommand::Configure {
                 session_id,
                 action: SessionConfigAction::SetProvider {
