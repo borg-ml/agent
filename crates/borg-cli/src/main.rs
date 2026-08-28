@@ -4,7 +4,9 @@ mod agent_mcp;
 mod cli;
 mod collab;
 mod customization;
-mod dictation;
+mod dictation {
+    pub(crate) use borg_dictation::*;
+}
 mod editor_preferences {
     pub(crate) use borg_ui::preferences::*;
 }

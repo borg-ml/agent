@@ -35,6 +35,7 @@ anyhow.workspace = true
 arboard = { version = "3.6", features = ["wayland-data-control"] }
 base64.workspace = true
 borg-provider = { path = "../borg-provider", default-features = false }
+borg-dictation.workspace = true
 borg-remote = { path = "../borg-remote", default-features = false }
 borg-tui.workspace = true
 borg-ui.workspace = true

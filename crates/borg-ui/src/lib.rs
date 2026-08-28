@@ -5,8 +5,8 @@
 use std::path::PathBuf;
 
 pub use borg_remote::{
-    ApprovalDecision, CodingProvider, GoalAction, PermissionMode, PromptDelivery, ResponseLanguage,
-    SessionEvent, SessionGoal, SessionState, SessionStatus, SubagentSnapshot,
+    ApprovalDecision, CodingProvider, GoalAction, PermissionMode, PlanItemStatus, PromptDelivery,
+    ResponseLanguage, SessionEvent, SessionGoal, SessionState, SessionStatus, SubagentSnapshot,
 };
 use uuid::Uuid;
 
@@ -158,6 +158,7 @@ pub enum FrontendCommand {
     FlushPendingInput,
     Interrupt,
     Approve(ApprovalDecision),
+    RespondToProviderInteraction(serde_json::Value),
     ApplyGoal(GoalAction),
     SetModel {
         provider: CodingProvider,
@@ -237,6 +238,107 @@ pub fn parse_submission(
         attachments: Vec::new(),
         delivery,
     })
+}
+
+pub fn cancelled_provider_interaction_response(kind: &str) -> serde_json::Value {
+    if kind == "mcp_elicitation" {
+        serde_json::json!({ "action": "cancel" })
+    } else {
+        serde_json::json!({ "answers": {} })
+    }
+}
+
+pub fn provider_interaction_contains_secret(payload: &serde_json::Value) -> bool {
+    payload
+        .get("questions")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|questions| {
+            questions.iter().any(|question| {
+                question
+                    .get("isSecret")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+            })
+        })
+}
+
+pub fn provider_interaction_response(
+    kind: &str,
+    payload: &serde_json::Value,
+    input: &str,
+) -> anyhow::Result<serde_json::Value> {
+    use anyhow::Context as _;
+
+    if input.eq_ignore_ascii_case("/cancel") {
+        return Ok(cancelled_provider_interaction_response(kind));
+    }
+    if kind == "mcp_elicitation" {
+        if input.eq_ignore_ascii_case("/decline") {
+            return Ok(serde_json::json!({ "action": "decline" }));
+        }
+        let content = match serde_json::from_str::<serde_json::Value>(input) {
+            Ok(value) => value,
+            Err(_) => {
+                let properties = payload
+                    .get("requestedSchema")
+                    .and_then(|schema| schema.get("properties"))
+                    .and_then(serde_json::Value::as_object)
+                    .context(
+                        "Enter JSON matching the requested form, or use /decline or /cancel",
+                    )?;
+                anyhow::ensure!(
+                    properties.len() == 1,
+                    "Enter a JSON object matching the requested form, or use /decline or /cancel"
+                );
+                let key = properties.keys().next().expect("one property");
+                serde_json::json!({ key: input })
+            }
+        };
+        return Ok(serde_json::json!({ "action": "accept", "content": content }));
+    }
+    let questions = payload
+        .get("questions")
+        .and_then(serde_json::Value::as_array)
+        .context("Provider user-input request did not include questions")?;
+    if questions.len() == 1 {
+        let id = questions[0]
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .context("Provider user-input question did not include an id")?;
+        return Ok(serde_json::json!({ "answers": { (id): { "answers": [input] } } }));
+    }
+    let value: serde_json::Value = serde_json::from_str(input).context(
+        "Answer multiple questions with a JSON object keyed by question id, or use /cancel",
+    )?;
+    if value.get("answers").is_some() {
+        return Ok(value);
+    }
+    let values = value
+        .as_object()
+        .context("Multiple answers must be a JSON object keyed by question id")?;
+    let mut answers = serde_json::Map::new();
+    for question in questions {
+        let id = question
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .context("Provider user-input question did not include an id")?;
+        let answer = values
+            .get(id)
+            .with_context(|| format!("Missing answer for question {id}"))?;
+        let answer_values = match answer {
+            serde_json::Value::Array(values) => values.clone(),
+            value => vec![value.clone()],
+        };
+        anyhow::ensure!(
+            answer_values.iter().all(serde_json::Value::is_string),
+            "Answer for {id} must be a string or an array of strings"
+        );
+        answers.insert(
+            id.to_string(),
+            serde_json::json!({ "answers": answer_values }),
+        );
+    }
+    Ok(serde_json::json!({ "answers": answers }))
 }
 
 #[derive(Clone, Debug)]

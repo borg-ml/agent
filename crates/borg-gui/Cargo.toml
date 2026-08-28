@@ -16,7 +16,9 @@ path = "src/main.rs"
 
 [dependencies]
 async-channel = "2.5"
+borg-dictation.workspace = true
 borg-ui.workspace = true
 gpui = "0.2.2"
+serde_json.workspace = true
 unicode-segmentation = "1"
 uuid.workspace = true

@@ -48,7 +48,7 @@ struct InstalledDictation {
 }
 
 #[derive(Clone)]
-pub(crate) struct LocalDictationConfig {
+pub struct LocalDictationConfig {
     base_url: String,
     model: String,
     api_key: Option<String>,
@@ -56,10 +56,11 @@ pub(crate) struct LocalDictationConfig {
     base_url_explicit: bool,
     model_explicit: bool,
     auto_setup: bool,
+    managed_model_path: Option<PathBuf>,
 }
 
 impl LocalDictationConfig {
-    pub(crate) fn from_env() -> Self {
+    pub fn from_env() -> Self {
         let base_url = env_value("BORG_CLI_DICTATION_BASE_URL")
             .or_else(|| env_value("BORG_DICTATION_BASE_URL"));
         let model =
@@ -79,11 +80,16 @@ impl LocalDictationConfig {
             base_url_explicit: base_url.is_some(),
             model_explicit: model.is_some(),
             auto_setup: env_bool("BORG_CLI_DICTATION_AUTO_SETUP").unwrap_or(true),
+            managed_model_path: env_value("BORG_CLI_DICTATION_MODEL_PATH").map(PathBuf::from),
         }
     }
 
-    pub(crate) fn requires_setup(&self) -> bool {
+    pub fn requires_setup(&self) -> bool {
         self.auto_setup && !self.base_url_explicit && !self.model_explicit && self.api_key.is_none()
+    }
+
+    pub fn uses_bundled_model(&self) -> bool {
+        self.managed_model_path.is_none()
     }
 
     fn for_managed_backend(&self) -> Self {
@@ -95,17 +101,18 @@ impl LocalDictationConfig {
             base_url_explicit: false,
             model_explicit: false,
             auto_setup: true,
+            managed_model_path: self.managed_model_path.clone(),
         }
     }
 }
 
-pub(crate) struct LocalDictationBackend {
+pub struct LocalDictationBackend {
     config: LocalDictationConfig,
     _service: Option<LocalDictationService>,
 }
 
 impl LocalDictationBackend {
-    pub(crate) fn config(&self) -> LocalDictationConfig {
+    pub fn config(&self) -> LocalDictationConfig {
         self.config.clone()
     }
 }
@@ -116,7 +123,7 @@ struct LocalDictationService {
 
 /// Prepare a local Parakeet service when Borg is using its default dictation
 /// endpoint. Explicit endpoint/model settings remain externally managed.
-pub(crate) async fn ensure_backend(config: LocalDictationConfig) -> Result<LocalDictationBackend> {
+pub async fn ensure_backend(config: LocalDictationConfig) -> Result<LocalDictationBackend> {
     if !config.requires_setup() {
         return Ok(LocalDictationBackend {
             config,
@@ -131,9 +138,12 @@ pub(crate) async fn ensure_backend(config: LocalDictationConfig) -> Result<Local
         });
     }
 
-    let installed = timeout(DICTATION_SETUP_TIMEOUT, ensure_installed())
-        .await
-        .context("timed out installing the local Parakeet dictation backend")??;
+    let installed = timeout(
+        DICTATION_SETUP_TIMEOUT,
+        ensure_installed(config.managed_model_path.as_deref()),
+    )
+    .await
+    .context("timed out installing the local Parakeet dictation backend")??;
     let managed_config = config.for_managed_backend();
     let mut child = Command::new(&installed.server_bin)
         .arg("--model")
@@ -166,7 +176,7 @@ pub(crate) async fn ensure_backend(config: LocalDictationConfig) -> Result<Local
     })
 }
 
-async fn ensure_installed() -> Result<InstalledDictation> {
+async fn ensure_installed(configured_model_path: Option<&Path>) -> Result<InstalledDictation> {
     let asset = runtime_asset()?;
     let cache_dir = dictation_cache_dir()?;
     fs::create_dir_all(&cache_dir)
@@ -191,15 +201,25 @@ async fn ensure_installed() -> Result<InstalledDictation> {
     let server_bin = find_file(&server_dir, runtime_binary_name())?
         .context("the downloaded Parakeet runtime did not contain parakeet-server")?;
 
-    let model_path = cache_dir.join(PARAKEET_MODEL_FILE);
-    download_verified(
-        PARAKEET_MODEL_URL,
-        &model_path,
-        PARAKEET_MODEL_SIZE,
-        PARAKEET_MODEL_SHA256,
-        "Parakeet V2 model",
-    )
-    .await?;
+    let model_path = if let Some(path) = configured_model_path {
+        ensure!(
+            path.is_file(),
+            "configured dictation model does not exist at {}",
+            path.display()
+        );
+        path.to_path_buf()
+    } else {
+        let path = cache_dir.join(PARAKEET_MODEL_FILE);
+        download_verified(
+            PARAKEET_MODEL_URL,
+            &path,
+            PARAKEET_MODEL_SIZE,
+            PARAKEET_MODEL_SHA256,
+            "Parakeet V2 model",
+        )
+        .await?;
+        path
+    };
 
     Ok(InstalledDictation {
         server_bin,
@@ -272,15 +292,21 @@ fn dictation_cache_dir() -> Result<PathBuf> {
         .context("unable to determine a cache directory for local dictation")
 }
 
-pub(crate) fn parakeet_is_installed() -> bool {
+pub fn parakeet_is_installed(config: &LocalDictationConfig) -> bool {
     let Ok(cache_dir) = dictation_cache_dir() else {
         return false;
     };
-    let model_path = cache_dir.join(PARAKEET_MODEL_FILE);
-    let marker_path = verification_marker(&model_path);
-    fs::metadata(&model_path).is_ok_and(|metadata| metadata.len() == PARAKEET_MODEL_SIZE)
-        && fs::read_to_string(marker_path)
-            .is_ok_and(|marker| marker.trim() == PARAKEET_MODEL_SHA256)
+    let model_installed = config.managed_model_path.as_ref().map_or_else(
+        || {
+            let model_path = cache_dir.join(PARAKEET_MODEL_FILE);
+            let marker_path = verification_marker(&model_path);
+            fs::metadata(&model_path).is_ok_and(|metadata| metadata.len() == PARAKEET_MODEL_SIZE)
+                && fs::read_to_string(marker_path)
+                    .is_ok_and(|marker| marker.trim() == PARAKEET_MODEL_SHA256)
+        },
+        |path| path.is_file(),
+    );
+    model_installed
         && find_file(&cache_dir.join("runtime"), runtime_binary_name())
             .is_ok_and(|path| path.is_some())
 }
@@ -640,14 +666,14 @@ fn ensure_safe_archive_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(crate) struct LocalDictationRecorder {
+pub struct LocalDictationRecorder {
     child: Child,
     audio_path: TempPath,
     stderr_task: tokio::task::JoinHandle<String>,
 }
 
 impl LocalDictationRecorder {
-    pub(crate) fn start(config: &LocalDictationConfig) -> Result<Self> {
+    pub fn start(config: &LocalDictationConfig) -> Result<Self> {
         let audio = recording_tempfile()?;
         let audio_path = audio.into_temp_path();
         let mut command = recorder_command(config, audio_path.as_ref())?;
@@ -673,10 +699,7 @@ impl LocalDictationRecorder {
         })
     }
 
-    pub(crate) async fn finish_and_transcribe(
-        mut self,
-        config: LocalDictationConfig,
-    ) -> Result<String> {
+    pub async fn finish_and_transcribe(mut self, config: LocalDictationConfig) -> Result<String> {
         if let Some(mut stdin) = self.child.stdin.take() {
             stdin.write_all(b"q\n").await.ok();
             stdin.shutdown().await.ok();
@@ -888,6 +911,106 @@ fn env_bool(name: &str) -> Option<bool> {
     }
 }
 
+#[derive(Clone, Debug)]
+pub enum DictationUpdate {
+    Preparing,
+    Recording,
+    Transcribing,
+    Transcript(String),
+    Error(String),
+}
+
+pub struct DictationWorker {
+    commands: async_channel::Sender<()>,
+    updates: async_channel::Receiver<DictationUpdate>,
+}
+
+impl DictationWorker {
+    pub fn start() -> Result<Self> {
+        let (command_tx, command_rx) = async_channel::unbounded();
+        let (update_tx, update_rx) = async_channel::unbounded();
+        std::thread::Builder::new()
+            .name("borg-dictation".into())
+            .spawn(move || {
+                let runtime = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        let _ = update_tx.send_blocking(DictationUpdate::Error(error.to_string()));
+                        return;
+                    }
+                };
+                runtime.block_on(async move {
+                    let config = LocalDictationConfig::from_env();
+                    let mut backend: Option<LocalDictationBackend> = None;
+                    let mut recorder: Option<LocalDictationRecorder> = None;
+                    while command_rx.recv().await.is_ok() {
+                        if let Some(active) = recorder.take() {
+                            let _ = update_tx.send_blocking(DictationUpdate::Transcribing);
+                            let active_config = backend
+                                .as_ref()
+                                .map(LocalDictationBackend::config)
+                                .unwrap_or_else(|| config.clone());
+                            match active.finish_and_transcribe(active_config).await {
+                                Ok(text) => {
+                                    let _ =
+                                        update_tx.send_blocking(DictationUpdate::Transcript(text));
+                                }
+                                Err(error) => {
+                                    let _ = update_tx
+                                        .send_blocking(DictationUpdate::Error(error.to_string()));
+                                }
+                            }
+                            continue;
+                        }
+                        let _ = update_tx.send_blocking(DictationUpdate::Preparing);
+                        if backend.is_none() {
+                            match ensure_backend(config.clone()).await {
+                                Ok(ready) => backend = Some(ready),
+                                Err(error) => {
+                                    let _ = update_tx
+                                        .send_blocking(DictationUpdate::Error(error.to_string()));
+                                    continue;
+                                }
+                            }
+                        }
+                        let active_config = backend
+                            .as_ref()
+                            .map(LocalDictationBackend::config)
+                            .unwrap_or_else(|| config.clone());
+                        match LocalDictationRecorder::start(&active_config) {
+                            Ok(active) => {
+                                recorder = Some(active);
+                                let _ = update_tx.send_blocking(DictationUpdate::Recording);
+                            }
+                            Err(error) => {
+                                let _ = update_tx
+                                    .send_blocking(DictationUpdate::Error(error.to_string()));
+                            }
+                        }
+                    }
+                });
+            })
+            .context("failed to start the Borg dictation worker")?;
+        Ok(Self {
+            commands: command_tx,
+            updates: update_rx,
+        })
+    }
+
+    pub fn toggle(&self) -> Result<()> {
+        self.commands
+            .send_blocking(())
+            .context("Borg dictation worker is no longer running")
+    }
+
+    pub fn updates(&self) -> async_channel::Receiver<DictationUpdate> {
+        self.updates.clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -911,6 +1034,7 @@ mod tests {
             base_url_explicit: false,
             model_explicit: false,
             auto_setup: true,
+            managed_model_path: None,
         }
     }
 
@@ -925,6 +1049,10 @@ mod tests {
         config.base_url_explicit = false;
         config.model_explicit = true;
         assert!(!config.requires_setup());
+
+        config.model_explicit = false;
+        config.managed_model_path = Some(Path::new("smaller-model.gguf").to_path_buf());
+        assert!(config.requires_setup());
     }
 
     #[test]

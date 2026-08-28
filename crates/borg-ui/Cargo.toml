@@ -17,6 +17,7 @@ borg-remote = { path = "../borg-remote", default-features = false }
 chrono.workspace = true
 dirs.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
 toml.workspace = true

@@ -41,6 +41,7 @@ pub struct Composer {
     last_layout: Option<ShapedLine>,
     last_bounds: Option<Bounds<Pixels>>,
     selecting: bool,
+    secret: bool,
 }
 
 impl Composer {
@@ -54,7 +55,29 @@ impl Composer {
             last_layout: None,
             last_bounds: None,
             selecting: false,
+            secret: false,
         }
+    }
+
+    pub fn set_secret(&mut self, secret: bool, cx: &mut Context<Self>) {
+        if self.secret != secret {
+            self.secret = secret;
+            cx.notify();
+        }
+    }
+
+    pub fn append_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        let separator = if self.content.is_empty()
+            || self.content.chars().last().is_some_and(char::is_whitespace)
+            || text.chars().next().is_some_and(char::is_whitespace)
+        {
+            ""
+        } else {
+            " "
+        };
+        self.content = format!("{}{separator}{text}", self.content).into();
+        self.selected = self.content.len()..self.content.len();
+        cx.notify();
     }
 
     fn cursor(&self) -> usize {
@@ -376,6 +399,8 @@ impl Element for ComposerElement {
                 SharedString::from("Type a follow-up…"),
                 hsla(0., 0., 0.62, 0.65),
             )
+        } else if input.secret {
+            ("*".repeat(content.len()).into(), style.color)
         } else {
             (content, style.color)
         };

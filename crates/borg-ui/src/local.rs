@@ -402,6 +402,18 @@ impl LocalSessionClient {
                     .context("this session is not waiting for approval")?,
                 decision,
             },
+            FrontendCommand::RespondToProviderInteraction(response) => {
+                HostCommand::RespondToProviderInteraction {
+                    session_id,
+                    interaction_id: self
+                        .view
+                        .state
+                        .pending_provider_interaction_id
+                        .clone()
+                        .context("this session is not waiting for provider input")?,
+                    response,
+                }
+            }
             FrontendCommand::ApplyGoal(action) => HostCommand::Goal { session_id, action },
             FrontendCommand::SetModel { provider, model } => HostCommand::Configure {
                 session_id,
