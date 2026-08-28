@@ -6530,7 +6530,7 @@ impl BorgTerminal {
                         .block(
                             Block::default()
                                 .borders(Borders::ALL)
-                                .border_style(Style::default().fg(BORG_ORANGE))
+                                .border_style(Style::default().fg(USER_LABEL_BLUE))
                                 .title(" Shells · click to inspect "),
                         ),
                     tooltip,
@@ -6659,7 +6659,7 @@ impl BorgTerminal {
                     .map(|_| desired_metadata_width.min(footer_area.width))
                     .unwrap_or(0);
                 let controls_area = Rect {
-                    width: footer_area.width.saturating_sub(metadata_width),
+                    width: footer_left_region_width(footer_area.width, metadata_width),
                     ..footer_area
                 };
                 frame.render_widget(
@@ -6894,7 +6894,7 @@ impl BorgTerminal {
                 .map(|value| (value.width() as u16).min(footer_area.width))
                 .unwrap_or(0);
                 let copy_area = Rect {
-                    width: footer_area.width.saturating_sub(metadata_width),
+                    width: footer_left_region_width(footer_area.width, metadata_width),
                     ..footer_area
                 };
                 frame.render_widget(Clear, copy_area);
@@ -11288,6 +11288,12 @@ fn footer_status_text(shell_status: Option<&str>, todo_status: Option<&str>) -> 
         .join(STATUS_SEPARATOR)
 }
 
+fn footer_left_region_width(total_width: u16, right_width: u16) -> u16 {
+    total_width
+        .saturating_sub(right_width)
+        .saturating_sub(u16::from(right_width > 0 && right_width < total_width))
+}
+
 #[cfg(test)]
 fn footer_todo_metadata_line(
     todo_status: &str,
@@ -11343,7 +11349,7 @@ fn footer_shell_todo_metadata_line(
     if let Some(shell) = shell_status {
         spans.push(Span::styled(
             shell.to_string(),
-            interactive_style(shell_hovered, BORG_ORANGE),
+            interactive_style(shell_hovered, USER_LABEL_BLUE),
         ));
     }
     if shell_status.is_some() && todo_status.is_some() {
@@ -11367,7 +11373,11 @@ fn footer_shell_todo_metadata_line(
 
 fn shell_row_style(hovered: bool) -> Style {
     Style::default()
-        .fg(if hovered { Color::White } else { BORG_ORANGE })
+        .fg(if hovered {
+            Color::White
+        } else {
+            USER_LABEL_BLUE
+        })
         .bg(if hovered {
             MESSAGE_HOVER_BG
         } else {

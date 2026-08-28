@@ -350,6 +350,7 @@ fn tool_has_expandable_body(
 }
 
 fn tool_lifecycle_label(name: &str, complete: bool) -> Cow<'_, str> {
+    let name = name.strip_suffix(" in progress").unwrap_or(name);
     if name == "Git add" {
         return Cow::Borrowed(if complete {
             "Updated Git index"
@@ -2468,37 +2469,70 @@ impl Transcript {
     }
 
     fn shell_status(&self) -> Option<String> {
-        let native = self
-            .runtime_processes
-            .values()
-            .filter(|process| process.running)
-            .count();
-        let active = native.saturating_add(self.provider_backgrounds.len());
+        let active = self.active_shell_rows().len();
         (active > 0).then(|| format!("{active} shell{}", if active == 1 { "" } else { "s" }))
     }
 
     fn active_shell_rows(&self) -> Vec<(String, Option<usize>)> {
+        let mut claimed_tools = HashSet::new();
         let mut rows = self
+            .order
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| match entry {
+                TranscriptEntry::Tool {
+                    source_name,
+                    name,
+                    detail,
+                    complete: false,
+                    error: false,
+                    user_interrupted: false,
+                    backgrounded: true,
+                    ..
+                } if tool_can_start_background_process(source_name) => {
+                    claimed_tools.insert(index);
+                    Some((
+                        compact_text(
+                            if detail.trim().is_empty() { name } else { detail },
+                            120,
+                        ),
+                        Some(index),
+                    ))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        rows.extend(self
             .runtime_processes
             .values()
-            .filter(|process| process.running)
+            .filter(|process| {
+                process.running
+                    && process
+                        .tool_index
+                        .is_none_or(|tool_index| !claimed_tools.contains(&tool_index))
+            })
             .map(|process| {
                 (
                     format!("pid {}  {}", process.pid, compact_text(&process.command, 100)),
                     process.tool_index,
                 )
             })
-            .collect::<Vec<_>>();
-        rows.extend(self.provider_backgrounds.iter().map(|(handle, process)| {
-            (
-                format!(
-                    "{}  {}",
-                    compact_text(handle, 18),
-                    compact_text(&process.command, 100)
-                ),
-                Some(process.tool_index),
-            )
-        }));
+        );
+        rows.extend(
+            self.provider_backgrounds
+                .iter()
+                .filter(|(_, process)| !claimed_tools.contains(&process.tool_index))
+                .map(|(handle, process)| {
+                    (
+                        format!(
+                            "{}  {}",
+                            compact_text(handle, 18),
+                            compact_text(&process.command, 100)
+                        ),
+                        Some(process.tool_index),
+                    )
+                }),
+        );
         rows.sort_by(|left, right| left.0.cmp(&right.0));
         rows
     }

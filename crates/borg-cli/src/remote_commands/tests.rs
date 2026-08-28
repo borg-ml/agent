@@ -71,7 +71,7 @@ fn input_fast_path_waits_for_a_pending_transcript_frame() {
 }
 
 #[test]
-fn queued_live_events_coalesce_tool_start_frames() {
+fn tool_start_gets_a_visible_frame_even_when_completion_is_already_queued() {
     let tool_started = SessionEventKind::ToolStarted {
         tool_call_id: "tool-1".to_string(),
         name: "command_execution".to_string(),
@@ -79,8 +79,7 @@ fn queued_live_events_coalesce_tool_start_frames() {
         input_ref: None,
     };
 
-    assert!(session_event_needs_immediate_frame(&tool_started, 0));
-    assert!(!session_event_needs_immediate_frame(&tool_started, 1));
+    assert!(session_event_needs_immediate_frame(&tool_started));
 }
 
 #[test]

@@ -706,14 +706,15 @@ pub fn tool_output_background_handle(output: &str) -> Option<String> {
     {
         return Some(handle);
     }
+    let output = output.trim();
     [
         "Process running with session ID ",
         "Script running with cell ID ",
     ]
     .into_iter()
     .find_map(|marker| {
-        output.find(marker).map(|start| {
-            output[start + marker.len()..]
+        output.strip_prefix(marker).map(|suffix| {
+            suffix
                 .split_whitespace()
                 .next()
                 .unwrap_or_default()
@@ -2866,5 +2867,12 @@ mod tests {
         })
         .to_string();
         assert_eq!(tool_process_output_text(&wrapped), "one\ntwo");
+        assert_eq!(
+            tool_output_background_handle(
+                "search.rs:42: Script running with cell ID already-finished"
+            ),
+            None,
+            "quoted lifecycle text in ordinary command output is not a live process"
+        );
     }
 }

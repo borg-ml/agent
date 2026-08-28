@@ -58,6 +58,7 @@ mod local_server;
 const MIN_TUI_FPS: u64 = 15;
 const MAX_TUI_FPS: u64 = 240;
 const ACTIVITY_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
+const TOOL_STARTED_FRAME_MIN_DURATION: std::time::Duration = std::time::Duration::from_millis(500);
 const IDLE_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 const MAX_RENDER_BACKOFF_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 const LOCAL_RESUME_RETRY_INITIAL_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
@@ -1776,6 +1777,7 @@ async fn run_local_agent_session(
     let mut handoff_on_safe_boundary = false;
     let mut last_ctrl_c = None;
     let mut terminal_dirty = false;
+    let mut tool_started_frame_hold_until = None;
     let mut tui_fps = tui_refresh_rate(u64::from(editor_preferences.presentation.refresh_rate_fps));
     let mut prevent_sleep = editor_preferences.interaction.prevent_sleep;
     let mut steer_active_turn =
@@ -2026,6 +2028,12 @@ async fn run_local_agent_session(
                 }
             }
             _ = render_tick.tick(), if terminal.is_some() && terminal_dirty => {
+                if tool_started_frame_hold_until
+                    .is_some_and(|until| tokio::time::Instant::now() < until)
+                {
+                    continue;
+                }
+                tool_started_frame_hold_until = None;
                 let terminal = terminal.as_mut().expect("terminal");
                 let interaction_frame = terminal.has_pending_scroll_frame();
                 terminal.advance_scroll_frame();
@@ -2461,14 +2469,12 @@ async fn run_local_agent_session(
                     {
                         history.push(event.clone());
                     }
-                    if terminal_dirty
-                        && session_event_needs_immediate_frame(
-                            &event.kind,
-                            session_events.len(),
-                        )
-                    {
+                    if terminal_dirty && session_event_needs_immediate_frame(&event.kind) {
                         terminal.draw()?;
                         terminal_dirty = terminal.has_pending_scroll_frame();
+                        tool_started_frame_hold_until = Some(
+                            tokio::time::Instant::now() + TOOL_STARTED_FRAME_MIN_DURATION,
+                        );
                     }
                 } else if !detached_from_terminal {
                     render_event(&event, args.json, &mut rendered)?;
@@ -6462,12 +6468,11 @@ fn terminal_needs_idle_tick(has_expiring_notice: bool, has_blinking_cursor: bool
     has_expiring_notice || has_blinking_cursor
 }
 
-fn session_event_needs_immediate_frame(kind: &SessionEventKind, queued_event_count: usize) -> bool {
-    queued_event_count == 0
-        && (matches!(
-            kind,
-            SessionEventKind::ToolStarted { .. } | SessionEventKind::ToolUpdated { .. }
-        ) || matches!(kind, SessionEventKind::ProviderEvent { kind, .. } if kind == "tool_call_started"))
+fn session_event_needs_immediate_frame(kind: &SessionEventKind) -> bool {
+    matches!(
+        kind,
+        SessionEventKind::ToolStarted { .. } | SessionEventKind::ToolUpdated { .. }
+    ) || matches!(kind, SessionEventKind::ProviderEvent { kind, .. } if kind == "tool_call_started")
 }
 
 fn should_draw_input_fast_path(

@@ -1639,6 +1639,14 @@ fn tool_lifecycle_labels_use_progressive_and_past_tense() {
         tool_lifecycle_label("Inspect repository", true),
         "Inspected repository"
     );
+    assert_eq!(
+        tool_lifecycle_label("Search web in progress", false),
+        "Searching web…"
+    );
+    assert_eq!(
+        tool_lifecycle_label("Search web in progress", true),
+        "Searched web"
+    );
 }
 
 #[test]
@@ -3545,6 +3553,31 @@ fn footer_todo_metadata_keeps_the_todo_segment_interactive() {
             .add_modifier
             .contains(Modifier::UNDERLINED)
     );
+}
+
+#[test]
+fn footer_shell_metadata_uses_the_blue_background_action_identity() {
+    let line = footer_shell_todo_metadata_line(
+        Some("1 shell"),
+        Some("2 to-dos"),
+        "~/borg-cli",
+        false,
+        false,
+        usize::MAX,
+    );
+
+    assert_eq!(line.spans[0].content, "1 shell");
+    assert_eq!(line.spans[0].style.fg, Some(USER_LABEL_BLUE));
+    assert_eq!(line.spans[1].content, STATUS_SEPARATOR);
+    assert_eq!(line.spans[2].style.fg, Some(Color::LightGreen));
+    assert_eq!(shell_row_style(false).fg, Some(USER_LABEL_BLUE));
+}
+
+#[test]
+fn footer_regions_keep_a_cell_between_left_text_and_right_metadata() {
+    assert_eq!(footer_left_region_width(100, 20), 79);
+    assert_eq!(footer_left_region_width(100, 0), 100);
+    assert_eq!(footer_left_region_width(20, 20), 0);
 }
 
 #[test]
@@ -7706,6 +7739,11 @@ fn provider_progress_marks_an_unfinished_tool_as_background_work() {
             ..
         }
     ));
+    assert_eq!(transcript.shell_status().as_deref(), Some("1 shell"));
+    assert_eq!(
+        transcript.active_shell_rows(),
+        vec![("cargo run --bin long-build".to_string(), Some(0))]
+    );
     let row = transcript
         .lines(120)
         .into_iter()
@@ -7736,6 +7774,28 @@ fn provider_progress_marks_an_unfinished_tool_as_background_work() {
             .iter()
             .any(|span| { span.style.fg == Some(brighten_color(USER_LABEL_BLUE, 2)) })
     );
+
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        3,
+        SessionEventKind::ToolCompleted {
+            tool_call_id: "long-build".to_string(),
+            output: "build complete".to_string(),
+            output_ref: None,
+            is_error: false,
+            input: Some(serde_json::json!({"command": "cargo run --bin long-build"})),
+            input_ref: None,
+        },
+    ));
+    assert_eq!(transcript.shell_status(), None);
+    assert!(transcript.active_shell_rows().is_empty());
+    let completed = transcript
+        .lines(120)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!completed.contains("Running in background"), "{completed}");
 }
 
 #[test]
