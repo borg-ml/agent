@@ -3775,25 +3775,20 @@ fn completed_goal_crosses_out_only_its_objective() {
 }
 
 #[test]
-fn ctrl_c_only_exits_on_the_third_quick_press() {
+fn ctrl_c_exits_on_the_second_quick_press() {
     let start = Instant::now();
     let mut last = None;
     let mut count = 0;
 
-    assert!(!third_ctrl_c(&mut last, &mut count, start));
-    assert!(!third_ctrl_c(
+    assert!(!repeated_ctrl_c(&mut last, &mut count, start));
+    assert!(repeated_ctrl_c(
         &mut last,
         &mut count,
         start + CTRL_C_SEQUENCE_WINDOW / 2
     ));
-    assert!(third_ctrl_c(
-        &mut last,
-        &mut count,
-        start + CTRL_C_SEQUENCE_WINDOW
-    ));
     assert!(last.is_none());
     assert_eq!(count, 0);
-    assert!(!third_ctrl_c(
+    assert!(!repeated_ctrl_c(
         &mut last,
         &mut count,
         start + CTRL_C_SEQUENCE_WINDOW + Duration::from_millis(1)

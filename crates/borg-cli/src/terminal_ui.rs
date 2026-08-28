@@ -2052,7 +2052,9 @@ impl BorgTerminal {
     pub fn handle_external_interrupt(&mut self) {
         self.composer.clear();
         self.composer_selection = None;
-        self.notice = Some("Prompt cleared · press Ctrl-C again to exit".to_string());
+        self.last_ctrl_c = None;
+        self.ctrl_c_count = 0;
+        self.notice = Some("Prompt cleared".to_string());
         self.event_redraw_needed = true;
     }
 
@@ -6983,15 +6985,23 @@ impl BorgTerminal {
     }
 
     fn handle_key(&mut self, mut key: KeyEvent) -> Result<UiAction> {
-        if is_ctrl_c(&key) {
-            if key.kind == KeyEventKind::Press
-                && third_ctrl_c(
-                    &mut self.last_ctrl_c,
-                    &mut self.ctrl_c_count,
-                    Instant::now(),
+        let ctrl_c = is_ctrl_c(&key);
+        if ctrl_c {
+            if self.picker.is_some()
+                || self.focused_tool.is_some()
+                || self.keybindings_open
+                || self.pending_approval
+                || !self.composer.text.is_empty()
+                || !self.composer.attachments.is_empty()
+                || matches!(
+                    self.active_status(),
+                    SessionStatus::Starting
+                        | SessionStatus::Running
+                        | SessionStatus::WaitingForApproval
                 )
             {
-                return Ok(UiAction::ForceQuit);
+                self.last_ctrl_c = None;
+                self.ctrl_c_count = 0;
             }
             key.code = KeyCode::Esc;
             key.modifiers = KeyModifiers::NONE;
@@ -7217,6 +7227,36 @@ impl BorgTerminal {
             } else {
                 UiAction::None
             });
+        }
+        if ctrl_c && (!self.composer.text.is_empty() || !self.composer.attachments.is_empty()) {
+            self.composer.clear();
+            self.composer_selection = None;
+            self.last_ctrl_c = None;
+            self.ctrl_c_count = 0;
+            self.notice = Some("Prompt cleared".to_string());
+            return Ok(UiAction::None);
+        }
+        if ctrl_c
+            && !self.pending_approval
+            && !matches!(
+                self.status,
+                SessionStatus::Starting
+                    | SessionStatus::Running
+                    | SessionStatus::WaitingForApproval
+            )
+        {
+            if key.kind == KeyEventKind::Press
+                && repeated_ctrl_c(
+                    &mut self.last_ctrl_c,
+                    &mut self.ctrl_c_count,
+                    Instant::now(),
+                )
+            {
+                return Ok(UiAction::ForceQuit);
+            }
+            self.rewind_primed = false;
+            self.notice = Some("Press Ctrl-C again to exit".to_string());
+            return Ok(UiAction::None);
         }
         if self.keymap.matches(KeyAction::Interrupt, &key)
             && self.composer.text.is_empty()
@@ -8610,7 +8650,7 @@ fn is_ctrl_c(key: &KeyEvent) -> bool {
         && matches!(key.code, KeyCode::Char('c' | 'C' | '\u{3}'))
 }
 
-fn third_ctrl_c(last: &mut Option<Instant>, count: &mut u8, now: Instant) -> bool {
+fn repeated_ctrl_c(last: &mut Option<Instant>, count: &mut u8, now: Instant) -> bool {
     if last
         .is_some_and(|previous| now.saturating_duration_since(previous) <= CTRL_C_SEQUENCE_WINDOW)
     {
@@ -8619,7 +8659,7 @@ fn third_ctrl_c(last: &mut Option<Instant>, count: &mut u8, now: Instant) -> boo
         *count = 1;
     }
     *last = Some(now);
-    if *count < 3 {
+    if *count < 2 {
         return false;
     }
     *last = None;
@@ -10925,7 +10965,7 @@ fn keybinding_reference(keymap: &KeyMap) -> Vec<(&'static str, String)> {
         ("newline", keymap.label(KeyAction::Newline)),
         ("commands", "/".to_string()),
         ("interrupt or close", keymap.label(KeyAction::Interrupt)),
-        ("escape · third exits", keymap.label(KeyAction::ClearOrExit)),
+        ("clear · twice exits", keymap.label(KeyAction::ClearOrExit)),
         ("exit", keymap.label(KeyAction::Exit)),
         ("attach image", keymap.label(KeyAction::AttachImage)),
         ("start/stop dictation", keymap.label(KeyAction::Dictate)),
