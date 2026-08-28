@@ -34,6 +34,7 @@ struct BorgGui {
     dictation: Option<DictationWorker>,
     dictation_status: SharedString,
     help_open: bool,
+    info_panel: Option<(SharedString, SharedString)>,
     expanded_entries: HashSet<String>,
     temporary_attachments: HashSet<PathBuf>,
 }
@@ -96,14 +97,28 @@ impl BorgGui {
                     cx.notify();
                     return;
                 }
-                "/help" | "/settings" => {
+                "/help" => {
                     this.help_open = true;
                     cx.notify();
                     return;
                 }
-                "/goal" | "/goal view" | "/todo" | "/todos" | "/todo view" | "/todos view"
-                | "/usage" | "/status" => {
-                    this.help_open = true;
+                "/settings" => {
+                    this.open_settings_info();
+                    cx.notify();
+                    return;
+                }
+                "/usage" | "/status" => {
+                    this.open_usage_info();
+                    cx.notify();
+                    return;
+                }
+                "/goal" | "/goal view" => {
+                    this.open_goal_info();
+                    cx.notify();
+                    return;
+                }
+                "/todo" | "/todos" | "/todo view" | "/todos view" => {
+                    this.open_todo_info();
                     cx.notify();
                     return;
                 }
@@ -203,6 +218,7 @@ impl BorgGui {
             dictation,
             dictation_status: "dictate".into(),
             help_open: false,
+            info_panel: None,
             expanded_entries: HashSet::new(),
             temporary_attachments: HashSet::new(),
         };
@@ -332,7 +348,9 @@ impl BorgGui {
         cx.notify();
     }
     fn escape_action(&mut self, _: &Escape, _: &mut Window, cx: &mut Context<Self>) {
-        if self.help_open {
+        if self.info_panel.is_some() {
+            self.info_panel = None;
+        } else if self.help_open {
             self.help_open = false;
         } else if self.sessions_open {
             self.sessions_open = false;
@@ -342,12 +360,133 @@ impl BorgGui {
         cx.notify();
     }
     fn toggle_help_action(&mut self, _: &ToggleHelp, _: &mut Window, cx: &mut Context<Self>) {
+        self.info_panel = None;
         self.help_open = !self.help_open;
         cx.notify();
     }
     fn toggle_help(&mut self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.info_panel = None;
         self.help_open = !self.help_open;
         cx.notify();
+    }
+
+    fn close_info(&mut self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.info_panel = None;
+        cx.notify();
+    }
+
+    fn open_usage_info(&mut self) {
+        let Some(view) = &self.view else {
+            self.error = Some("No local session is open".into());
+            return;
+        };
+        let usage = &view.state.usage;
+        let context = match (usage.context_tokens, usage.context_window_tokens) {
+            (Some(used), Some(window)) => format!("{used} / {window} tokens"),
+            _ => "not reported".into(),
+        };
+        let cost = usage
+            .cost_usd
+            .map(|value| format!("${value:.4}"))
+            .unwrap_or_else(|| "not reported".into());
+        self.info_panel = Some((
+            "SESSION USAGE".into(),
+            format!(
+                "Calls              {}\nInput tokens       {}\nCached input       {}\nCache creation     {}\nOutput tokens      {}\nTotal tokens       {}\nProvider time      {:.1}s\nContext            {}\nCost               {}\nCost basis         {}",
+                usage.calls,
+                usage.input_tokens,
+                usage.cached_input_tokens,
+                usage.cache_creation_input_tokens,
+                usage.output_tokens,
+                usage.total_tokens,
+                usage.provider_duration_ms as f64 / 1_000.0,
+                context,
+                cost,
+                usage.cost_basis,
+            )
+            .into(),
+        ));
+    }
+
+    fn show_usage(&mut self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.open_usage_info();
+        cx.notify();
+    }
+
+    fn show_goal(&mut self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.open_goal_info();
+        cx.notify();
+    }
+
+    fn open_settings_info(&mut self) {
+        let Some(view) = &self.view else {
+            self.error = Some("No local session is open".into());
+            return;
+        };
+        let configuration = view.state.configuration.as_ref();
+        let mut body = match configuration {
+            Some(configuration) => format!(
+                "Model              {}\nProvider           {}\nEffort             {}\nFast mode          {}\nPermission         {}\nResponse language  {}\nWorking directory  {}",
+                configuration.model.as_deref().unwrap_or("provider default"),
+                configuration.provider.label(),
+                configuration
+                    .effort
+                    .as_deref()
+                    .unwrap_or("provider default"),
+                if configuration.fast { "on" } else { "off" },
+                format!("{:?}", configuration.permission_mode).to_lowercase(),
+                configuration.response_language.code(),
+                configuration.cwd.display(),
+            ),
+            None => "This session is not configured yet.".into(),
+        };
+        if !view.state.provider_capabilities.is_empty() {
+            body.push_str("\n\nPROVIDERS\n");
+            for capability in &view.state.provider_capabilities {
+                let state = if capability.can_spawn {
+                    "ready"
+                } else if capability.authenticated {
+                    "authenticated, unavailable"
+                } else if capability.installed {
+                    "login required"
+                } else {
+                    "not installed"
+                };
+                body.push_str(&format!("{:<18} {state}\n", capability.provider.label()));
+            }
+        }
+        self.info_panel = Some(("SESSION SETTINGS".into(), body.into()));
+    }
+
+    fn open_goal_info(&mut self) {
+        let body = self
+            .view
+            .as_ref()
+            .and_then(|view| view.state.goal.as_ref())
+            .map(|goal| format!("Status   {:?}\nObjective\n{}", goal.status, goal.objective))
+            .unwrap_or_else(|| {
+                "No durable goal is active. Use /goal OBJECTIVE to create one.".into()
+            });
+        self.info_panel = Some(("DURABLE GOAL".into(), body.into()));
+    }
+
+    fn open_todo_info(&mut self) {
+        let items = self
+            .view
+            .as_ref()
+            .map(|view| view.state.todos.as_slice())
+            .unwrap_or_default();
+        let body = if items.is_empty() {
+            "No durable todo items. Use /todo add TEXT to add one.".into()
+        } else {
+            items
+                .iter()
+                .enumerate()
+                .map(|(index, item)| format!("{}. [{:?}] {}", index + 1, item.status, item.content))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        self.info_panel = Some(("DURABLE TODO".into(), body.into()));
     }
     fn approve_once(&mut self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.send(FrontendCommand::Approve(ApprovalDecision::AllowOnce));
@@ -754,6 +893,8 @@ impl Render for BorgGui {
             ("/permission MODE", "full, auto, or manual", "/permission "),
             ("/language NAME", "change response language", "/language "),
             ("/fast on|off", "toggle priority mode", "/fast "),
+            ("/settings", "inspect live session settings", "/settings"),
+            ("/usage", "inspect tokens, time, and cost", "/usage"),
             ("/compact", "compact conversation context", "/compact"),
             ("/clear", "clear conversation context", "/clear"),
             ("/recall", "return queued input to the composer", "/recall"),
@@ -823,6 +964,9 @@ impl Render for BorgGui {
                             div()
                                 .flex()
                                 .gap_2()
+                                .id("goal-summary")
+                                .cursor_pointer()
+                                .on_click(cx.listener(Self::show_goal))
                                 .child(div().text_color(rgb(palette::GREEN)).child("GOAL"))
                                 .child(div().min_w_0().overflow_hidden().text_ellipsis().child(goal)),
                         ),
@@ -1095,9 +1239,7 @@ impl Render for BorgGui {
                                     .child("·")
                                     .child(div().id("language-setting").cursor_pointer().text_color(rgb(palette::TEXT_MUTED)).hover(|style| style.bg(rgb(palette::SURFACE_RAISED))).on_click(cx.listener(Self::cycle_language)).child(language))
                                     .child("·")
-                                    .child(
-                                        div().text_color(rgb(palette::TEXT_MUTED)).child(context),
-                                    ),
+                                    .child(div().id("usage-setting").cursor_pointer().hover(|style| style.bg(rgb(palette::SURFACE_RAISED))).on_click(cx.listener(Self::show_usage)).text_color(rgb(palette::TEXT_MUTED)).child(context)),
                             )
                             .child(
                                 div()
@@ -1330,6 +1472,58 @@ impl Render for BorgGui {
                                 })).child(div().w(px(190.)).text_color(rgb(palette::BLUE)).child(command)).child(div().text_color(rgb(palette::TEXT_MUTED)).child(detail))
                             }))
                     )
+                )
+            })
+            .when_some(self.info_panel.clone(), |root, (title, body)| {
+                root.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .bg(gpui::rgba(0x00000088))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            div()
+                                .id("info-panel")
+                                .w(px(680.))
+                                .max_h(px(620.))
+                                .overflow_y_scroll()
+                                .border_1()
+                                .border_color(rgb(palette::BORDER))
+                                .bg(rgb(palette::SURFACE))
+                                .p_5()
+                                .flex()
+                                .flex_col()
+                                .gap_4()
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .child(
+                                            div()
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(rgb(palette::ORANGE))
+                                                .child(title),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("close-info")
+                                                .cursor_pointer()
+                                                .text_color(rgb(palette::TEXT_MUTED))
+                                                .on_click(cx.listener(Self::close_info))
+                                                .child("esc / close"),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .whitespace_normal()
+                                        .text_color(rgb(palette::TEXT))
+                                        .child(body),
+                                ),
+                        ),
                 )
             })
     }
