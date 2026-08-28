@@ -289,6 +289,35 @@ impl RuntimeEventBatch {
     }
 }
 
+fn relay_event_batch_payload(events: &[SessionEvent]) -> Result<serde_json::Value> {
+    let mut payload = serde_json::to_value(RuntimeEventBatch::from_events(events))?;
+    rewrite_relay_permission_modes(&mut payload);
+    Ok(payload)
+}
+
+fn rewrite_relay_permission_modes(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(object) => {
+            if let Some(serde_json::Value::String(mode)) = object.get_mut("permission_mode") {
+                match mode.as_str() {
+                    "auto" => *mode = "workspace_write".to_string(),
+                    "manual" => *mode = "read_only".to_string(),
+                    _ => {}
+                }
+            }
+            for value in object.values_mut() {
+                rewrite_relay_permission_modes(value);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                rewrite_relay_permission_modes(value);
+            }
+        }
+        _ => {}
+    }
+}
+
 // Keep ordinary uploads comfortably below the relay's request-body ceiling.
 // The adaptive 413 path below is still authoritative when a deployment has a
 // smaller limit or a single event is unusually large.
@@ -531,7 +560,7 @@ fn scoped_payload_refs(
 }
 
 fn event_upload_ranges(events: &[SessionEvent]) -> Result<VecDeque<Range<usize>>> {
-    let empty_batch_bytes = serde_json::to_vec(&RuntimeEventBatch::from_events(&[]))?.len();
+    let empty_batch_bytes = serde_json::to_vec(&relay_event_batch_payload(&[])?)?.len();
     let mut ranges = VecDeque::new();
     let mut start = 0;
     let mut batch_bytes = empty_batch_bytes;
@@ -592,7 +621,7 @@ async fn upload_event_page(
     let mut ranges = event_upload_ranges(&remote_events)?;
     while let Some(range) = ranges.pop_front() {
         let batch = &remote_events[range.clone()];
-        let runtime_batch = RuntimeEventBatch::from_events(batch);
+        let runtime_batch = relay_event_batch_payload(batch)?;
         if !upload_event_payloads(client, config, store, &compact_events[range.clone()], batch)
             .await?
         {
@@ -4152,6 +4181,57 @@ mod tests {
         );
         assert_eq!(ranges.front().unwrap().start, 0);
         assert_eq!(ranges.back().unwrap().end, 600);
+    }
+
+    #[test]
+    fn relay_event_batches_use_compatible_permission_modes() {
+        let session_id = Uuid::new_v4();
+        let events = [
+            SessionEvent::new(
+                session_id,
+                1,
+                crate::SessionEventKind::SessionConfigured {
+                    cwd: PathBuf::from("/tmp"),
+                    provider: CodingProvider::Codex,
+                    model: None,
+                    effort: None,
+                    fast: false,
+                    response_language: crate::ResponseLanguage::Auto,
+                    permission_mode: crate::PermissionMode::Auto,
+                },
+            ),
+            SessionEvent::new(
+                session_id,
+                2,
+                crate::SessionEventKind::SessionConfigured {
+                    cwd: PathBuf::from("/tmp"),
+                    provider: CodingProvider::Codex,
+                    model: None,
+                    effort: None,
+                    fast: false,
+                    response_language: crate::ResponseLanguage::Auto,
+                    permission_mode: crate::PermissionMode::Manual,
+                },
+            ),
+        ];
+
+        let payload = relay_event_batch_payload(&events).unwrap();
+        let modes = payload["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| event["event"]["kind"]["permission_mode"].as_str().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(modes, ["workspace_write", "read_only"]);
+        assert_eq!(
+            serde_json::to_value(&events[0].kind).unwrap()["permission_mode"],
+            "auto"
+        );
+        assert_eq!(
+            serde_json::to_value(&events[1].kind).unwrap()["permission_mode"],
+            "manual"
+        );
     }
 
     #[test]
