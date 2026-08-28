@@ -972,7 +972,7 @@ dependencies = [
 
 [[package]]
 name = "borg"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "aes-gcm",
  "agent-client-protocol",
@@ -1021,7 +1021,7 @@ dependencies = [
 
 [[package]]
 name = "borg-core"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "serde",
  "serde_json",
@@ -1029,7 +1029,7 @@ dependencies = [
 
 [[package]]
 name = "borg-dictation"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "anyhow",
  "async-channel 2.5.0",
@@ -1049,7 +1049,7 @@ dependencies = [
 
 [[package]]
 name = "borg-gui"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "async-channel 2.5.0",
  "borg-dictation",
@@ -1062,7 +1062,7 @@ dependencies = [
 
 [[package]]
 name = "borg-provider"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1088,7 +1088,7 @@ dependencies = [
 
 [[package]]
 name = "borg-remote"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1119,7 +1119,7 @@ dependencies = [
 
 [[package]]
 name = "borg-search"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1132,7 +1132,7 @@ dependencies = [
 
 [[package]]
 name = "borg-tui"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "anyhow",
  "arboard",
@@ -1163,7 +1163,7 @@ dependencies = [
 
 [[package]]
 name = "borg-ui"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "anyhow",
  "async-channel 2.5.0",
