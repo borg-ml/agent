@@ -1644,6 +1644,48 @@ fn tool_lifecycle_labels_use_progressive_and_past_tense() {
 }
 
 #[test]
+fn action_preparation_promotes_into_the_same_tool_card() {
+    let session_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::ProviderEvent {
+            provider: CodingProvider::Codex,
+            kind: "action/preparing".to_string(),
+            payload: serde_json::json!({"label": "edit"}),
+        },
+    ));
+    let preparing = transcript
+        .lines(100)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(preparing.contains("Preparing edit…"), "{preparing}");
+
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::ToolStarted {
+            tool_call_id: "edit-1".to_string(),
+            name: "Edit".to_string(),
+            input: serde_json::json!({"path": "src/main.rs"}),
+            input_ref: None,
+        },
+    ));
+    let editing = transcript
+        .lines(100)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(transcript.order.len(), 1);
+    assert!(editing.contains("Editing…"), "{editing}");
+    assert!(!editing.contains("Preparing edit…"), "{editing}");
+}
+
+#[test]
 fn composer_cursor_has_a_stable_software_blink_phase() {
     assert!(cursor_blink_visible(Duration::ZERO));
     assert!(cursor_blink_visible(Duration::from_millis(499)));

@@ -77,6 +77,7 @@ struct Transcript {
     messages: HashMap<Uuid, usize>,
     tools: HashMap<String, usize>,
     foreground_tool: Option<String>,
+    preparing_tool: Option<String>,
     goal: Option<SessionGoal>,
     todos: Vec<PlanItem>,
     config: Option<SessionDisplayConfig>,
@@ -156,6 +157,7 @@ impl Default for Transcript {
             messages: HashMap::new(),
             tools: HashMap::new(),
             foreground_tool: None,
+            preparing_tool: None,
             goal: None,
             todos: Vec::new(),
             config: None,
@@ -360,6 +362,7 @@ fn tool_lifecycle_label(name: &str, complete: bool) -> Cow<'_, str> {
     let (verb, rest) = name.split_once(' ').unwrap_or((name, ""));
     let forms = match verb {
         "Run" => Some(("Running", "Ran")),
+        "Prepare" => Some(("Preparing", "Prepared")),
         "Inspect" => Some(("Inspecting", "Inspected")),
         "Read" => Some(("Reading", "Read")),
         "Edit" => Some(("Editing", "Edited")),
@@ -1267,6 +1270,26 @@ impl Transcript {
                 self.finish_reasoning(event.created_at);
             }
             SessionEventKind::ProviderEvent { kind, payload, .. }
+                if kind == "action/preparing" =>
+            {
+                let Some(label) = payload.get("label").and_then(serde_json::Value::as_str) else {
+                    return removed_entry;
+                };
+                let tool_call_id = self
+                    .preparing_tool
+                    .clone()
+                    .unwrap_or_else(|| format!("action-preparing:{}", event.id));
+                self.preparing_tool = Some(tool_call_id.clone());
+                let input = serde_json::json!({"label": label});
+                self.upsert_running_tool(
+                    event,
+                    &tool_call_id,
+                    "action_preparing",
+                    &input,
+                    None,
+                );
+            }
+            SessionEventKind::ProviderEvent { kind, payload, .. }
                 if is_live_tool_call_event(kind) =>
             {
                 let Some(tool_call_id) = payload
@@ -1282,6 +1305,7 @@ impl Transcript {
                 let input = payload
                     .get("input")
                     .unwrap_or(&serde_json::Value::Null);
+                self.promote_preparing_tool(tool_call_id);
                 self.upsert_running_tool(event, tool_call_id, raw_name, input, None);
             }
             SessionEventKind::ToolStarted {
@@ -1290,6 +1314,7 @@ impl Transcript {
                 input,
                 input_ref,
             } => {
+                self.promote_preparing_tool(tool_call_id);
                 self.upsert_running_tool(
                     event,
                     tool_call_id,
@@ -1303,6 +1328,7 @@ impl Transcript {
                 name,
                 input,
             } => {
+                self.promote_preparing_tool(tool_call_id);
                 self.upsert_running_tool(event, tool_call_id, name, input, None);
             }
             SessionEventKind::ToolCompleted {
@@ -2171,9 +2197,23 @@ impl Transcript {
         }
     }
 
+    fn promote_preparing_tool(&mut self, tool_call_id: &str) {
+        let Some(preparing_id) = self.preparing_tool.take() else {
+            return;
+        };
+        let Some(tool_index) = self.tools.remove(&preparing_id) else {
+            return;
+        };
+        self.tools.insert(tool_call_id.to_string(), tool_index);
+        if self.foreground_tool.as_deref() == Some(preparing_id.as_str()) {
+            self.foreground_tool = Some(tool_call_id.to_string());
+        }
+    }
+
     fn mark_running_tools_user_interrupted(&mut self, completed_at: DateTime<Utc>) {
         self.finish_reasoning(completed_at);
         self.foreground_tool = None;
+        self.preparing_tool = None;
         for entry in &mut self.order {
             if let TranscriptEntry::Tool {
                 complete,
@@ -2220,6 +2260,7 @@ impl Transcript {
     ) {
         self.finish_reasoning(completed_at);
         self.foreground_tool = None;
+        self.preparing_tool = None;
         for entry in &mut self.order {
             if let TranscriptEntry::Tool {
                 detail,

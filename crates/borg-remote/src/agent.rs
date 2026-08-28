@@ -52,12 +52,39 @@ Preserve an explicit `@EFFORT` suffix in a profile when the intent includes one 
 You choose the complete freeform briefing: include the relevant objective, evidence, constraints, and \
 exact question, while omitting unrelated transcript noise. Never ask the human to relay messages manually. \
 The peer cannot invoke another peer; after the response returns, reconcile it with your own judgment and \
-remain the sole voice that answers the user.";
+remain the sole voice that answers the user. Before every tool call, emit exactly one standalone narration \
+item in the form `[[BORG_ACTION:label]]`, then generate the tool call. Use a short action noun for `label`, \
+such as `edit`, `command`, `plan update`, `web search`, `file read`, or `diagnostics`. Do not include any \
+other text in that narration item.";
 
 pub(crate) const COMPACT_CODING_SYSTEM_PROMPT: &str = "\
 You are Borg, a focused coding agent working in the user's local project. \
 Inspect the workspace, make the smallest requested changes, and verify the result. \
-Use the available workspace tools directly, preserve user work, and report what you verified.";
+Use the available workspace tools directly, preserve user work, and report what you verified. Before every \
+tool call, emit exactly one standalone narration item in the form `[[BORG_ACTION:label]]`, then generate the \
+tool call. Use a short action noun for `label` and no other text in that narration item.";
+
+fn action_intent_label(text: &str) -> Option<&str> {
+    let label = text
+        .trim()
+        .strip_prefix("[[BORG_ACTION:")?
+        .strip_suffix("]]")?
+        .trim();
+    (!label.is_empty()
+        && label.len() <= 64
+        && label.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, ' ' | '-' | '/')
+        }))
+    .then_some(label)
+}
+
+fn action_intent_is_streaming(text: &str) -> bool {
+    const PREFIX: &str = "[[BORG_ACTION:";
+    let text = text.trim();
+    PREFIX.starts_with(text)
+        || (text.starts_with(PREFIX) && !text.ends_with("]]"))
+        || action_intent_label(text).is_some()
+}
 
 #[derive(Clone)]
 pub struct AgentTurn {
@@ -1490,6 +1517,9 @@ async fn run_borg_provider_turn(
                     );
                 }
                 text.push_str(&delta);
+                if action_intent_is_streaming(&text) {
+                    continue;
+                }
                 if last_text_emit.elapsed() >= live_output_interval(text.len()) {
                     send(
                         &events,
@@ -1557,6 +1587,20 @@ async fn run_borg_provider_turn(
                         message_id = %ttft_message_id,
                         "Borg provider stage"
                     );
+                }
+                if let Some(label) = action_intent_label(&narration_text) {
+                    text.clear();
+                    assistant_message_id = Uuid::new_v4();
+                    send(
+                        &events,
+                        SessionEventKind::ProviderEvent {
+                            provider: turn.provider,
+                            kind: "action/preparing".to_string(),
+                            payload: serde_json::json!({"label": label}),
+                        },
+                    )
+                    .await;
+                    continue;
                 }
                 text = narration_text;
                 send(
@@ -2183,6 +2227,20 @@ async fn send(events: &mpsc::Sender<SessionEventKind>, event: SessionEventKind) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn action_intent_markers_are_exact_and_bounded() {
+        assert_eq!(
+            action_intent_label("[[BORG_ACTION:plan update]]"),
+            Some("plan update")
+        );
+        assert_eq!(action_intent_label("before [[BORG_ACTION:edit]]"), None);
+        assert_eq!(action_intent_label("[[BORG_ACTION:edit!]]"), None);
+        assert!(action_intent_is_streaming("[["));
+        assert!(action_intent_is_streaming("[[BORG_ACTION:edit"));
+        assert!(action_intent_is_streaming("[[BORG_ACTION:edit]]"));
+        assert!(!action_intent_is_streaming("ordinary narration"));
+    }
 
     fn test_server(name: &str) -> borg_provider::mcp::ExternalMcpServer {
         borg_provider::mcp::ExternalMcpServer {

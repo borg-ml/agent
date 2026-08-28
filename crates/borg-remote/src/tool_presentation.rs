@@ -379,6 +379,11 @@ pub fn is_diff_language(language: &str) -> bool {
 pub fn tool_call_summary(name: &str, input: &Value) -> (String, String) {
     let tool = tool_leaf_name(name);
 
+    if tool == "action_preparing" {
+        let label = string_field(input, "label").unwrap_or("action");
+        return (format!("Prepare {label}"), String::new());
+    }
+
     if is_mcp_resource_probe(name) {
         let label = if name.starts_with("mcp__") {
             format_mcp_tool_name(name)
