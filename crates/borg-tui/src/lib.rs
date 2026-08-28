@@ -19,9 +19,6 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use borg_ui::preferences::{
-    CompletionAlertPolicy, DictationIconStyle, TranscriptPreferences, parse_hex_color,
-};
 use anyhow::{Context, Result};
 use attachments::{AttachmentStore, PasteOutcome};
 use borg_remote::{
@@ -37,6 +34,9 @@ use borg_remote::{
 };
 #[cfg(test)]
 use borg_remote::{tool_call_summary, tool_code_view};
+use borg_ui::preferences::{
+    CompletionAlertPolicy, DictationIconStyle, TranscriptPreferences, parse_hex_color,
+};
 use chrono::{DateTime, Local, NaiveDate, Utc};
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{
@@ -6985,6 +6985,9 @@ impl BorgTerminal {
     }
 
     fn handle_key(&mut self, mut key: KeyEvent) -> Result<UiAction> {
+        if is_selection_copy_shortcut(&key) && self.copy_text_selection() {
+            return Ok(UiAction::None);
+        }
         let ctrl_c = is_ctrl_c(&key);
         if ctrl_c {
             if self.picker.is_some()
@@ -8648,6 +8651,14 @@ impl Composer {
 fn is_ctrl_c(key: &KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL)
         && matches!(key.code, KeyCode::Char('c' | 'C' | '\u{3}'))
+}
+
+fn is_selection_copy_shortcut(key: &KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('c' | 'C'))
+        && (key.modifiers.contains(KeyModifiers::SUPER)
+            || key
+                .modifiers
+                .contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT))
 }
 
 fn repeated_ctrl_c(last: &mut Option<Instant>, count: &mut u8, now: Instant) -> bool {

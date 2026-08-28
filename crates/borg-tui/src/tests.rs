@@ -820,6 +820,22 @@ fn focused_subagent_escape_targets_that_subagent() {
 }
 
 #[test]
+fn platform_copy_shortcuts_are_recognized_for_custom_text_selection() {
+    assert!(is_selection_copy_shortcut(&KeyEvent::new(
+        KeyCode::Char('c'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    )));
+    assert!(is_selection_copy_shortcut(&KeyEvent::new(
+        KeyCode::Char('c'),
+        KeyModifiers::SUPER,
+    )));
+    assert!(!is_selection_copy_shortcut(&KeyEvent::new(
+        KeyCode::Char('c'),
+        KeyModifiers::CONTROL,
+    )));
+}
+
+#[test]
 fn subagent_activity_timers_are_independent_and_stop_with_their_agent() {
     let first = Uuid::new_v4();
     let second = Uuid::new_v4();
@@ -1683,6 +1699,44 @@ fn action_preparation_promotes_into_the_same_tool_card() {
     assert_eq!(transcript.order.len(), 1);
     assert!(editing.contains("Editing…"), "{editing}");
     assert!(!editing.contains("Preparing edit…"), "{editing}");
+}
+
+#[test]
+fn action_preparation_completes_when_the_start_event_is_missing() {
+    let session_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::ProviderEvent {
+            provider: CodingProvider::Codex,
+            kind: "action/preparing".to_string(),
+            payload: serde_json::json!({"label": "command"}),
+        },
+    ));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::ToolCompleted {
+            tool_call_id: "command-1".to_string(),
+            output: "done".to_string(),
+            output_ref: None,
+            is_error: false,
+            input: None,
+            input_ref: None,
+        },
+    ));
+
+    let completed = transcript
+        .lines(100)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(transcript.order.len(), 1);
+    assert!(completed.contains("Ran command"), "{completed}");
+    assert!(!completed.contains("Preparing command"), "{completed}");
+    assert!(!transcript.has_running_tool());
 }
 
 #[test]
@@ -5228,8 +5282,8 @@ fn fuzzy_match_accepts_subsequences_and_rejects_reordering() {
 /// section off the rows that survive.
 #[test]
 fn the_command_palette_filters_across_commands_and_keybindings() {
-    let keymap = KeyMap::from_config(&borg_ui::KeybindingConfig::default())
-        .expect("default keymap");
+    let keymap =
+        KeyMap::from_config(&borg_ui::KeybindingConfig::default()).expect("default keymap");
     let mut picker = Picker {
         kind: PickerKind::Commands,
         title: "Commands and keybindings",

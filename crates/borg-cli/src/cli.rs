@@ -464,6 +464,9 @@ pub(crate) struct LocalAgentCliArgs {
     /// Use a temporary local session store and discard it when this process exits.
     #[arg(long, conflicts_with_all = ["resume", "continue_latest"])]
     pub(crate) ephemeral: bool,
+    /// Run without a terminal frontend while a native GUI owns this session.
+    #[arg(long, hide = true)]
+    pub(crate) gui_owner: bool,
 }
 
 impl LocalAgentCliArgs {
@@ -487,6 +490,7 @@ impl LocalAgentCliArgs {
             workspace: None,
             local_only: false,
             ephemeral: false,
+            gui_owner: false,
         }
     }
 
@@ -510,6 +514,7 @@ impl LocalAgentCliArgs {
             workspace: None,
             local_only: false,
             ephemeral: false,
+            gui_owner: false,
         }
     }
 }

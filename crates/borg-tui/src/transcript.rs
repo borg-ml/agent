@@ -1339,6 +1339,7 @@ impl Transcript {
                 input,
                 input_ref,
             } => {
+                self.complete_preparing_tool(tool_call_id);
                 if self.foreground_tool.as_deref() == Some(tool_call_id) {
                     self.foreground_tool = None;
                 }
@@ -2207,6 +2208,23 @@ impl Transcript {
         self.tools.insert(tool_call_id.to_string(), tool_index);
         if self.foreground_tool.as_deref() == Some(preparing_id.as_str()) {
             self.foreground_tool = Some(tool_call_id.to_string());
+        }
+    }
+
+    fn complete_preparing_tool(&mut self, tool_call_id: &str) {
+        self.promote_preparing_tool(tool_call_id);
+        let Some(tool_index) = self.tools.get(tool_call_id).copied() else {
+            return;
+        };
+        if let Some(TranscriptEntry::Tool {
+            source_name, name, ..
+        }) = self.order.get_mut(tool_index)
+            && source_name == "action_preparing"
+        {
+            *source_name = "action".to_string();
+            if let Some(label) = name.strip_prefix("Prepare ") {
+                *name = format!("Run {label}");
+            }
         }
     }
 

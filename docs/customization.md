@@ -45,6 +45,21 @@ bell is audible follows the terminal and operating-system settings. Terminals
 that support focus reporting let `unfocused` distinguish foreground from
 background windows. Replayed session history never produces alerts.
 
+## Dictation model
+
+Borg downloads Parakeet TDT 0.6B V2 by default. To use a smaller or otherwise
+different GGUF supported by `parakeet-server`, point the managed backend at the
+local model file before launching Borg:
+
+```sh
+export BORG_CLI_DICTATION_MODEL_PATH=/path/to/model.gguf
+```
+
+Borg still installs and manages the Parakeet runtime, but skips the bundled
+609 MiB model download and starts the server with the selected file. The
+existing `BORG_CLI_DICTATION_MODEL` setting remains the API model name for an
+externally managed dictation endpoint.
+
 ## Keybindings and command aliases
 
 Keybindings live in `agent.toml`. An action accepts one or more chords; omitted

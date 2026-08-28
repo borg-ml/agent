@@ -74,7 +74,7 @@ pub use host::{
     run_host_with_executor_factory,
 };
 pub use local_control::{
-    LocalSessionControlServer, force_terminate_local_session_owner,
+    LocalSessionControlServer, force_terminate_local_session_owner, local_session_owner_is_active,
     local_session_owner_uses_current_binary, obsolete_local_session_owner_pid,
     run_attached_session, send_local_session_command, session_control_presence_socket_path,
     session_control_socket_path,

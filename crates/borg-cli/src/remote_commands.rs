@@ -724,6 +724,9 @@ fn systemd_quote(value: &str) -> String {
 }
 
 pub(crate) async fn run_local_agent(args: LocalAgentCliArgs) -> Result<()> {
+    if args.print {
+        print_mode_banner();
+    }
     let agent_config = AgentConfig::load(args.config.as_deref())?;
     // Provider environment is applied inside each owned session, after resume
     // configuration is resolved and before the server/executor starts.
@@ -803,6 +806,17 @@ pub(crate) async fn run_local_agent(args: LocalAgentCliArgs) -> Result<()> {
             }
             Err(payload) => panic::resume_unwind(payload),
         };
+    }
+}
+
+fn print_mode_banner() {
+    #[cfg(unix)]
+    let terminal = "/dev/tty";
+    #[cfg(windows)]
+    let terminal = "CONOUT$";
+
+    if let Ok(mut terminal) = fs::OpenOptions::new().write(true).open(terminal) {
+        let _ = writeln!(terminal, "Borg Agent v{}", env!("CARGO_PKG_VERSION"));
     }
 }
 
@@ -1331,7 +1345,7 @@ async fn run_local_agent_session(
     let lifecycle_executor = Arc::clone(&executor);
     let mut rendered = HashMap::new();
     let stdin_is_terminal = io::stdin().is_terminal();
-    let machine_output = args.json || args.print;
+    let machine_output = args.json || args.print || args.gui_owner;
     let can_prompt = stdin_is_terminal && !machine_output;
     let rich_tui_allowed = rich_terminal_can_prompt(
         stdin_is_terminal,
@@ -1348,7 +1362,7 @@ async fn run_local_agent_session(
     let fallback_terminal = can_prompt && !rich_tui_allowed;
     let mut initial_prompt = if !args.prompt.is_empty() {
         Some(args.prompt.join(" "))
-    } else if !stdin_is_terminal {
+    } else if !stdin_is_terminal && !args.gui_owner {
         let mut piped = String::new();
         tokio::io::stdin().read_to_string(&mut piped).await?;
         (!piped.trim().is_empty()).then(|| piped.trim().to_string())
@@ -1386,7 +1400,7 @@ async fn run_local_agent_session(
         Vec::new()
     };
     let has_initial_prompt = initial_prompt.is_some();
-    let interactive = can_prompt;
+    let interactive = can_prompt || args.gui_owner;
     let (mut history, mut history_page_before_sequence) = if can_prompt && !fallback_terminal {
         let bootstrap =
             recent_tui_history(store.as_ref(), session_id, session_state.latest_sequence).await?;
@@ -3758,11 +3772,13 @@ async fn run_local_agent_session(
                                 .as_mut()
                                 .expect("terminal")
                                 .set_dictation_state(DictationState::Installing);
-                            terminal.as_mut().expect("terminal").set_notice(if parakeet_is_installed() {
-                                "Starting Parakeet V2".to_string()
-                            } else {
-                                "Preparing Parakeet V2 · may download about 609 MiB on first use"
+                            terminal.as_mut().expect("terminal").set_notice(if parakeet_is_installed(&dictation_config) {
+                                "Starting local dictation".to_string()
+                            } else if dictation_config.uses_bundled_model() {
+                                "Preparing local dictation · the default model downloads about 609 MiB"
                                     .to_string()
+                            } else {
+                                "Preparing local dictation runtime".to_string()
                             });
                             let config = dictation_config.clone();
                             dictation_setup_task = Some(tokio::spawn(async move {
@@ -7014,35 +7030,7 @@ fn print_agent_help() {
 }
 
 pub(crate) fn parse_goal_action(line: &str) -> Result<GoalAction> {
-    let value = line
-        .strip_prefix("/goal ")
-        .context("usage: /goal [OBJECTIVE|pause|resume|clear]")?
-        .trim();
-    match value {
-        "pause" => return Ok(GoalAction::Pause),
-        "resume" => return Ok(GoalAction::Resume),
-        "clear" => return Ok(GoalAction::Clear),
-        "" | "view" => anyhow::bail!("usage: /goal [OBJECTIVE|pause|resume|clear]"),
-        _ => {}
-    }
-    let value = value.strip_prefix("set ").unwrap_or(value).trim();
-    let (token_budget, objective) = if let Some(rest) = value.strip_prefix("--tokens ") {
-        let (budget, objective) = rest
-            .split_once(char::is_whitespace)
-            .context("usage: /goal set --tokens NUMBER OBJECTIVE")?;
-        let budget = budget
-            .parse::<u64>()
-            .context("goal token budget must be a positive integer")?;
-        anyhow::ensure!(budget > 0, "goal token budget must be positive");
-        (Some(budget), objective.trim())
-    } else {
-        (None, value)
-    };
-    anyhow::ensure!(!objective.is_empty(), "goal objective must not be empty");
-    Ok(GoalAction::Set {
-        objective: objective.to_string(),
-        token_budget,
-    })
+    borg_ui::parse_goal_action(line)
 }
 
 fn dispatch_host_command_without_blocking(
@@ -7731,25 +7719,11 @@ fn compact_json(value: &serde_json::Value) -> String {
 }
 
 fn cancelled_provider_interaction_response(kind: &str) -> serde_json::Value {
-    if kind == "mcp_elicitation" {
-        serde_json::json!({ "action": "cancel" })
-    } else {
-        serde_json::json!({ "answers": {} })
-    }
+    borg_ui::cancelled_provider_interaction_response(kind)
 }
 
 fn provider_interaction_payload_contains_secret(payload: &serde_json::Value) -> bool {
-    payload
-        .get("questions")
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|questions| {
-            questions.iter().any(|question| {
-                question
-                    .get("isSecret")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false)
-            })
-        })
+    borg_ui::provider_interaction_contains_secret(payload)
 }
 
 fn provider_interaction_response(
@@ -7757,82 +7731,7 @@ fn provider_interaction_response(
     payload: &serde_json::Value,
     input: &str,
 ) -> Result<serde_json::Value> {
-    if input.eq_ignore_ascii_case("/cancel") {
-        return Ok(cancelled_provider_interaction_response(kind));
-    }
-    if kind == "mcp_elicitation" {
-        if input.eq_ignore_ascii_case("/decline") {
-            return Ok(serde_json::json!({ "action": "decline" }));
-        }
-        let content = match serde_json::from_str::<serde_json::Value>(input) {
-            Ok(value) => value,
-            Err(_) => {
-                let properties = payload
-                    .get("requestedSchema")
-                    .and_then(|schema| schema.get("properties"))
-                    .and_then(serde_json::Value::as_object)
-                    .context(
-                        "Enter JSON matching the requested form, or use /decline or /cancel",
-                    )?;
-                anyhow::ensure!(
-                    properties.len() == 1,
-                    "Enter a JSON object matching the requested form, or use /decline or /cancel"
-                );
-                let key = properties.keys().next().expect("one property");
-                serde_json::json!({ key: input })
-            }
-        };
-        return Ok(serde_json::json!({ "action": "accept", "content": content }));
-    }
-
-    let questions = payload
-        .get("questions")
-        .and_then(serde_json::Value::as_array)
-        .context("Provider user-input request did not include questions")?;
-    if questions.len() == 1 {
-        let id = questions[0]
-            .get("id")
-            .and_then(serde_json::Value::as_str)
-            .context("Provider user-input question did not include an id")?;
-        return Ok(serde_json::json!({
-            "answers": {
-                (id): { "answers": [input] }
-            }
-        }));
-    }
-
-    let value: serde_json::Value = serde_json::from_str(input).context(
-        "Answer multiple questions with a JSON object keyed by question id, or use /cancel",
-    )?;
-    if value.get("answers").is_some() {
-        return Ok(value);
-    }
-    let values = value
-        .as_object()
-        .context("Multiple answers must be a JSON object keyed by question id")?;
-    let mut answers = serde_json::Map::new();
-    for question in questions {
-        let id = question
-            .get("id")
-            .and_then(serde_json::Value::as_str)
-            .context("Provider user-input question did not include an id")?;
-        let answer = values
-            .get(id)
-            .with_context(|| format!("Missing answer for question {id}"))?;
-        let answer_values = match answer {
-            serde_json::Value::Array(values) => values.clone(),
-            value => vec![value.clone()],
-        };
-        anyhow::ensure!(
-            answer_values.iter().all(serde_json::Value::is_string),
-            "Answer for {id} must be a string or an array of strings"
-        );
-        answers.insert(
-            id.to_string(),
-            serde_json::json!({ "answers": answer_values }),
-        );
-    }
-    Ok(serde_json::json!({ "answers": answers }))
+    borg_ui::provider_interaction_response(kind, payload, input)
 }
 
 #[cfg(test)]

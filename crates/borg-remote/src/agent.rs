@@ -2032,7 +2032,9 @@ fn terminal_assistant_text(
     } else {
         final_output
     };
-    if text.trim().is_empty() {
+    if !text.trim().is_empty() && action_intent_is_streaming(text) {
+        Ok(None)
+    } else if text.trim().is_empty() {
         anyhow::ensure!(
             completed_segment || interrupted,
             "provider completed without a visible response (empty result)"
@@ -2753,5 +2755,13 @@ mod tests {
             "provider completed without a visible response (empty result)"
         );
         assert_eq!(terminal_assistant_text("", "", false, true).unwrap(), None);
+        assert_eq!(
+            terminal_assistant_text("[[BORG_ACTION:command]]", "", false, true).unwrap(),
+            None
+        );
+        assert_eq!(
+            terminal_assistant_text("[[BORG_ACTION:command", "", false, true).unwrap(),
+            None
+        );
     }
 }

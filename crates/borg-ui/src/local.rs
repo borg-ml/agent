@@ -5,8 +5,8 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use borg_remote::{
     HostCommand, SessionConfigAction, SessionEventKind, SessionStore, SqliteSessionStore,
-    SubagentAction, default_host_config_path, send_local_session_command,
-    session_control_socket_path,
+    SubagentAction, default_host_config_path, local_session_owner_is_active,
+    send_local_session_command, session_control_socket_path,
 };
 use uuid::Uuid;
 
@@ -61,6 +61,16 @@ impl LocalSessionWorker {
                             return;
                         }
                     };
+                    let mut _owner =
+                        match ensure_session_owner(&client.sessions_dir, client.view().session_id)
+                            .await
+                        {
+                            Ok(owner) => owner,
+                            Err(error) => {
+                                let _ = ready_tx.send(Err(error));
+                                return;
+                            }
+                        };
                     if ready_tx.send(Ok(true)).is_err() {
                         return;
                     }
@@ -90,6 +100,22 @@ impl LocalSessionWorker {
                                 FrontendCommand::OpenSession(session_id) => {
                                     match LocalSessionClient::open(Some(session_id)).await {
                                         Ok(Some(next)) => {
+                                            match ensure_session_owner(
+                                                &next.sessions_dir,
+                                                session_id,
+                                            )
+                                            .await
+                                            {
+                                                Ok(next_owner) => _owner = next_owner,
+                                                Err(error) => {
+                                                    let _ = update_tx.send_blocking(
+                                                        LocalSessionUpdate::Error(
+                                                            error.to_string(),
+                                                        ),
+                                                    );
+                                                    continue;
+                                                }
+                                            }
                                             client = next;
                                             root_session_id = session_id;
                                             Ok(true)
@@ -179,6 +205,46 @@ impl LocalSessionWorker {
     pub fn updates(&self) -> async_channel::Receiver<LocalSessionUpdate> {
         self.updates.clone()
     }
+}
+
+async fn ensure_session_owner(
+    sessions_dir: &Path,
+    session_id: Uuid,
+) -> Result<Option<tokio::process::Child>> {
+    let socket = session_control_socket_path(sessions_dir, session_id);
+    if local_session_owner_is_active(sessions_dir, session_id)? {
+        return Ok(None);
+    }
+    let executable_name = if cfg!(windows) { "borg.exe" } else { "borg" };
+    let borg = std::env::current_exe()
+        .context("failed to locate the Borg GUI executable")?
+        .with_file_name(executable_name);
+    anyhow::ensure!(
+        borg.is_file(),
+        "session is not running and the Borg owner executable was not found at {}",
+        borg.display()
+    );
+    let mut child = tokio::process::Command::new(&borg)
+        .arg("--gui-owner")
+        .arg("--resume")
+        .arg(session_id.to_string())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .with_context(|| format!("failed to start session owner {}", borg.display()))?;
+    for _ in 0..200 {
+        if socket.exists() {
+            return Ok(Some(child));
+        }
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!("Borg session owner exited during startup with {status}");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    child.kill().await.ok();
+    anyhow::bail!("timed out waiting for the Borg session owner")
 }
 
 pub struct LocalSessionClient {

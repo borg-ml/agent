@@ -63,6 +63,15 @@ pub fn local_session_owner_uses_current_binary(
     Ok(metadata.executable_identity == current_executable_identity()?)
 }
 
+/// Whether the recorded local session owner process is still alive, regardless
+/// of which Borg frontend binary is asking.
+pub fn local_session_owner_is_active(sessions_dir: &Path, session_id: Uuid) -> Result<bool> {
+    let Some(metadata) = read_local_session_owner_metadata(sessions_dir, session_id)? else {
+        return Ok(false);
+    };
+    owner_process_matches_metadata(&metadata)
+}
+
 fn read_local_session_owner_metadata(
     sessions_dir: &Path,
     session_id: Uuid,
