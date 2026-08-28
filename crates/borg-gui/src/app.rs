@@ -242,6 +242,9 @@ impl BorgGui {
                     .update(cx, |this, cx| {
                         match update {
                             LocalSessionUpdate::Presentation(presentation) => {
+                                this.composer.update(cx, |composer, _| {
+                                    composer.set_history(&presentation.composer_history)
+                                });
                                 let view = presentation.view;
                                 this.root_session_id = Some(presentation.root_session_id);
                                 if this
@@ -1448,7 +1451,7 @@ impl Render for BorgGui {
                             .pb_3()
                             .text_xs()
                             .text_color(rgb(palette::TEXT_MUTED))
-                        .child(div().id("command-help").cursor_pointer().on_click(cx.listener(Self::toggle_help)).child("send  enter  ·  newline  shift-enter  ·  commands  ctrl-shift-p"))
+                        .child(div().id("command-help").cursor_pointer().on_click(cx.listener(Self::toggle_help)).child("send  enter  ·  newline  shift-enter  ·  history  ↑/↓  ·  commands  ctrl-shift-p"))
                             .child(
                                 self.view
                                     .as_ref()
@@ -1558,6 +1561,8 @@ pub fn run() {
             KeyBinding::new("ctrl-x", composer::Cut, Some("Composer")),
             KeyBinding::new("home", composer::Home, Some("Composer")),
             KeyBinding::new("end", composer::End, Some("Composer")),
+            KeyBinding::new("up", composer::HistoryPrevious, Some("Composer")),
+            KeyBinding::new("down", composer::HistoryNext, Some("Composer")),
             KeyBinding::new("shift-enter", composer::Newline, Some("Composer")),
             KeyBinding::new("alt-enter", composer::Newline, Some("Composer")),
             KeyBinding::new("enter", composer::Submit, Some("Composer")),

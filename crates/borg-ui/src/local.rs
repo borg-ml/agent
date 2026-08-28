@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use borg_remote::{
-    HostCommand, SessionConfigAction, SessionEventKind, SessionStore, SqliteSessionStore,
-    SubagentAction, default_host_config_path, local_session_owner_is_active,
+    EventActor, HostCommand, MessageStatus, SessionConfigAction, SessionEventKind, SessionStore,
+    SqliteSessionStore, SubagentAction, default_host_config_path, local_session_owner_is_active,
     send_local_session_command, session_control_socket_path,
 };
 use uuid::Uuid;
@@ -345,6 +345,7 @@ pub struct LocalSessionClient {
     root_session_id: Uuid,
     timeline: TimelineProjector,
     recalled_prompts: Vec<(String, Vec<PathBuf>)>,
+    composer_history: Arc<Vec<String>>,
 }
 
 impl LocalSessionClient {
@@ -404,6 +405,15 @@ impl LocalSessionClient {
         rebuild_agents(&mut view);
         let durable_history = view.history.as_ref().clone();
         let timeline = TimelineProjector::from_events(&durable_history);
+        let composer_history = store
+            .recent_user_messages(session_id, 100)
+            .await?
+            .into_iter()
+            .filter_map(|event| match event.kind {
+                SessionEventKind::Message { text, .. } => Some(text),
+                _ => None,
+            })
+            .collect();
         let mut client = Self {
             store,
             sessions_dir,
@@ -414,6 +424,7 @@ impl LocalSessionClient {
             root_session_id,
             timeline,
             recalled_prompts: Vec::new(),
+            composer_history: Arc::new(composer_history),
         };
         client.refresh_live().await?;
         client.rebuild_history();
@@ -433,6 +444,7 @@ impl LocalSessionClient {
             view: self.view.clone(),
             root_session_id: self.root_session_id,
             timeline: Arc::new(timeline.into_shared_entries()),
+            composer_history: Arc::clone(&self.composer_history),
         }
     }
 
@@ -443,6 +455,21 @@ impl LocalSessionClient {
             .await?;
         let mut changed = !events.is_empty();
         for event in events {
+            if let SessionEventKind::Message {
+                actor: EventActor::User,
+                text,
+                status: MessageStatus::Complete | MessageStatus::Failed,
+                ..
+            } = &event.kind
+            {
+                let history = Arc::make_mut(&mut self.composer_history);
+                if history.last() != Some(text) {
+                    history.push(text.clone());
+                    if history.len() > 100 {
+                        history.remove(0);
+                    }
+                }
+            }
             if let SessionEventKind::PromptRecalled {
                 text, attachments, ..
             } = &event.kind

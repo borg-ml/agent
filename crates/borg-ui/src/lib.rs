@@ -635,6 +635,7 @@ pub struct SessionPresentation {
     pub view: SessionView,
     pub root_session_id: Uuid,
     pub timeline: std::sync::Arc<Vec<std::sync::Arc<timeline::TimelineEntry>>>,
+    pub composer_history: std::sync::Arc<Vec<String>>,
 }
 
 impl SessionPresentation {
@@ -647,6 +648,7 @@ impl SessionPresentation {
             view,
             root_session_id,
             timeline,
+            composer_history: std::sync::Arc::new(Vec::new()),
         }
     }
 }

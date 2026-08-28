@@ -23,6 +23,8 @@ actions!(
         SelectAll,
         Home,
         End,
+        HistoryPrevious,
+        HistoryNext,
         Paste,
         Cut,
         Copy,
@@ -44,6 +46,9 @@ pub struct Composer {
     last_bounds: Option<Bounds<Pixels>>,
     selecting: bool,
     secret: bool,
+    history: Vec<String>,
+    history_index: Option<usize>,
+    history_draft: SharedString,
 }
 
 impl Composer {
@@ -58,6 +63,9 @@ impl Composer {
             last_bounds: None,
             selecting: false,
             secret: false,
+            history: Vec::new(),
+            history_index: None,
+            history_draft: "".into(),
         }
     }
 
@@ -79,6 +87,7 @@ impl Composer {
         };
         self.content = format!("{}{separator}{text}", self.content).into();
         self.selected = self.content.len()..self.content.len();
+        self.history_index = None;
         cx.notify();
     }
 
@@ -87,6 +96,7 @@ impl Composer {
         self.content = format!("{}{separator}{text}", self.content).into();
         self.selected = self.content.len()..self.content.len();
         self.marked = None;
+        self.history_index = None;
         cx.notify();
     }
 
@@ -94,7 +104,15 @@ impl Composer {
         self.content = text.into();
         self.selected = self.content.len()..self.content.len();
         self.marked = None;
+        self.history_index = None;
         cx.notify();
+    }
+
+    pub fn set_history(&mut self, history: &[String]) {
+        if self.history != history {
+            self.history = history.to_vec();
+            self.history_index = None;
+        }
     }
 
     fn cursor(&self) -> usize {
@@ -169,6 +187,38 @@ impl Composer {
     fn end(&mut self, _: &End, _: &mut Window, cx: &mut Context<Self>) {
         self.move_to(self.content.len(), cx);
     }
+    fn history_previous(&mut self, _: &HistoryPrevious, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self
+            .history_index
+            .map(|index| index.saturating_sub(1))
+            .or_else(|| {
+                self.history_draft = self.content.clone();
+                self.history.len().checked_sub(1)
+            })
+        else {
+            return;
+        };
+        self.history_index = Some(index);
+        self.content = self.history[index].clone().into();
+        self.selected = self.content.len()..self.content.len();
+        self.marked = None;
+        cx.notify();
+    }
+    fn history_next(&mut self, _: &HistoryNext, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self.history_index else {
+            return;
+        };
+        if index + 1 < self.history.len() {
+            self.history_index = Some(index + 1);
+            self.content = self.history[index + 1].clone().into();
+        } else {
+            self.history_index = None;
+            self.content = self.history_draft.clone();
+        }
+        self.selected = self.content.len()..self.content.len();
+        self.marked = None;
+        cx.notify();
+    }
     fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
         if self.selected.is_empty() {
             self.select_to(self.previous(self.cursor()), cx);
@@ -214,6 +264,8 @@ impl Composer {
         self.content = "".into();
         self.selected = 0..0;
         self.marked = None;
+        self.history_index = None;
+        self.history_draft = "".into();
         cx.emit(Submitted(text));
         cx.notify();
     }
@@ -360,6 +412,7 @@ impl EntityInputHandler for Composer {
             .unwrap_or(self.selected.clone());
         self.content =
             (self.content[..range.start].to_owned() + text + &self.content[range.end..]).into();
+        self.history_index = None;
         self.selected = range.start + text.len()..range.start + text.len();
         self.marked = None;
         cx.notify();
@@ -608,6 +661,8 @@ impl Render for Composer {
             .on_action(cx.listener(Self::select_all))
             .on_action(cx.listener(Self::home))
             .on_action(cx.listener(Self::end))
+            .on_action(cx.listener(Self::history_previous))
+            .on_action(cx.listener(Self::history_next))
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::cut))
             .on_action(cx.listener(Self::copy))
