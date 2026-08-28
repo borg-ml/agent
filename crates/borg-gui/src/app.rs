@@ -706,7 +706,10 @@ impl BorgGui {
             String::new()
         } else if entry.body.len() > 12_000 {
             let boundary = entry.body.floor_char_boundary(12_000);
-            format!("{}\n… output truncated", &entry.body[..boundary])
+            format!(
+                "{}\n… output truncated · right-click to copy full text",
+                &entry.body[..boundary]
+            )
         } else {
             entry.body
         };
@@ -753,20 +756,19 @@ impl BorgGui {
             }))
             .px_3()
             .py_2()
+            .on_mouse_up(gpui::MouseButton::Right, move |_, _, cx| {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy_body.clone()));
+            })
             .child(header)
             .when(entry.kind == TimelineKind::Tool, |card| {
-                card.cursor_pointer()
-                    .on_click(move |_, _, cx| {
-                        let _ = view.update(cx, |this, cx| {
-                            if !this.expanded_entries.remove(&entry_id) {
-                                this.expanded_entries.insert(entry_id.clone());
-                            }
-                            cx.notify();
-                        });
-                    })
-                    .on_mouse_up(gpui::MouseButton::Right, move |_, _, cx| {
-                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy_body.clone()));
-                    })
+                card.cursor_pointer().on_click(move |_, _, cx| {
+                    let _ = view.update(cx, |this, cx| {
+                        if !this.expanded_entries.remove(&entry_id) {
+                            this.expanded_entries.insert(entry_id.clone());
+                        }
+                        cx.notify();
+                    });
+                })
             })
             .when(!body.is_empty(), |card| {
                 card.child(
