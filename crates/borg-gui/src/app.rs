@@ -107,6 +107,27 @@ impl BorgGui {
                     cx.notify();
                     return;
                 }
+                "/lsp" => {
+                    this.send(FrontendCommand::Inspect(
+                        borg_ui::FrontendInspection::LanguageServers,
+                    ));
+                    cx.notify();
+                    return;
+                }
+                "/extensions" => {
+                    this.send(FrontendCommand::Inspect(
+                        borg_ui::FrontendInspection::Extensions,
+                    ));
+                    cx.notify();
+                    return;
+                }
+                "/customize" => {
+                    this.send(FrontendCommand::Inspect(
+                        borg_ui::FrontendInspection::Customization,
+                    ));
+                    cx.notify();
+                    return;
+                }
                 "/usage" | "/status" => {
                     this.open_usage_info();
                     cx.notify();
@@ -281,6 +302,9 @@ impl BorgGui {
                                 this.composer
                                     .update(cx, |composer, cx| composer.append_recalled(&text, cx));
                                 this.attachments.extend(attachments);
+                            }
+                            LocalSessionUpdate::Info { title, body } => {
+                                this.info_panel = Some((title.into(), body.into()));
                             }
                             LocalSessionUpdate::Error(error) => this.error = Some(error),
                         }
@@ -912,6 +936,13 @@ impl Render for BorgGui {
             ("/fast on|off", "toggle priority mode", "/fast "),
             ("/settings", "inspect live session settings", "/settings"),
             ("/usage", "inspect tokens, time, and cost", "/usage"),
+            ("/lsp", "inspect language server support", "/lsp"),
+            ("/extensions", "inspect live Blu extensions", "/extensions"),
+            (
+                "/customize",
+                "inspect effective customization",
+                "/customize",
+            ),
             ("/compact", "compact conversation context", "/compact"),
             ("/clear", "clear conversation context", "/clear"),
             ("/recall", "return queued input to the composer", "/recall"),

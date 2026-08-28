@@ -172,6 +172,7 @@ pub enum FrontendCommand {
         attachments: Vec<PathBuf>,
         delivery: PromptDelivery,
     },
+    Inspect(FrontendInspection),
     SetModel {
         provider: CodingProvider,
         model: String,
@@ -187,6 +188,13 @@ pub enum FrontendCommand {
     OpenSession(Uuid),
     LoadOlderHistory,
     Quit,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrontendInspection {
+    Extensions,
+    Customization,
+    LanguageServers,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -664,6 +672,53 @@ impl SessionView {
             cwd,
         }
     }
+}
+
+pub fn lsp_support_summary() -> String {
+    let servers = borg_remote::LspService::supported_status();
+    let mut available = Vec::new();
+    let mut missing = Vec::new();
+    for server in servers.as_array().into_iter().flatten() {
+        let language = server
+            .get("language")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let command = server
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("language server");
+        let extensions = server
+            .get("extensions")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let label = format!("{language} ({extensions}) · {command}");
+        if server
+            .get("available")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            available.push(label);
+        } else {
+            missing.push(label);
+        }
+    }
+    format!(
+        "Available\n{}\n\nInstall on PATH to enable\n{}\n\nServers start lazily when Borg inspects a matching source file.",
+        if available.is_empty() {
+            "none detected".into()
+        } else {
+            available.join("\n")
+        },
+        if missing.is_empty() {
+            "none".into()
+        } else {
+            missing.join("\n")
+        },
+    )
 }
 
 pub mod palette {

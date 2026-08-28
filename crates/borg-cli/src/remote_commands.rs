@@ -7333,50 +7333,7 @@ fn live_customization_summary(
 }
 
 fn lsp_support_summary() -> String {
-    let servers = borg_remote::LspService::supported_status();
-    let mut available = Vec::new();
-    let mut missing = Vec::new();
-    for server in servers.as_array().into_iter().flatten() {
-        let language = server
-            .get("language")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("unknown");
-        let command = server
-            .get("command")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("language server");
-        let extensions = server
-            .get("extensions")
-            .and_then(serde_json::Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(serde_json::Value::as_str)
-            .collect::<Vec<_>>()
-            .join(", ");
-        let label = format!("{language} ({extensions}) · {command}");
-        if server
-            .get("available")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-        {
-            available.push(label);
-        } else {
-            missing.push(label);
-        }
-    }
-    let available = if available.is_empty() {
-        "none detected".to_string()
-    } else {
-        available.join("; ")
-    };
-    let missing = if missing.is_empty() {
-        "none".to_string()
-    } else {
-        missing.join("; ")
-    };
-    format!(
-        "Language servers · available: {available}\nInstall on PATH to enable: {missing}\nServers start lazily when Borg inspects a matching source file."
-    )
+    borg_ui::lsp_support_summary()
 }
 
 fn render_event(

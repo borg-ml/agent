@@ -11,8 +11,8 @@ use borg_remote::{
 use uuid::Uuid;
 
 use crate::{
-    FrontendCommand, PeerIntent, PeerTarget, PromptDelivery, SessionPresentation, SessionView,
-    timeline::TimelineProjector,
+    FrontendCommand, FrontendInspection, PeerIntent, PeerTarget, PromptDelivery,
+    SessionPresentation, SessionView, timeline::TimelineProjector,
 };
 
 pub enum LocalSessionUpdate {
@@ -21,6 +21,10 @@ pub enum LocalSessionUpdate {
     RestoreComposer {
         text: String,
         attachments: Vec<PathBuf>,
+    },
+    Info {
+        title: String,
+        body: String,
     },
     Error(String),
 }
@@ -116,75 +120,87 @@ impl LocalSessionWorker {
                         };
                         if let Ok(command) = tokio::time::timeout(wait, command_rx.recv()).await {
                             let Ok(command) = command else { return };
-                            let result = match command {
-                                FrontendCommand::NewSession => {
-                                    match launch_new_session_owner().await {
-                                        Ok((next, next_owner)) => {
-                                            _owner = next_owner;
-                                            root_session_id = next.view().session_id;
-                                            client = next;
-                                            if let Ok(sessions) = client.list_sessions().await {
-                                                let _ = update_tx.send_blocking(
-                                                    LocalSessionUpdate::Sessions(sessions),
-                                                );
-                                            }
-                                            Ok(true)
-                                        }
-                                        Err(error) => Err(error),
-                                    }
-                                }
-                                FrontendCommand::OpenSession(session_id) => {
-                                    match LocalSessionClient::open(Some(session_id)).await {
-                                        Ok(Some(next)) => {
-                                            match ensure_session_owner(
-                                                &next.sessions_dir,
-                                                session_id,
-                                            )
-                                            .await
-                                            {
-                                                Ok(next_owner) => _owner = next_owner,
-                                                Err(error) => {
+                            let result =
+                                match command {
+                                    FrontendCommand::NewSession => {
+                                        match launch_new_session_owner().await {
+                                            Ok((next, next_owner)) => {
+                                                _owner = next_owner;
+                                                root_session_id = next.view().session_id;
+                                                client = next;
+                                                if let Ok(sessions) = client.list_sessions().await {
                                                     let _ = update_tx.send_blocking(
-                                                        LocalSessionUpdate::Error(
-                                                            error.to_string(),
-                                                        ),
+                                                        LocalSessionUpdate::Sessions(sessions),
                                                     );
-                                                    continue;
                                                 }
+                                                Ok(true)
                                             }
-                                            client = next;
-                                            root_session_id = session_id;
-                                            if let Ok(sessions) = client.list_sessions().await {
+                                            Err(error) => Err(error),
+                                        }
+                                    }
+                                    FrontendCommand::OpenSession(session_id) => {
+                                        match LocalSessionClient::open(Some(session_id)).await {
+                                            Ok(Some(next)) => {
+                                                match ensure_session_owner(
+                                                    &next.sessions_dir,
+                                                    session_id,
+                                                )
+                                                .await
+                                                {
+                                                    Ok(next_owner) => _owner = next_owner,
+                                                    Err(error) => {
+                                                        let _ = update_tx.send_blocking(
+                                                            LocalSessionUpdate::Error(
+                                                                error.to_string(),
+                                                            ),
+                                                        );
+                                                        continue;
+                                                    }
+                                                }
+                                                client = next;
+                                                root_session_id = session_id;
+                                                if let Ok(sessions) = client.list_sessions().await {
+                                                    let _ = update_tx.send_blocking(
+                                                        LocalSessionUpdate::Sessions(sessions),
+                                                    );
+                                                }
+                                                Ok(true)
+                                            }
+                                            Ok(None) => Ok(false),
+                                            Err(error) => Err(error),
+                                        }
+                                    }
+                                    FrontendCommand::FocusAgent(target) => {
+                                        match LocalSessionClient::open_for_root(
+                                            target.unwrap_or(root_session_id),
+                                            root_session_id,
+                                        )
+                                        .await
+                                        {
+                                            Ok(Some(next)) => {
+                                                client = next;
+                                                Ok(true)
+                                            }
+                                            Ok(None) => Ok(false),
+                                            Err(error) => Err(error),
+                                        }
+                                    }
+                                    FrontendCommand::LoadOlderHistory => {
+                                        client.load_older_history().await
+                                    }
+                                    FrontendCommand::Inspect(kind) => {
+                                        match inspect_frontend(kind, &client.view().cwd).await {
+                                            Ok((title, body)) => {
                                                 let _ = update_tx.send_blocking(
-                                                    LocalSessionUpdate::Sessions(sessions),
+                                                    LocalSessionUpdate::Info { title, body },
                                                 );
+                                                Ok(false)
                                             }
-                                            Ok(true)
+                                            Err(error) => Err(error),
                                         }
-                                        Ok(None) => Ok(false),
-                                        Err(error) => Err(error),
                                     }
-                                }
-                                FrontendCommand::FocusAgent(target) => {
-                                    match LocalSessionClient::open_for_root(
-                                        target.unwrap_or(root_session_id),
-                                        root_session_id,
-                                    )
-                                    .await
-                                    {
-                                        Ok(Some(next)) => {
-                                            client = next;
-                                            Ok(true)
-                                        }
-                                        Ok(None) => Ok(false),
-                                        Err(error) => Err(error),
-                                    }
-                                }
-                                FrontendCommand::LoadOlderHistory => {
-                                    client.load_older_history().await
-                                }
-                                command => client.dispatch(command).await.map(|_| false),
-                            };
+                                    command => client.dispatch(command).await.map(|_| false),
+                                };
                             match result {
                                 Ok(true) => {
                                     let _ = update_tx.send_blocking(
@@ -333,6 +349,43 @@ fn borg_executable() -> Result<PathBuf> {
         borg.display()
     );
     Ok(borg)
+}
+
+async fn inspect_frontend(kind: FrontendInspection, cwd: &Path) -> Result<(String, String)> {
+    if kind == FrontendInspection::LanguageServers {
+        return Ok(("LANGUAGE SERVERS".into(), crate::lsp_support_summary()));
+    }
+    let borg = borg_executable()?;
+    let arguments: &[&str] = match kind {
+        FrontendInspection::Extensions => &["extensions", "list"],
+        FrontendInspection::Customization => &["customize", "inspect"],
+        FrontendInspection::LanguageServers => unreachable!(),
+    };
+    let output = tokio::process::Command::new(&borg)
+        .args(arguments)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+        .with_context(|| format!("failed to run {} {}", borg.display(), arguments.join(" ")))?;
+    anyhow::ensure!(
+        output.status.success(),
+        "{} {} exited with {}: {}",
+        borg.display(),
+        arguments.join(" "),
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    let body = String::from_utf8(output.stdout).context("Borg inspection output was not UTF-8")?;
+    Ok((
+        match kind {
+            FrontendInspection::Extensions => "BLU EXTENSIONS",
+            FrontendInspection::Customization => "EFFECTIVE CUSTOMIZATION",
+            FrontendInspection::LanguageServers => unreachable!(),
+        }
+        .into(),
+        body.trim().to_string(),
+    ))
 }
 
 pub struct LocalSessionClient {
@@ -690,7 +743,8 @@ impl LocalSessionClient {
             FrontendCommand::FocusAgent(_)
             | FrontendCommand::NewSession
             | FrontendCommand::OpenSession(_)
-            | FrontendCommand::LoadOlderHistory => return Ok(()),
+            | FrontendCommand::LoadOlderHistory
+            | FrontendCommand::Inspect(_) => return Ok(()),
             FrontendCommand::Quit => HostCommand::Stop { session_id },
         };
         send_local_session_command(
