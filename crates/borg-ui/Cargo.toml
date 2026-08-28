@@ -13,9 +13,11 @@ publish = false
 [dependencies]
 anyhow.workspace = true
 async-channel = "2.5"
+borg-provider = { path = "../borg-provider" }
 borg-remote = { path = "../borg-remote", default-features = false }
 chrono.workspace = true
 dirs.workspace = true
+pulldown-cmark = "0.13"
 serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true

@@ -1167,9 +1167,11 @@ version = "0.3.7"
 dependencies = [
  "anyhow",
  "async-channel 2.5.0",
+ "borg-provider",
  "borg-remote",
  "chrono",
  "dirs 6.0.0",
+ "pulldown-cmark",
  "serde",
  "serde_json",
  "tempfile",

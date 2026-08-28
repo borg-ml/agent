@@ -680,7 +680,7 @@ pub fn run_claude_chat_stream(request: ChatStreamRequest) -> mpsc::Receiver<Chat
     #[cfg(not(feature = "claude"))]
     {
         let _ = request;
-        return unavailable_stream("Claude", "claude");
+        unavailable_stream("Claude", "claude")
     }
     #[cfg(feature = "claude")]
     run_subscription_stream(
@@ -698,7 +698,7 @@ pub fn run_claude_chat_stream_with_control(
     #[cfg(not(feature = "claude"))]
     {
         let _ = (request, controls);
-        return unavailable_stream("Claude", "claude");
+        unavailable_stream("Claude", "claude")
     }
     #[cfg(feature = "claude")]
     run_subscription_stream(
@@ -717,7 +717,7 @@ pub fn run_claude_local_chat_stream(
     #[cfg(not(feature = "claude"))]
     {
         let _ = (request, controls, permission);
-        return unavailable_stream("Claude", "claude");
+        unavailable_stream("Claude", "claude")
     }
     #[cfg(feature = "claude")]
     run_subscription_stream(request, controls, SubscriptionProvider::Claude, permission)
@@ -733,7 +733,7 @@ pub fn run_claude_local_chat_stream_pooled(
     #[cfg(not(feature = "claude"))]
     {
         let _ = (request, controls, permission, pool);
-        return unavailable_stream("Claude", "claude");
+        unavailable_stream("Claude", "claude")
     }
     #[cfg(feature = "claude")]
     {
@@ -763,7 +763,7 @@ pub fn run_codex_chat_stream(request: ChatStreamRequest) -> mpsc::Receiver<ChatS
     #[cfg(not(feature = "codex"))]
     {
         let _ = request;
-        return unavailable_stream("Codex", "codex");
+        unavailable_stream("Codex", "codex")
     }
     #[cfg(feature = "codex")]
     run_subscription_stream(
@@ -781,7 +781,7 @@ pub fn run_codex_chat_stream_with_control(
     #[cfg(not(feature = "codex"))]
     {
         let _ = (request, controls);
-        return unavailable_stream("Codex", "codex");
+        unavailable_stream("Codex", "codex")
     }
     #[cfg(feature = "codex")]
     run_subscription_stream(
@@ -800,7 +800,7 @@ pub fn run_codex_local_chat_stream(
     #[cfg(not(feature = "codex"))]
     {
         let _ = (request, controls, permission);
-        return unavailable_stream("Codex", "codex");
+        unavailable_stream("Codex", "codex")
     }
     #[cfg(feature = "codex")]
     run_subscription_stream(request, controls, SubscriptionProvider::Codex, permission)
@@ -816,7 +816,7 @@ pub fn run_codex_local_chat_stream_pooled(
     #[cfg(not(feature = "codex"))]
     {
         let _ = (request, controls, permission, pool);
-        return unavailable_stream("Codex", "codex");
+        unavailable_stream("Codex", "codex")
     }
     #[cfg(feature = "codex")]
     {

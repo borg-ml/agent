@@ -1,16 +1,16 @@
 use crate::composer::{self, Composer, PastedImage, Submitted};
 use borg_dictation::{DictationUpdate, DictationWorker};
 use borg_ui::{
-    ApprovalDecision, CodingProvider, FrontendCommand, PromptDelivery, ResponseLanguage,
-    SessionView,
+    ApprovalDecision, CodingProvider, FrontendCommand, ModelOption, PromptDelivery,
+    ResponseLanguage, SessionView,
     local::{LocalSessionOption, LocalSessionUpdate, LocalSessionWorker},
     palette,
     timeline::{TimelineEntry, TimelineKind, tool_lifecycle_label},
 };
 use gpui::{
-    App, Application, Bounds, Context, Entity, Focusable, FontWeight, KeyBinding, ListAlignment,
-    ListState, PathPromptOptions, SharedString, Window, WindowBounds, WindowOptions, div, list,
-    prelude::*, px, rgb, size,
+    App, Application, Bounds, Context, Entity, Focusable, FontStyle, FontWeight, HighlightStyle,
+    KeyBinding, ListAlignment, ListState, PathPromptOptions, SharedString, StyledText, Window,
+    WindowBounds, WindowOptions, div, list, prelude::*, px, rgb, size,
 };
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -34,6 +34,28 @@ fn shared_prefix_len<T>(old: &[Arc<T>], new: &[Arc<T>]) -> usize {
         .count()
 }
 
+fn rich_text_element(rich: &borg_ui::markdown::RichText) -> StyledText {
+    let highlights = rich.spans.iter().map(|span| {
+        let mut style = HighlightStyle::default();
+        if span.style.strong || span.style.heading {
+            style = style.highlight(FontWeight::BOLD.into());
+        }
+        if span.style.emphasis {
+            style = style.highlight(FontStyle::Italic.into());
+        }
+        if span.style.code {
+            style.color = Some(rgb(palette::BLUE).into());
+            style.background_color = Some(rgb(palette::SURFACE_RAISED).into());
+        } else if span.style.link {
+            style.color = Some(rgb(palette::BLUE).into());
+        } else if span.style.heading {
+            style.color = Some(rgb(palette::ORANGE).into());
+        }
+        (span.range.clone(), style)
+    });
+    StyledText::new(rich.text.clone()).with_highlights(highlights)
+}
+
 struct BorgGui {
     worker: Option<LocalSessionWorker>,
     view: Option<SessionView>,
@@ -46,6 +68,8 @@ struct BorgGui {
     attachments: Vec<PathBuf>,
     sessions: Vec<LocalSessionOption>,
     sessions_open: bool,
+    models_open: bool,
+    model_options: Vec<ModelOption>,
     dictation: Option<DictationWorker>,
     dictation_status: SharedString,
     help_open: bool,
@@ -109,6 +133,29 @@ impl BorgGui {
                 }
                 "/resume" => {
                     this.sessions_open = true;
+                    cx.notify();
+                    return;
+                }
+                "/model" => {
+                    this.open_model_picker();
+                    cx.notify();
+                    return;
+                }
+                "/login" => {
+                    if let Some(provider) = this
+                        .view
+                        .as_ref()
+                        .and_then(|view| view.state.configuration.as_ref())
+                        .map(|configuration| configuration.provider)
+                    {
+                        this.info_panel = Some((
+                            format!("{} LOGIN", provider.label().to_uppercase()).into(),
+                            "Starting native browser/device login…".into(),
+                        ));
+                        this.send(FrontendCommand::LoginProvider(provider));
+                    } else {
+                        this.error = Some("This session does not have a provider yet".into());
+                    }
                     cx.notify();
                     return;
                 }
@@ -251,6 +298,8 @@ impl BorgGui {
             attachments: Vec::new(),
             sessions: Vec::new(),
             sessions_open: false,
+            models_open: false,
+            model_options: Vec::new(),
             dictation,
             dictation_status: "dictate".into(),
             help_open: false,
@@ -393,6 +442,8 @@ impl BorgGui {
             self.help_open = false;
         } else if self.sessions_open {
             self.sessions_open = false;
+        } else if self.models_open {
+            self.models_open = false;
         } else {
             self.send(FrontendCommand::Interrupt);
         }
@@ -564,9 +615,45 @@ impl BorgGui {
         cx.notify();
     }
     fn edit_model(&mut self, _: &gpui::ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
-        self.composer
-            .update(cx, |composer, cx| composer.set_text("/model ", cx));
-        window.focus(&self.composer.focus_handle(cx));
+        let _ = window;
+        self.open_model_picker();
+        cx.notify();
+    }
+    fn login_current_provider(
+        &mut self,
+        _: &gpui::ClickEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(provider) = self
+            .view
+            .as_ref()
+            .and_then(|view| view.state.configuration.as_ref())
+            .map(|configuration| configuration.provider)
+        else {
+            self.error = Some("This session does not have a provider yet".into());
+            cx.notify();
+            return;
+        };
+        self.info_panel = Some((
+            format!("{} LOGIN", provider.label().to_uppercase()).into(),
+            "Starting native browser/device login…".into(),
+        ));
+        self.send(FrontendCommand::LoginProvider(provider));
+        cx.notify();
+    }
+    fn open_model_picker(&mut self) {
+        let Some(configuration) = self
+            .view
+            .as_ref()
+            .and_then(|view| view.state.configuration.as_ref())
+        else {
+            self.error = Some("This session is not configured yet".into());
+            return;
+        };
+        self.model_options =
+            borg_ui::model_options(configuration.provider, configuration.model.as_deref());
+        self.models_open = true;
     }
     fn cycle_effort(&mut self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
         const LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultra"];
@@ -714,11 +801,13 @@ impl BorgGui {
             ""
         };
         let copy_body = entry.body.clone();
+        let rich_body = entry.rich_body.clone();
         let title = if entry.kind == TimelineKind::Tool {
             tool_lifecycle_label(&entry.title, !entry.running).into_owned()
         } else {
             entry.title.clone()
         };
+        let body_truncated = entry.body.len() > 12_000;
         let body = if entry.kind == TimelineKind::Tool && !expanded {
             String::new()
         } else if entry.body.len() > 12_000 {
@@ -730,6 +819,10 @@ impl BorgGui {
         } else {
             entry.body
         };
+        let rich_body = (!body.is_empty() && !body_truncated)
+            .then_some(rich_body)
+            .flatten();
+        let has_rich_body = rich_body.is_some();
         let header = div()
             .flex()
             .items_center()
@@ -787,7 +880,21 @@ impl BorgGui {
                     });
                 })
             })
-            .when(!body.is_empty(), |card| {
+            .when_some(rich_body, |card, rich| {
+                card.child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .text_color(rgb(if compact {
+                            palette::TEXT_MUTED
+                        } else {
+                            palette::TEXT
+                        }))
+                        .whitespace_normal()
+                        .child(rich_text_element(&rich)),
+                )
+            })
+            .when(!body.is_empty() && !has_rich_body, |card| {
                 card.child(
                     div()
                         .w_full()
@@ -916,6 +1023,19 @@ impl Render for BorgGui {
             PromptDelivery::Steer => "steer",
             PromptDelivery::Queue => "queue",
         };
+        let login_required = self
+            .view
+            .as_ref()
+            .and_then(|view| view.state.configuration.as_ref())
+            .and_then(|configuration| {
+                self.view
+                    .as_ref()?
+                    .state
+                    .provider_capabilities
+                    .iter()
+                    .find(|capability| capability.provider == configuration.provider)
+            })
+            .is_some_and(|capability| capability.installed && !capability.authenticated);
         let attachment_labels = self
             .attachments
             .iter()
@@ -949,6 +1069,7 @@ impl Render for BorgGui {
             ),
             ("/todo add TEXT", "update the durable plan", "/todo add "),
             ("/model MODEL", "switch model", "/model "),
+            ("/login", "reconnect the current provider", "/login"),
             ("/effort LEVEL", "change reasoning effort", "/effort "),
             ("/permission MODE", "full, auto, or manual", "/permission "),
             ("/language NAME", "change response language", "/language "),
@@ -1090,6 +1211,110 @@ impl Render for BorgGui {
                                         .child(detail),
                                 )
                         })),
+                )
+            })
+            .when(self.models_open, |root| {
+                let current = self
+                    .view
+                    .as_ref()
+                    .and_then(|view| view.state.configuration.as_ref())
+                    .and_then(|configuration| configuration.model.clone());
+                let options = self.model_options.clone();
+                root.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .bg(gpui::rgba(0x00000088))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            div()
+                                .id("model-picker")
+                                .w(px(680.))
+                                .max_h(px(620.))
+                                .overflow_y_scroll()
+                                .border_1()
+                                .border_color(rgb(palette::BORDER))
+                                .bg(rgb(palette::SURFACE))
+                                .p_3()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .px_2()
+                                        .py_2()
+                                        .child(
+                                            div()
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(rgb(palette::ORANGE))
+                                                .child("CHOOSE MODEL"),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(palette::TEXT_MUTED))
+                                                .child("esc to close"),
+                                        ),
+                                )
+                                .children(options.into_iter().enumerate().map(|(index, option)| {
+                                    let selected = current.as_deref() == Some(option.id.as_str());
+                                    let provider = option.provider;
+                                    let model = option.id.clone();
+                                    div()
+                                        .id(SharedString::from(format!("model-{index}")))
+                                        .px_3()
+                                        .py_2()
+                                        .cursor_pointer()
+                                        .bg(rgb(if selected {
+                                            palette::SURFACE_RAISED
+                                        } else {
+                                            palette::SURFACE
+                                        }))
+                                        .hover(|style| style.bg(rgb(palette::SURFACE_RAISED)))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.send(FrontendCommand::SetModel {
+                                                provider,
+                                                model: model.clone(),
+                                            });
+                                            this.models_open = false;
+                                            cx.notify();
+                                        }))
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .justify_between()
+                                                .child(div().text_sm().child(option.label))
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(rgb(if selected {
+                                                            palette::GREEN
+                                                        } else {
+                                                            palette::TEXT_MUTED
+                                                        }))
+                                                        .child(if selected {
+                                                            "current".to_string()
+                                                        } else {
+                                                            option.provider.label().to_string()
+                                                        }),
+                                                ),
+                                        )
+                                        .when_some(option.detail, |row, detail| {
+                                            row.child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(rgb(palette::TEXT_MUTED))
+                                                    .child(detail),
+                                            )
+                                        })
+                                })),
+                        ),
                 )
             })
             .child(
@@ -1314,6 +1539,21 @@ impl Render for BorgGui {
                                 div()
                                     .flex()
                                     .gap_2()
+                                    .when(login_required, |actions| {
+                                        actions.child(
+                                            div()
+                                                .id("provider-login")
+                                                .px_2()
+                                                .rounded_sm()
+                                                .text_color(rgb(palette::ORANGE))
+                                                .hover(|style| {
+                                                    style.bg(rgb(palette::SURFACE_RAISED))
+                                                })
+                                                .cursor_pointer()
+                                                .on_click(cx.listener(Self::login_current_provider))
+                                                .child("login"),
+                                        )
+                                    })
                                     .child(
                                         div()
                                             .id("delivery")
@@ -1544,6 +1784,7 @@ impl Render for BorgGui {
                 )
             })
             .when_some(self.info_panel.clone(), |root, (title, body)| {
+                let copy_body = body.clone();
                 root.child(
                     div()
                         .absolute()
@@ -1555,6 +1796,11 @@ impl Render for BorgGui {
                         .child(
                             div()
                                 .id("info-panel")
+                                .on_mouse_up(gpui::MouseButton::Right, move |_, _, cx| {
+                                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                        copy_body.to_string(),
+                                    ));
+                                })
                                 .w(px(680.))
                                 .max_h(px(620.))
                                 .overflow_y_scroll()

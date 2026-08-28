@@ -13,6 +13,7 @@ use chrono::{DateTime, Utc};
 use futures::{StreamExt, stream};
 use reqwest::{Client, StatusCode, header::RETRY_AFTER};
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::Command;
 use tokio::sync::{Mutex, mpsc, watch};
 use url::{Host, Url};
@@ -1389,26 +1390,102 @@ pub fn provider_credentials_present(provider: CodingProvider) -> bool {
     }
 }
 
-pub async fn login_provider(provider: CodingProvider) -> Result<()> {
+fn provider_login_command(provider: CodingProvider) -> Result<Command> {
     if provider.uses_native_harness() {
         bail!(
             "{provider:?} uses API credentials from the environment; configure the provider key and endpoint variables"
         );
     }
-    let status = match provider {
-        CodingProvider::Codex => Command::new("codex")
-            .args(["login", "--device-auth"])
-            .status(),
-        CodingProvider::Claude => Command::new("claude").args(["auth", "login"]).status(),
-        CodingProvider::OpenCode => Command::new("opencode")
-            .args(["providers", "login"])
-            .status(),
+    let mut command = Command::new(provider.executable());
+    match provider {
+        CodingProvider::Codex => {
+            command.args(["login", "--device-auth"]);
+        }
+        CodingProvider::Claude => {
+            command.args(["auth", "login"]);
+        }
+        CodingProvider::OpenCode => {
+            command.args(["providers", "login"]);
+        }
         CodingProvider::Kimi | CodingProvider::OpenRouter | CodingProvider::OpenAiCompatible => {
             unreachable!("handled above")
         }
+    };
+    Ok(command)
+}
+
+pub async fn login_provider(provider: CodingProvider) -> Result<()> {
+    let status = provider_login_command(provider)?
+        .status()
+        .await
+        .with_context(|| format!("failed to start {} login", provider.executable()))?;
+    if !status.success() {
+        bail!("{} login exited with {status}", provider.executable());
     }
-    .await
-    .with_context(|| format!("failed to start {} login", provider.executable()))?;
+    let auth = provider_auth_status(provider).await.with_context(|| {
+        format!(
+            "{} login completed but auth status failed",
+            provider.executable()
+        )
+    })?;
+    anyhow::ensure!(
+        match provider {
+            CodingProvider::Claude => claude_auth_status_authenticated(&auth),
+            _ => !auth.trim().is_empty(),
+        },
+        "{} login completed but no authenticated session is available",
+        provider.executable()
+    );
+    if let Some(cache) = PROVIDER_CAPABILITIES_CACHE.get() {
+        cache.lock().await.clear();
+    }
+    Ok(())
+}
+
+async fn stream_provider_login_output(
+    stream: impl AsyncRead + Unpin,
+    tx: mpsc::UnboundedSender<String>,
+) {
+    let mut lines = BufReader::new(stream).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        let _ = tx.send(line);
+    }
+}
+
+/// Run a provider's browser/device login without requiring a terminal and
+/// stream its user-facing output to a native frontend.
+pub async fn login_provider_with_output(
+    provider: CodingProvider,
+    mut on_output: impl FnMut(&str) + Send,
+) -> Result<()> {
+    let mut command = provider_login_command(provider)?;
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("failed to start {} login", provider.executable()))?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("provider login stdout missing")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("provider login stderr missing")?;
+    let (line_tx, mut line_rx) = mpsc::unbounded_channel();
+    let stdout_task = tokio::spawn(stream_provider_login_output(stdout, line_tx.clone()));
+    let stderr_task = tokio::spawn(stream_provider_login_output(stderr, line_tx.clone()));
+    drop(line_tx);
+    while let Some(line) = line_rx.recv().await {
+        on_output(&line);
+    }
+    let _ = tokio::join!(stdout_task, stderr_task);
+    let status = child
+        .wait()
+        .await
+        .with_context(|| format!("failed to wait for {} login", provider.executable()))?;
     if !status.success() {
         bail!("{} login exited with {status}", provider.executable());
     }
@@ -3725,6 +3802,28 @@ mod tests {
     use tokio::net::{TcpListener, TcpStream};
 
     use super::*;
+
+    #[test]
+    fn native_provider_login_commands_use_non_terminal_flows() {
+        let codex = provider_login_command(CodingProvider::Codex).unwrap();
+        assert_eq!(
+            codex
+                .as_std()
+                .get_args()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            ["login", "--device-auth"]
+        );
+        let claude = provider_login_command(CodingProvider::Claude).unwrap();
+        assert_eq!(
+            claude
+                .as_std()
+                .get_args()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            ["auth", "login"]
+        );
+    }
     use crate::{RuntimeMcpServer, WorkspaceFilesystemOperation};
 
     async fn sqlite_receipts() -> SqliteReceiptStore {

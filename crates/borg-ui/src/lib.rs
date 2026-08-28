@@ -12,6 +12,7 @@ pub use borg_remote::{
 use uuid::Uuid;
 
 pub mod local;
+pub mod markdown;
 pub mod preferences;
 pub mod timeline;
 
@@ -173,6 +174,7 @@ pub enum FrontendCommand {
         delivery: PromptDelivery,
     },
     Inspect(FrontendInspection),
+    LoginProvider(CodingProvider),
     SetModel {
         provider: CodingProvider,
         model: String,
@@ -188,6 +190,104 @@ pub enum FrontendCommand {
     OpenSession(Uuid),
     LoadOlderHistory,
     Quit,
+}
+
+#[derive(Clone, Debug)]
+pub struct ModelOption {
+    pub provider: CodingProvider,
+    pub id: String,
+    pub label: String,
+    pub detail: Option<String>,
+}
+
+pub fn model_options(provider: CodingProvider, current: Option<&str>) -> Vec<ModelOption> {
+    let mut options = Vec::new();
+    for target in CodingProvider::CATALOG_PROVIDERS {
+        if let Some(catalog) = target.model_catalog() {
+            options.extend(
+                catalog
+                    .selectable_models
+                    .iter()
+                    .map(|(id, label)| ModelOption {
+                        provider: target,
+                        id: (*id).to_string(),
+                        label: (*id).to_string(),
+                        detail: Some((*label).to_string()),
+                    }),
+            );
+        }
+    }
+    let openrouter = borg_provider::openrouter_model_entries();
+    let mut openrouter_models =
+        borg_provider::dynamic_models_for_backend("openrouter", current, &openrouter);
+    if openrouter_models.is_empty() {
+        let id = borg_provider::openrouter_product_model().to_string();
+        openrouter_models.push(borg_provider::DynamicModelEntry {
+            id: id.clone(),
+            label: id,
+            detail: Some("OpenRouter model; enter another id with /model MODEL".into()),
+        });
+    }
+    options.extend(openrouter_models.into_iter().map(|model| ModelOption {
+        provider: CodingProvider::OpenRouter,
+        id: model.id,
+        label: model.label,
+        detail: model.detail,
+    }));
+    if provider == CodingProvider::Kimi {
+        let id = borg_provider::kimi_product_model().to_string();
+        options.push(ModelOption {
+            provider,
+            label: id.clone(),
+            id,
+            detail: Some("Borg-managed Kimi model".into()),
+        });
+    }
+    if matches!(
+        provider,
+        CodingProvider::OpenAiCompatible | CodingProvider::OpenCode
+    ) {
+        let config = borg_provider::LocalModelDiscoveryConfig::from_standard_environment();
+        if let Ok(discovered) = borg_provider::discover_dynamic_model_entries(&config) {
+            options.extend(
+                borg_provider::dynamic_models_for_backend(
+                    provider.catalog_backend(),
+                    current,
+                    &discovered,
+                )
+                .into_iter()
+                .map(|model| ModelOption {
+                    provider,
+                    id: model.id,
+                    label: model.label,
+                    detail: model.detail,
+                }),
+            );
+        }
+    }
+    options.sort_by(|left, right| {
+        left.provider
+            .label()
+            .cmp(right.provider.label())
+            .then_with(|| left.label.cmp(&right.label))
+    });
+    options.dedup_by(|left, right| left.provider == right.provider && left.id == right.id);
+    if let Some(current) = current
+        && !options
+            .iter()
+            .any(|option| option.provider == provider && option.id == current)
+    {
+        options.insert(
+            0,
+            ModelOption {
+                provider,
+                id: current.to_string(),
+                label: current.to_string(),
+                detail: Some("Current model".into()),
+            },
+        );
+    }
+    options
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -773,6 +873,27 @@ pub fn parse_goal_action(line: &str) -> anyhow::Result<GoalAction> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_model_picker_crosses_catalog_backends() {
+        let options = model_options(CodingProvider::Codex, Some("gpt-5.6-sol"));
+
+        assert!(
+            options
+                .iter()
+                .any(|option| option.provider == CodingProvider::Codex)
+        );
+        assert!(
+            options
+                .iter()
+                .any(|option| option.provider == CodingProvider::Claude)
+        );
+        assert!(
+            options
+                .iter()
+                .any(|option| option.provider == CodingProvider::OpenRouter)
+        );
+    }
 
     #[test]
     fn submission_parser_keeps_commands_out_of_prompts() {

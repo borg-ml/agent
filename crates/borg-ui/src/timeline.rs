@@ -108,6 +108,7 @@ pub struct TimelineEntry {
     pub title: String,
     pub detail: Option<String>,
     pub body: String,
+    pub rich_body: Option<Arc<crate::markdown::RichText>>,
     pub running: bool,
     pub failed: bool,
 }
@@ -168,6 +169,8 @@ impl TimelineProjector {
                     title: title.into(),
                     detail: message_status_label(*status).map(str::to_string),
                     body: text.clone(),
+                    rich_body: matches!(actor, EventActor::Assistant)
+                        .then(|| Arc::new(crate::markdown::project_markdown(text))),
                     running: matches!(status, MessageStatus::Queued | MessageStatus::InProgress),
                     failed: *status == MessageStatus::Failed,
                 };
@@ -197,6 +200,7 @@ impl TimelineProjector {
                         title: "Thinking".into(),
                         detail: None,
                         body: text.clone(),
+                        rich_body: None,
                         running: true,
                         failed: false,
                     }));
@@ -227,6 +231,7 @@ impl TimelineProjector {
                     title,
                     detail: (!detail.is_empty()).then_some(detail),
                     body: String::new(),
+                    rich_body: None,
                     running: true,
                     failed: false,
                 };
@@ -249,6 +254,7 @@ impl TimelineProjector {
                     entry.running = false;
                     entry.failed = *is_error;
                     entry.body = output.clone();
+                    entry.rich_body = None;
                 } else {
                     self.entries.push(Arc::new(TimelineEntry {
                         id: format!("tool:{tool_call_id}"),
@@ -257,6 +263,7 @@ impl TimelineProjector {
                         title: "Completed tool".into(),
                         detail: None,
                         body: output.clone(),
+                        rich_body: None,
                         running: false,
                         failed: *is_error,
                     }));
@@ -314,6 +321,7 @@ fn simple_entry(
         title: title.into(),
         detail: None,
         body: body.into(),
+        rich_body: None,
         running,
         failed,
     }

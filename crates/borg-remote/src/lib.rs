@@ -69,9 +69,9 @@ pub use extension_api::{
 pub use filesystem::{execute_workspace_filesystem, execute_workspace_filesystem_with_limits};
 pub use host::{
     HostConfig, HostExecutorFactory, default_host_config_path, enroll_host, login_provider,
-    mirror_local_session, probe_capabilities, probe_provider_admission_capabilities,
-    probe_provider_capabilities, provider_credentials_present, run_host,
-    run_host_with_executor_factory,
+    login_provider_with_output, mirror_local_session, probe_capabilities,
+    probe_provider_admission_capabilities, probe_provider_capabilities,
+    provider_credentials_present, run_host, run_host_with_executor_factory,
 };
 pub use local_control::{
     LocalSessionControlServer, force_terminate_local_session_owner, local_session_owner_is_active,

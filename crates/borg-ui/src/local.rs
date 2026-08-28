@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use borg_remote::{
     EventActor, HostCommand, MessageStatus, SessionConfigAction, SessionEventKind, SessionStore,
     SqliteSessionStore, SubagentAction, default_host_config_path, local_session_owner_is_active,
-    send_local_session_command, session_control_socket_path,
+    login_provider_with_output, send_local_session_command, session_control_socket_path,
 };
 use uuid::Uuid;
 
@@ -198,6 +198,54 @@ impl LocalSessionWorker {
                                                 Ok(false)
                                             }
                                             Err(error) => Err(error),
+                                        }
+                                    }
+                                    FrontendCommand::LoginProvider(provider) => {
+                                        if matches!(
+                                            client.view().state.status,
+                                            Some(
+                                                crate::SessionStatus::Starting
+                                                    | crate::SessionStatus::Running
+                                                    | crate::SessionStatus::WaitingForApproval
+                                            )
+                                        ) {
+                                            Err(anyhow::anyhow!(
+                                                "Interrupt the current turn before reconnecting the provider"
+                                            ))
+                                        } else {
+                                            let title = format!("{} LOGIN", provider.label().to_uppercase());
+                                            let mut body = format!(
+                                                "Starting {} login. Complete the browser or device flow shown below.\n",
+                                                provider.label()
+                                            );
+                                            let _ = update_tx.send_blocking(LocalSessionUpdate::Info {
+                                                title: title.clone(),
+                                                body: body.clone(),
+                                            });
+                                            let login = login_provider_with_output(provider, |line| {
+                                                if body.len() > 16_000 {
+                                                    let boundary = body.floor_char_boundary(body.len() - 12_000);
+                                                    body.drain(..boundary);
+                                                }
+                                                body.push_str(line);
+                                                body.push('\n');
+                                                let _ = update_tx.send_blocking(LocalSessionUpdate::Info {
+                                                    title: title.clone(),
+                                                    body: body.clone(),
+                                                });
+                                            })
+                                            .await;
+                                            match login {
+                                                Ok(()) => {
+                                                    body.push_str("\nLogin complete. This provider is ready.");
+                                                    let _ = update_tx.send_blocking(LocalSessionUpdate::Info {
+                                                        title,
+                                                        body,
+                                                    });
+                                                    Ok(false)
+                                                }
+                                                Err(error) => Err(error),
+                                            }
                                         }
                                     }
                                     command => client.dispatch(command).await.map(|_| false),
@@ -746,7 +794,8 @@ impl LocalSessionClient {
             | FrontendCommand::NewSession
             | FrontendCommand::OpenSession(_)
             | FrontendCommand::LoadOlderHistory
-            | FrontendCommand::Inspect(_) => return Ok(()),
+            | FrontendCommand::Inspect(_)
+            | FrontendCommand::LoginProvider(_) => return Ok(()),
             FrontendCommand::Quit => HostCommand::Stop { session_id },
         };
         send_local_session_command(

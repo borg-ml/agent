@@ -119,3 +119,10 @@ session and starts a headless Borg owner when that session is not already
 running. On a fresh installation it creates and owns a new session. Use
 `borg gui --session UUID` (or `borg-gui --session UUID`) to open a specific
 session; the native session menu can switch or create sessions after launch.
+
+The model status control opens the cross-provider catalog picker. `/login`
+runs the current provider's browser/device authentication flow inside the
+native app and streams its instructions into a copyable inspector. Assistant
+messages are projected into styled headings, emphasis, code, links, lists,
+tasks, rules, and math before they reach GPUI, keeping Markdown parsing off the
+window thread.
