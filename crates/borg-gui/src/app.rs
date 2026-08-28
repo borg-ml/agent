@@ -27,6 +27,13 @@ const UI_FONT: &str = if cfg!(target_os = "macos") {
     "monospace"
 };
 
+fn shared_prefix_len<T>(old: &[Arc<T>], new: &[Arc<T>]) -> usize {
+    old.iter()
+        .zip(new)
+        .take_while(|(old, new)| Arc::ptr_eq(old, new))
+        .count()
+}
+
 struct BorgGui {
     worker: Option<LocalSessionWorker>,
     view: Option<SessionView>,
@@ -285,18 +292,8 @@ impl BorgGui {
                                     this.transcript_state.reset(presentation.timeline.len());
                                     this.expanded_entries.clear();
                                 } else {
-                                    // Projection preserves Arc identity for the unchanged prefix and
-                                    // replaces only its suffix, so walk the usually tiny changed tail.
-                                    let mut common_prefix =
-                                        this.timeline.len().min(presentation.timeline.len());
-                                    while common_prefix > 0
-                                        && !Arc::ptr_eq(
-                                            &this.timeline[common_prefix - 1],
-                                            &presentation.timeline[common_prefix - 1],
-                                        )
-                                    {
-                                        common_prefix -= 1;
-                                    }
+                                    let common_prefix =
+                                        shared_prefix_len(&this.timeline, &presentation.timeline);
                                     this.transcript_state.splice(
                                         common_prefix..this.timeline.len(),
                                         presentation.timeline.len() - common_prefix,
@@ -1663,4 +1660,21 @@ pub fn run() {
             .ok();
         cx.activate(true);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shared_prefix_len;
+    use std::sync::Arc;
+
+    #[test]
+    fn timeline_refresh_starts_at_an_updated_entry_before_an_unchanged_suffix() {
+        let first = Arc::new("first");
+        let running_tool = Arc::new("running");
+        let trailing = Arc::new("trailing");
+        let old = vec![first.clone(), running_tool, trailing.clone()];
+        let new = vec![first, Arc::new("completed with stdout"), trailing];
+
+        assert_eq!(shared_prefix_len(&old, &new), 1);
+    }
 }
