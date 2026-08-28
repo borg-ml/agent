@@ -85,10 +85,37 @@ output device.
 
 The baseline reference is `artifacts/gui-port/tui-baseline-focused.png`.
 
+## Screenshot comparison
+
+The checked-in references keep the comparison reproducible:
+
+- `artifacts/gui-port/tui-baseline-focused.png` captures the TUI's message
+  edges, muted reasoning, compact action rail, status density, and anchored
+  composer.
+- `artifacts/gui-port/gui-live-virtualized.png` captures the same durable
+  session through GPUI with the transcript virtualized at a narrow workstation
+  width.
+
+The comparison drove concrete changes rather than pixel imitation. The native
+surface now preserves the TUI's transcript-first hierarchy and semantic
+orange/blue/pink/green identities, while replacing terminal-only chrome with a
+session switcher, clickable status controls, inspectors, attachment chips, and
+native overlays. The narrow capture exposed horizontal clipping and an overly
+shallow composer; transcript rows now enforce bounded width and wrapping, and
+the composer shapes up to three wrapped or explicit lines with Shift/Alt+Enter
+newlines. Tool output remains collapsed by default and bounded when expanded;
+the complete output is still available through copy.
+
+Screenshot capture is deliberately not part of automated verification because
+GPUI requires a real GPU presentation surface. Build, projection, parser, and
+workflow checks remain headless; visual captures are reviewed manually without
+driving the user's active desktop.
+
 ## Running the native frontend
 
-From the workspace, run `cargo run -p borg-gui`. The application resumes the
-latest durable local session and starts a headless Borg owner when that session
-is not already running. On a fresh installation it creates and owns a new
-session. Use `--session UUID` to open a specific session; the native session
-menu can switch or create sessions after launch.
+From an installed release, run `borg gui`; from the workspace, run
+`cargo run -p borg-gui`. The application resumes the latest durable local
+session and starts a headless Borg owner when that session is not already
+running. On a fresh installation it creates and owns a new session. Use
+`borg gui --session UUID` (or `borg-gui --session UUID`) to open a specific
+session; the native session menu can switch or create sessions after launch.

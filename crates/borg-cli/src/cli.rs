@@ -604,6 +604,18 @@ mod tests {
         let cli = Cli::try_parse_from(args).expect("explicit command parses");
         assert!(cli.no_limits);
         assert!(matches!(cli.command, Some(Command::Capabilities(_))));
+
+        let session = "22222222-2222-2222-2222-222222222222";
+        let args = Cli::agent_default_args(
+            ["borg", "gui", "--session", session]
+                .into_iter()
+                .map(OsString::from),
+        );
+        let cli = Cli::try_parse_from(args).expect("native GUI command parses");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Gui { session: Some(_) })
+        ));
     }
 
     #[test]

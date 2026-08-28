@@ -19,6 +19,14 @@ use uuid::Uuid;
 
 gpui::actions!(borg_gui, [Interrupt, Escape, ToggleHelp]);
 
+const UI_FONT: &str = if cfg!(target_os = "macos") {
+    "SF Mono"
+} else if cfg!(target_os = "windows") {
+    "Consolas"
+} else {
+    "monospace"
+};
+
 struct BorgGui {
     worker: Option<LocalSessionWorker>,
     view: Option<SessionView>,
@@ -968,7 +976,7 @@ impl Render for BorgGui {
             .size_full()
             .bg(rgb(palette::CANVAS))
             .text_color(rgb(palette::TEXT))
-            .font_family("Berkeley Mono")
+            .font_family(UI_FONT)
             .child(
                 div()
                     .flex()
