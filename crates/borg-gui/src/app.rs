@@ -242,7 +242,6 @@ impl BorgGui {
                                 this.composer
                                     .update(cx, |composer, cx| composer.set_secret(secret, cx));
                                 this.view = Some(view);
-                                this.error = None;
                             }
                             LocalSessionUpdate::Sessions(sessions) => this.sessions = sessions,
                             LocalSessionUpdate::Error(error) => this.error = Some(error),
@@ -472,6 +471,11 @@ impl BorgGui {
         cx.notify();
     }
 
+    fn dismiss_error(&mut self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.error = None;
+        cx.notify();
+    }
+
     fn status_segment(
         label: impl Into<SharedString>,
         value: impl Into<SharedString>,
@@ -690,10 +694,13 @@ impl Render for BorgGui {
         let attachment_labels = self
             .attachments
             .iter()
-            .map(|path| {
-                path.file_name()
+            .enumerate()
+            .map(|(index, path)| {
+                let label = path
+                    .file_name()
                     .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| path.display().to_string())
+                    .unwrap_or_else(|| path.display().to_string());
+                (index, label)
             })
             .collect::<Vec<_>>();
         let session_options = self.sessions.clone();
@@ -1009,7 +1016,19 @@ impl Render for BorgGui {
                         .border_color(rgb(palette::RED))
                         .text_color(rgb(palette::RED))
                         .text_sm()
-                        .child(error),
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_3()
+                        .child(div().flex_1().child(error))
+                        .child(
+                            div()
+                                .id("dismiss-error")
+                                .cursor_pointer()
+                                .text_color(rgb(palette::TEXT_MUTED))
+                                .on_click(cx.listener(Self::dismiss_error))
+                                .child("dismiss"),
+                        ),
                 )
             })
             .child(
@@ -1175,15 +1194,34 @@ impl Render for BorgGui {
                         row.flex()
                             .gap_2()
                             .pb_2()
-                            .children(attachment_labels.into_iter().map(|label| {
+                            .children(attachment_labels.into_iter().map(|(index, label)| {
                                 div()
+                                    .id(SharedString::from(format!("attachment-{index}")))
                                     .px_2()
                                     .py_1()
                                     .rounded_sm()
                                     .bg(rgb(palette::SURFACE_RAISED))
                                     .text_xs()
                                     .text_color(rgb(palette::BLUE))
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
                                     .child(label)
+                                    .child(
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "remove-attachment-{index}"
+                                            )))
+                                            .cursor_pointer()
+                                            .text_color(rgb(palette::TEXT_MUTED))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                if index < this.attachments.len() {
+                                                    this.attachments.remove(index);
+                                                    cx.notify();
+                                                }
+                                            }))
+                                            .child("×"),
+                                    )
                             }))
                     }))
                     .child(
