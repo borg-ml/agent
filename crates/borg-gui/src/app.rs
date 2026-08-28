@@ -263,6 +263,7 @@ impl BorgGui {
                     .update(cx, |this, cx| {
                         match update {
                             LocalSessionUpdate::Presentation(presentation) => {
+                                let presentation = *presentation;
                                 this.composer.update(cx, |composer, _| {
                                     composer.set_history(&presentation.composer_history)
                                 });
@@ -762,7 +763,7 @@ impl BorgGui {
             .child(header)
             .when(entry.kind == TimelineKind::Tool, |card| {
                 card.cursor_pointer().on_click(move |_, _, cx| {
-                    let _ = view.update(cx, |this, cx| {
+                    view.update(cx, |this, cx| {
                         if !this.expanded_entries.remove(&entry_id) {
                             this.expanded_entries.insert(entry_id.clone());
                         }
@@ -846,7 +847,7 @@ impl Render for BorgGui {
                 borg_ui::PermissionMode::Auto => "auto",
                 borg_ui::PermissionMode::Manual => "manual",
             })
-            .unwrap_or_else(|| "unknown".into())
+            .unwrap_or("unknown")
             .into();
         let fast = configuration.is_some_and(|c| c.fast);
         let language = configuration

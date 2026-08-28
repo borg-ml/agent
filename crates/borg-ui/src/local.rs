@@ -16,7 +16,7 @@ use crate::{
 };
 
 pub enum LocalSessionUpdate {
-    Presentation(SessionPresentation),
+    Presentation(Box<SessionPresentation>),
     Sessions(Vec<LocalSessionOption>),
     RestoreComposer {
         text: String,
@@ -103,8 +103,9 @@ impl LocalSessionWorker {
                     if let Ok(sessions) = client.list_sessions().await {
                         let _ = update_tx.send_blocking(LocalSessionUpdate::Sessions(sessions));
                     }
-                    let _ = update_tx
-                        .send_blocking(LocalSessionUpdate::Presentation(client.presentation()));
+                    let _ = update_tx.send_blocking(LocalSessionUpdate::Presentation(Box::new(
+                        client.presentation(),
+                    )));
                     loop {
                         let wait = if matches!(
                             client.view().state.status,
@@ -203,9 +204,10 @@ impl LocalSessionWorker {
                                 };
                             match result {
                                 Ok(true) => {
-                                    let _ = update_tx.send_blocking(
-                                        LocalSessionUpdate::Presentation(client.presentation()),
-                                    );
+                                    let _ =
+                                        update_tx.send_blocking(LocalSessionUpdate::Presentation(
+                                            Box::new(client.presentation()),
+                                        ));
                                 }
                                 Ok(false) => {}
                                 Err(error) => {
@@ -229,9 +231,9 @@ impl LocalSessionWorker {
                                     }
                                 }
                                 if update_tx
-                                    .send_blocking(LocalSessionUpdate::Presentation(
+                                    .send_blocking(LocalSessionUpdate::Presentation(Box::new(
                                         client.presentation(),
-                                    ))
+                                    )))
                                     .is_err()
                                 {
                                     return;

@@ -335,7 +335,7 @@ impl Composer {
             self.select_to(self.index_at(event.position), cx);
         }
     }
-    fn from_utf16(&self, offset: usize) -> usize {
+    fn byte_offset_from_utf16(&self, offset: usize) -> usize {
         self.content
             .chars()
             .take_while(|_| true)
@@ -354,7 +354,7 @@ impl Composer {
         self.content[..offset].encode_utf16().count()
     }
     fn range_from_utf16(&self, range: &Range<usize>) -> Range<usize> {
-        self.from_utf16(range.start)..self.from_utf16(range.end)
+        self.byte_offset_from_utf16(range.start)..self.byte_offset_from_utf16(range.end)
     }
     fn range_to_utf16(&self, range: &Range<usize>) -> Range<usize> {
         self.to_utf16(range.start)..self.to_utf16(range.end)

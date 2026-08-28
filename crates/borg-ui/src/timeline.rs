@@ -158,7 +158,6 @@ impl TimelineProjector {
                 tool_call_id,
                 output,
                 is_error,
-                input: _,
                 ..
             } => {
                 let index = self.tools.get(tool_call_id).copied();
