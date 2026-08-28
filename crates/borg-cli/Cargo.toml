@@ -36,6 +36,8 @@ arboard = { version = "3.6", features = ["wayland-data-control"] }
 base64.workspace = true
 borg-provider = { path = "../borg-provider", default-features = false }
 borg-remote = { path = "../borg-remote", default-features = false }
+borg-tui.workspace = true
+borg-ui.workspace = true
 chrono.workspace = true
 clap = { version = "4.6.6", features = ["derive"] }
 crossterm = { version = "0.29", features = ["bracketed-paste", "event-stream"] }

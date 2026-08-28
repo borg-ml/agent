@@ -12,7 +12,7 @@ const DRAG_FLUSH_INTERVAL: Duration = Duration::from_millis(8);
 const RESIZE_FLUSH_INTERVAL: Duration = Duration::from_millis(33);
 const MAX_PENDING_WHEEL_EVENTS: isize = 32;
 
-pub(crate) struct TerminalInputEvent {
+pub struct TerminalInputEvent {
     pub(super) event: Event,
     pub(super) scroll_repetitions: usize,
 }
@@ -25,14 +25,14 @@ impl TerminalInputEvent {
         }
     }
 
-    pub(crate) fn is_up(&self) -> bool {
+    pub fn is_up(&self) -> bool {
         matches!(
             &self.event,
             Event::Key(key) if key.kind != KeyEventKind::Release && key.code == KeyCode::Up
         )
     }
 
-    pub(crate) fn is_keyboard_input(&self) -> bool {
+    pub fn is_keyboard_input(&self) -> bool {
         matches!(&self.event, Event::Paste(_))
             || matches!(&self.event, Event::Key(key) if key.kind != KeyEventKind::Release)
     }

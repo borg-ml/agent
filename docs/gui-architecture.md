@@ -1,0 +1,67 @@
+# Borg native UI architecture
+
+## Product direction
+
+- **Subject:** a live, durable agent session where messages, tool work, goals,
+  plans, and subagents evolve together.
+- **Audience:** operators who already value Borg's terminal density but want a
+  native workstation surface with better pointing, selection, inspection, and
+  visual hierarchy.
+- **Primary job:** make the current agent state and the next available action
+  obvious without hiding the transcript.
+- **Signature:** the transcript remains the spine of the application. Tool runs
+  form a compact execution rail, while the orange session edge and status strip
+  carry live state from the TUI into the native surface.
+
+## Visual thesis
+
+The GUI is a polished instrument panel, not a generic dashboard. It keeps the
+TUI's dark ink, warm Borg orange, semantic blue/pink/green accents, compact
+monospace data, and uninterrupted vertical transcript. Native affordances add
+space and precision; they do not turn each event into a floating card.
+
+Initial tokens live in `borg_ui::palette`:
+
+- near-black canvas and ink-brown raised surfaces;
+- warm gray text with restrained muted metadata;
+- orange for Borg identity, peach for active work, blue for the operator,
+  pink for subagents, green for healthy goals, and red for failure;
+- 4/8 px spacing rhythm, one-pixel rules, two-pixel semantic message edges,
+  and small radii only around controls and the composer.
+
+## Dependency boundary
+
+```text
+borg-core / borg-remote / borg-provider
+                  │
+              borg-ui
+     domain view data + commands only
+          ┌───────┴────────┐
+       borg-tui         borg-gui
+      ratatui I/O        GPUI I/O
+          └───────┬────────┘
+             borg CLI shell
+```
+
+`borg-ui` may depend on Borg domain crates. It must not depend on `ratatui`,
+`crossterm`, GPUI, or operating-system window types. Frontends translate native
+input into `FrontendCommand` and render `SessionView`; they do not own session
+state transitions or persistence.
+
+This boundary intentionally stops short of a universal widget abstraction.
+Terminal cells and a retained GPU scene have different layout and interaction
+needs. Sharing widgets would couple both frontends while producing a worse API
+for each.
+
+## Layout
+
+1. A narrow native header identifies the session and workspace.
+2. The transcript occupies the flexible center and retains message/tool/event
+   ordering.
+3. Live goal, model, access, context, and agent state form a single status strip.
+4. The composer is anchored at the bottom, with contextual action hints below.
+5. Pickers and inspectors overlay the transcript only while active; persistent
+   secondary information belongs in an optional side inspector, not nested
+   cards.
+
+The baseline reference is `artifacts/gui-port/tui-baseline-focused.png`.

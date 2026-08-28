@@ -1118,7 +1118,7 @@ fn model_picker_none_yields_no_open_ended_placeholder() {
 
 #[test]
 fn keybinding_help_is_action_first_and_uses_configuration() {
-    let config = crate::agent_config::KeybindingConfig {
+    let config = borg_ui::KeybindingConfig {
         send: vec!["ctrl+s".to_string()],
         ..Default::default()
     };
@@ -3173,7 +3173,7 @@ fn every_goal_toggle_command_round_trips_through_the_parser() {
         let command = goal_toggle_command(&goal).expect("status is toggleable");
         assert_eq!(goal_toggle_action(&goal), Some(expected.clone()));
         assert_eq!(
-            crate::remote_commands::parse_goal_action(command).expect("parser accepts the click"),
+            borg_ui::parse_goal_action(command).expect("parser accepts the click"),
             expected
         );
     }
@@ -5228,7 +5228,7 @@ fn fuzzy_match_accepts_subsequences_and_rejects_reordering() {
 /// section off the rows that survive.
 #[test]
 fn the_command_palette_filters_across_commands_and_keybindings() {
-    let keymap = KeyMap::from_config(&crate::agent_config::KeybindingConfig::default())
+    let keymap = KeyMap::from_config(&borg_ui::KeybindingConfig::default())
         .expect("default keymap");
     let mut picker = Picker {
         kind: PickerKind::Commands,

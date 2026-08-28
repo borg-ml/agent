@@ -14,19 +14,19 @@ const HEX_COLOR_LENGTH: usize = 7;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 #[derive(Default)]
-pub(crate) struct EditorPreferences {
-    pub(crate) transcript: TranscriptPreferences,
-    pub(crate) interaction: InteractionPreferences,
-    pub(crate) presentation: PresentationPreferences,
-    pub(crate) layout: LayoutPreferences,
+pub struct EditorPreferences {
+    pub transcript: TranscriptPreferences,
+    pub interaction: InteractionPreferences,
+    pub presentation: PresentationPreferences,
+    pub layout: LayoutPreferences,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub(crate) struct LayoutPreferences {
-    pub(crate) horizontal_margin: u16,
-    pub(crate) composer_max_height: u16,
-    pub(crate) show_footer: bool,
+pub struct LayoutPreferences {
+    pub horizontal_margin: u16,
+    pub composer_max_height: u16,
+    pub show_footer: bool,
 }
 
 impl Default for LayoutPreferences {
@@ -41,13 +41,13 @@ impl Default for LayoutPreferences {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub(crate) struct TranscriptPreferences {
-    pub(crate) user_label: String,
-    pub(crate) assistant_label: String,
-    pub(crate) user_label_color: String,
-    pub(crate) user_message_color: String,
-    pub(crate) assistant_label_color: String,
-    pub(crate) assistant_message_color: String,
+pub struct TranscriptPreferences {
+    pub user_label: String,
+    pub assistant_label: String,
+    pub user_label_color: String,
+    pub user_message_color: String,
+    pub assistant_label_color: String,
+    pub assistant_message_color: String,
 }
 
 impl Default for TranscriptPreferences {
@@ -65,14 +65,14 @@ impl Default for TranscriptPreferences {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum ActiveMessageBehavior {
+pub enum ActiveMessageBehavior {
     Steer,
     Queue,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum CompletionAlertPolicy {
+pub enum CompletionAlertPolicy {
     Off,
     Unfocused,
     Always,
@@ -80,18 +80,18 @@ pub(crate) enum CompletionAlertPolicy {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum DictationIconStyle {
+pub enum DictationIconStyle {
     NerdFont,
     Emoji,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub(crate) struct InteractionPreferences {
-    pub(crate) active_messages: ActiveMessageBehavior,
-    pub(crate) prevent_sleep: bool,
-    pub(crate) completion_notifications: CompletionAlertPolicy,
-    pub(crate) completion_sound: CompletionAlertPolicy,
+pub struct InteractionPreferences {
+    pub active_messages: ActiveMessageBehavior,
+    pub prevent_sleep: bool,
+    pub completion_notifications: CompletionAlertPolicy,
+    pub completion_sound: CompletionAlertPolicy,
 }
 
 impl Default for InteractionPreferences {
@@ -107,12 +107,12 @@ impl Default for InteractionPreferences {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub(crate) struct PresentationPreferences {
-    pub(crate) refresh_rate_fps: u16,
-    pub(crate) auto_expand_edits: bool,
-    pub(crate) auto_expand_tools: bool,
-    pub(crate) running_sweeps: bool,
-    pub(crate) dictation_icon: Option<DictationIconStyle>,
+pub struct PresentationPreferences {
+    pub refresh_rate_fps: u16,
+    pub auto_expand_edits: bool,
+    pub auto_expand_tools: bool,
+    pub running_sweeps: bool,
+    pub dictation_icon: Option<DictationIconStyle>,
 }
 
 impl Default for PresentationPreferences {
@@ -128,11 +128,11 @@ impl Default for PresentationPreferences {
 }
 
 impl EditorPreferences {
-    pub(crate) fn load() -> Result<Self> {
+    pub fn load() -> Result<Self> {
         Self::load_from(&default_path()?)
     }
 
-    pub(crate) fn load_from(path: &Path) -> Result<Self> {
+    pub fn load_from(path: &Path) -> Result<Self> {
         if !path.exists() {
             return Ok(Self::default());
         }
@@ -146,11 +146,11 @@ impl EditorPreferences {
         Ok(preferences)
     }
 
-    pub(crate) fn save(&self) -> Result<()> {
+    pub fn save(&self) -> Result<()> {
         self.save_to(&default_path()?)
     }
 
-    pub(crate) fn save_to(&self, path: &Path) -> Result<()> {
+    pub fn save_to(&self, path: &Path) -> Result<()> {
         self.validate()
             .context("refusing to save invalid editor preferences")?;
         let parent = path
@@ -175,7 +175,7 @@ impl EditorPreferences {
         Ok(())
     }
 
-    pub(crate) fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<()> {
         validate_label("user", &self.transcript.user_label)?;
         validate_label("assistant", &self.transcript.assistant_label)?;
         for (name, color) in [
@@ -207,7 +207,7 @@ impl EditorPreferences {
     }
 }
 
-pub(crate) fn parse_hex_color(value: &str) -> Result<(u8, u8, u8)> {
+pub fn parse_hex_color(value: &str) -> Result<(u8, u8, u8)> {
     anyhow::ensure!(
         value.len() == HEX_COLOR_LENGTH && value.starts_with('#'),
         "expected #RRGGBB"
@@ -218,7 +218,7 @@ pub(crate) fn parse_hex_color(value: &str) -> Result<(u8, u8, u8)> {
     Ok((red, green, blue))
 }
 
-pub(crate) fn default_path() -> Result<PathBuf> {
+pub fn default_path() -> Result<PathBuf> {
     let root = config_root(
         std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
         std::env::var_os("HOME").map(PathBuf::from),

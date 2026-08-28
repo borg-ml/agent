@@ -5,7 +5,9 @@ mod cli;
 mod collab;
 mod customization;
 mod dictation;
-mod editor_preferences;
+mod editor_preferences {
+    pub(crate) use borg_ui::preferences::*;
+}
 mod extensions;
 mod inspect;
 mod limits;
@@ -13,7 +15,9 @@ mod protection;
 mod remote_commands;
 mod session_commands;
 mod sleep_inhibitor;
-mod terminal_ui;
+mod terminal_ui {
+    pub(crate) use borg_tui::*;
+}
 mod updater;
 
 use anyhow::{Context, Result};

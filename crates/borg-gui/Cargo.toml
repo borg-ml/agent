@@ -1,0 +1,20 @@
+[package]
+name = "borg-gui"
+description = "Native GPUI frontend for Borg Agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+publish = false
+
+[[bin]]
+name = "borg-gui"
+path = "src/main.rs"
+
+[dependencies]
+borg-ui.workspace = true
+gpui = "0.2.2"
+uuid.workspace = true

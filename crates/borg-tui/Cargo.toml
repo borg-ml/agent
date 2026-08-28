@@ -1,0 +1,40 @@
+[package]
+name = "borg-tui"
+description = "Terminal frontend for Borg Agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+arboard = { version = "3.6", features = ["wayland-data-control"] }
+base64.workspace = true
+borg-provider = { path = "../borg-provider", default-features = false }
+borg-remote = { path = "../borg-remote", default-features = false }
+borg-ui.workspace = true
+chrono.workspace = true
+crossterm = { version = "0.29", features = ["bracketed-paste", "event-stream"] }
+futures-util = "0.3"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+pulldown-cmark = "0.13"
+qrcode = { version = "0.14.1", default-features = false }
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache", "macros", "underline-color"] }
+serde_json.workspace = true
+shlex = "2.0"
+syntect = { version = "5.3", default-features = false, features = ["default-syntaxes", "default-themes", "parsing", "regex-fancy", "yaml-load"] }
+tempfile.workspace = true
+term-maths = "1.0.0"
+tokio.workspace = true
+tracing.workspace = true
+unicode-segmentation = "1.13"
+unicode-width = "0.2"
+url.workspace = true
+uuid.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true

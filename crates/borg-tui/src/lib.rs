@@ -19,7 +19,7 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::editor_preferences::{
+use borg_ui::preferences::{
     CompletionAlertPolicy, DictationIconStyle, TranscriptPreferences, parse_hex_color,
 };
 use anyhow::{Context, Result};
@@ -68,8 +68,8 @@ use self::markdown::{
     markdown_lines, markdown_link_ranges, markdown_plain_text, open_link, truncate_table_cell,
 };
 use self::terminal_input::TerminalInput;
-pub(crate) use self::terminal_input::TerminalInputEvent;
-use crate::agent_config::KeybindingConfig;
+pub use self::terminal_input::TerminalInputEvent;
+use borg_ui::KeybindingConfig;
 
 const INLINE_VIEWPORT_HEIGHT: u16 = 24;
 const HORIZONTAL_MARGIN: u16 = 0;
@@ -531,7 +531,7 @@ fn rich_terminal_supported(term: Option<&str>, borg_tui: Option<&str>) -> bool {
     !term.is_some_and(|value| matches!(value.trim(), "" | "dumb" | "unknown"))
 }
 
-pub(crate) fn dictation_icon_style_for_preference(
+pub fn dictation_icon_style_for_preference(
     preference: Option<DictationIconStyle>,
 ) -> DictationIconStyle {
     dictation_icon_from_environment()
@@ -629,7 +629,7 @@ pub enum UiAction {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum DictationState {
+pub enum DictationState {
     #[default]
     Idle,
     Installing,
@@ -3492,7 +3492,7 @@ impl BorgTerminal {
 
     pub fn set_layout_preferences(
         &mut self,
-        preferences: &crate::editor_preferences::LayoutPreferences,
+        preferences: &borg_ui::preferences::LayoutPreferences,
     ) {
         self.horizontal_margin = preferences.horizontal_margin;
         self.composer_max_height = preferences.composer_max_height;
@@ -7601,7 +7601,7 @@ fn is_composer_newline(keymap: &KeyMap, key: &KeyEvent) -> bool {
 /// Discard bytes that belong to an input sequence which was in flight while
 /// the event reader stopped. Without this, the shell can receive the tail of
 /// a Kitty CSI-u sequence after Borg gives the terminal back.
-pub(crate) fn discard_pending_terminal_input() {
+pub fn discard_pending_terminal_input() {
     #[cfg(unix)]
     {
         let stdin = io::stdin();
@@ -8676,7 +8676,7 @@ fn deletes_previous_word(key: &KeyEvent) -> bool {
         || (key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Backspace)
 }
 
-include!("terminal_ui/transcript.rs");
+include!("transcript.rs");
 
 fn subagent_status_label(status: SubagentStatus) -> &'static str {
     match status {
@@ -9117,7 +9117,7 @@ fn context_compaction_card_summary(payload: &serde_json::Value) -> String {
     }
 }
 
-pub(crate) fn subagent_activity_summary(
+pub fn subagent_activity_summary(
     activity: SubagentActivityKind,
     agent: &SubagentSnapshot,
     child_event: Option<&SessionEvent>,

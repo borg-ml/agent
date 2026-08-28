@@ -356,49 +356,7 @@ impl Default for McpServerConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub(crate) struct KeybindingConfig {
-    pub(crate) send: Vec<String>,
-    pub(crate) queue: Vec<String>,
-    pub(crate) newline: Vec<String>,
-    pub(crate) keybindings: Vec<String>,
-    pub(crate) interrupt: Vec<String>,
-    pub(crate) clear_or_exit: Vec<String>,
-    pub(crate) exit: Vec<String>,
-    pub(crate) attach_image: Vec<String>,
-    pub(crate) dictate: Vec<String>,
-    pub(crate) copy: Vec<String>,
-    pub(crate) scroll_up: Vec<String>,
-    pub(crate) scroll_down: Vec<String>,
-    pub(crate) select_previous: Vec<String>,
-    pub(crate) select_next: Vec<String>,
-    pub(crate) approve: Vec<String>,
-    pub(crate) deny: Vec<String>,
-}
-
-impl Default for KeybindingConfig {
-    fn default() -> Self {
-        Self {
-            send: vec!["enter".into()],
-            queue: vec!["tab".into()],
-            newline: vec!["shift+enter".into(), "alt+enter".into()],
-            keybindings: vec!["?".into()],
-            interrupt: vec!["esc".into()],
-            clear_or_exit: vec!["ctrl+c".into()],
-            exit: vec!["ctrl+d".into()],
-            attach_image: vec!["ctrl+v".into()],
-            dictate: vec!["alt+v".into()],
-            copy: vec!["ctrl+y".into()],
-            scroll_up: vec!["pageup".into()],
-            scroll_down: vec!["pagedown".into()],
-            select_previous: vec!["alt+up".into()],
-            select_next: vec!["alt+down".into()],
-            approve: vec!["y".into()],
-            deny: vec!["n".into(), "esc".into()],
-        }
-    }
-}
+pub(crate) use borg_ui::KeybindingConfig;
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -592,7 +550,7 @@ impl AgentConfig {
                 "keybinding action `{action}` must have at least one key"
             );
             for binding in bindings {
-                validate_key_chord(binding)
+                borg_ui::validate_key_chord(binding)
                     .with_context(|| format!("invalid `{action}` keybinding `{binding}`"))?;
             }
         }
@@ -926,95 +884,6 @@ impl AgentConfig {
             })
             .collect()
     }
-}
-
-impl KeybindingConfig {
-    pub(crate) fn replace(&mut self, action: &str, bindings: Vec<String>) -> Result<()> {
-        let target = match action {
-            "send" => &mut self.send,
-            "queue" => &mut self.queue,
-            "newline" => &mut self.newline,
-            "keybindings" => &mut self.keybindings,
-            "interrupt" => &mut self.interrupt,
-            "clear_or_exit" => &mut self.clear_or_exit,
-            "exit" => &mut self.exit,
-            "attach_image" => &mut self.attach_image,
-            "dictate" => &mut self.dictate,
-            "copy" => &mut self.copy,
-            "scroll_up" => &mut self.scroll_up,
-            "scroll_down" => &mut self.scroll_down,
-            "select_previous" => &mut self.select_previous,
-            "select_next" => &mut self.select_next,
-            "approve" => &mut self.approve,
-            "deny" => &mut self.deny,
-            _ => anyhow::bail!("unknown keybinding action `{action}`"),
-        };
-        anyhow::ensure!(
-            !bindings.is_empty(),
-            "keybinding action `{action}` cannot be empty"
-        );
-        for binding in &bindings {
-            validate_key_chord(binding)?;
-        }
-        *target = bindings;
-        Ok(())
-    }
-
-    pub(crate) fn entries(&self) -> [(&'static str, &[String]); 16] {
-        [
-            ("send", &self.send),
-            ("queue", &self.queue),
-            ("newline", &self.newline),
-            ("keybindings", &self.keybindings),
-            ("interrupt", &self.interrupt),
-            ("clear_or_exit", &self.clear_or_exit),
-            ("exit", &self.exit),
-            ("attach_image", &self.attach_image),
-            ("dictate", &self.dictate),
-            ("copy", &self.copy),
-            ("scroll_up", &self.scroll_up),
-            ("scroll_down", &self.scroll_down),
-            ("select_previous", &self.select_previous),
-            ("select_next", &self.select_next),
-            ("approve", &self.approve),
-            ("deny", &self.deny),
-        ]
-    }
-}
-
-fn validate_key_chord(value: &str) -> Result<()> {
-    let mut parts = value.split('+').peekable();
-    let mut key = None;
-    while let Some(part) = parts.next() {
-        let part = part.trim().to_ascii_lowercase();
-        if parts.peek().is_some() && matches!(part.as_str(), "ctrl" | "alt" | "shift") {
-            continue;
-        }
-        anyhow::ensure!(key.is_none(), "only one non-modifier key is allowed");
-        anyhow::ensure!(
-            matches!(
-                part.as_str(),
-                "enter"
-                    | "esc"
-                    | "tab"
-                    | "backspace"
-                    | "delete"
-                    | "up"
-                    | "down"
-                    | "left"
-                    | "right"
-                    | "pageup"
-                    | "pagedown"
-                    | "home"
-                    | "end"
-                    | "space"
-            ) || part.chars().count() == 1,
-            "unsupported key `{part}`"
-        );
-        key = Some(part);
-    }
-    anyhow::ensure!(key.is_some(), "key chord must include a key");
-    Ok(())
 }
 
 fn default_path() -> Option<PathBuf> {
