@@ -93,7 +93,7 @@ struct Transcript {
     queued_message_sequences: HashMap<Uuid, u64>,
     follow_tail: bool,
     selected: Option<usize>,
-    auto_expand_edits: bool,
+    diff_expansion: DiffExpansionPolicy,
     auto_expand_tools: bool,
     user_label: String,
     assistant_label: String,
@@ -174,7 +174,7 @@ impl Default for Transcript {
             queued_message_sequences: HashMap::new(),
             follow_tail: true,
             selected: None,
-            auto_expand_edits: true,
+            diff_expansion: DiffExpansionPolicy::Expanded,
             auto_expand_tools: false,
             user_label: "user".to_string(),
             assistant_label: "borg".to_string(),
@@ -1270,7 +1270,7 @@ impl Transcript {
                 if self.foreground_tool.as_deref() == Some(tool_call_id) {
                     self.foreground_tool = None;
                 }
-                let auto_expand_edits = self.auto_expand_edits;
+                let expand_edits = self.diff_expansion != DiffExpansionPolicy::Collapsed;
                 let tool_index = self.tools.get(tool_call_id).copied();
                 let (source_name_for_process, command_for_process) = tool_index
                     .and_then(|index| self.order.get(index))
@@ -1366,7 +1366,7 @@ impl Transcript {
                             *detail = completion_presentation.detail;
                             *code_view = Some((body.language, body.text));
                             *output_view = None;
-                            *expanded = auto_expand_edits;
+                            *expanded = expand_edits;
                         } else if let Some(body) = completion_presentation
                             .input
                             .filter(|body| is_diff_language(&body.language))
@@ -1379,14 +1379,14 @@ impl Transcript {
                             *detail = completion_presentation.detail;
                             *code_view = Some((body.language, body.text));
                             *output_view = None;
-                            *expanded = auto_expand_edits;
+                            *expanded = expand_edits;
                         } else if input_is_diff && !*is_error {
                             // Native edit tools return a mutation receipt rather
                             // than a second diff. Keep the useful proposed diff
                             // as the sole expanded body instead of appending an
                             // opaque JSON receipt below it.
                             *output_view = None;
-                            *expanded = auto_expand_edits;
+                            *expanded = expand_edits;
                         } else {
                             *output_view = if is_mcp_resource_probe(source_name) {
                                 None
@@ -2064,11 +2064,14 @@ impl Transcript {
             &display_name,
             code_view.as_ref().map(|(language, _)| language.as_str()),
         );
-        if is_edit_diff {
+        let existing_tool = self.tools.get(tool_call_id).copied();
+        if self.diff_expansion == DiffExpansionPolicy::UntilNextAction
+            && self.last_edit != existing_tool
+        {
             self.collapse_previous_edit();
         }
         let expanded = input_ref.is_none()
-            && ((is_edit_diff && self.auto_expand_edits)
+            && ((is_edit_diff && self.diff_expansion != DiffExpansionPolicy::Collapsed)
                 || (!is_edit_diff
                     && code_view.is_some()
                     && (rich_ui || self.auto_expand_tools)));
@@ -2290,8 +2293,8 @@ impl Transcript {
         self.finish_reasoning(completed_at);
     }
 
-    fn set_auto_expand_edits(&mut self, enabled: bool) {
-        self.auto_expand_edits = enabled;
+    fn set_diff_expansion(&mut self, policy: DiffExpansionPolicy) {
+        self.diff_expansion = policy;
         for entry in &mut self.order {
             if let TranscriptEntry::Tool {
                 code_view: Some((language, _)),
@@ -2300,7 +2303,7 @@ impl Transcript {
             } = entry
                 && is_diff_language(language)
             {
-                *expanded = enabled;
+                *expanded = policy != DiffExpansionPolicy::Collapsed;
             }
         }
     }

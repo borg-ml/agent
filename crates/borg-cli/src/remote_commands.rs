@@ -44,7 +44,8 @@ use crate::dictation::{
     parakeet_is_installed,
 };
 use crate::editor_preferences::{
-    ActiveMessageBehavior, CompletionAlertPolicy, DictationIconStyle, EditorPreferences,
+    ActiveMessageBehavior, CompletionAlertPolicy, DictationIconStyle, DiffExpansionPolicy,
+    EditorPreferences,
 };
 use crate::sleep_inhibitor::SleepInhibitor;
 use crate::terminal_ui::{
@@ -1687,7 +1688,7 @@ async fn run_local_agent_session(
             editor_preferences.save()?;
             terminal.open_dictation_icon_picker();
         }
-        terminal.set_auto_expand_edits(editor_preferences.presentation.auto_expand_edits);
+        terminal.set_diff_expansion(editor_preferences.presentation.effective_diff_expansion());
         terminal.set_auto_expand_tools(editor_preferences.presentation.auto_expand_tools);
         terminal.set_running_sweeps(editor_preferences.presentation.running_sweeps);
         terminal.set_layout_preferences(&editor_preferences.layout);
@@ -2221,8 +2222,8 @@ async fn run_local_agent_session(
                                 == ActiveMessageBehavior::Steer;
                             if let Some(terminal) = terminal.as_mut() {
                                 terminal.reload_keybindings(&agent_config.keybindings)?;
-                                terminal.set_auto_expand_edits(
-                                    editor_preferences.presentation.auto_expand_edits,
+                                terminal.set_diff_expansion(
+                                    editor_preferences.presentation.effective_diff_expansion(),
                                 );
                                 terminal.set_auto_expand_tools(
                                     editor_preferences.presentation.auto_expand_tools,
@@ -3700,14 +3701,14 @@ async fn run_local_agent_session(
                             }
                         ));
                     }
-                    UiAction::SetAutoExpandEdits(enabled) => {
-                        editor_preferences.presentation.auto_expand_edits = enabled;
+                    UiAction::SetDiffExpansion(policy) => {
+                        editor_preferences.presentation.diff_expansion = Some(policy);
                         editor_preferences.save()?;
                         let terminal = terminal.as_mut().expect("terminal");
-                        terminal.set_auto_expand_edits(enabled);
+                        terminal.set_diff_expansion(policy);
                         terminal.set_notice(format!(
-                            "Auto-expand edit diffs: {}",
-                            if enabled { "on" } else { "off" }
+                            "Edit diff display: {}",
+                            diff_expansion_label(policy)
                         ));
                     }
                     UiAction::SetAutoExpandTools(enabled) => {
@@ -4620,18 +4621,18 @@ async fn run_local_agent_session(
                         } else if let Some(value) = line.strip_prefix("/expand-edits ")
                             && attachments.is_empty()
                         {
-                            if let Some(enabled) = parse_on_off(value) {
-                                editor_preferences.presentation.auto_expand_edits = enabled;
+                            if let Some(policy) = parse_diff_expansion(value) {
+                                editor_preferences.presentation.diff_expansion = Some(policy);
                                 editor_preferences.save()?;
                                 let terminal = terminal.as_mut().expect("terminal");
-                                terminal.set_auto_expand_edits(enabled);
+                                terminal.set_diff_expansion(policy);
                                 terminal.set_notice(format!(
-                                    "Auto-expand edit diffs: {}",
-                                    if enabled { "on" } else { "off" }
+                                    "Edit diff display: {}",
+                                    diff_expansion_label(policy)
                                 ));
                             } else {
                                 terminal.as_mut().expect("terminal").set_notice(
-                                    "Choose /expand-edits on or /expand-edits off",
+                                    "Choose /expand-edits expanded, collapsed, or until-next-action",
                                 );
                             }
                         } else if let Some(value) = line.strip_prefix("/expand-tools ")
@@ -6403,6 +6404,23 @@ fn parse_on_off(value: &str) -> Option<bool> {
     }
 }
 
+fn parse_diff_expansion(value: &str) -> Option<DiffExpansionPolicy> {
+    match value.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+        "expanded" | "on" => Some(DiffExpansionPolicy::Expanded),
+        "collapsed" | "off" => Some(DiffExpansionPolicy::Collapsed),
+        "until-next-action" => Some(DiffExpansionPolicy::UntilNextAction),
+        _ => None,
+    }
+}
+
+fn diff_expansion_label(policy: DiffExpansionPolicy) -> &'static str {
+    match policy {
+        DiffExpansionPolicy::Expanded => "expanded",
+        DiffExpansionPolicy::Collapsed => "collapsed",
+        DiffExpansionPolicy::UntilNextAction => "expanded until the next action",
+    }
+}
+
 fn parse_completion_alert_policy(value: &str) -> Option<CompletionAlertPolicy> {
     match value.trim() {
         "off" => Some(CompletionAlertPolicy::Off),
@@ -7308,7 +7326,7 @@ fn live_customization_summary(
         format!(
             "rendering: {} FPS · edits {} · tools {} · sweeps {}",
             editor.presentation.refresh_rate_fps,
-            editor.presentation.auto_expand_edits,
+            diff_expansion_label(editor.presentation.effective_diff_expansion()),
             editor.presentation.auto_expand_tools,
             editor.presentation.running_sweeps
         ),

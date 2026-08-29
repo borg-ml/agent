@@ -2914,7 +2914,7 @@ fn deferred_tool_input_loads_when_the_card_is_expanded() {
         "diff": "@@ -1 +1 @@\n-old\n+new"
     }]);
     let mut transcript = Transcript {
-        auto_expand_edits: true,
+        diff_expansion: DiffExpansionPolicy::Expanded,
         ..Transcript::default()
     };
     transcript.apply(&SessionEvent::new(
@@ -4391,6 +4391,67 @@ fn markdown_semantics_are_visible_without_source_delimiters() {
             && span.style.fg == Some(BORG_ORANGE_HOVER)
             && span.style.add_modifier.contains(Modifier::BOLD)
     }));
+}
+
+#[test]
+fn markdown_preserves_literal_angle_bracket_text() {
+    let rendered = markdown_lines("Borg Agent <ver> starts", 80, None)
+        .into_iter()
+        .flat_map(|line| line.spans)
+        .map(|span| span.content.into_owned())
+        .collect::<String>();
+
+    assert_eq!(rendered, "Borg Agent <ver> starts");
+    assert_eq!(
+        markdown_plain_text("Borg Agent <ver> starts"),
+        "Borg Agent <ver> starts"
+    );
+}
+
+#[test]
+fn diff_expansion_policy_controls_action_lifetime() {
+    let session_id = Uuid::new_v4();
+    let edit = |sequence, id: &str| {
+        SessionEvent::new(
+            session_id,
+            sequence,
+            SessionEventKind::ToolStarted {
+                tool_call_id: id.to_string(),
+                name: "functions.apply_patch".to_string(),
+                input: serde_json::json!(
+                    "*** Begin Patch\n*** Update File: src/main.rs\n@@\n-old\n+new\n*** End Patch"
+                ),
+                input_ref: None,
+            },
+        )
+    };
+    let action = SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::ToolStarted {
+            tool_call_id: "test".to_string(),
+            name: "functions.exec_command".to_string(),
+            input: serde_json::json!({"cmd": "cargo test"}),
+            input_ref: None,
+        },
+    );
+    let edit_expanded = |transcript: &Transcript| match &transcript.order[0] {
+        TranscriptEntry::Tool { expanded, .. } => *expanded,
+        _ => panic!("first transcript entry should be an edit tool"),
+    };
+
+    for (policy, expanded_before, expanded_after) in [
+        (DiffExpansionPolicy::Expanded, true, true),
+        (DiffExpansionPolicy::Collapsed, false, false),
+        (DiffExpansionPolicy::UntilNextAction, true, false),
+    ] {
+        let mut transcript = Transcript::default();
+        transcript.set_diff_expansion(policy);
+        transcript.apply(&edit(1, "edit"));
+        assert_eq!(edit_expanded(&transcript), expanded_before);
+        transcript.apply(&action);
+        assert_eq!(edit_expanded(&transcript), expanded_after);
+    }
 }
 
 #[test]

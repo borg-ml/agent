@@ -137,6 +137,15 @@ pub(super) fn markdown_lines(
                     current.push(Span::styled(text.into_string(), markdown_style(&styles)));
                 }
             }
+            MarkdownEvent::Html(html) | MarkdownEvent::InlineHtml(html) => {
+                if let Some(table) = table.as_mut() {
+                    table.push_text(&html);
+                } else if code_block.is_some() {
+                    code.push_str(&html);
+                } else {
+                    current.push(Span::styled(html.into_string(), markdown_style(&styles)));
+                }
+            }
             MarkdownEvent::Code(text) => {
                 if let Some(table) = table.as_mut() {
                     table.push_text(&text);
@@ -295,7 +304,7 @@ pub(super) fn markdown_plain_text(markdown: &str) -> String {
             MarkdownEvent::TaskListMarker(checked) => {
                 output.push_str(if checked { "[x] " } else { "[ ] " });
             }
-            MarkdownEvent::Html(html) => output.push_str(&html),
+            MarkdownEvent::Html(html) | MarkdownEvent::InlineHtml(html) => output.push_str(&html),
             _ => {}
         }
     }

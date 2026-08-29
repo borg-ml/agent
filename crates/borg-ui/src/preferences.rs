@@ -85,6 +85,14 @@ pub enum DictationIconStyle {
     Emoji,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiffExpansionPolicy {
+    Expanded,
+    Collapsed,
+    UntilNextAction,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct InteractionPreferences {
@@ -109,6 +117,8 @@ impl Default for InteractionPreferences {
 #[serde(default, deny_unknown_fields)]
 pub struct PresentationPreferences {
     pub refresh_rate_fps: u16,
+    pub diff_expansion: Option<DiffExpansionPolicy>,
+    /// Legacy compatibility for editor.toml files written before diff_expansion.
     pub auto_expand_edits: bool,
     pub auto_expand_tools: bool,
     pub running_sweeps: bool,
@@ -119,11 +129,22 @@ impl Default for PresentationPreferences {
     fn default() -> Self {
         Self {
             refresh_rate_fps: DEFAULT_REFRESH_RATE_FPS,
+            diff_expansion: None,
             auto_expand_edits: true,
             auto_expand_tools: false,
             running_sweeps: true,
             dictation_icon: None,
         }
+    }
+}
+
+impl PresentationPreferences {
+    pub fn effective_diff_expansion(&self) -> DiffExpansionPolicy {
+        self.diff_expansion.unwrap_or(if self.auto_expand_edits {
+            DiffExpansionPolicy::Expanded
+        } else {
+            DiffExpansionPolicy::Collapsed
+        })
     }
 }
 
@@ -290,6 +311,7 @@ mod tests {
             },
             presentation: PresentationPreferences {
                 refresh_rate_fps: 144,
+                diff_expansion: Some(DiffExpansionPolicy::UntilNextAction),
                 auto_expand_edits: false,
                 auto_expand_tools: true,
                 running_sweeps: false,
@@ -392,5 +414,22 @@ mod tests {
         assert!(preferences.interaction.prevent_sleep);
         assert_eq!(preferences.presentation.refresh_rate_fps, 60);
         assert_eq!(preferences.layout.horizontal_margin, 0);
+    }
+
+    #[test]
+    fn diff_expansion_supports_new_policy_and_legacy_boolean() {
+        let configured: EditorPreferences =
+            toml::from_str("[presentation]\ndiff_expansion = \"until_next_action\"\n").unwrap();
+        assert_eq!(
+            configured.presentation.effective_diff_expansion(),
+            DiffExpansionPolicy::UntilNextAction
+        );
+
+        let legacy: EditorPreferences =
+            toml::from_str("[presentation]\nauto_expand_edits = false\n").unwrap();
+        assert_eq!(
+            legacy.presentation.effective_diff_expansion(),
+            DiffExpansionPolicy::Collapsed
+        );
     }
 }

@@ -18,7 +18,7 @@ completion_sound = "unfocused"
 
 [presentation]
 refresh_rate_fps = 60
-auto_expand_edits = true
+diff_expansion = "expanded" # expanded | collapsed | until_next_action
 auto_expand_tools = false
 # Omit to choose the microphone icon on first use. Valid values: nerd_font, emoji.
 # dictation_icon = "nerd_font"

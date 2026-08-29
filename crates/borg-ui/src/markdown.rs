@@ -107,7 +107,8 @@ pub fn project_markdown(source: &str) -> RichText {
                 append(&format!("${text}$"), style, &mut output);
                 newline(&mut output);
             }
-            Event::Html(_) | Event::InlineHtml(_) | Event::FootnoteReference(_) => {}
+            Event::Html(text) | Event::InlineHtml(text) => append(&text, style, &mut output),
+            Event::FootnoteReference(_) => {}
             Event::Start(_) | Event::End(_) => {}
         }
     }
@@ -133,5 +134,13 @@ mod tests {
         assert!(rich.spans.iter().any(|span| span.style.heading));
         assert!(rich.spans.iter().any(|span| span.style.strong));
         assert!(rich.spans.iter().any(|span| span.style.code));
+    }
+
+    #[test]
+    fn native_projection_preserves_literal_angle_bracket_text() {
+        assert_eq!(
+            project_markdown("Borg Agent <ver> starts").text,
+            "Borg Agent <ver> starts"
+        );
     }
 }

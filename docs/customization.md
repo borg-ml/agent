@@ -24,7 +24,7 @@ persisted to `editor.toml`.
 | Desktop completion notification | `/notifications` | `interaction.completion_notifications = "off"`, `"unfocused"`, or `"always"` |
 | Completion sound | `/sound` | `interaction.completion_sound = "off"`, `"unfocused"`, or `"always"` |
 | Refresh rate | `/refresh` | `presentation.refresh_rate_fps = 15..240` |
-| Expand edit diffs | `/expand-edits` | `presentation.auto_expand_edits = true` or `false` |
+| Edit diff display | `/expand-edits` | `presentation.diff_expansion = "expanded"`, `"collapsed"`, or `"until_next_action"` |
 | Expand tool details | `/expand-tools` | `presentation.auto_expand_tools = true` or `false` |
 | Running animations | `/animations` | `presentation.running_sweeps = true` or `false` |
 | Dictation icon | `/icons` | `presentation.dictation_icon = "nerd_font"` or `"emoji"` |

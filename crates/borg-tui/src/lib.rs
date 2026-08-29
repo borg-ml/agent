@@ -35,7 +35,8 @@ use borg_remote::{
 #[cfg(test)]
 use borg_remote::{tool_call_summary, tool_code_view};
 use borg_ui::preferences::{
-    CompletionAlertPolicy, DictationIconStyle, TranscriptPreferences, parse_hex_color,
+    CompletionAlertPolicy, DictationIconStyle, DiffExpansionPolicy, TranscriptPreferences,
+    parse_hex_color,
 };
 use borg_ui::timeline::tool_lifecycle_label;
 use chrono::{DateTime, Local, NaiveDate, Utc};
@@ -612,7 +613,7 @@ pub enum UiAction {
     SetRefreshRate(u64),
     SetPreventSleep(bool),
     SetSteerActive(bool),
-    SetAutoExpandEdits(bool),
+    SetDiffExpansion(DiffExpansionPolicy),
     SetAutoExpandTools(bool),
     SetRunningSweeps(bool),
     SetCompletionNotifications(CompletionAlertPolicy),
@@ -3420,15 +3421,16 @@ impl BorgTerminal {
     }
 
     pub fn open_auto_expand_edits_picker(&mut self) {
+        let current = match self.transcript.diff_expansion {
+            DiffExpansionPolicy::Expanded => "Expanded",
+            DiffExpansionPolicy::Collapsed => "Collapsed",
+            DiffExpansionPolicy::UntilNextAction => "Until next action",
+        };
         self.picker = Some(Picker::new(
             PickerKind::AutoExpandEdits,
-            "Auto-expand edit diffs",
-            ["On", "Off"],
-            Some(if self.transcript.auto_expand_edits {
-                "On"
-            } else {
-                "Off"
-            }),
+            "Edit diff display",
+            ["Expanded", "Collapsed", "Until next action"],
+            Some(current),
         ));
     }
 
@@ -3522,11 +3524,11 @@ impl BorgTerminal {
         self.notice = Some("Choose the preview that renders correctly in this terminal".into());
     }
 
-    pub fn set_auto_expand_edits(&mut self, enabled: bool) {
-        if !enabled {
+    pub fn set_diff_expansion(&mut self, policy: DiffExpansionPolicy) {
+        if policy == DiffExpansionPolicy::Collapsed {
             self.capture_transcript_anchor_for_collapse();
         }
-        self.transcript.set_auto_expand_edits(enabled);
+        self.transcript.set_diff_expansion(policy);
         self.transcript_render_cache = None;
     }
 
@@ -4964,7 +4966,12 @@ impl BorgTerminal {
                 UiAction::SetSteerActive(picker.selected_value() == ACTIVE_MESSAGES_SEND_NOW)
             }
             PickerKind::AutoExpandEdits => {
-                UiAction::SetAutoExpandEdits(picker.selected_value() == "On")
+                UiAction::SetDiffExpansion(match picker.selected_value().as_str() {
+                    "Expanded" => DiffExpansionPolicy::Expanded,
+                    "Collapsed" => DiffExpansionPolicy::Collapsed,
+                    "Until next action" => DiffExpansionPolicy::UntilNextAction,
+                    _ => unreachable!("diff expansion picker values are canonical"),
+                })
             }
             PickerKind::AutoExpandTools => {
                 UiAction::SetAutoExpandTools(picker.selected_value() == "On")
@@ -7690,7 +7697,7 @@ impl BorgTerminal {
 
 fn fresh_transcript_like(previous: &Transcript) -> Transcript {
     Transcript {
-        auto_expand_edits: previous.auto_expand_edits,
+        diff_expansion: previous.diff_expansion,
         auto_expand_tools: previous.auto_expand_tools,
         follow_tail: previous.follow_tail,
         user_label: previous.user_label.clone(),

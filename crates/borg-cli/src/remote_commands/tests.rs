@@ -190,6 +190,27 @@ fn persistent_sidecar_aliases_keep_their_durable_lane_identity() {
 }
 
 #[test]
+fn diff_expansion_command_accepts_policies_and_legacy_switches() {
+    assert_eq!(
+        parse_diff_expansion("expanded"),
+        Some(DiffExpansionPolicy::Expanded)
+    );
+    assert_eq!(
+        parse_diff_expansion("until-next-action"),
+        Some(DiffExpansionPolicy::UntilNextAction)
+    );
+    assert_eq!(
+        parse_diff_expansion("until_next_action"),
+        Some(DiffExpansionPolicy::UntilNextAction)
+    );
+    assert_eq!(
+        parse_diff_expansion("off"),
+        Some(DiffExpansionPolicy::Collapsed)
+    );
+    assert_eq!(parse_diff_expansion("sometimes"), None);
+}
+
+#[test]
 fn director_command_extracts_text_without_matching_longer_commands() {
     assert_eq!(
         director_prompt_command("/director review the focused child").and_then(Result::ok),
