@@ -974,6 +974,47 @@ async fn accepted_steer_queue_event_reopens_a_terminal_action_projection() {
 }
 
 #[tokio::test]
+async fn recovered_steer_accepts_a_coalesced_queue_snapshot() {
+    let (directory, store) = store().await;
+    let session_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+    for kind in [
+        SessionEventKind::SessionStarted,
+        configured(directory.path()),
+        SessionEventKind::Message {
+            message_id,
+            actor: EventActor::User,
+            text: "steer while active".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Queued,
+            delivery: Some(PromptDelivery::Steer),
+        },
+        SessionEventKind::Message {
+            message_id,
+            actor: EventActor::User,
+            text: "earlier queued input\n\nsteer while active".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::InProgress,
+            delivery: Some(PromptDelivery::Queue),
+        },
+    ] {
+        store
+            .append(SessionEvent::new(session_id, 0, kind))
+            .await
+            .unwrap();
+    }
+
+    let action = store.action(session_id, message_id).await.unwrap().unwrap();
+    assert_eq!(action.kind, crate::SessionActionKind::Prompt);
+    assert_eq!(action.state, SessionActionState::Admitted);
+    assert_eq!(
+        action.payload["text"],
+        "earlier queued input\n\nsteer while active"
+    );
+}
+
+#[tokio::test]
 async fn concurrent_claims_have_one_winner_and_same_owner_claim_is_idempotent() {
     let (_directory, store) = store().await;
     let session_id = Uuid::new_v4();

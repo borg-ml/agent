@@ -4681,13 +4681,15 @@ async fn insert_action_row(
         }
         if existing.kind == crate::SessionActionKind::Steering
             && action.kind == crate::SessionActionKind::Prompt
-            && same_prompt_payload_ignoring_delivery(&existing.payload, &action.payload)
+            && (same_prompt_payload_ignoring_delivery(&existing.payload, &action.payload)
+                || (allow_in_progress_payload_rewrite
+                    && existing.payload.get("message_id") == action.payload.get("message_id")))
         {
             // A rejected or interrupted active-turn steer is deliberately
-            // promoted into the next-turn FIFO. It remains one user action;
-            // only its delivery class changes. Keep the immutable message
-            // identity/content check above and update the durable routing
-            // projection in place so replay cannot duplicate the action.
+            // promoted into the next-turn FIFO. Its in-progress snapshot can
+            // also carry a coalesced queue payload, so that snapshot may
+            // rewrite content while preserving the durable message identity.
+            // A queued event still changes only the delivery class.
             sqlx::query(
                 "update session_actions set action_kind=?, delivery_policy=?, wake_policy=?, \
                  payload_json=?, updated_at=? where action_id=? and session_id=?",
