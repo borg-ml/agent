@@ -3309,11 +3309,6 @@ async fn run_local_agent_session(
                         }
                     }
                     UiAction::FlushPendingInput { target, prompt } => {
-                        terminal.as_mut().expect("terminal").draw()?;
-                        terminal_dirty = terminal
-                            .as_ref()
-                            .expect("terminal")
-                            .has_pending_scroll_frame();
                         if let Some((message_id, text, attachments)) = prompt {
                             if let Err(error) = persist_prompt_admission(
                                 store.as_ref(),
@@ -3897,8 +3892,6 @@ async fn run_local_agent_session(
                                         PromptDelivery::Queue,
                                     );
                                     terminal.set_notice("Queued message for director".to_string());
-                                    terminal.draw()?;
-                                    terminal_dirty = terminal.has_pending_scroll_frame();
                                     if let Err(error) = persist_prompt_admission(
                                         store.as_ref(),
                                         session_id,
@@ -3922,6 +3915,8 @@ async fn run_local_agent_session(
                                         terminal_dirty = false;
                                         continue;
                                     }
+                                    terminal.draw()?;
+                                    terminal_dirty = terminal.has_pending_scroll_frame();
                                     let command = director_prompt_host_command(
                                         session_id,
                                         message_id,
@@ -3998,11 +3993,6 @@ async fn run_local_agent_session(
                                 },
                             },
                         );
-                        terminal.as_mut().expect("terminal").draw()?;
-                        terminal_dirty = terminal
-                            .as_ref()
-                            .expect("terminal")
-                            .has_pending_scroll_frame();
                         if let Err(error) = persist_prompt_admission(
                             store.as_ref(),
                             target.unwrap_or(session_id),
@@ -4079,8 +4069,6 @@ async fn run_local_agent_session(
                                         sleep_inhibitor.set_turn_active(true);
                                     }
                                     terminal.set_notice("Sending to director".to_string());
-                                    terminal.draw()?;
-                                    terminal_dirty = terminal.has_pending_scroll_frame();
                                     if let Err(error) = persist_prompt_admission(
                                         store.as_ref(),
                                         session_id,
@@ -4108,6 +4096,8 @@ async fn run_local_agent_session(
                                         terminal_dirty = false;
                                         continue;
                                     }
+                                    terminal.draw()?;
+                                    terminal_dirty = terminal.has_pending_scroll_frame();
                                     let command = director_prompt_host_command(
                                         session_id,
                                         message_id,
@@ -4179,11 +4169,6 @@ async fn run_local_agent_session(
                                     text.clone(),
                                     delivery,
                                 );
-                            terminal.as_mut().expect("terminal").draw()?;
-                            terminal_dirty = terminal
-                                .as_ref()
-                                .expect("terminal")
-                                .has_pending_scroll_frame();
                             if let Err(error) = persist_prompt_admission(
                                 store.as_ref(),
                                 target,
@@ -5121,11 +5106,6 @@ async fn run_local_agent_session(
                                             status = SessionStatus::Starting;
                                             sleep_inhibitor.set_turn_active(true);
                                         }
-                                        terminal.as_mut().expect("terminal").draw()?;
-                                        terminal_dirty = terminal
-                                            .as_ref()
-                                            .expect("terminal")
-                                            .has_pending_scroll_frame();
                                         if let Err(error) = persist_prompt_admission(
                                             store.as_ref(),
                                             session_id,
