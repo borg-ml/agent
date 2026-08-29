@@ -432,6 +432,7 @@ impl NativeHarness {
                 }
                 outcomes
             };
+            let mut trailing_context_tokens = 0_u64;
             for (tool_call, (output, is_error, steer)) in tool_calls.iter().zip(outcomes) {
                 pending_steer = pending_steer.or(steer);
                 let output = bounded_tool_content(output);
@@ -451,6 +452,8 @@ impl NativeHarness {
                     tool_call_id: tool_call.id.clone(),
                     content: output,
                 };
+                trailing_context_tokens =
+                    trailing_context_tokens.saturating_add(estimated_message_tokens(&tool_message));
                 record_native_message(&events, turn.provider, &tool_message).await?;
                 messages.push(tool_message);
             }
@@ -458,6 +461,8 @@ impl NativeHarness {
             if let Some(steer) = pending_steer {
                 let message =
                     native_user_message(&turn.cwd, &steer.text, &steer.attachments).await?;
+                trailing_context_tokens =
+                    trailing_context_tokens.saturating_add(estimated_message_tokens(&message));
                 record_native_message(&events, turn.provider, &message).await?;
                 messages.push(message);
                 canonicalize_native_messages(&mut messages);
@@ -472,8 +477,12 @@ impl NativeHarness {
                 },
             )
             .await;
-            if native_usage_needs_auto_compaction(&result.usage) {
-                let context_tokens = result.usage.context_tokens.unwrap_or_default();
+            if native_usage_needs_auto_compaction(&result.usage, trailing_context_tokens) {
+                let context_tokens = result
+                    .usage
+                    .context_tokens
+                    .unwrap_or_default()
+                    .saturating_add(trailing_context_tokens);
                 let context_window_tokens = result.usage.context_window_tokens.unwrap_or_default();
                 send(
                     &events,
@@ -1819,16 +1828,26 @@ fn absorb_usage(total: &mut ProviderCallUsage, usage: &ProviderCallUsage) {
 
 const NATIVE_AUTO_COMPACT_REMAINING_PERCENT: u64 = 5;
 
-fn native_usage_needs_auto_compaction(usage: &ProviderCallUsage) -> bool {
+fn native_usage_needs_auto_compaction(
+    usage: &ProviderCallUsage,
+    trailing_context_tokens: u64,
+) -> bool {
     let (Some(context_tokens), Some(context_window_tokens)) =
         (usage.context_tokens, usage.context_window_tokens)
     else {
         return false;
     };
+    let context_tokens = context_tokens.saturating_add(trailing_context_tokens);
     context_window_tokens > 0
         && u128::from(context_tokens).saturating_mul(100)
             >= u128::from(context_window_tokens)
                 .saturating_mul(100 - u128::from(NATIVE_AUTO_COMPACT_REMAINING_PERCENT))
+}
+
+fn estimated_message_tokens(message: &ModelMessage) -> u64 {
+    serde_json::to_string(message).map_or(u64::MAX, |serialized| {
+        u64::try_from(serialized.chars().count().div_ceil(4)).unwrap_or(u64::MAX)
+    })
 }
 
 fn parse_tool_arguments(tool_call: &ModelToolCall) -> std::result::Result<Value, String> {
@@ -2566,10 +2585,25 @@ mod tests {
             context_window_tokens: Some(context_window_tokens),
             ..ProviderCallUsage::default()
         };
-        assert!(!native_usage_needs_auto_compaction(&usage(94_999, 100_000)));
-        assert!(native_usage_needs_auto_compaction(&usage(95_000, 100_000)));
         assert!(!native_usage_needs_auto_compaction(
-            &ProviderCallUsage::default()
+            &usage(94_999, 100_000),
+            0
+        ));
+        assert!(native_usage_needs_auto_compaction(
+            &usage(95_000, 100_000),
+            0
+        ));
+        let large_tool_result = ModelMessage::Tool {
+            tool_call_id: "large-result".to_string(),
+            content: "x".repeat(4_000),
+        };
+        assert!(native_usage_needs_auto_compaction(
+            &usage(94_000, 100_000),
+            estimated_message_tokens(&large_tool_result)
+        ));
+        assert!(!native_usage_needs_auto_compaction(
+            &ProviderCallUsage::default(),
+            1_000
         ));
     }
 

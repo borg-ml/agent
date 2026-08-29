@@ -2034,13 +2034,6 @@ impl BorgTerminal {
         self.input.next_event().await
     }
 
-    pub async fn restart_input(&mut self, notice: impl Into<String>) {
-        self.input.shutdown().await;
-        self.input = TerminalInput::spawn();
-        self.notice = Some(notice.into());
-        self.event_redraw_needed = true;
-    }
-
     /// Replace the live keymap after the agent config is edited by a Borg
     /// self-service tool. Parsing happens before the map is swapped, so an
     /// invalid update leaves the current terminal controls intact.

@@ -3117,26 +3117,46 @@ async fn run_local_agent_session(
                 }
             }
             terminal_event = recv_terminal_event(&mut terminal), if terminal.is_some() => {
-                let Some(terminal_event) = terminal_event else {
-                    tracing::warn!(%session_id, "terminal input pump ended; restarting it");
-                    terminal
-                        .as_mut()
-                        .expect("terminal")
-                        .restart_input("Terminal input recovered")
-                        .await;
-                    terminal_dirty = true;
-                    continue;
-                };
                 let terminal_event = match terminal_event {
-                    Ok(event) => event,
-                    Err(error) => {
-                        tracing::warn!(%session_id, %error, "terminal input failed; restarting it");
-                        terminal
-                            .as_mut()
-                            .expect("terminal")
-                            .restart_input("Terminal input recovered")
-                            .await;
-                        terminal_dirty = true;
+                    Some(Ok(event)) => event,
+                    failed => {
+                        let failure = failed
+                            .and_then(Result::err)
+                            .map_or_else(|| "input stream ended".to_string(), |error| error.to_string());
+                        tracing::warn!(%session_id, %failure, "terminal input failed; detaching it");
+                        let attached_prompt_pending = local_prompt_submission_pending(
+                            &pending_prompt_ids,
+                            &local_prompt_admissions,
+                        );
+                        let handoff_to_viewer = owner_shutdown_should_handoff_to_viewer(
+                            session_access,
+                            status,
+                            attached_prompt_pending,
+                            control_server.as_ref(),
+                        );
+                        let terminal_draft = terminal
+                            .as_ref()
+                            .and_then(BorgTerminal::composer_draft);
+                        shutdown_terminal(&mut terminal, &crash_context.tui_active).await;
+                        if should_detach_on_terminal_loss(status, attached_prompt_pending)
+                            || handoff_to_viewer
+                        {
+                            if detached_prompt.is_none() {
+                                detached_prompt = terminal_draft;
+                            }
+                            handoff_on_safe_boundary |= handoff_to_viewer;
+                            detached_from_terminal = true;
+                            continue;
+                        }
+                        stop_sent = true;
+                        user_requested_exit = true;
+                        exit_notice = Some(format!(
+                            "Terminal input was lost ({failure}); Borg stopped the idle local session."
+                        ));
+                        session_command_tx
+                            .send(HostCommand::Stop { session_id })
+                            .await
+                            .ok();
                         continue;
                     }
                 };
@@ -5576,14 +5596,15 @@ fn should_detach_on_terminal_hangup(
     status: SessionStatus,
     prompt_submission_pending: bool,
 ) -> bool {
-    signal == "SIGHUP"
-        && (prompt_submission_pending
-            || matches!(
-                status,
-                SessionStatus::Starting
-                    | SessionStatus::Running
-                    | SessionStatus::WaitingForApproval
-            ))
+    signal == "SIGHUP" && should_detach_on_terminal_loss(status, prompt_submission_pending)
+}
+
+fn should_detach_on_terminal_loss(status: SessionStatus, prompt_submission_pending: bool) -> bool {
+    prompt_submission_pending
+        || matches!(
+            status,
+            SessionStatus::Starting | SessionStatus::Running | SessionStatus::WaitingForApproval
+        )
 }
 
 fn committed_prompt_id(kind: &SessionEventKind) -> Option<Uuid> {

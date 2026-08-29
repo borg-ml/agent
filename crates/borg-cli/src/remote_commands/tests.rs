@@ -1721,6 +1721,11 @@ async fn obsolete_owner_handoff_waits_for_a_lease_after_its_socket_disappears() 
 
 #[test]
 fn active_session_survives_terminal_hangup_but_idle_session_stops() {
+    assert!(should_detach_on_terminal_loss(
+        SessionStatus::Running,
+        false
+    ));
+    assert!(!should_detach_on_terminal_loss(SessionStatus::Ready, false));
     assert!(should_detach_on_terminal_hangup(
         "SIGHUP",
         SessionStatus::Running,
