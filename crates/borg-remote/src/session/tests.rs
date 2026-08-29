@@ -922,6 +922,30 @@ struct EmptyThenSuccessExecutor {
     prompts: RecordedPromptTurns,
 }
 
+struct UsageLimitThenSuccessExecutor {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl AgentTurnExecutor for UsageLimitThenSuccessExecutor {
+    async fn execute(
+        &self,
+        _turn: AgentTurn,
+        _events: mpsc::Sender<SessionEventKind>,
+        _controls: Option<mpsc::Receiver<AgentTurnControl>>,
+    ) -> Result<AgentTurnResult> {
+        if self.calls.fetch_add(1, Ordering::AcqRel) == 0 {
+            return Err(anyhow::anyhow!(
+                "You've hit your usage limit. Try again later."
+            ));
+        }
+        Ok(AgentTurnResult {
+            provider_session_id: Some("provider-session".to_string()),
+            final_text: "resumed after reset".to_string(),
+        })
+    }
+}
+
 struct HungProviderExecutor;
 
 struct NarrationThenDelayedCompletionExecutor;
@@ -1484,6 +1508,86 @@ async fn empty_provider_response_retries_without_losing_user_prompt() {
         ]
     );
     assert_eq!(prompts.lock().unwrap().len(), 2);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn usage_limited_prompt_resumes_automatically_after_the_retry_delay() {
+    let root = tempdir().unwrap();
+    let session_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    let (command_tx, command_rx) = mpsc::channel(8);
+    let (event_tx, mut event_rx) = mpsc::channel(128);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let executor = Arc::new(UsageLimitThenSuccessExecutor {
+        calls: Arc::clone(&calls),
+    });
+    let actor = tokio::spawn({
+        let journal_path = root.path().join("session.lock");
+        let cwd = root.path().to_path_buf();
+        async move {
+            run_agent_session_with_executor(
+                &journal_path,
+                session_id,
+                LaunchSession {
+                    request_id: message_id,
+                    cwd,
+                    provider: CodingProvider::Codex,
+                    model: None,
+                    effort: None,
+                    fast: Some(false),
+                    response_language: crate::ResponseLanguage::Auto,
+                    permission_mode: PermissionMode::Manual,
+                    name: None,
+                    initial_prompt: Some("finish this task".to_string()),
+                    capabilities: Default::default(),
+                    subagent_concurrency_limit: None,
+                    extension_skill_roots: Vec::new(),
+                    team_policy: None,
+                },
+                command_rx,
+                event_tx,
+                executor,
+            )
+            .await
+        }
+    });
+
+    let mut completions = 0;
+    while completions < 2 {
+        let event = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+            .await
+            .expect("usage-limit retry completes")
+            .expect("session remains attached");
+        if matches!(
+            event.kind,
+            SessionEventKind::TurnCompleted {
+                message_id: completed_message_id,
+                ..
+            } if completed_message_id == message_id
+        ) {
+            completions += 1;
+        }
+    }
+
+    command_tx
+        .send(HostCommand::Stop { session_id })
+        .await
+        .unwrap();
+    actor.await.unwrap().unwrap();
+    assert_eq!(calls.load(Ordering::Acquire), 2);
+
+    let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .action(session_id, message_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        crate::SessionActionState::Completed
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -5276,8 +5380,35 @@ fn structured_rate_and_billing_errors_are_usage_limited() {
     assert!(provider_error_is_usage_limited(
         r#"claude SDK API error: payment required "kind": "billing_error""#
     ));
+    assert!(provider_error_is_usage_limited(
+        "You've hit your usage limit. Try again later."
+    ));
+    assert!(provider_error_is_usage_limited(
+        "OpenCode request failed: rate limit exceeded"
+    ));
+    assert!(provider_error_is_temporary_usage_limited(
+        "You've hit your usage limit. Try again later."
+    ));
+    assert!(!provider_error_is_temporary_usage_limited(
+        r#"claude SDK API error: payment required "kind": "billing_error""#
+    ));
     assert!(!provider_error_is_usage_limited(
         r#"claude SDK API error: overloaded "kind":"overloaded" "status":529"#
+    ));
+}
+
+#[test]
+fn usage_limit_auto_resume_is_restricted_to_subscription_cli_providers() {
+    assert!(provider_supports_usage_limit_resume(CodingProvider::Claude));
+    assert!(provider_supports_usage_limit_resume(CodingProvider::Codex));
+    assert!(provider_supports_usage_limit_resume(
+        CodingProvider::OpenCode
+    ));
+    assert!(!provider_supports_usage_limit_resume(
+        CodingProvider::OpenRouter
+    ));
+    assert!(!provider_supports_usage_limit_resume(
+        CodingProvider::OpenAiCompatible
     ));
 }
 

@@ -259,6 +259,7 @@ pub(crate) struct CapabilityConfig {
     pub(crate) cloud_sync: bool,
     pub(crate) web_relay: bool,
     pub(crate) telemetry: bool,
+    pub(crate) auto_resume_usage_limits: bool,
     /// Native-harness tool presentation. `compact` is the focused coding
     /// surface; `both` preserves the legacy catalog while adding programmatic
     /// dispatch.
@@ -276,6 +277,7 @@ impl Default for CapabilityConfig {
             cloud_sync: true,
             web_relay: true,
             telemetry: false,
+            auto_resume_usage_limits: true,
             tool_mode: borg_remote::ToolMode::Both,
         }
     }
@@ -292,6 +294,7 @@ impl From<&CapabilityConfig> for borg_remote::SessionCapabilities {
             cloud_sync: value.cloud_sync,
             web_relay: value.web_relay,
             telemetry: value.telemetry,
+            auto_resume_usage_limits: value.auto_resume_usage_limits,
             provider_capabilities: Vec::new(),
             runtime_mcp_context: None,
             resource_limits: None,
@@ -1130,6 +1133,17 @@ reasoning_format = "deepseek"
             toml::from_str(include_str!("../../../configs/agent.example.toml")).unwrap();
         config.validate().unwrap();
         assert_eq!(config.expand_command("/quick"), "/fast on");
+        assert!(config.capabilities.auto_resume_usage_limits);
+    }
+
+    #[test]
+    fn usage_limit_auto_resume_can_be_disabled() {
+        let config: AgentConfig =
+            toml::from_str("[capabilities]\nauto_resume_usage_limits = false\n").unwrap();
+        assert!(!config.capabilities.auto_resume_usage_limits);
+        assert!(
+            !borg_remote::SessionCapabilities::from(&config.capabilities).auto_resume_usage_limits
+        );
     }
 
     #[test]

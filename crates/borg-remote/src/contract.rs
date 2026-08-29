@@ -739,6 +739,10 @@ pub struct SessionCapabilities {
     pub cloud_sync: bool,
     pub web_relay: bool,
     pub telemetry: bool,
+    /// Keep interrupted subscription work queued and retry it after provider
+    /// usage limits have had time to clear.
+    #[serde(default = "default_true")]
+    pub auto_resume_usage_limits: bool,
     /// Host-local provider authentication and admission state. This is safe
     /// model metadata, never a credential, and is refreshed at session launch
     /// by local and enrolled hosts.
@@ -767,11 +771,16 @@ impl Default for SessionCapabilities {
             cloud_sync: true,
             web_relay: true,
             telemetry: false,
+            auto_resume_usage_limits: true,
             provider_capabilities: Vec::new(),
             runtime_mcp_context: None,
             resource_limits: None,
         }
     }
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 /// Render the secret-free provider admission snapshot that is appended to a

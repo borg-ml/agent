@@ -27,6 +27,11 @@ use crate::{
 };
 
 const ROOT_INBOX_REFRESH_INTERVAL: Duration = Duration::from_millis(50);
+#[cfg(not(test))]
+const USAGE_LIMIT_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(5 * 60);
+#[cfg(test)]
+const USAGE_LIMIT_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(10);
+const USAGE_LIMIT_RETRY_MAX_DELAY: Duration = Duration::from_secs(30 * 60);
 const WORKSPACE_PROJECTION_REPAIR_BATCH_SIZE: usize = 512;
 const RETAINED_COMPACTION_SYSTEM_PROMPT: &str = "This is an internal context-compaction preparation turn. Do not use tools, modify files, or answer the user. Return only a compact continuation summary of the supplied prior provider conversation.";
 const SUBSCRIPTION_CONTEXT_HEADER: &str = "Borg canonical provider context v2. The history below is a read-only, provider-neutral projection of durable Borg state; answer the current request normally.\n";
@@ -1300,6 +1305,8 @@ async fn run_agent_session_store_kernel(
     // all other failures remain durable as failed messages instead of being
     // mistaken for completed input.
     let mut automatic_retry_message_ids = HashSet::new();
+    let mut usage_limit_retry_not_before: Option<Instant> = None;
+    let mut usage_limit_retry_delay = USAGE_LIMIT_RETRY_INITIAL_DELAY;
     let mut at_turn_boundary = !pending.is_empty();
     let mut projection_repair_started = false;
     let mut next_ready_detail = (!fresh).then(|| "Resumed".to_string());
@@ -1490,11 +1497,16 @@ async fn run_agent_session_store_kernel(
         let goal_is_active = goal
             .as_ref()
             .is_some_and(|goal| goal.status == GoalStatus::Active);
-        let next = if let Some(prompt) = pop_next_pending_prompt(&mut pending, goal_is_active) {
+        let usage_limit_retry_waiting =
+            usage_limit_retry_not_before.is_some_and(|deadline| deadline > Instant::now());
+        let next = if !usage_limit_retry_waiting
+            && let Some(prompt) = pop_next_pending_prompt(&mut pending, goal_is_active)
+        {
             Some(prompt)
-        } else if let Some(active_goal) = goal
-            .as_ref()
-            .filter(|goal| goal_allows_automatic_continuation(goal))
+        } else if !usage_limit_retry_waiting
+            && let Some(active_goal) = goal
+                .as_ref()
+                .filter(|goal| goal_allows_automatic_continuation(goal))
         {
             Some(QueuedPrompt {
                 message_id: Uuid::new_v4(),
@@ -1525,8 +1537,36 @@ async fn run_agent_session_store_kernel(
                 session_id,
             );
             loop {
+                let usage_limit_wait = async {
+                    match usage_limit_retry_not_before {
+                        Some(deadline) => {
+                            tokio::time::sleep(deadline.saturating_duration_since(Instant::now()))
+                                .await
+                        }
+                        None => std::future::pending().await,
+                    }
+                };
                 let command = tokio::select! {
                     biased;
+                    _ = usage_limit_wait, if usage_limit_retry_not_before.is_some() => {
+                        usage_limit_retry_not_before = None;
+                        let goal_is_active = goal.as_ref().is_some_and(|goal| goal.status == GoalStatus::Active);
+                        break pop_next_pending_prompt(&mut pending, goal_is_active).or_else(|| {
+                            goal.as_ref()
+                                .filter(|goal| goal_allows_automatic_continuation(goal))
+                                .map(|active_goal| QueuedPrompt {
+                                    message_id: Uuid::new_v4(),
+                                    text: continuation_prompt(active_goal),
+                                    actor: EventActor::System,
+                                    attachments: Vec::new(),
+                                    output_schema: None,
+                                    delivery: PromptDelivery::Queue,
+                                    visible: false,
+                                    interrupt_batch: false,
+                                    batch: Vec::new(),
+                                })
+                        });
+                    }
                     command = next_host_command(&mut deferred_commands, &mut commands) => command,
                     message = root_message_rx.recv(), if owns_team => {
                         match message {
@@ -2790,6 +2830,8 @@ async fn run_agent_session_store_kernel(
                     .await?;
                         match result {
                         Ok(outcome) => {
+                            usage_limit_retry_delay = USAGE_LIMIT_RETRY_INITIAL_DELAY;
+                            usage_limit_retry_not_before = None;
                             goal_turn_failures.reset();
                             subscription_context_reusable =
                                 subscription_context_reusable_after_turn(
@@ -2848,7 +2890,10 @@ async fn run_agent_session_store_kernel(
                                 provider_fork_turn_id = None;
                                 executor.stop_session(session_id).await?;
                             }
-                            let retry = automatic_retry_allowed(
+                            let usage_limit_retry = launch.capabilities.auto_resume_usage_limits
+                                && provider_supports_usage_limit_resume(launch.provider)
+                                && provider_error_is_temporary_usage_limited(&error);
+                            let retry = usage_limit_retry || automatic_retry_allowed(
                                 &error,
                                 interrupted,
                                 prompt.visible,
@@ -2856,7 +2901,7 @@ async fn run_agent_session_store_kernel(
                                 turn_had_side_effects,
                                 !automatic_retry_message_ids.contains(&prompt.message_id),
                             );
-                            if retry {
+                            if retry && !usage_limit_retry {
                                 automatic_retry_message_ids.insert(prompt.message_id);
                             }
                             if !retry {
@@ -2868,7 +2913,10 @@ async fn run_agent_session_store_kernel(
                                 autonomy_result = Some(Err(anyhow::anyhow!(error.clone())));
                             }
                             let ready_detail = if retry {
-                                if provider_isolation_recovery {
+                                if usage_limit_retry {
+                                    "The provider usage limit was reached; Borg preserved this work and will resume it automatically when capacity is available."
+                                        .to_string()
+                                } else if provider_isolation_recovery {
                                     "Borg blocked a provider-native delegation attempt and is continuing automatically on a clean provider thread."
                                         .to_string()
                                 } else if error.to_ascii_lowercase().contains(
@@ -2883,7 +2931,14 @@ async fn run_agent_session_store_kernel(
                             } else {
                                 format!("Turn failed; the session remains available: {error}")
                             };
-                            if retry {
+                            if usage_limit_retry {
+                                goal_turn_failures.reset();
+                                usage_limit_retry_not_before =
+                                    Some(Instant::now() + usage_limit_retry_delay);
+                                usage_limit_retry_delay = usage_limit_retry_delay
+                                    .saturating_mul(2)
+                                    .min(USAGE_LIMIT_RETRY_MAX_DELAY);
+                            } else if retry {
                                 goal_turn_failures.reset();
                             } else if provider_error_is_usage_limited(&error) {
                                 goal_turn_failures.reset();
@@ -6700,7 +6755,30 @@ fn provider_error_is_usage_limited(error: &str) -> bool {
         .filter(|character| !character.is_ascii_whitespace())
         .flat_map(char::to_lowercase)
         .collect::<String>();
-    compact.contains(r#""kind":"rate_limit""#) || compact.contains(r#""kind":"billing_error""#)
+    compact.contains(r#""kind":"rate_limit""#)
+        || compact.contains(r#""kind":"billing_error""#)
+        || compact.contains("ratelimit")
+        || compact.contains("usagelimit")
+        || compact.contains("quotaexceeded")
+        || compact.contains("toomanyrequests")
+        || compact.contains("hityourlimit")
+}
+
+fn provider_error_is_temporary_usage_limited(error: &str) -> bool {
+    provider_error_is_usage_limited(error)
+        && !error
+            .chars()
+            .filter(|character| !character.is_ascii_whitespace())
+            .flat_map(char::to_lowercase)
+            .collect::<String>()
+            .contains(r#""kind":"billing_error""#)
+}
+
+fn provider_supports_usage_limit_resume(provider: CodingProvider) -> bool {
+    matches!(
+        provider,
+        CodingProvider::Claude | CodingProvider::Codex | CodingProvider::OpenCode
+    )
 }
 
 fn is_safe_automatic_retry_error(error: &str) -> bool {

@@ -17,6 +17,9 @@ presence = true
 cloud_sync = true
 web_relay = true
 telemetry = false
+# Keep in-progress Claude, Codex, and OpenCode work queued when a subscription
+# limit is reached, then retry periodically until the limit clears.
+auto_resume_usage_limits = true
 # Native tool presentation: `compact`, `native`, `code`, or `both` (the default).
 tool_mode = "both"
 # `shared_work`, `presence`, `cloud_sync`, `web_relay`, and `telemetry` are
