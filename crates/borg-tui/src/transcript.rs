@@ -2206,11 +2206,23 @@ impl Transcript {
         self.finish_reasoning(completed_at);
         self.foreground_tool = None;
         self.preparing_tool = None;
-        for entry in &mut self.order {
+        let active_background_tools = self
+            .runtime_processes
+            .values()
+            .filter(|process| process.running)
+            .filter_map(|process| process.tool_index)
+            .chain(
+                self.provider_backgrounds
+                    .values()
+                    .map(|process| process.tool_index),
+            )
+            .collect::<HashSet<_>>();
+        for (index, entry) in self.order.iter_mut().enumerate() {
             if let TranscriptEntry::Tool {
                 detail,
                 complete,
                 error,
+                backgrounded,
                 completed_at: stored_completed_at,
                 ..
             } = entry
@@ -2218,6 +2230,7 @@ impl Transcript {
             {
                 *complete = true;
                 *error = failed;
+                *backgrounded = active_background_tools.contains(&index);
                 *stored_completed_at = Some(completed_at);
                 if failed && !error_detail.trim().is_empty() {
                     *detail = format!(

@@ -7923,6 +7923,47 @@ fn provider_progress_marks_an_unfinished_tool_as_background_work() {
 }
 
 #[test]
+fn turn_completion_clears_unbacked_background_tool_state() {
+    let session_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::ToolStarted {
+            tool_call_id: "long-build".to_string(),
+            name: "command_execution".to_string(),
+            input: serde_json::json!({"command": "cargo build"}),
+            input_ref: None,
+        },
+    ));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::ReasoningCompleted,
+    ));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        3,
+        SessionEventKind::TurnCompleted {
+            message_id: Uuid::new_v4(),
+            provider_session_id: None,
+            final_text: String::new(),
+            error: None,
+        },
+    ));
+
+    let completed = transcript
+        .lines(120)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(completed.contains("Ran"), "{completed}");
+    assert!(!completed.contains("Running in background"), "{completed}");
+    assert_eq!(transcript.shell_status(), None);
+}
+
+#[test]
 fn boxed_thinking_rows_keep_one_edge_separator_without_duplicates() {
     let mut transcript = Transcript::default();
     transcript
