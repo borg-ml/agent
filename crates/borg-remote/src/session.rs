@@ -1283,15 +1283,7 @@ async fn run_agent_session_store_kernel(
         .is_some_and(|goal| goal.status.is_active())
         .then(Instant::now);
     let mut goal_turn_failures = ConsecutiveGoalTurnFailures::default();
-    let mut primary_turn_starts = HashMap::new();
-    for event in journal.context_events() {
-        if let SessionEventKind::TurnStarted { message_id, .. } = event.kind {
-            primary_turn_starts
-                .entry(message_id)
-                .or_insert(event.sequence);
-        }
-    }
-    let mut pending = recover_prompts_on_resume(&recovery.queue_events, &primary_turn_starts);
+    let mut pending = recover_prompts_on_resume(&recovery.queue_events);
     for action in recovered_actions {
         if let Some(prompt) = queued_prompt_from_action(&action)
             && !pending
@@ -2188,7 +2180,7 @@ async fn run_agent_session_store_kernel(
                 }
             }
         };
-        let Some(prompt) = next else {
+        let Some(mut prompt) = next else {
             if owns_team && let Some(team) = &subagents {
                 for activity in team.stop_all().await {
                     record_subagent_activity(&mut journal, &events, session_id, team, activity)
@@ -2198,6 +2190,14 @@ async fn run_agent_session_store_kernel(
             stop(&mut journal, &events, session_id).await?;
             return Ok(());
         };
+        // Steering only has meaning while a provider turn is active. Input
+        // selected here starts a new turn, even when the frontend submitted
+        // it through its immediate-send path. Persist it as queued before
+        // provider admission so a crash cannot make an idle prompt look like
+        // an already-consumed active-turn steer.
+        if prompt.actor == EventActor::User {
+            prompt.delivery = PromptDelivery::Queue;
+        }
         let autonomy_job_id = autonomy_prompt_ids
             .remove(&prompt.message_id)
             .then_some(prompt.message_id);
@@ -5114,20 +5114,14 @@ fn retained_compaction_prompt(context: &str) -> String {
     )
 }
 
-fn recover_prompts_on_resume(
-    events: &[SessionEvent],
-    primary_turn_starts: &HashMap<Uuid, u64>,
-) -> VecDeque<QueuedPrompt> {
+fn recover_prompts_on_resume(events: &[SessionEvent]) -> VecDeque<QueuedPrompt> {
     // A queued message is durable user input, not a disposable snapshot. Keep
     // every unresolved entry and let the normal boundary drain admit it
     // without interrupting any provider turn that may still be running.
-    recover_queued_prompts(events, primary_turn_starts)
+    recover_queued_prompts(events)
 }
 
-fn recover_queued_prompts(
-    events: &[SessionEvent],
-    primary_turn_starts: &HashMap<Uuid, u64>,
-) -> VecDeque<QueuedPrompt> {
+fn recover_queued_prompts(events: &[SessionEvent]) -> VecDeque<QueuedPrompt> {
     let mut pending = VecDeque::<QueuedPrompt>::new();
     // A crashed actor can leave an older in-progress snapshot after the
     // message's terminal event. Do not resurrect that snapshot on resume;
@@ -5147,18 +5141,6 @@ fn recover_queued_prompts(
             } if matches!(actor, EventActor::User | EventActor::System) => {
                 let queued = *status == MessageStatus::Queued;
                 let delivery = delivery.unwrap_or(PromptDelivery::Queue);
-                // A primary prompt has its own earlier TurnStarted boundary.
-                // Without one, InProgress is the provider's active-steer ack.
-                if *status == MessageStatus::InProgress
-                    && delivery == PromptDelivery::Steer
-                    && primary_turn_starts
-                        .get(message_id)
-                        .is_none_or(|turn_sequence| event.sequence < *turn_sequence)
-                {
-                    settled.insert(*message_id, (false, Some(delivery)));
-                    pending.retain(|prompt| prompt.message_id != *message_id);
-                    continue;
-                }
                 let explicit_retry = queued
                     && settled
                         .get(message_id)

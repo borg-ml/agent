@@ -1477,7 +1477,7 @@ async fn empty_provider_response_retries_without_losing_user_prompt() {
     assert_eq!(
         transitions,
         [
-            (MessageStatus::InProgress, PromptDelivery::Steer),
+            (MessageStatus::InProgress, PromptDelivery::Queue),
             (MessageStatus::Queued, PromptDelivery::Queue),
             (MessageStatus::InProgress, PromptDelivery::Queue),
             (MessageStatus::Complete, PromptDelivery::Queue),
@@ -1939,6 +1939,104 @@ async fn executor_ready_has_a_bounded_provider_drain() {
             ..
         } if text == "final answer"
     )));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn idle_immediate_input_is_persisted_as_queue_before_turn_admission() {
+    let root = tempdir().unwrap();
+    let journal_path = root.path().join("session.lock");
+    let cwd = root.path().to_path_buf();
+    let session_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    let (command_tx, command_rx) = mpsc::channel(8);
+    let (event_tx, mut event_rx) = mpsc::channel(64);
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let called = Arc::new(Notify::new());
+    let executor = Arc::new(RecordingExecutor {
+        seen: Arc::clone(&seen),
+        called,
+    });
+    let actor = tokio::spawn(async move {
+        run_agent_session_with_executor(
+            &journal_path,
+            session_id,
+            LaunchSession {
+                request_id: Uuid::new_v4(),
+                cwd,
+                provider: CodingProvider::Codex,
+                model: None,
+                effort: None,
+                fast: Some(false),
+                response_language: crate::ResponseLanguage::Auto,
+                permission_mode: PermissionMode::Manual,
+                name: None,
+                initial_prompt: None,
+                capabilities: Default::default(),
+                subagent_concurrency_limit: None,
+                extension_skill_roots: Vec::new(),
+                team_policy: None,
+            },
+            command_rx,
+            event_tx,
+            executor,
+        )
+        .await
+    });
+
+    command_tx
+        .send(HostCommand::Prompt {
+            session_id,
+            message_id,
+            text: "start this idle turn".to_string(),
+            attachments: Vec::new(),
+            output_schema: None,
+            delivery: PromptDelivery::Steer,
+        })
+        .await
+        .unwrap();
+
+    let mut in_progress_delivery = None;
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+            .await
+            .expect("idle prompt reaches a terminal turn boundary")
+            .expect("session remains attached");
+        if let SessionEventKind::Message {
+            message_id: event_message_id,
+            status: MessageStatus::InProgress,
+            delivery,
+            ..
+        } = &event.kind
+            && *event_message_id == message_id
+        {
+            in_progress_delivery = *delivery;
+        }
+        if matches!(
+            event.kind,
+            SessionEventKind::TurnCompleted {
+                message_id: completed_id,
+                error: None,
+                ..
+            } if completed_id == message_id
+        ) {
+            break;
+        }
+    }
+
+    assert_eq!(in_progress_delivery, Some(PromptDelivery::Queue));
+    command_tx
+        .send(HostCommand::Stop { session_id })
+        .await
+        .unwrap();
+    actor.await.unwrap().unwrap();
+
+    let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+        .await
+        .unwrap();
+    let action = store.action(session_id, message_id).await.unwrap().unwrap();
+    assert_eq!(action.kind, crate::SessionActionKind::Prompt);
+    assert_eq!(action.state, crate::SessionActionState::Completed);
+    assert_eq!(seen.lock().unwrap().len(), 1);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -5890,7 +5988,7 @@ fn queued_prompt_recovery_preserves_fifo_and_excludes_settled_messages() {
         ),
     ];
 
-    let recovered = recover_queued_prompts(&events, &HashMap::new());
+    let recovered = recover_queued_prompts(&events);
 
     assert_eq!(recovered.len(), 1);
     assert_eq!(recovered[0].message_id, pending_id);
@@ -5928,31 +6026,28 @@ fn resume_recovers_unresolved_queue_entries_for_any_session_status() {
         },
     );
 
-    let recovered = recover_prompts_on_resume(std::slice::from_ref(&queued), &HashMap::new());
+    let recovered = recover_prompts_on_resume(std::slice::from_ref(&queued));
     assert_eq!(recovered.len(), 1);
     assert_eq!(recovered[0].message_id, message_id);
     assert_eq!(recovered[0].text, "do not replay this old queue entry");
 
-    let recovered = recover_prompts_on_resume(&[queued, in_progress], &HashMap::new());
+    let recovered = recover_prompts_on_resume(&[queued, in_progress]);
     assert_eq!(recovered.len(), 1);
     assert_eq!(recovered[0].message_id, message_id);
     assert_eq!(recovered[0].text, "recover this admitted turn");
 
-    let recovered = recover_prompts_on_resume(
-        &[SessionEvent::new(
-            session_id,
-            3,
-            SessionEventKind::Message {
-                message_id: Uuid::new_v4(),
-                actor: EventActor::User,
-                text: "old queue entry without an admitted turn".to_string(),
-                attachments: Vec::new(),
-                status: MessageStatus::Queued,
-                delivery: Some(PromptDelivery::Queue),
-            },
-        )],
-        &HashMap::new(),
-    );
+    let recovered = recover_prompts_on_resume(&[SessionEvent::new(
+        session_id,
+        3,
+        SessionEventKind::Message {
+            message_id: Uuid::new_v4(),
+            actor: EventActor::User,
+            text: "old queue entry without an admitted turn".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Queued,
+            delivery: Some(PromptDelivery::Queue),
+        },
+    )]);
     assert_eq!(recovered.len(), 1);
 }
 
@@ -6155,7 +6250,7 @@ fn in_progress_prompt_recovery_preserves_input_after_a_host_crash() {
         ),
     ];
 
-    let recovered = recover_queued_prompts(&events, &HashMap::from([(message_id, 1)]));
+    let recovered = recover_queued_prompts(&events);
 
     assert_eq!(recovered.len(), 1);
     assert_eq!(recovered[0].message_id, message_id);
@@ -6232,7 +6327,7 @@ fn prompt_recovery_updates_delivery_and_ignores_stale_terminal_snapshots() {
         ),
     ];
 
-    assert!(recover_queued_prompts(&events, &HashMap::new()).is_empty());
+    assert!(recover_queued_prompts(&events).is_empty());
 }
 
 #[test]
@@ -6278,14 +6373,14 @@ fn prompt_recovery_allows_an_explicit_retry_after_terminal_status() {
         ),
     ];
 
-    let recovered = recover_queued_prompts(&events, &HashMap::new());
+    let recovered = recover_queued_prompts(&events);
     assert_eq!(recovered.len(), 1);
     assert_eq!(recovered[0].message_id, message_id);
     assert_eq!(recovered[0].delivery, PromptDelivery::Queue);
 }
 
 #[test]
-fn legacy_accepted_steer_without_terminal_event_is_not_recovered() {
+fn terminal_active_steer_is_not_recovered() {
     let session_id = Uuid::new_v4();
     let message_id = Uuid::new_v4();
     let events = vec![
@@ -6321,13 +6416,13 @@ fn legacy_accepted_steer_without_terminal_event_is_not_recovered() {
                 actor: EventActor::User,
                 text: "preserve this pending steer".to_string(),
                 attachments: Vec::new(),
-                status: MessageStatus::Queued,
-                delivery: Some(PromptDelivery::Queue),
+                status: MessageStatus::Complete,
+                delivery: Some(PromptDelivery::Steer),
             },
         ),
     ];
 
-    let recovered = recover_queued_prompts(&events, &HashMap::new());
+    let recovered = recover_queued_prompts(&events);
 
     assert!(recovered.is_empty());
 }
@@ -6360,7 +6455,7 @@ fn recovered_team_messages_stay_out_of_escape_batches() {
         },
     )];
 
-    let recovered = recover_queued_prompts(&events, &HashMap::new());
+    let recovered = recover_queued_prompts(&events);
 
     assert_eq!(recovered.len(), 1);
     assert!(!recovered[0].interrupt_batch);
@@ -6410,7 +6505,7 @@ fn queued_prompt_recovery_discards_entries_bypassed_by_later_admission() {
         ),
     ];
 
-    assert!(recover_queued_prompts(&events, &HashMap::new()).is_empty());
+    assert!(recover_queued_prompts(&events).is_empty());
 }
 
 #[test]
@@ -6457,7 +6552,7 @@ fn committed_steer_does_not_consume_a_separate_next_turn_queue_on_resume() {
         ),
     ];
 
-    let recovered = recover_queued_prompts(&events, &HashMap::new());
+    let recovered = recover_queued_prompts(&events);
 
     assert_eq!(recovered.len(), 1);
     assert_eq!(recovered[0].message_id, queued_id);
