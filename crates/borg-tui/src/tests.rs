@@ -10567,7 +10567,7 @@ fn provider_background_handle_drives_shell_status_and_full_output() {
             .to_string(),
             output_ref: None,
             is_error: false,
-            input: Some(serde_json::json!({"cell_id": "build-1"})),
+            input: None,
             input_ref: None,
         },
     ));

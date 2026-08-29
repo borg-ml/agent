@@ -88,6 +88,7 @@ struct Transcript {
     subagent_entries: HashMap<Uuid, usize>,
     runtime_processes: HashMap<Uuid, RuntimeProcessProjection>,
     provider_backgrounds: HashMap<String, ProviderBackgroundProjection>,
+    provider_followups: HashMap<String, String>,
     queued_messages: HashSet<Uuid>,
     queued_message_sequences: HashMap<Uuid, u64>,
     follow_tail: bool,
@@ -168,6 +169,7 @@ impl Default for Transcript {
             subagent_entries: HashMap::new(),
             runtime_processes: HashMap::new(),
             provider_backgrounds: HashMap::new(),
+            provider_followups: HashMap::new(),
             queued_messages: HashSet::new(),
             queued_message_sequences: HashMap::new(),
             follow_tail: true,
@@ -1281,13 +1283,14 @@ impl Transcript {
                         _ => None,
                     })
                     .unwrap_or_default();
-                let followup_handle = tool_process_followup_handle(
-                    &source_name_for_process,
-                    input.as_ref(),
-                );
-                let output_handle = (!*is_error
-                    && tool_can_start_background_process(&source_name_for_process))
-                    .then(|| tool_output_background_handle(output))
+                let stored_followup_handle = self.provider_followups.remove(tool_call_id);
+                let followup_handle =
+                    tool_process_followup_handle(&source_name_for_process, input.as_ref())
+                        .or(stored_followup_handle);
+                let reported_background_handle =
+                    (!*is_error).then(|| tool_output_background_handle(output)).flatten();
+                let output_handle = (tool_can_start_background_process(&source_name_for_process))
+                    .then(|| reported_background_handle.clone())
                     .flatten();
                 if let Some(index) = tool_index
                     && let TranscriptEntry::Tool {
@@ -1432,7 +1435,7 @@ impl Transcript {
                             });
                     }
                 }
-                if output_handle.is_none()
+                if reported_background_handle.is_none()
                     && let Some(handle) = followup_handle
                     && let Some(process) = self.provider_backgrounds.remove(&handle)
                     && let Some(TranscriptEntry::Tool {
@@ -2045,6 +2048,10 @@ impl Transcript {
         input_ref: Option<&SessionPayloadRef>,
     ) {
         self.finish_reasoning(event.created_at);
+        if let Some(handle) = tool_process_followup_handle(name, Some(input)) {
+            self.provider_followups
+                .insert(tool_call_id.to_string(), handle);
+        }
         let presentation = project_tool_presentation(name, input, None, false);
         let display_name = presentation.label;
         let detail = presentation.detail;

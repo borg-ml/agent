@@ -28,7 +28,8 @@ pub const CODEX_SELECTABLE_MODELS: [(&str, &str); 3] = [
     ("gpt-5.6-terra", "Terra"),
     ("gpt-5.6-luna", "Luna"),
 ];
-pub const CODEX_EFFORT_LEVELS: [&str; 6] = ["low", "medium", "high", "xhigh", "max", "ultra"];
+pub const CODEX_EFFORT_LEVELS: [&str; 7] =
+    ["none", "low", "medium", "high", "xhigh", "max", "ultra"];
 pub const CODEX_MODEL_CATALOG: ProviderModelCatalog = ProviderModelCatalog {
     backend: "codex",
     default_model: "gpt-5.6-sol",
@@ -273,6 +274,7 @@ mod tests {
         assert_eq!(codex_product_model(), "gpt-5.6-sol");
         assert_eq!(codex_default_effort(), "low");
         assert!(codex_effort_supported(codex_default_effort()));
+        assert!(codex_effort_supported("none"));
     }
 
     #[test]

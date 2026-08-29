@@ -6056,9 +6056,9 @@ async fn apply_session_config(
             anyhow::ensure!(
                 matches!(
                     effort.as_str(),
-                    "low" | "medium" | "high" | "xhigh" | "max" | "ultra"
+                    "none" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra"
                 ),
-                "effort must be one of low, medium, high, xhigh, max, or ultra"
+                "effort must be one of none, low, medium, high, xhigh, max, or ultra"
             );
             launch.effort = Some(effort);
         }
