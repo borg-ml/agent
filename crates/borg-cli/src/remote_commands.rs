@@ -2072,6 +2072,7 @@ async fn run_local_agent_session(
                 terminal.draw()?;
                 let activity_frame = terminal_needs_activity_tick(status)
                     || terminal.has_running_tool()
+                    || terminal.has_active_subagents()
                     || terminal.has_active_splash_animation()
                     || terminal.is_history_page_loading();
                 let next_interval = responsive_tui_frame_interval(
@@ -2089,6 +2090,7 @@ async fn run_local_agent_session(
             _ = activity_tick.tick(), if terminal.as_ref().is_some_and(|terminal| {
                 terminal_needs_activity_tick(status)
                     || terminal.has_running_tool()
+                    || terminal.has_active_subagents()
                     || terminal.has_active_splash_animation()
                     || terminal.is_history_page_loading()
             }) => {

@@ -2363,6 +2363,10 @@ impl BorgTerminal {
         self.transcript.has_running_tool()
     }
 
+    pub fn has_active_subagents(&self) -> bool {
+        self.transcript.active_subagent_count() > 0
+    }
+
     pub fn has_expiring_notice(&self) -> bool {
         self.copy_notice_expires_at.is_some()
     }
@@ -5299,13 +5303,20 @@ impl BorgTerminal {
                 ))]
             } else {
                 vec![if let Some(hint) = interaction_hint {
-                    Line::from(vec![
+                    let mut spans = vec![
                         Span::styled(hint, Style::default().fg(Color::Yellow)),
                         Span::raw(" · "),
-                        Span::raw(primary_controls.clone()),
-                    ])
-                } else {
+                    ];
+                    if resume_picker_open {
+                        spans.push(Span::raw(primary_controls.clone()));
+                    } else {
+                        spans.extend(primary_controls_spans(&self.keymap));
+                    }
+                    Line::from(spans)
+                } else if resume_picker_open {
                     Line::from(primary_controls.clone())
+                } else {
+                    Line::from(primary_controls_spans(&self.keymap))
                 }]
             }
         });
@@ -10942,10 +10953,25 @@ fn slash_help(matches: &[&(&str, &str)]) -> String {
 
 fn primary_controls_line(keymap: &KeyMap) -> String {
     format!(
-        "send {} · commands / · palette tab or {}",
+        "send {} · commands / · palette menu tab or {}",
         keymap.label(KeyAction::Send),
         keymap.label(KeyAction::Keybindings)
     )
+}
+
+fn primary_controls_spans(keymap: &KeyMap) -> Vec<Span<'static>> {
+    let binding_style = Style::default().fg(Color::DarkGray);
+    let key_style = Style::default().fg(Color::Gray);
+    vec![
+        Span::styled("send ", binding_style),
+        Span::styled(keymap.label(KeyAction::Send), key_style),
+        Span::styled(" · commands ", binding_style),
+        Span::styled("/", key_style),
+        Span::styled(" · palette menu ", binding_style),
+        Span::styled("tab", key_style),
+        Span::styled(" or ", binding_style),
+        Span::styled(keymap.label(KeyAction::Keybindings), key_style),
+    ]
 }
 
 fn active_message_placeholder(steer_active: bool) -> &'static str {
@@ -12397,6 +12423,9 @@ fn format_elapsed_duration(total_seconds: u64) -> Option<String> {
 }
 
 fn activity_glyph(status: SessionStatus) -> &'static str {
+    if status == SessionStatus::Ready {
+        return "◇";
+    }
     if !matches!(status, SessionStatus::Starting | SessionStatus::Running) {
         return "●";
     }

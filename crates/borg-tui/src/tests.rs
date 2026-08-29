@@ -1141,8 +1141,15 @@ fn keybinding_help_is_action_first_and_uses_configuration() {
     let keymap = KeyMap::from_config(&config).expect("keymap");
     assert_eq!(
         primary_controls_line(&keymap),
-        "send ctrl+s · commands / · palette tab or ?"
+        "send ctrl+s · commands / · palette menu tab or ?"
     );
+    let controls = primary_controls_spans(&keymap);
+    assert_eq!(
+        Line::from(controls.clone()).to_string(),
+        primary_controls_line(&keymap)
+    );
+    assert_eq!(controls[0].style.fg, Some(Color::DarkGray));
+    assert_eq!(controls[1].style.fg, Some(Color::Gray));
     let help = keybinding_lines(&keymap, 60)
         .into_iter()
         .map(|line| line.to_string())
@@ -8257,6 +8264,11 @@ fn status_hover_underlines_the_label_but_not_the_activity_glyph() {
     assert!(spans[1].style.add_modifier.contains(Modifier::UNDERLINED));
     assert_eq!(spans[2].content.as_ref(), " 2m");
     assert!(!spans[2].style.add_modifier.contains(Modifier::UNDERLINED));
+}
+
+#[test]
+fn ready_status_uses_a_diamond_activity_glyph() {
+    assert_eq!(activity_glyph(SessionStatus::Ready), "◇");
 }
 
 #[test]
