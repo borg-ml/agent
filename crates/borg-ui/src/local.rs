@@ -4,9 +4,10 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use borg_remote::{
-    EventActor, HostCommand, MessageStatus, SessionConfigAction, SessionEventKind, SessionStore,
-    SqliteSessionStore, SubagentAction, default_host_config_path, local_session_owner_is_active,
-    login_provider_with_output, send_local_session_command, session_control_socket_path,
+    EventActor, HostCommand, MessageStatus, SessionConfigAction, SessionEvent, SessionEventKind,
+    SessionStore, SqliteSessionStore, SubagentAction, default_host_config_path,
+    local_session_owner_is_active, login_provider_with_output, send_local_session_command,
+    session_control_socket_path,
 };
 use uuid::Uuid;
 
@@ -720,14 +721,31 @@ impl LocalSessionClient {
                 text,
                 attachments,
                 delivery,
-            } => HostCommand::Prompt {
-                session_id,
-                message_id: Uuid::new_v4(),
-                text,
-                attachments,
-                output_schema: None,
-                delivery,
-            },
+            } => {
+                let message_id = Uuid::new_v4();
+                self.store
+                    .admit_prompt(SessionEvent::new(
+                        session_id,
+                        0,
+                        SessionEventKind::Message {
+                            message_id,
+                            actor: EventActor::User,
+                            text: text.clone(),
+                            attachments: attachments.clone(),
+                            status: MessageStatus::Queued,
+                            delivery: Some(delivery),
+                        },
+                    ))
+                    .await?;
+                HostCommand::Prompt {
+                    session_id,
+                    message_id,
+                    text,
+                    attachments,
+                    output_schema: None,
+                    delivery,
+                }
+            }
             FrontendCommand::RecallQueuedPrompt(message_id) => HostCommand::RecallQueuedPrompt {
                 session_id,
                 message_id,
@@ -815,14 +833,31 @@ impl LocalSessionClient {
                 text,
                 attachments,
                 delivery,
-            } => SubagentAction::Prompt {
-                request_id,
-                target,
-                message_id: Uuid::new_v4(),
-                text,
-                attachments,
-                delivery,
-            },
+            } => {
+                let message_id = Uuid::new_v4();
+                self.store
+                    .admit_prompt(SessionEvent::new(
+                        self.view.session_id,
+                        0,
+                        SessionEventKind::Message {
+                            message_id,
+                            actor: EventActor::User,
+                            text: text.clone(),
+                            attachments: attachments.clone(),
+                            status: MessageStatus::Queued,
+                            delivery: Some(delivery),
+                        },
+                    ))
+                    .await?;
+                SubagentAction::Prompt {
+                    request_id,
+                    target,
+                    message_id,
+                    text,
+                    attachments,
+                    delivery,
+                }
+            }
             FrontendCommand::RecallQueuedPrompt(message_id) => SubagentAction::RecallPrompt {
                 request_id,
                 target,

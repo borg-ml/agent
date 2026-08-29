@@ -12,7 +12,8 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::{
-    HostCommand, SessionEvent, SessionEventKind, SessionStatus, SessionStore, SessionWriterLease,
+    EventActor, HostCommand, MessageStatus, SessionEvent, SessionEventKind, SessionStatus,
+    SessionStore, SessionWriterLease,
 };
 
 const MAX_CONTROL_COMMAND_BYTES: u64 = 1024 * 1024;
@@ -444,6 +445,17 @@ impl LocalSessionControlServer {
         Self::start(socket_path, session_id, _writer, commands)
     }
 
+    pub fn start_with_durable_prompt_admissions(
+        socket_path: PathBuf,
+        session_id: Uuid,
+        _writer: &SessionWriterLease,
+        commands: mpsc::Sender<HostCommand>,
+        _prompt_admissions: Option<Arc<Mutex<HashSet<Uuid>>>>,
+        _store: Arc<dyn SessionStore>,
+    ) -> Result<Self> {
+        Self::start(socket_path, session_id, _writer, commands)
+    }
+
     pub fn has_attached_viewers(&self) -> bool {
         false
     }
@@ -466,6 +478,33 @@ impl LocalSessionControlServer {
         _writer: &SessionWriterLease,
         commands: mpsc::Sender<HostCommand>,
         prompt_admissions: Option<Arc<Mutex<HashSet<Uuid>>>>,
+    ) -> Result<Self> {
+        Self::start_control_server(socket_path, session_id, commands, prompt_admissions, None)
+    }
+
+    pub fn start_with_durable_prompt_admissions(
+        socket_path: PathBuf,
+        session_id: Uuid,
+        _writer: &SessionWriterLease,
+        commands: mpsc::Sender<HostCommand>,
+        prompt_admissions: Option<Arc<Mutex<HashSet<Uuid>>>>,
+        store: Arc<dyn SessionStore>,
+    ) -> Result<Self> {
+        Self::start_control_server(
+            socket_path,
+            session_id,
+            commands,
+            prompt_admissions,
+            Some(store),
+        )
+    }
+
+    fn start_control_server(
+        socket_path: PathBuf,
+        session_id: Uuid,
+        commands: mpsc::Sender<HostCommand>,
+        prompt_admissions: Option<Arc<Mutex<HashSet<Uuid>>>>,
+        store: Option<Arc<dyn SessionStore>>,
     ) -> Result<Self> {
         use std::os::unix::fs::PermissionsExt;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -507,11 +546,13 @@ impl LocalSessionControlServer {
                             Ok((stream, _)) => {
                                 let commands = commands.clone();
                                 let prompt_admissions = prompt_admissions.clone();
+                                let store = store.clone();
                                 tokio::spawn(handle_control_connection(
                                     stream,
                                     session_id,
                                     commands,
                                     prompt_admissions,
+                                    store,
                                 ));
                             }
                             Err(error) => {
@@ -573,6 +614,7 @@ async fn handle_control_connection(
     session_id: Uuid,
     commands: mpsc::Sender<HostCommand>,
     prompt_admissions: Option<Arc<Mutex<HashSet<Uuid>>>>,
+    store: Option<Arc<dyn SessionStore>>,
 ) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -590,13 +632,43 @@ async fn handle_control_connection(
         if command.session_id() != Some(session_id) {
             bail!("command targets a different session");
         }
-        if let HostCommand::Prompt { message_id, .. } = &command
-            && let Some(admissions) = prompt_admissions.as_ref()
+        if let HostCommand::Prompt {
+            message_id,
+            text,
+            attachments,
+            delivery,
+            ..
+        } = &command
         {
-            admissions
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .insert(*message_id);
+            let store = store
+                .as_ref()
+                .context("session owner cannot accept prompts without a durable journal")?;
+            let workspace_durable = match store.workspace_store().await? {
+                Some(workspace) => workspace.contains_message(*message_id).await?,
+                None => false,
+            };
+            if !workspace_durable {
+                store
+                    .admit_prompt(SessionEvent::new(
+                        session_id,
+                        0,
+                        SessionEventKind::Message {
+                            message_id: *message_id,
+                            actor: EventActor::User,
+                            text: text.clone(),
+                            attachments: attachments.clone(),
+                            status: MessageStatus::Queued,
+                            delivery: Some(*delivery),
+                        },
+                    ))
+                    .await?;
+            }
+            if let Some(admissions) = prompt_admissions.as_ref() {
+                admissions
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(*message_id);
+            }
         }
         commands
             .send(command)
@@ -1025,14 +1097,45 @@ mod tests {
         let writer = SessionWriterLease::try_acquire(&journal_path)
             .unwrap()
             .unwrap();
+        let store: Arc<dyn SessionStore> = Arc::new(
+            crate::SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+                .await
+                .unwrap(),
+        );
+        store.create_session(session_id).await.unwrap();
+        store
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::SessionStarted,
+            ))
+            .await
+            .unwrap();
+        store
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::SessionConfigured {
+                    cwd: root.path().to_path_buf(),
+                    provider: crate::CodingProvider::Codex,
+                    model: Some("gpt-test".to_string()),
+                    effort: None,
+                    fast: false,
+                    response_language: crate::ResponseLanguage::Auto,
+                    permission_mode: crate::PermissionMode::Manual,
+                },
+            ))
+            .await
+            .unwrap();
         let (owner_tx, mut owner_rx) = mpsc::channel(1);
         let admissions = Arc::new(Mutex::new(HashSet::new()));
-        let _server = LocalSessionControlServer::start_with_prompt_admissions(
+        let _server = LocalSessionControlServer::start_with_durable_prompt_admissions(
             socket_path.clone(),
             session_id,
             &writer,
             owner_tx,
             Some(Arc::clone(&admissions)),
+            Arc::clone(&store),
         )
         .unwrap();
 
@@ -1057,6 +1160,12 @@ mod tests {
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&response).unwrap()["ok"],
             true
+        );
+        assert!(
+            store
+                .contains_message(session_id, message_id)
+                .await
+                .unwrap()
         );
         assert_eq!(
             owner_rx.recv().await.unwrap().session_id(),
@@ -1086,6 +1195,46 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("different session")
+        );
+        assert!(owner_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn prompt_acknowledgement_requires_a_durable_journal() {
+        let root = short_socket_tempdir();
+        let session_id = Uuid::new_v4();
+        let socket_path = session_control_socket_path(root.path(), session_id);
+        let journal_path = root.path().join(format!("{session_id}.lock"));
+        let writer = SessionWriterLease::try_acquire(&journal_path)
+            .unwrap()
+            .unwrap();
+        let (owner_tx, mut owner_rx) = mpsc::channel(1);
+        let _server =
+            LocalSessionControlServer::start(socket_path.clone(), session_id, &writer, owner_tx)
+                .unwrap();
+        let command = HostCommand::Prompt {
+            session_id,
+            message_id: Uuid::new_v4(),
+            text: "must survive acknowledgement".to_string(),
+            attachments: Vec::new(),
+            output_schema: None,
+            delivery: PromptDelivery::Queue,
+        };
+
+        let mut stream = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
+        stream
+            .write_all(&serde_json::to_vec(&command).unwrap())
+            .await
+            .unwrap();
+        stream.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&response).unwrap()["error"]
+                .as_str()
+                .unwrap()
+                .contains("durable journal")
         );
         assert!(owner_rx.try_recv().is_err());
     }

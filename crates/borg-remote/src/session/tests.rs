@@ -4299,7 +4299,7 @@ async fn durably_preadmitted_prompt_executes_once_after_actor_handoff() {
         }
     }
     store
-        .append(SessionEvent::new(
+        .admit_prompt(SessionEvent::new(
             session_id,
             0,
             SessionEventKind::Message {

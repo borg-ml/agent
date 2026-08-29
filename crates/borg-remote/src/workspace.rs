@@ -868,6 +868,17 @@ impl SqliteWorkspaceStore {
         ))
     }
 
+    pub async fn contains_message(&self, message_id: Uuid) -> Result<bool> {
+        let found: i64 = sqlx::query_scalar(
+            "select exists(select 1 from workspace_events \
+             where id=? and json_extract(event_json, '$.kind.type')='message')",
+        )
+        .bind(message_id.to_string())
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(found != 0)
+    }
+
     /// Highest session sequence already projected into this workspace.
     ///
     /// The projection is append-only and strictly ordered, so a restart only

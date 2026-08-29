@@ -782,6 +782,77 @@ async fn prompt_event_boundaries_drive_one_atomic_action_lifecycle() {
 }
 
 #[tokio::test]
+async fn prompt_admission_is_durable_visible_and_idempotent_before_routing() {
+    let (directory, store) = store().await;
+    let session_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+    for kind in [
+        SessionEventKind::SessionStarted,
+        configured(directory.path()),
+    ] {
+        store
+            .append(SessionEvent::new(session_id, 0, kind))
+            .await
+            .unwrap();
+    }
+    let admission = || {
+        SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::Message {
+                message_id,
+                actor: EventActor::User,
+                text: "persist me before acknowledgement".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Queued,
+                delivery: Some(PromptDelivery::Steer),
+            },
+        )
+    };
+
+    let first = store.admit_prompt(admission()).await.unwrap();
+    let duplicate = store.admit_prompt(admission()).await.unwrap();
+
+    assert_eq!(duplicate.id, first.id);
+    assert_eq!(duplicate.sequence, first.sequence);
+    assert_eq!(
+        store
+            .state(session_id)
+            .await
+            .unwrap()
+            .latest_prompt
+            .as_deref(),
+        Some("persist me before acknowledgement")
+    );
+    assert_eq!(
+        store
+            .read(session_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|event| {
+                matches!(
+                    event.kind,
+                    SessionEventKind::Message {
+                        message_id: stored_id,
+                        ..
+                    } if stored_id == message_id
+                )
+            })
+            .count(),
+        1
+    );
+
+    let mut conflicting = admission();
+    let SessionEventKind::Message { text, .. } = &mut conflicting.kind else {
+        unreachable!()
+    };
+    *text = "different content".to_string();
+    assert!(store.admit_prompt(conflicting).await.is_err());
+}
+
+#[tokio::test]
 async fn stale_in_progress_message_does_not_resurrect_terminal_action() {
     let (directory, store) = store().await;
     let session_id = Uuid::new_v4();

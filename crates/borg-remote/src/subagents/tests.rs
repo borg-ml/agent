@@ -2241,11 +2241,43 @@ async fn focused_human_prompt_and_recall_target_the_exact_child_actor() {
     .unwrap();
     let mut table = coordinator.table.lock().await;
     let child = table.reserve("worker", &launch()).unwrap();
+    let child_session_id = child.session_id;
     let (commands, mut received) = mpsc::channel(2);
     let entry = table.entries.get_mut(&child.session_id).unwrap();
     entry.snapshot.status = SubagentStatus::Running;
     entry.commands = Some(commands);
     drop(table);
+    coordinator
+        .store
+        .register_child_session(root, child_session_id)
+        .await
+        .unwrap();
+    coordinator
+        .store
+        .append(SessionEvent::new(
+            child_session_id,
+            0,
+            SessionEventKind::SessionStarted,
+        ))
+        .await
+        .unwrap();
+    coordinator
+        .store
+        .append(SessionEvent::new(
+            child_session_id,
+            0,
+            SessionEventKind::SessionConfigured {
+                cwd: child.cwd.clone(),
+                provider: child.provider,
+                model: child.model.clone(),
+                effort: child.effort.clone(),
+                fast: false,
+                response_language: crate::ResponseLanguage::Auto,
+                permission_mode: PermissionMode::Manual,
+            },
+        ))
+        .await
+        .unwrap();
 
     let message_id = Uuid::new_v4();
     coordinator
@@ -2258,6 +2290,13 @@ async fn focused_human_prompt_and_recall_target_the_exact_child_actor() {
         )
         .await
         .unwrap();
+    assert!(
+        coordinator
+            .store
+            .contains_message(child_session_id, message_id)
+            .await
+            .unwrap()
+    );
     let HostCommand::Prompt {
         session_id,
         message_id: received_id,

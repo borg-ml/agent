@@ -3909,6 +3909,20 @@ impl SubagentCoordinator {
             id
         };
         self.ensure_child_actor(id).await?;
+        self.store
+            .admit_prompt(SessionEvent::new(
+                id,
+                0,
+                SessionEventKind::Message {
+                    message_id,
+                    actor: EventActor::User,
+                    text: text.clone(),
+                    attachments: attachments.clone(),
+                    status: MessageStatus::Queued,
+                    delivery: Some(delivery),
+                },
+            ))
+            .await?;
         let (commands, task_name) = {
             let table = self.table.lock().await;
             let entry = table

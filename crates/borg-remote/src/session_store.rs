@@ -34,6 +34,7 @@ pub(crate) const SESSION_PAYLOAD_PREVIEW_BYTES: usize = 4 * 1024;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(1);
 const SQLITE_SCHEMA_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 const SQLITE_WRITE_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+const PROMPT_ADMISSION_SESSION_READY_TIMEOUT: Duration = Duration::from_secs(5);
 const SQLITE_WRITE_TRANSACTION: &str = "BEGIN IMMEDIATE";
 const SQLITE_JOURNAL_SIZE_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_HOST_LAUNCH_METADATA_BYTES: usize = 512 * 1024;
@@ -726,7 +727,6 @@ impl SessionState {
             SessionEventKind::Message {
                 actor: crate::EventActor::User,
                 text,
-                status: MessageStatus::Complete | MessageStatus::Failed,
                 ..
             } if !text.trim().is_empty() => {
                 let prompt = text.trim().to_string();
@@ -855,6 +855,12 @@ pub trait SessionStore: Send + Sync {
         anyhow::bail!("session store cannot register child session {session_id}")
     }
     async fn append(&self, event: SessionEvent) -> Result<SessionEvent>;
+    /// Durably accept a user prompt exactly once before any in-memory routing
+    /// or caller acknowledgement. Repeating the same admission is a no-op;
+    /// reusing its message id with different content is rejected.
+    async fn admit_prompt(&self, _event: SessionEvent) -> Result<SessionEvent> {
+        bail!("session store does not support durable idempotent prompt admission")
+    }
     async fn enqueue_action(&self, action: SessionAction) -> Result<SessionAction>;
     async fn transition_action(
         &self,
@@ -4931,6 +4937,64 @@ fn same_prompt_payload_ignoring_delivery(
         && left.get("attachments") == right.get("attachments")
 }
 
+fn ensure_prompt_admission(event: &SessionEvent) -> Result<()> {
+    ensure!(
+        matches!(
+            event.kind,
+            SessionEventKind::Message {
+                actor: crate::EventActor::User,
+                status: MessageStatus::Queued,
+                ..
+            }
+        ),
+        "prompt admission must be a queued user message"
+    );
+    ensure!(
+        event.sequence == 0,
+        "prompt admission sequence must be assigned by the store"
+    );
+    Ok(())
+}
+
+fn prompt_message_id(event: &SessionEvent) -> Result<Uuid> {
+    match event.kind {
+        SessionEventKind::Message { message_id, .. } => Ok(message_id),
+        _ => bail!("prompt admission is not a message"),
+    }
+}
+
+fn ensure_same_prompt_admission(existing: &SessionEvent, requested: &SessionEvent) -> Result<()> {
+    let (
+        SessionEventKind::Message {
+            message_id: existing_id,
+            actor: crate::EventActor::User,
+            text: existing_text,
+            attachments: existing_attachments,
+            delivery: existing_delivery,
+            ..
+        },
+        SessionEventKind::Message {
+            message_id: requested_id,
+            actor: crate::EventActor::User,
+            text: requested_text,
+            attachments: requested_attachments,
+            delivery: requested_delivery,
+            ..
+        },
+    ) = (&existing.kind, &requested.kind)
+    else {
+        bail!("prompt message id was reused by a non-user event")
+    };
+    ensure!(
+        existing_id == requested_id
+            && existing_text == requested_text
+            && existing_attachments == requested_attachments
+            && existing_delivery == requested_delivery,
+        "prompt message id {requested_id} was reused with different immutable content"
+    );
+    Ok(())
+}
+
 async fn update_action_row(
     transaction: &mut Transaction<'_, Sqlite>,
     action: &SessionAction,
@@ -5132,6 +5196,44 @@ impl SessionStore for SqliteSessionStore {
             EventPersistence::Durable => {}
         }
         let mut transaction = self.begin_write().await?;
+        event = self
+            .append_durable_in_transaction(&mut transaction, event)
+            .await?;
+        transaction.commit().await?;
+        Ok(event)
+    }
+
+    async fn admit_prompt(&self, mut event: SessionEvent) -> Result<SessionEvent> {
+        ensure_prompt_admission(&event)?;
+        let message_id = prompt_message_id(&event)?;
+        let ready_deadline = tokio::time::Instant::now() + PROMPT_ADMISSION_SESSION_READY_TIMEOUT;
+        loop {
+            let state = self.state(event.session_id).await?;
+            if state.started_at.is_some() && state.configuration.is_some() {
+                break;
+            }
+            ensure!(
+                tokio::time::Instant::now() < ready_deadline,
+                "session {} did not establish its durable journal before prompt admission",
+                event.session_id
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let mut transaction = self.begin_write().await?;
+        if let Some(event_json) = sqlx::query_scalar::<_, String>(
+            "select event_json from session_events \
+             where session_id = ? and message_id = ? order by sequence asc limit 1",
+        )
+        .bind(event.session_id.to_string())
+        .bind(message_id.to_string())
+        .fetch_optional(&mut *transaction)
+        .await?
+        {
+            let existing: SessionEvent = serde_json::from_str(&event_json)?;
+            ensure_same_prompt_admission(&existing, &event)?;
+            transaction.commit().await?;
+            return Ok(existing);
+        }
         event = self
             .append_durable_in_transaction(&mut transaction, event)
             .await?;

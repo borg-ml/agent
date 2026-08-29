@@ -1559,13 +1559,16 @@ async fn run_local_agent_session(
     let control_server = if session_access.is_attached() {
         None
     } else {
-        Some(LocalSessionControlServer::start_with_prompt_admissions(
-            control_socket_path.clone(),
-            session_id,
-            writer.as_ref().expect("session owner holds writer lease"),
-            session_command_tx.clone(),
-            Some(Arc::clone(&local_prompt_admissions)),
-        )?)
+        Some(
+            LocalSessionControlServer::start_with_durable_prompt_admissions(
+                control_socket_path.clone(),
+                session_id,
+                writer.as_ref().expect("session owner holds writer lease"),
+                session_command_tx.clone(),
+                Some(Arc::clone(&local_prompt_admissions)),
+                Arc::clone(&store),
+            )?,
+        )
     };
     let actor = if session_access.is_attached() {
         tokio::spawn(run_attached_session(
@@ -6564,7 +6567,7 @@ async fn persist_prompt_admission(
     delivery: PromptDelivery,
 ) -> Result<()> {
     store
-        .append(SessionEvent::new(
+        .admit_prompt(SessionEvent::new(
             session_id,
             0,
             SessionEventKind::Message {
