@@ -2267,6 +2267,10 @@ fn codex_thread_start_params(
         "features".to_string(),
         serde_json::json!({
             "apply_patch_streaming_events": true,
+            // Borg owns the durable subagent tree. Codex-native children are
+            // invisible to that tree and cannot be focused or controlled by
+            // Borg clients, so keep the provider's parallel agent tools off.
+            "multi_agent": false,
             "web_search_request": request.web_search_allowed,
         }),
     );
@@ -3908,6 +3912,10 @@ mod tests {
         assert_eq!(
             codex_config.pointer("/config/features/apply_patch_streaming_events"),
             Some(&Value::Bool(true))
+        );
+        assert_eq!(
+            codex_config.pointer("/config/features/multi_agent"),
+            Some(&Value::Bool(false))
         );
         assert!(codex_config.get("baseInstructions").is_none());
         let codex_auto_config = codex_thread_start_params(&request, LocalAgentPermission::Auto);

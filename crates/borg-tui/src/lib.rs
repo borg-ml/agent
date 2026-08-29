@@ -5530,6 +5530,10 @@ impl BorgTerminal {
         let pending_transcript_anchor = self.pending_transcript_anchor.take();
         let mut restored_scroll_from_bottom = None;
         let cursor_visible = cursor_blink_visible(self.cursor_blink_started_at.elapsed());
+        // Ratatui flushes changed cells before it applies the frame's cursor
+        // state. Hide the hardware cursor first so animated transcript diffs
+        // cannot briefly drag a visible caret through action rows.
+        self.terminal.hide_cursor()?;
         self.terminal.draw(|frame| {
             let area = centered_content_area_with_margin(frame.area(), self.horizontal_margin);
             let chunks = terminal_vertical_chunks(
