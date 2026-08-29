@@ -8942,7 +8942,7 @@ async fn cancelling_a_turn_resolves_its_pending_provider_interaction() {
 }
 
 #[tokio::test]
-async fn parent_stream_preserves_full_child_transcript_events() {
+async fn parent_journal_preserves_full_child_transcript_events() {
     let root = tempdir().unwrap();
     let parent_id = Uuid::new_v4();
     let child_id = Uuid::new_v4();
@@ -9055,8 +9055,18 @@ async fn parent_stream_preserves_full_child_transcript_events() {
             .await
             .unwrap()
             .iter()
-            .all(|event| !matches!(event.kind, SessionEventKind::SubagentActivity { .. })),
-        "routine child transcript updates must not be duplicated into the parent journal"
+            .any(|event| matches!(
+                event.kind,
+                SessionEventKind::SubagentActivity {
+                    event: Some(ref child_event),
+                    ..
+                } if matches!(
+                    child_event.kind,
+                    SessionEventKind::ToolStarted { ref tool_call_id, .. }
+                        if tool_call_id == "call-1"
+                )
+            )),
+        "child activity must remain replayable after the live projection disconnects"
     );
 
     let message_id = Uuid::new_v4();
@@ -9133,8 +9143,8 @@ async fn parent_stream_preserves_full_child_transcript_events() {
             .iter()
             .filter(|event| matches!(event.kind, SessionEventKind::SubagentActivity { .. }))
             .count(),
-        1,
-        "the completed child message remains a durable parent boundary"
+        3,
+        "tool, partial message, and completed message updates remain ordered and durable"
     );
 
     record_subagent_activity(

@@ -65,25 +65,57 @@ tool call, emit exactly one standalone narration item in the form `[[BORG_ACTION
 tool call. Use a short action noun for `label` and no other text in that narration item.";
 
 fn action_intent_label(text: &str) -> Option<&str> {
-    let label = text
-        .trim()
-        .strip_prefix("[[BORG_ACTION:")?
-        .strip_suffix("]]")?
-        .trim();
-    (!label.is_empty()
-        && label.len() <= 64
-        && label.chars().all(|character| {
-            character.is_ascii_alphanumeric() || matches!(character, ' ' | '-' | '/')
-        }))
-    .then_some(label)
+    const PREFIX: &str = "[[BORG_ACTION:";
+    let mut remaining = text.trim();
+    let mut last_label = None;
+    while !remaining.is_empty() {
+        remaining = remaining.strip_prefix(PREFIX)?;
+        let end = remaining.find("]]")?;
+        let label = remaining[..end].trim();
+        if label.is_empty()
+            || label.len() > 64
+            || !label.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, ' ' | '-' | '/')
+            })
+        {
+            return None;
+        }
+        last_label = Some(label);
+        remaining = remaining[end + 2..].trim();
+    }
+    last_label
 }
 
 fn action_intent_is_streaming(text: &str) -> bool {
     const PREFIX: &str = "[[BORG_ACTION:";
-    let text = text.trim();
-    PREFIX.starts_with(text)
-        || (text.starts_with(PREFIX) && !text.ends_with("]]"))
-        || action_intent_label(text).is_some()
+    let mut remaining = text.trim();
+    loop {
+        if PREFIX.starts_with(remaining) {
+            return !remaining.is_empty();
+        }
+        let Some(label_and_rest) = remaining.strip_prefix(PREFIX) else {
+            return false;
+        };
+        let Some(end) = label_and_rest.find("]]") else {
+            return label_and_rest.len() <= 64
+                && label_and_rest.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, ' ' | '-' | '/')
+                });
+        };
+        let label = label_and_rest[..end].trim();
+        if label.is_empty()
+            || label.len() > 64
+            || !label.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, ' ' | '-' | '/')
+            })
+        {
+            return false;
+        }
+        remaining = label_and_rest[end + 2..].trim();
+        if remaining.is_empty() {
+            return true;
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -2238,9 +2270,19 @@ mod tests {
         );
         assert_eq!(action_intent_label("before [[BORG_ACTION:edit]]"), None);
         assert_eq!(action_intent_label("[[BORG_ACTION:edit!]]"), None);
+        assert_eq!(
+            action_intent_label("[[BORG_ACTION:command]][[BORG_ACTION:file read]]"),
+            Some("file read")
+        );
         assert!(action_intent_is_streaming("[["));
         assert!(action_intent_is_streaming("[[BORG_ACTION:edit"));
         assert!(action_intent_is_streaming("[[BORG_ACTION:edit]]"));
+        assert!(action_intent_is_streaming(
+            "[[BORG_ACTION:command]][[BORG_ACTION:file read]]"
+        ));
+        assert!(action_intent_is_streaming(
+            "[[BORG_ACTION:command]][[BORG_ACTION:file"
+        ));
         assert!(!action_intent_is_streaming("ordinary narration"));
     }
 
