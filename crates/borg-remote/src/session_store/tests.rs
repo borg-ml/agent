@@ -974,6 +974,65 @@ async fn accepted_steer_queue_event_reopens_a_terminal_action_projection() {
 }
 
 #[tokio::test]
+async fn internal_messages_do_not_reuse_child_action_identity() {
+    let (directory, store) = store().await;
+    let child_session_id = Uuid::new_v4();
+    let parent_session_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    for session_id in [child_session_id, parent_session_id] {
+        store.create_session(session_id).await.unwrap();
+        for kind in [
+            SessionEventKind::SessionStarted,
+            configured(directory.path()),
+        ] {
+            store
+                .append(SessionEvent::new(session_id, 0, kind))
+                .await
+                .unwrap();
+        }
+    }
+    store
+        .append(SessionEvent::new(
+            child_session_id,
+            0,
+            SessionEventKind::Message {
+                message_id,
+                actor: EventActor::User,
+                text: "team input".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Queued,
+                delivery: Some(PromptDelivery::Queue),
+            },
+        ))
+        .await
+        .unwrap();
+
+    store
+        .append(SessionEvent::new(
+            parent_session_id,
+            0,
+            SessionEventKind::Message {
+                message_id,
+                actor: EventActor::System,
+                text: "internal child report".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Queued,
+                delivery: Some(PromptDelivery::Queue),
+            },
+        ))
+        .await
+        .unwrap();
+
+    assert!(
+        store
+            .action(parent_session_id, message_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn recovered_steer_accepts_a_coalesced_queue_snapshot() {
     let (directory, store) = store().await;
     let session_id = Uuid::new_v4();

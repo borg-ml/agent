@@ -879,7 +879,9 @@ impl Transcript {
             SessionEventKind::ProviderEvent { kind, payload, .. }
                 if Self::provider_reasoning_lifecycle(kind, payload).is_some()
         );
-        if provider_advanced {
+        let starts_prepared_action = matches!(event.kind, SessionEventKind::ToolStarted { .. })
+            && self.preparing_tool.is_some();
+        if provider_advanced && !starts_prepared_action {
             self.mark_running_tools_backgrounded();
         }
         let completed_turn = match &event.kind {
@@ -1196,10 +1198,12 @@ impl Transcript {
                 let Some(label) = payload.get("label").and_then(serde_json::Value::as_str) else {
                     return removed_entry;
                 };
-                let tool_call_id = self
-                    .preparing_tool
-                    .clone()
-                    .unwrap_or_else(|| format!("action-preparing:{}", event.id));
+                if self.preparing_tool.is_none() {
+                    self.mark_running_tools_backgrounded();
+                }
+                let tool_call_id = self.preparing_tool.clone().unwrap_or_else(|| {
+                    format!("action-preparing:{}", event.id)
+                });
                 self.preparing_tool = Some(tool_call_id.clone());
                 let input = serde_json::json!({"label": label});
                 self.upsert_running_tool(
@@ -2053,7 +2057,6 @@ impl Transcript {
             &display_name,
             code_view.as_ref().map(|(language, _)| language.as_str()),
         );
-        self.foreground_tool = Some(tool_call_id.to_string());
         if is_edit_diff {
             self.collapse_previous_edit();
         }
@@ -2080,6 +2083,9 @@ impl Transcript {
             }) = self.order.get_mut(tool_index)
             && !*stored_complete
         {
+            if !*stored_backgrounded {
+                self.foreground_tool = Some(tool_call_id.to_string());
+            }
             *stored_source_name = name.to_string();
             *stored_name = display_name;
             *stored_detail = detail;
@@ -2088,7 +2094,6 @@ impl Transcript {
             *stored_payload_refs = input_ref.cloned().into_iter().collect();
             *stored_error = false;
             *stored_user_interrupted = false;
-            *stored_backgrounded = false;
             *stored_expanded = expanded;
             *stored_completed_at = None;
             if is_edit_diff {
@@ -2096,6 +2101,7 @@ impl Transcript {
             }
             return;
         }
+        self.foreground_tool = Some(tool_call_id.to_string());
         let tool_index = self.order.len();
         self.tools.insert(tool_call_id.to_string(), tool_index);
         self.order.push(TranscriptEntry::Tool {
@@ -2123,6 +2129,17 @@ impl Transcript {
         let Some(preparing_id) = self.preparing_tool.take() else {
             return;
         };
+        if preparing_id != tool_call_id && self.tools.contains_key(tool_call_id) {
+            let Some(preparing_index) = self.tools.remove(&preparing_id) else {
+                return;
+            };
+            self.order.remove(preparing_index);
+            self.reindex_after_removal(preparing_index);
+            if self.foreground_tool.as_deref() == Some(preparing_id.as_str()) {
+                self.foreground_tool = Some(tool_call_id.to_string());
+            }
+            return;
+        }
         let Some(tool_index) = self.tools.remove(&preparing_id) else {
             return;
         };

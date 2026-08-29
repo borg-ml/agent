@@ -6483,7 +6483,7 @@ async fn send_prompt(
         .commands
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("subagent {} is still starting", entry.snapshot.task_name))?
-        .send(HostCommand::Prompt {
+        .send(HostCommand::TeamPrompt {
             session_id,
             message_id: message.message_id,
             text: message.text,

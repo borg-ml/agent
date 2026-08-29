@@ -5692,7 +5692,9 @@ fn resumed_team_backlog_is_deferred_behind_the_triggering_user_prompt() {
     let ordered_ids = deferred
         .iter()
         .filter_map(|command| match command {
-            HostCommand::Prompt { message_id, .. } => Some(*message_id),
+            HostCommand::Prompt { message_id, .. } | HostCommand::TeamPrompt { message_id, .. } => {
+                Some(*message_id)
+            }
             _ => None,
         })
         .collect::<Vec<_>>();

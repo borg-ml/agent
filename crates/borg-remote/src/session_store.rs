@@ -37,6 +37,8 @@ const SQLITE_WRITE_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 const PROMPT_ADMISSION_SESSION_READY_TIMEOUT: Duration = Duration::from_secs(5);
 const SQLITE_WRITE_TRANSACTION: &str = "BEGIN IMMEDIATE";
 const SQLITE_JOURNAL_SIZE_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
+const SQLITE_MMAP_SIZE_BYTES: u64 = 256 * 1024 * 1024;
+const SQLITE_CACHE_KIB: u64 = 8 * 1024;
 const MAX_HOST_LAUNCH_METADATA_BYTES: usize = 512 * 1024;
 // Cap fork replay at 255 local events without duplicating SessionState in every row.
 const FORK_PROJECTION_CHECKPOINT_INTERVAL: u64 = 256;
@@ -1069,6 +1071,9 @@ impl SqliteSessionStore {
                 "journal_size_limit",
                 SQLITE_JOURNAL_SIZE_LIMIT_BYTES.to_string(),
             )
+            .pragma("mmap_size", SQLITE_MMAP_SIZE_BYTES.to_string())
+            .pragma("cache_size", format!("-{SQLITE_CACHE_KIB}"))
+            .pragma("temp_store", "MEMORY")
             .synchronous(SqliteSynchronous::Full)
             .busy_timeout(SQLITE_BUSY_TIMEOUT)
             .foreign_keys(true);
@@ -1077,7 +1082,7 @@ impl SqliteSessionStore {
         let schema_deadline = std::time::Instant::now() + SQLITE_SCHEMA_WAIT_TIMEOUT;
         let pool = loop {
             match SqlitePoolOptions::new()
-                .max_connections(8)
+                .max_connections(4)
                 .connect_with(options.clone())
                 .await
             {
@@ -3342,18 +3347,16 @@ impl SqliteSessionStore {
         .bind(&session_key)
         .fetch_all(&self.pool);
         let legacy_messages = sqlx::query(
-            "select e.event_json from session_event_search search \
-                 join session_events e \
-                   on e.session_id = search.session_id and e.event_id = search.event_id \
+            "select e.event_json from session_events e \
                  left join session_actions a \
                    on a.session_id = e.session_id and a.action_id = e.message_id \
-                 where search.session_id = ? and search.sequence < ? \
-                 and search.event_kind = 'message' \
-                 and search.actor in ('user', 'system') \
+                 where e.session_id = ? and e.sequence < ? \
+                 and e.event_kind = 'message' \
+                 and json_extract(e.event_json, '$.kind.actor') in ('user', 'system') \
                  and (? is null or e.message_id != ?) \
                  and (a.action_id is null \
                    or a.state not in ('completed', 'failed', 'cancelled')) \
-                 order by search.sequence",
+                 order by e.sequence",
         )
         .bind(&session_key)
         .bind(recovery_start_sequence)
@@ -3361,11 +3364,9 @@ impl SqliteSessionStore {
         .bind(&resolved_message_id)
         .fetch_all(&self.pool);
         let legacy_recalls = sqlx::query(
-            "select e.event_json from session_event_search search \
-                 join session_events e \
-                   on e.session_id = search.session_id and e.event_id = search.event_id \
-                 where search.session_id = ? and search.sequence < ? \
-                 and search.event_kind = 'prompt_recalled' order by search.sequence",
+            "select e.event_json from session_events e \
+                 where e.session_id = ? and e.sequence < ? \
+                 and e.event_kind = 'prompt_recalled' order by e.sequence",
         )
         .bind(&session_key)
         .bind(recovery_start_sequence)
@@ -4020,9 +4021,7 @@ impl SqliteSessionStore {
         );
         let mut state: SessionState = serde_json::from_str(row.try_get("state_json")?)?;
         state.apply(&event)?;
-        let search_body = serde_json::to_string(&event)?;
         let stored_event_kind = event_kind(&event.kind)?;
-        let actor = event_actor(&event.kind);
         let compact_event = self.compact_payloads(transaction, &event).await?;
         let event_json = serde_json::to_string(&compact_event)?;
         let projection_json = serde_json::to_string(&state)?;
@@ -4050,19 +4049,9 @@ impl SqliteSessionStore {
         .bind(event.created_at.to_rfc3339())
         .execute(&mut **transaction)
         .await?;
-        sqlx::query(
-            "insert into session_event_search \
-             (session_id, sequence, event_id, event_kind, actor, body) \
-             values (?, ?, ?, ?, ?, ?)",
-        )
-        .bind(event.session_id.to_string())
-        .bind(i64::try_from(event.sequence).context("session sequence exceeds SQLite integer")?)
-        .bind(event.id.to_string())
-        .bind(stored_event_kind)
-        .bind(actor)
-        .bind(search_body)
-        .execute(&mut **transaction)
-        .await?;
+        // Full-text search is a rebuildable projection. Populate it lazily in
+        // `ensure_history_projection` instead of updating FTS5 inside every
+        // latency-sensitive journal commit.
         // Keep the action journal and the event proving its admission or
         // terminal boundary in the same SQLite transaction.
         sync_session_action(transaction, &event).await?;
@@ -4331,25 +4320,20 @@ async fn sync_session_action(
         }
         SessionEventKind::Message {
             message_id,
-            actor,
+            actor: crate::EventActor::User,
             text,
             attachments,
             status: status @ (MessageStatus::Queued | MessageStatus::InProgress),
             delivery,
-        } if matches!(actor, crate::EventActor::User | crate::EventActor::System) => {
+        } => {
             let delivery = delivery.unwrap_or(crate::PromptDelivery::Queue);
-            let (kind, delivery_policy, wake_policy) = match (*actor, delivery) {
-                (crate::EventActor::System, _) => (
-                    crate::SessionActionKind::AgentMessage,
-                    crate::ActionDeliveryPolicy::NextTurnBoundary,
-                    crate::ActionWakePolicy::OnLowerBoundary,
-                ),
-                (_, crate::PromptDelivery::Steer) => (
+            let (kind, delivery_policy, wake_policy) = match delivery {
+                crate::PromptDelivery::Steer => (
                     crate::SessionActionKind::Steering,
                     crate::ActionDeliveryPolicy::WhenRunIdle,
                     crate::ActionWakePolicy::Immediate,
                 ),
-                (_, crate::PromptDelivery::Queue) => (
+                crate::PromptDelivery::Queue => (
                     crate::SessionActionKind::Prompt,
                     crate::ActionDeliveryPolicy::NextTurnBoundary,
                     crate::ActionWakePolicy::OnLowerBoundary,
@@ -4380,7 +4364,7 @@ async fn sync_session_action(
         }
         SessionEventKind::Message {
             message_id,
-            actor: crate::EventActor::User | crate::EventActor::System,
+            actor: crate::EventActor::User,
             status: status @ (MessageStatus::Complete | MessageStatus::Failed),
             ..
         } => {

@@ -7457,10 +7457,12 @@ fn render_event(
 fn remote_command_name(command: &HostCommand) -> &'static str {
     match command {
         HostCommand::Launch { .. } => "launch",
-        HostCommand::Prompt { delivery, .. } => match delivery {
-            PromptDelivery::Steer => "steer",
-            PromptDelivery::Queue => "queue",
-        },
+        HostCommand::Prompt { delivery, .. } | HostCommand::TeamPrompt { delivery, .. } => {
+            match delivery {
+                PromptDelivery::Steer => "steer",
+                PromptDelivery::Queue => "queue",
+            }
+        }
         HostCommand::RecallQueuedPrompt { .. } => "recall queued prompt",
         HostCommand::FlushPendingInput { .. } => "flush pending input",
         HostCommand::Configure { .. } => "configure",

@@ -1938,7 +1938,7 @@ async fn sibling_messages_use_the_shared_team_directory() {
         .send_message_as(sender.session_id, "recipient", "share the benchmark")
         .await
         .unwrap();
-    let HostCommand::Prompt {
+    let HostCommand::TeamPrompt {
         session_id,
         text,
         delivery,
@@ -1956,7 +1956,7 @@ async fn sibling_messages_use_the_shared_team_directory() {
         .broadcast_message_as(sender.session_id, "team checkpoint")
         .await
         .unwrap();
-    let HostCommand::Prompt { message_id, .. } = received.recv().await.unwrap() else {
+    let HostCommand::TeamPrompt { message_id, .. } = received.recv().await.unwrap() else {
         panic!("expected broadcast prompt");
     };
     assert_eq!(message_id, broadcast.message_id);

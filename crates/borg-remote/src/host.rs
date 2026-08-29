@@ -686,6 +686,39 @@ async fn upload_event_page(
                     response.text().await.unwrap_or_default()
                 );
             }
+            Ok(response)
+                if response.status().is_client_error()
+                    && response.status() != StatusCode::REQUEST_TIMEOUT
+                    && response.status() != StatusCode::TOO_MANY_REQUESTS =>
+            {
+                let status = response.status();
+                let detail = response
+                    .text()
+                    .await
+                    .unwrap_or_default()
+                    .chars()
+                    .take(512)
+                    .collect::<String>();
+                let event_kind = serde_json::to_value(&batch[0].kind)?
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string();
+                tracing::error!(
+                    %status,
+                    %detail,
+                    session_id = %batch[0].session_id,
+                    sequence = batch[0].sequence,
+                    %event_kind,
+                    "remote relay permanently rejected a journal event; pausing replay"
+                );
+                return Ok(EventUploadOutcome::Blocked {
+                    session_id: batch[0].session_id,
+                    sequence: batch[0].sequence,
+                    event_kind,
+                    event_bytes: serde_json::to_vec(&batch[0])?.len(),
+                });
+            }
             Ok(response) => {
                 let status = response.status();
                 let detail = response
@@ -2234,6 +2267,10 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
         let attachment = metadata
             .as_ref()
             .and_then(|metadata| metadata.attachment.as_ref());
+        if matches!(command, HostCommand::TeamPrompt { .. }) {
+            tracing::warn!(%session_id, "rejected host-local team prompt from remote command queue");
+            return true;
+        }
         if let Some(attachment) = attachment.as_ref()
             && let Err(error) = authorize_workspace_command(attachment, &command)
         {
@@ -2865,11 +2902,15 @@ fn authorize_workspace_command(
     attachment: &WorkspaceAttachment,
     command: &HostCommand,
 ) -> Result<()> {
+    if matches!(command, HostCommand::TeamPrompt { .. }) {
+        bail!("team prompts are host-local and cannot be remotely authorized");
+    }
     let Some(authority) = &attachment.command_authority else {
         return Ok(());
     };
     let kind = match command {
         HostCommand::Prompt { .. } => crate::ParticipantCommandKind::Prompt,
+        HostCommand::TeamPrompt { .. } => unreachable!("rejected above"),
         HostCommand::RecallQueuedPrompt { .. } => crate::ParticipantCommandKind::RecallQueuedPrompt,
         HostCommand::FlushPendingInput { .. } => crate::ParticipantCommandKind::Prompt,
         HostCommand::Configure { .. } => crate::ParticipantCommandKind::Configure,
@@ -4606,6 +4647,39 @@ mod tests {
             server.await.unwrap(),
             vec![vec![1, 2, 3, 4], vec![1, 2], vec![3, 4]]
         );
+    }
+
+    #[tokio::test]
+    async fn permanent_client_rejection_blocks_the_replay_cursor() {
+        let (server_url, server) = event_server(vec!["400 Bad Request"]).await;
+        let root = tempdir().unwrap();
+        let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+            .await
+            .unwrap();
+        let events = error_events(Uuid::new_v4(), 1, 16);
+        let config = HostConfig {
+            server: server_url,
+            ..test_config(root.path())
+        };
+        let mut uploaded_sequence = 0;
+
+        let outcome = upload_event_page(
+            &Client::new(),
+            &config,
+            &store,
+            &events,
+            &mut uploaded_sequence,
+            Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            outcome,
+            EventUploadOutcome::Blocked { sequence: 1, .. }
+        ));
+        assert_eq!(uploaded_sequence, 0);
+        assert_eq!(server.await.unwrap(), vec![vec![1]]);
     }
 
     #[tokio::test]

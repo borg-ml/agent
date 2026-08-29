@@ -1754,6 +1754,150 @@ fn action_preparation_completes_when_the_start_event_is_missing() {
 }
 
 #[test]
+fn action_preparation_does_not_orphan_an_already_running_tool() {
+    let session_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::ToolStarted {
+            tool_call_id: "command-1".to_string(),
+            name: "exec_command".to_string(),
+            input: serde_json::json!({"cmd": "cargo test"}),
+            input_ref: None,
+        },
+    ));
+    transcript.mark_running_tools_backgrounded();
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::ProviderEvent {
+            provider: CodingProvider::Codex,
+            kind: "action/preparing".to_string(),
+            payload: serde_json::json!({"label": "command"}),
+        },
+    ));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        3,
+        SessionEventKind::ToolCompleted {
+            tool_call_id: "command-1".to_string(),
+            output: "done".to_string(),
+            output_ref: None,
+            is_error: false,
+            input: Some(serde_json::json!({"cmd": "cargo test"})),
+            input_ref: None,
+        },
+    ));
+
+    assert_eq!(transcript.order.len(), 1);
+    assert_eq!(transcript.shell_status(), None);
+    assert!(!transcript.has_running_tool());
+    assert!(
+        transcript
+            .lines(100)
+            .iter()
+            .any(|line| line.to_string().contains("Ran"))
+    );
+}
+
+#[test]
+fn backgrounded_tool_updates_do_not_steal_the_foreground() {
+    let session_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::ToolStarted {
+            tool_call_id: "command-1".to_string(),
+            name: "exec_command".to_string(),
+            input: serde_json::json!({"cmd": "long-running command"}),
+            input_ref: None,
+        },
+    ));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::ReasoningDelta {
+            text: "Moving on while that runs.".to_string(),
+        },
+    ));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        3,
+        SessionEventKind::ToolUpdated {
+            tool_call_id: "command-1".to_string(),
+            name: "exec_command".to_string(),
+            input: serde_json::json!({"cmd": "long-running command"}),
+        },
+    ));
+
+    assert_eq!(transcript.foreground_tool, None);
+    assert!(matches!(
+        transcript.order.first(),
+        Some(TranscriptEntry::Tool {
+            complete: false,
+            backgrounded: true,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn preparing_a_new_action_backgrounds_the_previous_tool_once() {
+    let session_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::ToolStarted {
+            tool_call_id: "command-1".to_string(),
+            name: "exec_command".to_string(),
+            input: serde_json::json!({"cmd": "server"}),
+            input_ref: None,
+        },
+    ));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::ProviderEvent {
+            provider: CodingProvider::Codex,
+            kind: "action/preparing".to_string(),
+            payload: serde_json::json!({"label": "command"}),
+        },
+    ));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        3,
+        SessionEventKind::ToolStarted {
+            tool_call_id: "command-2".to_string(),
+            name: "exec_command".to_string(),
+            input: serde_json::json!({"cmd": "status"}),
+            input_ref: None,
+        },
+    ));
+
+    assert_eq!(transcript.order.len(), 2);
+    assert!(matches!(
+        transcript.order.first(),
+        Some(TranscriptEntry::Tool {
+            complete: false,
+            backgrounded: true,
+            ..
+        })
+    ));
+    assert!(matches!(
+        transcript.order.get(1),
+        Some(TranscriptEntry::Tool {
+            complete: false,
+            backgrounded: false,
+            ..
+        })
+    ));
+    assert_eq!(transcript.foreground_tool.as_deref(), Some("command-2"));
+}
+
+#[test]
 fn composer_cursor_has_a_stable_software_blink_phase() {
     assert!(cursor_blink_visible(Duration::ZERO));
     assert!(cursor_blink_visible(Duration::from_millis(499)));
@@ -6517,6 +6661,21 @@ fn internal_team_delivery_never_renders_or_enters_user_prompt_history() {
 
     let mut composer = Composer::default();
     composer.seed_session_events(std::slice::from_ref(&current));
+    assert!(composer.history.is_empty());
+
+    let legacy = SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::Message {
+            message_id: Uuid::new_v4(),
+            actor: EventActor::User,
+            text: text.clone(),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: Some(PromptDelivery::Queue),
+        },
+    );
+    composer.seed_session_events(&[legacy]);
     assert!(composer.history.is_empty());
 
     let mut pending = Vec::new();

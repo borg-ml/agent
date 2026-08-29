@@ -965,6 +965,16 @@ pub enum HostCommand {
         output_schema: Option<Value>,
         delivery: PromptDelivery,
     },
+    /// Provider input originating inside the agent team. This variant is
+    /// host-local and must never be accepted from a remote participant.
+    TeamPrompt {
+        session_id: Uuid,
+        message_id: Uuid,
+        text: String,
+        attachments: Vec<PathBuf>,
+        output_schema: Option<Value>,
+        delivery: PromptDelivery,
+    },
     RecallQueuedPrompt {
         session_id: Uuid,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1047,6 +1057,7 @@ impl HostCommand {
         match self {
             Self::Launch { session_id, .. }
             | Self::Prompt { session_id, .. }
+            | Self::TeamPrompt { session_id, .. }
             | Self::RecallQueuedPrompt { session_id, .. }
             | Self::FlushPendingInput { session_id }
             | Self::Configure { session_id, .. }

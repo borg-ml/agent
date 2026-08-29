@@ -8168,6 +8168,9 @@ impl Composer {
             else {
                 continue;
             };
+            if text.starts_with("Team message from /") {
+                continue;
+            }
             if seen.insert(*message_id) && self.history_message_ids.insert(*message_id) {
                 if !attachments.is_empty() {
                     if let Some(highest) = image_numbers_in_text(text).into_iter().max() {

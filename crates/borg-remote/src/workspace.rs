@@ -14,6 +14,8 @@ use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 use uuid::Uuid;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const SQLITE_MMAP_SIZE_BYTES: u64 = 256 * 1024 * 1024;
+const SQLITE_CACHE_KIB: u64 = 8 * 1024;
 const WORKSPACE_SCHEMA_VERSION: i64 = 2;
 
 /// Stable identity for the local OS user across all personal workspaces in one
@@ -385,9 +387,12 @@ impl SqliteWorkspaceStore {
             .journal_mode(SqliteJournalMode::Wal)
             .synchronous(SqliteSynchronous::Full)
             .busy_timeout(BUSY_TIMEOUT)
+            .pragma("mmap_size", SQLITE_MMAP_SIZE_BYTES.to_string())
+            .pragma("cache_size", format!("-{SQLITE_CACHE_KIB}"))
+            .pragma("temp_store", "MEMORY")
             .foreign_keys(true);
         let pool = SqlitePoolOptions::new()
-            .max_connections(8)
+            .max_connections(4)
             .connect_with(opts)
             .await
             .with_context(|| format!("failed to open SQLite workspace store {}", path.display()))?;

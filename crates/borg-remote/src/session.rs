@@ -1532,7 +1532,7 @@ async fn run_agent_session_store_kernel(
                         match message {
                             Ok(message) => {
                                 team_message_ids.insert(message.message_id);
-                                Some(HostCommand::Prompt {
+                                Some(HostCommand::TeamPrompt {
                                     session_id,
                                     message_id: message.message_id,
                                     text: message.text,
@@ -1629,6 +1629,25 @@ async fn run_agent_session_store_kernel(
                     }
                 };
                 match command {
+                    Some(HostCommand::TeamPrompt {
+                        session_id: command_session_id,
+                        message_id,
+                        text,
+                        attachments,
+                        output_schema,
+                        delivery,
+                    }) if command_session_id == session_id => {
+                        team_message_ids.insert(message_id);
+                        deferred_commands.push_front(HostCommand::Prompt {
+                            session_id,
+                            message_id,
+                            text,
+                            attachments,
+                            output_schema,
+                            delivery,
+                        });
+                        continue;
+                    }
                     Some(HostCommand::Prompt {
                         session_id: command_session_id,
                         message_id,
@@ -3003,7 +3022,7 @@ async fn run_agent_session_store_kernel(
                     match message {
                         Ok(message) => {
                             team_message_ids.insert(message.message_id);
-                            deferred_commands.push_front(HostCommand::Prompt {
+                            deferred_commands.push_front(HostCommand::TeamPrompt {
                                 session_id,
                                 message_id: message.message_id,
                                 text: message.text,
@@ -3267,6 +3286,24 @@ async fn run_agent_session_store_kernel(
                         continue;
                     }
                     match command {
+                        HostCommand::TeamPrompt {
+                            message_id,
+                            text,
+                            attachments,
+                            output_schema,
+                            delivery,
+                            ..
+                        } => {
+                            team_message_ids.insert(message_id);
+                            deferred_commands.push_front(HostCommand::Prompt {
+                                session_id,
+                                message_id,
+                                text,
+                                attachments,
+                                output_schema,
+                                delivery,
+                            });
+                        }
                         HostCommand::Prompt {
                             message_id,
                             text,
@@ -5610,7 +5647,7 @@ fn defer_root_inbox_behind_current_command(
     deferred.push_front(current);
     for message in inbox {
         team_message_ids.insert(message.message_id);
-        deferred.push_back(HostCommand::Prompt {
+        deferred.push_back(HostCommand::TeamPrompt {
             session_id,
             message_id: message.message_id,
             text: message.text,
