@@ -120,6 +120,24 @@ fn action_intent_is_streaming(text: &str) -> bool {
     }
 }
 
+fn without_action_intent_marker(text: &str) -> Option<&str> {
+    let trimmed = text.trim_start();
+    if trimmed.is_empty() {
+        return Some(text);
+    }
+    if "[[BORG_ACTION".starts_with(trimmed) || trimmed.starts_with("[[BORG_ACTION") {
+        return trimmed
+            .split_once('\n')
+            .map(|(_, remainder)| remainder.trim_start())
+            .filter(|remainder| !remainder.is_empty());
+    }
+    Some(text)
+}
+
+fn provider_native_agent_tool(name: &str) -> bool {
+    matches!(name, "subAgentActivity" | "collabAgentToolCall")
+}
+
 #[derive(Clone)]
 pub struct AgentTurn {
     pub session_id: Uuid,
@@ -1551,16 +1569,16 @@ async fn run_borg_provider_turn(
                     );
                 }
                 text.push_str(&delta);
-                if action_intent_is_streaming(&text) {
+                let Some(visible_text) = without_action_intent_marker(&text) else {
                     continue;
-                }
+                };
                 if last_text_emit.elapsed() >= live_output_interval(text.len()) {
                     send(
                         &events,
                         SessionEventKind::Message {
                             message_id: assistant_message_id,
                             actor: EventActor::Assistant,
-                            text: text.clone(),
+                            text: visible_text.to_string(),
                             attachments: Vec::new(),
                             status: MessageStatus::InProgress,
                             delivery: None,
@@ -1636,6 +1654,10 @@ async fn run_borg_provider_turn(
                     .await;
                     continue;
                 }
+                if without_action_intent_marker(&narration_text).is_none() {
+                    text.clear();
+                    continue;
+                }
                 text = narration_text;
                 send(
                     &events,
@@ -1674,6 +1696,10 @@ async fn run_borg_provider_turn(
                 .await;
             }
             ChatStreamEvent::ToolCall { id, name, input } => {
+                anyhow::ensure!(
+                    !provider_native_agent_tool(&name),
+                    "Codex exposed a forbidden provider-native agent tool: {name}"
+                );
                 flush_pending_reasoning(&events, &mut pending_reasoning).await;
                 reasoning_text.clear();
                 last_completed_reasoning = None;
@@ -2066,6 +2092,9 @@ fn terminal_assistant_text(
     } else {
         final_output
     };
+    let Some(text) = without_action_intent_marker(text) else {
+        return Ok(None);
+    };
     if !text.trim().is_empty() && action_intent_is_streaming(text) {
         Ok(None)
     } else if text.trim().is_empty() {
@@ -2286,6 +2315,14 @@ mod tests {
             "[[BORG_ACTION:command]][[BORG_ACTION:file"
         ));
         assert!(!action_intent_is_streaming("ordinary narration"));
+        assert_eq!(without_action_intent_marker("[[BORG_ACTION[["), None);
+        assert_eq!(
+            without_action_intent_marker("[[BORG_ACTION:command]]\nvisible result"),
+            Some("visible result")
+        );
+        assert!(provider_native_agent_tool("subAgentActivity"));
+        assert!(provider_native_agent_tool("collabAgentToolCall"));
+        assert!(!provider_native_agent_tool("mcp__borg_agent__spawn_agent"));
     }
 
     fn test_server(name: &str) -> borg_provider::mcp::ExternalMcpServer {
@@ -2806,6 +2843,15 @@ mod tests {
         assert_eq!(
             terminal_assistant_text("[[BORG_ACTION:command", "", false, true).unwrap(),
             None
+        );
+        assert_eq!(
+            terminal_assistant_text("[[BORG_ACTION[[", "", false, true).unwrap(),
+            None
+        );
+        assert_eq!(
+            terminal_assistant_text("[[BORG_ACTION:command]]\nvisible result", "", false, false)
+                .unwrap(),
+            Some("visible result".to_string())
         );
     }
 }

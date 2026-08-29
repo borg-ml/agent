@@ -2215,6 +2215,8 @@ fn codex_app_server_command(
         "app-server",
         "--stdio",
         "--disable",
+        "collaboration_modes",
+        "--disable",
         "multi_agent",
         "--disable",
         "multi_agent_v2",
@@ -2277,7 +2279,9 @@ fn codex_thread_start_params(
             // Borg owns the durable subagent tree. Codex-native children are
             // invisible to that tree and cannot be focused or controlled by
             // Borg clients, so keep the provider's parallel agent tools off.
+            "collaboration_modes": false,
             "multi_agent": false,
+            "multi_agent_v2": false,
             "web_search_request": request.web_search_allowed,
         }),
     );
@@ -3921,7 +3925,15 @@ mod tests {
             Some(&Value::Bool(true))
         );
         assert_eq!(
+            codex_config.pointer("/config/features/collaboration_modes"),
+            Some(&Value::Bool(false))
+        );
+        assert_eq!(
             codex_config.pointer("/config/features/multi_agent"),
+            Some(&Value::Bool(false))
+        );
+        assert_eq!(
+            codex_config.pointer("/config/features/multi_agent_v2"),
             Some(&Value::Bool(false))
         );
         assert!(codex_config.get("baseInstructions").is_none());
@@ -3967,6 +3979,11 @@ mod tests {
             codex_args
                 .windows(2)
                 .any(|args| args[0] == "app-server" && args[1] == "--stdio")
+        );
+        assert!(
+            codex_args
+                .windows(2)
+                .any(|args| args[0] == "--disable" && args[1] == "collaboration_modes")
         );
         assert!(
             codex_args
