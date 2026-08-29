@@ -2211,7 +2211,14 @@ fn codex_app_server_command(
     auth_home: Option<&TempDir>,
 ) -> Result<Command> {
     let mut command = Command::new("codex");
-    command.args(["app-server", "--stdio"]);
+    command.args([
+        "app-server",
+        "--stdio",
+        "--disable",
+        "multi_agent",
+        "--disable",
+        "multi_agent_v2",
+    ]);
     if let Some(auth_home) = auth_home {
         command.env("HOME", auth_home.path());
         let codex_home = crate::provider_auth::ensure_codex_home(auth_home.path())?;
@@ -3960,6 +3967,16 @@ mod tests {
             codex_args
                 .windows(2)
                 .any(|args| args[0] == "app-server" && args[1] == "--stdio")
+        );
+        assert!(
+            codex_args
+                .windows(2)
+                .any(|args| args[0] == "--disable" && args[1] == "multi_agent")
+        );
+        assert!(
+            codex_args
+                .windows(2)
+                .any(|args| args[0] == "--disable" && args[1] == "multi_agent_v2")
         );
 
         let mcp_setup =

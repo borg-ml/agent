@@ -42,8 +42,6 @@ Use the canonical update_plan shape `{\"explanation\":\"optional\",\"plan\":[{\"
 plan content is limited to 500 characters and only one item may be in_progress. \
 Use `lsp_workspace_diagnostics` for a project-wide diagnostic pass when the workspace language is supported; use `lsp_diagnostics` for a targeted file and the other LSP tools for semantic navigation. \
 After editing supported source files, run LSP diagnostics before finishing and repair errors caused by the edit. \
-Do not use a provider-native spawn or collaboration tool because those children are not part of \
-the Borg session tree and cannot be controlled from Borg Remote. \
 When the user starts a message with `/ask PROFILE`, `/claude`, `/gpt`, or `/codex`, treat it as a \
 request for a second opinion. Use `consult_peer` for the normal case: it keeps the opposite GPT/Claude \
 peer thread alive across calls and returns the peer's answer to you privately so you can reconcile \
