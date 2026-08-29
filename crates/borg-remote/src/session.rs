@@ -2841,12 +2841,24 @@ async fn run_agent_session_store_kernel(
                         Err(error) => {
                             subscription_context_reusable = false;
                             let error = format!("{error:#}");
-                            let retry = !interrupted
-                                && prompt.visible
-                                && prompt.actor == EventActor::User
-                                && !turn_had_side_effects
-                                && is_safe_automatic_retry_error(&error)
-                                && automatic_retry_message_ids.insert(prompt.message_id);
+                            let provider_isolation_recovery =
+                                is_provider_agent_isolation_error(&error);
+                            if provider_isolation_recovery {
+                                provider_session_id = None;
+                                provider_fork_turn_id = None;
+                                executor.stop_session(session_id).await?;
+                            }
+                            let retry = automatic_retry_allowed(
+                                &error,
+                                interrupted,
+                                prompt.visible,
+                                prompt.actor,
+                                turn_had_side_effects,
+                                !automatic_retry_message_ids.contains(&prompt.message_id),
+                            );
+                            if retry {
+                                automatic_retry_message_ids.insert(prompt.message_id);
+                            }
                             if !retry {
                                 for kind in retryable_provider_errors.drain(..) {
                                     record(&mut journal, &events, session_id, kind).await?;
@@ -2856,7 +2868,10 @@ async fn run_agent_session_store_kernel(
                                 autonomy_result = Some(Err(anyhow::anyhow!(error.clone())));
                             }
                             let ready_detail = if retry {
-                                if error.to_ascii_lowercase().contains(
+                                if provider_isolation_recovery {
+                                    "Borg blocked a provider-native delegation attempt and is continuing automatically on a clean provider thread."
+                                        .to_string()
+                                } else if error.to_ascii_lowercase().contains(
                                     "durable thread recovery unavailable",
                                 ) {
                                     "The provider thread could not be resumed; your message was preserved and Borg is retrying from its durable journal."
@@ -2868,7 +2883,9 @@ async fn run_agent_session_store_kernel(
                             } else {
                                 format!("Turn failed; the session remains available: {error}")
                             };
-                            if provider_error_is_usage_limited(&error) {
+                            if retry {
+                                goal_turn_failures.reset();
+                            } else if provider_error_is_usage_limited(&error) {
                                 goal_turn_failures.reset();
                                 usage_limit_active_goal(
                                     &mut journal,
@@ -6690,6 +6707,26 @@ fn is_safe_automatic_retry_error(error: &str) -> bool {
     let error = error.to_ascii_lowercase();
     error.contains("returned an empty response")
         || error.contains("durable thread recovery unavailable")
+}
+
+fn is_provider_agent_isolation_error(error: &str) -> bool {
+    error.contains("forbidden provider-native agent tool")
+}
+
+fn automatic_retry_allowed(
+    error: &str,
+    interrupted: bool,
+    prompt_visible: bool,
+    actor: EventActor,
+    turn_had_side_effects: bool,
+    retry_not_attempted: bool,
+) -> bool {
+    !interrupted
+        && prompt_visible
+        && actor == EventActor::User
+        && retry_not_attempted
+        && (is_provider_agent_isolation_error(error)
+            || (!turn_had_side_effects && is_safe_automatic_retry_error(error)))
 }
 
 fn provider_event_has_side_effect(kind: &SessionEventKind) -> bool {
