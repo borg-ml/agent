@@ -1726,6 +1726,42 @@ fn action_preparation_promotes_into_the_same_tool_card() {
 }
 
 #[test]
+fn action_preparation_can_be_hidden_without_hiding_tool_activity() {
+    let session_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    transcript.set_action_descriptors(false);
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::ProviderEvent {
+            provider: CodingProvider::Codex,
+            kind: "action/preparing".to_string(),
+            payload: serde_json::json!({"label": "edit src/main.rs"}),
+        },
+    ));
+    assert!(transcript.order.is_empty());
+
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::ToolStarted {
+            tool_call_id: "edit-1".to_string(),
+            name: "Edit".to_string(),
+            input: serde_json::json!({"path": "src/main.rs"}),
+            input_ref: None,
+        },
+    ));
+    let rendered = transcript
+        .lines(100)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("Editing…"), "{rendered}");
+    assert!(!rendered.contains("Preparing next action"), "{rendered}");
+}
+
+#[test]
 fn action_preparation_completes_when_the_start_event_is_missing() {
     let session_id = Uuid::new_v4();
     let mut transcript = Transcript::default();

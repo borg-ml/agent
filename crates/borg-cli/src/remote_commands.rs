@@ -1691,6 +1691,7 @@ async fn run_local_agent_session(
         }
         terminal.set_diff_expansion(editor_preferences.presentation.effective_diff_expansion());
         terminal.set_auto_expand_tools(editor_preferences.presentation.auto_expand_tools);
+        terminal.set_action_descriptors(editor_preferences.presentation.action_descriptors);
         terminal.set_running_sweeps(editor_preferences.presentation.running_sweeps);
         terminal.set_layout_preferences(&editor_preferences.layout);
         terminal.set_completion_alerts(
@@ -2243,6 +2244,9 @@ async fn run_local_agent_session(
                                 );
                                 terminal.set_auto_expand_tools(
                                     editor_preferences.presentation.auto_expand_tools,
+                                );
+                                terminal.set_action_descriptors(
+                                    editor_preferences.presentation.action_descriptors,
                                 );
                                 terminal.set_running_sweeps(
                                     editor_preferences.presentation.running_sweeps,
@@ -3743,6 +3747,16 @@ async fn run_local_agent_session(
                             if enabled { "on" } else { "off" }
                         ));
                     }
+                    UiAction::SetActionDescriptors(enabled) => {
+                        editor_preferences.presentation.action_descriptors = enabled;
+                        editor_preferences.save()?;
+                        let terminal = terminal.as_mut().expect("terminal");
+                        terminal.set_action_descriptors(enabled);
+                        terminal.set_notice(format!(
+                            "Action descriptors: {}",
+                            if enabled { "on" } else { "off" }
+                        ));
+                    }
                     UiAction::SetRunningSweeps(enabled) => {
                         editor_preferences.presentation.running_sweeps = enabled;
                         editor_preferences.save()?;
@@ -4372,6 +4386,11 @@ async fn run_local_agent_session(
                                 .as_mut()
                                 .expect("terminal")
                                 .open_auto_expand_tools_picker();
+                        } else if line == "/action-descriptors" && attachments.is_empty() {
+                            terminal
+                                .as_mut()
+                                .expect("terminal")
+                                .open_action_descriptors_picker();
                         } else if line == "/animations" && attachments.is_empty() {
                             terminal
                                 .as_mut()
@@ -4674,6 +4693,23 @@ async fn run_local_agent_session(
                             } else {
                                 terminal.as_mut().expect("terminal").set_notice(
                                     "Choose /expand-tools on or /expand-tools off",
+                                );
+                            }
+                        } else if let Some(value) = line.strip_prefix("/action-descriptors ")
+                            && attachments.is_empty()
+                        {
+                            if let Some(enabled) = parse_on_off(value) {
+                                editor_preferences.presentation.action_descriptors = enabled;
+                                editor_preferences.save()?;
+                                let terminal = terminal.as_mut().expect("terminal");
+                                terminal.set_action_descriptors(enabled);
+                                terminal.set_notice(format!(
+                                    "Action descriptors: {}",
+                                    if enabled { "on" } else { "off" }
+                                ));
+                            } else {
+                                terminal.as_mut().expect("terminal").set_notice(
+                                    "Choose /action-descriptors on or /action-descriptors off",
                                 );
                             }
                         } else if let Some(value) = line.strip_prefix("/animations ")
@@ -7390,10 +7426,11 @@ fn live_customization_summary(
             }
         ),
         format!(
-            "rendering: {} FPS · edits {} · tools {} · sweeps {}",
+            "rendering: {} FPS · edits {} · tools {} · action descriptors {} · sweeps {}",
             editor.presentation.refresh_rate_fps,
             diff_expansion_label(editor.presentation.effective_diff_expansion()),
             editor.presentation.auto_expand_tools,
+            editor.presentation.action_descriptors,
             editor.presentation.running_sweeps
         ),
         format!(

@@ -26,6 +26,7 @@ persisted to `editor.toml`.
 | Refresh rate | `/refresh` | `presentation.refresh_rate_fps = 15..240` |
 | Edit diff display | `/expand-edits` | `presentation.diff_expansion = "expanded"`, `"collapsed"`, or `"until_next_action"` |
 | Expand tool details | `/expand-tools` | `presentation.auto_expand_tools = true` or `false` |
+| Action descriptors | `/action-descriptors` | `presentation.action_descriptors = true` or `false` |
 | Running animations | `/animations` | `presentation.running_sweeps = true` or `false` |
 | Dictation icon | `/icons` | `presentation.dictation_icon = "nerd_font"` or `"emoji"` |
 | Transcript labels | `/user-label`, `/assistant-label` | `transcript.user_label`, `transcript.assistant_label` |

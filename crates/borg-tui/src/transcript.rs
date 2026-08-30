@@ -95,6 +95,7 @@ struct Transcript {
     selected: Option<usize>,
     diff_expansion: DiffExpansionPolicy,
     auto_expand_tools: bool,
+    action_descriptors: bool,
     user_label: String,
     assistant_label: String,
     user_label_color: Color,
@@ -176,6 +177,7 @@ impl Default for Transcript {
             selected: None,
             diff_expansion: DiffExpansionPolicy::Expanded,
             auto_expand_tools: false,
+            action_descriptors: true,
             user_label: "user".to_string(),
             assistant_label: "borg".to_string(),
             user_label_color: USER_LABEL_BLUE,
@@ -1197,6 +1199,9 @@ impl Transcript {
             SessionEventKind::ProviderEvent { kind, payload, .. }
                 if kind == "action/preparing" =>
             {
+                if !self.action_descriptors {
+                    return removed_entry;
+                }
                 let Some(label) = payload.get("label").and_then(serde_json::Value::as_str) else {
                     return removed_entry;
                 };
@@ -2344,6 +2349,10 @@ impl Transcript {
                 *expanded = enabled;
             }
         }
+    }
+
+    fn set_action_descriptors(&mut self, enabled: bool) {
+        self.action_descriptors = enabled;
     }
 
     fn config_statuses(

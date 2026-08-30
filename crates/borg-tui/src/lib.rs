@@ -477,6 +477,10 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/expand-edits", "auto-expand edit diffs"),
     ("/expand-tools", "auto-expand other tool details"),
     (
+        "/action-descriptors",
+        "show preparation descriptors before tools",
+    ),
+    (
         "/notifications",
         "choose when completion notifications appear",
     ),
@@ -616,6 +620,7 @@ pub enum UiAction {
     SetSteerActive(bool),
     SetDiffExpansion(DiffExpansionPolicy),
     SetAutoExpandTools(bool),
+    SetActionDescriptors(bool),
     SetRunningSweeps(bool),
     SetCompletionNotifications(CompletionAlertPolicy),
     SetCompletionSound(CompletionAlertPolicy),
@@ -792,6 +797,7 @@ pub struct BorgTerminal {
     dictation_state: DictationState,
     dictation_icon: DictationIconStyle,
     running_sweeps: bool,
+    action_descriptors: bool,
     completion_notifications: CompletionAlertPolicy,
     completion_sound: CompletionAlertPolicy,
     horizontal_margin: u16,
@@ -1020,6 +1026,7 @@ enum PickerKind {
     ActiveMessages,
     AutoExpandEdits,
     AutoExpandTools,
+    ActionDescriptors,
     RunningSweeps,
     CompletionNotifications,
     CompletionSound,
@@ -1814,6 +1821,7 @@ impl BorgTerminal {
             dictation_state: DictationState::Idle,
             dictation_icon: dictation_icon_style_for_preference(None),
             running_sweeps: true,
+            action_descriptors: true,
             completion_notifications: CompletionAlertPolicy::Unfocused,
             completion_sound: CompletionAlertPolicy::Unfocused,
             horizontal_margin: HORIZONTAL_MARGIN,
@@ -3217,6 +3225,7 @@ impl BorgTerminal {
             "Keep machine awake".to_string(),
             "Auto-expand edits".to_string(),
             "Auto-expand tools".to_string(),
+            "Action descriptors".to_string(),
             "Running sweep animations".to_string(),
             "Completion notifications".to_string(),
             "Completion sound".to_string(),
@@ -3236,6 +3245,7 @@ impl BorgTerminal {
             "/sleep",
             "/expand-edits",
             "/expand-tools",
+            "/action-descriptors",
             "/animations",
             "/notifications",
             "/sound",
@@ -3445,6 +3455,15 @@ impl BorgTerminal {
         ));
     }
 
+    pub fn open_action_descriptors_picker(&mut self) {
+        self.picker = Some(Picker::new(
+            PickerKind::ActionDescriptors,
+            "Preparation descriptors before tools",
+            ["On", "Off"],
+            Some(if self.action_descriptors { "On" } else { "Off" }),
+        ));
+    }
+
     pub fn open_running_sweeps_picker(&mut self) {
         self.picker = Some(Picker::new(
             PickerKind::RunningSweeps,
@@ -3486,6 +3505,12 @@ impl BorgTerminal {
 
     pub fn set_running_sweeps(&mut self, enabled: bool) {
         self.running_sweeps = enabled;
+    }
+
+    pub fn set_action_descriptors(&mut self, enabled: bool) {
+        self.action_descriptors = enabled;
+        self.transcript.set_action_descriptors(enabled);
+        self.transcript_render_cache = None;
     }
 
     pub fn set_layout_preferences(
@@ -4973,6 +4998,9 @@ impl BorgTerminal {
             }
             PickerKind::AutoExpandTools => {
                 UiAction::SetAutoExpandTools(picker.selected_value() == "On")
+            }
+            PickerKind::ActionDescriptors => {
+                UiAction::SetActionDescriptors(picker.selected_value() == "On")
             }
             PickerKind::RunningSweeps => {
                 UiAction::SetRunningSweeps(picker.selected_value() == "On")

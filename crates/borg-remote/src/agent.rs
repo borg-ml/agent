@@ -153,6 +153,17 @@ fn without_action_intent_marker(text: &str) -> Option<&str> {
     Some(text)
 }
 
+fn canonical_action_descriptor(name: &str, input: &Value) -> String {
+    let (label, detail) = crate::tool_call_summary(name, input);
+    let label = label.trim_end_matches('…').to_ascii_lowercase();
+    let descriptor = if detail.trim().is_empty() {
+        label
+    } else {
+        format!("{label} {detail}")
+    };
+    crate::compact_text(&descriptor, 64)
+}
+
 fn provider_native_agent_tool(name: &str) -> bool {
     matches!(name, "subAgentActivity" | "collabAgentToolCall")
 }
@@ -1770,6 +1781,16 @@ async fn run_borg_provider_turn(
                         "Borg provider stage"
                     );
                 }
+                let action_descriptor = canonical_action_descriptor(&name, &input);
+                send(
+                    &events,
+                    SessionEventKind::ProviderEvent {
+                        provider: turn.provider,
+                        kind: "action/preparing".to_string(),
+                        payload: serde_json::json!({"label": action_descriptor}),
+                    },
+                )
+                .await;
                 send(
                     &events,
                     SessionEventKind::ToolStarted {
@@ -2414,6 +2435,21 @@ mod tests {
         assert!(provider_native_agent_tool("subAgentActivity"));
         assert!(provider_native_agent_tool("collabAgentToolCall"));
         assert!(!provider_native_agent_tool("mcp__borg_agent__spawn_agent"));
+    }
+
+    #[test]
+    fn canonical_action_descriptors_use_tool_metadata() {
+        assert_eq!(
+            canonical_action_descriptor(
+                "apply_patch",
+                &serde_json::json!({"file_path": "src/main.rs"}),
+            ),
+            "edit src/main.rs"
+        );
+        assert_eq!(
+            canonical_action_descriptor("mcp__borg_agent__get_plan", &serde_json::json!({})),
+            "read plan current steps"
+        );
     }
 
     fn test_server(name: &str) -> borg_provider::mcp::ExternalMcpServer {
