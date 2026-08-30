@@ -2,9 +2,9 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::os::fd::FromRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
@@ -91,7 +91,7 @@ fn live_tui_input_latency_under_storage_pressure() {
         .wheel_and_measure("start the responsiveness stream", Duration::from_secs(2))
         .expect("measure wheel scroll paint");
     terminal
-        .write_all_retry(&mouse_wheel_sequence(65, 32, 10, 10))
+        .write_all_retry(&mouse_wheel_sequence(65, 32, 1, 10))
         .expect("restore live-tail scroll");
 
     let cpu_before = terminal.cpu_time().expect("read initial Borg CPU time");
@@ -178,6 +178,129 @@ fn live_tui_input_latency_under_storage_pressure() {
             "{interaction}-to-paint latency exceeded {MOUSE_INPUT_SLO:?}: {latency:?}"
         );
     }
+}
+
+#[test]
+#[ignore = "explicit read-only viewer gate against a live Borg session"]
+fn live_attached_session_interaction_latency() {
+    let session_id = std::env::var("BORG_TUI_LIVE_SESSION")
+        .expect("set BORG_TUI_LIVE_SESSION to the durable session id");
+    assert!(
+        live_session_owner_pid(&session_id).is_some(),
+        "the live gate requires an existing Borg owner for {session_id}"
+    );
+    let cwd = PathBuf::from(
+        std::env::var_os("BORG_TUI_LIVE_CWD")
+            .expect("set BORG_TUI_LIVE_CWD to the session workspace"),
+    );
+    let executable = std::env::var("BORG_TUI_STRESS_EXE")
+        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_borg").to_string());
+    let home = PathBuf::from(std::env::var_os("HOME").expect("HOME is configured"));
+    let borg_home = std::env::var_os("BORG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".borg"));
+    let mut terminal = PtyChild::spawn_attached_viewer(&executable, &cwd, &borg_home, &session_id)
+        .expect("attach an isolated viewer to the live session");
+    terminal
+        .wait_for_output(Duration::from_secs(15))
+        .expect("wait for the live session's first frame");
+    terminal
+        .wait_for_screen_text("full access", Duration::from_secs(15))
+        .expect("wait for the live session status line");
+
+    let hover_latency = terminal
+        .hover_and_measure(
+            "full access",
+            "left click change permissions",
+            Duration::from_secs(2),
+        )
+        .expect("measure live pointer hover paint");
+    let click_latency = terminal
+        .click_and_measure("full access", "Choose access", Duration::from_secs(2))
+        .expect("measure live pointer click paint");
+    terminal
+        .write_all_retry(b"\x1b")
+        .expect("close live access picker");
+    terminal
+        .wait_for_absence("Choose access", Duration::from_secs(2))
+        .expect("wait for live access picker to close");
+    terminal
+        .resize(18, PTY_COLS)
+        .expect("shrink the live viewer to force transcript overflow");
+    terminal
+        .wait_for_screen_text("full access", Duration::from_secs(2))
+        .expect("wait for the resized live viewer");
+    assert!(
+        !terminal.screen.contains("Jump to bottom"),
+        "live viewer must begin at the transcript tail"
+    );
+    let wheel_latency = terminal
+        .wheel_and_measure("Jump to bottom", Duration::from_secs(2))
+        .expect("measure live wheel scroll paint");
+    terminal
+        .write_all_retry(&mouse_wheel_sequence(65, 32, 1, 10))
+        .expect("restore live viewer to the tail");
+    let keyboard_latency = terminal
+        .type_and_measure("live-viewer-latency-ZXQ", Duration::from_secs(2))
+        .expect("measure live keyboard paint");
+    terminal
+        .write_all_retry(b"\x15")
+        .expect("clear the unsent live viewer draft");
+
+    let cpu_before = terminal.cpu_time().expect("read live viewer CPU time");
+    let cpu_sample_started = Instant::now();
+    while cpu_sample_started.elapsed() < ACTIVE_CPU_SAMPLE {
+        terminal
+            .read_available(None)
+            .expect("drain live viewer output during CPU sample");
+        thread::sleep(Duration::from_millis(2));
+    }
+    let cpu_ratio = terminal
+        .cpu_time()
+        .expect("read final live viewer CPU time")
+        .saturating_sub(cpu_before)
+        .as_secs_f64()
+        / cpu_sample_started.elapsed().as_secs_f64();
+    eprintln!(
+        "live attached-session profile: active_cpu={:.1}% keyboard={keyboard_latency:?} hover={hover_latency:?} click={click_latency:?} wheel={wheel_latency:?}",
+        cpu_ratio * 100.0,
+    );
+
+    // Live-session CPU includes durable event ingestion from the active owner;
+    // the isolated pressure gate above owns the renderer CPU SLO.
+    assert!(
+        keyboard_latency <= INPUT_MAX_SLO,
+        "live keyboard-to-paint exceeded {INPUT_MAX_SLO:?}: {keyboard_latency:?}"
+    );
+    for (interaction, latency) in [
+        ("hover", hover_latency),
+        ("click", click_latency),
+        ("wheel", wheel_latency),
+    ] {
+        assert!(
+            latency <= MOUSE_INPUT_SLO,
+            "live {interaction}-to-paint exceeded {MOUSE_INPUT_SLO:?}: {latency:?}"
+        );
+    }
+}
+
+fn live_session_owner_pid(session_id: &str) -> Option<u32> {
+    fs::read_dir("/proc")
+        .ok()?
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().to_string_lossy().parse::<u32>().ok())
+        .find(|pid| {
+            let executable = fs::read_link(format!("/proc/{pid}/exe"))
+                .ok()
+                .and_then(|path| path.file_name().map(|name| name.to_owned()))
+                .unwrap_or_default();
+            executable.to_string_lossy().starts_with("borg")
+                && fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|command| {
+                    command
+                        .windows(session_id.len())
+                        .any(|part| part == session_id.as_bytes())
+                })
+        })
 }
 
 fn mouse_wheel_sequence(button: u8, repetitions: usize, column: usize, row: usize) -> Vec<u8> {
@@ -328,6 +451,7 @@ struct PtyChild {
     master: File,
     log_path: std::path::PathBuf,
     screen: VirtualScreen,
+    stop_session_on_drop: bool,
 }
 
 impl PtyChild {
@@ -337,6 +461,58 @@ impl PtyChild {
         borg_home: &Path,
         config_home: &Path,
         endpoint: &str,
+    ) -> io::Result<Self> {
+        let mut command = Command::new(executable);
+        let prompt = format!(
+            "start the responsiveness stream\n{}",
+            "wheel latency history fixture\n".repeat(120)
+        );
+        command
+            .args([
+                "--provider",
+                "open-ai-compatible",
+                "--model",
+                "tui-stress-model",
+            ])
+            .arg(prompt)
+            .current_dir(cwd)
+            .env("HOME", cwd)
+            .env("XDG_CONFIG_HOME", config_home)
+            .env("BORG_HOME", borg_home)
+            .env("BORG_LIMITS", "0")
+            .env("BORG_TUI", "1")
+            .env("BORG_TUI_SCREEN", "alternate")
+            .env("BORG_TUI_FPS", "165")
+            .env("TERM", "xterm-256color")
+            .env("BORG_OPENAI_COMPATIBLE_BASE_URL", endpoint)
+            .env("BORG_OPENAI_COMPATIBLE_MODEL", "tui-stress-model")
+            .env("BORG_OPENAI_COMPATIBLE_API_KEY", "local-test")
+            .env("BORG_OPENAI_COMPATIBLE_CONTEXT_WINDOW_TOKENS", "1000000")
+            .env("RUST_LOG", "borg=debug");
+        Self::spawn_command(command, borg_home.join("logs/borg.log"), true)
+    }
+
+    fn spawn_attached_viewer(
+        executable: &str,
+        cwd: &Path,
+        borg_home: &Path,
+        session_id: &str,
+    ) -> io::Result<Self> {
+        let mut command = Command::new(executable);
+        command
+            .args(["resume", session_id])
+            .current_dir(cwd)
+            .env("BORG_TUI", "1")
+            .env("BORG_TUI_SCREEN", "alternate")
+            .env("BORG_TUI_FPS", "165")
+            .env("TERM", "xterm-256color");
+        Self::spawn_command(command, borg_home.join("logs/borg.log"), false)
+    }
+
+    fn spawn_command(
+        mut command: Command,
+        log_path: std::path::PathBuf,
+        stop_session_on_drop: bool,
     ) -> io::Result<Self> {
         let mut master_fd = -1;
         let mut slave_fd = -1;
@@ -377,33 +553,7 @@ impl PtyChild {
         let stderr = unsafe { File::from_raw_fd(stderr_fd) };
         // SAFETY: the master descriptor is independently owned by the parent process.
         let master = unsafe { File::from_raw_fd(master_fd) };
-        let mut command = Command::new(executable);
-        let prompt = format!(
-            "start the responsiveness stream\n{}",
-            "wheel latency history fixture\n".repeat(120)
-        );
         command
-            .args([
-                "--provider",
-                "open-ai-compatible",
-                "--model",
-                "tui-stress-model",
-            ])
-            .arg(prompt)
-            .current_dir(cwd)
-            .env("HOME", cwd)
-            .env("XDG_CONFIG_HOME", config_home)
-            .env("BORG_HOME", borg_home)
-            .env("BORG_LIMITS", "0")
-            .env("BORG_TUI", "1")
-            .env("BORG_TUI_SCREEN", "alternate")
-            .env("BORG_TUI_FPS", "165")
-            .env("TERM", "xterm-256color")
-            .env("BORG_OPENAI_COMPATIBLE_BASE_URL", endpoint)
-            .env("BORG_OPENAI_COMPATIBLE_MODEL", "tui-stress-model")
-            .env("BORG_OPENAI_COMPATIBLE_API_KEY", "local-test")
-            .env("BORG_OPENAI_COMPATIBLE_CONTEXT_WINDOW_TOKENS", "1000000")
-            .env("RUST_LOG", "borg=debug")
             .stdin(Stdio::from(stdin))
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr));
@@ -428,8 +578,9 @@ impl PtyChild {
         Ok(Self {
             child,
             master,
-            log_path: borg_home.join("logs/borg.log"),
+            log_path,
             screen: VirtualScreen::new(PTY_ROWS, PTY_COLS),
+            stop_session_on_drop,
         })
     }
 
@@ -456,6 +607,25 @@ impl PtyChild {
         ))
     }
 
+    fn resize(&mut self, rows: usize, cols: usize) -> io::Result<()> {
+        let size = libc::winsize {
+            ws_row: rows as u16,
+            ws_col: cols as u16,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: ioctl only reads the winsize and updates this live PTY.
+        if unsafe { libc::ioctl(self.master.as_raw_fd(), libc::TIOCSWINSZ, &size) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        self.screen.resize(rows, cols);
+        // SAFETY: the child PID belongs to this harness and SIGWINCH is non-terminating.
+        if unsafe { libc::kill(self.child.id() as i32, libc::SIGWINCH) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     fn wait_for_pattern(&mut self, pattern: &[u8], timeout: Duration) -> io::Result<()> {
         let deadline = Instant::now() + timeout;
         let mut output = Vec::new();
@@ -477,6 +647,30 @@ impl PtyChild {
         Err(io::Error::new(
             io::ErrorKind::TimedOut,
             "Borg did not paint the active streaming screen",
+        ))
+    }
+
+    fn wait_for_screen_text(&mut self, pattern: &str, timeout: Duration) -> io::Result<()> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            self.read_available(None)?;
+            if self.screen.contains(pattern) {
+                return Ok(());
+            }
+            if let Some(status) = self.child.try_wait()? {
+                return Err(io::Error::other(format!(
+                    "Borg exited while waiting for {pattern}: {status}; screen={:?}",
+                    self.screen.text(),
+                )));
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "TUI did not paint {pattern}; screen={:?}",
+                self.screen.text()
+            ),
         ))
     }
 
@@ -566,7 +760,7 @@ impl PtyChild {
 
     fn wheel_and_measure(&mut self, expected: &str, timeout: Duration) -> io::Result<Duration> {
         let started = Instant::now();
-        self.write_all_retry(&mouse_wheel_sequence(64, 32, 10, 10))?;
+        self.write_all_retry(&mouse_wheel_sequence(64, 32, 1, 10))?;
         let deadline = started + timeout;
         while Instant::now() < deadline {
             self.read_available(None)?;
@@ -577,7 +771,10 @@ impl PtyChild {
         }
         Err(io::Error::new(
             io::ErrorKind::TimedOut,
-            format!("TUI did not scroll to {expected}"),
+            format!(
+                "TUI did not scroll to {expected}; screen={:?}",
+                self.screen.text()
+            ),
         ))
     }
 
@@ -684,6 +881,12 @@ impl VirtualScreen {
         for action in self.parser.parse_as_vec(bytes) {
             self.apply(action);
         }
+    }
+
+    fn resize(&mut self, rows: usize, cols: usize) {
+        self.cells = vec![vec![' '; cols]; rows];
+        self.row = 0;
+        self.col = 0;
     }
 
     fn contains(&self, text: &str) -> bool {
@@ -813,6 +1016,11 @@ impl VirtualScreen {
 
 impl Drop for PtyChild {
     fn drop(&mut self) {
+        if !self.stop_session_on_drop {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            return;
+        }
         let _ = self.write_all_retry(b"\x15\x03\x03");
         for _ in 0..20 {
             if self.child.try_wait().ok().flatten().is_some() {
