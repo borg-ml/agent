@@ -455,6 +455,35 @@ const fn default_max_processes() -> u32 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export)]
+pub struct ProviderUsageWindow {
+    pub label: String,
+    pub used_percent: u8,
+    pub resets_at: Option<DateTime<Utc>>,
+    /// Global windows block the whole provider when exhausted. Model-scoped
+    /// windows remain advisory because another model may still have capacity.
+    pub global: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum ProviderUsageAvailability {
+    Available,
+    Exhausted,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ProviderUsage {
+    pub availability: ProviderUsageAvailability,
+    #[serde(default)]
+    pub windows: Vec<ProviderUsageWindow>,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct ProviderCapability {
     pub provider: CodingProvider,
     pub installed: bool,
@@ -471,9 +500,14 @@ pub struct ProviderCapability {
     pub auth_methods: Vec<ProviderAuthMethod>,
     /// Whether the host can admit a child on this provider right now. This is
     /// stronger than `authenticated`: a provider CLI or endpoint may still be
-    /// missing even when credentials exist.
+    /// missing even when credentials exist, or a subscription lane may have
+    /// exhausted its current usage window.
     #[serde(default)]
     pub can_spawn: bool,
+    /// Secret-free account capacity metadata. `None` means the provider does
+    /// not expose a quota view or the probe was unavailable.
+    #[serde(default)]
+    pub usage: Option<ProviderUsage>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -823,17 +857,62 @@ pub fn provider_capabilities_prompt(capabilities: &[ProviderCapability]) -> Stri
         } else {
             format!("authenticated via {}", methods.join(" + "))
         };
+        let usage = capability.usage.as_ref().map(|usage| {
+            let availability = match usage.availability {
+                ProviderUsageAvailability::Available => "available",
+                ProviderUsageAvailability::Exhausted => "EXHAUSTED",
+                ProviderUsageAvailability::Unknown => "unknown",
+            };
+            let windows = usage
+                .windows
+                .iter()
+                .map(|window| {
+                    let left = 100_u8.saturating_sub(window.used_percent.min(100));
+                    match window.resets_at {
+                        Some(reset) => format!(
+                            "{} {left}% left (resets {})",
+                            window.label,
+                            reset.to_rfc3339()
+                        ),
+                        None => format!("{} {left}% left", window.label),
+                    }
+                })
+                .collect::<Vec<_>>();
+            if windows.is_empty() {
+                format!("usage {availability}")
+            } else {
+                format!("usage {availability}: {}", windows.join(", "))
+            }
+        });
         let status = if capability.can_spawn {
-            "READY"
+            if capability
+                .usage
+                .as_ref()
+                .is_some_and(|usage| usage.availability == ProviderUsageAvailability::Exhausted)
+            {
+                "READY (subscription exhausted; another authenticated route is available)"
+            } else {
+                "READY"
+            }
+        } else if capability
+            .usage
+            .as_ref()
+            .is_some_and(|usage| usage.availability == ProviderUsageAvailability::Exhausted)
+        {
+            "NOT READY (usage exhausted)"
         } else if capability.authenticated {
             "NOT READY (credential present, but the provider executable/endpoint is unavailable)"
         } else {
             "NOT READY (not authenticated/configured)"
         };
-        prompt.push_str(&format!("- {}: {status}; {mechanism}.\n", provider.label()));
+        prompt.push_str(&format!("- {}: {status}; {mechanism}", provider.label()));
+        if let Some(usage) = usage {
+            prompt.push_str(&format!("; {usage}"));
+        }
+        prompt.push_str(".\n");
     }
     prompt.push_str(
-        "Only use `spawn_agent` for a provider marked READY; it performs the same admission check and returns a clear remediation error otherwise. Use `get_provider_capabilities` for the complete structured snapshot.",
+        "Before cross-provider collaboration or consultation, call `get_provider_capabilities` for a fresh structured usage snapshot. Only use `spawn_agent`, `consult_peer`, or `consult_model` with a provider marked READY.",
     );
     prompt
 }
@@ -2587,6 +2666,16 @@ mod tests {
                 auth_detail: Some("Codex subscription authenticated".to_string()),
                 auth_methods: vec![ProviderAuthMethod::Subscription],
                 can_spawn: true,
+                usage: Some(ProviderUsage {
+                    availability: ProviderUsageAvailability::Available,
+                    windows: vec![ProviderUsageWindow {
+                        label: "Weekly".to_string(),
+                        used_percent: 48,
+                        resets_at: None,
+                        global: true,
+                    }],
+                    detail: None,
+                }),
             },
             ProviderCapability {
                 provider: CodingProvider::OpenRouter,
@@ -2596,12 +2685,35 @@ mod tests {
                 auth_detail: Some(format!("API key configured: {secret}")),
                 auth_methods: vec![ProviderAuthMethod::ApiKey],
                 can_spawn: true,
+                usage: None,
+            },
+            ProviderCapability {
+                provider: CodingProvider::Claude,
+                installed: true,
+                version: Some("test".to_string()),
+                authenticated: true,
+                auth_detail: Some("Claude subscription authenticated".to_string()),
+                auth_methods: vec![ProviderAuthMethod::Subscription],
+                can_spawn: false,
+                usage: Some(ProviderUsage {
+                    availability: ProviderUsageAvailability::Exhausted,
+                    windows: vec![ProviderUsageWindow {
+                        label: "5-hour".to_string(),
+                        used_percent: 100,
+                        resets_at: None,
+                        global: true,
+                    }],
+                    detail: Some("Claude subscription usage is exhausted".to_string()),
+                }),
             },
         ]);
         assert!(prompt.contains("Codex: READY"));
         assert!(prompt.contains("subscription"));
+        assert!(prompt.contains("Weekly 52% left"));
         assert!(prompt.contains("OpenRouter: READY"));
         assert!(prompt.contains("API key"));
+        assert!(prompt.contains("Claude: NOT READY (usage exhausted)"));
+        assert!(prompt.contains("5-hour 0% left"));
         assert!(!prompt.contains(secret));
     }
 }

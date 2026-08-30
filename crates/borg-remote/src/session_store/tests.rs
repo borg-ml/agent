@@ -474,6 +474,7 @@ async fn provider_capability_snapshot_is_durable_metadata_not_context() {
         auth_detail: Some("Codex subscription authenticated".to_string()),
         auth_methods: vec![crate::ProviderAuthMethod::Subscription],
         can_spawn: true,
+        usage: None,
     }];
     store
         .append(SessionEvent::new(

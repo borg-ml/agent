@@ -539,6 +539,7 @@ fn test_provider_capabilities() -> Vec<crate::ProviderCapability> {
         auth_detail: Some("test credentials".to_string()),
         auth_methods: vec![crate::ProviderAuthMethod::Subscription],
         can_spawn: true,
+        usage: None,
     })
     .collect()
 }

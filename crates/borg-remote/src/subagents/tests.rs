@@ -141,6 +141,7 @@ fn test_provider_capabilities() -> Vec<crate::ProviderCapability> {
         auth_detail: Some("test credentials".to_string()),
         auth_methods: vec![crate::ProviderAuthMethod::Subscription],
         can_spawn: true,
+        usage: None,
     })
     .collect()
 }
@@ -1526,6 +1527,58 @@ async fn subagent_admission_rejects_a_provider_without_host_authentication() {
         .to_string();
     assert!(error.contains("Claude cannot spawn"));
     assert!(error.contains("not authenticated"));
+}
+
+#[tokio::test]
+async fn subagent_admission_rejects_an_exhausted_subscription() {
+    let directory = tempdir().unwrap();
+    let root = Uuid::new_v4();
+    let store = Arc::new(
+        crate::SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
+            .await
+            .unwrap(),
+    );
+    store.create_session(root).await.unwrap();
+    let mut root_launch = launch();
+    let claude = root_launch
+        .capabilities
+        .provider_capabilities
+        .iter_mut()
+        .find(|capability| capability.provider == CodingProvider::Claude)
+        .unwrap();
+    claude.can_spawn = false;
+    claude.usage = Some(crate::ProviderUsage {
+        availability: crate::ProviderUsageAvailability::Exhausted,
+        windows: vec![crate::ProviderUsageWindow {
+            label: "5-hour".to_string(),
+            used_percent: 100,
+            resets_at: None,
+            global: true,
+        }],
+        detail: Some("Claude subscription usage is exhausted".to_string()),
+    });
+    let coordinator = SubagentCoordinator::new_with_store_and_executor(
+        directory.path(),
+        root,
+        root_launch,
+        2,
+        Arc::new(crate::LocalAgentTurnExecutor::default()),
+        store,
+    )
+    .unwrap();
+
+    let error = coordinator
+        .ensure_sidecar(
+            "claude",
+            CodingProvider::Claude,
+            Some("claude-opus-5".to_string()),
+            Some("high".to_string()),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("Claude cannot spawn"));
+    assert!(error.contains("usage is exhausted"));
 }
 
 #[tokio::test]

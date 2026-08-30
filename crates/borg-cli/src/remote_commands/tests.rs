@@ -2453,6 +2453,7 @@ fn usage_screen_keeps_account_limits_and_session_usage_distinct() {
         secondary: None,
     };
 
+    let limits = AccountRateLimits::Codex(limits);
     let summary = format_usage_summary(CodingProvider::Codex, &session, Some(&limits));
     assert!(summary.contains("Account limits · Codex"));
     assert!(summary.contains("Weekly"));
@@ -2468,4 +2469,23 @@ fn usage_screen_keeps_account_limits_and_session_usage_distinct() {
     assert!(!generic.contains("Codex"));
     assert!(generic.contains("No provider token usage was reported"));
     assert!(!generic.contains("Calls            0"));
+
+    let claude = AccountRateLimits::Claude(ClaudeAccountRateLimits {
+        subscription_type: Some("pro".to_string()),
+        rate_limits_available: true,
+        windows: vec![ClaudeRateLimitWindow {
+            label: "5-hour".to_string(),
+            used_percent: 100,
+            resets_at: None,
+            global: true,
+        }],
+        extra_usage_available: false,
+    });
+    let claude_summary = format_usage_summary(
+        CodingProvider::Claude,
+        &SessionUsage::default(),
+        Some(&claude),
+    );
+    assert!(claude_summary.contains("Account limits · Claude"));
+    assert!(claude_summary.contains("[░░░░░░░░░░░░░░░░░░░░] 0% left"));
 }

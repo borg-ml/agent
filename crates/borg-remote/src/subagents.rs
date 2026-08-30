@@ -1357,9 +1357,12 @@ impl AgentToolDispatcher {
             }
             "get_provider_capabilities" => {
                 let _: NoArgs = serde_json::from_value(arguments)?;
+                let providers =
+                    crate::host::refresh_provider_capability_usage(&self.provider_capabilities)
+                        .await;
                 Ok(json!({
-                    "providers": self.provider_capabilities,
-                    "instruction": "Only providers with can_spawn=true are eligible for subagent admission."
+                    "providers": providers,
+                    "instruction": "Check usage availability before cross-provider spawn or consultation. Only providers with can_spawn=true are eligible."
                 }))
             }
             "web_search" => {
@@ -5172,7 +5175,10 @@ fn validate_subagent_overrides(
     Ok(())
 }
 
-fn ensure_provider_can_spawn(launch: &LaunchSession, provider: CodingProvider) -> Result<()> {
+pub(crate) fn ensure_provider_can_spawn(
+    launch: &LaunchSession,
+    provider: CodingProvider,
+) -> Result<()> {
     let capability = launch
         .capabilities
         .provider_capabilities
@@ -5189,8 +5195,11 @@ fn ensure_provider_can_spawn(launch: &LaunchSession, provider: CodingProvider) -
         "{} cannot spawn on this host: {}",
         provider.label(),
         capability
-            .auth_detail
-            .as_deref()
+            .usage
+            .as_ref()
+            .filter(|usage| { usage.availability == crate::ProviderUsageAvailability::Exhausted })
+            .and_then(|usage| usage.detail.as_deref())
+            .or(capability.auth_detail.as_deref())
             .unwrap_or("no authenticated subscription, API key, or configured endpoint")
     );
     Ok(())
@@ -5476,7 +5485,7 @@ fn agent_tool_specs_with_capabilities_and_consultation_and_search(
         ),
         tool(
             "get_provider_capabilities",
-            "Read the host-local, secret-free authentication and admission snapshot. It distinguishes authenticated Codex/Claude subscriptions, configured API-key routes, and OpenAI-compatible endpoints. Only providers with can_spawn=true can be used for a child; never ask for or expose credentials.",
+            "Read a fresh host-local, secret-free authentication, usage, and admission snapshot before cross-provider collaboration or consultation. It distinguishes authenticated subscriptions, configured API-key routes, and exhausted usage windows. Only providers with can_spawn=true can be used; never ask for or expose credentials.",
             json!({
                 "type": "object",
                 "properties": {},

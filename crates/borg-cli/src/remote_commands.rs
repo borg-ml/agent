@@ -11,7 +11,8 @@ use std::sync::{
 
 use anyhow::{Context, Result, ensure};
 use borg_provider::provider::{
-    CodexAccountRateLimits, CodexRateLimitWindow, read_codex_account_rate_limits,
+    ClaudeAccountRateLimits, ClaudeRateLimitWindow, CodexAccountRateLimits, CodexRateLimitWindow,
+    read_claude_account_rate_limits, read_codex_account_rate_limits,
 };
 use borg_remote::{
     AgentTurnExecutor, ApprovalDecision, CodingProvider, EventActor, GoalAction, GoalStatus,
@@ -7004,28 +7005,39 @@ impl SessionUsage {
 }
 
 async fn usage_summary(provider: CodingProvider, session: &SessionUsage) -> String {
-    let limits = if provider == CodingProvider::Codex {
-        match read_codex_account_rate_limits().await {
-            Ok(limits) => Some(limits),
+    let limits = match provider {
+        CodingProvider::Codex => match read_codex_account_rate_limits().await {
+            Ok(limits) => Some(AccountRateLimits::Codex(limits)),
             Err(error) => {
                 tracing::debug!(%error, "Codex account limits unavailable for usage view");
                 None
             }
-        }
-    } else {
-        None
+        },
+        CodingProvider::Claude => match read_claude_account_rate_limits().await {
+            Ok(limits) => Some(AccountRateLimits::Claude(limits)),
+            Err(error) => {
+                tracing::debug!(%error, "Claude account limits unavailable for usage view");
+                None
+            }
+        },
+        _ => None,
     };
     format_usage_summary(provider, session, limits.as_ref())
+}
+
+enum AccountRateLimits {
+    Codex(CodexAccountRateLimits),
+    Claude(ClaudeAccountRateLimits),
 }
 
 fn format_usage_summary(
     provider: CodingProvider,
     session: &SessionUsage,
-    limits: Option<&CodexAccountRateLimits>,
+    limits: Option<&AccountRateLimits>,
 ) -> String {
     let mut lines = vec![format!("Account limits · {}", provider.label())];
-    if provider == CodingProvider::Codex {
-        if let Some(limits) = limits {
+    match (provider, limits) {
+        (CodingProvider::Codex, Some(AccountRateLimits::Codex(limits))) => {
             if let Some(plan) = limits.plan_type.as_deref() {
                 lines.push(format!("  {:<16} {}", "Plan", title_case(plan)));
             }
@@ -7040,15 +7052,40 @@ fn format_usage_summary(
             if limits.primary.is_none() && limits.secondary.is_none() {
                 lines.push("  No active account limit reported.".to_string());
             }
-        } else {
+        }
+        (CodingProvider::Claude, Some(AccountRateLimits::Claude(limits))) => {
+            if let Some(plan) = limits.subscription_type.as_deref() {
+                lines.push(format!("  {:<16} {}", "Plan", title_case(plan)));
+            }
+            if !limits.rate_limits_available {
+                lines.push(
+                    "  Unavailable      Plan limits do not apply to this account route."
+                        .to_string(),
+                );
+            } else if limits.windows.is_empty() {
+                lines.push("  No active account limit reported.".to_string());
+            } else {
+                for window in &limits.windows {
+                    append_claude_rate_limit_window(&mut lines, window);
+                }
+            }
+            if limits.extra_usage_available {
+                lines.push("  Extra usage      Available after plan limits.".to_string());
+            }
+        }
+        (CodingProvider::Codex, None) => {
             lines.push("  Unavailable      Could not read current account limits.".to_string());
             lines.push("  Details          https://chatgpt.com/codex/settings/usage".to_string());
         }
-    } else {
-        lines.push(format!(
-            "  Unavailable      Account limits are not exposed by {}.",
-            provider.label()
-        ));
+        (CodingProvider::Claude, None) => {
+            lines.push("  Unavailable      Could not read current account limits.".to_string());
+        }
+        _ => {
+            lines.push(format!(
+                "  Unavailable      Account limits are not exposed by {}.",
+                provider.label()
+            ));
+        }
     }
 
     lines.extend([String::new(), "Session".to_string()]);
@@ -7109,6 +7146,21 @@ fn append_rate_limit_window(lines: &mut Vec<String>, label: &str, window: &Codex
             "  {:<16} resets {}",
             "",
             reset.format("%H:%M on %d %b")
+        ));
+    }
+}
+
+fn append_claude_rate_limit_window(lines: &mut Vec<String>, window: &ClaudeRateLimitWindow) {
+    lines.push(format!(
+        "  {:<16} {}",
+        window.label,
+        rate_limit_bar(window.used_percent)
+    ));
+    if let Some(reset) = window.resets_at {
+        lines.push(format!(
+            "  {:<16} resets {}",
+            "",
+            reset.with_timezone(&Local).format("%H:%M on %d %b")
         ));
     }
 }

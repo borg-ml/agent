@@ -14,6 +14,7 @@ use crate::mcp::{
 use crate::runtime::ProviderCallUsage;
 use crate::{ProviderAuthBundle, ProviderAuthProvider, ProviderChannel};
 use anyhow::{Context, Result, bail};
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
@@ -416,6 +417,22 @@ pub struct CodexAccountRateLimits {
     pub secondary: Option<CodexRateLimitWindow>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaudeRateLimitWindow {
+    pub label: String,
+    pub used_percent: u8,
+    pub resets_at: Option<DateTime<Utc>>,
+    pub global: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaudeAccountRateLimits {
+    pub subscription_type: Option<String>,
+    pub rate_limits_available: bool,
+    pub windows: Vec<ClaudeRateLimitWindow>,
+    pub extra_usage_available: bool,
+}
+
 /// Read the authenticated Codex account limits through the same app-server
 /// protocol used for subscription turns. The command layer decides how to
 /// present an unavailable account view for other providers.
@@ -433,6 +450,178 @@ pub async fn read_codex_account_rate_limits() -> Result<CodexAccountRateLimits> 
         .await
         .context("timed out reading Codex account limits")?
     }
+}
+
+/// Read Claude's structured `/usage` data through the native CLI control
+/// protocol. This does not submit a model prompt or consume a model turn.
+pub async fn read_claude_account_rate_limits() -> Result<ClaudeAccountRateLimits> {
+    #[cfg(not(feature = "claude"))]
+    {
+        bail!("Claude account limits require the Claude subscription adapter")
+    }
+    #[cfg(feature = "claude")]
+    {
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            read_claude_account_rate_limits_inner(),
+        )
+        .await
+        .context("timed out reading Claude account limits")?
+    }
+}
+
+#[cfg(feature = "claude")]
+async fn read_claude_account_rate_limits_inner() -> Result<ClaudeAccountRateLimits> {
+    let mut command = Command::new("claude");
+    command
+        .args([
+            "--print",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--input-format",
+            "stream-json",
+            "--permission-mode",
+            "dontAsk",
+            "--tools",
+            "",
+            "--no-session-persistence",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let mut child = command
+        .spawn()
+        .context("failed to start Claude for account limits")?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .context("Claude usage stdin pipe missing")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("Claude usage stdout pipe missing")?;
+    let mut lines = BufReader::new(stdout).lines();
+    let init_id = format!("borg-usage-init-{}", uuid::Uuid::new_v4());
+    let usage_id = format!("borg-usage-read-{}", uuid::Uuid::new_v4());
+    write_claude_control_request(
+        &mut stdin,
+        &init_id,
+        serde_json::json!({"subtype": "initialize"}),
+    )
+    .await?;
+    write_claude_control_request(
+        &mut stdin,
+        &usage_id,
+        serde_json::json!({"subtype": "get_usage"}),
+    )
+    .await?;
+
+    let result = loop {
+        let line = lines
+            .next_line()
+            .await
+            .context("failed reading Claude account limits")?
+            .context("Claude exited before returning account limits")?;
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let Some(response) = value.get("response") else {
+            continue;
+        };
+        if response.get("request_id").and_then(Value::as_str) != Some(usage_id.as_str()) {
+            continue;
+        }
+        if response.get("subtype").and_then(Value::as_str) == Some("error") {
+            bail!(
+                "Claude account limits request failed: {}",
+                response
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown control error")
+            );
+        }
+        break parse_claude_account_rate_limits(response.get("response").unwrap_or(&Value::Null));
+    };
+    drop(lines);
+    drop(stdin);
+    child.start_kill().ok();
+    let _ = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
+    result
+}
+
+#[cfg(feature = "claude")]
+async fn write_claude_control_request(
+    stdin: &mut ChildStdin,
+    request_id: &str,
+    request: Value,
+) -> Result<()> {
+    let mut line = serde_json::to_vec(&serde_json::json!({
+        "type": "control_request",
+        "request_id": request_id,
+        "request": request,
+    }))?;
+    line.push(b'\n');
+    stdin
+        .write_all(&line)
+        .await
+        .context("failed to write Claude account limits request")?;
+    stdin
+        .flush()
+        .await
+        .context("failed to flush Claude account limits request")
+}
+
+fn parse_claude_account_rate_limits(value: &Value) -> Result<ClaudeAccountRateLimits> {
+    let rate_limits_available = value
+        .get("rate_limits_available")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let limits = value.get("rate_limits").filter(|value| value.is_object());
+    let mut windows = Vec::new();
+    for (key, label, global) in [
+        ("five_hour", "5-hour", true),
+        ("seven_day", "Weekly", true),
+        ("seven_day_opus", "Weekly · Opus", false),
+        ("seven_day_sonnet", "Weekly · Sonnet", false),
+    ] {
+        let Some(window) = limits.and_then(|limits| limits.get(key)) else {
+            continue;
+        };
+        let Some(used_percent) = window.get("utilization").and_then(Value::as_f64) else {
+            continue;
+        };
+        let resets_at = window
+            .get("resets_at")
+            .and_then(Value::as_str)
+            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+            .map(|value| value.with_timezone(&Utc));
+        windows.push(ClaudeRateLimitWindow {
+            label: label.to_string(),
+            used_percent: used_percent.clamp(0.0, 100.0).round() as u8,
+            resets_at,
+            global,
+        });
+    }
+    let extra_usage = limits.and_then(|limits| limits.get("extra_usage"));
+    let extra_usage_available = extra_usage
+        .and_then(|usage| usage.get("is_enabled"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        && !extra_usage
+            .and_then(|usage| usage.get("spend_limit_reached"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+    Ok(ClaudeAccountRateLimits {
+        subscription_type: value
+            .get("subscription_type")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        rate_limits_available,
+        windows,
+        extra_usage_available,
+    })
 }
 
 #[cfg(feature = "codex")]
@@ -3855,6 +4044,39 @@ mod tests {
                 .windows(2)
                 .any(|args| args[0] == "--permission-mode" && args[1] == "auto")
         );
+    }
+
+    #[test]
+    fn claude_account_rate_limits_parse_control_response_shape() {
+        let parsed = parse_claude_account_rate_limits(&serde_json::json!({
+            "subscription_type": "pro",
+            "rate_limits_available": true,
+            "rate_limits": {
+                "five_hour": {
+                    "utilization": 100,
+                    "resets_at": "2026-08-30T23:40:00Z"
+                },
+                "seven_day": {
+                    "utilization": 33.4,
+                    "resets_at": "2026-09-01T23:00:00Z"
+                },
+                "seven_day_opus": null,
+                "extra_usage": {
+                    "is_enabled": false,
+                    "spend_limit_reached": false
+                }
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(parsed.subscription_type.as_deref(), Some("pro"));
+        assert!(parsed.rate_limits_available);
+        assert_eq!(parsed.windows.len(), 2);
+        assert_eq!(parsed.windows[0].label, "5-hour");
+        assert_eq!(parsed.windows[0].used_percent, 100);
+        assert!(parsed.windows[0].global);
+        assert_eq!(parsed.windows[1].used_percent, 33);
+        assert!(!parsed.extra_usage_available);
     }
 
     #[test]
