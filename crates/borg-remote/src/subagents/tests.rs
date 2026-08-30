@@ -1274,6 +1274,87 @@ fn child_identity_is_stable_and_inherits_execution_context() {
 }
 
 #[tokio::test]
+async fn spawn_tool_reuses_a_compatible_ready_worker_for_a_new_task() {
+    let directory = tempdir().unwrap();
+    let root = Uuid::new_v4();
+    let store = Arc::new(
+        crate::SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
+            .await
+            .unwrap(),
+    );
+    store.create_session(root).await.unwrap();
+    let prompts = Arc::new(StdMutex::new(Vec::new()));
+    let executor = RecordingPeerExecutor {
+        prompts: Arc::clone(&prompts),
+    };
+    let mut root_launch = launch();
+    root_launch.capabilities.multiplayer = false;
+    root_launch.cwd = directory.path().to_path_buf();
+    let coordinator = SubagentCoordinator::new_with_store_and_executor(
+        directory.path(),
+        root,
+        root_launch,
+        1,
+        Arc::new(executor),
+        store,
+    )
+    .unwrap();
+
+    let first = coordinator
+        .call_tool(
+            "spawn_agent",
+            json!({
+                "task_name": "first_task",
+                "message": "Complete the first bounded task."
+            }),
+        )
+        .await
+        .unwrap();
+    let session_id = Uuid::parse_str(first["session_id"].as_str().unwrap()).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if coordinator.get(session_id).await.unwrap().status == SubagentStatus::Ready {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("first assignment should complete");
+
+    let second = coordinator
+        .call_tool(
+            "spawn_agent",
+            json!({
+                "task_name": "second_task",
+                "message": "Complete the second bounded task."
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second["reused"], true);
+    assert_eq!(second["assignment_task_name"], "/root/second_task");
+    assert_eq!(second["session_id"], session_id.to_string());
+    assert_eq!(coordinator.list(None).await.len(), 1);
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if prompts.lock().unwrap().len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("reused worker should receive the second assignment");
+    let prompts = prompts.lock().unwrap().clone();
+    assert!(prompts[0].contains("first bounded task"));
+    assert!(prompts[1].contains("second bounded task"));
+
+    coordinator.stop_all().await;
+}
+
+#[tokio::test]
 async fn ensuring_a_sidecar_reuses_one_idle_provider_session() {
     let directory = tempdir().unwrap();
     let root = Uuid::new_v4();

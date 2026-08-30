@@ -2263,6 +2263,10 @@ struct SubagentEntry {
     snapshot: SubagentSnapshot,
     commands: Option<mpsc::Sender<HostCommand>>,
     inbox: Vec<TeamInboxMessage>,
+    /// A delegation has selected this ready worker but its actor has not yet
+    /// projected the next status boundary. This closes the double-assignment
+    /// window without misreporting the durable lifecycle state.
+    assignment_claimed: bool,
     /// Restored children are metadata-only until an explicit child-directed
     /// action wakes them. This prevents resuming an idle root from silently
     /// starting providers in the background.
@@ -2313,6 +2317,7 @@ impl SubagentTable {
                 snapshot: snapshot.clone(),
                 commands: None,
                 inbox: Vec::new(),
+                assignment_claimed: false,
                 dormant: false,
             },
         );
@@ -2895,6 +2900,7 @@ impl SubagentCoordinator {
                         snapshot: snapshot.clone(),
                         commands: None,
                         inbox: Vec::new(),
+                        assignment_claimed: false,
                         dormant: !snapshot.status.is_terminal() && !recovery_failed,
                     },
                 );
@@ -2975,6 +2981,11 @@ impl SubagentCoordinator {
     }
 
     pub async fn spawn(&self, request: SpawnSubagent) -> Result<SubagentSnapshot> {
+        let launch = self.subagent_launch(&request)?;
+        self.spawn_with_launch(&request.task_name, launch).await
+    }
+
+    fn subagent_launch(&self, request: &SpawnSubagent) -> Result<LaunchSession> {
         let message = required_message(&request.message)?;
         let mut launch = self.root_launch.clone();
         launch.request_id = Uuid::new_v4();
@@ -2990,15 +3001,17 @@ impl SubagentCoordinator {
         if launch.provider != parent_provider {
             launch.model = request
                 .model
+                .clone()
                 .or_else(|| default_model_for_cross_provider_peer(launch.provider));
             launch.effort = request
                 .effort
+                .clone()
                 .or_else(|| default_effort_for_cross_provider_peer(launch.provider));
         } else {
             if request.model.is_some() {
-                launch.model = request.model;
+                launch.model = request.model.clone();
             }
-            launch.effort = effective_worker_effort(&launch, request.effort);
+            launch.effort = effective_worker_effort(&launch, request.effort.clone());
         }
         anyhow::ensure!(
             !launch.provider.uses_native_harness() || launch.model.is_some(),
@@ -3006,14 +3019,93 @@ impl SubagentCoordinator {
             launch.provider
         );
         launch.name = Some(canonical_task_name(&request.task_name)?);
+        Ok(launch)
+    }
 
-        let snapshot = self
-            .table
-            .lock()
-            .await
-            .reserve(&request.task_name, &launch)?;
+    async fn spawn_with_launch(
+        &self,
+        task_name: &str,
+        launch: LaunchSession,
+    ) -> Result<SubagentSnapshot> {
+        let snapshot = self.table.lock().await.reserve(task_name, &launch)?;
         self.start_reserved(snapshot.clone(), launch, true).await?;
         Ok(snapshot)
+    }
+
+    async fn assign_task_as(
+        &self,
+        actor_session_id: Uuid,
+        request: SpawnSubagent,
+    ) -> Result<Value> {
+        let launch = self.subagent_launch(&request)?;
+        let assignment_name = launch
+            .name
+            .as_deref()
+            .expect("subagent launch has a canonical task name")
+            .to_string();
+        let claimed = {
+            let mut table = self.table.lock().await;
+            anyhow::ensure!(
+                !table.task_names.contains_key(&assignment_name),
+                "subagent task name already exists: {assignment_name}"
+            );
+            table
+                .entries
+                .values_mut()
+                .filter(|entry| {
+                    entry.snapshot.status == SubagentStatus::Ready
+                        && !entry.assignment_claimed
+                        && !is_persistent_peer_lane(&entry.snapshot.task_name)
+                        && entry.snapshot.provider == launch.provider
+                        && entry.snapshot.model == launch.model
+                        && entry.snapshot.effort == launch.effort
+                })
+                .min_by_key(|entry| entry.snapshot.updated_at)
+                .map(|entry| {
+                    entry.assignment_claimed = true;
+                    entry.snapshot.updated_at = Utc::now();
+                    entry.snapshot.detail = Some(format!("Assigned new task {assignment_name}"));
+                    entry.snapshot.clone()
+                })
+        };
+
+        if let Some(claimed) = claimed {
+            let target = format!("session:{}", claimed.session_id);
+            if let Err(error) = self
+                .route_followup_task_with_options_as(
+                    actor_session_id,
+                    &target,
+                    launch
+                        .initial_prompt
+                        .as_deref()
+                        .expect("subagent launch has an initial prompt"),
+                    TeamMessageOptions::default(),
+                )
+                .await
+            {
+                let mut table = self.table.lock().await;
+                if let Some(entry) = table.entries.get_mut(&claimed.session_id)
+                    && entry.assignment_claimed
+                {
+                    entry.assignment_claimed = false;
+                    entry.snapshot.updated_at = Utc::now();
+                    entry.snapshot.detail =
+                        Some(format!("Automatic task assignment failed: {error:#}"));
+                }
+                return Err(error);
+            }
+            let mut value =
+                serde_json::to_value(self.get(claimed.session_id).await.unwrap_or(claimed))?;
+            value["reused"] = Value::Bool(true);
+            value["assignment_task_name"] = Value::String(assignment_name);
+            return Ok(value);
+        }
+
+        let agent = self.spawn_with_launch(&request.task_name, launch).await?;
+        let mut value = serde_json::to_value(agent)?;
+        value["reused"] = Value::Bool(false);
+        value["assignment_task_name"] = Value::String(assignment_name);
+        Ok(value)
     }
 
     /// Return the durable child for a provider-specific sidecar, creating it
@@ -4666,16 +4758,17 @@ impl SubagentCoordinator {
         match name {
             "spawn_agent" => {
                 let args: SpawnAgentArgs = serde_json::from_value(arguments)?;
-                let agent = self
-                    .spawn(SpawnSubagent {
+                self.assign_task_as(
+                    actor_session_id,
+                    SpawnSubagent {
                         task_name: args.task_name,
                         message: args.message,
                         provider: args.provider,
                         model: args.model,
                         effort: args.reasoning_effort,
-                    })
-                    .await?;
-                Ok(serde_json::to_value(agent)?)
+                    },
+                )
+                .await
             }
             "list_agents" => {
                 let args: ListAgentsArgs = serde_json::from_value(arguments)?;
@@ -4793,6 +4886,10 @@ fn persistent_peer_lane(provider: CodingProvider) -> (&'static str, &'static str
         CodingProvider::Codex => ("gpt", "GPT"),
         _ => unreachable!("persistent peer profile is restricted to GPT and Claude"),
     }
+}
+
+fn is_persistent_peer_lane(task_name: &str) -> bool {
+    matches!(task_name, "/root/claude" | "/root/gpt")
 }
 
 fn resolve_persistent_peer_profile(
@@ -5013,9 +5110,11 @@ fn subagent_tool_description(provider: CodingProvider) -> String {
             )
         });
     format!(
-        "Spawn an isolated child Borg session for a concrete, bounded task. \
-         Omit provider, model, and reasoning_effort to inherit the parent. {inheritance} \
-         All catalog-backed subagent choices are also available explicitly: {}",
+        "Delegate a concrete, bounded task. Borg atomically reuses a compatible idle worker \
+         when one is available and otherwise spawns an isolated child session; do not list \
+         agents or issue follow-up calls just to manage worker capacity. Omit provider, model, \
+         and reasoning_effort to inherit the parent. {inheritance} All catalog-backed subagent \
+         choices are also available explicitly: {}",
         subagent_model_override_description()
     )
 }
@@ -6516,6 +6615,7 @@ async fn update_from_session_event(
     };
     match &event.kind {
         SessionEventKind::StatusChanged { status, detail } => {
+            entry.assignment_claimed = false;
             entry.snapshot.status = match status {
                 SessionStatus::Starting => SubagentStatus::Starting,
                 SessionStatus::Running => SubagentStatus::Running,

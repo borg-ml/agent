@@ -472,7 +472,7 @@ pub fn tool_call_summary(name: &str, input: &Value) -> (String, String) {
         let provider = string_field(input, "provider")
             .map(|provider| format!(" · {provider}"))
             .unwrap_or_default();
-        return ("Spawn agent".to_string(), format!("{task}{provider}"));
+        return ("Delegate task".to_string(), format!("{task}{provider}"));
     }
 
     if tool == "list_agents" {
