@@ -1,7 +1,9 @@
 use std::io;
 use std::time::Duration;
 
-use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, MouseEvent, MouseEventKind};
+use crossterm::event::{
+    Event, EventStream, KeyCode, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+};
 use futures_util::{Stream, StreamExt};
 
 const PRIORITY_EVENT_CHANNEL_CAPACITY: usize = 64;
@@ -35,6 +37,30 @@ impl TerminalInputEvent {
     pub fn is_keyboard_input(&self) -> bool {
         matches!(&self.event, Event::Paste(_))
             || matches!(&self.event, Event::Key(key) if key.kind != KeyEventKind::Release)
+    }
+
+    pub fn is_interaction_input(&self) -> bool {
+        self.is_keyboard_input() || matches!(&self.event, Event::Mouse(_))
+    }
+
+    pub fn may_change_transcript_view(&self) -> bool {
+        match &self.event {
+            Event::Mouse(mouse) => !matches!(mouse.kind, MouseEventKind::Moved),
+            Event::Key(key) if key.kind != KeyEventKind::Release => {
+                key.modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                    || matches!(
+                        key.code,
+                        KeyCode::Enter
+                            | KeyCode::Esc
+                            | KeyCode::Tab
+                            | KeyCode::BackTab
+                            | KeyCode::PageUp
+                            | KeyCode::PageDown
+                    )
+            }
+            _ => false,
+        }
     }
 }
 
@@ -445,6 +471,59 @@ mod tests {
         release.kind = KeyEventKind::Release;
         assert!(!TerminalInputEvent::single(Event::Key(release)).is_keyboard_input());
         assert!(!TerminalInputEvent::single(Event::Resize(80, 24)).is_keyboard_input());
+    }
+
+    #[test]
+    fn interaction_input_includes_hover_click_drag_and_wheel() {
+        for kind in [
+            MouseEventKind::Moved,
+            MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            MouseEventKind::ScrollDown,
+        ] {
+            assert!(
+                TerminalInputEvent::single(Event::Mouse(wheel_mouse(kind))).is_interaction_input()
+            );
+        }
+        assert!(
+            TerminalInputEvent::single(Event::Key(KeyEvent::new(
+                KeyCode::Char('x'),
+                KeyModifiers::NONE,
+            )))
+            .is_interaction_input()
+        );
+        assert!(!TerminalInputEvent::single(Event::Resize(80, 24)).is_interaction_input());
+    }
+
+    #[test]
+    fn passive_hover_and_text_input_do_not_request_transcript_reflow() {
+        assert!(
+            !TerminalInputEvent::single(Event::Mouse(wheel_mouse(MouseEventKind::Moved)))
+                .may_change_transcript_view()
+        );
+        assert!(
+            !TerminalInputEvent::single(Event::Key(KeyEvent::new(
+                KeyCode::Char('x'),
+                KeyModifiers::NONE,
+            )))
+            .may_change_transcript_view()
+        );
+        for kind in [
+            MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            MouseEventKind::ScrollDown,
+        ] {
+            assert!(
+                TerminalInputEvent::single(Event::Mouse(wheel_mouse(kind)))
+                    .may_change_transcript_view()
+            );
+        }
+        assert!(
+            TerminalInputEvent::single(Event::Key(
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE,)
+            ))
+            .may_change_transcript_view()
+        );
     }
 
     #[tokio::test]

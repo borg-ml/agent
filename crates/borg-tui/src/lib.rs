@@ -2919,7 +2919,6 @@ impl BorgTerminal {
         self.transcript_render_cache = None;
         self.transcript_full_render_cache = None;
         self.active_transcript_render = None;
-        self.last_committed_viewport_render = None;
         self.text_selection = None;
         self.composer_selection = None;
         self.pending_transcript_click = None;
@@ -2952,7 +2951,6 @@ impl BorgTerminal {
         self.hovered_tool_run_header = None;
         self.transcript_render_cache = None;
         self.transcript_full_render_cache = None;
-        self.last_committed_viewport_render = None;
         self.transcript.tool_payloads(index)
     }
 
@@ -2968,7 +2966,6 @@ impl BorgTerminal {
         self.hovered_tool = None;
         self.transcript_render_cache = None;
         self.transcript_full_render_cache = None;
-        self.last_committed_viewport_render = None;
     }
 
     fn clear_background_hover(&mut self) {
@@ -5021,6 +5018,13 @@ impl BorgTerminal {
         self.draw_internal(true)
     }
 
+    /// Paint interaction feedback without laying out transcript history.
+    /// After the first committed frame this path is bounded by the visible
+    /// terminal surface, even while newer transcript content awaits reflow.
+    pub fn draw_for_interaction(&mut self) -> Result<()> {
+        self.draw_internal(true)
+    }
+
     /// Draw activity animation from the last committed transcript viewport.
     /// Session events still use [`Self::draw`] so new transcript content is
     /// committed before subsequent animation frames reuse it.
@@ -5071,22 +5075,6 @@ impl BorgTerminal {
         let committed_viewport_render = if input_fast_path {
             self.last_committed_viewport_render
                 .as_ref()
-                .filter(
-                    |(
-                        cached_width,
-                        cached_tool_run_viewport_height,
-                        cached_goal_tick,
-                        _,
-                        cached_date,
-                        render,
-                    )| {
-                        *cached_width <= full_transcript_width
-                            && *cached_tool_run_viewport_height == tool_run_viewport_height
-                            && *cached_date == local_date
-                            && *cached_goal_tick == goal_tick
-                            && tool_elapsed_widths_match(&render.7, &current_tool_elapsed)
-                    },
-                )
                 .map(|(_, _, _, _, _, render)| Arc::clone(render))
         } else {
             None
@@ -5114,14 +5102,15 @@ impl BorgTerminal {
         } else {
             None
         };
-        let full_transcript_render = if let Some(index) = self.focused_tool {
-            Arc::new(self.transcript.render_tool_for_cache(
-                index,
-                full_transcript_width,
-                tool_run_viewport_height,
-            ))
-        } else {
+        let full_transcript_render =
             select_transcript_snapshot(input_fast_path, committed_viewport_render, || {
+                if let Some(index) = self.focused_tool {
+                    return Arc::new(self.transcript.render_tool_for_cache(
+                        index,
+                        full_transcript_width,
+                        tool_run_viewport_height,
+                    ));
+                }
                 stale_full_transcript_render.unwrap_or_else(|| {
                     if self.transcript_render_cache.is_some() {
                         cached_transcript_render(
@@ -5148,8 +5137,7 @@ impl BorgTerminal {
                         )
                     }
                 })
-            })
-        };
+            });
         let queued_prompts = self.active_queued_prompts().to_vec();
         // Keep the first draft anchored in the splash composition area. Moving
         // it to the chat footer on the first keystroke makes the whole screen

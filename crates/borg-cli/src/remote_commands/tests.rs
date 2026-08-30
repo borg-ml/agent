@@ -62,12 +62,11 @@ fn resume_retry_delay_is_capped_to_avoid_a_reconnect_storm() {
 }
 
 #[test]
-fn input_fast_path_waits_for_a_pending_transcript_frame() {
-    assert!(should_draw_input_fast_path(true, true, true, false, true));
-    assert!(!should_draw_input_fast_path(true, true, true, true, true));
-    assert!(!should_draw_input_fast_path(true, false, true, false, true));
-    assert!(!should_draw_input_fast_path(true, true, false, false, true));
-    assert!(!should_draw_input_fast_path(false, true, true, false, true));
+fn interaction_fast_path_does_not_wait_for_transcript_reflow() {
+    assert!(should_draw_interaction_fast_path(true, true, true));
+    assert!(!should_draw_interaction_fast_path(true, false, true));
+    assert!(!should_draw_interaction_fast_path(false, true, true));
+    assert!(!should_draw_interaction_fast_path(true, true, false));
 }
 
 #[test]
@@ -1787,28 +1786,28 @@ fn tui_frame_interval_preserves_supported_high_refresh_and_caps_extremes() {
 #[test]
 fn expensive_draws_leave_time_for_input_and_animation_events() {
     assert_eq!(
-        responsive_tui_frame_interval(165, std::time::Duration::from_millis(5), false, false),
+        responsive_tui_frame_interval(165, std::time::Duration::from_millis(5), false),
         std::time::Duration::from_millis(15)
     );
     assert_eq!(
-        responsive_tui_frame_interval(60, std::time::Duration::from_millis(40), false, false),
+        responsive_tui_frame_interval(60, std::time::Duration::from_millis(40), false),
         std::time::Duration::from_millis(120)
     );
     assert_eq!(
-        responsive_tui_frame_interval(60, std::time::Duration::ZERO, false, false),
+        responsive_tui_frame_interval(60, std::time::Duration::ZERO, false),
         tui_frame_interval(60)
     );
     assert_eq!(
-        responsive_tui_frame_interval(60, std::time::Duration::from_millis(40), true, false),
+        responsive_tui_frame_interval(60, std::time::Duration::from_millis(40), true),
         std::time::Duration::from_millis(40)
     );
     assert_eq!(
-        responsive_tui_frame_interval(60, std::time::Duration::from_millis(500), false, false),
+        responsive_tui_frame_interval(60, std::time::Duration::from_millis(500), false),
         MAX_RENDER_BACKOFF_INTERVAL
     );
     assert_eq!(
-        responsive_tui_frame_interval(60, std::time::Duration::from_millis(500), false, true),
-        ACTIVITY_FRAME_INTERVAL
+        responsive_tui_frame_interval(60, std::time::Duration::from_millis(500), false),
+        MAX_RENDER_BACKOFF_INTERVAL
     );
 }
 

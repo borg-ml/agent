@@ -2071,16 +2071,10 @@ async fn run_local_agent_session(
                 }
                 let draw_started = std::time::Instant::now();
                 terminal.draw()?;
-                let activity_frame = terminal_needs_activity_tick(status)
-                    || terminal.has_running_tool()
-                    || terminal.has_active_subagents()
-                    || terminal.has_active_splash_animation()
-                    || terminal.is_history_page_loading();
                 let next_interval = responsive_tui_frame_interval(
                     tui_fps,
                     draw_started.elapsed(),
                     interaction_frame,
-                    activity_frame,
                 );
                 if next_interval != render_frame_interval {
                     render_frame_interval = next_interval;
@@ -2094,17 +2088,16 @@ async fn run_local_agent_session(
                     || terminal.has_active_subagents()
                     || terminal.has_active_splash_animation()
                     || terminal.is_history_page_loading()
+                    || terminal.has_pending_scroll_frame()
             }) => {
-                if !terminal_dirty
-                    && !tool_started_frame_hold_until
-                        .is_some_and(|until| tokio::time::Instant::now() < until)
+                if !tool_started_frame_hold_until
+                    .is_some_and(|until| tokio::time::Instant::now() < until)
                 {
-                    terminal
-                        .as_mut()
-                        .expect("terminal")
-                        .draw_for_activity()?;
-                } else {
-                    terminal_dirty = true;
+                    let terminal = terminal.as_mut().expect("terminal");
+                    if terminal.has_pending_scroll_frame() {
+                        terminal.advance_scroll_frame();
+                    }
+                    terminal.draw_for_activity()?;
                 }
             }
             _ = idle_tick.tick(), if terminal.as_ref().is_some_and(|terminal| {
@@ -2113,16 +2106,13 @@ async fn run_local_agent_session(
                     terminal.has_blinking_cursor(),
                 )
             }) => {
-                if !terminal_dirty
-                    && !tool_started_frame_hold_until
-                        .is_some_and(|until| tokio::time::Instant::now() < until)
+                if !tool_started_frame_hold_until
+                    .is_some_and(|until| tokio::time::Instant::now() < until)
                 {
                     terminal
                         .as_mut()
                         .expect("terminal")
                         .draw_for_activity()?;
-                } else {
-                    terminal_dirty = true;
                 }
             }
             _ = cache_tick.tick(), if terminal.as_ref().is_some_and(
@@ -2513,11 +2503,25 @@ async fn run_local_agent_session(
                         history.push(event.clone());
                     }
                     if terminal_dirty && session_event_needs_immediate_frame(&event.kind) {
-                        terminal.draw()?;
-                        terminal_dirty = terminal.has_pending_scroll_frame();
-                        tool_started_frame_hold_until = Some(
-                            tokio::time::Instant::now() + TOOL_STARTED_FRAME_MIN_DURATION,
-                        );
+                        if render_frame_interval <= ACTIVITY_FRAME_INTERVAL {
+                            let draw_started = std::time::Instant::now();
+                            terminal.draw()?;
+                            let next_interval = responsive_tui_frame_interval(
+                                tui_fps,
+                                draw_started.elapsed(),
+                                false,
+                            );
+                            if next_interval != render_frame_interval {
+                                render_frame_interval = next_interval;
+                                render_tick = tui_render_interval(render_frame_interval);
+                            }
+                            terminal_dirty = terminal.has_pending_scroll_frame();
+                            tool_started_frame_hold_until = Some(
+                                tokio::time::Instant::now() + TOOL_STARTED_FRAME_MIN_DURATION,
+                            );
+                        } else {
+                            terminal.draw_for_activity()?;
+                        }
                     }
                 } else if !detached_from_terminal {
                     render_event(&event, args.json, args.print, &mut rendered)?;
@@ -3229,44 +3233,34 @@ async fn run_local_agent_session(
                         }
                     }
                 }
-                let input_is_keyboard = terminal_event.is_keyboard_input();
+                let input_is_interaction = terminal_event.is_interaction_input();
+                let interaction_may_change_transcript =
+                    terminal_event.may_change_transcript_view();
                 let terminal_dirty_before_input = terminal_dirty;
-                let scroll_was_active = terminal
-                    .as_ref()
-                    .expect("terminal")
-                    .has_pending_scroll_frame();
                 let action = terminal.as_mut().expect("terminal").handle_event(terminal_event)?;
-                let scroll_is_active = terminal
-                    .as_ref()
-                    .expect("terminal")
-                    .has_pending_scroll_frame();
-                if scroll_is_active && !scroll_was_active {
-                    render_frame_interval = tui_frame_interval(tui_fps);
-                    render_tick = tui_render_interval(render_frame_interval);
-                }
+                let action_is_none = matches!(&action, UiAction::None);
                 let event_redraw_needed = terminal
                     .as_mut()
                     .expect("terminal")
                     .take_event_redraw_needed();
                 terminal_dirty |= event_redraw_needed;
-                if should_draw_input_fast_path(
-                    input_is_keyboard,
+                if should_draw_interaction_fast_path(
+                    input_is_interaction,
                     event_redraw_needed,
-                    matches!(&action, UiAction::None),
-                    terminal_dirty_before_input,
                     !terminal.as_ref().expect("terminal").is_launch_screen(),
                 ) {
-                    terminal
-                        .as_mut()
-                        .expect("terminal")
-                        .draw_for_input()?;
-                    terminal_dirty = terminal_dirty_before_input
-                        || terminal
-                            .as_ref()
-                            .expect("terminal")
-                            .has_pending_scroll_frame();
+                    let terminal = terminal.as_mut().expect("terminal");
+                    if terminal.has_pending_scroll_frame() {
+                        terminal.advance_scroll_frame();
+                    }
+                    terminal.draw_for_interaction()?;
+                    if action_is_none {
+                        terminal_dirty = terminal_dirty_before_input
+                            || interaction_may_change_transcript
+                            || terminal.has_pending_scroll_frame();
+                    }
                 }
-                if matches!(&action, UiAction::None)
+                if action_is_none
                     && event_redraw_needed
                     && terminal.as_ref().expect("terminal").is_launch_screen()
                 {
@@ -3290,8 +3284,8 @@ async fn run_local_agent_session(
                             status = SessionStatus::Starting;
                             sleep_inhibitor.set_turn_active(true);
                         }
-                        terminal.draw()?;
-                        terminal_dirty = terminal.has_pending_scroll_frame();
+                        terminal.draw_for_interaction()?;
+                        terminal_dirty = true;
                         if !dispatch_host_command_without_blocking(
                             &session_command_tx,
                             HostCommand::Goal {
@@ -3373,8 +3367,8 @@ async fn run_local_agent_session(
                                 terminal.set_notice(format!(
                                     "Could not durably send the pending input: {error:#}"
                                 ));
-                                terminal.draw()?;
-                                terminal_dirty = false;
+                                terminal.draw_for_interaction()?;
+                                terminal_dirty = true;
                             } else {
                                 pending_prompt_ids.insert(message_id);
                                 let command = target.map_or_else(
@@ -3954,12 +3948,12 @@ async fn run_local_agent_session(
                                         terminal.set_notice(format!(
                                             "Could not durably queue the prompt: {error:#}"
                                         ));
-                                        terminal.draw()?;
-                                        terminal_dirty = false;
+                                        terminal.draw_for_interaction()?;
+                                        terminal_dirty = true;
                                         continue;
                                     }
-                                    terminal.draw()?;
-                                    terminal_dirty = terminal.has_pending_scroll_frame();
+                                    terminal.draw_for_interaction()?;
+                                    terminal_dirty = true;
                                     let command = director_prompt_host_command(
                                         session_id,
                                         message_id,
@@ -3973,8 +3967,8 @@ async fn run_local_agent_session(
                                             "Prompt saved durably · waiting for the director thread to reconnect"
                                                 .to_string(),
                                         );
-                                        terminal.draw()?;
-                                        terminal_dirty = false;
+                                        terminal.draw_for_interaction()?;
+                                        terminal_dirty = true;
                                     }
                                 }
                                 Err(error) => {
@@ -4056,8 +4050,8 @@ async fn run_local_agent_session(
                             terminal.set_notice(format!(
                                 "Could not durably queue the prompt: {error:#}"
                             ));
-                            terminal.draw()?;
-                            terminal_dirty = false;
+                            terminal.draw_for_interaction()?;
+                            terminal_dirty = true;
                             continue;
                         }
                         pending_prompt_ids.insert(message_id);
@@ -4067,8 +4061,8 @@ async fn run_local_agent_session(
                                 "Prompt saved durably · waiting for the session coordinator to reconnect"
                                     .to_string(),
                             );
-                            terminal.draw()?;
-                            terminal_dirty = false;
+                            terminal.draw_for_interaction()?;
+                            terminal_dirty = true;
                         }
                     }
                     UiAction::Submit {
@@ -4135,12 +4129,12 @@ async fn run_local_agent_session(
                                             status = SessionStatus::Ready;
                                             sleep_inhibitor.set_turn_active(false);
                                         }
-                                        terminal.draw()?;
-                                        terminal_dirty = false;
+                                        terminal.draw_for_interaction()?;
+                                        terminal_dirty = true;
                                         continue;
                                     }
-                                    terminal.draw()?;
-                                    terminal_dirty = terminal.has_pending_scroll_frame();
+                                    terminal.draw_for_interaction()?;
+                                    terminal_dirty = true;
                                     let command = director_prompt_host_command(
                                         session_id,
                                         message_id,
@@ -4154,8 +4148,8 @@ async fn run_local_agent_session(
                                             "Prompt saved durably · waiting for the director thread to reconnect"
                                                 .to_string(),
                                         );
-                                        terminal.draw()?;
-                                        terminal_dirty = false;
+                                        terminal.draw_for_interaction()?;
+                                        terminal_dirty = true;
                                     }
                                 }
                                 Err(error) => {
@@ -4232,8 +4226,8 @@ async fn run_local_agent_session(
                                 terminal.set_notice(format!(
                                     "Could not durably send the prompt: {error:#}"
                                 ));
-                                terminal.draw()?;
-                                terminal_dirty = false;
+                                terminal.draw_for_interaction()?;
+                                terminal_dirty = true;
                                 continue;
                             }
                             let command = HostCommand::Subagent {
@@ -4254,8 +4248,8 @@ async fn run_local_agent_session(
                                     "Prompt saved durably · waiting for the session coordinator to reconnect"
                                         .to_string(),
                                 );
-                                terminal.draw()?;
-                                terminal_dirty = false;
+                                terminal.draw_for_interaction()?;
+                                terminal_dirty = true;
                             }
                             continue;
                         }
@@ -4784,8 +4778,8 @@ async fn run_local_agent_session(
                                             status = SessionStatus::Starting;
                                             sleep_inhibitor.set_turn_active(true);
                                         }
-                                        terminal.draw()?;
-                                        terminal_dirty = terminal.has_pending_scroll_frame();
+                                        terminal.draw_for_interaction()?;
+                                        terminal_dirty = true;
                                     }
                                     if !dispatch_host_command_without_blocking(
                                         &session_command_tx,
@@ -5173,8 +5167,8 @@ async fn run_local_agent_session(
                                                 status = SessionStatus::Ready;
                                                 sleep_inhibitor.set_turn_active(false);
                                             }
-                                            terminal.draw()?;
-                                            terminal_dirty = false;
+                                            terminal.draw_for_interaction()?;
+                                            terminal_dirty = true;
                                             continue;
                                         }
                                         pending_prompt_ids.insert(message_id);
@@ -5191,8 +5185,8 @@ async fn run_local_agent_session(
                                                 "Prompt saved durably · waiting for the session actor to reconnect"
                                                     .to_string(),
                                             );
-                                            terminal.draw()?;
-                                            terminal_dirty = false;
+                                            terminal.draw_for_interaction()?;
+                                            terminal_dirty = true;
                                         }
                                     }
                                 }
@@ -5200,8 +5194,11 @@ async fn run_local_agent_session(
                         }
                     }
                 }
-                if let Some(terminal) = terminal.as_mut() {
-                    terminal.draw()?;
+                if !action_is_none
+                    && let Some(terminal) = terminal.as_mut()
+                {
+                    terminal.draw_for_interaction()?;
+                    terminal_dirty = true;
                 }
             }
             command = remote_commands.recv(), if remote_open => {
@@ -6400,20 +6397,14 @@ fn responsive_tui_frame_interval(
     fps: u64,
     last_draw: std::time::Duration,
     interaction_frame: bool,
-    activity_frame: bool,
 ) -> std::time::Duration {
-    let max_interval = if activity_frame {
-        ACTIVITY_FRAME_INTERVAL
-    } else {
-        MAX_RENDER_BACKOFF_INTERVAL
-    };
     tui_frame_interval(fps)
         .max(if interaction_frame {
             last_draw
         } else {
             last_draw.saturating_mul(3)
         })
-        .min(max_interval)
+        .min(MAX_RENDER_BACKOFF_INTERVAL)
 }
 
 fn parse_on_off(value: &str) -> Option<bool> {
@@ -6538,18 +6529,12 @@ fn session_event_needs_immediate_frame(kind: &SessionEventKind) -> bool {
     ) || matches!(kind, SessionEventKind::ProviderEvent { kind, .. } if kind == "tool_call_started")
 }
 
-fn should_draw_input_fast_path(
-    input_is_keyboard: bool,
+fn should_draw_interaction_fast_path(
+    input_is_interaction: bool,
     event_redraw_needed: bool,
-    action_is_none: bool,
-    transcript_dirty: bool,
     not_launch_screen: bool,
 ) -> bool {
-    input_is_keyboard
-        && event_redraw_needed
-        && action_is_none
-        && !transcript_dirty
-        && not_launch_screen
+    input_is_interaction && event_redraw_needed && not_launch_screen
 }
 
 fn spawn_terminal_input() -> mpsc::Receiver<io::Result<String>> {
