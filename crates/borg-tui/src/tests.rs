@@ -1764,7 +1764,7 @@ fn action_preparation_completes_when_the_start_event_is_missing() {
 }
 
 #[test]
-fn action_preparation_does_not_orphan_an_already_running_tool() {
+fn late_completion_does_not_consume_new_action_preparation() {
     let session_id = Uuid::new_v4();
     let mut transcript = Transcript::default();
     transcript.apply(&SessionEvent::new(
@@ -1790,6 +1790,15 @@ fn action_preparation_does_not_orphan_an_already_running_tool() {
     transcript.apply(&SessionEvent::new(
         session_id,
         3,
+        SessionEventKind::ToolUpdated {
+            tool_call_id: "command-1".to_string(),
+            name: "exec_command".to_string(),
+            input: serde_json::json!({"cmd": "cargo test"}),
+        },
+    ));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        4,
         SessionEventKind::ToolCompleted {
             tool_call_id: "command-1".to_string(),
             output: "done".to_string(),
@@ -1800,15 +1809,56 @@ fn action_preparation_does_not_orphan_an_already_running_tool() {
         },
     ));
 
-    assert_eq!(transcript.order.len(), 1);
-    assert_eq!(transcript.shell_status(), None);
-    assert!(!transcript.has_running_tool());
-    assert!(
-        transcript
-            .lines(100)
-            .iter()
-            .any(|line| line.to_string().contains("Ran"))
-    );
+    assert_eq!(transcript.order.len(), 2);
+    assert!(matches!(
+        transcript.order.first(),
+        Some(TranscriptEntry::Tool { complete: true, .. })
+    ));
+    assert!(matches!(
+        transcript.order.get(1),
+        Some(TranscriptEntry::Tool {
+            source_name,
+            complete: false,
+            ..
+        }) if source_name == "action_preparing"
+    ));
+    assert!(transcript.has_running_tool());
+    let rendered = transcript
+        .lines(100)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("Ran"), "{rendered}");
+    assert!(rendered.contains("Preparing next action"), "{rendered}");
+}
+
+#[test]
+fn consecutive_action_preparations_remain_distinct_and_ordered() {
+    let session_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    for (sequence, label) in [(1, "inspect first target"), (2, "inspect second target")] {
+        transcript.apply(&SessionEvent::new(
+            session_id,
+            sequence,
+            SessionEventKind::ProviderEvent {
+                provider: CodingProvider::Codex,
+                kind: "action/preparing".to_string(),
+                payload: serde_json::json!({"label": label}),
+            },
+        ));
+    }
+
+    assert_eq!(transcript.order.len(), 2);
+    let rendered = transcript
+        .lines(100)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let first = rendered.find("inspect first target").unwrap();
+    let second = rendered.find("inspect second target").unwrap();
+    assert!(first < second, "{rendered}");
 }
 
 #[test]

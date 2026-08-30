@@ -118,6 +118,7 @@ pub struct TimelineProjector {
     entries: Vec<Arc<TimelineEntry>>,
     messages: HashMap<Uuid, usize>,
     tools: HashMap<String, usize>,
+    preparing_tool: Option<usize>,
     reasoning: Option<usize>,
 }
 
@@ -211,6 +212,32 @@ impl TimelineProjector {
                     Arc::make_mut(&mut self.entries[index]).running = false;
                 }
             }
+            SessionEventKind::ProviderEvent { kind, payload, .. } if kind == "action/preparing" => {
+                self.reasoning = None;
+                if let Some(index) = self.preparing_tool.take() {
+                    Arc::make_mut(&mut self.entries[index]).running = false;
+                }
+                let input = serde_json::json!({
+                    "label": payload
+                        .get("label")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("action")
+                });
+                let (title, detail) = tool_call_summary("action_preparing", &input);
+                let index = self.entries.len();
+                self.entries.push(Arc::new(TimelineEntry {
+                    id: format!("action:{}", event.id),
+                    created_at: event.created_at,
+                    kind: TimelineKind::Tool,
+                    title,
+                    detail: (!detail.is_empty()).then_some(detail),
+                    body: String::new(),
+                    rich_body: None,
+                    running: true,
+                    failed: false,
+                }));
+                self.preparing_tool = Some(index);
+            }
             SessionEventKind::ToolStarted {
                 tool_call_id,
                 name,
@@ -224,23 +251,44 @@ impl TimelineProjector {
             } => {
                 self.reasoning = None;
                 let (title, detail) = tool_call_summary(name, input);
-                let entry = TimelineEntry {
-                    id: format!("tool:{tool_call_id}"),
-                    created_at: event.created_at,
-                    kind: TimelineKind::Tool,
-                    title,
-                    detail: (!detail.is_empty()).then_some(detail),
-                    body: String::new(),
-                    rich_body: None,
-                    running: true,
-                    failed: false,
-                };
-                if let Some(index) = self.tools.get(tool_call_id).copied() {
-                    self.entries[index] = Arc::new(entry);
+                let known_tool = self.tools.get(tool_call_id).copied();
+                let running_tool = known_tool.filter(|index| self.entries[*index].running);
+                let index = if matches!(&event.kind, SessionEventKind::ToolStarted { .. }) {
+                    self.preparing_tool.take().or(running_tool)
                 } else {
-                    self.tools.insert(tool_call_id.clone(), self.entries.len());
-                    self.entries.push(Arc::new(entry));
-                }
+                    running_tool.or_else(|| {
+                        if known_tool.is_none() {
+                            self.preparing_tool.take()
+                        } else {
+                            None
+                        }
+                    })
+                };
+                let index = if let Some(index) = index {
+                    let entry = Arc::make_mut(&mut self.entries[index]);
+                    entry.title = title;
+                    entry.detail = (!detail.is_empty()).then_some(detail);
+                    entry.body.clear();
+                    entry.rich_body = None;
+                    entry.running = true;
+                    entry.failed = false;
+                    index
+                } else {
+                    let index = self.entries.len();
+                    self.entries.push(Arc::new(TimelineEntry {
+                        id: format!("tool:{tool_call_id}:{}", event.id),
+                        created_at: event.created_at,
+                        kind: TimelineKind::Tool,
+                        title,
+                        detail: (!detail.is_empty()).then_some(detail),
+                        body: String::new(),
+                        rich_body: None,
+                        running: true,
+                        failed: false,
+                    }));
+                    index
+                };
+                self.tools.insert(tool_call_id.clone(), index);
             }
             SessionEventKind::ToolCompleted {
                 tool_call_id,
@@ -248,16 +296,29 @@ impl TimelineProjector {
                 is_error,
                 ..
             } => {
-                let index = self.tools.get(tool_call_id).copied();
+                let known_index = self.tools.get(tool_call_id).copied();
+                let index = known_index.filter(|index| self.entries[*index].running);
                 if let Some(index) = index {
                     let entry = Arc::make_mut(&mut self.entries[index]);
                     entry.running = false;
                     entry.failed = *is_error;
                     entry.body = output.clone();
                     entry.rich_body = None;
+                } else if known_index.is_none()
+                    && let Some(index) = self.preparing_tool.take()
+                {
+                    let entry = Arc::make_mut(&mut self.entries[index]);
+                    let label = entry.detail.take().unwrap_or_else(|| "action".into());
+                    entry.title = format!("Run {label}");
+                    entry.running = false;
+                    entry.failed = *is_error;
+                    entry.body = output.clone();
+                    entry.rich_body = None;
+                    self.tools.insert(tool_call_id.clone(), index);
                 } else {
+                    let index = self.entries.len();
                     self.entries.push(Arc::new(TimelineEntry {
-                        id: format!("tool:{tool_call_id}"),
+                        id: format!("tool:{tool_call_id}:{}", event.id),
                         created_at: event.created_at,
                         kind: TimelineKind::Tool,
                         title: "Completed tool".into(),
@@ -267,6 +328,7 @@ impl TimelineProjector {
                         running: false,
                         failed: *is_error,
                     }));
+                    self.tools.insert(tool_call_id.clone(), index);
                 }
             }
             SessionEventKind::ApprovalRequested { title, detail, .. } => {
@@ -339,6 +401,7 @@ fn message_status_label(status: MessageStatus) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use borg_remote::CodingProvider;
 
     #[test]
     fn cumulative_live_reasoning_replaces_instead_of_duplicating() {
@@ -362,5 +425,94 @@ mod tests {
         let entries = projector.into_entries();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].body, "checking the workspace");
+    }
+
+    #[test]
+    fn reused_tool_call_id_starts_a_new_audit_entry() {
+        let session_id = Uuid::new_v4();
+        let mut projector = TimelineProjector::default();
+        projector.push(&SessionEvent::new(
+            session_id,
+            1,
+            SessionEventKind::ToolStarted {
+                tool_call_id: "command-1".into(),
+                name: "exec_command".into(),
+                input: serde_json::json!({"cmd": "first"}),
+                input_ref: None,
+            },
+        ));
+        projector.push(&SessionEvent::new(
+            session_id,
+            2,
+            SessionEventKind::ToolCompleted {
+                tool_call_id: "command-1".into(),
+                output: "first output".into(),
+                output_ref: None,
+                is_error: false,
+                input: None,
+                input_ref: None,
+            },
+        ));
+        projector.push(&SessionEvent::new(
+            session_id,
+            3,
+            SessionEventKind::ToolStarted {
+                tool_call_id: "command-1".into(),
+                name: "exec_command".into(),
+                input: serde_json::json!({"cmd": "second"}),
+                input_ref: None,
+            },
+        ));
+
+        let entries = projector.into_entries();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].body, "first output");
+        assert!(!entries[0].running);
+        assert!(entries[1].running);
+        assert_ne!(entries[0].id, entries[1].id);
+    }
+
+    #[test]
+    fn late_tool_completion_does_not_claim_the_next_action() {
+        let session_id = Uuid::new_v4();
+        let mut projector = TimelineProjector::default();
+        projector.push(&SessionEvent::new(
+            session_id,
+            1,
+            SessionEventKind::ToolStarted {
+                tool_call_id: "command-1".into(),
+                name: "exec_command".into(),
+                input: serde_json::json!({"cmd": "server"}),
+                input_ref: None,
+            },
+        ));
+        projector.push(&SessionEvent::new(
+            session_id,
+            2,
+            SessionEventKind::ProviderEvent {
+                provider: CodingProvider::Codex,
+                kind: "action/preparing".into(),
+                payload: serde_json::json!({"label": "inspect next target"}),
+            },
+        ));
+        projector.push(&SessionEvent::new(
+            session_id,
+            3,
+            SessionEventKind::ToolCompleted {
+                tool_call_id: "command-1".into(),
+                output: "server stopped".into(),
+                output_ref: None,
+                is_error: false,
+                input: None,
+                input_ref: None,
+            },
+        ));
+
+        let entries = projector.into_entries();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].body, "server stopped");
+        assert!(!entries[0].running);
+        assert_eq!(entries[1].detail.as_deref(), Some("inspect next target"));
+        assert!(entries[1].running);
     }
 }

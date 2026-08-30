@@ -1200,12 +1200,8 @@ impl Transcript {
                 let Some(label) = payload.get("label").and_then(serde_json::Value::as_str) else {
                     return removed_entry;
                 };
-                if self.preparing_tool.is_none() {
-                    self.mark_running_tools_backgrounded();
-                }
-                let tool_call_id = self.preparing_tool.clone().unwrap_or_else(|| {
-                    format!("action-preparing:{}", event.id)
-                });
+                self.mark_running_tools_backgrounded();
+                let tool_call_id = format!("action-preparing:{}", event.id);
                 self.preparing_tool = Some(tool_call_id.clone());
                 let input = serde_json::json!({"label": label});
                 self.upsert_running_tool(
@@ -1255,7 +1251,7 @@ impl Transcript {
                 name,
                 input,
             } => {
-                self.promote_preparing_tool(tool_call_id);
+                self.promote_preparing_tool_if_untracked(tool_call_id);
                 self.upsert_running_tool(event, tool_call_id, name, input, None);
             }
             SessionEventKind::ToolCompleted {
@@ -2139,17 +2135,6 @@ impl Transcript {
         let Some(preparing_id) = self.preparing_tool.take() else {
             return;
         };
-        if preparing_id != tool_call_id && self.tools.contains_key(tool_call_id) {
-            let Some(preparing_index) = self.tools.remove(&preparing_id) else {
-                return;
-            };
-            self.order.remove(preparing_index);
-            self.reindex_after_removal(preparing_index);
-            if self.foreground_tool.as_deref() == Some(preparing_id.as_str()) {
-                self.foreground_tool = Some(tool_call_id.to_string());
-            }
-            return;
-        }
         let Some(tool_index) = self.tools.remove(&preparing_id) else {
             return;
         };
@@ -2159,8 +2144,14 @@ impl Transcript {
         }
     }
 
+    fn promote_preparing_tool_if_untracked(&mut self, tool_call_id: &str) {
+        if !self.tools.contains_key(tool_call_id) {
+            self.promote_preparing_tool(tool_call_id);
+        }
+    }
+
     fn complete_preparing_tool(&mut self, tool_call_id: &str) {
-        self.promote_preparing_tool(tool_call_id);
+        self.promote_preparing_tool_if_untracked(tool_call_id);
         let Some(tool_index) = self.tools.get(tool_call_id).copied() else {
             return;
         };
