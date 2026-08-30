@@ -74,6 +74,8 @@ const ACTION_SUMMARIES: &[&str] = &[
     "inspect", "edit", "run", "test", "search", "plan", "wait", "diagnose",
 ];
 
+const MAX_RESIDENT_CODEX_SUBSCRIPTION_POOLS: usize = 4;
+
 fn action_intent_label(text: &str) -> Option<&str> {
     let trimmed = text.trim();
     if ACTION_SUMMARIES.contains(&trimmed) {
@@ -429,6 +431,7 @@ struct SubscriptionPoolSlot {
     context_generation: u64,
     epoch: u64,
     healthy: bool,
+    last_used: Instant,
     pool: SubscriptionPool,
 }
 
@@ -474,6 +477,33 @@ impl SubscriptionPoolRegistry {
             lifecycle_key,
         } = input;
         let mut slots = self.slots.lock().await;
+        let mut evicted = Vec::new();
+        if provider == CodingProvider::Codex && !slots.contains_key(&session_id) {
+            let resident = slots
+                .values()
+                .filter(|slot| slot.provider == CodingProvider::Codex)
+                .count();
+            let remove_count = resident
+                .saturating_add(1)
+                .saturating_sub(MAX_RESIDENT_CODEX_SUBSCRIPTION_POOLS);
+            if remove_count > 0 {
+                let mut candidates = slots
+                    .iter()
+                    .filter_map(|(id, slot)| {
+                        (slot.provider == CodingProvider::Codex && slot.healthy)
+                            .then_some((*id, slot.last_used))
+                    })
+                    .collect::<Vec<_>>();
+                candidates.sort_by_key(|(_, last_used)| *last_used);
+                for (id, _) in candidates.into_iter().take(remove_count) {
+                    if let Some(slot) = slots.remove(&id)
+                        && let SubscriptionPool::Codex(pool) = slot.pool
+                    {
+                        evicted.push(pool);
+                    }
+                }
+            }
+        }
         let slot = slots
             .entry(session_id)
             .or_insert_with(|| SubscriptionPoolSlot {
@@ -482,6 +512,7 @@ impl SubscriptionPoolRegistry {
                 context_generation,
                 epoch: 0,
                 healthy: false,
+                last_used: Instant::now(),
                 pool: SubscriptionPool::Claude(ClaudeSubscriptionPool::default()),
             });
         let append = slot.provider == provider
@@ -493,6 +524,7 @@ impl SubscriptionPoolRegistry {
         // resume a separately persisted, acknowledged thread checkpoint;
         // otherwise the next turn replays Borg's durable journal.
         slot.healthy = false;
+        slot.last_used = Instant::now();
         if !append {
             if slot.provider != provider {
                 slot.pool = match provider {
@@ -524,7 +556,7 @@ impl SubscriptionPoolRegistry {
         let resume_unavailable_prompt =
             (reusing_native_context && prompt != prompt_delta).then(|| prompt.clone());
         let effective_key = format!("{lifecycle_key}#epoch={}", slot.epoch);
-        PreparedSubscriptionTurn {
+        let prepared = PreparedSubscriptionTurn {
             prompt: if reusing_native_context {
                 prompt_delta
             } else {
@@ -536,7 +568,12 @@ impl SubscriptionPoolRegistry {
             resume_session_id,
             fork_turn_id,
             resume_unavailable_prompt,
+        };
+        drop(slots);
+        for pool in evicted {
+            tokio::spawn(async move { pool.shutdown().await });
         }
+        prepared
     }
 
     async fn mark(&self, session_id: Uuid, provider: CodingProvider, healthy: bool) {
@@ -544,6 +581,7 @@ impl SubscriptionPoolRegistry {
             && slot.provider == provider
         {
             slot.healthy = healthy;
+            slot.last_used = Instant::now();
             if !healthy {
                 slot.epoch = slot.epoch.saturating_add(1);
             }
@@ -2565,6 +2603,54 @@ mod tests {
             )
             .await;
         assert!(lazy.resume_unavailable_prompt.is_none());
+    }
+
+    #[tokio::test]
+    async fn idle_codex_subscription_pools_are_bounded_without_evicting_active_turns() {
+        let registry = SubscriptionPoolRegistry::default();
+        let active_session_id = Uuid::new_v4();
+        registry
+            .prepare(
+                active_session_id,
+                SubscriptionTurnInput {
+                    context_generation: 0,
+                    provider: CodingProvider::Codex,
+                    provider_session_id: Some("active-thread".to_string()),
+                    provider_fork_turn_id: None,
+                    prompt: "active turn".to_string(),
+                    prompt_delta: "active turn".to_string(),
+                    lifecycle_key: "stable-config".to_string(),
+                },
+            )
+            .await;
+        for index in 0..MAX_RESIDENT_CODEX_SUBSCRIPTION_POOLS + 3 {
+            let session_id = Uuid::new_v4();
+            registry
+                .prepare(
+                    session_id,
+                    SubscriptionTurnInput {
+                        context_generation: 0,
+                        provider: CodingProvider::Codex,
+                        provider_session_id: Some(format!("thread-{index}")),
+                        provider_fork_turn_id: None,
+                        prompt: format!("turn {index}"),
+                        prompt_delta: format!("turn {index}"),
+                        lifecycle_key: "stable-config".to_string(),
+                    },
+                )
+                .await;
+            registry.mark(session_id, CodingProvider::Codex, true).await;
+        }
+
+        let slots = registry.slots.lock().await;
+        assert!(slots.contains_key(&active_session_id));
+        assert_eq!(
+            slots
+                .values()
+                .filter(|slot| slot.provider == CodingProvider::Codex)
+                .count(),
+            MAX_RESIDENT_CODEX_SUBSCRIPTION_POOLS
+        );
     }
 
     #[tokio::test]

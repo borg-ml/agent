@@ -2095,7 +2095,17 @@ async fn run_local_agent_session(
                     || terminal.has_active_splash_animation()
                     || terminal.is_history_page_loading()
             }) => {
-                terminal_dirty = true;
+                if !terminal_dirty
+                    && !tool_started_frame_hold_until
+                        .is_some_and(|until| tokio::time::Instant::now() < until)
+                {
+                    terminal
+                        .as_mut()
+                        .expect("terminal")
+                        .draw_for_activity()?;
+                } else {
+                    terminal_dirty = true;
+                }
             }
             _ = idle_tick.tick(), if terminal.as_ref().is_some_and(|terminal| {
                 terminal_needs_idle_tick(

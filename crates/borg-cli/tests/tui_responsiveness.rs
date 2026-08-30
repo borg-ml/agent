@@ -14,6 +14,8 @@ use std::time::{Duration, Instant};
 const PROBE_SAMPLES: usize = 24;
 const INPUT_P95_SLO: Duration = Duration::from_millis(100);
 const INPUT_MAX_SLO: Duration = Duration::from_millis(250);
+const ACTIVE_CPU_SAMPLE: Duration = Duration::from_secs(1);
+const ACTIVE_CPU_RATIO_SLO: f64 = 0.25;
 const PTY_ROWS: usize = 40;
 const PTY_COLS: usize = 120;
 
@@ -44,8 +46,10 @@ fn live_tui_input_latency_under_storage_pressure() {
     .expect("configure the isolated editor fixture");
 
     let (endpoint, stream_started, server) = spawn_streaming_provider();
+    let executable = std::env::var("BORG_TUI_STRESS_EXE")
+        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_borg").to_string());
     let mut terminal = PtyChild::spawn(
-        env!("CARGO_BIN_EXE_borg"),
+        &executable,
         runtime.path(),
         &borg_home,
         &config_home,
@@ -61,6 +65,21 @@ fn live_tui_input_latency_under_storage_pressure() {
     terminal
         .wait_for_pattern(b"live-", Duration::from_secs(10))
         .expect("wait for the active streaming screen");
+
+    let cpu_before = terminal.cpu_time().expect("read initial Borg CPU time");
+    let cpu_sample_started = Instant::now();
+    while cpu_sample_started.elapsed() < ACTIVE_CPU_SAMPLE {
+        terminal
+            .read_available(None)
+            .expect("drain output during active CPU sample");
+        thread::sleep(Duration::from_millis(2));
+    }
+    let cpu_ratio = terminal
+        .cpu_time()
+        .expect("read final Borg CPU time")
+        .saturating_sub(cpu_before)
+        .as_secs_f64()
+        / cpu_sample_started.elapsed().as_secs_f64();
 
     let stop_pressure = Arc::new(AtomicBool::new(false));
     let pressure_bytes = Arc::new(AtomicU64::new(0));
@@ -100,12 +119,19 @@ fn live_tui_input_latency_under_storage_pressure() {
     let max = *samples.last().expect("latency samples");
     let pressure_delta = io_pressure_after.saturating_sub(io_pressure_before);
     eprintln!(
-        "live TUI/storage profile: samples={} input_p50={p50:?} input_p95={p95:?} input_max={max:?} pressure_bytes={} io_full_stall={:?}",
+        "live TUI/storage profile: active_cpu={:.1}% samples={} input_p50={p50:?} input_p95={p95:?} input_max={max:?} pressure_bytes={} io_full_stall={:?}",
+        cpu_ratio * 100.0,
         samples.len(),
         written,
         Duration::from_micros(pressure_delta),
     );
 
+    assert!(
+        cpu_ratio <= ACTIVE_CPU_RATIO_SLO,
+        "active TUI CPU exceeded {:.0}% of one core: {:.1}%",
+        ACTIVE_CPU_RATIO_SLO * 100.0,
+        cpu_ratio * 100.0,
+    );
     assert!(
         p95 <= INPUT_P95_SLO,
         "input-to-paint p95 exceeded {INPUT_P95_SLO:?}: {p95:?}"
@@ -437,6 +463,32 @@ impl PtyChild {
     fn drain_output(&mut self) -> io::Result<()> {
         while self.read_available(None)? > 0 {}
         Ok(())
+    }
+
+    fn cpu_time(&self) -> io::Result<Duration> {
+        let stat = fs::read_to_string(format!("/proc/{}/stat", self.child.id()))?;
+        let fields = stat
+            .rsplit_once(") ")
+            .ok_or_else(|| io::Error::other("malformed process stat"))?
+            .1
+            .split_whitespace()
+            .collect::<Vec<_>>();
+        let user_ticks = fields
+            .get(11)
+            .and_then(|value| value.parse::<u64>().ok())
+            .ok_or_else(|| io::Error::other("missing process user CPU time"))?;
+        let system_ticks = fields
+            .get(12)
+            .and_then(|value| value.parse::<u64>().ok())
+            .ok_or_else(|| io::Error::other("missing process system CPU time"))?;
+        // SAFETY: sysconf reads the host's immutable clock-tick setting.
+        let ticks_per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        if ticks_per_second <= 0 {
+            return Err(io::Error::other("invalid process clock-tick rate"));
+        }
+        Ok(Duration::from_secs_f64(
+            (user_ticks + system_ticks) as f64 / ticks_per_second as f64,
+        ))
     }
 
     fn read_available(&mut self, mut output: Option<&mut Vec<u8>>) -> io::Result<usize> {

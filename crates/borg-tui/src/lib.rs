@@ -5020,6 +5020,13 @@ impl BorgTerminal {
         self.draw_internal(true)
     }
 
+    /// Draw activity animation from the last committed transcript viewport.
+    /// Session events still use [`Self::draw`] so new transcript content is
+    /// committed before subsequent animation frames reuse it.
+    pub fn draw_for_activity(&mut self) -> Result<()> {
+        self.draw_internal(true)
+    }
+
     fn draw_internal(&mut self, input_fast_path: bool) -> Result<()> {
         if self
             .copy_notice_expires_at
