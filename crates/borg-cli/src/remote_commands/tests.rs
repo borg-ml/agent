@@ -1814,6 +1814,7 @@ fn expensive_draws_leave_time_for_input_and_animation_events() {
 
 #[test]
 fn terminal_animation_ticks_separate_active_and_idle_rates() {
+    assert_eq!(IDLE_FRAME_INTERVAL, std::time::Duration::from_millis(100));
     assert!(terminal_needs_activity_tick(SessionStatus::Starting));
     assert!(terminal_needs_activity_tick(SessionStatus::Running));
     assert!(!terminal_needs_activity_tick(SessionStatus::Ready));

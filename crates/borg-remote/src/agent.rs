@@ -36,6 +36,8 @@ source is not already available, inspect or clone that public repository as need
 Write simple mathematical notation as readable Unicode or plain text. For complex notation, use \
 valid Markdown math delimiters (`$...$` or `$$...$$`); never emit bare TeX commands in prose. \
 Use the tools from the borg_agent MCP server for durable goals, plans, and subagents. \
+Never invoke provider-native delegation tools such as `subAgentActivity` or `collabAgentToolCall`; \
+delegate only through `mcp__borg_agent__spawn_agent`. \
 For a substantial multi-step user request, call get_goal first, create a concise goal when none \
 exists, then create the plan. Before updating an existing plan, call get_plan and reuse its exact \
 item UUIDs; omit IDs for new items. \
@@ -54,9 +56,10 @@ You choose the complete freeform briefing: include the relevant objective, evide
 exact question, while omitting unrelated transcript noise. Never ask the human to relay messages manually. \
 The peer cannot invoke another peer; after the response returns, reconcile it with your own judgment and \
 remain the sole voice that answers the user. Progress updates are separate from action summaries. \
-Immediately before every tool call, emit exactly one standalone narration item containing only the closest \
-lowercase summary from this list: `inspect`, `edit`, `run`, `test`, `search`, `plan`, `wait`, `diagnose`. \
-Then generate the tool call. Do not include any other text in the action-summary item.";
+Immediately before every tool call, emit exactly one standalone narration item in the form \
+`[[BORG_ACTION:verb specific target]]`, choosing `verb` from `inspect`, `edit`, `run`, `test`, `search`, \
+`plan`, `wait`, or `diagnose` and naming the concrete target in a few lowercase words. Then generate the \
+tool call. Do not include any other text in the action-summary item.";
 
 pub(crate) const COMPACT_CODING_SYSTEM_PROMPT: &str = "\
 You are Borg, a focused coding agent working in the user's local project. \
@@ -64,11 +67,13 @@ Inspect the workspace, make the smallest requested changes, and verify the resul
 For any request that requires tools, first send the user a concise visible progress update before \
 emitting an action summary or calling a tool. While work is ongoing, send further visible progress \
 updates at meaningful milestones and do not leave the user without one for more than about 60 seconds. \
-Use the available workspace tools directly, preserve user work, and report what you verified. Progress \
-updates are separate from action summaries. Immediately before every tool call, emit exactly one standalone \
-narration item containing only the closest lowercase summary from this list: `inspect`, `edit`, `run`, \
-`test`, `search`, `plan`, `wait`, `diagnose`. Then generate the tool call and include no other text in the \
-action-summary item.";
+Use the available workspace tools directly, preserve user work, and report what you verified. \
+Never invoke provider-native delegation tools such as `subAgentActivity` or `collabAgentToolCall`; \
+delegate only through `mcp__borg_agent__spawn_agent`. \
+Progress updates are separate from action summaries. Immediately before every tool call, emit exactly one standalone \
+narration item in the form `[[BORG_ACTION:verb specific target]]`, choosing `verb` from `inspect`, `edit`, \
+`run`, `test`, `search`, `plan`, `wait`, or `diagnose` and naming the concrete target in a few lowercase \
+words. Then generate the tool call and include no other text in the action-summary item.";
 
 const ACTION_SUMMARIES: &[&str] = &[
     "inspect", "edit", "run", "test", "search", "plan", "wait", "diagnose",
@@ -2358,7 +2363,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn coding_prompts_require_visible_progress_before_compact_action_summaries() {
+    fn coding_prompts_require_visible_progress_before_specific_action_summaries() {
         for prompt in [CODING_SYSTEM_PROMPT, COMPACT_CODING_SYSTEM_PROMPT] {
             let progress = prompt
                 .find("first send the user a concise visible progress update")
@@ -2368,8 +2373,11 @@ mod tests {
                 .expect("prompt requires a tool action summary");
             assert!(progress < summary);
             assert!(prompt.contains("Progress updates are separate from action summaries"));
+            assert!(prompt.contains("Never invoke provider-native delegation tools"));
+            assert!(prompt.contains("`mcp__borg_agent__spawn_agent`"));
+            assert!(prompt.contains("`[[BORG_ACTION:verb specific target]]`"));
             assert!(prompt.contains("`inspect`, `edit`, `run`, `test`"));
-            assert!(!prompt.contains("[[BORG_ACTION:"));
+            assert!(prompt.contains("naming the concrete target"));
             assert!(prompt.contains("more than about 60 seconds"));
         }
     }
@@ -2391,6 +2399,10 @@ mod tests {
         assert_eq!(
             action_intent_label("[[BORG_ACTION:plan update]]"),
             Some("plan update")
+        );
+        assert_eq!(
+            action_intent_label("[[BORG_ACTION:inspect provider retry handling]]"),
+            Some("inspect provider retry handling")
         );
         assert_eq!(action_intent_label("before [[BORG_ACTION:edit]]"), None);
         assert_eq!(action_intent_label("[[BORG_ACTION:edit!]]"), None);

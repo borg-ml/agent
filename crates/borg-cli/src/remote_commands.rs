@@ -60,7 +60,7 @@ const MIN_TUI_FPS: u64 = 15;
 const MAX_TUI_FPS: u64 = 240;
 const ACTIVITY_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
 const TOOL_STARTED_FRAME_MIN_DURATION: std::time::Duration = std::time::Duration::from_millis(500);
-const IDLE_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+const IDLE_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 const MAX_RENDER_BACKOFF_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 const LOCAL_RESUME_RETRY_INITIAL_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
 const LOCAL_RESUME_RETRY_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
@@ -2113,7 +2113,17 @@ async fn run_local_agent_session(
                     terminal.has_blinking_cursor(),
                 )
             }) => {
-                terminal_dirty = true;
+                if !terminal_dirty
+                    && !tool_started_frame_hold_until
+                        .is_some_and(|until| tokio::time::Instant::now() < until)
+                {
+                    terminal
+                        .as_mut()
+                        .expect("terminal")
+                        .draw_for_activity()?;
+                } else {
+                    terminal_dirty = true;
+                }
             }
             _ = cache_tick.tick(), if terminal.as_ref().is_some_and(
                 crate::terminal_ui::BorgTerminal::has_cache_idle_timer

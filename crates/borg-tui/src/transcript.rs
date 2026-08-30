@@ -2636,15 +2636,34 @@ impl Transcript {
             .then(|| now.timestamp_millis().div_euclid(TOOL_ELAPSED_REFRESH_MILLIS))
     }
 
-    fn has_running_tool(&self) -> bool {
-        self.order.iter().any(|entry| {
-            matches!(
-                entry,
-                TranscriptEntry::Tool {
+    fn running_tool_elapsed_labels(&self) -> Vec<(usize, Option<String>)> {
+        let now = Utc::now();
+        let mut indices = self.tools.values().copied().collect::<Vec<_>>();
+        indices.extend(self.active_reasoning);
+        indices.sort_unstable();
+        indices.dedup();
+        indices
+            .into_iter()
+            .filter_map(|index| match self.order.get(index) {
+                Some(TranscriptEntry::Tool {
+                    started_at,
+                    completed_at,
                     complete: false,
                     ..
-                }
-            )
+                }) => Some((
+                    index,
+                    format_tool_elapsed_at(*started_at, *completed_at, now),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn has_running_tool(&self) -> bool {
+        self.active_reasoning.is_some_and(|index| {
+            matches!(self.order.get(index), Some(TranscriptEntry::Tool { complete: false, .. }))
+        }) || self.tools.values().any(|index| {
+            matches!(self.order.get(*index), Some(TranscriptEntry::Tool { complete: false, .. }))
         })
     }
 
@@ -2782,7 +2801,9 @@ impl Transcript {
         let mut entry_rows = Vec::new();
         let mut link_rows = Vec::new();
         let mut selection_rows: Vec<SelectionRowRange> = Vec::new();
+        let mut running_tool_elapsed = Vec::new();
         let mut tool_run_starts = HashMap::new();
+        let render_time = Utc::now();
         let tool_run_windows = self.tool_run_windows();
         let running_tool = self.has_running_tool();
         if let Some(index) = focused_tool
@@ -3477,7 +3498,10 @@ impl Transcript {
                         summary.push_str(&format!(" · {lifecycle}"));
                     }
                     let prefix = if tool_window.is_some() { "│ " } else { "  " };
-                    let elapsed = format_tool_elapsed(*started_at, *completed_at);
+                    let elapsed = format_tool_elapsed_at(*started_at, *completed_at, render_time);
+                    if !*complete {
+                        running_tool_elapsed.push((index, elapsed.clone()));
+                    }
                     for (line_index, line) in
                         tool_summary_lines(&summary, elapsed.as_deref(), prefix, width)
                             .into_iter()
@@ -3805,6 +3829,7 @@ impl Transcript {
             entry_rows,
             link_rows,
             selection_rows,
+            running_tool_elapsed,
         )
     }
 

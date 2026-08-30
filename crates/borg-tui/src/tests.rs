@@ -1689,7 +1689,7 @@ fn action_preparation_promotes_into_the_same_tool_card() {
         SessionEventKind::ProviderEvent {
             provider: CodingProvider::Codex,
             kind: "action/preparing".to_string(),
-            payload: serde_json::json!({"label": "edit"}),
+            payload: serde_json::json!({"label": "edit session retry policy"}),
         },
     ));
     let preparing = transcript
@@ -1699,7 +1699,10 @@ fn action_preparation_promotes_into_the_same_tool_card() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(preparing.contains("Preparing next action…"), "{preparing}");
-    assert!(preparing.contains("edit"), "{preparing}");
+    assert!(
+        preparing.contains("edit session retry policy"),
+        "{preparing}"
+    );
 
     transcript.apply(&SessionEvent::new(
         session_id,
@@ -2039,6 +2042,76 @@ fn large_transcript_keeps_running_tool_elapsed_at_tenth_second_cadence() {
 }
 
 #[test]
+fn cached_transcript_reuses_history_for_same_width_timer_updates() {
+    let session_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    let mut started = SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::ToolStarted {
+            tool_call_id: "timed-1".to_string(),
+            name: "command_execution".to_string(),
+            input: serde_json::json!({"command": "sleep 10"}),
+            input_ref: None,
+        },
+    );
+    started.created_at = Utc::now() - chrono::Duration::seconds(1);
+    transcript.apply(&started);
+    let width = 100;
+    let viewport_height = DEFAULT_TOOL_RUN_VIEWPORT_HEIGHT;
+    let labels = transcript.running_tool_elapsed_labels();
+    let mut cache = None;
+    let first = cached_transcript_render(
+        &transcript,
+        &mut cache,
+        width,
+        viewport_height,
+        None,
+        Some(1),
+        &labels,
+        Local::now().date_naive(),
+    );
+    let mut same_width = first.7.clone();
+    let elapsed = same_width[0]
+        .1
+        .as_mut()
+        .expect("running tool has an elapsed label");
+    let replacement = if elapsed == "0.1s" { "0.2s" } else { "0.1s" };
+    assert_eq!(elapsed.width(), replacement.width());
+    *elapsed = replacement.to_string();
+
+    let reused = cached_transcript_render(
+        &transcript,
+        &mut cache,
+        width,
+        viewport_height,
+        None,
+        Some(2),
+        &same_width,
+        Local::now().date_naive(),
+    );
+    assert!(Arc::ptr_eq(&first, &reused));
+    let (tool_index, row, _) = first.1[0];
+    let mut visible_row = first.0[row].clone();
+    refresh_tool_elapsed_line(&mut visible_row, tool_index, &first.7, &same_width);
+    assert!(visible_row.to_string().ends_with(replacement));
+
+    let mut wider = same_width;
+    wider[0].1 = Some("10.0s".to_string());
+    let reflowed = cached_transcript_render(
+        &transcript,
+        &mut cache,
+        width,
+        viewport_height,
+        None,
+        Some(3),
+        &wider,
+        Local::now().date_naive(),
+    );
+    assert!(!Arc::ptr_eq(&first, &reflowed));
+}
+
+#[test]
 fn background_tool_elapsed_cache_tick_also_changes_each_tenth() {
     let started_at = DateTime::parse_from_rfc3339("2026-07-29T10:00:00.000Z")
         .unwrap()
@@ -2060,6 +2133,7 @@ fn background_tool_elapsed_cache_tick_also_changes_each_tenth() {
         backgrounded: true,
         expanded: false,
     });
+    transcript.tools.insert("background".to_string(), 0);
 
     assert_ne!(
         transcript.tool_elapsed_cache_tick_at(started_at),
@@ -5274,6 +5348,63 @@ fn ready_subagent_status_always_notifies_the_director() {
             body: None,
             ..
         } if detail == "/root/peer · done · waiting for input"
+    ));
+}
+
+#[test]
+fn ready_subagent_with_provider_isolation_is_shown_as_a_failed_turn() {
+    let parent_id = Uuid::new_v4();
+    let child_id = Uuid::new_v4();
+    let detail = "Borg blocked a provider-native delegation attempt. The turn was not retried because doing so could repeat work.";
+    let now = Utc::now();
+    let agent = SubagentSnapshot {
+        session_id: child_id,
+        parent_session_id: parent_id,
+        task_name: "/root/audit".to_string(),
+        status: SubagentStatus::Ready,
+        provider: CodingProvider::Codex,
+        model: Some("gpt-test".to_string()),
+        effort: None,
+        cwd: PathBuf::from("/workspace"),
+        created_at: now,
+        updated_at: now,
+        detail: Some(detail.to_string()),
+        final_text: Some("I will inspect the code.".to_string()),
+        usage: borg_remote::SubagentUsage::default(),
+    };
+    let child_event = SessionEvent::new(
+        child_id,
+        1,
+        SessionEventKind::StatusChanged {
+            status: SessionStatus::Ready,
+            detail: Some(detail.to_string()),
+        },
+    );
+    assert_eq!(
+        subagent_activity_summary(SubagentActivityKind::Updated, &agent, Some(&child_event),)
+            .as_deref(),
+        Some(
+            "agent · /root/audit · failed turn · Borg blocked a provider-native delegation attempt. The turn was not retried because doing so could repeat work."
+        )
+    );
+
+    let mut transcript = Transcript::default();
+    transcript.apply(&SessionEvent::new(
+        parent_id,
+        1,
+        SessionEventKind::SubagentActivity {
+            activity: SubagentActivityKind::Updated,
+            agent,
+            event: Some(Box::new(child_event)),
+        },
+    ));
+    assert!(matches!(
+        &transcript.order[0],
+        TranscriptEntry::Action {
+            detail,
+            state: TranscriptActionState::Failed,
+            ..
+        } if detail.starts_with("/root/audit · failed turn")
     ));
 }
 

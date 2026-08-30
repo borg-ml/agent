@@ -2324,7 +2324,8 @@ impl SubagentTable {
         if target == "/root" || target == "root" {
             return Ok(self.root_session_id);
         }
-        if let Ok(id) = Uuid::parse_str(target)
+        let session_id = target.strip_prefix("session:").unwrap_or(target);
+        if let Ok(id) = Uuid::parse_str(session_id)
             && (id == self.root_session_id || self.entries.contains_key(&id))
         {
             return Ok(id);
@@ -6419,6 +6420,13 @@ fn parse_workspace_participant_target(target: &str) -> Result<Option<Uuid>> {
 }
 
 fn routed_message_json(routed: RoutedTeamMessage, accepted_field: &str) -> Value {
+    let delivery_state = if routed.dispatched_locally {
+        "dispatched"
+    } else if routed.relay_pending {
+        "relay_pending"
+    } else {
+        "queued_offline"
+    };
     let mut value = match routed.receipt {
         Some(receipt) => json!({
             "message_id": receipt.message_id,
@@ -6429,11 +6437,13 @@ fn routed_message_json(routed: RoutedTeamMessage, accepted_field: &str) -> Value
             "delivery_mode": receipt.mode,
             "dispatched_locally": routed.dispatched_locally,
             "relay_pending": routed.relay_pending,
+            "delivery_state": delivery_state,
         }),
         None => json!({
             "recipient_count": 1,
             "dispatched_locally": routed.dispatched_locally,
             "relay_pending": routed.relay_pending,
+            "delivery_state": delivery_state,
         }),
     };
     value[accepted_field] = Value::Bool(true);

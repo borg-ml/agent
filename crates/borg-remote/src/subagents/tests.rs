@@ -1265,6 +1265,12 @@ fn child_identity_is_stable_and_inherits_execution_context() {
     assert_eq!(child.model.as_deref(), Some("gpt-test"));
     assert_eq!(table.resolve("review_api").unwrap(), child.session_id);
     assert_eq!(table.resolve("/root/review_api").unwrap(), child.session_id);
+    assert_eq!(
+        table
+            .resolve(&format!("session:{}", child.session_id))
+            .unwrap(),
+        child.session_id
+    );
 }
 
 #[tokio::test]

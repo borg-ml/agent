@@ -2928,6 +2928,14 @@ async fn run_agent_session_store_kernel(
                                     "The provider returned no response; your message was preserved and is being retried automatically."
                                         .to_string()
                                 }
+                            } else if provider_isolation_recovery {
+                                if goal.as_ref().is_some_and(|goal| goal.status.is_active()) {
+                                    "Borg blocked a provider-native delegation attempt. Automatic goal continuation is paused because retrying could repeat work; resume after changing the model/provider or updating Codex."
+                                        .to_string()
+                                } else {
+                                    "Borg blocked a provider-native delegation attempt. The turn was not retried because doing so could repeat work."
+                                        .to_string()
+                                }
                             } else {
                                 format!("Turn failed; the session remains available: {error}")
                             };
@@ -2939,6 +2947,16 @@ async fn run_agent_session_store_kernel(
                                     .saturating_mul(2)
                                     .min(USAGE_LIMIT_RETRY_MAX_DELAY);
                             } else if retry {
+                                goal_turn_failures.reset();
+                            } else if provider_isolation_recovery {
+                                pause_active_goal(
+                                    &mut journal,
+                                    &events,
+                                    session_id,
+                                    &mut goal,
+                                    &mut goal_active_since,
+                                )
+                                .await?;
                                 goal_turn_failures.reset();
                             } else if provider_error_is_usage_limited(&error) {
                                 goal_turn_failures.reset();
@@ -6802,10 +6820,9 @@ fn automatic_retry_allowed(
     !interrupted
         && prompt_visible
         && actor == EventActor::User
-        && (is_provider_agent_isolation_error(error)
-            || (retry_not_attempted
-                && !turn_had_side_effects
-                && is_safe_automatic_retry_error(error)))
+        && retry_not_attempted
+        && !turn_had_side_effects
+        && (is_provider_agent_isolation_error(error) || is_safe_automatic_retry_error(error))
 }
 
 fn provider_event_has_side_effect(kind: &SessionEventKind) -> bool {

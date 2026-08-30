@@ -184,6 +184,7 @@ type TranscriptRender = (
     Vec<RowRange>,
     Vec<LinkRowRange>,
     Vec<SelectionRowRange>,
+    Vec<(usize, Option<String>)>,
 );
 type CachedTranscriptRender = (
     usize,
@@ -5060,6 +5061,7 @@ impl BorgTerminal {
         let full_transcript_width = content_width.max(1) as usize;
         let goal_tick = self.transcript.active_goal_cache_tick();
         let tool_elapsed_tick = self.transcript.tool_elapsed_cache_tick();
+        let current_tool_elapsed = self.transcript.running_tool_elapsed_labels();
         let local_date = Local::now().date_naive();
         // Keep a separate full-width measurement so an overflowing transcript
         // can switch to the scrollbar-safe width without rendering both widths
@@ -5070,10 +5072,19 @@ impl BorgTerminal {
             self.last_committed_viewport_render
                 .as_ref()
                 .filter(
-                    |(cached_width, cached_tool_run_viewport_height, _, _, cached_date, _)| {
+                    |(
+                        cached_width,
+                        cached_tool_run_viewport_height,
+                        cached_goal_tick,
+                        _,
+                        cached_date,
+                        render,
+                    )| {
                         *cached_width <= full_transcript_width
                             && *cached_tool_run_viewport_height == tool_run_viewport_height
                             && *cached_date == local_date
+                            && *cached_goal_tick == goal_tick
+                            && tool_elapsed_widths_match(&render.7, &current_tool_elapsed)
                     },
                 )
                 .map(|(_, _, _, _, _, render)| Arc::clone(render))
@@ -5084,10 +5095,19 @@ impl BorgTerminal {
             self.transcript_full_render_cache
                 .as_ref()
                 .filter(
-                    |(cached_width, cached_tool_run_viewport_height, _, _, cached_date, _)| {
+                    |(
+                        cached_width,
+                        cached_tool_run_viewport_height,
+                        cached_goal_tick,
+                        _,
+                        cached_date,
+                        render,
+                    )| {
                         *cached_width == full_transcript_width
                             && *cached_tool_run_viewport_height == tool_run_viewport_height
                             && *cached_date == local_date
+                            && *cached_goal_tick == goal_tick
+                            && tool_elapsed_widths_match(&render.7, &current_tool_elapsed)
                     },
                 )
                 .map(|(_, _, _, _, _, render)| Arc::clone(render))
@@ -5111,6 +5131,7 @@ impl BorgTerminal {
                             tool_run_viewport_height,
                             goal_tick,
                             tool_elapsed_tick,
+                            &current_tool_elapsed,
                             local_date,
                         )
                     } else {
@@ -5122,6 +5143,7 @@ impl BorgTerminal {
                             tool_run_viewport_height,
                             goal_tick,
                             tool_elapsed_tick,
+                            &current_tool_elapsed,
                             local_date,
                         )
                     }
@@ -5487,6 +5509,7 @@ impl BorgTerminal {
                 tool_run_viewport_height,
                 goal_tick,
                 tool_elapsed_tick,
+                &current_tool_elapsed,
                 local_date,
             )
         };
@@ -5499,6 +5522,7 @@ impl BorgTerminal {
             entry_rows,
             link_rows,
             selection_rows,
+            cached_tool_elapsed,
         ) = transcript_render.as_ref();
         let transcript_height = transcript.len();
         self.scroll_from_bottom = resolve_pending_scroll_anchor(
@@ -5733,6 +5757,12 @@ impl BorgTerminal {
                         .filter(|(_, _, end)| *end > scroll_start)
                         .map(|(index, start, _)| {
                             let mut header = transcript[*start].clone();
+                            refresh_tool_elapsed_line(
+                                &mut header,
+                                *index,
+                                cached_tool_elapsed,
+                                &current_tool_elapsed,
+                            );
                             if let Some(animation) = tool_activity_animation(
                                 self.running_sweeps,
                                 self.transcript.tool_activity_is_running(*index),
@@ -5753,6 +5783,16 @@ impl BorgTerminal {
                 for (index, start, end) in
                     visible_row_ranges(tool_rows, scroll_start, visible_height)
                 {
+                    if *start >= scroll_start
+                        && let Some(line) = visible_transcript.get_mut(*start - scroll_start)
+                    {
+                        refresh_tool_elapsed_line(
+                            line,
+                            *index,
+                            cached_tool_elapsed,
+                            &current_tool_elapsed,
+                        );
+                    }
                     if let Some(animation) = tool_activity_animation(
                         self.running_sweeps,
                         self.transcript.tool_activity_is_running(*index),
@@ -9182,6 +9222,13 @@ pub fn subagent_activity_summary(
             )),
             Some(SessionEventKind::StatusChanged {
                 status: SessionStatus::Ready | SessionStatus::Completed,
+                detail: Some(detail),
+            }) if ready_detail_is_failure(detail) => Some(format!(
+                "agent · {task} · failed turn · {}",
+                compact_text(detail, 120)
+            )),
+            Some(SessionEventKind::StatusChanged {
+                status: SessionStatus::Ready | SessionStatus::Completed,
                 ..
             }) => Some(format!("agent · {task} · done · waiting for input")),
             Some(SessionEventKind::StatusChanged {
@@ -9291,6 +9338,14 @@ fn subagent_action_projection(
             ),
             Some(SessionEventKind::StatusChanged {
                 status: SessionStatus::Ready | SessionStatus::Completed,
+                detail: Some(detail),
+            }) if ready_detail_is_failure(detail) => project(
+                format!("failed turn · {}", compact_text(detail, 120)),
+                Some(detail.clone()),
+                TranscriptActionState::Failed,
+            ),
+            Some(SessionEventKind::StatusChanged {
+                status: SessionStatus::Ready | SessionStatus::Completed,
                 ..
             }) => project(
                 "done · waiting for input".to_string(),
@@ -9322,12 +9377,26 @@ fn subagent_action_projection(
                     None,
                     TranscriptActionState::Waiting,
                 ),
-                SubagentStatus::Ready => Some((
-                    "Agent".to_string(),
-                    format!("{task} · done · waiting for input"),
-                    agent.final_text.clone(),
-                    TranscriptActionState::Complete,
-                )),
+                SubagentStatus::Ready => {
+                    if let Some(detail) = agent
+                        .detail
+                        .as_deref()
+                        .filter(|detail| ready_detail_is_failure(detail))
+                    {
+                        project(
+                            format!("failed turn · {}", compact_text(detail, 120)),
+                            Some(detail.to_string()),
+                            TranscriptActionState::Failed,
+                        )
+                    } else {
+                        Some((
+                            "Agent".to_string(),
+                            format!("{task} · done · waiting for input"),
+                            agent.final_text.clone(),
+                            TranscriptActionState::Complete,
+                        ))
+                    }
+                }
                 SubagentStatus::Stopped => project(
                     "stopped".to_string(),
                     agent.final_text.clone(),
@@ -9341,6 +9410,13 @@ fn subagent_action_projection(
             },
         },
     }
+}
+
+fn ready_detail_is_failure(detail: &str) -> bool {
+    let detail = detail.trim().to_ascii_lowercase();
+    detail.starts_with("borg blocked a provider-native delegation attempt")
+        || detail.starts_with("turn failed")
+        || detail.starts_with("could not wake")
 }
 
 fn format_action_detail(label: &str, detail: &str) -> String {
@@ -11176,6 +11252,7 @@ fn cached_transcript_render(
     tool_run_viewport_height: usize,
     goal_tick: Option<i64>,
     tool_elapsed_tick: Option<i64>,
+    current_tool_elapsed: &[(usize, Option<String>)],
     local_date: NaiveDate,
 ) -> Arc<TranscriptRender> {
     cache
@@ -11185,14 +11262,14 @@ fn cached_transcript_render(
                 cached_width,
                 cached_tool_run_viewport_height,
                 cached_goal_tick,
-                cached_tool_elapsed_tick,
-                cached_date,
                 _,
+                cached_date,
+                render,
             )| {
                 *cached_width == width
                     && *cached_tool_run_viewport_height == tool_run_viewport_height
                     && *cached_goal_tick == goal_tick
-                    && *cached_tool_elapsed_tick == tool_elapsed_tick
+                    && tool_elapsed_widths_match(&render.7, current_tool_elapsed)
                     && *cached_date == local_date
             },
         )
@@ -11209,6 +11286,54 @@ fn cached_transcript_render(
             ));
             render
         })
+}
+
+fn tool_elapsed_widths_match(
+    cached: &[(usize, Option<String>)],
+    current: &[(usize, Option<String>)],
+) -> bool {
+    cached.len() == current.len()
+        && cached
+            .iter()
+            .zip(current)
+            .all(|((cached_index, cached), (current_index, current))| {
+                cached_index == current_index
+                    && cached.as_deref().map(UnicodeWidthStr::width)
+                        == current.as_deref().map(UnicodeWidthStr::width)
+            })
+}
+
+fn refresh_tool_elapsed_line(
+    line: &mut Line<'static>,
+    tool_index: usize,
+    cached: &[(usize, Option<String>)],
+    current: &[(usize, Option<String>)],
+) {
+    let cached = cached
+        .iter()
+        .find_map(|(index, elapsed)| (*index == tool_index).then_some(elapsed.as_deref()))
+        .flatten();
+    let current = current
+        .iter()
+        .find_map(|(index, elapsed)| (*index == tool_index).then_some(elapsed.as_deref()))
+        .flatten();
+    let (Some(cached), Some(current)) = (cached, current) else {
+        return;
+    };
+    if cached == current || cached.len() != current.len() {
+        return;
+    }
+    let Some(span) = line
+        .spans
+        .iter_mut()
+        .rev()
+        .find(|span| span.content.ends_with(cached))
+    else {
+        return;
+    };
+    let mut content = span.content.to_string();
+    content.replace_range(content.len() - cached.len().., current);
+    span.content = Cow::Owned(content);
 }
 
 fn select_transcript_snapshot<T, F>(
@@ -11841,12 +11966,21 @@ fn tool_summary_lines(
     lines
 }
 
+#[cfg(test)]
 fn format_tool_elapsed(
     started_at: DateTime<Utc>,
     completed_at: Option<DateTime<Utc>>,
 ) -> Option<String> {
+    format_tool_elapsed_at(started_at, completed_at, Utc::now())
+}
+
+fn format_tool_elapsed_at(
+    started_at: DateTime<Utc>,
+    completed_at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> Option<String> {
     let elapsed_ms = completed_at
-        .unwrap_or_else(Utc::now)
+        .unwrap_or(now)
         .signed_duration_since(started_at)
         .num_milliseconds()
         .max(0) as u64;

@@ -6561,7 +6561,7 @@ fn terminal_active_steer_is_not_recovered() {
 }
 
 #[test]
-fn only_side_effect_free_transport_recovery_is_eligible_for_automatic_retry() {
+fn automatic_transport_recovery_is_single_shot_and_side_effect_free() {
     assert!(is_safe_automatic_retry_error(
         "codex returned an empty response"
     ));
@@ -6570,7 +6570,7 @@ fn only_side_effect_free_transport_recovery_is_eligible_for_automatic_retry() {
     ));
     assert!(!is_safe_automatic_retry_error("turn interrupted"));
     assert!(!is_safe_automatic_retry_error("tool execution failed"));
-    assert!(automatic_retry_allowed(
+    assert!(!automatic_retry_allowed(
         "Codex exposed a forbidden provider-native agent tool: subAgentActivity",
         false,
         true,
@@ -6578,13 +6578,21 @@ fn only_side_effect_free_transport_recovery_is_eligible_for_automatic_retry() {
         true,
         true,
     ));
+    assert!(!automatic_retry_allowed(
+        "Codex exposed a forbidden provider-native agent tool: subAgentActivity",
+        false,
+        true,
+        EventActor::User,
+        false,
+        false,
+    ));
     assert!(automatic_retry_allowed(
         "Codex exposed a forbidden provider-native agent tool: subAgentActivity",
         false,
         true,
         EventActor::User,
-        true,
         false,
+        true,
     ));
 }
 
