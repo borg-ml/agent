@@ -408,6 +408,18 @@ impl LspClient {
         self.notify(method, params).await
     }
 
+    async fn close_document(&mut self, path: &Path, uri: &str) -> Result<()> {
+        if self.opened_versions.remove(path).is_none() {
+            return Ok(());
+        }
+        self.published_diagnostics.remove(uri);
+        self.notify(
+            "textDocument/didClose",
+            json!({ "textDocument": { "uri": uri } }),
+        )
+        .await
+    }
+
     async fn document_diagnostics(
         &mut self,
         path: &Path,
@@ -441,10 +453,16 @@ impl LspClient {
             let uri = Url::from_file_path(&path)
                 .map_err(|_| anyhow::anyhow!("cannot convert {} to a file URI", path.display()))?
                 .to_string();
+            self.close_document(&path, &uri)
+                .await
+                .with_context(|| format!("failed to reset {}", path.display()))?;
             let report = self
                 .document_diagnostics(&path, &uri, spec.language_id)
-                .await
-                .with_context(|| format!("diagnostics failed for {}", path.display()))?;
+                .await;
+            let close = self.close_document(&path, &uri).await;
+            let report =
+                report.with_context(|| format!("diagnostics failed for {}", path.display()))?;
+            close.with_context(|| format!("failed to close {}", path.display()))?;
             items.push(workspace_document_report(&uri, report));
         }
         let mut result = json!({ "kind": "full", "items": items });
@@ -867,7 +885,7 @@ fn server_specs() -> &'static [ServerSpec] {
         ServerSpec {
             id: "clangd",
             command: "clangd",
-            args: &[],
+            args: &["--pch-storage=memory"],
             language_id: "cpp",
             extensions: &["c", "h", "cc", "cpp", "cxx", "hpp"],
         },
@@ -1027,6 +1045,13 @@ mod tests {
         assert_eq!(options.pointer("/check/allTargets"), Some(&json!(false)));
     }
 
+    #[test]
+    fn clangd_keeps_preambles_out_of_shared_temporary_storage() {
+        let spec = spec_for_id("clangd").expect("clangd spec");
+
+        assert!(spec.args.contains(&"--pch-storage=memory"));
+    }
+
     #[tokio::test]
     async fn trusted_lsp_resolves_external_files_against_their_project_root() {
         let session_root = tempfile::tempdir().expect("session workspace");
@@ -1135,7 +1160,8 @@ mod tests {
         )
         .await
         .expect("write C source");
-        let result = LspService::new(root.path())
+        let service = LspService::new(root.path());
+        let result = service
             .diagnostics(Path::new("broken.c"))
             .await
             .expect("clangd diagnostics");
@@ -1145,5 +1171,13 @@ mod tests {
                 .and_then(Value::as_array)
                 .is_some_and(|items| !items.is_empty())
         );
+
+        service
+            .workspace_diagnostics(Some(Path::new("broken.c")))
+            .await
+            .expect("clangd workspace diagnostics");
+        let clients = service.clients.lock().await;
+        let client = clients.values().next().expect("active clangd client");
+        assert!(client.opened_versions.is_empty());
     }
 }
