@@ -28,8 +28,9 @@ pub(crate) const CODING_SYSTEM_PROMPT: &str = "\
 You are Borg, a practical agent working in the user's local project. \
 Inspect before changing, keep solutions small, preserve user work, explain consequential actions, \
 and continue until the requested outcome is implemented and verified. \
-While work is ongoing, keep the user informed with concise progress updates and do not leave them \
-without an update for more than about 60 seconds. \
+For any request that requires tools, first send the user a concise visible progress update before \
+emitting an action summary or calling a tool. While work is ongoing, send further visible progress \
+updates at meaningful milestones and do not leave the user without one for more than about 60 seconds. \
 The Borg Agent source is https://github.com/borg-ml/agent; when diagnosing Borg Agent behavior and the \
 source is not already available, inspect or clone that public repository as needed. \
 Write simple mathematical notation as readable Unicode or plain text. For complex notation, use \
@@ -52,23 +53,35 @@ Preserve an explicit `@EFFORT` suffix in a profile when the intent includes one 
 You choose the complete freeform briefing: include the relevant objective, evidence, constraints, and \
 exact question, while omitting unrelated transcript noise. Never ask the human to relay messages manually. \
 The peer cannot invoke another peer; after the response returns, reconcile it with your own judgment and \
-remain the sole voice that answers the user. Before every tool call, emit exactly one standalone narration \
-item in the form `[[BORG_ACTION:label]]`, then generate the tool call. Use a short action noun for `label`, \
-such as `edit`, `command`, `plan update`, `web search`, `file read`, or `diagnostics`. Do not include any \
-other text in that narration item.";
+remain the sole voice that answers the user. Progress updates are separate from action summaries. \
+Immediately before every tool call, emit exactly one standalone narration item containing only the closest \
+lowercase summary from this list: `inspect`, `edit`, `run`, `test`, `search`, `plan`, `wait`, `diagnose`. \
+Then generate the tool call. Do not include any other text in the action-summary item.";
 
 pub(crate) const COMPACT_CODING_SYSTEM_PROMPT: &str = "\
 You are Borg, a focused coding agent working in the user's local project. \
 Inspect the workspace, make the smallest requested changes, and verify the result. \
-While work is ongoing, keep the user informed with concise progress updates and do not leave them \
-without an update for more than about 60 seconds. \
-Use the available workspace tools directly, preserve user work, and report what you verified. Before every \
-tool call, emit exactly one standalone narration item in the form `[[BORG_ACTION:label]]`, then generate the \
-tool call. Use a short action noun for `label` and no other text in that narration item.";
+For any request that requires tools, first send the user a concise visible progress update before \
+emitting an action summary or calling a tool. While work is ongoing, send further visible progress \
+updates at meaningful milestones and do not leave the user without one for more than about 60 seconds. \
+Use the available workspace tools directly, preserve user work, and report what you verified. Progress \
+updates are separate from action summaries. Immediately before every tool call, emit exactly one standalone \
+narration item containing only the closest lowercase summary from this list: `inspect`, `edit`, `run`, \
+`test`, `search`, `plan`, `wait`, `diagnose`. Then generate the tool call and include no other text in the \
+action-summary item.";
+
+const ACTION_SUMMARIES: &[&str] = &[
+    "inspect", "edit", "run", "test", "search", "plan", "wait", "diagnose",
+];
 
 fn action_intent_label(text: &str) -> Option<&str> {
+    let trimmed = text.trim();
+    if ACTION_SUMMARIES.contains(&trimmed) {
+        return Some(trimmed);
+    }
+
     const PREFIX: &str = "[[BORG_ACTION:";
-    let mut remaining = text.trim();
+    let mut remaining = trimmed;
     let mut last_label = None;
     while !remaining.is_empty() {
         remaining = remaining.strip_prefix(PREFIX)?;
@@ -91,6 +104,13 @@ fn action_intent_label(text: &str) -> Option<&str> {
 fn action_intent_is_streaming(text: &str) -> bool {
     const PREFIX: &str = "[[BORG_ACTION:";
     let mut remaining = text.trim();
+    if !remaining.is_empty()
+        && ACTION_SUMMARIES
+            .iter()
+            .any(|summary| summary.starts_with(remaining))
+    {
+        return true;
+    }
     loop {
         if PREFIX.starts_with(remaining) {
             return !remaining.is_empty();
@@ -124,6 +144,12 @@ fn without_action_intent_marker(text: &str) -> Option<&str> {
     let trimmed = text.trim_start();
     if trimmed.is_empty() {
         return Some(text);
+    }
+    if ACTION_SUMMARIES
+        .iter()
+        .any(|summary| summary.starts_with(trimmed.trim_end()))
+    {
+        return None;
     }
     if "[[BORG_ACTION".starts_with(trimmed) || trimmed.starts_with("[[BORG_ACTION") {
         return trimmed
@@ -2294,7 +2320,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn action_intent_markers_are_exact_and_bounded() {
+    fn coding_prompts_require_visible_progress_before_compact_action_summaries() {
+        for prompt in [CODING_SYSTEM_PROMPT, COMPACT_CODING_SYSTEM_PROMPT] {
+            let progress = prompt
+                .find("first send the user a concise visible progress update")
+                .expect("prompt requires an initial visible progress update");
+            let summary = prompt
+                .find("Immediately before every tool call")
+                .expect("prompt requires a tool action summary");
+            assert!(progress < summary);
+            assert!(prompt.contains("Progress updates are separate from action summaries"));
+            assert!(prompt.contains("`inspect`, `edit`, `run`, `test`"));
+            assert!(!prompt.contains("[[BORG_ACTION:"));
+            assert!(prompt.contains("more than about 60 seconds"));
+        }
+    }
+
+    #[test]
+    fn compact_action_summaries_are_exact_and_legacy_markers_remain_replayable() {
+        assert_eq!(action_intent_label("edit"), Some("edit"));
+        assert_eq!(action_intent_label("plan"), Some("plan"));
+        assert_eq!(action_intent_label("done"), None);
+        assert!(action_intent_is_streaming("edi"));
+        assert!(action_intent_is_streaming("edit"));
+        assert!(!action_intent_is_streaming("editing files"));
+        assert_eq!(without_action_intent_marker("edit"), None);
+        assert_eq!(
+            without_action_intent_marker("editing files"),
+            Some("editing files")
+        );
+
         assert_eq!(
             action_intent_label("[[BORG_ACTION:plan update]]"),
             Some("plan update")
