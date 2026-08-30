@@ -1867,6 +1867,25 @@ fn live_child_limit_and_task_names_are_enforced() {
     assert!(table.reserve("SECOND", &launch()).is_err());
 }
 
+#[test]
+fn ready_children_do_not_consume_live_child_limit() {
+    let mut table = SubagentTable {
+        root_session_id: Uuid::new_v4(),
+        max_children: 1,
+        entries: HashMap::new(),
+        task_names: HashMap::new(),
+    };
+    let child = table.reserve("completed", &launch()).unwrap();
+    table
+        .entries
+        .get_mut(&child.session_id)
+        .unwrap()
+        .snapshot
+        .status = SubagentStatus::Ready;
+
+    assert!(table.reserve("new_work", &launch()).is_ok());
+}
+
 #[tokio::test]
 async fn child_messages_are_team_scoped_and_can_report_to_root() {
     let directory = tempdir().unwrap();

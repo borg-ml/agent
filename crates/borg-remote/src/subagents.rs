@@ -85,6 +85,18 @@ impl SubagentStatus {
     fn is_terminal(self) -> bool {
         matches!(self, Self::Stopped | Self::Failed)
     }
+
+    /// Whether this child currently owns one provider-execution slot.
+    ///
+    /// `Ready` is deliberately non-terminal because the same conversational
+    /// worker can accept a follow-up assignment, but an idle ready worker is
+    /// not concurrently executing and must not block an unrelated spawn.
+    fn consumes_concurrency_slot(self) -> bool {
+        matches!(
+            self,
+            Self::Starting | Self::Running | Self::WaitingForApproval
+        )
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -2298,7 +2310,7 @@ impl SubagentTable {
         let active = self
             .entries
             .values()
-            .filter(|entry| !entry.snapshot.status.is_terminal() && !entry.dormant)
+            .filter(|entry| entry.snapshot.status.consumes_concurrency_slot() && !entry.dormant)
             .count();
         if active >= self.max_children {
             bail!("subagent concurrency limit reached ({})", self.max_children);
@@ -3770,7 +3782,9 @@ impl SubagentCoordinator {
                 let active = table
                     .entries
                     .values()
-                    .filter(|entry| !entry.snapshot.status.is_terminal() && !entry.dormant)
+                    .filter(|entry| {
+                        entry.snapshot.status.consumes_concurrency_slot() && !entry.dormant
+                    })
                     .count();
                 let max_children = table.max_children;
                 let entry = table
