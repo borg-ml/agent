@@ -2214,6 +2214,8 @@ fn codex_app_server_command(
     command.args([
         "app-server",
         "--stdio",
+        "--config",
+        "agents.enabled=false",
         "--disable",
         "collaboration_modes",
         "--disable",
@@ -2272,6 +2274,7 @@ fn codex_thread_start_params(
     {
         config.extend(mcp_config.clone());
     }
+    config.insert("agents".to_string(), serde_json::json!({"enabled": false}));
     config.insert(
         "features".to_string(),
         serde_json::json!({
@@ -3925,6 +3928,10 @@ mod tests {
             Some(&Value::Bool(true))
         );
         assert_eq!(
+            codex_config.pointer("/config/agents/enabled"),
+            Some(&Value::Bool(false))
+        );
+        assert_eq!(
             codex_config.pointer("/config/features/collaboration_modes"),
             Some(&Value::Bool(false))
         );
@@ -3979,6 +3986,11 @@ mod tests {
             codex_args
                 .windows(2)
                 .any(|args| args[0] == "app-server" && args[1] == "--stdio")
+        );
+        assert!(
+            codex_args
+                .windows(2)
+                .any(|args| args[0] == "--config" && args[1] == "agents.enabled=false")
         );
         assert!(
             codex_args
