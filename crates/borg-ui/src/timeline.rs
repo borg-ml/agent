@@ -214,9 +214,6 @@ impl TimelineProjector {
             }
             SessionEventKind::ProviderEvent { kind, payload, .. } if kind == "action/preparing" => {
                 self.reasoning = None;
-                if let Some(index) = self.preparing_tool.take() {
-                    Arc::make_mut(&mut self.entries[index]).running = false;
-                }
                 let input = serde_json::json!({
                     "label": payload
                         .get("label")
@@ -224,6 +221,17 @@ impl TimelineProjector {
                         .unwrap_or("action")
                 });
                 let (title, detail) = tool_call_summary("action_preparing", &input);
+                if let Some(index) = self.preparing_tool {
+                    let entry = Arc::make_mut(&mut self.entries[index]);
+                    entry.created_at = event.created_at;
+                    entry.title = title;
+                    entry.detail = (!detail.is_empty()).then_some(detail);
+                    entry.body.clear();
+                    entry.rich_body = None;
+                    entry.running = true;
+                    entry.failed = false;
+                    return;
+                }
                 let index = self.entries.len();
                 self.entries.push(Arc::new(TimelineEntry {
                     id: format!("action:{}", event.id),
@@ -514,5 +522,27 @@ mod tests {
         assert!(!entries[0].running);
         assert_eq!(entries[1].detail.as_deref(), Some("inspect next target"));
         assert!(entries[1].running);
+    }
+
+    #[test]
+    fn consecutive_unmatched_action_preparations_reuse_the_live_entry() {
+        let session_id = Uuid::new_v4();
+        let mut projector = TimelineProjector::default();
+        for (sequence, label) in [(1, "inspect first"), (2, "inspect second")] {
+            projector.push(&SessionEvent::new(
+                session_id,
+                sequence,
+                SessionEventKind::ProviderEvent {
+                    provider: CodingProvider::Codex,
+                    kind: "action/preparing".into(),
+                    payload: serde_json::json!({"label": label}),
+                },
+            ));
+        }
+
+        let entries = projector.into_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].detail.as_deref(), Some("inspect second"));
+        assert!(entries[0].running);
     }
 }

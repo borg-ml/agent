@@ -5119,7 +5119,6 @@ impl BorgTerminal {
                             full_transcript_width,
                             tool_run_viewport_height,
                             goal_tick,
-                            tool_elapsed_tick,
                             &current_tool_elapsed,
                             local_date,
                         )
@@ -5131,7 +5130,6 @@ impl BorgTerminal {
                             full_transcript_width,
                             tool_run_viewport_height,
                             goal_tick,
-                            tool_elapsed_tick,
                             &current_tool_elapsed,
                             local_date,
                         )
@@ -5496,7 +5494,6 @@ impl BorgTerminal {
                 transcript_width,
                 tool_run_viewport_height,
                 goal_tick,
-                tool_elapsed_tick,
                 &current_tool_elapsed,
                 local_date,
             )
@@ -11239,7 +11236,6 @@ fn cached_transcript_render(
     width: usize,
     tool_run_viewport_height: usize,
     goal_tick: Option<i64>,
-    tool_elapsed_tick: Option<i64>,
     current_tool_elapsed: &[(usize, Option<String>)],
     local_date: NaiveDate,
 ) -> Arc<TranscriptRender> {
@@ -11264,6 +11260,7 @@ fn cached_transcript_render(
         .map(|(_, _, _, _, _, render)| Arc::clone(render))
         .unwrap_or_else(|| {
             let render = Arc::new(transcript.render_for_cache(width, tool_run_viewport_height));
+            let tool_elapsed_tick = transcript.tool_elapsed_cache_tick();
             *cache = Some((
                 width,
                 tool_run_viewport_height,

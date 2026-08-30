@@ -1200,17 +1200,7 @@ impl Transcript {
                 let Some(label) = payload.get("label").and_then(serde_json::Value::as_str) else {
                     return removed_entry;
                 };
-                self.mark_running_tools_backgrounded();
-                let tool_call_id = format!("action-preparing:{}", event.id);
-                self.preparing_tool = Some(tool_call_id.clone());
-                let input = serde_json::json!({"label": label});
-                self.upsert_running_tool(
-                    event,
-                    &tool_call_id,
-                    "action_preparing",
-                    &input,
-                    None,
-                );
+                self.upsert_action_preparation(event, label);
             }
             SessionEventKind::ProviderEvent { kind, payload, .. }
                 if is_live_tool_call_event(kind) =>
@@ -2128,6 +2118,37 @@ impl Transcript {
         });
         if is_edit_diff {
             self.last_edit = Some(tool_index);
+        }
+    }
+
+    fn upsert_action_preparation(&mut self, event: &SessionEvent, label: &str) {
+        let existing = self.preparing_tool.clone();
+        let tool_call_id = existing
+            .clone()
+            .unwrap_or_else(|| format!("action-preparing:{}", event.id));
+        if existing.is_none() {
+            self.mark_running_tools_backgrounded();
+            self.preparing_tool = Some(tool_call_id.clone());
+        }
+        self.upsert_running_tool(
+            event,
+            &tool_call_id,
+            "action_preparing",
+            &serde_json::json!({"label": label}),
+            None,
+        );
+        if existing.is_some()
+            && let Some(index) = self.tools.get(&tool_call_id).copied()
+            && let Some(TranscriptEntry::Tool {
+                time,
+                started_at,
+                backgrounded,
+                ..
+            }) = self.order.get_mut(index)
+        {
+            *time = local_event_time(event);
+            *started_at = event.created_at;
+            *backgrounded = false;
         }
     }
 

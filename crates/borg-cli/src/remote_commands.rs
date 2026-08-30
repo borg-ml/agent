@@ -2101,16 +2101,12 @@ async fn run_local_agent_session(
                     || terminal.is_history_page_loading()
                     || terminal.has_pending_scroll_frame()
             }) => {
-                if !tool_started_frame_hold_until
-                    .is_some_and(|until| tokio::time::Instant::now() < until)
-                {
-                    let terminal = terminal.as_mut().expect("terminal");
-                    if terminal.has_pending_scroll_frame() {
-                        terminal.advance_scroll_frame();
-                    }
-                    terminal.draw_for_activity()?;
-                    interaction_dirty = false;
+                let terminal = terminal.as_mut().expect("terminal");
+                if terminal.has_pending_scroll_frame() {
+                    terminal.advance_scroll_frame();
                 }
+                terminal.draw_for_activity()?;
+                interaction_dirty = false;
             }
             _ = idle_tick.tick(), if terminal.as_ref().is_some_and(|terminal| {
                 terminal_needs_idle_tick(
@@ -2118,15 +2114,11 @@ async fn run_local_agent_session(
                     terminal.has_blinking_cursor(),
                 )
             }) => {
-                if !tool_started_frame_hold_until
-                    .is_some_and(|until| tokio::time::Instant::now() < until)
-                {
-                    terminal
-                        .as_mut()
-                        .expect("terminal")
-                        .draw_for_activity()?;
-                    interaction_dirty = false;
-                }
+                terminal
+                    .as_mut()
+                    .expect("terminal")
+                    .draw_for_activity()?;
+                interaction_dirty = false;
             }
             _ = cache_tick.tick(), if terminal.as_ref().is_some_and(
                 crate::terminal_ui::BorgTerminal::has_cache_idle_timer

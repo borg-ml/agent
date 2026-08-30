@@ -1834,7 +1834,7 @@ fn late_completion_does_not_consume_new_action_preparation() {
 }
 
 #[test]
-fn consecutive_action_preparations_remain_distinct_and_ordered() {
+fn consecutive_unmatched_action_preparations_reuse_the_live_card() {
     let session_id = Uuid::new_v4();
     let mut transcript = Transcript::default();
     for (sequence, label) in [(1, "inspect first target"), (2, "inspect second target")] {
@@ -1849,16 +1849,17 @@ fn consecutive_action_preparations_remain_distinct_and_ordered() {
         ));
     }
 
-    assert_eq!(transcript.order.len(), 2);
+    assert_eq!(transcript.order.len(), 1);
     let rendered = transcript
         .lines(100)
         .into_iter()
         .map(|line| line.to_string())
         .collect::<Vec<_>>()
         .join("\n");
-    let first = rendered.find("inspect first target").unwrap();
-    let second = rendered.find("inspect second target").unwrap();
-    assert!(first < second, "{rendered}");
+    assert!(!rendered.contains("inspect first target"), "{rendered}");
+    assert!(rendered.contains("inspect second target"), "{rendered}");
+    assert!(!rendered.contains("Running in background"), "{rendered}");
+    assert!(transcript.has_running_tool());
 }
 
 #[test]
@@ -2117,7 +2118,6 @@ fn cached_transcript_reuses_history_for_same_width_timer_updates() {
         width,
         viewport_height,
         None,
-        Some(1),
         &labels,
         Local::now().date_naive(),
     );
@@ -2136,7 +2136,6 @@ fn cached_transcript_reuses_history_for_same_width_timer_updates() {
         width,
         viewport_height,
         None,
-        Some(2),
         &same_width,
         Local::now().date_naive(),
     );
@@ -2154,7 +2153,6 @@ fn cached_transcript_reuses_history_for_same_width_timer_updates() {
         width,
         viewport_height,
         None,
-        Some(3),
         &wider,
         Local::now().date_naive(),
     );
