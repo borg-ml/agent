@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 const PROBE_SAMPLES: usize = 24;
 const INPUT_P95_SLO: Duration = Duration::from_millis(100);
 const INPUT_MAX_SLO: Duration = Duration::from_millis(250);
+const MOUSE_INPUT_SLO: Duration = Duration::from_millis(100);
 const ACTIVE_CPU_SAMPLE: Duration = Duration::from_secs(1);
 const ACTIVE_CPU_RATIO_SLO: f64 = 0.25;
 const PTY_ROWS: usize = 40;
@@ -65,6 +66,33 @@ fn live_tui_input_latency_under_storage_pressure() {
     terminal
         .wait_for_pattern(b"live-", Duration::from_secs(10))
         .expect("wait for the active streaming screen");
+
+    let hover_latency = terminal
+        .hover_and_measure(
+            "full access",
+            "left click change permissions",
+            Duration::from_secs(2),
+        )
+        .expect("measure pointer hover paint");
+    let click_latency = terminal
+        .click_and_measure("full access", "Choose access", Duration::from_secs(2))
+        .expect("measure pointer click paint");
+    terminal
+        .write_all_retry(b"\x1b")
+        .expect("close access picker");
+    terminal
+        .wait_for_absence("Choose access", Duration::from_secs(2))
+        .expect("wait for access picker to close");
+    assert!(
+        !terminal.screen.contains("start the responsiveness stream"),
+        "wheel latency target must start outside the live-tail viewport"
+    );
+    let wheel_latency = terminal
+        .wheel_and_measure("start the responsiveness stream", Duration::from_secs(2))
+        .expect("measure wheel scroll paint");
+    terminal
+        .write_all_retry(&mouse_wheel_sequence(65, 32, 10, 10))
+        .expect("restore live-tail scroll");
 
     let cpu_before = terminal.cpu_time().expect("read initial Borg CPU time");
     let cpu_sample_started = Instant::now();
@@ -119,7 +147,7 @@ fn live_tui_input_latency_under_storage_pressure() {
     let max = *samples.last().expect("latency samples");
     let pressure_delta = io_pressure_after.saturating_sub(io_pressure_before);
     eprintln!(
-        "live TUI/storage profile: active_cpu={:.1}% samples={} input_p50={p50:?} input_p95={p95:?} input_max={max:?} pressure_bytes={} io_full_stall={:?}",
+        "live TUI/storage profile: active_cpu={:.1}% samples={} input_p50={p50:?} input_p95={p95:?} input_max={max:?} hover={hover_latency:?} click={click_latency:?} wheel={wheel_latency:?} pressure_bytes={} io_full_stall={:?}",
         cpu_ratio * 100.0,
         samples.len(),
         written,
@@ -140,6 +168,22 @@ fn live_tui_input_latency_under_storage_pressure() {
         max <= INPUT_MAX_SLO,
         "input-to-paint max exceeded {INPUT_MAX_SLO:?}: {max:?}"
     );
+    for (interaction, latency) in [
+        ("hover", hover_latency),
+        ("click", click_latency),
+        ("wheel", wheel_latency),
+    ] {
+        assert!(
+            latency <= MOUSE_INPUT_SLO,
+            "{interaction}-to-paint latency exceeded {MOUSE_INPUT_SLO:?}: {latency:?}"
+        );
+    }
+}
+
+fn mouse_wheel_sequence(button: u8, repetitions: usize, column: usize, row: usize) -> Vec<u8> {
+    format!("\x1b[<{button};{column};{row}M")
+        .repeat(repetitions)
+        .into_bytes()
 }
 
 fn spawn_streaming_provider() -> (String, mpsc::Receiver<()>, thread::JoinHandle<()>) {
@@ -334,14 +378,18 @@ impl PtyChild {
         // SAFETY: the master descriptor is independently owned by the parent process.
         let master = unsafe { File::from_raw_fd(master_fd) };
         let mut command = Command::new(executable);
+        let prompt = format!(
+            "start the responsiveness stream\n{}",
+            "wheel latency history fixture\n".repeat(120)
+        );
         command
             .args([
                 "--provider",
                 "open-ai-compatible",
                 "--model",
                 "tui-stress-model",
-                "start the responsiveness stream",
             ])
+            .arg(prompt)
             .current_dir(cwd)
             .env("HOME", cwd)
             .env("XDG_CONFIG_HOME", config_home)
@@ -460,6 +508,94 @@ impl PtyChild {
         ))
     }
 
+    fn hover_and_measure(
+        &mut self,
+        label: &str,
+        expected: &str,
+        timeout: Duration,
+    ) -> io::Result<Duration> {
+        let (row, column) = self
+            .screen
+            .position_of(label)
+            .ok_or_else(|| io::Error::other(format!("hover label not visible: {label}")))?;
+        let started = Instant::now();
+        self.write_all_retry(
+            format!("\x1b[<35;{};{}M", column + label.len() / 2 + 1, row + 1).as_bytes(),
+        )?;
+        let deadline = started + timeout;
+        while Instant::now() < deadline {
+            self.read_available(None)?;
+            if self.screen.contains(expected) {
+                return Ok(started.elapsed());
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("TUI did not paint {expected} after hovering {label}"),
+        ))
+    }
+
+    fn click_and_measure(
+        &mut self,
+        label: &str,
+        expected: &str,
+        timeout: Duration,
+    ) -> io::Result<Duration> {
+        let (row, column) = self
+            .screen
+            .position_of(label)
+            .ok_or_else(|| io::Error::other(format!("click label not visible: {label}")))?;
+        let column = column + label.len() / 2 + 1;
+        let row = row + 1;
+        let started = Instant::now();
+        self.write_all_retry(format!("\x1b[<0;{column};{row}M\x1b[<0;{column};{row}m").as_bytes())?;
+        let deadline = started + timeout;
+        while Instant::now() < deadline {
+            self.read_available(None)?;
+            if self.screen.contains(expected) {
+                return Ok(started.elapsed());
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("TUI did not paint {expected} after clicking {label}"),
+        ))
+    }
+
+    fn wheel_and_measure(&mut self, expected: &str, timeout: Duration) -> io::Result<Duration> {
+        let started = Instant::now();
+        self.write_all_retry(&mouse_wheel_sequence(64, 32, 10, 10))?;
+        let deadline = started + timeout;
+        while Instant::now() < deadline {
+            self.read_available(None)?;
+            if self.screen.contains(expected) {
+                return Ok(started.elapsed());
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("TUI did not scroll to {expected}"),
+        ))
+    }
+
+    fn wait_for_absence(&mut self, pattern: &str, timeout: Duration) -> io::Result<()> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            self.read_available(None)?;
+            if !self.screen.contains(pattern) {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("TUI did not clear {pattern}"),
+        ))
+    }
+
     fn drain_output(&mut self) -> io::Result<()> {
         while self.read_available(None)? > 0 {}
         Ok(())
@@ -555,6 +691,16 @@ impl VirtualScreen {
         self.cells
             .iter()
             .any(|row| row.windows(needle.len()).any(|window| window == needle))
+    }
+
+    fn position_of(&self, text: &str) -> Option<(usize, usize)> {
+        let needle = text.chars().collect::<Vec<_>>();
+        self.cells.iter().enumerate().find_map(|(row, cells)| {
+            cells
+                .windows(needle.len())
+                .position(|window| window == needle)
+                .map(|column| (row, column))
+        })
     }
 
     fn text(&self) -> String {

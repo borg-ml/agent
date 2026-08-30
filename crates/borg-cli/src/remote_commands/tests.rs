@@ -63,10 +63,10 @@ fn resume_retry_delay_is_capped_to_avoid_a_reconnect_storm() {
 
 #[test]
 fn interaction_fast_path_does_not_wait_for_transcript_reflow() {
-    assert!(should_draw_interaction_fast_path(true, true, true));
-    assert!(!should_draw_interaction_fast_path(true, false, true));
-    assert!(!should_draw_interaction_fast_path(false, true, true));
-    assert!(!should_draw_interaction_fast_path(true, true, false));
+    assert!(should_schedule_interaction_frame(true, true, true));
+    assert!(!should_schedule_interaction_frame(true, false, true));
+    assert!(!should_schedule_interaction_frame(false, true, true));
+    assert!(!should_schedule_interaction_frame(true, true, false));
 }
 
 #[test]
