@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -22,8 +22,8 @@ use uuid::Uuid;
 use crate::{
     AgentTurn, AgentTurnControl, AgentTurnResult, ApprovalDecision, EventActor,
     ExecutionCommandRequest, ExecutionProvider, ExecutionReadRequest, ExecutionSearchRequest,
-    ExecutionStdinRequest, HostResourceLimits, MessageStatus, PermissionMode, SessionEventKind,
-    SessionStatus, ToolMode, WorkspaceFilesystemOperation, WorkspaceFilesystemOutcome,
+    ExecutionStdinRequest, HarnessMode, HostResourceLimits, MessageStatus, PermissionMode,
+    SessionEventKind, SessionStatus, WorkspaceFilesystemOperation, WorkspaceFilesystemOutcome,
     WorkspaceFilesystemRequest,
 };
 
@@ -34,16 +34,6 @@ const DEFAULT_FILE_BYTES: u64 = 256 * 1024;
 const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const DEFAULT_COMMAND_TIMEOUT_MS: u64 = 120_000;
 const MAX_COMMAND_TIMEOUT_MS: u64 = 30 * 60 * 1000;
-const COMPACT_TOOL_NAMES: &[&str] = &[
-    "list_files",
-    "read_file",
-    "search_files",
-    "write_file",
-    "edit_file",
-    "exec_command",
-    "write_stdin",
-];
-
 #[derive(Clone)]
 pub(crate) struct NativeHarness {
     model_client: Arc<dyn NativeModelClient>,
@@ -51,7 +41,7 @@ pub(crate) struct NativeHarness {
     workflow_process_manager: crate::native_process::ProcessManager,
     reviewer_model: Option<String>,
     reviewer_effort: Option<String>,
-    tool_mode: ToolMode,
+    harness: HarnessMode,
 }
 
 impl std::fmt::Debug for NativeHarness {
@@ -63,7 +53,7 @@ impl std::fmt::Debug for NativeHarness {
             .field("workflow_process_manager", &"[session-owned processes]")
             .field("reviewer_model", &self.reviewer_model)
             .field("reviewer_effort", &self.reviewer_effort)
-            .field("tool_mode", &self.tool_mode)
+            .field("harness", &self.harness)
             .finish()
     }
 }
@@ -76,7 +66,7 @@ impl Default for NativeHarness {
             workflow_process_manager: crate::native_process::ProcessManager::default(),
             reviewer_model: None,
             reviewer_effort: None,
-            tool_mode: ToolMode::Both,
+            harness: HarnessMode::Borg,
         }
     }
 }
@@ -92,7 +82,7 @@ impl NativeHarness {
             reviewer_effort: settings.approval_reviewer_effort.clone(),
             execution_provider: Arc::new(crate::LocalExecutionProvider::new()),
             workflow_process_manager: crate::native_process::ProcessManager::default(),
-            tool_mode: settings.tool_mode,
+            harness: settings.harness,
         }
     }
 
@@ -136,6 +126,12 @@ impl NativeHarness {
         turn.agent_tools
             .configure_execution_provider(self.execution_provider.clone());
         let session_store = turn.agent_tools.session_store();
+        let mut command_environment = turn.agent_mcp_server.env.clone();
+        command_environment.insert(
+            "BORG_AGENT_CLI".to_string(),
+            turn.agent_mcp_server.command.clone(),
+        );
+        command_environment.insert("BORG_AGENT_TOOL_APPROVED".to_string(), "1".to_string());
         let runtime = NativeToolRuntime::start(NativeToolRuntimeConfig {
             session_id: turn.session_id,
             root: turn.cwd.clone(),
@@ -145,48 +141,26 @@ impl NativeHarness {
             extension_skill_roots: turn.extension_skill_roots.clone(),
             execution_provider: turn.agent_tools.execution_provider(),
             session_store,
-            tool_mode: self.tool_mode,
+            harness: self.harness,
+            command_environment,
             workflow_process_manager: self.workflow_process_manager.clone(),
         })
         .await?;
         let tools = runtime.tool_definitions()?;
         let mut messages = Vec::with_capacity(turn.conversation.len().saturating_add(3));
-        let mut system_prompt = match self.tool_mode {
-            ToolMode::Compact => super::agent::COMPACT_CODING_SYSTEM_PROMPT.to_string(),
-            ToolMode::Native | ToolMode::Code | ToolMode::Both => {
-                super::agent::CODING_SYSTEM_PROMPT.to_string()
-            }
-        };
-        match self.tool_mode {
-            ToolMode::Compact => system_prompt.push_str(
-                "\n\nUse the available workspace tools directly to inspect, edit, and verify the project. ",
-            ),
-            ToolMode::Native => system_prompt.push_str(
-                "\n\nUse `runtime_exec` for loops, filtering, transformations, and persistent programmatic work. It is trusted user-authority execution, not a security sandbox. ",
-            ),
-            ToolMode::Code => system_prompt.push_str(
-                "\n\nUse `run_code` for loops, filtering, transformations, and batches of Borg calls. It is trusted user-authority execution, not a security sandbox. ",
-            ),
-            ToolMode::Both => system_prompt.push_str(
-                "\n\nUse `run_code` for loops, filtering, transformations, and batches of Borg calls; use `runtime_exec` when you specifically need its persistent namespace. Both are trusted user-authority execution, not security sandboxes. ",
-            ),
-        }
-        if !matches!(self.tool_mode, ToolMode::Compact) {
-            system_prompt.push_str(
-                "The runtime's `borg` bridge exposes bounded filesystem, process, history, MCP, workflow, and collaboration operations. ",
-            );
-            system_prompt.push_str(
-                "Inside the persistent runtime, `borg.environment(extension_id, server)` discovers and calls the extension's long-lived MCP environment, `await borg.rlm(task)` admits a subagent and returns a handle, and `borg.harness` manages bounded prompt, memory, skill, and subagent entries that are injected into later turns. ",
-            );
-            system_prompt.push_str(
-                "Use `query_history` (or `borg.history(...)` inside Python) to retrieve exact, ",
-            );
-            system_prompt.push_str(
-                "typed, lexical, or regex evidence from the lossless journal when compacted context is insufficient. Use `history_index` or `borg.history_index(...)` to page the full normalized log and build a task-specific retrieval or BorgSearch adapter; use `borg.semantic_search(...)` when the scoped Web BorgSearch MCP service is the right candidate retriever; persist mature adapters with `create_retrieval_adapter`, test them with `borg.test_retrieval_adapter(...)`, and resolve every index hit back through canonical history. ",
-            );
-        }
-        if matches!(self.tool_mode, ToolMode::Code | ToolMode::Both) {
-            system_prompt.push_str(&code_mode_prompt(&runtime.code_mode_catalog()?));
+        let mut system_prompt = super::agent::CODING_SYSTEM_PROMPT.to_string();
+        match self.harness {
+            HarnessMode::Borg => system_prompt.push_str(concat!(
+                "\n\nBorg provides one shell-first execution surface through `exec`. ",
+                "Use shell commands for orchestration and invoke the language or installed runtime that best fits the problem, such as TypeScript/JavaScript for web and JSON work or Python for data and scientific work. ",
+                "This is trusted user-authority execution, not a security sandbox. ",
+                "Use `borg tools` to discover Borg, Blu, plugin, history, workflow, and collaboration capabilities on demand, and `borg call NAME JSON` to invoke one. ",
+                "Inside commands, `$BORG_AGENT_CLI` is the exact Borg executable when `borg` is not on PATH. Keep intermediate data in files, pipes, or programs and return only useful results."
+            )),
+            HarnessMode::Native => system_prompt.push_str(concat!(
+                "\n\nUse the available Borg capabilities directly. `exec_command` runs trusted user-authority shell commands and can invoke any installed language runtime. ",
+                "Use `query_history` when compacted context is insufficient."
+            )),
         }
         system_prompt.push_str(&runtime.context.prompt_appendix());
         if !turn.system_prompt_appendix.is_empty() {
@@ -811,7 +785,8 @@ struct NativeToolRuntimeConfig {
     extension_skill_roots: Vec<PathBuf>,
     execution_provider: Arc<dyn ExecutionProvider>,
     session_store: Option<crate::SqliteSessionStore>,
-    tool_mode: ToolMode,
+    harness: HarnessMode,
+    command_environment: BTreeMap<String, String>,
     workflow_process_manager: crate::native_process::ProcessManager,
 }
 
@@ -825,7 +800,8 @@ struct NativeToolRuntime {
     workflow_process_manager: crate::native_process::ProcessManager,
     session_store: Option<crate::SqliteSessionStore>,
     context: crate::native_context::NativeContext,
-    tool_mode: ToolMode,
+    harness: HarnessMode,
+    command_environment: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -861,36 +837,22 @@ impl NativeToolRuntime {
             workflow_process_manager: config.workflow_process_manager,
             session_store: config.session_store,
             context,
-            tool_mode: config.tool_mode,
+            harness: config.harness,
+            command_environment: config.command_environment,
         })
     }
 
     fn tool_definitions(&self) -> Result<Vec<ModelToolDefinition>> {
-        let mut definitions = match self.tool_mode {
-            ToolMode::Compact => Self::compact_tool_catalog()?,
-            ToolMode::Native | ToolMode::Code | ToolMode::Both => self.code_mode_catalog()?,
+        let mut definitions = match self.harness {
+            HarnessMode::Borg => vec![exec_tool_definition()?],
+            HarnessMode::Native => self.native_tool_catalog()?,
         };
-        if matches!(self.tool_mode, ToolMode::Code) {
-            return Ok(vec![run_code_tool_definition()?]);
-        }
-        if matches!(self.tool_mode, ToolMode::Both) {
-            definitions.push(run_code_tool_definition()?);
-        }
         sort_tool_definitions(&mut definitions);
         validate_tool_definitions(&definitions)?;
         Ok(definitions)
     }
 
-    fn compact_tool_catalog() -> Result<Vec<ModelToolDefinition>> {
-        let mut definitions = compact_tool_specs()
-            .map(|spec| ModelToolDefinition::from_mcp_spec(&spec).map_err(anyhow::Error::msg))
-            .collect::<Result<Vec<_>>>()?;
-        sort_tool_definitions(&mut definitions);
-        validate_tool_definitions(&definitions)?;
-        Ok(definitions)
-    }
-
-    fn code_mode_catalog(&self) -> Result<Vec<ModelToolDefinition>> {
+    fn native_tool_catalog(&self) -> Result<Vec<ModelToolDefinition>> {
         let mut specs = builtin_tool_specs();
         if self.context.has_skills() {
             specs.push(self.context.skill_tool_spec());
@@ -971,53 +933,39 @@ impl NativeToolRuntime {
             }
             "exec_command" => {
                 let args: ExecCommandArgs = serde_json::from_value(arguments)?;
-                Ok(serde_json::to_value(
-                    self.execution_provider
-                        .command(ExecutionCommandRequest {
-                            owner_session_id: self.session_id,
-                            root: self.root.clone(),
-                            command: args.cmd,
-                            workdir: args.workdir,
-                            yield_time_ms: args.yield_time_ms,
-                            max_output_tokens: args.max_output_tokens,
-                            timeout_ms: args
-                                .timeout_ms
-                                .unwrap_or(DEFAULT_COMMAND_TIMEOUT_MS)
-                                .clamp(1, MAX_COMMAND_TIMEOUT_MS),
-                            journal: self.session_store.clone(),
-                        })
-                        .await?,
-                )?)
+                self.exec_command(args).await
             }
             "write_stdin" => {
                 let args: WriteStdinArgs = serde_json::from_value(arguments)?;
-                Ok(serde_json::to_value(
-                    self.execution_provider
-                        .write_stdin(ExecutionStdinRequest {
-                            owner_session_id: self.session_id,
-                            process_id: args.session_id,
-                            chars: args.chars,
-                            terminate: args.terminate.unwrap_or(false),
+                self.write_stdin(args).await
+            }
+            "exec" => {
+                let args: ExecArgs = serde_json::from_value(arguments)?;
+                match (args.cmd.as_deref(), args.session_id) {
+                    (Some(cmd), None) => {
+                        ensure_process_fields_absent(&args)?;
+                        self.exec_command(ExecCommandArgs {
+                            cmd: cmd.to_string(),
+                            workdir: args.workdir,
                             yield_time_ms: args.yield_time_ms,
                             max_output_tokens: args.max_output_tokens,
+                            timeout_ms: args.timeout_ms,
                         })
-                        .await?,
-                )?)
-            }
-            "run_code" => {
-                let args: RunCodeArgs = serde_json::from_value(arguments)?;
-                self.agent_tools
-                    .call_with_workflow_control(
-                        "runtime_exec",
-                        json!({
-                            "runtime": args.runtime,
-                            "code": args.code,
-                            "timeout_ms": args.timeout_ms,
-                        }),
-                        workflow_approved,
-                        cancellation,
-                    )
-                    .await
+                        .await
+                    }
+                    (None, Some(session_id)) => {
+                        ensure_command_fields_absent(&args)?;
+                        self.write_stdin(WriteStdinArgs {
+                            session_id,
+                            chars: args.chars,
+                            yield_time_ms: args.yield_time_ms,
+                            max_output_tokens: args.max_output_tokens,
+                            terminate: args.terminate,
+                        })
+                        .await
+                    }
+                    _ => bail!("exec requires exactly one of `cmd` or `session_id`"),
+                }
             }
             "run_blu_workflow" => {
                 let args: RunBluWorkflowArgs = serde_json::from_value(arguments)?;
@@ -1043,6 +991,42 @@ impl NativeToolRuntime {
                     .await
             }
         }
+    }
+
+    async fn exec_command(&self, args: ExecCommandArgs) -> Result<Value> {
+        Ok(serde_json::to_value(
+            self.execution_provider
+                .command(ExecutionCommandRequest {
+                    owner_session_id: self.session_id,
+                    root: self.root.clone(),
+                    command: args.cmd,
+                    workdir: args.workdir,
+                    yield_time_ms: args.yield_time_ms,
+                    max_output_tokens: args.max_output_tokens,
+                    timeout_ms: args
+                        .timeout_ms
+                        .unwrap_or(DEFAULT_COMMAND_TIMEOUT_MS)
+                        .clamp(1, MAX_COMMAND_TIMEOUT_MS),
+                    journal: self.session_store.clone(),
+                    environment: self.command_environment.clone(),
+                })
+                .await?,
+        )?)
+    }
+
+    async fn write_stdin(&self, args: WriteStdinArgs) -> Result<Value> {
+        Ok(serde_json::to_value(
+            self.execution_provider
+                .write_stdin(ExecutionStdinRequest {
+                    owner_session_id: self.session_id,
+                    process_id: args.session_id,
+                    chars: args.chars,
+                    terminate: args.terminate.unwrap_or(false),
+                    yield_time_ms: args.yield_time_ms,
+                    max_output_tokens: args.max_output_tokens,
+                })
+                .await?,
+        )?)
     }
 
     async fn run_blu_workflow(
@@ -1408,9 +1392,12 @@ async fn execute_tool(
     usage: &mut ProviderCallUsage,
 ) -> Result<(String, bool, Option<NativeSteer>)> {
     let external_mcp = runtime.mcp.contains(&tool_call.function.name);
-    if (tool_call.function.name == "exec_command"
+    let shell_command = match tool_call.function.name.as_str() {
+        "exec_command" | "exec" => input.get("cmd").and_then(Value::as_str).map(str::to_string),
+        _ => None,
+    };
+    if (shell_command.is_some()
         || tool_call.function.name == "runtime_exec"
-        || tool_call.function.name == "run_code"
         || matches!(
             tool_call.function.name.as_str(),
             "run_workflow" | "run_blu_workflow" | "run_blu_extension"
@@ -1418,21 +1405,11 @@ async fn execute_tool(
         || external_mcp)
         && runtime.permission != PermissionMode::FullAccess
     {
-        let command = (tool_call.function.name == "exec_command").then(|| {
-            input
-                .get("cmd")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string()
-        });
-        let (title, detail) = if let Some(command) = command.as_deref() {
+        let (title, detail) = if let Some(command) = shell_command.as_deref() {
             ("Run command", command.to_string())
         } else {
             (
-                if matches!(
-                    tool_call.function.name.as_str(),
-                    "runtime_exec" | "run_code"
-                ) {
+                if tool_call.function.name == "runtime_exec" {
                     "Use persistent runtime"
                 } else {
                     "Use workflow or external tool"
@@ -1447,7 +1424,7 @@ async fn execute_tool(
         let decision = match runtime.permission {
             PermissionMode::FullAccess => ApprovalDecision::AllowOnce,
             PermissionMode::Manual => {
-                request_tool_approval(title, &detail, command, events, controls).await?
+                request_tool_approval(title, &detail, shell_command, events, controls).await?
             }
             PermissionMode::Auto => {
                 match review_tool_automatically(
@@ -1486,7 +1463,7 @@ async fn execute_tool(
                         request_tool_approval(
                             "Automatic review unavailable",
                             &fallback_detail,
-                            command,
+                            shell_command,
                             events,
                             controls,
                         )
@@ -1510,12 +1487,12 @@ async fn execute_tool(
 
     let workflow_approved = matches!(
         tool_call.function.name.as_str(),
-        "run_workflow" | "run_blu_workflow" | "run_blu_extension" | "runtime_exec" | "run_code"
+        "run_workflow" | "run_blu_workflow" | "run_blu_extension" | "runtime_exec"
     ) && runtime.permission != PermissionMode::FullAccess;
     let call_cancel = (external_mcp
         || matches!(
             tool_call.function.name.as_str(),
-            "run_workflow" | "run_blu_workflow" | "run_blu_extension" | "runtime_exec" | "run_code"
+            "run_workflow" | "run_blu_workflow" | "run_blu_extension" | "runtime_exec"
         ))
     .then(CancellationToken::new);
     let call = runtime.call(
@@ -2094,35 +2071,38 @@ fn builtin_tool_specs() -> Vec<Value> {
     ]
 }
 
-fn compact_tool_specs() -> impl Iterator<Item = Value> {
-    builtin_tool_specs().into_iter().filter(|spec| {
-        spec.get("name")
-            .and_then(Value::as_str)
-            .map(|name| COMPACT_TOOL_NAMES.contains(&name))
-            .unwrap_or(false)
-    })
-}
-
-fn run_code_tool_definition() -> Result<ModelToolDefinition> {
+fn exec_tool_definition() -> Result<ModelToolDefinition> {
     ModelToolDefinition::new(
-        "run_code",
-        "Run Python, JavaScript, or TypeScript against the generated Borg SDK. Use this for loops, filtering, transformations, or batches of tool calls.",
+        "exec",
+        "Run a shell command, or poll, interact with, or terminate a running process. Shell commands may invoke any installed language runtime. Use `borg tools` and `borg call NAME JSON` inside the shell for Borg and Blu capabilities.",
         json!({
             "type": "object",
             "properties": {
-                "runtime": {
-                    "type": "string",
-                    "enum": ["python", "javascript", "typescript"],
-                    "default": "python"
+                "cmd": { "type": "string", "minLength": 1, "maxLength": 65536 },
+                "session_id": { "type": "string", "format": "uuid" },
+                "chars": { "type": "string" },
+                "terminate": { "type": "boolean", "default": false },
+                "workdir": { "type": "string" },
+                "yield_time_ms": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 30000
                 },
-                "code": { "type": "string", "minLength": 1, "maxLength": 524288 },
+                "max_output_tokens": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 64000
+                },
                 "timeout_ms": {
                     "type": "integer",
                     "minimum": 1,
                     "maximum": MAX_COMMAND_TIMEOUT_MS
                 }
             },
-            "required": ["code"],
+            "oneOf": [
+                { "required": ["cmd"] },
+                { "required": ["session_id"] }
+            ],
             "additionalProperties": false
         }),
     )
@@ -2141,37 +2121,6 @@ fn validate_tool_definitions(definitions: &[ModelToolDefinition]) -> Result<()> 
 
 fn sort_tool_definitions(definitions: &mut [ModelToolDefinition]) {
     definitions.sort_by(|left, right| left.name.cmp(&right.name));
-}
-
-fn code_mode_prompt(catalog: &[ModelToolDefinition]) -> String {
-    let mut prompt = String::from(concat!(
-        "\n\nCode Mode SDK (generated from this session's tool catalog):\n",
-        "- `run_code` accepts Python, JavaScript, or TypeScript.\n",
-        "- Python calls are synchronous: `borg.tool(name, arguments)`; JavaScript/TypeScript calls are async: `await borg.tool(name, arguments)`.\n",
-        "- `borg.read`, `borg.search`, `borg.list`, `borg.write`, `borg.edit`, `borg.exec`, and `borg.tool` are bounded host calls. `borg.mcp` reaches configured MCP tools.\n",
-        "- Keep intermediate data inside the runtime and return only the compact conclusion or selected records. The runtime namespace persists across calls.\n",
-        "Available tool names and schemas:\n",
-    ));
-    for definition in catalog {
-        if definition.name == "runtime_exec" {
-            continue;
-        }
-        let schema =
-            serde_json::to_string(&definition.input_schema).unwrap_or_else(|_| "{}".into());
-        prompt.push_str(&format!(
-            "- `{}`: {}; schema={}\n",
-            definition.name,
-            bounded_text(definition.description.clone(), 240),
-            schema
-        ));
-        if prompt.len() >= 48 * 1024 {
-            prompt.push_str(
-                "- (remaining tool schemas omitted; use borg.mcp_tools() or the native tool catalog when needed)\n",
-            );
-            break;
-        }
-    }
-    prompt
 }
 
 fn tool(name: &str, description: &str, input_schema: Value) -> Value {
@@ -2235,20 +2184,39 @@ struct ExecCommandArgs {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ExecArgs {
+    cmd: Option<String>,
+    session_id: Option<Uuid>,
+    chars: Option<String>,
+    terminate: Option<bool>,
+    workdir: Option<String>,
+    yield_time_ms: Option<u64>,
+    max_output_tokens: Option<usize>,
+    timeout_ms: Option<u64>,
+}
+
+fn ensure_process_fields_absent(args: &ExecArgs) -> Result<()> {
+    if args.chars.is_some() || args.terminate.is_some() {
+        bail!("exec command calls do not accept `chars` or `terminate`");
+    }
+    Ok(())
+}
+
+fn ensure_command_fields_absent(args: &ExecArgs) -> Result<()> {
+    if args.workdir.is_some() || args.timeout_ms.is_some() {
+        bail!("exec process calls do not accept `workdir` or `timeout_ms`");
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WriteStdinArgs {
     session_id: Uuid,
     chars: Option<String>,
     yield_time_ms: Option<u64>,
     max_output_tokens: Option<usize>,
     terminate: Option<bool>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RunCodeArgs {
-    runtime: Option<String>,
-    code: String,
-    timeout_ms: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -2414,50 +2382,22 @@ mod tests {
     }
 
     #[test]
-    fn code_mode_has_one_bounded_dispatch_tool() {
-        let definition = run_code_tool_definition().expect("run_code schema is valid");
-        assert_eq!(definition.name, "run_code");
+    fn borg_harness_has_one_polyglot_exec_tool() {
+        let definition = exec_tool_definition().expect("exec schema is valid");
+        assert_eq!(definition.name, "exec");
         assert_eq!(
-            definition.input_schema["properties"]["code"]["type"],
+            definition.input_schema["properties"]["cmd"]["type"],
             "string"
         );
-        assert_eq!(
-            definition.input_schema["properties"]["runtime"]["enum"],
-            json!(["python", "javascript", "typescript"])
+        assert!(
+            definition.input_schema["properties"]
+                .get("runtime")
+                .is_none()
         );
-    }
-
-    #[test]
-    fn code_mode_catalog_prompt_is_generated_from_visible_tools() {
-        let catalog = vec![
-            ModelToolDefinition::new("read_file", "Read a file", json!({"type": "object"}))
-                .unwrap(),
-            ModelToolDefinition::new(
-                "runtime_exec",
-                "Low-level runtime",
-                json!({"type": "object"}),
-            )
-            .unwrap(),
-        ];
-        let prompt = code_mode_prompt(&catalog);
-        assert!(prompt.contains("`read_file`"));
-        assert!(prompt.contains("\"type\":\"object\""));
-        assert!(!prompt.contains("`runtime_exec`"));
-    }
-
-    #[test]
-    fn compact_catalog_is_limited_to_workspace_coding_tools() {
-        let names = compact_tool_specs()
-            .filter_map(|spec| spec.get("name").and_then(Value::as_str).map(str::to_string))
-            .collect::<Vec<_>>();
         assert_eq!(
-            names,
-            COMPACT_TOOL_NAMES
-                .iter()
-                .map(|name| (*name).to_string())
-                .collect::<Vec<_>>()
+            definition.input_schema["oneOf"].as_array().unwrap().len(),
+            2
         );
-        assert!(!COMPACT_TOOL_NAMES.contains(&"run_blu_workflow"));
     }
 
     #[test]
@@ -2613,10 +2553,7 @@ mod tests {
             tool_execution_class("read_file"),
             ToolExecutionClass::ReadOnly
         );
-        assert_eq!(
-            tool_execution_class("exec_command"),
-            ToolExecutionClass::Stateful
-        );
+        assert_eq!(tool_execution_class("exec"), ToolExecutionClass::Stateful);
         assert_eq!(
             tool_execution_class("update_plan"),
             ToolExecutionClass::Stateful

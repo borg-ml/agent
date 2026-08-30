@@ -260,10 +260,10 @@ pub(crate) struct CapabilityConfig {
     pub(crate) web_relay: bool,
     pub(crate) telemetry: bool,
     pub(crate) auto_resume_usage_limits: bool,
-    /// Native-harness tool presentation. `compact` is the focused coding
-    /// surface; `both` preserves the legacy catalog while adding programmatic
-    /// dispatch.
-    pub(crate) tool_mode: borg_remote::ToolMode,
+    /// Model-facing harness. `borg` is the curated shell-first surface;
+    /// `native` is the explicit direct-tool fallback.
+    #[serde(alias = "tool_mode")]
+    pub(crate) harness: borg_remote::HarnessMode,
 }
 
 impl Default for CapabilityConfig {
@@ -278,7 +278,7 @@ impl Default for CapabilityConfig {
             web_relay: true,
             telemetry: false,
             auto_resume_usage_limits: true,
-            tool_mode: borg_remote::ToolMode::Both,
+            harness: borg_remote::HarnessMode::Borg,
         }
     }
 }
@@ -1178,31 +1178,34 @@ reasoning_format = "deepseek"
         assert_eq!(config.extensions.default_access, ExtensionAccess::Trusted);
         assert_eq!(config.extensions.project_access, ExtensionAccess::Sandboxed);
         assert_eq!(config.extensions.native_access, NativeAccessPolicy::Prompt);
-        assert_eq!(config.capabilities.tool_mode, borg_remote::ToolMode::Both);
+        assert_eq!(config.capabilities.harness, borg_remote::HarnessMode::Borg);
     }
 
     #[test]
-    fn native_tool_mode_is_configurable_without_changing_other_capabilities() {
+    fn native_harness_is_configurable_without_changing_other_capabilities() {
         let config: AgentConfig = toml::from_str(
             r#"
             [capabilities]
-            tool_mode = "code"
-            "#,
-        )
-        .unwrap();
-        assert_eq!(config.capabilities.tool_mode, borg_remote::ToolMode::Code);
-        assert!(config.capabilities.subagents);
-
-        let compact: AgentConfig = toml::from_str(
-            r#"
-            [capabilities]
-            tool_mode = "compact"
+            harness = "native"
             "#,
         )
         .unwrap();
         assert_eq!(
-            compact.capabilities.tool_mode,
-            borg_remote::ToolMode::Compact
+            config.capabilities.harness,
+            borg_remote::HarnessMode::Native
+        );
+        assert!(config.capabilities.subagents);
+
+        let migrated: AgentConfig = toml::from_str(
+            r#"
+            [capabilities]
+            tool_mode = "both"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            migrated.capabilities.harness,
+            borg_remote::HarnessMode::Borg
         );
     }
 

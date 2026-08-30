@@ -20,8 +20,8 @@ use tokio::sync::{Mutex, mpsc};
 use uuid::Uuid;
 
 use crate::{
-    CodingProvider, EventActor, MessageStatus, PermissionMode, ResponseLanguage, SessionEventKind,
-    SessionStatus, ToolMode, WorkflowRuntime, native_harness::NativeHarness,
+    CodingProvider, EventActor, HarnessMode, MessageStatus, PermissionMode, ResponseLanguage,
+    SessionEventKind, SessionStatus, WorkflowRuntime, native_harness::NativeHarness,
 };
 
 pub(crate) const CODING_SYSTEM_PROMPT: &str = "\
@@ -60,20 +60,6 @@ Immediately before every tool call, emit exactly one standalone narration item i
 `[[BORG_ACTION:verb specific target]]`, choosing `verb` from `inspect`, `edit`, `run`, `test`, `search`, \
 `plan`, `wait`, or `diagnose` and naming the concrete target in a few lowercase words. Then generate the \
 tool call. Do not include any other text in the action-summary item.";
-
-pub(crate) const COMPACT_CODING_SYSTEM_PROMPT: &str = "\
-You are Borg, a focused coding agent working in the user's local project. \
-Inspect the workspace, make the smallest requested changes, and verify the result. \
-For any request that requires tools, first send the user a concise visible progress update before \
-emitting an action summary or calling a tool. While work is ongoing, send further visible progress \
-updates at meaningful milestones and do not leave the user without one for more than about 60 seconds. \
-Use the available workspace tools directly, preserve user work, and report what you verified. \
-Never invoke provider-native delegation tools such as `subAgentActivity` or `collabAgentToolCall`; \
-delegate only through `mcp__borg_agent__spawn_agent`. \
-Progress updates are separate from action summaries. Immediately before every tool call, emit exactly one standalone \
-narration item in the form `[[BORG_ACTION:verb specific target]]`, choosing `verb` from `inspect`, `edit`, \
-`run`, `test`, `search`, `plan`, `wait`, or `diagnose` and naming the concrete target in a few lowercase \
-words. Then generate the tool call and include no other text in the action-summary item.";
 
 const ACTION_SUMMARIES: &[&str] = &[
     "inspect", "edit", "run", "test", "search", "plan", "wait", "diagnose",
@@ -642,8 +628,8 @@ fn subscription_lifecycle_key(
 pub struct LocalAgentSettings {
     pub approval_reviewer_model: Option<String>,
     pub approval_reviewer_effort: Option<String>,
-    /// Presentation mode for the native harness tool catalog.
-    pub tool_mode: ToolMode,
+    /// Model-facing harness selected before the session starts.
+    pub harness: HarnessMode,
     /// Host-local snapshot of named OpenAI-compatible routes. Secrets stay in
     /// memory and are never part of LaunchSession or durable events.
     pub configured_model_gateways: BTreeMap<String, borg_provider::provider::ModelGateway>,
@@ -2363,23 +2349,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn coding_prompts_require_visible_progress_before_specific_action_summaries() {
-        for prompt in [CODING_SYSTEM_PROMPT, COMPACT_CODING_SYSTEM_PROMPT] {
-            let progress = prompt
-                .find("first send the user a concise visible progress update")
-                .expect("prompt requires an initial visible progress update");
-            let summary = prompt
-                .find("Immediately before every tool call")
-                .expect("prompt requires a tool action summary");
-            assert!(progress < summary);
-            assert!(prompt.contains("Progress updates are separate from action summaries"));
-            assert!(prompt.contains("Never invoke provider-native delegation tools"));
-            assert!(prompt.contains("`mcp__borg_agent__spawn_agent`"));
-            assert!(prompt.contains("`[[BORG_ACTION:verb specific target]]`"));
-            assert!(prompt.contains("`inspect`, `edit`, `run`, `test`"));
-            assert!(prompt.contains("naming the concrete target"));
-            assert!(prompt.contains("more than about 60 seconds"));
-        }
+    fn coding_prompt_requires_visible_progress_before_specific_action_summaries() {
+        let progress = CODING_SYSTEM_PROMPT
+            .find("first send the user a concise visible progress update")
+            .expect("prompt requires an initial visible progress update");
+        let summary = CODING_SYSTEM_PROMPT
+            .find("Immediately before every tool call")
+            .expect("prompt requires a tool action summary");
+        assert!(progress < summary);
+        assert!(
+            CODING_SYSTEM_PROMPT.contains("Progress updates are separate from action summaries")
+        );
+        assert!(CODING_SYSTEM_PROMPT.contains("Never invoke provider-native delegation tools"));
+        assert!(CODING_SYSTEM_PROMPT.contains("`mcp__borg_agent__spawn_agent`"));
+        assert!(CODING_SYSTEM_PROMPT.contains("`[[BORG_ACTION:verb specific target]]`"));
+        assert!(CODING_SYSTEM_PROMPT.contains("`inspect`, `edit`, `run`, `test`"));
+        assert!(CODING_SYSTEM_PROMPT.contains("naming the concrete target"));
+        assert!(CODING_SYSTEM_PROMPT.contains("more than about 60 seconds"));
     }
 
     #[test]

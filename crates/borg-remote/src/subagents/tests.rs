@@ -2554,7 +2554,6 @@ fn every_execution_lane_exposes_the_same_borg_control_plane() {
         "create_extension",
         "list_workflows",
         "run_workflow",
-        "runtime_exec",
         "query_history",
         "history_index",
     ];
@@ -2574,6 +2573,10 @@ fn every_execution_lane_exposes_the_same_borg_control_plane() {
                 "{provider:?} lane is missing Borg tool {required}"
             );
         }
+        assert!(
+            !names.iter().any(|name| name == "runtime_exec"),
+            "{provider:?} lane leaked the internal persistent runtime selector"
+        );
     }
 }
 

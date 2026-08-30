@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -102,6 +102,7 @@ impl Default for ProcessManager {
 }
 
 impl ProcessManager {
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn exec(
         &self,
@@ -114,7 +115,34 @@ impl ProcessManager {
         timeout_ms: u64,
         journal: Option<SqliteSessionStore>,
     ) -> Result<ProcessSnapshot> {
-        self.exec_with_cancel(
+        self.exec_with_environment(
+            owner_session_id,
+            root,
+            command,
+            workdir,
+            yield_time_ms,
+            max_output_tokens,
+            timeout_ms,
+            journal,
+            &BTreeMap::new(),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn exec_with_environment(
+        &self,
+        owner_session_id: Uuid,
+        root: &Path,
+        command: String,
+        workdir: Option<&str>,
+        yield_time_ms: Option<u64>,
+        max_output_tokens: Option<usize>,
+        timeout_ms: u64,
+        journal: Option<SqliteSessionStore>,
+        environment: &BTreeMap<String, String>,
+    ) -> Result<ProcessSnapshot> {
+        self.exec_with_cancel_and_environment(
             owner_session_id,
             root,
             command,
@@ -124,6 +152,7 @@ impl ProcessManager {
             timeout_ms,
             journal,
             CancellationToken::new(),
+            environment,
         )
         .await
     }
@@ -140,6 +169,35 @@ impl ProcessManager {
         timeout_ms: u64,
         journal: Option<SqliteSessionStore>,
         cancel: CancellationToken,
+    ) -> Result<ProcessSnapshot> {
+        self.exec_with_cancel_and_environment(
+            owner_session_id,
+            root,
+            command,
+            workdir,
+            yield_time_ms,
+            max_output_tokens,
+            timeout_ms,
+            journal,
+            cancel,
+            &BTreeMap::new(),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn exec_with_cancel_and_environment(
+        &self,
+        owner_session_id: Uuid,
+        root: &Path,
+        command: String,
+        workdir: Option<&str>,
+        yield_time_ms: Option<u64>,
+        max_output_tokens: Option<usize>,
+        timeout_ms: u64,
+        journal: Option<SqliteSessionStore>,
+        cancel: CancellationToken,
+        environment: &BTreeMap<String, String>,
     ) -> Result<ProcessSnapshot> {
         ensure!(!cancel.is_cancelled(), "process execution was cancelled");
         let cwd = resolve_workdir(root, workdir)?;
@@ -167,6 +225,7 @@ impl ProcessManager {
         let process_id = Uuid::new_v4();
         let mut process = shell_command(&command);
         crate::process_environment::configure_host_child_environment(&mut process);
+        process.envs(environment);
         process
             .current_dir(&cwd)
             .stdin(Stdio::piped())
@@ -1082,6 +1141,33 @@ mod tests {
             completed.stdout.contains("got:hello"),
             "unexpected process result: {completed:?}"
         );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn process_inherits_explicit_session_capabilities() {
+        let root = tempfile::tempdir().expect("workspace");
+        let manager = ProcessManager::default();
+        let environment = BTreeMap::from([(
+            "BORG_AGENT_TOOL_SOCKET".to_string(),
+            "/tmp/borg-session.sock".to_string(),
+        )]);
+        let result = manager
+            .exec_with_environment(
+                Uuid::new_v4(),
+                root.path(),
+                "printf %s \"$BORG_AGENT_TOOL_SOCKET\"".to_string(),
+                None,
+                Some(2_000),
+                Some(100),
+                10_000,
+                None,
+                &environment,
+            )
+            .await
+            .expect("command");
+
+        assert_eq!(result.stdout, "/tmp/borg-session.sock");
     }
 
     #[tokio::test]

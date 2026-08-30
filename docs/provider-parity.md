@@ -5,8 +5,8 @@ Parity is checked at the boundaries where regressions matter:
 
 | Contract | Codex app server | Claude Agent SDK | Native harness |
 | --- | --- | --- | --- |
-| Borg goal/plan/LSP/settings/plugin tools | external MCP catalog | external MCP catalog | direct dispatcher catalog |
-| Tool call/result normalization | `ChatStreamEvent` mapper | `ChatStreamEvent` mapper | native tool runtime |
+| Borg goal/plan/LSP/settings/plugin tools | external MCP catalog | external MCP catalog | `borg tools` / `borg call` over the dispatcher |
+| Tool call/result normalization | `ChatStreamEvent` mapper | `ChatStreamEvent` mapper | one shell-first `exec` boundary |
 | Steering | active-turn control | active-turn control | active model-round control |
 | Queue/recovery | durable session actor | durable session actor | durable session actor + replay |
 | Usage/context projection | normalized provider usage | normalized provider usage | normalized model usage |
@@ -20,8 +20,8 @@ same billing buckets. Session tests verify that all active-turn lanes share
 steering and queue semantics, while recovery/replay tests exercise FIFO queue
 admission, compaction summaries, and native tool-round boundaries. Catalog
 tests ensure the same Borg control plane is available whether tools are
-transported over MCP or called in-process by the native harness. Live provider
-smoke tests remain opt-in and are not required for the deterministic parity
+transported over MCP or reached through the session-scoped Borg CLI. Live
+provider smoke tests remain opt-in and are not required for the deterministic parity
 suite because they depend on credentials, network availability, and mutable
 provider behavior.
 

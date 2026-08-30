@@ -255,20 +255,41 @@ pub enum PermissionMode {
     Manual,
 }
 
-/// How a native harness presents its tools to the model.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+/// The model-facing harness selected before a native-provider session starts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(export)]
-pub enum ToolMode {
-    /// Expose only the focused workspace coding tools with a compact prompt.
-    Compact,
-    /// Expose the ordinary one-call-per-tool catalog.
-    Native,
-    /// Expose one `run_code` tool with the generated Borg SDK in the prompt.
-    Code,
-    /// Expose both ordinary tools and `run_code`.
+pub enum HarnessMode {
+    /// Borg's curated shell-first, polyglot execution surface.
     #[default]
-    Both,
+    Borg,
+    /// Expose the ordinary one-call-per-capability catalog.
+    Native,
+}
+
+impl<'de> Deserialize<'de> for HarnessMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum StoredHarnessMode {
+            Borg,
+            Native,
+            Compact,
+            Code,
+            Both,
+        }
+
+        Ok(match StoredHarnessMode::deserialize(deserializer)? {
+            StoredHarnessMode::Native => Self::Native,
+            StoredHarnessMode::Borg
+            | StoredHarnessMode::Compact
+            | StoredHarnessMode::Code
+            | StoredHarnessMode::Both => Self::Borg,
+        })
+    }
 }
 
 impl<'de> Deserialize<'de> for PermissionMode {

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -21,6 +22,9 @@ pub struct ExecutionCommandRequest {
     pub max_output_tokens: Option<usize>,
     pub timeout_ms: u64,
     pub journal: Option<SqliteSessionStore>,
+    /// Session-scoped capability transport inherited by model-authored child
+    /// processes. Provider and deployment credentials are never added here.
+    pub environment: BTreeMap<String, String>,
 }
 
 /// One stdin interaction with a process in an agent's execution world.
@@ -142,7 +146,7 @@ impl ExecutionProvider for LocalExecutionProvider {
 
     async fn command(&self, request: ExecutionCommandRequest) -> Result<ProcessSnapshot> {
         self.processes
-            .exec(
+            .exec_with_environment(
                 request.owner_session_id,
                 &request.root,
                 request.command,
@@ -151,6 +155,7 @@ impl ExecutionProvider for LocalExecutionProvider {
                 request.max_output_tokens,
                 request.timeout_ms,
                 request.journal,
+                &request.environment,
             )
             .await
     }

@@ -20,8 +20,8 @@ telemetry = false
 # Keep in-progress Claude, Codex, and OpenCode work queued when a subscription
 # limit is reached, then retry periodically until the limit clears.
 auto_resume_usage_limits = true
-# Native tool presentation: `compact`, `native`, `code`, or `both` (the default).
-tool_mode = "both"
+# `borg` is the default shell-first harness; `native` exposes direct tools.
+harness = "borg"
 # `shared_work`, `presence`, `cloud_sync`, `web_relay`, and `telemetry` are
 # reserved provider-neutral declarations in this CLI release. They do not
 # initialize a runtime or register tools yet.

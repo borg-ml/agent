@@ -394,7 +394,7 @@ fn blu_host_executor_factory() -> HostExecutorFactory {
             approval_reviewer_model: agent_config.approvals.reviewer_model.clone(),
             approval_reviewer_effort: agent_config.approvals.reviewer_effort.clone(),
             configured_model_gateways: agent_config.configured_model_gateways(),
-            tool_mode: agent_config.capabilities.tool_mode,
+            harness: agent_config.capabilities.harness,
         };
         let reload_cwd = launch.cwd.clone();
         let reload = move || {
@@ -1316,7 +1316,7 @@ async fn run_local_agent_session(
         approval_reviewer_model: agent_config.approvals.reviewer_model.clone(),
         approval_reviewer_effort: agent_config.approvals.reviewer_effort.clone(),
         configured_model_gateways: agent_config.configured_model_gateways(),
-        tool_mode: agent_config.capabilities.tool_mode,
+        harness: agent_config.capabilities.harness,
     };
     let (mut extension_catalog, extension_servers, extension_workflows) =
         crate::extensions::discover(&cwd, &agent_config.capabilities, &agent_config.extensions)?;

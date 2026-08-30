@@ -39,6 +39,8 @@ impl Cli {
                 | "update"
                 | "install"
                 | "capabilities"
+                | "tools"
+                | "call"
                 | "extensions"
                 | "customize"
                 | "inspect"
@@ -90,6 +92,18 @@ pub(crate) enum Command {
     Update(UpdateArgs),
     /// Show configured and effective optional runtime capabilities.
     Capabilities(CapabilitiesArgs),
+    /// List session-scoped Borg and Blu capabilities as JSON.
+    Tools {
+        /// Show one capability by name.
+        name: Option<String>,
+    },
+    /// Invoke one session-scoped Borg or Blu capability with JSON arguments.
+    Call {
+        /// Capability name from `borg tools`.
+        name: String,
+        /// JSON object, or `-` to read the object from stdin.
+        arguments: Option<String>,
+    },
     /// Manage Blu live extensions.
     Extensions(ExtensionsArgs),
     /// Inspect, export, and import the complete customization profile.
@@ -628,6 +642,28 @@ mod tests {
         };
         assert!(args.json);
         assert!(args.config.is_none());
+    }
+
+    #[test]
+    fn capability_commands_are_not_rewritten_as_agent_prompts() {
+        let tools = try_parse_direct(["borg", "tools", "get_goal"])
+            .expect("tools command parses")
+            .command_or_agent();
+        assert!(matches!(
+            tools,
+            Command::Tools { name: Some(name) } if name == "get_goal"
+        ));
+
+        let call = try_parse_direct(["borg", "call", "get_goal", "{}"])
+            .expect("call command parses")
+            .command_or_agent();
+        assert!(matches!(
+            call,
+            Command::Call {
+                name,
+                arguments: Some(arguments),
+            } if name == "get_goal" && arguments == "{}"
+        ));
     }
 
     #[test]

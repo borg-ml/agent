@@ -277,16 +277,20 @@ snapshot_json)`. The assertion is journaled and makes the workflow fail after th
 receipt exists, while retries replay both boundaries without repeating the
 external effect.
 
-## Persistent programming runtime
+## Internal persistent programming runtime
 
-`runtime_exec` is a separate model-facing primitive for iterative work. It is
-not a workflow and it is not the same as the per-invocation external process
-used by `run_workflow`. The first adapter is a session-scoped plain CPython
+The persistent runtime engine is retained as an internal execution adapter;
+Borg's default harness does not advertise `runtime_exec` to
+the model. Ordinary work uses the shell-first `exec` surface and can select
+Python, TypeScript, JavaScript, or another installed runtime naturally. Durable
+extension operations use `run_workflow`, whose runtime is selected by the
+extension rather than by a model-facing language switch.
+
+The first persistent adapter is a session-scoped plain CPython
 worker started lazily with `python3 -u` (or `BORG_PYTHON_RUNTIME`), so variables,
 imports, helper functions, and parsed data survive multiple calls and native
 turns. The worker is owned by the provider-neutral agent-tool dispatcher, which
-also serves the local MCP bridge; native, Codex, and Claude paths therefore use
-the same session namespace rather than provider-specific copies.
+also serves the local capability bridge.
 
 The initial worker intentionally has no `ipykernel` dependency. It supports a
 normal persistent Python namespace, final-expression values, top-level await,
@@ -320,10 +324,10 @@ The bridge also has the three pieces needed for a stateful environment loop:
 The lifecycle is:
 
 ```text
-first runtime_exec in a session
+internal persistent-runtime invocation
         ↓ lazy worker start
 execute ↔ Borg host-call bridge ↔ filesystem/process/Borg tools
-        ↓ next runtime_exec / next native turn
+        ↓ next invocation / next native turn
 same in-memory namespace
         ↓ error, timeout, cancellation, or session teardown
 worker is killed; the durable runtime manifest records the worker boundary

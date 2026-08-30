@@ -543,6 +543,8 @@ struct AgentToolWireRequest {
     arguments: Value,
     #[serde(default)]
     token: Option<String>,
+    #[serde(default)]
+    workflow_approved: bool,
 }
 
 async fn serve_agent_tool_connection<S>(
@@ -563,12 +565,15 @@ async fn serve_agent_tool_connection<S>(
             {
                 json!({ "error": "agent tool authentication failed" })
             }
+            Ok(request) if request.name == "__borg_tools" => {
+                json!({ "result": dispatcher.specs() })
+            }
             Ok(request) => {
                 let cancel = CancellationToken::new();
                 let call = dispatcher.call_with_workflow_control(
                     &request.name,
                     request.arguments,
-                    false,
+                    request.workflow_approved,
                     Some(cancel.clone()),
                 );
                 tokio::pin!(call);
@@ -1810,6 +1815,7 @@ impl RuntimeHost for DispatcherRuntimeHost {
                                 .min(timeout_limit)
                                 .clamp(1, RUNTIME_MAX_COMMAND_TIMEOUT_MS),
                             journal: self.session_store.clone(),
+                            environment: BTreeMap::new(),
                         })
                         .await?,
                 )?)
@@ -1836,7 +1842,7 @@ impl RuntimeHost for DispatcherRuntimeHost {
             "borg_tool" => {
                 let args: RuntimeBorgToolArgs = serde_json::from_value(arguments)?;
                 ensure!(
-                    !matches!(args.name.as_str(), "runtime_exec" | "run_code"),
+                    args.name != "runtime_exec",
                     "nested runtime code calls are not supported"
                 );
                 if matches!(
@@ -5361,32 +5367,6 @@ fn agent_tool_specs_with_capabilities_and_consultation_and_search(
                     "name": { "type": "string", "minLength": 1, "maxLength": 128 }
                 },
                 "required": ["workflow_id", "extension_id", "name"],
-                "additionalProperties": false
-            }),
-        ),
-        tool(
-            "runtime_exec",
-            "Execute code in the session's persistent Python or optional Bun JavaScript/TypeScript runtime. Variables, imports, helper functions, and parsed data survive across calls and turns. The `borg` object exposes read, filesystem search, lossless history retrieval, a sequence-cursored full-log index feed, versioned retrieval_adapter/test_retrieval_adapter helpers, extension-scoped transactional storage and artifact verification, explicit checkpoints, restore, exec, persistent extension environments, RLM-style subagent handles, continual harness CRUD, and selected Borg tool calls through the host's permission and journal boundary. This is trusted execution, not a sandbox.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "runtime": {
-                        "type": "string",
-                        "enum": ["python", "javascript", "typescript"],
-                        "default": "python"
-                    },
-                    "code": {
-                        "type": "string",
-                        "minLength": 1,
-                        "maxLength": 524288
-                    },
-                    "timeout_ms": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": RUNTIME_MAX_COMMAND_TIMEOUT_MS
-                    }
-                },
-                "required": ["code"],
                 "additionalProperties": false
             }),
         ),

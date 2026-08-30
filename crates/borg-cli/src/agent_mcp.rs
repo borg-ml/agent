@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 #[cfg(not(unix))]
 use tokio::net::TcpStream;
 #[cfg(unix)]
@@ -24,6 +24,46 @@ const SERVER_INFO_META: &str = "io.modelcontextprotocol/serverInfo";
 pub(crate) async fn run() -> Result<()> {
     let endpoint = Arc::new(AgentToolEndpoint::from_env()?);
     serve(endpoint, tokio::io::stdin(), tokio::io::stdout()).await
+}
+
+pub(crate) async fn list_tools(name: Option<&str>) -> Result<()> {
+    let endpoint = AgentToolEndpoint::from_env()?;
+    let tools = forward(&endpoint, "__borg_tools", json!({}), None).await?;
+    let tools = tools
+        .as_array()
+        .context("Borg agent tool catalog was not an array")?;
+    let output = if let Some(name) = name {
+        tools
+            .iter()
+            .find(|tool| tool.get("name").and_then(Value::as_str) == Some(name))
+            .cloned()
+            .with_context(|| format!("unknown Borg capability `{name}`"))?
+    } else {
+        Value::Array(tools.clone())
+    };
+    println!("{}", serde_json::to_string(&output)?);
+    Ok(())
+}
+
+pub(crate) async fn call_tool(name: &str, arguments: Option<&str>) -> Result<()> {
+    let arguments = match arguments {
+        Some("-") => {
+            let mut input = String::new();
+            tokio::io::stdin().read_to_string(&mut input).await?;
+            serde_json::from_str(&input).context("stdin did not contain valid JSON")?
+        }
+        Some(arguments) => {
+            serde_json::from_str(arguments).context("tool arguments are not valid JSON")?
+        }
+        None => json!({}),
+    };
+    if !arguments.is_object() {
+        bail!("tool arguments must be a JSON object");
+    }
+    let endpoint = AgentToolEndpoint::from_env()?;
+    let output = forward(&endpoint, name, arguments, None).await?;
+    println!("{}", serde_json::to_string(&output)?);
+    Ok(())
 }
 
 async fn serve<R, W>(endpoint: Arc<AgentToolEndpoint>, read: R, mut write: W) -> Result<()>
@@ -515,6 +555,11 @@ where
 {
     let (read, mut write) = tokio::io::split(stream);
     let mut request = json!({ "name": name, "arguments": arguments });
+    request["workflow_approved"] = Value::Bool(
+        std::env::var("BORG_AGENT_TOOL_APPROVED")
+            .ok()
+            .is_some_and(|value| value == "1"),
+    );
     if let Some(token) = token {
         request["token"] = Value::String(token.to_string());
     }

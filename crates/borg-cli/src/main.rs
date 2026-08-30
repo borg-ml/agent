@@ -54,6 +54,10 @@ async fn main() -> Result<()> {
         Command::Remote { command } => run_remote_command(command).await,
         Command::Update(args) => updater::run(args).await,
         Command::Capabilities(args) => print_capabilities(args),
+        Command::Tools { name } => agent_mcp::list_tools(name.as_deref()).await,
+        Command::Call { name, arguments } => {
+            agent_mcp::call_tool(&name, arguments.as_deref()).await
+        }
         Command::Extensions(args) => print_extensions(args),
         Command::Customize(args) => customization::run(args),
         Command::Inspect(args) => inspect::run(args).await,
