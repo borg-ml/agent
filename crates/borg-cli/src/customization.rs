@@ -221,7 +221,8 @@ fn user_blu_path() -> Result<PathBuf> {
     let root = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-        .context("HOME or XDG_CONFIG_HOME is required")?;
+        .or_else(dirs::config_dir)
+        .context("unable to determine a user config directory")?;
     Ok(root.join("borg/blu.toml"))
 }
 

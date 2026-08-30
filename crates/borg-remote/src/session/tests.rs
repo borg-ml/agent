@@ -6578,7 +6578,7 @@ fn only_side_effect_free_transport_recovery_is_eligible_for_automatic_retry() {
         true,
         true,
     ));
-    assert!(!automatic_retry_allowed(
+    assert!(automatic_retry_allowed(
         "Codex exposed a forbidden provider-native agent tool: subAgentActivity",
         false,
         true,

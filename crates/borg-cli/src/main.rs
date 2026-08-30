@@ -462,6 +462,7 @@ fn log_writer() -> BoxMakeWriter {
         .or_else(|| {
             std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".borg"))
         })
+        .or_else(|| dirs::home_dir().map(|home| home.join(".borg")))
         .unwrap_or_else(|| std::path::PathBuf::from(".borg"));
     let log_dir = borg_home.join("logs");
     let file = fs::create_dir_all(&log_dir).and_then(|()| {

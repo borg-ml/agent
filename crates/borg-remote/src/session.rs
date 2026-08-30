@@ -6802,9 +6802,10 @@ fn automatic_retry_allowed(
     !interrupted
         && prompt_visible
         && actor == EventActor::User
-        && retry_not_attempted
         && (is_provider_agent_isolation_error(error)
-            || (!turn_had_side_effects && is_safe_automatic_retry_error(error)))
+            || (retry_not_attempted
+                && !turn_had_side_effects
+                && is_safe_automatic_retry_error(error)))
 }
 
 fn provider_event_has_side_effect(kind: &SessionEventKind) -> bool {

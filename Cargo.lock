@@ -1097,6 +1097,7 @@ dependencies = [
  "borg-provider",
  "borg-search",
  "chrono",
+ "dirs 6.0.0",
  "futures",
  "hex",
  "ignore",

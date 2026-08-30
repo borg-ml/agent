@@ -2200,11 +2200,23 @@ fn scope_state_path(cwd: &Path, project: bool) -> Result<PathBuf> {
 }
 
 fn user_config_root() -> Result<PathBuf> {
-    std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-        .map(|root| root.join("borg"))
-        .context("HOME or XDG_CONFIG_HOME is required for user extensions")
+    user_config_base(
+        std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
+        std::env::var_os("HOME").map(PathBuf::from),
+        dirs::config_dir(),
+    )
+    .map(|root| root.join("borg"))
+    .context("unable to determine a config directory for user extensions")
+}
+
+fn user_config_base(
+    xdg_config_home: Option<PathBuf>,
+    home: Option<PathBuf>,
+    platform_config_dir: Option<PathBuf>,
+) -> Option<PathBuf> {
+    xdg_config_home
+        .or_else(|| home.map(|home| home.join(".config")))
+        .or(platform_config_dir)
 }
 
 fn validate_relative_path(path: &Path, label: &str) -> Result<()> {
@@ -2327,6 +2339,15 @@ fn hash_package_tree(digest: &mut Sha256, root: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn user_config_base_falls_back_to_the_native_platform_directory() {
+        let platform = PathBuf::from(r"C:\Users\borg\AppData\Roaming");
+        assert_eq!(
+            user_config_base(None, None, Some(platform.clone())),
+            Some(platform)
+        );
+    }
 
     fn manifest(id: &str, extra: &str) -> String {
         format!(

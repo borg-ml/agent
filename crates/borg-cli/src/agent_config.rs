@@ -893,6 +893,7 @@ fn default_path() -> Option<PathBuf> {
     std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+        .or_else(dirs::config_dir)
         .map(|root| root.join("borg").join("agent.toml"))
 }
 

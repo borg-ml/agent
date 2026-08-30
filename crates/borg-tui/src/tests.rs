@@ -2071,6 +2071,7 @@ fn background_tool_elapsed_cache_tick_also_changes_each_tenth() {
 fn a_new_edit_or_message_collapses_the_previous_diff() {
     let session_id = Uuid::new_v4();
     let mut transcript = Transcript::default();
+    transcript.set_diff_expansion(DiffExpansionPolicy::UntilNextAction);
     for (sequence, path) in [(1, "src/first.rs"), (2, "src/second.rs")] {
         transcript.apply(&SessionEvent::new(
             session_id,
