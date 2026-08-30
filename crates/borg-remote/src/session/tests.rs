@@ -5035,7 +5035,10 @@ async fn model_consultation_dispatches_a_freeform_briefing_to_an_isolated_provid
         permission_mode: PermissionMode::FullAccess,
         name: None,
         initial_prompt: None,
-        capabilities: Default::default(),
+        capabilities: crate::SessionCapabilities {
+            provider_capabilities: test_provider_capabilities(),
+            ..crate::SessionCapabilities::default()
+        },
         subagent_concurrency_limit: None,
         extension_skill_roots: Vec::new(),
         team_policy: None,

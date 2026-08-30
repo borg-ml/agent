@@ -19,6 +19,7 @@ const MAX_EXTENSION_HISTORY_VERSIONS: usize = 32;
 const SETTINGS_SECTIONS: &[&str] = &[
     "capabilities",
     "extensions",
+    "local",
     "team",
     "commands",
     "keybindings",
@@ -2103,6 +2104,70 @@ fn validate_settings_shape(root: &toml::Value) -> Result<()> {
         check_keys(extensions, &["allow_project_mcp"], "extensions")?;
         check_bool_values(extensions, "extensions")?;
     }
+    if let Some(local) = root.get("local") {
+        check_keys(
+            local,
+            &[
+                "base_url",
+                "model",
+                "context_window_tokens",
+                "api_key",
+                "model_path",
+                "model_dirs",
+                "include_ollama_store",
+                "include_hf_cache",
+                "server_bin",
+                "host",
+                "port",
+                "auto_start",
+                "ctx_size",
+                "jinja",
+                "reasoning_format",
+            ],
+            "local",
+        )?;
+        for name in [
+            "base_url",
+            "model",
+            "api_key",
+            "model_path",
+            "server_bin",
+            "host",
+            "reasoning_format",
+        ] {
+            if let Some(value) = local.get(name) {
+                ensure!(
+                    value.as_str().is_some_and(|value| !value.trim().is_empty()),
+                    "local.{name} must be a non-empty string"
+                );
+            }
+        }
+        for name in ["context_window_tokens", "ctx_size"] {
+            if let Some(value) = local.get(name) {
+                check_positive_integer(value, &format!("local.{name}"))?;
+            }
+        }
+        if let Some(port) = local.get("port") {
+            ensure!(
+                port.as_integer()
+                    .is_some_and(|value| (1..=u16::MAX.into()).contains(&value)),
+                "local.port must be between 1 and 65535"
+            );
+        }
+        for name in [
+            "include_ollama_store",
+            "include_hf_cache",
+            "auto_start",
+            "jinja",
+        ] {
+            if let Some(value) = local.get(name) {
+                ensure!(value.as_bool().is_some(), "local.{name} must be a boolean");
+            }
+        }
+        if let Some(model_dirs) = local.get("model_dirs") {
+            check_string_array(model_dirs, "local.model_dirs", false)?;
+        }
+    }
     if let Some(team) = root.get("team") {
         check_keys(
             team,
@@ -2506,6 +2571,15 @@ mod tests {
     fn settings_validation_rejects_unknown_nested_fields_before_writing() {
         let valid = toml::from_str::<toml::Value>(
             r#"
+            [local]
+            base_url = "http://127.0.0.1:8000/v1"
+            model = "local-model"
+            context_window_tokens = 32768
+            model_dirs = ["/models"]
+            include_ollama_store = true
+            auto_start = true
+            port = 8000
+            jinja = true
             [team]
             preset = "xhigh_director_low_workers"
             worker_concurrency = 2
@@ -2518,6 +2592,12 @@ mod tests {
         )
         .unwrap();
         validate_settings_shape(&valid).unwrap();
+
+        let invalid_local = toml::from_str::<toml::Value>(
+            "[local]\nbase_url = 'http://127.0.0.1:8000/v1'\nunknown = true\n",
+        )
+        .unwrap();
+        assert!(validate_settings_shape(&invalid_local).is_err());
 
         let invalid = toml::from_str::<toml::Value>(
             r#"
