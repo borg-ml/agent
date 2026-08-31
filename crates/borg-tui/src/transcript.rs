@@ -641,7 +641,6 @@ impl Transcript {
         )
     }
 
-    #[cfg(test)]
     fn tool_is_expandable(&self, index: usize) -> bool {
         matches!(
             self.order.get(index),
@@ -654,7 +653,6 @@ impl Transcript {
         )
     }
 
-    #[cfg(test)]
     fn toggle_tool(&mut self, index: usize) -> Vec<SessionPayloadRef> {
         if !self.tool_is_expandable(index) {
             return Vec::new();
@@ -673,7 +671,6 @@ impl Transcript {
         Vec::new()
     }
 
-    #[cfg(test)]
     fn tool_is_expanded(&self, index: usize) -> bool {
         matches!(
             self.order.get(index),
