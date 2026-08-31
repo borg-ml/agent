@@ -55,11 +55,9 @@ Preserve an explicit `@EFFORT` suffix in a profile when the intent includes one 
 You choose the complete freeform briefing: include the relevant objective, evidence, constraints, and \
 exact question, while omitting unrelated transcript noise. Never ask the human to relay messages manually. \
 The peer cannot invoke another peer; after the response returns, reconcile it with your own judgment and \
-remain the sole voice that answers the user. Progress updates are separate from action summaries. \
-Immediately before every tool call, emit exactly one standalone narration item in the form \
-`[[BORG_ACTION:verb specific target]]`, choosing `verb` from `inspect`, `edit`, `run`, `test`, `search`, \
-`plan`, `wait`, or `diagnose` and naming the concrete target in a few lowercase words. Then generate the \
-tool call. Do not include any other text in the action-summary item.";
+remain the sole voice that answers the user. When a tool schema offers an `action` field, put it first and \
+use a one- or two-word lowercase summary such as `edit`, `delete files`, or `run tests`. Do not emit a \
+separate action-summary narration item.";
 
 const ACTION_SUMMARIES: &[&str] = &[
     "inspect", "edit", "run", "test", "search", "plan", "wait", "diagnose",
@@ -151,17 +149,6 @@ fn without_action_intent_marker(text: &str) -> Option<&str> {
             .filter(|remainder| !remainder.is_empty());
     }
     Some(text)
-}
-
-fn canonical_action_descriptor(name: &str, input: &Value) -> String {
-    let (label, detail) = crate::tool_call_summary(name, input);
-    let label = label.trim_end_matches('…').to_ascii_lowercase();
-    let descriptor = if detail.trim().is_empty() {
-        label
-    } else {
-        format!("{label} {detail}")
-    };
-    crate::compact_text(&descriptor, 64)
 }
 
 fn provider_native_agent_tool(name: &str) -> bool {
@@ -1783,13 +1770,16 @@ async fn run_borg_provider_turn(
                         "Borg provider stage"
                     );
                 }
-                let action_descriptor = canonical_action_descriptor(&name, &input);
+                let action_descriptor = crate::canonical_action_descriptor(&name, &input);
                 send(
                     &events,
                     SessionEventKind::ProviderEvent {
                         provider: turn.provider,
                         kind: "action/preparing".to_string(),
-                        payload: serde_json::json!({"label": action_descriptor}),
+                        payload: serde_json::json!({
+                            "label": action_descriptor,
+                            "tool_call_id": id.clone(),
+                        }),
                     },
                 )
                 .await;
@@ -2367,22 +2357,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn coding_prompt_requires_visible_progress_before_specific_action_summaries() {
+    fn coding_prompt_requires_progress_and_lean_tool_actions() {
         let progress = CODING_SYSTEM_PROMPT
             .find("first send the user a concise visible progress update")
             .expect("prompt requires an initial visible progress update");
-        let summary = CODING_SYSTEM_PROMPT
-            .find("Immediately before every tool call")
-            .expect("prompt requires a tool action summary");
-        assert!(progress < summary);
-        assert!(
-            CODING_SYSTEM_PROMPT.contains("Progress updates are separate from action summaries")
-        );
+        let action = CODING_SYSTEM_PROMPT
+            .find("When a tool schema offers an `action` field")
+            .expect("prompt describes the optional tool action field");
+        assert!(progress < action);
         assert!(CODING_SYSTEM_PROMPT.contains("Never invoke provider-native delegation tools"));
         assert!(CODING_SYSTEM_PROMPT.contains("`mcp__borg_agent__spawn_agent`"));
-        assert!(CODING_SYSTEM_PROMPT.contains("`[[BORG_ACTION:verb specific target]]`"));
-        assert!(CODING_SYSTEM_PROMPT.contains("`inspect`, `edit`, `run`, `test`"));
-        assert!(CODING_SYSTEM_PROMPT.contains("naming the concrete target"));
+        assert!(CODING_SYSTEM_PROMPT.contains("put it first"));
+        assert!(CODING_SYSTEM_PROMPT.contains("one- or two-word lowercase summary"));
+        assert!(CODING_SYSTEM_PROMPT.contains("Do not emit a separate action-summary"));
         assert!(CODING_SYSTEM_PROMPT.contains("more than about 60 seconds"));
     }
 
@@ -2437,15 +2424,15 @@ mod tests {
     #[test]
     fn canonical_action_descriptors_use_tool_metadata() {
         assert_eq!(
-            canonical_action_descriptor(
+            crate::canonical_action_descriptor(
                 "apply_patch",
                 &serde_json::json!({"file_path": "src/main.rs"}),
             ),
             "edit src/main.rs"
         );
         assert_eq!(
-            canonical_action_descriptor("mcp__borg_agent__get_plan", &serde_json::json!({})),
-            "read plan current steps"
+            crate::canonical_action_descriptor("mcp__borg_agent__get_plan", &serde_json::json!({}),),
+            "read plan"
         );
     }
 

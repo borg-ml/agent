@@ -990,6 +990,7 @@ async fn read_compatible_model_stream(
     let mut reasoning_details = Vec::new();
     let mut tool_calls = BTreeMap::<usize, PartialToolCall>::new();
     let mut started_tool_calls = HashSet::new();
+    let mut described_tool_calls = HashSet::new();
     let mut finish_reason = None;
     let mut usage = None;
     let mut saw_done = false;
@@ -1100,6 +1101,18 @@ async fn read_compatible_model_stream(
                             input: Value::Null,
                         });
                     }
+                    if !call.id.is_empty()
+                        && !described_tool_calls.contains(&index)
+                        && let Some(action) = streamed_tool_action(&call.arguments)
+                    {
+                        described_tool_calls.insert(index);
+                        if let Some(sender) = progress {
+                            let _ = sender.send(ProviderProgress::ToolCallAction {
+                                id: call.id.clone(),
+                                action,
+                            });
+                        }
+                    }
                 }
             }
             if let Some(reason) = chunk
@@ -1172,6 +1185,41 @@ async fn read_compatible_model_stream(
         finish_reason,
         raw,
     })
+}
+
+fn streamed_tool_action(arguments: &str) -> Option<String> {
+    let mut remaining = arguments.trim_start().strip_prefix('{')?.trim_start();
+    let (field, rest) = parse_complete_json_string(remaining)?;
+    if field != "action" {
+        return None;
+    }
+    remaining = rest.trim_start().strip_prefix(':')?.trim_start();
+    let (action, _) = parse_complete_json_string(remaining)?;
+    let action = action.trim();
+    (!action.is_empty() && action.chars().count() <= 64).then(|| action.to_string())
+}
+
+fn parse_complete_json_string(input: &str) -> Option<(String, &str)> {
+    if !input.starts_with('"') {
+        return None;
+    }
+    let mut escaped = false;
+    for (offset, character) in input[1..].char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' => escaped = true,
+            '"' => {
+                let end = offset + 2;
+                let value = serde_json::from_str::<String>(&input[..end]).ok()?;
+                return Some((value, &input[end..]));
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn compatible_retryable_status(status: reqwest::StatusCode) -> bool {
@@ -1615,8 +1663,8 @@ mod tests {
         let address = listener.local_addr().expect("test server address");
         let body = [
             r#"data: {"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.text","text":"inspect " }]},"finish_reason":null}]}"#,
-            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"read_","arguments":"{\"pa"}}]},"finish_reason":null}]}"#,
-            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"file","arguments":"th\":\"src/lib.rs\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"read_","arguments":"{\"action\":\"ed"}}]},"finish_reason":null}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"file","arguments":"it\",\"path\":\"src/lib.rs\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#,
             "data: [DONE]",
             "",
         ]
@@ -1663,6 +1711,13 @@ mod tests {
         assert_eq!(id, "call-1");
         assert_eq!(name, "read_");
         assert_eq!(input, Value::Null);
+        let ProviderProgress::ToolCallAction { id, action } =
+            progress_rx.try_recv().expect("tool action progress event")
+        else {
+            panic!("expected tool action progress event");
+        };
+        assert_eq!(id, "call-1");
+        assert_eq!(action, "edit");
         assert_eq!(streamed.finish_reason, "tool_calls");
         let ModelMessage::Assistant {
             reasoning_content,
@@ -1684,8 +1739,24 @@ mod tests {
         assert_eq!(tool_calls.len(), 1);
         assert_eq!(tool_calls[0].id, "call-1");
         assert_eq!(tool_calls[0].function.name, "read_file");
-        assert_eq!(tool_calls[0].function.arguments, r#"{"path":"src/lib.rs"}"#);
+        assert_eq!(
+            tool_calls[0].function.arguments,
+            r#"{"action":"edit","path":"src/lib.rs"}"#
+        );
         assert_eq!(streamed.raw["usage"]["prompt_tokens"], 10);
+    }
+
+    #[test]
+    fn streamed_action_must_be_the_first_complete_argument_field() {
+        assert_eq!(
+            streamed_tool_action(r#"{"action":"delete files","#).as_deref(),
+            Some("delete files")
+        );
+        assert_eq!(streamed_tool_action(r#"{"action":"edi"#), None);
+        assert_eq!(
+            streamed_tool_action(r#"{"cmd":"pwd","action":"inspect"}"#),
+            None
+        );
     }
 
     #[tokio::test]

@@ -20,7 +20,7 @@ completion_sound = "unfocused"
 refresh_rate_fps = 60
 diff_expansion = "expanded" # expanded | collapsed | until_next_action
 auto_expand_tools = false
-# Show the short "Preparing next action…" descriptor before tool activity.
+# Show the short "Generating edit…" descriptor while a tool call is assembled.
 action_descriptors = true
 # Omit to choose the microphone icon on first use. Valid values: nerd_font, emoji.
 # dictation_icon = "nerd_font"

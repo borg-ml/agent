@@ -199,6 +199,10 @@ pub enum ProviderProgress {
         name: String,
         input: Value,
     },
+    ToolCallAction {
+        id: String,
+        action: String,
+    },
     ToolCallCompleted {
         tool_use_id: String,
         output: String,

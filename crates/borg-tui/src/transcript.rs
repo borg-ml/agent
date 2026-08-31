@@ -78,6 +78,7 @@ struct Transcript {
     tools: HashMap<String, usize>,
     foreground_tool: Option<String>,
     preparing_tool: Option<String>,
+    preparing_provider_tool_id: Option<String>,
     goal: Option<SessionGoal>,
     todos: Vec<PlanItem>,
     config: Option<SessionDisplayConfig>,
@@ -160,6 +161,7 @@ impl Default for Transcript {
             tools: HashMap::new(),
             foreground_tool: None,
             preparing_tool: None,
+            preparing_provider_tool_id: None,
             goal: None,
             todos: Vec::new(),
             config: None,
@@ -1202,7 +1204,13 @@ impl Transcript {
                 let Some(label) = payload.get("label").and_then(serde_json::Value::as_str) else {
                     return removed_entry;
                 };
-                self.upsert_action_preparation(event, label);
+                self.upsert_action_preparation(
+                    event,
+                    label,
+                    payload
+                        .get("tool_call_id")
+                        .and_then(serde_json::Value::as_str),
+                );
             }
             SessionEventKind::ProviderEvent { kind, payload, .. }
                 if is_live_tool_call_event(kind) =>
@@ -1229,6 +1237,15 @@ impl Transcript {
                 input,
                 input_ref,
             } => {
+                if self.preparing_tool.is_some()
+                    && self
+                        .preparing_provider_tool_id
+                        .as_deref()
+                        .is_none_or(|expected| expected == tool_call_id)
+                    && edit_is_awaiting_diff(name, input)
+                {
+                    return removed_entry;
+                }
                 self.promote_preparing_tool(tool_call_id);
                 self.upsert_running_tool(
                     event,
@@ -2123,7 +2140,21 @@ impl Transcript {
         }
     }
 
-    fn upsert_action_preparation(&mut self, event: &SessionEvent, label: &str) {
+    fn upsert_action_preparation(
+        &mut self,
+        event: &SessionEvent,
+        label: &str,
+        provider_tool_id: Option<&str>,
+    ) {
+        let reuse = self.preparing_tool.is_some()
+            && match (self.preparing_provider_tool_id.as_deref(), provider_tool_id) {
+                (Some(current), Some(incoming)) => current == incoming,
+                (None, Some(_)) => true,
+                _ => false,
+            };
+        if !reuse {
+            self.finish_preparing_tool(event.created_at);
+        }
         let existing = self.preparing_tool.clone();
         let tool_call_id = existing
             .clone()
@@ -2131,6 +2162,9 @@ impl Transcript {
         if existing.is_none() {
             self.mark_running_tools_backgrounded();
             self.preparing_tool = Some(tool_call_id.clone());
+        }
+        if provider_tool_id.is_some() {
+            self.preparing_provider_tool_id = provider_tool_id.map(str::to_string);
         }
         self.upsert_running_tool(
             event,
@@ -2143,18 +2177,46 @@ impl Transcript {
             && let Some(index) = self.tools.get(&tool_call_id).copied()
             && let Some(TranscriptEntry::Tool {
                 time,
-                started_at,
                 backgrounded,
                 ..
             }) = self.order.get_mut(index)
         {
             *time = local_event_time(event);
-            *started_at = event.created_at;
             *backgrounded = false;
         }
     }
 
+    fn finish_preparing_tool(&mut self, completed_at: DateTime<Utc>) {
+        self.preparing_provider_tool_id = None;
+        let Some(preparing_id) = self.preparing_tool.take() else {
+            return;
+        };
+        if self.foreground_tool.as_deref() == Some(preparing_id.as_str()) {
+            self.foreground_tool = None;
+        }
+        let Some(index) = self.tools.get(&preparing_id).copied() else {
+            return;
+        };
+        if let Some(TranscriptEntry::Tool {
+            complete,
+            completed_at: stored_completed_at,
+            ..
+        }) = self.order.get_mut(index)
+        {
+            *complete = true;
+            *stored_completed_at = Some(completed_at);
+        }
+    }
+
     fn promote_preparing_tool(&mut self, tool_call_id: &str) {
+        if self
+            .preparing_provider_tool_id
+            .as_deref()
+            .is_some_and(|expected| expected != tool_call_id)
+        {
+            return;
+        }
+        self.preparing_provider_tool_id = None;
         let Some(preparing_id) = self.preparing_tool.take() else {
             return;
         };
@@ -2200,6 +2262,7 @@ impl Transcript {
         self.finish_reasoning(completed_at);
         self.foreground_tool = None;
         self.preparing_tool = None;
+        self.preparing_provider_tool_id = None;
         for entry in &mut self.order {
             if let TranscriptEntry::Tool {
                 complete,
@@ -2247,6 +2310,7 @@ impl Transcript {
         self.finish_reasoning(completed_at);
         self.foreground_tool = None;
         self.preparing_tool = None;
+        self.preparing_provider_tool_id = None;
         let active_background_tools = self
             .runtime_processes
             .values()

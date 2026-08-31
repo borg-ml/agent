@@ -1680,7 +1680,7 @@ fn tool_lifecycle_labels_use_progressive_and_past_tense() {
 }
 
 #[test]
-fn action_preparation_promotes_into_the_same_tool_card() {
+fn edit_preparation_waits_for_the_first_diff_before_promotion() {
     let session_id = Uuid::new_v4();
     let mut transcript = Transcript::default();
     transcript.apply(&SessionEvent::new(
@@ -1698,7 +1698,10 @@ fn action_preparation_promotes_into_the_same_tool_card() {
         .map(|line| line.to_string())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(preparing.contains("Preparing next action…"), "{preparing}");
+    assert!(
+        preparing.contains("Generating edit session retry policy…"),
+        "{preparing}"
+    );
     assert!(
         preparing.contains("edit session retry policy"),
         "{preparing}"
@@ -1721,8 +1724,36 @@ fn action_preparation_promotes_into_the_same_tool_card() {
         .collect::<Vec<_>>()
         .join("\n");
     assert_eq!(transcript.order.len(), 1);
+    assert!(
+        editing.contains("Generating edit session retry policy…"),
+        "{editing}"
+    );
+    assert!(!editing.contains("Editing…"), "{editing}");
+
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        3,
+        SessionEventKind::ToolUpdated {
+            tool_call_id: "edit-1".to_string(),
+            name: "Edit".to_string(),
+            input: serde_json::json!({
+                "changes": [{
+                    "path": "src/main.rs",
+                    "kind": {"type": "update", "move_path": null},
+                    "diff": "@@ -1 +1 @@\n-old\n+new"
+                }]
+            }),
+        },
+    ));
+    let editing = transcript
+        .lines(100)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(transcript.order.len(), 1);
     assert!(editing.contains("Editing…"), "{editing}");
-    assert!(!editing.contains("Preparing next action"), "{editing}");
+    assert!(!editing.contains("Generating edit"), "{editing}");
 }
 
 #[test]
@@ -1758,7 +1789,7 @@ fn action_preparation_can_be_hidden_without_hiding_tool_activity() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(rendered.contains("Editing…"), "{rendered}");
-    assert!(!rendered.contains("Preparing next action"), "{rendered}");
+    assert!(!rendered.contains("Generating edit"), "{rendered}");
 }
 
 #[test]
@@ -1794,8 +1825,8 @@ fn action_preparation_completes_when_the_start_event_is_missing() {
         .collect::<Vec<_>>()
         .join("\n");
     assert_eq!(transcript.order.len(), 1);
-    assert!(completed.contains("Ran command"), "{completed}");
-    assert!(!completed.contains("Preparing next action"), "{completed}");
+    assert!(completed.contains("Generated command"), "{completed}");
+    assert!(!completed.contains("Generating command"), "{completed}");
     assert!(!transcript.has_running_tool());
 }
 
@@ -1866,11 +1897,11 @@ fn late_completion_does_not_consume_new_action_preparation() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(rendered.contains("Ran"), "{rendered}");
-    assert!(rendered.contains("Preparing next action"), "{rendered}");
+    assert!(rendered.contains("Generating command"), "{rendered}");
 }
 
 #[test]
-fn consecutive_unmatched_action_preparations_reuse_the_live_card() {
+fn consecutive_unmatched_action_preparations_preserve_audit_rows() {
     let session_id = Uuid::new_v4();
     let mut transcript = Transcript::default();
     for (sequence, label) in [(1, "inspect first target"), (2, "inspect second target")] {
@@ -1885,6 +1916,41 @@ fn consecutive_unmatched_action_preparations_reuse_the_live_card() {
         ));
     }
 
+    assert_eq!(transcript.order.len(), 2);
+    assert!(matches!(
+        transcript.order.first(),
+        Some(TranscriptEntry::Tool { complete: true, .. })
+    ));
+    let rendered = transcript
+        .lines(100)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("inspect first target"), "{rendered}");
+    assert!(rendered.contains("inspect second target"), "{rendered}");
+    assert!(!rendered.contains("Running in background"), "{rendered}");
+    assert!(transcript.has_running_tool());
+}
+
+#[test]
+fn matching_tool_action_updates_refine_one_live_card() {
+    let session_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    for (sequence, label) in [(1, "command"), (2, "edit")] {
+        transcript.apply(&SessionEvent::new(
+            session_id,
+            sequence,
+            SessionEventKind::ProviderEvent {
+                provider: CodingProvider::Codex,
+                kind: "action/preparing".to_string(),
+                payload: serde_json::json!({
+                    "label": label,
+                    "tool_call_id": "tool-1",
+                }),
+            },
+        ));
+    }
     assert_eq!(transcript.order.len(), 1);
     let rendered = transcript
         .lines(100)
@@ -1892,10 +1958,8 @@ fn consecutive_unmatched_action_preparations_reuse_the_live_card() {
         .map(|line| line.to_string())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(!rendered.contains("inspect first target"), "{rendered}");
-    assert!(rendered.contains("inspect second target"), "{rendered}");
-    assert!(!rendered.contains("Running in background"), "{rendered}");
-    assert!(transcript.has_running_tool());
+    assert!(rendered.contains("Generating edit"), "{rendered}");
+    assert!(!rendered.contains("Generating command"), "{rendered}");
 }
 
 #[test]

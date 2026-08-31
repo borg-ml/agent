@@ -372,8 +372,38 @@ pub fn is_edit_tool(name: &str, display_name: &str) -> bool {
     tool_category(name, display_name, &Value::Null) == ToolPresentationCategory::Edit
 }
 
+pub fn edit_is_awaiting_diff(name: &str, input: &Value) -> bool {
+    let presentation = project_tool_presentation(name, input, None, false);
+    presentation.category == ToolPresentationCategory::Edit
+        && presentation
+            .input
+            .is_none_or(|body| !is_diff_language(&body.language))
+}
+
 pub fn is_diff_language(language: &str) -> bool {
     language == "diff" || language.starts_with("diff:")
+}
+
+pub fn canonical_action_descriptor(name: &str, input: &Value) -> String {
+    if let Some(action) = input.get("action").and_then(Value::as_str) {
+        let action = action.trim();
+        if !action.is_empty() {
+            return compact_text(&action.to_ascii_lowercase(), 64);
+        }
+    }
+    let (label, detail) = tool_call_summary(name, input);
+    let mut label = label.trim_end_matches('…').to_ascii_lowercase();
+    if label == "run" {
+        label = "command".to_string();
+    }
+    let input_is_empty =
+        input.is_null() || input.as_object().is_some_and(serde_json::Map::is_empty);
+    let descriptor = if input_is_empty || detail.trim().is_empty() {
+        label
+    } else {
+        format!("{label} {detail}")
+    };
+    compact_text(&descriptor, 64)
 }
 
 pub fn tool_call_summary(name: &str, input: &Value) -> (String, String) {
@@ -381,7 +411,10 @@ pub fn tool_call_summary(name: &str, input: &Value) -> (String, String) {
 
     if tool == "action_preparing" {
         let label = string_field(input, "label").unwrap_or("action");
-        return ("Prepare next action".to_string(), compact_text(label, 64));
+        return (
+            format!("Generate {}", compact_text(label, 64)),
+            String::new(),
+        );
     }
 
     if is_mcp_resource_probe(name) {

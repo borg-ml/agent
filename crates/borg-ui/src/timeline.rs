@@ -2,7 +2,10 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use borg_remote::{EventActor, MessageStatus, SessionEvent, SessionEventKind, tool_call_summary};
+use borg_remote::{
+    EventActor, MessageStatus, SessionEvent, SessionEventKind, edit_is_awaiting_diff,
+    tool_call_summary,
+};
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
@@ -119,6 +122,7 @@ pub struct TimelineProjector {
     messages: HashMap<Uuid, usize>,
     tools: HashMap<String, usize>,
     preparing_tool: Option<usize>,
+    preparing_provider_tool_id: Option<String>,
     reasoning: Option<usize>,
 }
 
@@ -214,6 +218,19 @@ impl TimelineProjector {
             }
             SessionEventKind::ProviderEvent { kind, payload, .. } if kind == "action/preparing" => {
                 self.reasoning = None;
+                let provider_tool_id = payload
+                    .get("tool_call_id")
+                    .and_then(serde_json::Value::as_str);
+                let reuse = self.preparing_tool.is_some()
+                    && match (self.preparing_provider_tool_id.as_deref(), provider_tool_id) {
+                        (Some(current), Some(incoming)) => current == incoming,
+                        (None, Some(_)) => true,
+                        _ => false,
+                    };
+                if !reuse && let Some(index) = self.preparing_tool.take() {
+                    Arc::make_mut(&mut self.entries[index]).running = false;
+                    self.preparing_provider_tool_id = None;
+                }
                 let input = serde_json::json!({
                     "label": payload
                         .get("label")
@@ -230,6 +247,9 @@ impl TimelineProjector {
                     entry.rich_body = None;
                     entry.running = true;
                     entry.failed = false;
+                    if provider_tool_id.is_some() {
+                        self.preparing_provider_tool_id = provider_tool_id.map(str::to_string);
+                    }
                     return;
                 }
                 let index = self.entries.len();
@@ -245,6 +265,21 @@ impl TimelineProjector {
                     failed: false,
                 }));
                 self.preparing_tool = Some(index);
+                self.preparing_provider_tool_id = provider_tool_id.map(str::to_string);
+            }
+            SessionEventKind::ToolStarted {
+                tool_call_id,
+                name,
+                input,
+                ..
+            } if self.preparing_tool.is_some()
+                && self
+                    .preparing_provider_tool_id
+                    .as_deref()
+                    .is_none_or(|expected| expected == tool_call_id)
+                && edit_is_awaiting_diff(name, input) =>
+            {
+                self.reasoning = None;
             }
             SessionEventKind::ToolStarted {
                 tool_call_id,
@@ -261,12 +296,21 @@ impl TimelineProjector {
                 let (title, detail) = tool_call_summary(name, input);
                 let known_tool = self.tools.get(tool_call_id).copied();
                 let running_tool = known_tool.filter(|index| self.entries[*index].running);
+                let matching_preparation = self
+                    .preparing_provider_tool_id
+                    .as_deref()
+                    .is_none_or(|expected| expected == tool_call_id)
+                    .then(|| self.preparing_tool.take())
+                    .flatten();
+                if matching_preparation.is_some() {
+                    self.preparing_provider_tool_id = None;
+                }
                 let index = if matches!(&event.kind, SessionEventKind::ToolStarted { .. }) {
-                    self.preparing_tool.take().or(running_tool)
+                    matching_preparation.or(running_tool)
                 } else {
                     running_tool.or_else(|| {
                         if known_tool.is_none() {
-                            self.preparing_tool.take()
+                            matching_preparation
                         } else {
                             None
                         }
@@ -313,8 +357,13 @@ impl TimelineProjector {
                     entry.body = output.clone();
                     entry.rich_body = None;
                 } else if known_index.is_none()
+                    && self
+                        .preparing_provider_tool_id
+                        .as_deref()
+                        .is_none_or(|expected| expected == tool_call_id)
                     && let Some(index) = self.preparing_tool.take()
                 {
+                    self.preparing_provider_tool_id = None;
                     let entry = Arc::make_mut(&mut self.entries[index]);
                     let label = entry.detail.take().unwrap_or_else(|| "action".into());
                     entry.title = format!("Run {label}");
@@ -520,12 +569,12 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].body, "server stopped");
         assert!(!entries[0].running);
-        assert_eq!(entries[1].detail.as_deref(), Some("inspect next target"));
+        assert_eq!(entries[1].title, "Generate inspect next target");
         assert!(entries[1].running);
     }
 
     #[test]
-    fn consecutive_unmatched_action_preparations_reuse_the_live_entry() {
+    fn consecutive_unmatched_action_preparations_preserve_audit_entries() {
         let session_id = Uuid::new_v4();
         let mut projector = TimelineProjector::default();
         for (sequence, label) in [(1, "inspect first"), (2, "inspect second")] {
@@ -541,8 +590,10 @@ mod tests {
         }
 
         let entries = projector.into_entries();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].detail.as_deref(), Some("inspect second"));
-        assert!(entries[0].running);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].title, "Generate inspect first");
+        assert!(!entries[0].running);
+        assert_eq!(entries[1].title, "Generate inspect second");
+        assert!(entries[1].running);
     }
 }

@@ -152,6 +152,7 @@ impl NativeHarness {
         match self.harness {
             HarnessMode::Borg => system_prompt.push_str(concat!(
                 "\n\nBorg provides one shell-first execution surface through `exec`. ",
+                "Put the optional `action` argument first in every tool call so the live UI can display it while the remaining arguments stream. ",
                 "Use shell commands for orchestration and invoke the language or installed runtime that best fits the problem, such as TypeScript/JavaScript for web and JSON work or Python for data and scientific work. ",
                 "This is trusted user-authority execution, not a security sandbox. ",
                 "Use `borg tools` to discover Borg, Blu, plugin, history, workflow, and collaboration capabilities on demand, and `borg call NAME JSON` to invoke one. ",
@@ -159,6 +160,7 @@ impl NativeHarness {
             )),
             HarnessMode::Native => system_prompt.push_str(concat!(
                 "\n\nUse the available Borg capabilities directly. `exec_command` runs trusted user-authority shell commands and can invoke any installed language runtime. ",
+                "Put the optional `action` argument first in every tool call so the live UI can display it while the remaining arguments stream. ",
                 "Use `query_history` when compacted context is insufficient."
             )),
         }
@@ -330,17 +332,33 @@ impl NativeHarness {
                 .map(parse_tool_arguments)
                 .collect::<Vec<_>>();
             for (tool_call, input) in tool_calls.iter().zip(&inputs) {
+                let resolved_input = input.clone().unwrap_or_else(|error| {
+                    json!({
+                        "malformed_arguments": tool_call.function.arguments,
+                        "error": error
+                    })
+                });
+                send(
+                    &events,
+                    SessionEventKind::ProviderEvent {
+                        provider: turn.provider,
+                        kind: "action/preparing".to_string(),
+                        payload: json!({
+                            "label": crate::canonical_action_descriptor(
+                                &tool_call.function.name,
+                                &resolved_input,
+                            ),
+                            "tool_call_id": tool_call.id.clone(),
+                        }),
+                    },
+                )
+                .await;
                 send(
                     &events,
                     SessionEventKind::ToolStarted {
                         tool_call_id: tool_call.id.clone(),
                         name: tool_call.function.name.clone(),
-                        input: input.clone().unwrap_or_else(|error| {
-                            json!({
-                                "malformed_arguments": tool_call.function.arguments,
-                                "error": error
-                            })
-                        }),
+                        input: resolved_input,
                         input_ref: None,
                     },
                 )
@@ -847,6 +865,9 @@ impl NativeToolRuntime {
             HarnessMode::Borg => vec![exec_tool_definition()?],
             HarnessMode::Native => self.native_tool_catalog()?,
         };
+        for definition in &mut definitions {
+            add_action_metadata(definition)?;
+        }
         sort_tool_definitions(&mut definitions);
         validate_tool_definitions(&definitions)?;
         Ok(definitions)
@@ -875,10 +896,13 @@ impl NativeToolRuntime {
     async fn call(
         &self,
         name: &str,
-        arguments: Value,
+        mut arguments: Value,
         workflow_approved: bool,
         cancellation: Option<CancellationToken>,
     ) -> Result<Value> {
+        if let Some(arguments) = arguments.as_object_mut() {
+            arguments.remove("action");
+        }
         match name {
             "list_files" => {
                 let args: ListFilesArgs = serde_json::from_value(arguments)?;
@@ -1251,17 +1275,24 @@ async fn call_model_streaming(
                         payload,
                     }).await;
                 }
-                Some(ProviderProgress::ToolCallStarted { id, name, input }) => {
+                Some(ProviderProgress::ToolCallStarted { id, .. }) => {
                     send(
                         context.events,
                         SessionEventKind::ProviderEvent {
                             provider: context.coding_provider,
-                            kind: "tool_call_started".to_string(),
-                            payload: json!({
-                                "tool_call_id": id,
-                                "name": name,
-                                "input": input,
-                            }),
+                            kind: "action/preparing".to_string(),
+                            payload: json!({"label": "command", "tool_call_id": id}),
+                        },
+                    )
+                    .await;
+                }
+                Some(ProviderProgress::ToolCallAction { id, action }) => {
+                    send(
+                        context.events,
+                        SessionEventKind::ProviderEvent {
+                            provider: context.coding_provider,
+                            kind: "action/preparing".to_string(),
+                            payload: json!({"label": action, "tool_call_id": id}),
                         },
                     )
                     .await;
@@ -2122,6 +2153,28 @@ fn validate_tool_definitions(definitions: &[ModelToolDefinition]) -> Result<()> 
     Ok(())
 }
 
+fn add_action_metadata(definition: &mut ModelToolDefinition) -> Result<()> {
+    let schema = definition
+        .input_schema
+        .as_object_mut()
+        .context("native tool input schema is not an object")?;
+    let properties = schema
+        .entry("properties")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .context("native tool properties schema is not an object")?;
+    properties.insert(
+        "action".to_string(),
+        json!({
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "description": "Optional one- or two-word summary for the live UI. When present, this must be the first argument field."
+        }),
+    );
+    Ok(())
+}
+
 fn sort_tool_definitions(definitions: &mut [ModelToolDefinition]) {
     definitions.sort_by(|left, right| left.name.cmp(&right.name));
 }
@@ -2279,6 +2332,12 @@ mod tests {
                     input: Value::Null,
                 })
                 .expect("progress receiver remains alive");
+            progress
+                .send(ProviderProgress::ToolCallAction {
+                    id: "call-1".to_string(),
+                    action: "delete files".to_string(),
+                })
+                .expect("progress receiver remains alive");
             *self.held_progress.lock().unwrap() = Some(progress);
             Ok(ModelTurnResult {
                 message: ModelMessage::assistant(
@@ -2361,13 +2420,17 @@ mod tests {
         ));
         assert!(matches!(
             events_rx.recv().await,
-            Some(SessionEventKind::ProviderEvent {
-                kind,
-                payload,
-                ..
-            }) if kind == "tool_call_started"
-                && payload["tool_call_id"] == "call-1"
-                && payload["name"] == "apply_patch"
+            Some(SessionEventKind::ProviderEvent { kind, payload, .. })
+                if kind == "action/preparing"
+                    && payload["tool_call_id"] == "call-1"
+                    && payload["label"] == "command"
+        ));
+        assert!(matches!(
+            events_rx.recv().await,
+            Some(SessionEventKind::ProviderEvent { kind, payload, .. })
+                if kind == "action/preparing"
+                    && payload["tool_call_id"] == "call-1"
+                    && payload["label"] == "delete files"
         ));
     }
 
@@ -2400,6 +2463,19 @@ mod tests {
         assert_eq!(
             definition.input_schema["oneOf"].as_array().unwrap().len(),
             2
+        );
+    }
+
+    #[test]
+    fn native_action_metadata_is_first_and_optional() {
+        let mut definition = exec_tool_definition().expect("exec schema is valid");
+        add_action_metadata(&mut definition).expect("action metadata is valid");
+        let properties = definition.input_schema["properties"].as_object().unwrap();
+        assert_eq!(properties.keys().next().map(String::as_str), Some("action"));
+        assert!(
+            definition.input_schema["required"]
+                .as_array()
+                .is_none_or(|required| required.iter().all(|field| field != "action"))
         );
     }
 
