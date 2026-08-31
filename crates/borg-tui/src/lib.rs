@@ -4537,7 +4537,12 @@ impl BorgTerminal {
                 if let Some((start, max_offset)) = run {
                     self.transcript.anchor_tool_run(start, max_offset);
                 }
-                let payloads = self.open_tool_inspector(index);
+                if self.transcript.tool_is_expanded(index) {
+                    self.capture_transcript_anchor_for_collapse();
+                }
+                let payloads = self.transcript.toggle_tool(index);
+                self.transcript_render_cache = None;
+                self.transcript_full_render_cache = None;
                 if !payloads.is_empty() {
                     return UiAction::LoadPayloads(payloads);
                 }
