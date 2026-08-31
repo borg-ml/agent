@@ -82,3 +82,6 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_Threading",
 ] }
 zip = { version = "8", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+sqlx.workspace = true

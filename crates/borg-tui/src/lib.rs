@@ -566,6 +566,127 @@ fn dictation_icon(style: DictationIconStyle) -> &'static str {
     }
 }
 
+pub struct TerminalIoRequest {
+    kind: TerminalIoRequestKind,
+}
+
+enum TerminalIoRequestKind {
+    Copy {
+        text: String,
+        notice: String,
+    },
+    Paste {
+        store: AttachmentStore,
+        value: String,
+        cwd: PathBuf,
+    },
+    CaptureImage {
+        store: AttachmentStore,
+    },
+    OpenLink {
+        url: String,
+    },
+}
+
+impl std::fmt::Debug for TerminalIoRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("TerminalIoRequest")
+    }
+}
+
+pub struct TerminalIoCompletion {
+    kind: TerminalIoCompletionKind,
+}
+
+enum TerminalIoCompletionKind {
+    Copied(std::result::Result<String, String>),
+    Pasted(std::result::Result<PasteOutcome, String>),
+    ImageCaptured(std::result::Result<PathBuf, String>),
+    LinkOpened(std::result::Result<(), String>),
+}
+
+#[derive(Clone)]
+pub struct TerminalIoSender(std::sync::mpsc::Sender<TerminalIoRequest>);
+
+impl TerminalIoSender {
+    pub fn send(&self, request: TerminalIoRequest) -> bool {
+        self.0.send(request).is_ok()
+    }
+}
+
+pub fn spawn_terminal_io_worker() -> (
+    TerminalIoSender,
+    tokio::sync::mpsc::UnboundedReceiver<TerminalIoCompletion>,
+) {
+    let (requests_tx, requests_rx) = std::sync::mpsc::channel::<TerminalIoRequest>();
+    let (completions_tx, completions_rx) = tokio::sync::mpsc::unbounded_channel();
+    thread::spawn(move || {
+        let mut clipboard_lease = None;
+        while let Ok(request) = requests_rx.recv() {
+            let kind = match request.kind {
+                TerminalIoRequestKind::Copy { text, notice } => {
+                    let result = clipboard::copy(&text).map(|lease| {
+                        clipboard_lease = lease;
+                        notice
+                    });
+                    TerminalIoCompletionKind::Copied(result)
+                }
+                TerminalIoRequestKind::Paste { store, value, cwd } => {
+                    TerminalIoCompletionKind::Pasted(
+                        store
+                            .stage_paste(&value, &cwd)
+                            .map_err(|error| format!("{error:#}")),
+                    )
+                }
+                TerminalIoRequestKind::CaptureImage { store } => {
+                    TerminalIoCompletionKind::ImageCaptured(
+                        store
+                            .capture_clipboard_image()
+                            .map_err(|error| format!("{error:#}")),
+                    )
+                }
+                TerminalIoRequestKind::OpenLink { url } => TerminalIoCompletionKind::LinkOpened(
+                    open_link(&url).map_err(|error| format!("{error:#}")),
+                ),
+            };
+            if completions_tx.send(TerminalIoCompletion { kind }).is_err() {
+                break;
+            }
+        }
+        drop(clipboard_lease);
+    });
+    (TerminalIoSender(requests_tx), completions_rx)
+}
+
+impl TerminalIoRequest {
+    fn copy(text: String, notice: impl Into<String>) -> Self {
+        Self {
+            kind: TerminalIoRequestKind::Copy {
+                text,
+                notice: notice.into(),
+            },
+        }
+    }
+
+    fn paste(store: AttachmentStore, value: String, cwd: PathBuf) -> Self {
+        Self {
+            kind: TerminalIoRequestKind::Paste { store, value, cwd },
+        }
+    }
+
+    fn capture_image(store: AttachmentStore) -> Self {
+        Self {
+            kind: TerminalIoRequestKind::CaptureImage { store },
+        }
+    }
+
+    fn open_link(url: String) -> Self {
+        Self {
+            kind: TerminalIoRequestKind::OpenLink { url },
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum UiAction {
     None,
@@ -626,6 +747,7 @@ pub enum UiAction {
     SetCompletionSound(CompletionAlertPolicy),
     SetDictationIcon(DictationIconStyle),
     ToggleDictation,
+    TerminalIo(TerminalIoRequest),
     LoadPayloads(Vec<SessionPayloadRef>),
     Interrupt {
         target: Option<Uuid>,
@@ -852,7 +974,6 @@ pub struct BorgTerminal {
     active_since: Option<DateTime<Utc>>,
     notice: Option<String>,
     copy_notice_expires_at: Option<Instant>,
-    clipboard_lease: Option<clipboard::ClipboardLease>,
     last_ctrl_c: Option<Instant>,
     ctrl_c_count: u8,
     queued_prompts: Vec<PendingPromptProjection>,
@@ -1876,7 +1997,6 @@ impl BorgTerminal {
             active_since: None,
             notice: None,
             copy_notice_expires_at: None,
-            clipboard_lease: None,
             last_ctrl_c: None,
             ctrl_c_count: 0,
             queued_prompts: Vec::new(),
@@ -2014,7 +2134,6 @@ impl BorgTerminal {
         self.active_since = None;
         self.notice = None;
         self.copy_notice_expires_at = None;
-        self.clipboard_lease = None;
         self.last_ctrl_c = None;
         self.ctrl_c_count = 0;
         self.queued_prompts.clear();
@@ -2031,7 +2150,7 @@ impl BorgTerminal {
         self.rewind_primed = false;
         self.borging_this_run = false;
         self.last_terminal_title = None;
-        self.transcript_render_cache = None;
+        self.invalidate_transcript_render_cache();
         self.rendered_transcript_height = 0;
         self.pending_scroll_anchor_height = None;
         self.pending_transcript_anchor = None;
@@ -2160,7 +2279,7 @@ impl BorgTerminal {
         self.text_selection = None;
         self.pending_transcript_click = None;
         self.pending_scroll_anchor_height = Some(previous_height);
-        self.transcript_render_cache = None;
+        self.invalidate_transcript_render_cache();
     }
 
     /// Consume one explicit upward-navigation request once the loaded
@@ -2313,7 +2432,7 @@ impl BorgTerminal {
         self.interrupt_requested = false;
         self.active_since = Some(event.created_at);
         self.transcript.follow_tail = true;
-        self.transcript_render_cache = None;
+        self.invalidate_transcript_render_cache();
     }
 
     pub fn reject_optimistic_prompt(
@@ -2333,7 +2452,7 @@ impl BorgTerminal {
                 .retain(|queued| queued.message_id != message_id);
             if let Some(removed) = self.transcript.remove_message(message_id) {
                 self.remap_selection_after_entry_removal(removed);
-                self.transcript_render_cache = None;
+                self.invalidate_transcript_render_cache();
             }
             if self
                 .transcript
@@ -2587,7 +2706,7 @@ impl BorgTerminal {
             {
                 self.pending_scroll_anchor_height = Some(self.rendered_transcript_height);
             }
-            self.transcript_render_cache = None;
+            self.invalidate_transcript_render_cache();
         }
         if self.transcript.follow_tail {
             self.scroll_from_bottom = 0;
@@ -2847,7 +2966,7 @@ impl BorgTerminal {
             self.transcript = transcript;
             self.text_selection = None;
             self.pending_transcript_click = None;
-            self.transcript_render_cache = None;
+            self.invalidate_transcript_render_cache();
         } else {
             self.child_transcripts.insert(child_id, transcript);
         }
@@ -2920,12 +3039,17 @@ impl BorgTerminal {
         }
     }
 
+    fn invalidate_transcript_render_cache(&mut self) {
+        self.transcript_render_cache = None;
+        self.transcript_full_render_cache = None;
+        self.last_committed_viewport_render = None;
+    }
+
     fn reset_transcript_focus(&mut self) {
         self.focused_tool = None;
         self.scroll_from_bottom = 0;
         self.transcript.follow_tail = true;
-        self.transcript_render_cache = None;
-        self.transcript_full_render_cache = None;
+        self.invalidate_transcript_render_cache();
         self.active_transcript_render = None;
         self.text_selection = None;
         self.composer_selection = None;
@@ -2957,8 +3081,7 @@ impl BorgTerminal {
         self.hovered_tool = None;
         self.hovered_tool_run = None;
         self.hovered_tool_run_header = None;
-        self.transcript_render_cache = None;
-        self.transcript_full_render_cache = None;
+        self.invalidate_transcript_render_cache();
         self.transcript.tool_payloads(index)
     }
 
@@ -2972,8 +3095,7 @@ impl BorgTerminal {
         self.text_selection = None;
         self.pending_transcript_click = None;
         self.hovered_tool = None;
-        self.transcript_render_cache = None;
-        self.transcript_full_render_cache = None;
+        self.invalidate_transcript_render_cache();
     }
 
     fn clear_background_hover(&mut self) {
@@ -3021,8 +3143,7 @@ impl BorgTerminal {
             });
             self.transcript.follow_tail = true;
             self.scroll_from_bottom = 0;
-            self.transcript_render_cache = None;
-            self.transcript_full_render_cache = None;
+            self.invalidate_transcript_render_cache();
             self.event_redraw_needed = true;
         }
         true
@@ -3056,17 +3177,56 @@ impl BorgTerminal {
         UiAction::FlushPendingInput { target, prompt }
     }
 
-    pub fn hydrate_payload(&mut self, payload: &SessionPayloadRef, bytes: Vec<u8>) -> Result<()> {
+    pub fn hydrate_payload(
+        &mut self,
+        payload: &SessionPayloadRef,
+        bytes: Vec<u8>,
+    ) -> Result<Option<TerminalIoRequest>> {
         self.transcript.hydrate_payload(payload, bytes)?;
         self.transcript.tool_body_cache.get_mut().lines.clear();
-        self.transcript_render_cache = None;
+        self.invalidate_transcript_render_cache();
         if let Some(index) = self.pending_tool_copy
             && self.transcript.tool_payloads(index).is_empty()
         {
             self.pending_tool_copy = None;
-            self.copy_transcript_entry(index);
+            return Ok(self.copy_transcript_entry_request(index));
         }
-        Ok(())
+        Ok(None)
+    }
+
+    pub fn apply_terminal_io_completion(&mut self, completion: TerminalIoCompletion) {
+        match completion.kind {
+            TerminalIoCompletionKind::Copied(Ok(notice)) => self.show_copy_notice(notice),
+            TerminalIoCompletionKind::Copied(Err(error)) => {
+                self.notice = Some(format!("Copy failed: {error}"));
+            }
+            TerminalIoCompletionKind::Pasted(Ok(PasteOutcome { text, attachments })) => {
+                self.composer.insert(&text);
+                for path in attachments {
+                    self.composer.insert_attachment(path);
+                }
+                self.notice = self
+                    .composer
+                    .attachments
+                    .last()
+                    .map(|attachment| format!("Attached {}", attachment.label));
+            }
+            TerminalIoCompletionKind::Pasted(Err(error)) => {
+                self.notice = Some(format!("Paste failed: {error}"));
+            }
+            TerminalIoCompletionKind::ImageCaptured(Ok(path)) => {
+                let label = self.composer.insert_attachment(path);
+                self.notice = Some(format!("Attached {label}"));
+            }
+            TerminalIoCompletionKind::ImageCaptured(Err(error)) => {
+                self.notice = Some(format!("Image paste failed: {error}"));
+            }
+            TerminalIoCompletionKind::LinkOpened(Ok(())) => {}
+            TerminalIoCompletionKind::LinkOpened(Err(error)) => {
+                self.notice = Some(format!("Could not open link: {error}"));
+            }
+        }
+        self.event_redraw_needed = true;
     }
 
     pub fn show_goal(&mut self, goal: Option<&SessionGoal>) {
@@ -3074,7 +3234,7 @@ impl BorgTerminal {
         if let Some(removed) = self.transcript.show_goal(goal) {
             self.remap_selection_after_entry_removal(removed);
         }
-        self.transcript_render_cache = None;
+        self.invalidate_transcript_render_cache();
     }
 
     pub fn optimistically_apply_goal_action(&mut self, action: &GoalAction) -> bool {
@@ -3094,7 +3254,7 @@ impl BorgTerminal {
                 self.active_since = Some(Utc::now());
                 self.borging_this_run = borging_for_run(Uuid::new_v4());
             }
-            self.transcript_render_cache = None;
+            self.invalidate_transcript_render_cache();
             self.event_redraw_needed = true;
         }
         changed
@@ -3105,7 +3265,7 @@ impl BorgTerminal {
         if let Some(removed) = self.transcript.show_plan(items) {
             self.remap_selection_after_entry_removal(removed);
         }
-        self.transcript_render_cache = None;
+        self.invalidate_transcript_render_cache();
     }
 
     fn remap_selection_after_entry_removal(&mut self, removed: usize) {
@@ -3137,7 +3297,7 @@ impl BorgTerminal {
             text: text.into(),
             time: canonical_local_time(Local::now()),
         });
-        self.transcript_render_cache = None;
+        self.invalidate_transcript_render_cache();
     }
 
     pub fn set_configured_model_entries(&mut self, entries: Vec<borg_provider::DynamicModelEntry>) {
@@ -3510,7 +3670,7 @@ impl BorgTerminal {
     pub fn set_action_descriptors(&mut self, enabled: bool) {
         self.action_descriptors = enabled;
         self.transcript.set_action_descriptors(enabled);
-        self.transcript_render_cache = None;
+        self.invalidate_transcript_render_cache();
     }
 
     pub fn set_layout_preferences(
@@ -3520,8 +3680,7 @@ impl BorgTerminal {
         self.horizontal_margin = preferences.horizontal_margin;
         self.composer_max_height = preferences.composer_max_height;
         self.show_footer = preferences.show_footer;
-        self.transcript_render_cache = None;
-        self.transcript_full_render_cache = None;
+        self.invalidate_transcript_render_cache();
     }
 
     pub fn open_dictation_icon_picker(&mut self) {
@@ -3552,7 +3711,7 @@ impl BorgTerminal {
             self.capture_transcript_anchor_for_collapse();
         }
         self.transcript.set_diff_expansion(policy);
-        self.transcript_render_cache = None;
+        self.invalidate_transcript_render_cache();
     }
 
     pub fn set_auto_expand_tools(&mut self, enabled: bool) {
@@ -3560,7 +3719,7 @@ impl BorgTerminal {
             self.capture_transcript_anchor_for_collapse();
         }
         self.transcript.set_auto_expand_tools(enabled);
-        self.transcript_render_cache = None;
+        self.invalidate_transcript_render_cache();
     }
 
     pub fn set_dictation_icon(&mut self, style: DictationIconStyle) {
@@ -3571,7 +3730,7 @@ impl BorgTerminal {
     pub fn set_transcript_labels(&mut self, user: String, assistant: String) {
         self.transcript.user_label = user;
         self.transcript.assistant_label = assistant;
-        self.transcript_render_cache = None;
+        self.invalidate_transcript_render_cache();
     }
 
     pub fn set_transcript_colors(&mut self, preferences: &TranscriptPreferences) {
@@ -3585,7 +3744,7 @@ impl BorgTerminal {
             .get_mut()
             .messages
             .clear();
-        self.transcript_render_cache = None;
+        self.invalidate_transcript_render_cache();
     }
 
     fn open_rewind_picker(&mut self) {
@@ -3735,18 +3894,12 @@ impl BorgTerminal {
                 self.ctrl_c_count = 0;
                 self.composer_selection = None;
                 let value = normalize_terminal_capture_paste(&value);
-                let PasteOutcome { text, attachments } =
-                    self.attachment_store.stage_paste(&value, &self.cwd)?;
-                self.composer.insert(&text);
-                for path in attachments {
-                    self.composer.insert_attachment(path);
-                }
-                self.notice = self
-                    .composer
-                    .attachments
-                    .last()
-                    .map(|attachment| format!("Attached {}", attachment.label));
-                Ok(UiAction::None)
+                self.notice = Some("Processing paste…".to_string());
+                Ok(UiAction::TerminalIo(TerminalIoRequest::paste(
+                    self.attachment_store.clone(),
+                    value.into_owned(),
+                    self.cwd.clone(),
+                )))
             }
             Event::Mouse(mouse) => {
                 let previous_hover = self.hover_state();
@@ -3867,12 +4020,13 @@ impl BorgTerminal {
                 {
                     let payloads = self.transcript.tool_payloads(index);
                     if payloads.is_empty() {
-                        self.copy_transcript_entry(index);
+                        return Ok(self
+                            .copy_transcript_entry_request(index)
+                            .map_or(UiAction::None, UiAction::TerminalIo));
                     } else {
                         self.pending_tool_copy = Some(index);
                         return Ok(UiAction::LoadPayloads(payloads));
                     }
-                    return Ok(UiAction::None);
                 }
                 if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
                     if self.dictation_button_hovered {
@@ -4409,7 +4563,7 @@ impl BorgTerminal {
                 -isize::try_from(current - next).unwrap_or(isize::MAX)
             };
             self.transcript.scroll_tool_run(start, max_offset, delta);
-            self.transcript_render_cache = None;
+            self.invalidate_transcript_render_cache();
         }
         if self
             .nested_scroll_motion
@@ -4520,9 +4674,7 @@ impl BorgTerminal {
     fn run_pending_transcript_click(&mut self, click: PendingTranscriptClick) -> UiAction {
         match click {
             PendingTranscriptClick::Link(url) => {
-                if let Err(error) = open_link(&url) {
-                    self.notice = Some(format!("Could not open link: {error}"));
-                }
+                return UiAction::TerminalIo(TerminalIoRequest::open_link(url));
             }
             PendingTranscriptClick::ToolRunHeader(start) => {
                 if self.transcript.tool_run_expanded(start) {
@@ -4530,7 +4682,7 @@ impl BorgTerminal {
                 }
                 self.nested_scroll_motion = None;
                 self.transcript.toggle_tool_run_expansion(start);
-                self.transcript_render_cache = None;
+                self.invalidate_transcript_render_cache();
             }
             PendingTranscriptClick::Tool { index, run } => {
                 self.nested_scroll_motion = None;
@@ -4541,8 +4693,7 @@ impl BorgTerminal {
                     self.capture_transcript_anchor_for_collapse();
                 }
                 let payloads = self.transcript.toggle_tool(index);
-                self.transcript_render_cache = None;
-                self.transcript_full_render_cache = None;
+                self.invalidate_transcript_render_cache();
                 if !payloads.is_empty() {
                     return UiAction::LoadPayloads(payloads);
                 }
@@ -4554,14 +4705,14 @@ impl BorgTerminal {
                 if self.transcript.compaction_is_expandable(index) {
                     self.capture_transcript_anchor_for_collapse();
                     self.transcript.toggle_compaction_expansion(index);
-                    self.transcript_render_cache = None;
+                    self.invalidate_transcript_render_cache();
                 } else if self.transcript.action_is_expandable(index) {
                     self.capture_transcript_anchor_for_collapse();
                     self.transcript.toggle_action_expansion(index);
-                    self.transcript_render_cache = None;
+                    self.invalidate_transcript_render_cache();
                 } else if self.transcript.plan_is_clippable(index) {
                     self.transcript.toggle_plan_expansion(index);
-                    self.transcript_render_cache = None;
+                    self.invalidate_transcript_render_cache();
                 } else if matches!(
                     self.transcript.order.get(index),
                     Some(TranscriptEntry::Compaction { .. })
@@ -4589,7 +4740,7 @@ impl BorgTerminal {
         if let Some((start, max_offset, delta)) = nested
             && self.transcript.scroll_tool_run(start, max_offset, delta)
         {
-            self.transcript_render_cache = None;
+            self.invalidate_transcript_render_cache();
             if let Some(selection) = self.text_selection.as_mut() {
                 selection.autoscroll = 0;
             }
@@ -4710,62 +4861,42 @@ impl BorgTerminal {
         }
     }
 
-    fn copy_text_selection(&mut self) -> bool {
-        if self.copy_composer_selection() {
-            return true;
+    fn copy_text_selection_request(&self) -> Option<TerminalIoRequest> {
+        if let Some(request) = self.copy_composer_selection_request() {
+            return Some(request);
         }
-        let Some(render) = self.active_transcript_render.as_ref() else {
-            return false;
-        };
-        let Some((start, end)) = self
+        let render = self.active_transcript_render.as_ref()?;
+        let (start, end) = self
             .text_selection
             .filter(|selection| !selection.is_empty())
-            .and_then(|selection| resolved_selection_in_lines(selection, &render.6, &render.0))
-        else {
-            return false;
-        };
-        let Some(text) = selected_transcript_text(&render.0, start, end) else {
-            return false;
-        };
-        match clipboard::copy(&text) {
-            Ok(lease) => {
-                self.clipboard_lease = lease;
-                self.show_copy_notice("✓ Copied selection to clipboard");
-            }
-            Err(error) => self.notice = Some(format!("Copy failed: {error}")),
-        }
-        true
+            .and_then(|selection| resolved_selection_in_lines(selection, &render.6, &render.0))?;
+        let text = selected_transcript_text(&render.0, start, end)?;
+        Some(TerminalIoRequest::copy(
+            text,
+            "✓ Copied selection to clipboard",
+        ))
     }
 
-    fn copy_composer_selection(&mut self) -> bool {
-        let Some(selection) = self.composer_selection.filter(|selection| {
+    fn copy_composer_selection_request(&self) -> Option<TerminalIoRequest> {
+        let selection = self.composer_selection.filter(|selection| {
             !selection.is_empty()
                 && selection.anchor <= self.composer.text.len()
                 && selection.focus <= self.composer.text.len()
-        }) else {
-            return false;
-        };
+        })?;
         let (start, end) = if selection.anchor <= selection.focus {
             (selection.anchor, selection.focus)
         } else {
             (selection.focus, selection.anchor)
         };
-        let Some(text) = self
+        let text = self
             .composer
             .text
             .get(start..end)
-            .filter(|text| !text.is_empty())
-        else {
-            return false;
-        };
-        match clipboard::copy(text) {
-            Ok(lease) => {
-                self.clipboard_lease = lease;
-                self.show_copy_notice("✓ Copied composer selection to clipboard");
-            }
-            Err(error) => self.notice = Some(format!("Copy failed: {error}")),
-        }
-        true
+            .filter(|text| !text.is_empty())?;
+        Some(TerminalIoRequest::copy(
+            text.to_string(),
+            "✓ Copied composer selection to clipboard",
+        ))
     }
 
     fn scroll_to_scrollbar_row(&mut self, row: u16) {
@@ -4813,36 +4944,24 @@ impl BorgTerminal {
         }
     }
 
-    fn copy_transcript_entry(&mut self, index: usize) {
-        let Some(text) = self
+    fn copy_transcript_entry_request(&self, index: usize) -> Option<TerminalIoRequest> {
+        let text = self
             .transcript
             .order
             .get(index)
-            .and_then(TranscriptEntry::copy_text_owned)
-        else {
-            return;
-        };
-        match clipboard::copy(&text) {
-            Ok(lease) => {
-                self.clipboard_lease = lease;
-                self.show_copy_notice("✓ Copied to clipboard");
-            }
-            Err(error) => self.notice = Some(format!("Copy failed: {error}")),
-        }
+            .and_then(TranscriptEntry::copy_text_owned)?;
+        Some(TerminalIoRequest::copy(text, "✓ Copied to clipboard"))
     }
 
-    fn copy_last_assistant_message(&mut self) {
+    fn copy_last_assistant_message_request(&mut self) -> Option<TerminalIoRequest> {
         let Some(text) = self.transcript.last_assistant_message_text() else {
             self.notice = Some("No assistant message is available to copy".to_string());
-            return;
+            return None;
         };
-        match clipboard::copy(&text) {
-            Ok(lease) => {
-                self.clipboard_lease = lease;
-                self.show_copy_notice("✓ Copied last assistant message to clipboard");
-            }
-            Err(error) => self.notice = Some(format!("Copy failed: {error}")),
-        }
+        Some(TerminalIoRequest::copy(
+            text,
+            "✓ Copied last assistant message to clipboard",
+        ))
     }
 
     fn show_copy_notice(&mut self, notice: impl Into<String>) {
@@ -4889,10 +5008,9 @@ impl BorgTerminal {
         match selected.as_deref() {
             Some("Revert to here") => self.rewind_action_for_output(index),
             Some("Revert to after compaction") => self.revert_compaction_action(index),
-            Some(selected) if selected.starts_with("Copy ") => {
-                self.copy_transcript_entry(index);
-                UiAction::None
-            }
+            Some(selected) if selected.starts_with("Copy ") => self
+                .copy_transcript_entry_request(index)
+                .map_or(UiAction::None, UiAction::TerminalIo),
             _ => UiAction::None,
         }
     }
@@ -5100,19 +5218,20 @@ impl BorgTerminal {
         let tool_elapsed_tick = self.transcript.tool_elapsed_cache_tick();
         let current_tool_elapsed = self.transcript.running_tool_elapsed_labels();
         let local_date = Local::now().date_naive();
+        let transcript_snapshot_current = self.transcript_render_cache.is_some();
         // Keep a separate full-width measurement so an overflowing transcript
         // can switch to the scrollbar-safe width without rendering both widths
         // again on every frame. Input redraws reuse the last complete viewport
         // snapshot so typing cannot alternate between full-width and
         // scrollbar-safe wrapping.
-        let committed_viewport_render = if input_fast_path {
+        let committed_viewport_render = if input_fast_path && transcript_snapshot_current {
             self.last_committed_viewport_render
                 .as_ref()
                 .map(|(_, _, _, _, _, render)| Arc::clone(render))
         } else {
             None
         };
-        let stale_full_transcript_render = if input_fast_path {
+        let stale_full_transcript_render = if input_fast_path && transcript_snapshot_current {
             self.transcript_full_render_cache
                 .as_ref()
                 .filter(
@@ -5135,8 +5254,11 @@ impl BorgTerminal {
         } else {
             None
         };
-        let full_transcript_render =
-            select_transcript_snapshot(input_fast_path, committed_viewport_render, || {
+        let full_transcript_render = select_transcript_snapshot(
+            input_fast_path,
+            transcript_snapshot_current,
+            committed_viewport_render,
+            || {
                 if let Some(index) = self.focused_tool {
                     return Arc::new(self.transcript.render_tool_for_cache(
                         index,
@@ -5168,7 +5290,8 @@ impl BorgTerminal {
                         )
                     }
                 })
-            });
+            },
+        );
         let queued_prompts = self.active_queued_prompts().to_vec();
         // Keep the first draft anchored in the splash composition area. Moving
         // it to the chat footer on the first keystroke makes the whole screen
@@ -7066,8 +7189,10 @@ impl BorgTerminal {
     }
 
     fn handle_key(&mut self, mut key: KeyEvent) -> Result<UiAction> {
-        if is_selection_copy_shortcut(&key) && self.copy_text_selection() {
-            return Ok(UiAction::None);
+        if is_selection_copy_shortcut(&key)
+            && let Some(request) = self.copy_text_selection_request()
+        {
+            return Ok(UiAction::TerminalIo(request));
         }
         let ctrl_c = is_ctrl_c(&key);
         if ctrl_c {
@@ -7391,30 +7516,23 @@ impl BorgTerminal {
             return Ok(UiAction::Quit);
         }
         if self.keymap.matches(KeyAction::AttachImage, &key) {
-            match self.attachment_store.capture_clipboard_image() {
-                Ok(path) => {
-                    let label = self.composer.insert_attachment(path);
-                    self.notice = Some(format!("Attached {label}"));
-                }
-                Err(error) => self.notice = Some(format!("Image paste failed: {error:#}")),
-            }
-            return Ok(UiAction::None);
+            self.notice = Some("Reading clipboard image…".to_string());
+            return Ok(UiAction::TerminalIo(TerminalIoRequest::capture_image(
+                self.attachment_store.clone(),
+            )));
         }
         if self.keymap.matches(KeyAction::Dictate, &key) {
             return Ok(UiAction::ToggleDictation);
         }
         if self.keymap.matches(KeyAction::Copy, &key) {
-            if self.copy_text_selection() {
-                return Ok(UiAction::None);
+            if let Some(request) = self.copy_text_selection_request() {
+                return Ok(UiAction::TerminalIo(request));
             }
             if let Some(text) = self.transcript.copy_text() {
-                match clipboard::copy(&text) {
-                    Ok(lease) => {
-                        self.clipboard_lease = lease;
-                        self.show_copy_notice(self.transcript.copy_notice());
-                    }
-                    Err(error) => self.notice = Some(format!("Copy failed: {error}")),
-                }
+                return Ok(UiAction::TerminalIo(TerminalIoRequest::copy(
+                    text,
+                    self.transcript.copy_notice(),
+                )));
             }
             return Ok(UiAction::None);
         }
@@ -7488,8 +7606,9 @@ impl BorgTerminal {
             if self.composer.attachments.is_empty() && self.composer.text.trim() == "/copy" {
                 self.composer.clear();
                 self.notice = None;
-                self.copy_last_assistant_message();
-                return Ok(UiAction::None);
+                return Ok(self
+                    .copy_last_assistant_message_request()
+                    .map_or(UiAction::None, UiAction::TerminalIo));
             }
             if self.composer.attachments.is_empty() && self.composer.text.trim() == "/dictate" {
                 self.composer.clear();
@@ -9972,7 +10091,9 @@ impl TranscriptEntry {
 
 fn apply_line_background(line: &mut Line<'static>, width: usize, background: Color) {
     for span in &mut line.spans {
-        span.style = span.style.bg(background);
+        if span.style.bg.is_none() {
+            span.style = span.style.bg(background);
+        }
     }
     let fill = width.saturating_sub(line.width());
     line.spans.push(Span::styled(
@@ -11356,13 +11477,14 @@ fn refresh_tool_elapsed_line(
 
 fn select_transcript_snapshot<T, F>(
     input_fast_path: bool,
+    transcript_snapshot_current: bool,
     committed_viewport_render: Option<T>,
     fallback_render: F,
 ) -> T
 where
     F: FnOnce() -> T,
 {
-    if input_fast_path {
+    if input_fast_path && transcript_snapshot_current {
         committed_viewport_render.unwrap_or_else(fallback_render)
     } else {
         fallback_render()

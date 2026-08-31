@@ -2997,10 +2997,23 @@ impl Transcript {
                     };
                     let message_content_start = lines.len();
                     let time = display_local_time(time, &today_prefix);
-                    let mut header = vec![Span::styled(
-                        format!("  ▌ {label}"),
-                        Style::default().fg(color).add_modifier(Modifier::BOLD),
-                    )];
+                    let mut header = if matches!(actor, EventActor::User | EventActor::Assistant) {
+                        vec![
+                            Span::raw("  "),
+                            Span::styled(
+                                format!(" {label} "),
+                                Style::default()
+                                    .fg(Color::White)
+                                    .bg(color)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                        ]
+                    } else {
+                        vec![Span::styled(
+                            format!("  {label}"),
+                            Style::default().fg(color).add_modifier(Modifier::BOLD),
+                        )]
+                    };
                     if *actor == EventActor::Assistant {
                         let runtime = [model.as_deref(), effort.as_deref()]
                             .into_iter()

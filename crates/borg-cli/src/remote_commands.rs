@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::net::IpAddr;
@@ -52,6 +52,7 @@ use crate::sleep_inhibitor::SleepInhibitor;
 use crate::terminal_ui::{
     BorgTerminal, DictationState, ProviderAuthChoice, ResumeSessionOption, TerminalInputEvent,
     UiAction, dictation_icon_style_for_preference, discard_pending_terminal_input,
+    spawn_terminal_io_worker,
 };
 
 #[path = "local_server.rs"]
@@ -80,12 +81,256 @@ type BluDiscoveryResult = Result<(
     crate::extensions::ExtensionCatalog,
     Vec<borg_provider::mcp::ExternalMcpServer>,
     Vec<borg_remote::BluWorkflowDefinition>,
+    Option<(AgentConfig, EditorPreferences)>,
 )>;
 type BluDiscoveryTask = tokio::task::JoinHandle<BluDiscoveryResult>;
 type RevertForkTask = tokio::task::JoinHandle<Result<Uuid>>;
+type UiInteractionTask = tokio::task::JoinHandle<()>;
+type EditorPreferencesTask = tokio::task::JoinHandle<()>;
+type PayloadHydrationTask = tokio::task::JoinHandle<()>;
+type DictationStartTask = tokio::task::JoinHandle<Result<LocalDictationRecorder>>;
+type AgentConfigPollResult = (
+    Option<(std::time::SystemTime, u64)>,
+    Option<std::result::Result<AgentConfig, String>>,
+);
+type ProjectionGapRepairTask = tokio::task::JoinHandle<Result<Vec<SessionEvent>>>;
+type StaleOwnerHandoffTask = tokio::task::JoinHandle<Result<()>>;
 /// Resume filtering is local and eager, so load enough history to make search useful while
 /// keeping picker construction and per-keystroke filtering bounded.
 const RESUME_PICKER_SESSION_LIMIT: usize = 1_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromptSubmissionKind {
+    Send,
+    Queue,
+    Flush,
+}
+
+impl PromptSubmissionKind {
+    fn failure_label(self) -> &'static str {
+        match self {
+            Self::Send => "send the prompt",
+            Self::Queue => "queue the prompt",
+            Self::Flush => "send the pending input",
+        }
+    }
+
+    fn disconnected_notice(self) -> &'static str {
+        match self {
+            Self::Send => "Prompt saved durably · waiting for the session coordinator to reconnect",
+            Self::Queue => {
+                "Prompt saved durably · waiting for the session coordinator to reconnect"
+            }
+            Self::Flush => {
+                "Pending input saved durably · waiting for the session coordinator to reconnect"
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct UiPromptSubmission {
+    journal_session_id: Uuid,
+    target: Option<Uuid>,
+    message_id: Uuid,
+    text: String,
+    rejected_text: String,
+    attachments: Vec<PathBuf>,
+    delivery: PromptDelivery,
+    command: Option<HostCommand>,
+    kind: PromptSubmissionKind,
+    started_idle_turn: bool,
+}
+
+#[derive(Debug)]
+enum UiInteractionOperation {
+    Command(HostCommand),
+    Prompt(UiPromptSubmission),
+}
+
+#[derive(Debug)]
+enum UiPromptOutcome {
+    Routed,
+    PersistenceFailed(String),
+    CoordinatorClosed,
+}
+
+#[derive(Debug)]
+enum UiInteractionCompletion {
+    Prompt {
+        submission: UiPromptSubmission,
+        outcome: UiPromptOutcome,
+    },
+    CoordinatorClosed,
+}
+
+fn spawn_ui_interaction_dispatcher(
+    store: Arc<dyn SessionStore>,
+    commands: mpsc::Sender<HostCommand>,
+) -> (
+    mpsc::UnboundedSender<UiInteractionOperation>,
+    mpsc::UnboundedReceiver<UiInteractionCompletion>,
+    UiInteractionTask,
+) {
+    let (operation_tx, mut operations) = mpsc::unbounded_channel();
+    let (completion_tx, completion_rx) = mpsc::unbounded_channel();
+    let task = tokio::spawn(async move {
+        let mut coordinator_closed = false;
+        while let Some(operation) = operations.recv().await {
+            match operation {
+                UiInteractionOperation::Command(command) => {
+                    if !coordinator_closed && commands.send(command).await.is_err() {
+                        coordinator_closed = true;
+                        let _ = completion_tx.send(UiInteractionCompletion::CoordinatorClosed);
+                    }
+                }
+                UiInteractionOperation::Prompt(mut submission) => {
+                    let outcome = match persist_prompt_admission(
+                        store.as_ref(),
+                        submission.journal_session_id,
+                        submission.message_id,
+                        &submission.text,
+                        &submission.attachments,
+                        submission.delivery,
+                    )
+                    .await
+                    {
+                        Ok(()) if coordinator_closed => UiPromptOutcome::CoordinatorClosed,
+                        Ok(()) => {
+                            let command = submission
+                                .command
+                                .take()
+                                .expect("queued prompt retains its host command");
+                            if commands.send(command).await.is_ok() {
+                                UiPromptOutcome::Routed
+                            } else {
+                                coordinator_closed = true;
+                                UiPromptOutcome::CoordinatorClosed
+                            }
+                        }
+                        Err(error) => UiPromptOutcome::PersistenceFailed(format!("{error:#}")),
+                    };
+                    let _ = completion_tx.send(UiInteractionCompletion::Prompt {
+                        submission,
+                        outcome,
+                    });
+                }
+            }
+        }
+    });
+    (operation_tx, completion_rx, task)
+}
+
+fn dispatch_ui_command(
+    operations: &mpsc::UnboundedSender<UiInteractionOperation>,
+    command: HostCommand,
+) -> bool {
+    operations
+        .send(UiInteractionOperation::Command(command))
+        .is_ok()
+}
+
+fn dispatch_ui_prompt(
+    operations: &mpsc::UnboundedSender<UiInteractionOperation>,
+    pending_prompt_ids: &mut HashSet<Uuid>,
+    submission: UiPromptSubmission,
+) -> std::result::Result<(), UiPromptSubmission> {
+    let message_id = submission.message_id;
+    match operations.send(UiInteractionOperation::Prompt(submission)) {
+        Ok(()) => {
+            pending_prompt_ids.insert(message_id);
+            Ok(())
+        }
+        Err(error) => match error.0 {
+            UiInteractionOperation::Prompt(submission) => Err(submission),
+            UiInteractionOperation::Command(_) => unreachable!("submitted a prompt operation"),
+        },
+    }
+}
+
+fn spawn_editor_preferences_writer() -> (
+    mpsc::UnboundedSender<EditorPreferences>,
+    mpsc::UnboundedReceiver<String>,
+    EditorPreferencesTask,
+) {
+    let (preferences_tx, mut preferences_rx) = mpsc::unbounded_channel::<EditorPreferences>();
+    let (error_tx, error_rx) = mpsc::unbounded_channel();
+    let task = tokio::spawn(async move {
+        while let Some(mut preferences) = preferences_rx.recv().await {
+            while let Ok(latest) = preferences_rx.try_recv() {
+                preferences = latest;
+            }
+            let result = tokio::task::spawn_blocking(move || preferences.save()).await;
+            let error = match result {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(format!("Could not save editor preferences: {error:#}")),
+                Err(error) => Some(format!("Editor preferences writer failed: {error}")),
+            };
+            if let Some(error) = error {
+                let _ = error_tx.send(error);
+            }
+        }
+    });
+    (preferences_tx, error_rx, task)
+}
+
+fn dispatch_editor_preferences_save(
+    preferences_tx: &mpsc::UnboundedSender<EditorPreferences>,
+    preferences: &EditorPreferences,
+) -> bool {
+    preferences_tx.send(preferences.clone()).is_ok()
+}
+
+type PayloadHydrationResult = Result<Vec<(borg_remote::SessionPayloadRef, Vec<u8>)>, String>;
+
+enum ResumeLookupResult {
+    Options(std::result::Result<Vec<ResumeSessionOption>, String>),
+    Switch(std::result::Result<Uuid, String>),
+}
+
+enum CollaborationTaskResult {
+    Started {
+        read_only: bool,
+        result: std::result::Result<(Child, String, String), String>,
+    },
+    Stopped,
+}
+
+fn spawn_payload_hydrator(
+    store: Arc<dyn SessionStore>,
+) -> (
+    mpsc::UnboundedSender<Vec<borg_remote::SessionPayloadRef>>,
+    mpsc::UnboundedReceiver<PayloadHydrationResult>,
+    PayloadHydrationTask,
+) {
+    let (requests_tx, mut requests_rx) =
+        mpsc::unbounded_channel::<Vec<borg_remote::SessionPayloadRef>>();
+    let (results_tx, results_rx) = mpsc::unbounded_channel();
+    let task = tokio::spawn(async move {
+        while let Some(payloads) = requests_rx.recv().await {
+            let mut hydrated = Vec::with_capacity(payloads.len());
+            let mut failure = None;
+            for payload in payloads {
+                match store.load_payload(&payload).await {
+                    Ok(bytes) => hydrated.push((payload, bytes)),
+                    Err(error) => {
+                        failure = Some(format!("{error:#}"));
+                        break;
+                    }
+                }
+            }
+            let result = failure.map_or_else(|| Ok(hydrated), Err);
+            if results_tx.send(result).is_err() {
+                break;
+            }
+        }
+    });
+    (requests_tx, results_rx, task)
+}
+
+fn spawn_dictation_start(config: LocalDictationConfig) -> DictationStartTask {
+    tokio::task::spawn_blocking(move || LocalDictationRecorder::start(&config))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RevertStartMode {
@@ -882,41 +1127,6 @@ impl DeliveredSessionProjection {
         Self { state }
     }
 
-    async fn observe_from_store(
-        &mut self,
-        store: &dyn SessionStore,
-        event: &SessionEvent,
-    ) -> Result<Vec<SessionEvent>> {
-        let mut repaired_events = Vec::new();
-        if event.sequence > 0 {
-            let mut after = self.state.latest_sequence;
-            while event.sequence > after.saturating_add(1) {
-                let remaining = event.sequence - after - 1;
-                let missing = store
-                    .events_after(event.session_id, after, remaining.min(1_024) as usize)
-                    .await?;
-                anyhow::ensure!(
-                    !missing.is_empty(),
-                    "session projection could not repair the durable gap after {after} before {}",
-                    event.sequence
-                );
-                for missing_event in missing {
-                    anyhow::ensure!(
-                        missing_event.sequence == after.saturating_add(1),
-                        "session projection repair expected sequence {}, received {}",
-                        after.saturating_add(1),
-                        missing_event.sequence
-                    );
-                    self.observe(&missing_event)?;
-                    after = missing_event.sequence;
-                    repaired_events.push(missing_event);
-                }
-            }
-        }
-        self.observe(event)?;
-        Ok(repaired_events)
-    }
-
     fn observe(&mut self, event: &SessionEvent) -> Result<()> {
         if event.sequence > 0 {
             self.state.apply(event)?;
@@ -937,6 +1147,37 @@ impl DeliveredSessionProjection {
     fn state(&self) -> &SessionState {
         &self.state
     }
+}
+
+async fn load_projection_gap(
+    store: Arc<dyn SessionStore>,
+    mut after: u64,
+    event: SessionEvent,
+) -> Result<Vec<SessionEvent>> {
+    let mut events = Vec::new();
+    while event.sequence > after.saturating_add(1) {
+        let remaining = event.sequence - after - 1;
+        let missing = store
+            .events_after(event.session_id, after, remaining.min(1_024) as usize)
+            .await?;
+        anyhow::ensure!(
+            !missing.is_empty(),
+            "session projection could not repair the durable gap after {after} before {}",
+            event.sequence
+        );
+        for missing_event in missing {
+            anyhow::ensure!(
+                missing_event.sequence == after.saturating_add(1),
+                "session projection repair expected sequence {}, received {}",
+                after.saturating_add(1),
+                missing_event.sequence
+            );
+            after = missing_event.sequence;
+            events.push(missing_event);
+        }
+    }
+    events.push(event);
+    Ok(events)
 }
 
 impl LocalSessionAccess {
@@ -1485,6 +1726,7 @@ async fn run_local_agent_session(
     let mut mirror_shutdown = None;
     let mut mirror_task = None;
     let mut collab_child: Option<Child> = None;
+    let mut collaboration_task: Option<tokio::task::JoinHandle<CollaborationTaskResult>> = None;
     if remote_open {
         let mut registration = launch.clone();
         // Attached-session identity is stable across CLI resume and does not
@@ -1615,6 +1857,13 @@ async fn run_local_agent_session(
             }
         })
     };
+    let (ui_interaction_tx, mut ui_interaction_completions, ui_interaction_task) =
+        spawn_ui_interaction_dispatcher(Arc::clone(&store), session_command_tx.clone());
+    let (editor_preferences_tx, mut editor_preferences_errors, editor_preferences_task) =
+        spawn_editor_preferences_writer();
+    let (payload_hydration_tx, mut payload_hydration_results, payload_hydration_task) =
+        spawn_payload_hydrator(Arc::clone(&store));
+    let (terminal_io_tx, mut terminal_io_completions) = spawn_terminal_io_worker();
     let mut shutdown_signals =
         ShutdownSignals::new().context("failed to install process shutdown handlers")?;
     let mut terminal = if rich_tui_allowed {
@@ -1686,7 +1935,7 @@ async fn run_local_agent_session(
         terminal.set_dictation_icon(icon);
         if editor_preferences.presentation.dictation_icon.is_none() {
             editor_preferences.presentation.dictation_icon = Some(icon);
-            editor_preferences.save()?;
+            dispatch_editor_preferences_save(&editor_preferences_tx, &editor_preferences);
             terminal.open_dictation_icon_picker();
         }
         terminal.set_diff_expansion(editor_preferences.presentation.effective_diff_expansion());
@@ -1818,6 +2067,9 @@ async fn run_local_agent_session(
     let mut dictation_task: Option<tokio::task::JoinHandle<Result<String>>> = None;
     let mut dictation_setup_task: Option<tokio::task::JoinHandle<Result<LocalDictationBackend>>> =
         None;
+    let mut dictation_start_task: Option<DictationStartTask> = None;
+    let mut usage_summary_task: Option<tokio::task::JoinHandle<String>> = None;
+    let mut resume_lookup_task: Option<tokio::task::JoinHandle<ResumeLookupResult>> = None;
     let mut dictation_backend: Option<LocalDictationBackend> = None;
     sleep_inhibitor.set_turn_active(matches!(
         status,
@@ -1839,10 +2091,361 @@ async fn run_local_agent_session(
     let mut update_tick = tokio::time::interval(std::time::Duration::from_secs(1));
     update_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut blu_discovery_task: Option<BluDiscoveryTask> = None;
+    let mut agent_config_poll_task: Option<tokio::task::JoinHandle<AgentConfigPollResult>> = None;
     let mut shutdown_signal_open = true;
     let mut session_event_stream_open = true;
+    let mut queued_session_events = VecDeque::new();
+    let mut projection_gap_repair_task: Option<ProjectionGapRepairTask> = None;
+    let mut stale_owner_handoff_task: Option<StaleOwnerHandoffTask> = None;
+    let mut ui_interaction_completions_open = true;
+    let mut editor_preferences_errors_open = true;
+    let mut payload_hydration_results_open = true;
+    let mut terminal_io_completions_open = true;
     loop {
         tokio::select! {
+            completion = terminal_io_completions.recv(), if terminal_io_completions_open => {
+                match completion {
+                    Some(completion) => {
+                        if let Some(terminal) = terminal.as_mut() {
+                            terminal.apply_terminal_io_completion(completion);
+                            terminal_dirty = true;
+                        }
+                    }
+                    None => terminal_io_completions_open = false,
+                }
+            }
+            result = async {
+                stale_owner_handoff_task
+                    .as_mut()
+                    .expect("stale owner handoff branch is guarded")
+                    .await
+            }, if stale_owner_handoff_task.is_some() => {
+                stale_owner_handoff_task = None;
+                match result {
+                    Ok(Ok(())) => {
+                        stale_local_owner = false;
+                        resume_session = Some(session_id);
+                    }
+                    Ok(Err(error)) => {
+                        tracing::warn!(%error, %session_id, "could not replace obsolete local session owner");
+                        if let Some(terminal) = terminal.as_mut() {
+                            terminal.set_notice(format!(
+                                "Could not upgrade the older session owner: {error:#}"
+                            ));
+                            terminal_dirty = true;
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, %session_id, "obsolete session owner handoff task failed");
+                    }
+                }
+            }
+            result = async {
+                projection_gap_repair_task
+                    .as_mut()
+                    .expect("projection gap repair branch is guarded")
+                    .await
+            }, if projection_gap_repair_task.is_some() => {
+                projection_gap_repair_task = None;
+                match result {
+                    Ok(Ok(events)) => queued_session_events.extend(events),
+                    Ok(Err(error)) => return Err(error),
+                    Err(error) => {
+                        return Err(anyhow::anyhow!("session projection repair task failed: {error}"));
+                    }
+                }
+            }
+            result = async {
+                agent_config_poll_task
+                    .as_mut()
+                    .expect("agent config poll branch is guarded")
+                    .await
+            }, if agent_config_poll_task.is_some() => {
+                agent_config_poll_task = None;
+                match result {
+                    Ok((signature, Some(Ok(next)))) => {
+                        let keybindings_changed = next.keybindings != agent_config.keybindings;
+                        agent_config = next;
+                        if let Some(terminal) = terminal.as_mut() {
+                            terminal.set_configured_model_entries(
+                                agent_config.configured_model_entries(),
+                            );
+                            terminal.set_extension_commands(
+                                extension_catalog.api_snapshot().commands,
+                            );
+                        }
+                        observed_extension_revision.clear();
+                        if let Some(task) = blu_discovery_task.take() {
+                            task.abort();
+                        }
+                        agent_config_signature = signature;
+                        if let Some(terminal) = terminal.as_mut() {
+                            if keybindings_changed {
+                                if let Err(error) = terminal.reload_keybindings(&agent_config.keybindings) {
+                                    terminal.set_notice(format!("Settings changed, but keybindings were invalid: {error:#}"));
+                                } else {
+                                    terminal.set_notice("Agent settings reloaded · aliases/keybindings are live · Blu/MCP apply next turn".to_string());
+                                }
+                            } else {
+                                terminal.set_notice("Agent settings changed · Blu/MCP apply next turn · provider/session policy applies next session".to_string());
+                            }
+                            terminal_dirty = true;
+                        }
+                    }
+                    Ok((signature, Some(Err(error)))) => {
+                        agent_config_signature = signature;
+                        if let Some(terminal) = terminal.as_mut() {
+                            terminal.set_notice(format!("Agent settings not reloaded: {error}"));
+                            terminal_dirty = true;
+                        }
+                    }
+                    Ok((_, None)) => {}
+                    Err(error) => tracing::warn!(%error, "agent settings poll failed"),
+                }
+            }
+            result = async {
+                collaboration_task
+                    .as_mut()
+                    .expect("collaboration task branch is guarded")
+                    .await
+            }, if collaboration_task.is_some() => {
+                collaboration_task = None;
+                if let Some(terminal) = terminal.as_mut() {
+                    match result {
+                        Ok(CollaborationTaskResult::Started {
+                            read_only,
+                            result: Ok((child, view, control)),
+                        }) => {
+                            let notice = if read_only {
+                                format!("Read-only collaboration link:\n{view}")
+                            } else {
+                                format!("Control link:\n{control}\n\nRead-only link:\n{view}")
+                            };
+                            collab_child = Some(child);
+                            terminal.show_info("Collaboration", &notice);
+                        }
+                        Ok(CollaborationTaskResult::Started { result: Err(error), .. }) => {
+                            terminal.set_notice(format!("Collaboration failed: {error}"));
+                        }
+                        Ok(CollaborationTaskResult::Stopped) => {
+                            terminal.set_notice("Collaboration link stopped.".to_string());
+                        }
+                        Err(error) => {
+                            terminal.set_notice(format!("Collaboration task failed: {error}"));
+                        }
+                    }
+                    terminal_dirty = true;
+                }
+            }
+            result = async {
+                resume_lookup_task
+                    .as_mut()
+                    .expect("resume lookup branch is guarded")
+                    .await
+            }, if resume_lookup_task.is_some() => {
+                resume_lookup_task = None;
+                match result {
+                    Ok(ResumeLookupResult::Options(Ok(sessions))) if sessions.is_empty() => {
+                        if let Some(terminal) = terminal.as_mut() {
+                            terminal.set_notice(
+                                "No other saved Borg sessions. Use /resume <session-id>."
+                                    .to_string(),
+                            );
+                        }
+                    }
+                    Ok(ResumeLookupResult::Options(Ok(sessions))) => {
+                        if let Some(terminal) = terminal.as_mut() {
+                            terminal.open_resume_picker(&sessions);
+                        }
+                    }
+                    Ok(ResumeLookupResult::Switch(Ok(target))) => {
+                        match session_access.switch(status) {
+                            Ok(switch) => {
+                                tracing::info!(?switch, from = %session_id, to = %target, "switching local session");
+                                resume_session = Some(target);
+                                stop_sent = true;
+                                dispatch_host_command_without_blocking(
+                                    &session_command_tx,
+                                    HostCommand::Stop { session_id },
+                                );
+                            }
+                            Err(error) => {
+                                if let Some(terminal) = terminal.as_mut() {
+                                    terminal.set_notice(error.to_string());
+                                }
+                            }
+                        }
+                    }
+                    Ok(ResumeLookupResult::Options(Err(error)))
+                    | Ok(ResumeLookupResult::Switch(Err(error))) => {
+                        if let Some(terminal) = terminal.as_mut() {
+                            terminal.set_notice(error);
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(terminal) = terminal.as_mut() {
+                            terminal.set_notice(format!("Session lookup failed: {error}"));
+                        }
+                    }
+                }
+                terminal_dirty = true;
+            }
+            result = async {
+                usage_summary_task
+                    .as_mut()
+                    .expect("usage summary branch is guarded")
+                    .await
+            }, if usage_summary_task.is_some() => {
+                usage_summary_task = None;
+                if let Some(terminal) = terminal.as_mut() {
+                    match result {
+                        Ok(summary) => terminal.show_info("Usage", summary),
+                        Err(error) => terminal.set_notice(format!("Usage lookup failed: {error}")),
+                    }
+                    terminal_dirty = true;
+                }
+            }
+            result = payload_hydration_results.recv(), if payload_hydration_results_open => {
+                match result {
+                    Some(Ok(payloads)) => {
+                        if let Some(terminal) = terminal.as_mut() {
+                            for (payload, bytes) in payloads {
+                                match terminal.hydrate_payload(&payload, bytes) {
+                                    Ok(Some(request)) => {
+                                        if !terminal_io_tx.send(request) {
+                                            terminal.set_notice(
+                                                "Could not access the clipboard".to_string(),
+                                            );
+                                        }
+                                    }
+                                    Ok(None) => {}
+                                    Err(error) => {
+                                        terminal.set_notice(error.to_string());
+                                        break;
+                                    }
+                                }
+                            }
+                            terminal_dirty = true;
+                        }
+                    }
+                    Some(Err(error)) => {
+                        if let Some(terminal) = terminal.as_mut() {
+                            terminal.set_notice(error);
+                            terminal_dirty = true;
+                        }
+                    }
+                    None => payload_hydration_results_open = false,
+                }
+            }
+            error = editor_preferences_errors.recv(), if editor_preferences_errors_open => {
+                match error {
+                    Some(error) => {
+                        tracing::warn!(%error);
+                        if let Some(terminal) = terminal.as_mut() {
+                            terminal.set_notice(error);
+                            terminal_dirty = true;
+                        }
+                    }
+                    None => editor_preferences_errors_open = false,
+                }
+            }
+            completion = ui_interaction_completions.recv(), if ui_interaction_completions_open => {
+                let Some(completion) = completion else {
+                    ui_interaction_completions_open = false;
+                    continue;
+                };
+                match completion {
+                    UiInteractionCompletion::Prompt {
+                        submission,
+                        outcome: UiPromptOutcome::Routed,
+                    } => {
+                        tracing::debug!(
+                            message_id = %submission.message_id,
+                            "durable UI prompt reached the session coordinator"
+                        );
+                    }
+                    UiInteractionCompletion::Prompt {
+                        submission,
+                        outcome: UiPromptOutcome::PersistenceFailed(error),
+                    } => {
+                        pending_prompt_ids.remove(&submission.message_id);
+                        local_prompt_admissions
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .remove(&submission.message_id);
+                        if let Some(terminal) = terminal.as_mut() {
+                            terminal.reject_optimistic_prompt(
+                                submission.target,
+                                submission.message_id,
+                                submission.rejected_text,
+                                submission.attachments,
+                            );
+                            terminal.set_notice(format!(
+                                "Could not durably {}: {error}",
+                                submission.kind.failure_label(),
+                            ));
+                            interaction_dirty = true;
+                            terminal_dirty = true;
+                        }
+                        if submission.started_idle_turn
+                            && pending_prompt_ids.is_empty()
+                            && status == SessionStatus::Starting
+                        {
+                            status = SessionStatus::Ready;
+                            sleep_inhibitor.set_turn_active(false);
+                        }
+                    }
+                    UiInteractionCompletion::Prompt {
+                        submission,
+                        outcome: UiPromptOutcome::CoordinatorClosed,
+                    } => {
+                        if let Some(terminal) = terminal.as_mut() {
+                            terminal.set_notice(submission.kind.disconnected_notice().to_string());
+                            interaction_dirty = true;
+                            terminal_dirty = true;
+                        }
+                    }
+                    UiInteractionCompletion::CoordinatorClosed => {
+                        if let Some(terminal) = terminal.as_mut() {
+                            terminal.set_notice(
+                                "Session coordinator disconnected · commands will resume after reconnect"
+                                    .to_string(),
+                            );
+                            interaction_dirty = true;
+                            terminal_dirty = true;
+                        }
+                    }
+                }
+            }
+            result = async {
+                dictation_start_task
+                    .as_mut()
+                    .expect("dictation start branch is guarded")
+                    .await
+            }, if dictation_start_task.is_some() => {
+                dictation_start_task = None;
+                if let Some(terminal) = terminal.as_mut() {
+                    match result {
+                        Ok(Ok(recorder)) => {
+                            dictation_recorder = Some(recorder);
+                            terminal.set_dictation_state(DictationState::Recording);
+                            terminal.set_notice(
+                                "Recording locally · click stop or use the dictate keybinding"
+                                    .to_string(),
+                            );
+                        }
+                        Ok(Err(error)) => {
+                            terminal.set_dictation_state(DictationState::Idle);
+                            terminal.set_notice(format!("Could not start dictation: {error:#}"));
+                        }
+                        Err(error) => {
+                            terminal.set_dictation_state(DictationState::Idle);
+                            terminal.set_notice(format!("Dictation start task failed: {error}"));
+                        }
+                    }
+                    terminal_dirty = true;
+                }
+            }
             result = async {
                 dictation_setup_task
                     .as_mut()
@@ -1854,20 +2457,9 @@ async fn run_local_agent_session(
                     Ok(Ok(backend)) => {
                         let config = backend.config();
                         dictation_backend = Some(backend);
-                        match LocalDictationRecorder::start(&config) {
-                            Ok(recorder) => {
-                                dictation_recorder = Some(recorder);
-                                let terminal = terminal.as_mut().expect("terminal");
-                                terminal.set_dictation_state(DictationState::Recording);
-                                terminal.set_notice(
-                                    "Recording locally · click stop or use the dictate keybinding"
-                                        .to_string(),
-                                );
-                            }
-                            Err(error) => terminal
-                                .as_mut()
-                                .expect("terminal")
-                                .set_notice(format!("Could not start dictation: {error:#}")),
+                        dictation_start_task = Some(spawn_dictation_start(config));
+                        if let Some(terminal) = terminal.as_mut() {
+                            terminal.set_notice("Starting local microphone…".to_string());
                         }
                     }
                     Ok(Err(error)) => {
@@ -2141,61 +2733,42 @@ async fn run_local_agent_session(
                     }
                 }
             }
-            _ = agent_config_tick.tick(), if interactive => {
-                let signature = agent_config_file_signature(agent_config_path.as_deref());
-                if signature != agent_config_signature {
-                    match AgentConfig::load(args.config.as_deref()) {
-                        Ok(next) => {
-                            let keybindings_changed = next.keybindings != agent_config.keybindings;
-                            agent_config = next;
-                            if let Some(terminal) = terminal.as_mut() {
-                                terminal.set_configured_model_entries(
-                                    agent_config.configured_model_entries(),
-                                );
-                                terminal.set_extension_commands(
-                                    extension_catalog.api_snapshot().commands,
-                                );
-                            }
-                            // Force the Blu snapshot to include updated base
-                            // MCP servers, capability gates, and trust policy.
-                            observed_extension_revision.clear();
-                            if let Some(task) = blu_discovery_task.take() {
-                                task.abort();
-                            }
-                            agent_config_signature = signature;
-                            if let Some(terminal) = terminal.as_mut() {
-                                if keybindings_changed {
-                                    if let Err(error) = terminal.reload_keybindings(&agent_config.keybindings) {
-                                        terminal.set_notice(format!("Settings changed, but keybindings were invalid: {error:#}"));
-                                    } else {
-                                        terminal.set_notice("Agent settings reloaded · aliases/keybindings are live · Blu/MCP apply next turn".to_string());
-                                    }
-                                } else {
-                                    terminal.set_notice("Agent settings changed · Blu/MCP apply next turn · provider/session policy applies next session".to_string());
-                                }
-                                terminal_dirty = true;
-                            }
-                        }
-                        Err(error) => {
-                            agent_config_signature = signature;
-                            if let Some(terminal) = terminal.as_mut() {
-                                terminal.set_notice(format!("Agent settings not reloaded: {error:#}"));
-                                terminal_dirty = true;
-                            }
-                        }
-                    }
-                }
+            _ = agent_config_tick.tick(), if interactive && agent_config_poll_task.is_none() => {
+                let config_path = args.config.clone();
+                let signature_path = agent_config_path.clone();
+                let observed_signature = agent_config_signature;
+                agent_config_poll_task = Some(tokio::task::spawn_blocking(move || {
+                    let signature = agent_config_file_signature(signature_path.as_deref());
+                    let config = (signature != observed_signature).then(|| {
+                        AgentConfig::load(config_path.as_deref())
+                            .map_err(|error| format!("{error:#}"))
+                    });
+                    (signature, config)
+                }));
             }
             _ = blu_tick.tick(), if interactive && blu_discovery_task.is_none() => {
                 let discovery_cwd = cwd.clone();
                 let discovery_capabilities = agent_config.capabilities.clone();
                 let extension_config = agent_config.extensions.clone();
+                let config_path = args.config.clone();
                 blu_discovery_task = Some(tokio::task::spawn_blocking(move || {
-                    crate::extensions::discover(
+                    let (catalog, servers, workflows) = crate::extensions::discover(
                         &discovery_cwd,
                         &discovery_capabilities,
                         &extension_config,
-                    )
+                    )?;
+                    let customization = if catalog.has_errors() {
+                        None
+                    } else {
+                        let mut next_agent_config = AgentConfig::load(config_path.as_deref())?;
+                        let mut next_editor_preferences = EditorPreferences::load()?;
+                        catalog.apply_editor_customization(
+                            &mut next_editor_preferences,
+                            &mut next_agent_config,
+                        )?;
+                        Some((next_agent_config, next_editor_preferences))
+                    };
+                    Ok((catalog, servers, workflows, customization))
                 }));
             }
             blu_result = async {
@@ -2206,19 +2779,19 @@ async fn run_local_agent_session(
             }, if blu_discovery_task.is_some() => {
                 blu_discovery_task = None;
                 match blu_result {
-                    Ok(Ok((next_catalog, next_extension_servers, next_extension_workflows)))
+                    Ok(Ok((
+                        next_catalog,
+                        next_extension_servers,
+                        next_extension_workflows,
+                        customization,
+                    )))
                         if next_catalog.revision != observed_extension_revision =>
                     {
                         observed_extension_revision = next_catalog.revision.clone();
                         if !next_catalog.has_errors() {
                             last_blu_discovery_error = None;
-                            let mut next_agent_config =
-                                AgentConfig::load(args.config.as_deref())?;
-                            let mut next_editor_preferences = EditorPreferences::load()?;
-                            next_catalog.apply_editor_customization(
-                                &mut next_editor_preferences,
-                                &mut next_agent_config,
-                            )?;
+                            let (next_agent_config, next_editor_preferences) = customization
+                                .expect("valid Blu discovery includes editor customization");
                             let mut servers = agent_config.external_mcp_servers();
                             servers.extend(next_extension_servers);
                             live_extension_executor.replace_runtime_extensions_with_api(
@@ -2300,7 +2873,7 @@ async fn run_local_agent_session(
                             }
                         }
                     }
-                    Ok(Ok((next_catalog, _, _))) => {
+                    Ok(Ok((next_catalog, _, _, _))) => {
                         if !next_catalog.has_errors() {
                             last_blu_discovery_error = None;
                         }
@@ -2331,7 +2904,14 @@ async fn run_local_agent_session(
                     }
                 }
             }
-            event = session_events.recv(), if session_event_stream_open => {
+            event = async {
+                if let Some(event) = queued_session_events.pop_front() {
+                    Some(event)
+                } else {
+                    session_events.recv().await
+                }
+            }, if projection_gap_repair_task.is_none()
+                && (session_event_stream_open || !queued_session_events.is_empty()) => {
                 let Some(event) = event else {
                     session_event_stream_open = false;
                     if revert_fork_task.is_none()
@@ -2355,7 +2935,16 @@ async fn run_local_agent_session(
                     }
                     continue;
                 };
+                if event.sequence > delivered_projection.state().latest_sequence.saturating_add(1) {
+                    projection_gap_repair_task = Some(tokio::spawn(load_projection_gap(
+                        Arc::clone(&store),
+                        delivered_projection.state().latest_sequence,
+                        event,
+                    )));
+                    continue;
+                }
                 let handoff_stale_owner = stale_local_owner
+                    && stale_owner_handoff_task.is_none()
                     && matches!(
                         event.kind,
                         SessionEventKind::StatusChanged {
@@ -2363,25 +2952,7 @@ async fn run_local_agent_session(
                             ..
                         }
                     );
-                let repaired_events = delivered_projection
-                    .observe_from_store(store.as_ref(), &event)
-                    .await?;
-                for repaired_event in repaired_events {
-                    if let Some(terminal) = terminal.as_mut() {
-                        terminal_dirty |= terminal.apply_session_event(&repaired_event);
-                        if !history.iter().any(|loaded| {
-                            loaded.sequence > 0 && loaded.sequence == repaired_event.sequence
-                        }) {
-                            let insertion = history
-                                .iter()
-                                .position(|loaded| loaded.sequence > repaired_event.sequence)
-                                .unwrap_or(history.len());
-                            history.insert(insertion, repaired_event);
-                        }
-                    } else if !detached_from_terminal {
-                        render_event(&repaired_event, args.json, args.print, &mut rendered)?;
-                    }
-                }
+                delivered_projection.observe(&event)?;
                 if let Some(message_id) = committed_prompt_id(&event.kind) {
                     pending_prompt_ids.remove(&message_id);
                     local_prompt_admissions
@@ -2537,39 +3108,26 @@ async fn run_local_agent_session(
                     render_event(&event, args.json, args.print, &mut rendered)?;
                 }
                 if handoff_stale_owner {
-                    match send_local_session_command(
-                        &control_socket_path,
-                        session_id,
-                        HostCommand::Stop { session_id },
-                    )
-                    .await
-                    {
-                        Ok(()) => {
-                            stale_local_owner = false;
-                            // Re-enter the same durable session with the
-                            // existing terminal instead of tearing down the
-                            // screen and making an automatic build handoff
-                            // look like a user-requested resume.
-                            resume_session = Some(session_id);
-                        }
-                        Err(error) => {
-                            tracing::warn!(%error, %session_id, "could not replace obsolete local session owner");
-                            if let Some(terminal) = terminal.as_mut() {
-                                terminal.set_notice(format!(
-                                    "Could not upgrade the older session owner: {error:#}"
-                                ));
-                                terminal_dirty = true;
-                            }
-                        }
-                    }
+                    let socket_path = control_socket_path.clone();
+                    stale_owner_handoff_task = Some(tokio::spawn(async move {
+                        send_local_session_command(
+                            &socket_path,
+                            session_id,
+                            HostCommand::Stop { session_id },
+                        )
+                        .await
+                    }));
                 }
                 if pending_approval.is_some() && !can_prompt {
                     let approval_id = pending_approval.take().expect("pending approval");
-                    session_command_tx.send(HostCommand::Approve {
-                        session_id,
-                        approval_id,
-                        decision: ApprovalDecision::Deny,
-                    }).await.ok();
+                    dispatch_ui_command(
+                        &ui_interaction_tx,
+                        HostCommand::Approve {
+                            session_id,
+                            approval_id,
+                            decision: ApprovalDecision::Deny,
+                        },
+                    );
                 } else if !detached_from_terminal
                     && pending_provider_interaction
                     .as_ref()
@@ -2583,26 +3141,26 @@ async fn run_local_agent_session(
                     eprintln!(
                         "\n  Secret provider input requires Borg's rich terminal; request cancelled.\n"
                     );
-                    session_command_tx
-                        .send(HostCommand::RespondToProviderInteraction {
+                    dispatch_ui_command(
+                        &ui_interaction_tx,
+                        HostCommand::RespondToProviderInteraction {
                             session_id,
                             interaction_id,
                             response: cancelled_provider_interaction_response(&kind),
-                        })
-                        .await
-                        .ok();
+                        },
+                    );
                 } else if pending_provider_interaction.is_some() && !can_prompt {
                     let (interaction_id, kind, _) = pending_provider_interaction
                         .take()
                         .expect("pending provider interaction");
-                    session_command_tx
-                        .send(HostCommand::RespondToProviderInteraction {
+                    dispatch_ui_command(
+                        &ui_interaction_tx,
+                        HostCommand::RespondToProviderInteraction {
                             session_id,
                             interaction_id,
                             response: cancelled_provider_interaction_response(&kind),
-                        })
-                        .await
-                        .ok();
+                        },
+                    );
                 } else if !detached_from_terminal
                     && pending_approval.is_some()
                     && !args.json
@@ -2625,7 +3183,10 @@ async fn run_local_agent_session(
                     && !stop_sent
                 {
                     stop_sent = true;
-                    session_command_tx.send(HostCommand::Stop { session_id }).await.ok();
+                    dispatch_host_command_without_blocking(
+                        &session_command_tx,
+                        HostCommand::Stop { session_id },
+                    );
                 }
                 if handoff_on_safe_boundary
                     && status == SessionStatus::Ready
@@ -2636,7 +3197,10 @@ async fn run_local_agent_session(
                     // this actor so the viewer can acquire the writer lease
                     // without observing an interrupted turn.
                     stop_sent = true;
-                    session_command_tx.send(HostCommand::Stop { session_id }).await.ok();
+                    dispatch_host_command_without_blocking(
+                        &session_command_tx,
+                        HostCommand::Stop { session_id },
+                    );
                 }
             }
             line = recv_terminal_line(&mut input), if input_open => {
@@ -2720,14 +3284,15 @@ async fn run_local_agent_session(
                 if let Some(model) = line.strip_prefix("/model ") {
                     let model = model.trim().to_string();
                     let target = CodingProvider::for_model(&model).unwrap_or(provider);
-                    send_model_selection(
-                        &session_command_tx,
-                        session_id,
-                        provider,
-                        target,
-                        model,
-                    )
-                    .await;
+                    session_command_tx
+                        .send(model_selection_command(
+                            session_id,
+                            provider,
+                            target,
+                            model,
+                        ))
+                        .await
+                        .ok();
                     continue;
                 }
                 if line == "/effort" {
@@ -2847,7 +3412,9 @@ async fn run_local_agent_session(
                     continue;
                 }
                 if let Some(value) = line.strip_prefix("/color ") {
-                    match set_transcript_color(&mut editor_preferences, value) {
+                    match update_transcript_color(&mut editor_preferences, value)
+                        .and_then(|()| editor_preferences.save())
+                    {
                         Ok(()) => println!("\n{}\n", transcript_colors_summary(&editor_preferences)),
                         Err(error) => eprintln!("\n  {error}\n"),
                     }
@@ -2918,7 +3485,9 @@ async fn run_local_agent_session(
                     continue;
                 }
                 if let Some(value) = line.strip_prefix("/user-label ") {
-                    match set_transcript_label(&mut editor_preferences, true, value) {
+                    match update_transcript_label(&mut editor_preferences, true, value)
+                        .and_then(|()| editor_preferences.save())
+                    {
                         Ok(()) => println!(
                             "\n  User transcript label: {}.\n",
                             editor_preferences.transcript.user_label
@@ -2928,7 +3497,9 @@ async fn run_local_agent_session(
                     continue;
                 }
                 if let Some(value) = line.strip_prefix("/assistant-label ") {
-                    match set_transcript_label(&mut editor_preferences, false, value) {
+                    match update_transcript_label(&mut editor_preferences, false, value)
+                        .and_then(|()| editor_preferences.save())
+                    {
                         Ok(()) => println!(
                             "\n  Assistant transcript label: {}.\n",
                             editor_preferences.transcript.assistant_label
@@ -3189,59 +3760,33 @@ async fn run_local_agent_session(
                         exit_notice = Some(format!(
                             "Terminal input was lost ({failure}); Borg stopped the idle local session."
                         ));
-                        session_command_tx
-                            .send(HostCommand::Stop { session_id })
-                            .await
-                            .ok();
+                        dispatch_host_command_without_blocking(
+                            &session_command_tx,
+                            HostCommand::Stop { session_id },
+                        );
                         continue;
                     }
                 };
                 // Resume hydration is deliberately deferred until after the
-                // first paint. Up may depend on either deferred projection,
-                // but an already hydrated local history or an in-progress
-                // multiline edit must not wait on storage before being handled.
+                // first paint. Never await it from a key handler: even history
+                // recall must leave the input/render loop schedulable while
+                // SQLite or the filesystem is slow.
                 if terminal_event.is_up() {
                     let should_wait_for_composer_history = terminal
                         .as_ref()
                         .is_some_and(|terminal| {
                             !terminal.has_composer_history() && terminal.up_may_recall_history()
                         });
-                    if should_wait_for_composer_history
-                        && let Some(task) = composer_history_task.take()
-                    {
-                        match task.await {
-                            Ok(Ok(composer_history)) => {
-                                if let Some(terminal) = terminal.as_mut() {
-                                    terminal.seed_composer_history(&composer_history);
-                                }
-                            }
-                            Ok(Err(error)) => {
-                                tracing::warn!(%error, "could not hydrate composer history before recall");
-                            }
-                            Err(error) => {
-                                tracing::warn!(%error, "composer history hydration task failed before recall");
-                            }
-                        }
-                    }
                     let should_wait_for_pending_prompts = terminal.as_ref().is_some_and(|terminal| {
                         terminal.has_empty_composer_text() && !terminal.has_active_queued_prompts()
                     });
-                    if should_wait_for_pending_prompts
-                        && let Some(task) = pending_prompt_task.take()
+                    if (should_wait_for_composer_history && composer_history_task.is_some())
+                        || (should_wait_for_pending_prompts && pending_prompt_task.is_some())
                     {
-                        match task.await {
-                            Ok(Ok(pending_prompt_events)) => {
-                                if let Some(terminal) = terminal.as_mut() {
-                                    terminal.seed_pending_prompt_events(&pending_prompt_events);
-                                }
-                            }
-                            Ok(Err(error)) => {
-                                tracing::warn!(%error, "could not hydrate pending prompts before recall");
-                            }
-                            Err(error) => {
-                                tracing::warn!(%error, "pending prompt hydration task failed before recall");
-                            }
-                        }
+                        terminal
+                            .as_mut()
+                            .expect("terminal")
+                            .set_notice("Prompt history is still loading".to_string());
                     }
                 }
                 let input_is_interaction = terminal_event.is_interaction_input();
@@ -3312,8 +3857,9 @@ async fn run_local_agent_session(
                             if let Some(approval_id) =
                                 child_pending_approvals.get(&target).cloned()
                             {
-                                session_command_tx
-                                    .send(HostCommand::Subagent {
+                                dispatch_ui_command(
+                                    &ui_interaction_tx,
+                                    HostCommand::Subagent {
                                         session_id,
                                         action: SubagentAction::Approve {
                                             request_id: Uuid::new_v4(),
@@ -3321,94 +3867,96 @@ async fn run_local_agent_session(
                                             approval_id,
                                             decision,
                                         },
-                                    })
-                                    .await
-                                    .ok();
+                                    },
+                                );
                             }
                         } else if let Some(approval_id) = pending_approval.clone() {
-                            session_command_tx.send(HostCommand::Approve {
-                                session_id,
-                                approval_id,
-                                decision,
-                            }).await.ok();
+                            dispatch_ui_command(
+                                &ui_interaction_tx,
+                                HostCommand::Approve {
+                                    session_id,
+                                    approval_id,
+                                    decision,
+                                },
+                            );
                         }
                     }
                     UiAction::RecallQueuedPrompts { target } => {
                         if let Some(target) = target {
-                            session_command_tx
-                                .send(HostCommand::Subagent {
+                            dispatch_ui_command(
+                                &ui_interaction_tx,
+                                HostCommand::Subagent {
                                     session_id,
                                     action: SubagentAction::RecallPrompt {
                                         request_id: Uuid::new_v4(),
                                         target: target.to_string(),
                                         message_id: None,
                                     },
-                                })
-                                .await
-                                .ok();
+                                },
+                            );
                         } else {
-                            session_command_tx
-                                .send(HostCommand::RecallQueuedPrompt {
+                            dispatch_ui_command(
+                                &ui_interaction_tx,
+                                HostCommand::RecallQueuedPrompt {
                                     session_id,
                                     message_id: None,
-                                })
-                                .await
-                            .ok();
+                                },
+                            );
                         }
                     }
                     UiAction::FlushPendingInput { target, prompt } => {
                         if let Some((message_id, text, attachments)) = prompt {
-                            if let Err(error) = persist_prompt_admission(
-                                store.as_ref(),
-                                target.unwrap_or(session_id),
-                                message_id,
-                                &text,
-                                &attachments,
-                                PromptDelivery::Steer,
-                            )
-                            .await
-                            {
-                                let terminal = terminal.as_mut().expect("terminal");
-                                terminal.reject_optimistic_prompt(
-                                    target,
+                            let command = target.map_or_else(
+                                || HostCommand::Prompt {
+                                    session_id,
                                     message_id,
-                                    text,
-                                    attachments,
-                                );
-                                terminal.set_notice(format!(
-                                    "Could not durably send the pending input: {error:#}"
-                                ));
-                                interaction_dirty = true;
-                                terminal_dirty = true;
-                            } else {
-                                pending_prompt_ids.insert(message_id);
-                                let command = target.map_or_else(
-                                    || HostCommand::Prompt {
-                                        session_id,
+                                    text: text.clone(),
+                                    attachments: attachments.clone(),
+                                    output_schema: None,
+                                    delivery: PromptDelivery::Steer,
+                                },
+                                |target| HostCommand::Subagent {
+                                    session_id,
+                                    action: SubagentAction::Prompt {
+                                        request_id: Uuid::new_v4(),
+                                        target: target.to_string(),
                                         message_id,
                                         text: text.clone(),
                                         attachments: attachments.clone(),
-                                        output_schema: None,
                                         delivery: PromptDelivery::Steer,
                                     },
-                                    |target| HostCommand::Subagent {
-                                        session_id,
-                                        action: SubagentAction::Prompt {
-                                            request_id: Uuid::new_v4(),
-                                            target: target.to_string(),
-                                            message_id,
-                                            text: text.clone(),
-                                            attachments: attachments.clone(),
-                                            delivery: PromptDelivery::Steer,
-                                        },
-                                    },
+                                },
+                            );
+                            let submission = UiPromptSubmission {
+                                journal_session_id: target.unwrap_or(session_id),
+                                target,
+                                message_id,
+                                rejected_text: text.clone(),
+                                text,
+                                attachments,
+                                delivery: PromptDelivery::Steer,
+                                command: Some(command),
+                                kind: PromptSubmissionKind::Flush,
+                                started_idle_turn: false,
+                            };
+                            if let Err(submission) = dispatch_ui_prompt(
+                                &ui_interaction_tx,
+                                &mut pending_prompt_ids,
+                                submission,
+                            ) {
+                                let terminal = terminal.as_mut().expect("terminal");
+                                terminal.reject_optimistic_prompt(
+                                    submission.target,
+                                    submission.message_id,
+                                    submission.rejected_text,
+                                    submission.attachments,
                                 );
-                                if session_command_tx.send(command).await.is_err() {
-                                    terminal.as_mut().expect("terminal").set_notice(
-                                        "Prompt saved durably · waiting for the session actor to reconnect"
-                                            .to_string(),
-                                    );
-                                }
+                                terminal.set_notice(
+                                    "Could not queue the pending input for durable storage"
+                                        .to_string(),
+                                );
+                                interaction_dirty = true;
+                                terminal_dirty = true;
                             }
                         }
                         let command = target.map_or_else(
@@ -3421,7 +3969,7 @@ async fn run_local_agent_session(
                                 },
                             },
                         );
-                        session_command_tx.send(command).await.ok();
+                        dispatch_ui_command(&ui_interaction_tx, command);
                     }
                     UiAction::Rewind {
                         sequence,
@@ -3453,24 +4001,10 @@ async fn run_local_agent_session(
                                 .set_notice("Stopping session before reverting…".to_string());
                             if !stop_sent {
                                 stop_sent = true;
-                                if session_command_tx
-                                    .send(HostCommand::Stop { session_id })
-                                    .await
-                                    .is_err()
-                                    && let Some(sequence) = pending_revert_sequence.take()
-                                {
-                                    // The command receiver is gone, so the
-                                    // actor cannot mutate the session further.
-                                    revert_fork_task = Some(spawn_revert_fork(
-                                        Arc::clone(&store),
-                                        session_id,
-                                        sequence,
-                                    ));
-                                    terminal.as_mut().expect("terminal").set_notice(
-                                        "Session already stopped · creating reverted session…"
-                                            .to_string(),
-                                    );
-                                }
+                                dispatch_host_command_without_blocking(
+                                    &session_command_tx,
+                                    HostCommand::Stop { session_id },
+                                );
                             }
                         }
                     }
@@ -3498,22 +4032,10 @@ async fn run_local_agent_session(
                             );
                             if !stop_sent {
                                 stop_sent = true;
-                                if session_command_tx
-                                    .send(HostCommand::Stop { session_id })
-                                    .await
-                                    .is_err()
-                                    && let Some(sequence) = pending_revert_sequence.take()
-                                {
-                                    revert_fork_task = Some(spawn_revert_fork(
-                                        Arc::clone(&store),
-                                        session_id,
-                                        sequence,
-                                    ));
-                                    terminal.as_mut().expect("terminal").set_notice(
-                                        "Session already stopped · creating reverted session…"
-                                            .to_string(),
-                                    );
-                                }
+                                dispatch_host_command_without_blocking(
+                                    &session_command_tx,
+                                    HostCommand::Stop { session_id },
+                                );
                             }
                         }
                     }
@@ -3534,14 +4056,10 @@ async fn run_local_agent_session(
                                 .expect("terminal")
                                 .open_provider_auth_picker(target, model);
                         } else {
-                            send_model_selection(
-                                &session_command_tx,
-                                session_id,
-                                active,
-                                target,
-                                model,
-                            )
-                            .await;
+                            dispatch_ui_command(
+                                &ui_interaction_tx,
+                                model_selection_command(session_id, active, target, model),
+                            );
                             terminal
                                 .as_mut()
                                 .expect("terminal")
@@ -3632,14 +4150,10 @@ async fn run_local_agent_session(
                             terminal = Some(restored);
                             crash_context.tui_active.store(true, Ordering::Release);
                             if outcome.is_ok() {
-                                send_model_selection(
-                                    &session_command_tx,
-                                    session_id,
-                                    active,
-                                    target,
-                                    model,
-                                )
-                                .await;
+                                dispatch_ui_command(
+                                    &ui_interaction_tx,
+                                    model_selection_command(session_id, active, target, model),
+                                );
                                 terminal
                                     .as_mut()
                                     .expect("terminal")
@@ -3648,42 +4162,42 @@ async fn run_local_agent_session(
                         }
                     }
                     UiAction::SetEffort(effort) => {
-                        session_command_tx
-                            .send(HostCommand::Configure {
+                        dispatch_ui_command(
+                            &ui_interaction_tx,
+                            HostCommand::Configure {
                                 session_id,
                                 action: SessionConfigAction::SetEffort { effort },
-                            })
-                            .await
-                            .ok();
+                            },
+                        );
                     }
                     UiAction::SetPermissionMode(permission_mode) => {
-                        session_command_tx
-                            .send(HostCommand::Configure {
+                        dispatch_ui_command(
+                            &ui_interaction_tx,
+                            HostCommand::Configure {
                                 session_id,
                                 action: SessionConfigAction::SetPermissionMode {
                                     permission_mode,
                                 },
-                            })
-                            .await
-                            .ok();
+                            },
+                        );
                     }
                     UiAction::SetResponseLanguage(language) => {
-                        session_command_tx
-                            .send(HostCommand::Configure {
+                        dispatch_ui_command(
+                            &ui_interaction_tx,
+                            HostCommand::Configure {
                                 session_id,
                                 action: SessionConfigAction::SetResponseLanguage { language },
-                            })
-                            .await
-                            .ok();
+                            },
+                        );
                     }
                     UiAction::SetFast(enabled) => {
-                        session_command_tx
-                            .send(HostCommand::Configure {
+                        dispatch_ui_command(
+                            &ui_interaction_tx,
+                            HostCommand::Configure {
                                 session_id,
                                 action: SessionConfigAction::SetFast { enabled },
-                            })
-                            .await
-                            .ok();
+                            },
+                        );
                     }
                     UiAction::SetRefreshRate(fps) => {
                         tui_fps = fps.clamp(MIN_TUI_FPS, MAX_TUI_FPS);
@@ -3692,7 +4206,10 @@ async fn run_local_agent_session(
                         interaction_tick = tui_render_interval(tui_frame_interval(tui_fps));
                         editor_preferences.presentation.refresh_rate_fps =
                             u16::try_from(tui_fps).expect("bounded refresh rate fits u16");
-                        editor_preferences.save()?;
+                        dispatch_editor_preferences_save(
+                            &editor_preferences_tx,
+                            &editor_preferences,
+                        );
                         terminal
                             .as_mut()
                             .expect("terminal")
@@ -3702,7 +4219,10 @@ async fn run_local_agent_session(
                         prevent_sleep = enabled;
                         sleep_inhibitor.set_enabled(enabled);
                         editor_preferences.interaction.prevent_sleep = enabled;
-                        editor_preferences.save()?;
+                        dispatch_editor_preferences_save(
+                            &editor_preferences_tx,
+                            &editor_preferences,
+                        );
                         terminal.as_mut().expect("terminal").set_notice(format!(
                             "Keep machine awake during active turns: {}",
                             if enabled { "on" } else { "off" }
@@ -3715,7 +4235,10 @@ async fn run_local_agent_session(
                         } else {
                             ActiveMessageBehavior::Queue
                         };
-                        editor_preferences.save()?;
+                        dispatch_editor_preferences_save(
+                            &editor_preferences_tx,
+                            &editor_preferences,
+                        );
                         let terminal = terminal.as_mut().expect("terminal");
                         terminal.set_active_message_behavior(enabled);
                         terminal.set_notice(format!(
@@ -3729,7 +4252,10 @@ async fn run_local_agent_session(
                     }
                     UiAction::SetDiffExpansion(policy) => {
                         editor_preferences.presentation.diff_expansion = Some(policy);
-                        editor_preferences.save()?;
+                        dispatch_editor_preferences_save(
+                            &editor_preferences_tx,
+                            &editor_preferences,
+                        );
                         let terminal = terminal.as_mut().expect("terminal");
                         terminal.set_diff_expansion(policy);
                         terminal.set_notice(format!(
@@ -3739,7 +4265,10 @@ async fn run_local_agent_session(
                     }
                     UiAction::SetAutoExpandTools(enabled) => {
                         editor_preferences.presentation.auto_expand_tools = enabled;
-                        editor_preferences.save()?;
+                        dispatch_editor_preferences_save(
+                            &editor_preferences_tx,
+                            &editor_preferences,
+                        );
                         let terminal = terminal.as_mut().expect("terminal");
                         terminal.set_auto_expand_tools(enabled);
                         terminal.set_notice(format!(
@@ -3749,7 +4278,10 @@ async fn run_local_agent_session(
                     }
                     UiAction::SetActionDescriptors(enabled) => {
                         editor_preferences.presentation.action_descriptors = enabled;
-                        editor_preferences.save()?;
+                        dispatch_editor_preferences_save(
+                            &editor_preferences_tx,
+                            &editor_preferences,
+                        );
                         let terminal = terminal.as_mut().expect("terminal");
                         terminal.set_action_descriptors(enabled);
                         terminal.set_notice(format!(
@@ -3759,7 +4291,10 @@ async fn run_local_agent_session(
                     }
                     UiAction::SetRunningSweeps(enabled) => {
                         editor_preferences.presentation.running_sweeps = enabled;
-                        editor_preferences.save()?;
+                        dispatch_editor_preferences_save(
+                            &editor_preferences_tx,
+                            &editor_preferences,
+                        );
                         let terminal = terminal.as_mut().expect("terminal");
                         terminal.set_running_sweeps(enabled);
                         terminal.set_notice(format!(
@@ -3769,7 +4304,10 @@ async fn run_local_agent_session(
                     }
                     UiAction::SetCompletionNotifications(policy) => {
                         editor_preferences.interaction.completion_notifications = policy;
-                        editor_preferences.save()?;
+                        dispatch_editor_preferences_save(
+                            &editor_preferences_tx,
+                            &editor_preferences,
+                        );
                         let terminal = terminal.as_mut().expect("terminal");
                         terminal.set_completion_alerts(
                             policy,
@@ -3782,7 +4320,10 @@ async fn run_local_agent_session(
                     }
                     UiAction::SetCompletionSound(policy) => {
                         editor_preferences.interaction.completion_sound = policy;
-                        editor_preferences.save()?;
+                        dispatch_editor_preferences_save(
+                            &editor_preferences_tx,
+                            &editor_preferences,
+                        );
                         let terminal = terminal.as_mut().expect("terminal");
                         terminal.set_completion_alerts(
                             editor_preferences.interaction.completion_notifications,
@@ -3795,7 +4336,10 @@ async fn run_local_agent_session(
                     }
                     UiAction::SetDictationIcon(style) => {
                         editor_preferences.presentation.dictation_icon = Some(style);
-                        editor_preferences.save()?;
+                        dispatch_editor_preferences_save(
+                            &editor_preferences_tx,
+                            &editor_preferences,
+                        );
                         let terminal = terminal.as_mut().expect("terminal");
                         terminal.set_dictation_icon(style);
                         terminal.set_notice(format!(
@@ -3807,7 +4351,10 @@ async fn run_local_agent_session(
                         ));
                     }
                     UiAction::ToggleDictation => {
-                        if dictation_task.is_some() || dictation_setup_task.is_some() {
+                        if dictation_task.is_some()
+                            || dictation_setup_task.is_some()
+                            || dictation_start_task.is_some()
+                        {
                             terminal
                                 .as_mut()
                                 .expect("terminal")
@@ -3846,59 +4393,58 @@ async fn run_local_agent_session(
                                 .as_ref()
                                 .map(LocalDictationBackend::config)
                                 .unwrap_or_else(|| dictation_config.clone());
-                            match LocalDictationRecorder::start(&config) {
-                                Ok(recorder) => {
-                                    dictation_recorder = Some(recorder);
-                                    let terminal = terminal.as_mut().expect("terminal");
-                                    terminal.set_dictation_state(DictationState::Recording);
-                                    terminal.set_notice(
-                                        "Recording locally · click stop or use the dictate keybinding"
-                                            .to_string(),
-                                    );
-                                }
-                                Err(error) => terminal
-                                    .as_mut()
-                                    .expect("terminal")
-                                    .set_notice(format!("Could not start dictation: {error:#}")),
-                            }
+                            let terminal = terminal.as_mut().expect("terminal");
+                            terminal.set_dictation_state(DictationState::Installing);
+                            terminal.set_notice("Starting local microphone…".to_string());
+                            dictation_start_task = Some(spawn_dictation_start(config));
+                        }
+                    }
+                    UiAction::TerminalIo(request) => {
+                        if !terminal_io_tx.send(request) {
+                            terminal
+                                .as_mut()
+                                .expect("terminal")
+                                .set_notice("Could not start terminal I/O".to_string());
                         }
                     }
                     UiAction::LoadPayloads(payloads) => {
-                        for payload in payloads {
-                            match store.load_payload(&payload).await {
-                                Ok(bytes) => terminal
-                                    .as_mut()
-                                    .expect("terminal")
-                                    .hydrate_payload(&payload, bytes)?,
-                                Err(error) => {
-                                    terminal
-                                        .as_mut()
-                                        .expect("terminal")
-                                        .set_notice(error.to_string());
-                                    break;
-                                }
-                            }
+                        if payload_hydration_tx.send(payloads).is_err() {
+                            terminal
+                                .as_mut()
+                                .expect("terminal")
+                                .set_notice("Could not load tool output".to_string());
                         }
                     }
                     UiAction::Interrupt { target } => {
-                        if let Some(target) = target {
-                            session_command_tx
-                                .send(HostCommand::Subagent {
+                        let dispatched = if let Some(target) = target {
+                            dispatch_host_command_without_blocking(
+                                &session_command_tx,
+                                HostCommand::Subagent {
                                     session_id,
                                     action: SubagentAction::Interrupt {
                                         request_id: Uuid::new_v4(),
                                         target: target.to_string(),
                                     },
-                                })
-                                .await
-                                .ok();
+                                },
+                            )
                         } else if matches!(
                             status,
                             SessionStatus::Starting
                                 | SessionStatus::Running
                                 | SessionStatus::WaitingForApproval
                         ) {
-                            session_command_tx.send(HostCommand::Interrupt { session_id }).await.ok();
+                            dispatch_host_command_without_blocking(
+                                &session_command_tx,
+                                HostCommand::Interrupt { session_id },
+                            )
+                        } else {
+                            true
+                        };
+                        if !dispatched {
+                            terminal
+                                .as_mut()
+                                .expect("terminal")
+                                .set_notice("Could not reach the session actor".to_string());
                         }
                     }
                     UiAction::ForceQuit => {
@@ -3928,7 +4474,10 @@ async fn run_local_agent_session(
                         } else {
                             stop_sent = true;
                             shutdown_terminal(&mut terminal, &crash_context.tui_active).await;
-                            session_command_tx.send(HostCommand::Stop { session_id }).await.ok();
+                            dispatch_host_command_without_blocking(
+                                &session_command_tx,
+                                HostCommand::Stop { session_id },
+                            );
                         }
                     }
                     UiAction::Queue {
@@ -3951,47 +4500,46 @@ async fn run_local_agent_session(
                                         PromptDelivery::Queue,
                                     );
                                     terminal.set_notice("Queued message for director".to_string());
-                                    if let Err(error) = persist_prompt_admission(
-                                        store.as_ref(),
+                                    let command = director_prompt_host_command(
                                         session_id,
                                         message_id,
-                                        &prompt,
-                                        &attachments,
+                                        prompt.clone(),
+                                        attachments.clone(),
                                         PromptDelivery::Queue,
-                                    )
-                                    .await
-                                    {
+                                    );
+                                    let submission = UiPromptSubmission {
+                                        journal_session_id: session_id,
+                                        target: None,
+                                        message_id,
+                                        rejected_text: format!("/director {prompt}"),
+                                        text: prompt,
+                                        attachments,
+                                        delivery: PromptDelivery::Queue,
+                                        command: Some(command),
+                                        kind: PromptSubmissionKind::Queue,
+                                        started_idle_turn: false,
+                                    };
+                                    if let Err(submission) = dispatch_ui_prompt(
+                                        &ui_interaction_tx,
+                                        &mut pending_prompt_ids,
+                                        submission,
+                                    ) {
                                         terminal.reject_optimistic_prompt(
                                             None,
-                                            message_id,
-                                            format!("/director {prompt}"),
-                                            attachments,
+                                            submission.message_id,
+                                            submission.rejected_text,
+                                            submission.attachments,
                                         );
-                                        terminal.set_notice(format!(
-                                            "Could not durably queue the prompt: {error:#}"
-                                        ));
+                                        terminal.set_notice(
+                                            "Could not queue the prompt for durable storage"
+                                                .to_string(),
+                                        );
                                         interaction_dirty = true;
                                         terminal_dirty = true;
                                         continue;
                                     }
                                     interaction_dirty = true;
                                     terminal_dirty = true;
-                                    let command = director_prompt_host_command(
-                                        session_id,
-                                        message_id,
-                                        prompt,
-                                        attachments,
-                                        PromptDelivery::Queue,
-                                    );
-                                    pending_prompt_ids.insert(message_id);
-                                    if session_command_tx.send(command).await.is_err() {
-                                        terminal.set_notice(
-                                            "Prompt saved durably · waiting for the director thread to reconnect"
-                                                .to_string(),
-                                        );
-                                        interaction_dirty = true;
-                                        terminal_dirty = true;
-                                    }
                                 }
                                 Err(error) => {
                                     terminal.restore_composer(text, attachments);
@@ -4015,13 +4563,7 @@ async fn run_local_agent_session(
                                         &attachments,
                                         PromptDelivery::Queue,
                                     ) {
-                                        if session_command_tx.send(command).await.is_err() {
-                                            terminal.set_notice(format!(
-                                                "Could not reach {} peer",
-                                                sidecar.label()
-                                            ));
-                                            break;
-                                        }
+                                        dispatch_ui_command(&ui_interaction_tx, command);
                                     }
                                 }
                                 Err(error) => {
@@ -4052,39 +4594,36 @@ async fn run_local_agent_session(
                                 },
                             },
                         );
-                        if let Err(error) = persist_prompt_admission(
-                            store.as_ref(),
-                            target.unwrap_or(session_id),
+                        let submission = UiPromptSubmission {
+                            journal_session_id: target.unwrap_or(session_id),
+                            target,
                             message_id,
-                            &text,
-                            &attachments,
-                            PromptDelivery::Queue,
-                        )
-                        .await
-                        {
+                            rejected_text: text.clone(),
+                            text,
+                            attachments,
+                            delivery: PromptDelivery::Queue,
+                            command: Some(command),
+                            kind: PromptSubmissionKind::Queue,
+                            started_idle_turn: false,
+                        };
+                        if let Err(submission) = dispatch_ui_prompt(
+                            &ui_interaction_tx,
+                            &mut pending_prompt_ids,
+                            submission,
+                        ) {
                             let terminal = terminal.as_mut().expect("terminal");
                             terminal.reject_optimistic_prompt(
-                                target,
-                                message_id,
-                                text,
-                                attachments,
+                                submission.target,
+                                submission.message_id,
+                                submission.rejected_text,
+                                submission.attachments,
                             );
-                            terminal.set_notice(format!(
-                                "Could not durably queue the prompt: {error:#}"
-                            ));
+                            terminal.set_notice(
+                                "Could not queue the prompt for durable storage".to_string(),
+                            );
                             interaction_dirty = true;
                             terminal_dirty = true;
                             continue;
-                        }
-                        pending_prompt_ids.insert(message_id);
-                        if session_command_tx.send(command).await.is_err() {
-                            let terminal = terminal.as_mut().expect("terminal");
-                            terminal.set_notice(
-                                "Prompt saved durably · waiting for the session coordinator to reconnect"
-                                    .to_string(),
-                            );
-                            interaction_dirty = true;
-                            terminal_dirty = true;
                         }
                     }
                     UiAction::Submit {
@@ -4128,25 +4667,40 @@ async fn run_local_agent_session(
                                         sleep_inhibitor.set_turn_active(true);
                                     }
                                     terminal.set_notice("Sending to director".to_string());
-                                    if let Err(error) = persist_prompt_admission(
-                                        store.as_ref(),
+                                    let command = director_prompt_host_command(
                                         session_id,
                                         message_id,
-                                        &prompt,
-                                        &attachments,
+                                        prompt.clone(),
+                                        attachments.clone(),
                                         delivery,
-                                    )
-                                    .await
-                                    {
+                                    );
+                                    let submission = UiPromptSubmission {
+                                        journal_session_id: session_id,
+                                        target: None,
+                                        message_id,
+                                        rejected_text: format!("/director {prompt}"),
+                                        text: prompt,
+                                        attachments,
+                                        delivery,
+                                        command: Some(command),
+                                        kind: PromptSubmissionKind::Send,
+                                        started_idle_turn: !active,
+                                    };
+                                    if let Err(submission) = dispatch_ui_prompt(
+                                        &ui_interaction_tx,
+                                        &mut pending_prompt_ids,
+                                        submission,
+                                    ) {
                                         terminal.reject_optimistic_prompt(
                                             None,
-                                            message_id,
-                                            format!("/director {prompt}"),
-                                            attachments,
+                                            submission.message_id,
+                                            submission.rejected_text,
+                                            submission.attachments,
                                         );
-                                        terminal.set_notice(format!(
-                                            "Could not durably send the prompt: {error:#}"
-                                        ));
+                                        terminal.set_notice(
+                                            "Could not queue the prompt for durable storage"
+                                                .to_string(),
+                                        );
                                         if !active {
                                             status = SessionStatus::Ready;
                                             sleep_inhibitor.set_turn_active(false);
@@ -4157,22 +4711,6 @@ async fn run_local_agent_session(
                                     }
                                     interaction_dirty = true;
                                     terminal_dirty = true;
-                                    let command = director_prompt_host_command(
-                                        session_id,
-                                        message_id,
-                                        prompt,
-                                        attachments,
-                                        delivery,
-                                    );
-                                    pending_prompt_ids.insert(message_id);
-                                    if session_command_tx.send(command).await.is_err() {
-                                        terminal.set_notice(
-                                            "Prompt saved durably · waiting for the director thread to reconnect"
-                                                .to_string(),
-                                        );
-                                        interaction_dirty = true;
-                                        terminal_dirty = true;
-                                    }
                                 }
                                 Err(error) => {
                                     terminal.restore_composer(text, attachments);
@@ -4195,13 +4733,7 @@ async fn run_local_agent_session(
                                         &attachments,
                                         PromptDelivery::Steer,
                                     ) {
-                                        if session_command_tx.send(command).await.is_err() {
-                                            terminal.set_notice(format!(
-                                                "Could not reach {} peer",
-                                                sidecar.label()
-                                            ));
-                                            break;
-                                        }
+                                        dispatch_ui_command(&ui_interaction_tx, command);
                                     }
                                 }
                                 Err(error) => {
@@ -4228,30 +4760,6 @@ async fn run_local_agent_session(
                                     text.clone(),
                                     delivery,
                                 );
-                            if let Err(error) = persist_prompt_admission(
-                                store.as_ref(),
-                                target,
-                                message_id,
-                                &text,
-                                &attachments,
-                                delivery,
-                            )
-                            .await
-                            {
-                                let terminal = terminal.as_mut().expect("terminal");
-                                terminal.reject_optimistic_prompt(
-                                    Some(target),
-                                    message_id,
-                                    text,
-                                    attachments,
-                                );
-                                terminal.set_notice(format!(
-                                    "Could not durably send the prompt: {error:#}"
-                                ));
-                                interaction_dirty = true;
-                                terminal_dirty = true;
-                                continue;
-                            }
                             let command = HostCommand::Subagent {
                                 session_id,
                                 action: SubagentAction::Prompt {
@@ -4263,15 +4771,36 @@ async fn run_local_agent_session(
                                     delivery,
                                 },
                             };
-                            pending_prompt_ids.insert(message_id);
-                            if session_command_tx.send(command).await.is_err() {
+                            let submission = UiPromptSubmission {
+                                journal_session_id: target,
+                                target: Some(target),
+                                message_id,
+                                rejected_text: text.clone(),
+                                text,
+                                attachments,
+                                delivery,
+                                command: Some(command),
+                                kind: PromptSubmissionKind::Send,
+                                started_idle_turn: false,
+                            };
+                            if let Err(submission) = dispatch_ui_prompt(
+                                &ui_interaction_tx,
+                                &mut pending_prompt_ids,
+                                submission,
+                            ) {
                                 let terminal = terminal.as_mut().expect("terminal");
+                                terminal.reject_optimistic_prompt(
+                                    Some(target),
+                                    submission.message_id,
+                                    submission.rejected_text,
+                                    submission.attachments,
+                                );
                                 terminal.set_notice(
-                                    "Prompt saved durably · waiting for the session coordinator to reconnect"
-                                        .to_string(),
+                                    "Could not queue the prompt for durable storage".to_string(),
                                 );
                                 interaction_dirty = true;
                                 terminal_dirty = true;
+                                continue;
                             }
                             continue;
                         }
@@ -4291,14 +4820,14 @@ async fn run_local_agent_session(
                             }
                             match provider_interaction_response(&kind, &payload, text.trim()) {
                                 Ok(response) => {
-                                    session_command_tx
-                                        .send(HostCommand::RespondToProviderInteraction {
+                                    dispatch_ui_command(
+                                        &ui_interaction_tx,
+                                        HostCommand::RespondToProviderInteraction {
                                             session_id,
                                             interaction_id,
                                             response,
-                                        })
-                                        .await
-                                        .ok();
+                                        },
+                                    );
                                 }
                                 Err(error) => {
                                     terminal
@@ -4323,15 +4852,15 @@ async fn run_local_agent_session(
                             Ok(Some((command, arguments))) if attachments.is_empty() => {
                                 let invocation_id = Uuid::new_v4();
                                 let notice = format!("Running {line}");
-                                if session_command_tx
-                                    .send(HostCommand::ExtensionCommand {
+                                if dispatch_ui_command(
+                                    &ui_interaction_tx,
+                                    HostCommand::ExtensionCommand {
                                         session_id,
                                         invocation_id,
                                         command,
                                         arguments,
-                                    })
-                                    .await
-                                    .is_ok()
+                                    },
+                                )
                                 {
                                     terminal.as_mut().expect("terminal").set_notice(notice);
                                 } else {
@@ -4416,7 +4945,10 @@ async fn run_local_agent_session(
                         {
                             if let Some(style) = parse_dictation_icon_style(value) {
                                 editor_preferences.presentation.dictation_icon = Some(style);
-                                editor_preferences.save()?;
+                                dispatch_editor_preferences_save(
+                                    &editor_preferences_tx,
+                                    &editor_preferences,
+                                );
                                 let terminal = terminal.as_mut().expect("terminal");
                                 terminal.set_dictation_icon(style);
                                 terminal.set_notice(format!(
@@ -4497,21 +5029,31 @@ async fn run_local_agent_session(
                                 .expect("terminal")
                                 .set_notice("Type the assistant transcript label and press Enter");
                         } else if is_usage_command(line) && attachments.is_empty() {
-                            let summary = usage_summary(provider, &session_usage).await;
-                            terminal
-                                .as_mut()
-                                .expect("terminal")
-                                .show_info("Usage", summary);
+                            if usage_summary_task.is_some() {
+                                terminal
+                                    .as_mut()
+                                    .expect("terminal")
+                                    .set_notice("Usage is still loading".to_string());
+                            } else {
+                                let usage = session_usage.clone();
+                                usage_summary_task = Some(tokio::spawn(async move {
+                                    usage_summary(provider, &usage).await
+                                }));
+                                terminal
+                                    .as_mut()
+                                    .expect("terminal")
+                                    .set_notice("Loading usage…".to_string());
+                            }
                         } else if line == "/clear" && attachments.is_empty() {
-                            session_command_tx
-                                .send(HostCommand::ClearContext { session_id })
-                                .await
-                                .ok();
+                            dispatch_ui_command(
+                                &ui_interaction_tx,
+                                HostCommand::ClearContext { session_id },
+                            );
                         } else if line == "/compact" && attachments.is_empty() {
-                            session_command_tx
-                                .send(HostCommand::Compact { session_id })
-                                .await
-                                .ok();
+                            dispatch_ui_command(
+                                &ui_interaction_tx,
+                                HostCommand::Compact { session_id },
+                            );
                         } else if let Some(model) = line.strip_prefix("/model ")
                             && attachments.is_empty()
                         {
@@ -4522,31 +5064,40 @@ async fn run_local_agent_session(
                                 .unwrap_or(provider);
                             let target =
                                 CodingProvider::for_model(&model).unwrap_or(active_provider);
-                            send_model_selection(
-                                &session_command_tx,
-                                session_id,
-                                active_provider,
-                                target,
-                                model,
-                            )
-                            .await;
+                            dispatch_ui_command(
+                                &ui_interaction_tx,
+                                model_selection_command(
+                                    session_id,
+                                    active_provider,
+                                    target,
+                                    model,
+                                ),
+                            );
                         } else if let Some(effort) = line.strip_prefix("/effort ")
                             && attachments.is_empty()
                         {
-                            session_command_tx.send(HostCommand::Configure {
-                                session_id,
-                                action: SessionConfigAction::SetEffort {
-                                    effort: effort.trim().to_string(),
+                            dispatch_ui_command(
+                                &ui_interaction_tx,
+                                HostCommand::Configure {
+                                    session_id,
+                                    action: SessionConfigAction::SetEffort {
+                                        effort: effort.trim().to_string(),
+                                    },
                                 },
-                            }).await.ok();
+                            );
                         } else if let Some(value) = line.strip_prefix("/language ")
                             && attachments.is_empty()
                         {
                             if let Some(language) = ResponseLanguage::parse(value) {
-                                session_command_tx.send(HostCommand::Configure {
-                                    session_id,
-                                    action: SessionConfigAction::SetResponseLanguage { language },
-                                }).await.ok();
+                                dispatch_ui_command(
+                                    &ui_interaction_tx,
+                                    HostCommand::Configure {
+                                        session_id,
+                                        action: SessionConfigAction::SetResponseLanguage {
+                                            language,
+                                        },
+                                    },
+                                );
                             } else {
                                 terminal.as_mut().expect("terminal").set_notice(
                                     "Unknown language. Use /language to choose one.",
@@ -4556,10 +5107,13 @@ async fn run_local_agent_session(
                             && attachments.is_empty()
                         {
                             if let Some(enabled) = parse_on_off(value) {
-                                session_command_tx.send(HostCommand::Configure {
-                                    session_id,
-                                    action: SessionConfigAction::SetFast { enabled },
-                                }).await.ok();
+                                dispatch_ui_command(
+                                    &ui_interaction_tx,
+                                    HostCommand::Configure {
+                                        session_id,
+                                        action: SessionConfigAction::SetFast { enabled },
+                                    },
+                                );
                             } else {
                                 terminal.as_mut().expect("terminal").set_notice(
                                     "Choose /fast on or /fast off",
@@ -4568,8 +5122,12 @@ async fn run_local_agent_session(
                         } else if let Some(value) = line.strip_prefix("/user-label ")
                             && attachments.is_empty()
                         {
-                            match set_transcript_label(&mut editor_preferences, true, value) {
+                            match update_transcript_label(&mut editor_preferences, true, value) {
                                 Ok(()) => {
+                                    dispatch_editor_preferences_save(
+                                        &editor_preferences_tx,
+                                        &editor_preferences,
+                                    );
                                     terminal.as_mut().expect("terminal").set_transcript_labels(
                                         editor_preferences.transcript.user_label.clone(),
                                         editor_preferences.transcript.assistant_label.clone(),
@@ -4587,8 +5145,12 @@ async fn run_local_agent_session(
                         } else if let Some(value) = line.strip_prefix("/assistant-label ")
                             && attachments.is_empty()
                         {
-                            match set_transcript_label(&mut editor_preferences, false, value) {
+                            match update_transcript_label(&mut editor_preferences, false, value) {
                                 Ok(()) => {
+                                    dispatch_editor_preferences_save(
+                                        &editor_preferences_tx,
+                                        &editor_preferences,
+                                    );
                                     terminal.as_mut().expect("terminal").set_transcript_labels(
                                         editor_preferences.transcript.user_label.clone(),
                                         editor_preferences.transcript.assistant_label.clone(),
@@ -4606,8 +5168,12 @@ async fn run_local_agent_session(
                         } else if let Some(value) = line.strip_prefix("/color ")
                             && attachments.is_empty()
                         {
-                            match set_transcript_color(&mut editor_preferences, value) {
+                            match update_transcript_color(&mut editor_preferences, value) {
                                 Ok(()) => {
+                                    dispatch_editor_preferences_save(
+                                        &editor_preferences_tx,
+                                        &editor_preferences,
+                                    );
                                     terminal
                                         .as_mut()
                                         .expect("terminal")
@@ -4634,7 +5200,10 @@ async fn run_local_agent_session(
                                     editor_preferences.presentation.refresh_rate_fps =
                                         u16::try_from(fps)
                                             .expect("bounded refresh rate fits u16");
-                                    editor_preferences.save()?;
+                                    dispatch_editor_preferences_save(
+                                        &editor_preferences_tx,
+                                        &editor_preferences,
+                                    );
                                     terminal.as_mut().expect("terminal").set_notice(format!(
                                         "Refresh rate set to {tui_fps} FPS"
                                     ));
@@ -4650,7 +5219,10 @@ async fn run_local_agent_session(
                                 prevent_sleep = enabled;
                                 sleep_inhibitor.set_enabled(enabled);
                                 editor_preferences.interaction.prevent_sleep = enabled;
-                                editor_preferences.save()?;
+                                dispatch_editor_preferences_save(
+                                    &editor_preferences_tx,
+                                    &editor_preferences,
+                                );
                                 terminal.as_mut().expect("terminal").set_notice(format!(
                                     "Keep machine awake during active turns: {}",
                                     if enabled { "on" } else { "off" }
@@ -4666,7 +5238,10 @@ async fn run_local_agent_session(
                         {
                             if let Some(policy) = parse_diff_expansion(value) {
                                 editor_preferences.presentation.diff_expansion = Some(policy);
-                                editor_preferences.save()?;
+                                dispatch_editor_preferences_save(
+                                    &editor_preferences_tx,
+                                    &editor_preferences,
+                                );
                                 let terminal = terminal.as_mut().expect("terminal");
                                 terminal.set_diff_expansion(policy);
                                 terminal.set_notice(format!(
@@ -4683,7 +5258,10 @@ async fn run_local_agent_session(
                         {
                             if let Some(enabled) = parse_on_off(value) {
                                 editor_preferences.presentation.auto_expand_tools = enabled;
-                                editor_preferences.save()?;
+                                dispatch_editor_preferences_save(
+                                    &editor_preferences_tx,
+                                    &editor_preferences,
+                                );
                                 let terminal = terminal.as_mut().expect("terminal");
                                 terminal.set_auto_expand_tools(enabled);
                                 terminal.set_notice(format!(
@@ -4700,7 +5278,10 @@ async fn run_local_agent_session(
                         {
                             if let Some(enabled) = parse_on_off(value) {
                                 editor_preferences.presentation.action_descriptors = enabled;
-                                editor_preferences.save()?;
+                                dispatch_editor_preferences_save(
+                                    &editor_preferences_tx,
+                                    &editor_preferences,
+                                );
                                 let terminal = terminal.as_mut().expect("terminal");
                                 terminal.set_action_descriptors(enabled);
                                 terminal.set_notice(format!(
@@ -4717,7 +5298,10 @@ async fn run_local_agent_session(
                         {
                             if let Some(enabled) = parse_on_off(value) {
                                 editor_preferences.presentation.running_sweeps = enabled;
-                                editor_preferences.save()?;
+                                dispatch_editor_preferences_save(
+                                    &editor_preferences_tx,
+                                    &editor_preferences,
+                                );
                                 let terminal = terminal.as_mut().expect("terminal");
                                 terminal.set_running_sweeps(enabled);
                                 terminal.set_notice(format!(
@@ -4734,7 +5318,10 @@ async fn run_local_agent_session(
                         {
                             if let Some(policy) = parse_completion_alert_policy(value) {
                                 editor_preferences.interaction.completion_notifications = policy;
-                                editor_preferences.save()?;
+                                dispatch_editor_preferences_save(
+                                    &editor_preferences_tx,
+                                    &editor_preferences,
+                                );
                                 let terminal = terminal.as_mut().expect("terminal");
                                 terminal.set_completion_alerts(
                                     policy,
@@ -4754,7 +5341,10 @@ async fn run_local_agent_session(
                         {
                             if let Some(policy) = parse_completion_alert_policy(value) {
                                 editor_preferences.interaction.completion_sound = policy;
-                                editor_preferences.save()?;
+                                dispatch_editor_preferences_save(
+                                    &editor_preferences_tx,
+                                    &editor_preferences,
+                                );
                                 let terminal = terminal.as_mut().expect("terminal");
                                 terminal.set_completion_alerts(
                                     editor_preferences.interaction.completion_notifications,
@@ -4778,7 +5368,10 @@ async fn run_local_agent_session(
                                     steer_active_turn = true;
                                     editor_preferences.interaction.active_messages =
                                         ActiveMessageBehavior::Steer;
-                                    editor_preferences.save()?;
+                                    dispatch_editor_preferences_save(
+                                        &editor_preferences_tx,
+                                        &editor_preferences,
+                                    );
                                     terminal.as_mut().expect("terminal").set_notice(
                                         "Messages sent while Borg works: send now and redirect the current turn",
                                     );
@@ -4787,7 +5380,10 @@ async fn run_local_agent_session(
                                     steer_active_turn = false;
                                     editor_preferences.interaction.active_messages =
                                         ActiveMessageBehavior::Queue;
-                                    editor_preferences.save()?;
+                                    dispatch_editor_preferences_save(
+                                        &editor_preferences_tx,
+                                        &editor_preferences,
+                                    );
                                     terminal.as_mut().expect("terminal").set_notice(
                                         "Messages sent while Borg works: send after the current turn finishes",
                                     );
@@ -4851,58 +5447,82 @@ async fn run_local_agent_session(
                         {
                             match parse_todo_action(line, &current_todos) {
                                 Ok(action) => {
-                                    session_command_tx.send(HostCommand::Todo {
-                                        session_id,
-                                        action,
-                                    }).await.ok();
+                                    dispatch_ui_command(
+                                        &ui_interaction_tx,
+                                        HostCommand::Todo { session_id, action },
+                                    );
                                 }
                                 Err(error) => terminal.as_mut().expect("terminal").set_notice(error.to_string()),
                             }
                         } else if line == "/resume" && attachments.is_empty() {
-                            let sessions = recent_session_options(
-                                &sessions_dir,
-                                sqlite_store.as_ref(),
-                                session_id,
-                                &cwd,
-                                RESUME_PICKER_SESSION_LIMIT,
-                            )
-                            .await?;
-                            if sessions.is_empty() {
-                                terminal.as_mut().expect("terminal").set_notice(
-                                    "No other saved Borg sessions. Use /resume <session-id>.",
-                                );
-                            } else {
+                            if resume_lookup_task.is_some() {
                                 terminal
                                     .as_mut()
                                     .expect("terminal")
-                                    .open_resume_picker(&sessions);
+                                    .set_notice("Session lookup is still running".to_string());
+                            } else {
+                                let lookup_sessions_dir = sessions_dir.clone();
+                                let lookup_store = Arc::clone(&sqlite_store);
+                                let lookup_cwd = cwd.clone();
+                                resume_lookup_task = Some(tokio::spawn(async move {
+                                    ResumeLookupResult::Options(
+                                        recent_session_options(
+                                            &lookup_sessions_dir,
+                                            lookup_store.as_ref(),
+                                            session_id,
+                                            &lookup_cwd,
+                                            RESUME_PICKER_SESSION_LIMIT,
+                                        )
+                                        .await
+                                        .map_err(|error| format!("{error:#}")),
+                                    )
+                                }));
+                                terminal
+                                    .as_mut()
+                                    .expect("terminal")
+                                    .set_notice("Loading saved sessions…".to_string());
                             }
                         } else if let Some(target) = line.strip_prefix("/resume ")
                             && attachments.is_empty()
                         {
-                            match resolve_resume_switch(
-                                &sessions_dir,
-                                sqlite_store.as_ref(),
-                                session_id,
-                                target,
-                                session_access,
-                                status,
-                            )
-                            .await
-                            {
-                                Ok((target, switch)) => {
-                                    tracing::info!(?switch, from = %session_id, to = %target, "switching local session");
-                                    resume_session = Some(target);
-                                    stop_sent = true;
-                                    session_command_tx
-                                        .send(HostCommand::Stop { session_id })
-                                        .await
-                                        .ok();
-                                }
-                                Err(error) => terminal
+                            if resume_lookup_task.is_some() {
+                                terminal
                                     .as_mut()
                                     .expect("terminal")
-                                    .set_notice(error.to_string()),
+                                    .set_notice("Session lookup is still running".to_string());
+                            } else {
+                                let lookup_sessions_dir = sessions_dir.clone();
+                                let lookup_store = Arc::clone(&sqlite_store);
+                                let target = target.to_string();
+                                resume_lookup_task = Some(tokio::spawn(async move {
+                                    ResumeLookupResult::Switch(
+                                        async {
+                                            let target = resolve_resume_target(
+                                                &lookup_sessions_dir,
+                                                lookup_store.as_ref(),
+                                                session_id,
+                                                &target,
+                                            )
+                                            .await?;
+                                            if lookup_store
+                                                .load_host_launch_metadata(target)
+                                                .await?
+                                                .is_some()
+                                            {
+                                                anyhow::bail!(
+                                                    "this session is still owned by the background Borg remote host; reopen it from the connected remote chat instead of starting a second local writer"
+                                                );
+                                            }
+                                            Ok(target)
+                                        }
+                                        .await
+                                        .map_err(|error: anyhow::Error| format!("{error:#}")),
+                                    )
+                                }));
+                                terminal
+                                    .as_mut()
+                                    .expect("terminal")
+                                    .set_notice("Resolving session…".to_string());
                             }
                         } else {
                             match line {
@@ -4911,37 +5531,46 @@ async fn run_local_agent_session(
                                     .expect("terminal")
                                     .open_command_palette(),
                                 "/collab" | "/collab view" if attachments.is_empty() => {
-                                    if collab_child.is_some() {
+                                    if collaboration_task.is_some() {
+                                        terminal.as_mut().expect("terminal").set_notice(
+                                            "Collaboration link change is still in progress."
+                                                .to_string(),
+                                        );
+                                    } else if collab_child.is_some() {
                                         terminal.as_mut().expect("terminal").set_notice(
                                             "This session already has an active collaboration link. Use /collab stop first."
                                         );
                                     } else {
-                                        match start_collaboration_host(session_id).await {
-                                            Ok((child, view, control)) => {
-                                                let notice = if line == "/collab view" {
-                                                    format!("Read-only collaboration link:\n{view}")
-                                                } else {
-                                                    format!("Control link:\n{control}\n\nRead-only link:\n{view}")
-                                                };
-                                                collab_child = Some(child);
-                                                terminal.as_mut().expect("terminal").show_info(
-                                                    "Collaboration",
-                                                    &notice,
-                                                );
+                                        let read_only = line == "/collab view";
+                                        collaboration_task = Some(tokio::spawn(async move {
+                                            CollaborationTaskResult::Started {
+                                                read_only,
+                                                result: start_collaboration_host(session_id)
+                                                    .await
+                                                    .map_err(|error| format!("{error:#}")),
                                             }
-                                            Err(error) => terminal
-                                                .as_mut()
-                                                .expect("terminal")
-                                                .set_notice(format!("Collaboration failed: {error:#}")),
-                                        }
+                                        }));
+                                        terminal
+                                            .as_mut()
+                                            .expect("terminal")
+                                            .set_notice("Starting collaboration link…".to_string());
                                     }
                                 }
                                 "/collab stop" if attachments.is_empty() => {
-                                    if let Some(mut child) = collab_child.take() {
-                                        child.kill().await.ok();
+                                    if collaboration_task.is_some() {
                                         terminal.as_mut().expect("terminal").set_notice(
-                                            "Collaboration link stopped."
+                                            "Collaboration link change is still in progress."
+                                                .to_string(),
                                         );
+                                    } else if let Some(mut child) = collab_child.take() {
+                                        collaboration_task = Some(tokio::spawn(async move {
+                                            child.kill().await.ok();
+                                            CollaborationTaskResult::Stopped
+                                        }));
+                                        terminal
+                                            .as_mut()
+                                            .expect("terminal")
+                                            .set_notice("Stopping collaboration link…".to_string());
                                     } else {
                                         terminal.as_mut().expect("terminal").set_notice(
                                             "No collaboration link is active."
@@ -5128,14 +5757,17 @@ async fn run_local_agent_session(
                                         stop_sent = true;
                                         shutdown_terminal(&mut terminal, &crash_context.tui_active)
                                             .await;
-                                        session_command_tx
-                                            .send(HostCommand::Stop { session_id })
-                                            .await
-                                            .ok();
+                                        dispatch_host_command_without_blocking(
+                                            &session_command_tx,
+                                            HostCommand::Stop { session_id },
+                                        );
                                     }
                                 }
                                 "/interrupt" | "/stop" if attachments.is_empty() => {
-                                    session_command_tx.send(HostCommand::Interrupt { session_id }).await.ok();
+                                    dispatch_host_command_without_blocking(
+                                        &session_command_tx,
+                                        HostCommand::Interrupt { session_id },
+                                    );
                                 }
                                 _ => {
                                     let active = matches!(
@@ -5189,26 +5821,42 @@ async fn run_local_agent_session(
                                             status = SessionStatus::Starting;
                                             sleep_inhibitor.set_turn_active(true);
                                         }
-                                        if let Err(error) = persist_prompt_admission(
-                                            store.as_ref(),
+                                        let command = HostCommand::Prompt {
                                             session_id,
                                             message_id,
-                                            &text,
-                                            &attachments,
+                                            text: text.clone(),
+                                            attachments: attachments.clone(),
+                                            output_schema: None,
                                             delivery,
-                                        )
-                                        .await
-                                        {
+                                        };
+                                        let submission = UiPromptSubmission {
+                                            journal_session_id: session_id,
+                                            target: None,
+                                            message_id,
+                                            rejected_text: text.clone(),
+                                            text,
+                                            attachments,
+                                            delivery,
+                                            command: Some(command),
+                                            kind: PromptSubmissionKind::Send,
+                                            started_idle_turn: !active,
+                                        };
+                                        if let Err(submission) = dispatch_ui_prompt(
+                                            &ui_interaction_tx,
+                                            &mut pending_prompt_ids,
+                                            submission,
+                                        ) {
                                             let terminal = terminal.as_mut().expect("terminal");
                                             terminal.reject_optimistic_prompt(
                                                 None,
-                                                message_id,
-                                                text,
-                                                attachments,
+                                                submission.message_id,
+                                                submission.rejected_text,
+                                                submission.attachments,
                                             );
-                                            terminal.set_notice(format!(
-                                                "Could not durably send the prompt: {error:#}"
-                                            ));
+                                            terminal.set_notice(
+                                                "Could not queue the prompt for durable storage"
+                                                    .to_string(),
+                                            );
                                             if !active {
                                                 status = SessionStatus::Ready;
                                                 sleep_inhibitor.set_turn_active(false);
@@ -5216,23 +5864,6 @@ async fn run_local_agent_session(
                                             interaction_dirty = true;
                                             terminal_dirty = true;
                                             continue;
-                                        }
-                                        pending_prompt_ids.insert(message_id);
-                                        if session_command_tx.send(HostCommand::Prompt {
-                                            session_id,
-                                            message_id,
-                                            text,
-                                            attachments,
-                                            output_schema: None,
-                                            delivery,
-                                        }).await.is_err() {
-                                            let terminal = terminal.as_mut().expect("terminal");
-                                            terminal.set_notice(
-                                                "Prompt saved durably · waiting for the session actor to reconnect"
-                                                    .to_string(),
-                                            );
-                                            interaction_dirty = true;
-                                            terminal_dirty = true;
                                         }
                                     }
                                 }
@@ -5253,7 +5884,7 @@ async fn run_local_agent_session(
                         if !args.json && terminal.is_none() {
                             println!("\n  ↳ remote {}", remote_command_name(&command));
                         }
-                        session_command_tx.send(command).await.ok();
+                        dispatch_ui_command(&ui_interaction_tx, command);
                     }
                     None => remote_open = false,
                 }
@@ -5328,10 +5959,10 @@ async fn run_local_agent_session(
                 exit_notice = Some(format!(
                     "{signal} received; Borg restored the terminal and stopped the local session."
                 ));
-                session_command_tx
-                    .send(HostCommand::Stop { session_id })
-                    .await
-                    .ok();
+                dispatch_host_command_without_blocking(
+                    &session_command_tx,
+                    HostCommand::Stop { session_id },
+                );
             }
         }
     }
@@ -5342,6 +5973,27 @@ async fn run_local_agent_session(
     if let Some(task) = dictation_setup_task.take() {
         task.abort();
     }
+    if let Some(task) = dictation_start_task.take() {
+        task.abort();
+    }
+    if let Some(task) = usage_summary_task.take() {
+        task.abort();
+    }
+    if let Some(task) = resume_lookup_task.take() {
+        task.abort();
+    }
+    if let Some(task) = collaboration_task.take() {
+        task.abort();
+    }
+    if let Some(task) = agent_config_poll_task.take() {
+        task.abort();
+    }
+    if let Some(task) = projection_gap_repair_task.take() {
+        task.abort();
+    }
+    if let Some(task) = stale_owner_handoff_task.take() {
+        task.abort();
+    }
     drop(dictation_backend);
     if let Some(terminal) = terminal.as_mut() {
         terminal.set_dictation_state(DictationState::Idle);
@@ -5350,6 +6002,21 @@ async fn run_local_agent_session(
     let preserve_terminal = resume_session.is_some() && !user_requested_exit && terminal.is_some();
     if !preserve_terminal {
         shutdown_terminal(&mut terminal, &crash_context.tui_active).await;
+    }
+    drop(payload_hydration_tx);
+    payload_hydration_task.abort();
+    drop(terminal_io_tx);
+    drop(editor_preferences_tx);
+    if force_exit_requested {
+        editor_preferences_task.abort();
+    } else if let Err(error) = editor_preferences_task.await {
+        tracing::warn!(%session_id, %error, "editor preferences writer stopped unexpectedly");
+    }
+    drop(ui_interaction_tx);
+    if force_exit_requested {
+        ui_interaction_task.abort();
+    } else if let Err(error) = ui_interaction_task.await {
+        tracing::warn!(%session_id, %error, "UI interaction dispatcher stopped unexpectedly");
     }
     drop(session_events);
     let mut actor = actor;
@@ -5515,13 +6182,12 @@ async fn start_collaboration_host(session_id: Uuid) -> Result<(Child, String, St
 /// Applies a model choice, switching the session's provider first when the
 /// model belongs to a different one. The switch is live: the session keeps
 /// running and the next turn goes to the new provider.
-async fn send_model_selection(
-    session_command_tx: &mpsc::Sender<HostCommand>,
+fn model_selection_command(
     session_id: Uuid,
     active: CodingProvider,
     target: CodingProvider,
     model: String,
-) {
+) -> HostCommand {
     let action = if target == active {
         SessionConfigAction::SetModel { model }
     } else {
@@ -5530,10 +6196,7 @@ async fn send_model_selection(
             model: Some(model),
         }
     };
-    session_command_tx
-        .send(HostCommand::Configure { session_id, action })
-        .await
-        .ok();
+    HostCommand::Configure { session_id, action }
 }
 
 /// Reads an API key from the terminal without echoing it and stores it in the
@@ -6503,7 +7166,7 @@ fn parse_dictation_icon_style(value: &str) -> Option<DictationIconStyle> {
     }
 }
 
-fn set_transcript_label(
+fn update_transcript_label(
     preferences: &mut EditorPreferences,
     user_label: bool,
     value: &str,
@@ -6514,12 +7177,12 @@ fn set_transcript_label(
     } else {
         candidate.transcript.assistant_label = value.to_string();
     }
-    candidate.save()?;
+    candidate.validate()?;
     *preferences = candidate;
     Ok(())
 }
 
-fn set_transcript_color(preferences: &mut EditorPreferences, value: &str) -> Result<()> {
+fn update_transcript_color(preferences: &mut EditorPreferences, value: &str) -> Result<()> {
     let mut parts = value.split_whitespace();
     let target = parts.next().unwrap_or_default();
     let color = parts.next().unwrap_or_default();
@@ -6538,7 +7201,7 @@ fn set_transcript_color(preferences: &mut EditorPreferences, value: &str) -> Res
         ),
     };
     *destination = color.to_ascii_lowercase();
-    candidate.save()?;
+    candidate.validate()?;
     *preferences = candidate;
     Ok(())
 }
@@ -7006,7 +7669,7 @@ fn dispatch_host_command_without_blocking(
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct SessionUsage {
     calls: u64,
     input_tokens: u64,

@@ -5989,9 +5989,16 @@ fn transcript_width_reserves_scrollbar_gutter_only_when_overflowing() {
 
 #[test]
 fn input_redraw_reuses_the_last_committed_viewport_snapshot() {
-    assert_eq!(select_transcript_snapshot(true, Some(97), || 100), 97);
-    assert_eq!(select_transcript_snapshot(true, None, || 100), 100);
-    assert_eq!(select_transcript_snapshot(false, Some(97), || 100), 100);
+    assert_eq!(select_transcript_snapshot(true, true, Some(97), || 100), 97);
+    assert_eq!(select_transcript_snapshot(true, true, None, || 100), 100);
+    assert_eq!(
+        select_transcript_snapshot(false, true, Some(97), || 100),
+        100
+    );
+    assert_eq!(
+        select_transcript_snapshot(true, false, Some(97), || 100),
+        100
+    );
 }
 
 /// Only commands whose bare form is not a command need finishing by hand;
@@ -8052,7 +8059,9 @@ fn transcript_separates_labeled_groups_from_header_and_tool_activity() {
         .flat_map(|line| line.spans.iter())
         .find(|span| span.content.contains("shulgin"))
         .expect("user label");
-    assert_eq!(user_label.style.fg, Some(USER_LABEL_BLUE));
+    assert_eq!(user_label.content, " shulgin ");
+    assert_eq!(user_label.style.fg, Some(Color::White));
+    assert_eq!(user_label.style.bg, Some(USER_LABEL_BLUE));
     let user_header = lines
         .iter()
         .position(|line| {
@@ -8079,10 +8088,13 @@ fn transcript_separates_labeled_groups_from_header_and_tool_activity() {
         .position(|line| line.spans.iter().any(|span| span.content.contains("borg")))
         .expect("assistant header");
     let assistant_header_spans = &lines[assistant_header].spans;
-    assert_eq!(assistant_header_spans[0].content, "  ▌ borg");
-    assert_eq!(assistant_header_spans[1].content, "  gpt-5.6-sol xhigh");
-    assert_eq!(assistant_header_spans[1].style.fg, Some(Color::DarkGray));
-    assert_eq!(assistant_header_spans[2].content, "  12:02");
+    assert_eq!(assistant_header_spans[0].content, "  ");
+    assert_eq!(assistant_header_spans[1].content, " borg ");
+    assert_eq!(assistant_header_spans[1].style.fg, Some(Color::White));
+    assert_eq!(assistant_header_spans[1].style.bg, Some(BORG_ORANGE));
+    assert_eq!(assistant_header_spans[2].content, "  gpt-5.6-sol xhigh");
+    assert_eq!(assistant_header_spans[2].style.fg, Some(Color::DarkGray));
+    assert_eq!(assistant_header_spans[3].content, "  12:02");
     assert!(lines[assistant_header - 1].to_string().trim().is_empty());
     assert_eq!(
         lines[assistant_header - 1]

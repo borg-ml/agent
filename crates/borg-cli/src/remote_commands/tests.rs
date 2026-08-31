@@ -1,4 +1,5 @@
 use super::*;
+use sqlx::Executor;
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
 #[cfg(unix)]
@@ -37,6 +38,139 @@ async fn goal_dispatch_does_not_wait_for_a_full_command_queue() {
             action: GoalAction::Resume,
         }) if received_session == session_id
     ));
+}
+
+#[tokio::test]
+async fn prompt_dispatch_does_not_block_input_while_sqlite_is_locked() {
+    let directory = tempdir().expect("session directory");
+    let store = Arc::new(
+        SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
+            .await
+            .expect("session store"),
+    );
+    let session_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    store
+        .create_session(session_id)
+        .await
+        .expect("create session");
+    for kind in [
+        SessionEventKind::SessionStarted,
+        SessionEventKind::SessionConfigured {
+            cwd: directory.path().to_path_buf(),
+            provider: CodingProvider::Codex,
+            model: None,
+            effort: None,
+            fast: false,
+            response_language: ResponseLanguage::Auto,
+            permission_mode: PermissionMode::FullAccess,
+        },
+    ] {
+        store
+            .append(SessionEvent::new(session_id, 0, kind))
+            .await
+            .expect("initialize session journal");
+    }
+
+    let mut blocker = store.pool().acquire().await.expect("writer connection");
+    blocker
+        .execute("BEGIN IMMEDIATE")
+        .await
+        .expect("hold SQLite writer lock");
+
+    let (commands_tx, mut commands_rx) = mpsc::channel(1);
+    let durable_store: Arc<dyn SessionStore> = store.clone();
+    let (operations, mut completions, dispatcher) =
+        spawn_ui_interaction_dispatcher(durable_store, commands_tx.clone());
+    let text = "keep typing while persistence waits".to_string();
+    let command = HostCommand::Prompt {
+        session_id,
+        message_id,
+        text: text.clone(),
+        attachments: Vec::new(),
+        output_schema: None,
+        delivery: PromptDelivery::Queue,
+    };
+    let submission = UiPromptSubmission {
+        journal_session_id: session_id,
+        target: None,
+        message_id,
+        text: text.clone(),
+        rejected_text: text.clone(),
+        attachments: Vec::new(),
+        delivery: PromptDelivery::Queue,
+        command: Some(command),
+        kind: PromptSubmissionKind::Queue,
+        started_idle_turn: false,
+    };
+    let mut pending_prompt_ids = HashSet::new();
+
+    let started = Instant::now();
+    dispatch_ui_prompt(&operations, &mut pending_prompt_ids, submission).expect("enqueue prompt");
+    assert!(
+        started.elapsed() < Duration::from_millis(100),
+        "the input path waited on durable prompt admission"
+    );
+    assert_eq!(pending_prompt_ids, HashSet::from([message_id]));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), commands_rx.recv())
+            .await
+            .is_err(),
+        "the prompt reached the actor before its journal write completed"
+    );
+    assert!(dispatch_host_command_without_blocking(
+        &commands_tx,
+        HostCommand::Interrupt { session_id },
+    ));
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_millis(100), commands_rx.recv())
+            .await
+            .expect("urgent interrupt waited behind prompt persistence"),
+        Some(HostCommand::Interrupt {
+            session_id: interrupted,
+        }) if interrupted == session_id
+    ));
+
+    blocker
+        .execute("ROLLBACK")
+        .await
+        .expect("release writer lock");
+    let routed = tokio::time::timeout(Duration::from_secs(2), commands_rx.recv())
+        .await
+        .expect("prompt was not routed after releasing the writer lock")
+        .expect("command channel closed");
+    assert!(matches!(
+        routed,
+        HostCommand::Prompt {
+            session_id: routed_session,
+            message_id: routed_message,
+            ..
+        } if routed_session == session_id && routed_message == message_id
+    ));
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(2), completions.recv())
+            .await
+            .expect("prompt completion timed out"),
+        Some(UiInteractionCompletion::Prompt {
+            submission: UiPromptSubmission { message_id: completed, .. },
+            outcome: UiPromptOutcome::Routed,
+        }) if completed == message_id
+    ));
+    assert_eq!(
+        store
+            .state(session_id)
+            .await
+            .expect("durable projection")
+            .latest_prompt
+            .as_deref(),
+        Some(text.as_str())
+    );
+
+    drop(operations);
+    tokio::time::timeout(Duration::from_secs(1), dispatcher)
+        .await
+        .expect("dispatcher did not drain")
+        .expect("dispatcher task panicked");
 }
 
 #[test]
@@ -955,11 +1089,18 @@ async fn delivered_projection_repairs_durable_workflow_events_missing_from_live_
         .await
         .unwrap();
     let mut delivered = DeliveredSessionProjection::new(initial);
+    let final_sequence = final_event.sequence;
 
-    let repaired = delivered
-        .observe_from_store(&store, &final_event)
-        .await
-        .unwrap();
+    let repaired = load_projection_gap(
+        Arc::new(store),
+        delivered.state().latest_sequence,
+        final_event,
+    )
+    .await
+    .unwrap();
+    for event in &repaired {
+        delivered.observe(event).unwrap();
+    }
 
     assert!(repaired.iter().any(|event| matches!(
         &event.kind,
@@ -971,7 +1112,7 @@ async fn delivered_projection_repairs_durable_workflow_events_missing_from_live_
             ..
         } if *repaired_id == message_id
     )));
-    assert_eq!(delivered.state().latest_sequence, final_event.sequence);
+    assert_eq!(delivered.state().latest_sequence, final_sequence);
     assert_eq!(delivered.state().status, Some(SessionStatus::Running));
 }
 
