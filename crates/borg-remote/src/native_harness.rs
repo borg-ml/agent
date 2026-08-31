@@ -2163,6 +2163,8 @@ fn add_action_metadata(definition: &mut ModelToolDefinition) -> Result<()> {
         .or_insert_with(|| json!({}))
         .as_object_mut()
         .context("native tool properties schema is not an object")?;
+    let mut existing = std::mem::take(properties);
+    existing.remove("action");
     properties.insert(
         "action".to_string(),
         json!({
@@ -2172,6 +2174,7 @@ fn add_action_metadata(definition: &mut ModelToolDefinition) -> Result<()> {
             "description": "Optional one- or two-word summary for the live UI. When present, this must be the first argument field."
         }),
     );
+    properties.extend(existing);
     Ok(())
 }
 
