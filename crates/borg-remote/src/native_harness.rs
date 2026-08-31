@@ -1201,7 +1201,9 @@ async fn call_model_streaming(
                     chunk,
                 }) => {
                     text.push_str(&String::from_utf8_lossy(&chunk));
-                    if last_text_emit.elapsed() >= crate::agent::live_output_interval(text.len()) {
+                    if last_text_emit.elapsed() >= crate::agent::live_output_interval()
+                        || chunk.ends_with(b"\n")
+                    {
                         send(context.events, SessionEventKind::Message {
                             message_id: context.assistant_message_id,
                             actor: EventActor::Assistant,
@@ -1228,7 +1230,8 @@ async fn call_model_streaming(
                         }
                         if !pending_reasoning.is_empty()
                             && last_reasoning_emit.elapsed()
-                            >= crate::agent::live_output_interval(reasoning_accumulated.len())
+                            >= crate::agent::live_output_interval()
+                            || pending_reasoning.ends_with('\n')
                         {
                             send(
                                 context.events,
@@ -2561,18 +2564,10 @@ mod tests {
     }
 
     #[test]
-    fn live_text_updates_back_off_as_the_response_grows() {
+    fn live_text_updates_use_a_smooth_cadence() {
         assert_eq!(
-            crate::agent::live_output_interval(1_000),
+            crate::agent::live_output_interval(),
             Duration::from_millis(40)
-        );
-        assert_eq!(
-            crate::agent::live_output_interval(100_000),
-            Duration::from_millis(160)
-        );
-        assert_eq!(
-            crate::agent::live_output_interval(1_000_000),
-            Duration::from_millis(300)
         );
     }
 

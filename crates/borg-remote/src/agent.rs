@@ -1638,7 +1638,7 @@ async fn run_borg_provider_turn(
                 let Some(visible_text) = without_action_intent_marker(&text) else {
                     continue;
                 };
-                if last_text_emit.elapsed() >= live_output_interval(text.len()) {
+                if last_text_emit.elapsed() >= live_output_interval() || delta.ends_with('\n') {
                     send(
                         &events,
                         SessionEventKind::Message {
@@ -1679,7 +1679,9 @@ async fn run_borg_provider_turn(
                     );
                 }
                 pending_reasoning.push_str(&delta);
-                if last_reasoning_emit.elapsed() >= live_output_interval(reasoning_text.len()) {
+                if last_reasoning_emit.elapsed() >= live_output_interval()
+                    || pending_reasoning.ends_with('\n')
+                {
                     flush_pending_reasoning(&events, &mut pending_reasoning).await;
                     last_reasoning_emit = Instant::now();
                 }
@@ -2040,13 +2042,8 @@ async fn run_borg_provider_turn(
     })
 }
 
-pub(crate) fn live_output_interval(bytes: usize) -> Duration {
-    match bytes {
-        0..=16_384 => Duration::from_millis(40),
-        16_385..=65_536 => Duration::from_millis(80),
-        65_537..=262_144 => Duration::from_millis(160),
-        _ => Duration::from_millis(300),
-    }
+pub(crate) fn live_output_interval() -> Duration {
+    Duration::from_millis(40)
 }
 
 async fn flush_pending_reasoning(events: &mpsc::Sender<SessionEventKind>, pending: &mut String) {
