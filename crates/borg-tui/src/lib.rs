@@ -11511,6 +11511,7 @@ fn terminal_content_width(terminal_width: u16) -> u16 {
         .max(1)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cached_transcript_render(
     transcript: &Transcript,
     cache: &mut Option<CachedTranscriptRender>,

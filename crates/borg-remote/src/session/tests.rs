@@ -8370,8 +8370,10 @@ fn subscription_input_budget_counts_characters_not_utf8_bytes() {
 
 #[test]
 fn legacy_provider_checkpoint_contract_is_never_resumed() {
-    let mut state = SessionState::default();
-    state.provider_session_id = Some("stale-thread".to_string());
+    let mut state = SessionState {
+        provider_session_id: Some("stale-thread".to_string()),
+        ..SessionState::default()
+    };
     assert!(!provider_checkpoint_contract_is_current(&state));
 
     state.provider_context_contract_version = Some(crate::agent::PROVIDER_CONTEXT_CONTRACT_VERSION);
