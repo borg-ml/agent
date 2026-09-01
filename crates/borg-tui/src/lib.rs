@@ -5213,17 +5213,15 @@ impl BorgTerminal {
         let terminal_size = self.terminal.size()?;
         let content_width = terminal_content_width(terminal_size.width);
         let tool_run_viewport_height = tool_run_viewport_height(terminal_size.height as usize);
-        let full_transcript_width = content_width.max(1) as usize;
+        let full_transcript_width = transcript_width_for_viewport(content_width, 0, 0);
         let goal_tick = self.transcript.active_goal_cache_tick();
         let tool_elapsed_tick = self.transcript.tool_elapsed_cache_tick();
         let current_tool_elapsed = self.transcript.running_tool_elapsed_labels();
         let local_date = Local::now().date_naive();
         let transcript_snapshot_current = self.transcript_render_cache.is_some();
-        // Keep a separate full-width measurement so an overflowing transcript
-        // can switch to the scrollbar-safe width without rendering both widths
-        // again on every frame. Input redraws reuse the last complete viewport
-        // snapshot so typing cannot alternate between full-width and
-        // scrollbar-safe wrapping.
+        // Input redraws reuse the last complete viewport snapshot. Transcript
+        // content always uses the stable scrollbar-safe width, so tool growth
+        // cannot trigger a second whole-history layout at a narrower width.
         let committed_viewport_render = if input_fast_path && transcript_snapshot_current {
             self.last_committed_viewport_render
                 .as_ref()
@@ -11498,16 +11496,18 @@ fn reuse_current_transcript_width(input_fast_path: bool, snapshot_current: bool)
 
 fn transcript_width_for_viewport(
     content_width: u16,
-    transcript_height: usize,
-    viewport_height: usize,
+    _transcript_height: usize,
+    _viewport_height: usize,
 ) -> usize {
-    let full_width = content_width.max(1) as usize;
-    if content_width > 4 && transcript_height > viewport_height {
+    // Reserve the scrollbar lane from the first transcript frame. Tool and
+    // streaming activity can otherwise cross the overflow threshold and
+    // rewrap every existing row by three columns in the middle of a turn.
+    if content_width > 4 {
         content_width
             .saturating_sub(TRANSCRIPT_SCROLLBAR_GUTTER_WIDTH)
             .max(1) as usize
     } else {
-        full_width
+        content_width.max(1) as usize
     }
 }
 

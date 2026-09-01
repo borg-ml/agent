@@ -6053,8 +6053,8 @@ fn launch_resume_picker_height_is_stable_and_reserved_once() {
 }
 
 #[test]
-fn transcript_width_reserves_scrollbar_gutter_only_when_overflowing() {
-    assert_eq!(transcript_width_for_viewport(100, 24, 24), 100);
+fn transcript_width_is_stable_when_activity_crosses_scrollbar_threshold() {
+    assert_eq!(transcript_width_for_viewport(100, 24, 24), 97);
     assert_eq!(transcript_width_for_viewport(100, 25, 24), 97);
     assert_eq!(transcript_width_for_viewport(4, 25, 24), 4);
 }
