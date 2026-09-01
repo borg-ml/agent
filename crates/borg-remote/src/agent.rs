@@ -59,97 +59,7 @@ remain the sole voice that answers the user. When a tool schema offers an `actio
 use a one- or two-word lowercase summary such as `edit`, `delete files`, or `run tests`. Do not emit a \
 separate action-summary narration item.";
 
-const ACTION_SUMMARIES: &[&str] = &[
-    "inspect", "edit", "run", "test", "search", "plan", "wait", "diagnose",
-];
-
 const MAX_RESIDENT_CODEX_SUBSCRIPTION_POOLS: usize = 4;
-
-fn action_intent_label(text: &str) -> Option<&str> {
-    let trimmed = text.trim();
-    if ACTION_SUMMARIES.contains(&trimmed) {
-        return Some(trimmed);
-    }
-
-    const PREFIX: &str = "[[BORG_ACTION:";
-    let mut remaining = trimmed;
-    let mut last_label = None;
-    while !remaining.is_empty() {
-        remaining = remaining.strip_prefix(PREFIX)?;
-        let end = remaining.find("]]")?;
-        let label = remaining[..end].trim();
-        if label.is_empty()
-            || label.len() > 64
-            || !label.chars().all(|character| {
-                character.is_ascii_alphanumeric() || matches!(character, ' ' | '-' | '/')
-            })
-        {
-            return None;
-        }
-        last_label = Some(label);
-        remaining = remaining[end + 2..].trim();
-    }
-    last_label
-}
-
-fn action_intent_is_streaming(text: &str) -> bool {
-    const PREFIX: &str = "[[BORG_ACTION:";
-    let mut remaining = text.trim();
-    if !remaining.is_empty()
-        && ACTION_SUMMARIES
-            .iter()
-            .any(|summary| summary.starts_with(remaining))
-    {
-        return true;
-    }
-    loop {
-        if PREFIX.starts_with(remaining) {
-            return !remaining.is_empty();
-        }
-        let Some(label_and_rest) = remaining.strip_prefix(PREFIX) else {
-            return false;
-        };
-        let Some(end) = label_and_rest.find("]]") else {
-            return label_and_rest.len() <= 64
-                && label_and_rest.chars().all(|character| {
-                    character.is_ascii_alphanumeric() || matches!(character, ' ' | '-' | '/')
-                });
-        };
-        let label = label_and_rest[..end].trim();
-        if label.is_empty()
-            || label.len() > 64
-            || !label.chars().all(|character| {
-                character.is_ascii_alphanumeric() || matches!(character, ' ' | '-' | '/')
-            })
-        {
-            return false;
-        }
-        remaining = label_and_rest[end + 2..].trim();
-        if remaining.is_empty() {
-            return true;
-        }
-    }
-}
-
-fn without_action_intent_marker(text: &str) -> Option<&str> {
-    let trimmed = text.trim_start();
-    if trimmed.is_empty() {
-        return Some(text);
-    }
-    if ACTION_SUMMARIES
-        .iter()
-        .any(|summary| summary.starts_with(trimmed.trim_end()))
-    {
-        return None;
-    }
-    if "[[BORG_ACTION".starts_with(trimmed) || trimmed.starts_with("[[BORG_ACTION") {
-        return trimmed
-            .split_once('\n')
-            .map(|(_, remainder)| remainder.trim_start())
-            .filter(|remainder| !remainder.is_empty());
-    }
-    Some(text)
-}
 
 fn provider_native_agent_tool(name: &str) -> bool {
     matches!(name, "subAgentActivity" | "collabAgentToolCall")
@@ -1622,16 +1532,13 @@ async fn run_borg_provider_turn(
                     );
                 }
                 text.push_str(&delta);
-                let Some(visible_text) = without_action_intent_marker(&text) else {
-                    continue;
-                };
                 if last_text_emit.elapsed() >= live_output_interval() || delta.ends_with('\n') {
                     send(
                         &events,
                         SessionEventKind::Message {
                             message_id: assistant_message_id,
                             actor: EventActor::Assistant,
-                            text: visible_text.to_string(),
+                            text: text.clone(),
                             attachments: Vec::new(),
                             status: MessageStatus::InProgress,
                             delivery: None,
@@ -1694,24 +1601,6 @@ async fn run_borg_provider_turn(
                         message_id = %ttft_message_id,
                         "Borg provider stage"
                     );
-                }
-                if let Some(label) = action_intent_label(&narration_text) {
-                    text.clear();
-                    assistant_message_id = Uuid::new_v4();
-                    send(
-                        &events,
-                        SessionEventKind::ProviderEvent {
-                            provider: turn.provider,
-                            kind: "action/preparing".to_string(),
-                            payload: serde_json::json!({"label": label}),
-                        },
-                    )
-                    .await;
-                    continue;
-                }
-                if without_action_intent_marker(&narration_text).is_none() {
-                    text.clear();
-                    continue;
                 }
                 text = narration_text;
                 send(
@@ -2155,12 +2044,7 @@ fn terminal_assistant_text(
     } else {
         final_output
     };
-    let Some(text) = without_action_intent_marker(text) else {
-        return Ok(None);
-    };
-    if !text.trim().is_empty() && action_intent_is_streaming(text) {
-        Ok(None)
-    } else if text.trim().is_empty() {
+    if text.trim().is_empty() {
         anyhow::ensure!(
             completed_segment || interrupted,
             "provider completed without a visible response (empty result)"
@@ -2374,48 +2258,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_action_summaries_are_exact_and_legacy_markers_remain_replayable() {
-        assert_eq!(action_intent_label("edit"), Some("edit"));
-        assert_eq!(action_intent_label("plan"), Some("plan"));
-        assert_eq!(action_intent_label("done"), None);
-        assert!(action_intent_is_streaming("edi"));
-        assert!(action_intent_is_streaming("edit"));
-        assert!(!action_intent_is_streaming("editing files"));
-        assert_eq!(without_action_intent_marker("edit"), None);
-        assert_eq!(
-            without_action_intent_marker("editing files"),
-            Some("editing files")
-        );
-
-        assert_eq!(
-            action_intent_label("[[BORG_ACTION:plan update]]"),
-            Some("plan update")
-        );
-        assert_eq!(
-            action_intent_label("[[BORG_ACTION:inspect provider retry handling]]"),
-            Some("inspect provider retry handling")
-        );
-        assert_eq!(action_intent_label("before [[BORG_ACTION:edit]]"), None);
-        assert_eq!(action_intent_label("[[BORG_ACTION:edit!]]"), None);
-        assert_eq!(
-            action_intent_label("[[BORG_ACTION:command]][[BORG_ACTION:file read]]"),
-            Some("file read")
-        );
-        assert!(action_intent_is_streaming("[["));
-        assert!(action_intent_is_streaming("[[BORG_ACTION:edit"));
-        assert!(action_intent_is_streaming("[[BORG_ACTION:edit]]"));
-        assert!(action_intent_is_streaming(
-            "[[BORG_ACTION:command]][[BORG_ACTION:file read]]"
-        ));
-        assert!(action_intent_is_streaming(
-            "[[BORG_ACTION:command]][[BORG_ACTION:file"
-        ));
-        assert!(!action_intent_is_streaming("ordinary narration"));
-        assert_eq!(without_action_intent_marker("[[BORG_ACTION[["), None);
-        assert_eq!(
-            without_action_intent_marker("[[BORG_ACTION:command]]\nvisible result"),
-            Some("visible result")
-        );
+    fn provider_native_delegation_tools_are_rejected() {
         assert!(provider_native_agent_tool("subAgentActivity"));
         assert!(provider_native_agent_tool("collabAgentToolCall"));
         assert!(!provider_native_agent_tool("mcp__borg_agent__spawn_agent"));
@@ -2995,22 +2838,5 @@ mod tests {
             "provider completed without a visible response (empty result)"
         );
         assert_eq!(terminal_assistant_text("", "", false, true).unwrap(), None);
-        assert_eq!(
-            terminal_assistant_text("[[BORG_ACTION:command]]", "", false, true).unwrap(),
-            None
-        );
-        assert_eq!(
-            terminal_assistant_text("[[BORG_ACTION:command", "", false, true).unwrap(),
-            None
-        );
-        assert_eq!(
-            terminal_assistant_text("[[BORG_ACTION[[", "", false, true).unwrap(),
-            None
-        );
-        assert_eq!(
-            terminal_assistant_text("[[BORG_ACTION:command]]\nvisible result", "", false, false)
-                .unwrap(),
-            Some("visible result".to_string())
-        );
     }
 }
