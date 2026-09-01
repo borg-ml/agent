@@ -10,6 +10,16 @@ members = [
     "crates/borg-gui",
     "crates/borg-cli",
 ]
+default-members = [
+    "crates/borg-core",
+    "crates/borg-dictation",
+    "crates/borg-provider",
+    "crates/borg-remote",
+    "crates/borg-search",
+    "crates/borg-ui",
+    "crates/borg-tui",
+    "crates/borg-cli",
+]
 resolver = "2"
 
 [workspace.package]

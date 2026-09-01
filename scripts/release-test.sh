@@ -61,8 +61,9 @@ if [[ -f "$repo_root/.github/workflows/release.yml" ]]; then
     fail "release archive does not package the Blu manifest example"
   grep -Fq 'include/borg_extension.h' "$release_workflow" ||
     fail "release archive does not package the native extension header"
-  grep -Fq 'release/borg-gui' "$release_workflow" ||
-    fail "release archive does not package the native GUI"
+  if grep -Fq 'release/borg-gui' "$release_workflow"; then
+    fail "release archive packages the experimental native GUI"
+  fi
   if grep -Eq 'providers/claude-sdk|BORG_CLAUDE_NATIVE|borg-claude-sdk' "$release_workflow"; then
     fail "release workflow still contains the removed Claude fallback"
   fi
@@ -105,8 +106,9 @@ if [[ -f "$repo_root/.github/workflows/platform-ci.yml" ]]; then
     fail "platform archive does not package the Blu manifest example"
   grep -Fq 'include/borg_extension.h' "$platform_workflow" ||
     fail "platform archive does not package the native extension header"
-  grep -Fq 'release/borg-gui' "$platform_workflow" ||
-    fail "platform archive does not package the native GUI"
+  if grep -Fq 'release/borg-gui' "$platform_workflow"; then
+    fail "platform archive packages the experimental native GUI"
+  fi
   if grep -Eq 'providers/claude-sdk|BORG_CLAUDE_NATIVE|borg-claude-sdk' "$platform_workflow"; then
     fail "platform workflow still contains the removed Claude fallback"
   fi
@@ -315,11 +317,11 @@ assert_equal "$(git -C "$success_fixture" rev-parse HEAD)" \
   "$(git --git-dir="$test_root/success-origin.git" rev-parse \
     'refs/tags/v1.2.4^{commit}')" \
   "remote release tag"
-grep -Fxq 'check --workspace --all-targets' "$test_root/success-fake-cargo.log" ||
+grep -Fxq 'check --workspace --exclude borg-gui --all-targets' "$test_root/success-fake-cargo.log" ||
   fail "release did not run the workspace check"
 grep -Fxq 'fmt --all -- --check' "$test_root/success-fake-cargo.log" ||
   fail "release did not run the formatting check"
-grep -Fxq 'test --workspace --locked -- --test-threads=1' "$test_root/success-fake-cargo.log" ||
+grep -Fxq 'test --workspace --exclude borg-gui --locked -- --test-threads=1' "$test_root/success-fake-cargo.log" ||
   fail "release did not run workspace tests"
 
 run_release "$success_fixture" v2.0.0

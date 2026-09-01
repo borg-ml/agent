@@ -139,14 +139,12 @@ async fn update(check_only: bool, quiet: bool) -> Result<UpdateOutcome> {
     verify_checksum(&asset_name, &archive, &checksum_bytes)?;
     let temporary = tempfile::tempdir().context("failed to create update staging directory")?;
     let candidate = temporary.path().join(executable_name());
-    let gui_candidate = temporary.path().join(gui_executable_name());
     let provider_candidate = temporary.path().join("providers/claude");
     extract_executable(&archive, &candidate)?;
-    extract_gui_executable(&archive, &gui_candidate)?;
     extract_native_provider(&archive, &provider_candidate)?;
     validate_candidate(&candidate, &latest)?;
     validate_native_provider(&provider_candidate)?;
-    install_candidate(&candidate, &gui_candidate, &provider_candidate, &latest)?;
+    install_candidate(&candidate, &provider_candidate, &latest)?;
     clear_background_failure();
     Ok(UpdateOutcome::Installed(latest))
 }
@@ -222,11 +220,6 @@ fn extract_executable(archive: &[u8], destination: &Path) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn extract_gui_executable(archive: &[u8], destination: &Path) -> Result<()> {
-    extract_unix_executable(archive, destination, "borg-gui")
-}
-
-#[cfg(unix)]
 fn extract_unix_executable(archive: &[u8], destination: &Path, name: &str) -> Result<()> {
     use flate2::read::GzDecoder;
     let mut tar = tar::Archive::new(GzDecoder::new(Cursor::new(archive)));
@@ -291,11 +284,6 @@ fn extract_native_provider(archive: &[u8], destination: &Path) -> Result<()> {
 #[cfg(windows)]
 fn extract_executable(archive: &[u8], destination: &Path) -> Result<()> {
     extract_windows_executable(archive, destination, "borg.exe")
-}
-
-#[cfg(windows)]
-fn extract_gui_executable(archive: &[u8], destination: &Path) -> Result<()> {
-    extract_windows_executable(archive, destination, "borg-gui.exe")
 }
 
 #[cfg(windows)]
@@ -372,28 +360,14 @@ fn validate_native_provider(provider: &Path) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn install_candidate(
-    candidate: &Path,
-    gui_candidate: &Path,
-    provider: &Path,
-    _version: &Version,
-) -> Result<()> {
+fn install_candidate(candidate: &Path, provider: &Path, _version: &Version) -> Result<()> {
     let executable = std::env::current_exe().context("failed to locate installed Borg")?;
-    let gui_executable = executable
-        .parent()
-        .context("installed Borg has no parent")?
-        .join(gui_executable_name());
     let target = native_provider_target(&executable)?;
     let swap = stage_native_provider(provider, &target)?;
     if let Err(error) = install_candidate_at(candidate, &executable) {
         swap.rollback()
             .context("failed to roll back native provider after binary update failure")?;
         return Err(error);
-    }
-    if let Err(error) = install_candidate_at(gui_candidate, &gui_executable) {
-        swap.rollback()
-            .context("failed to roll back native provider after GUI update failure")?;
-        return Err(error).context("failed to install the native GUI beside Borg");
     }
     swap.commit()
 }
@@ -518,12 +492,7 @@ fn stage_native_provider(provider: &Path, target: &Path) -> Result<NativeProvide
 }
 
 #[cfg(windows)]
-fn install_candidate(
-    candidate: &Path,
-    gui_candidate: &Path,
-    provider: &Path,
-    version: &Version,
-) -> Result<()> {
+fn install_candidate(candidate: &Path, provider: &Path, version: &Version) -> Result<()> {
     use std::os::windows::process::CommandExt;
     let executable = std::env::current_exe().context("failed to locate installed Borg")?;
     let parent = executable
@@ -531,20 +500,15 @@ fn install_candidate(
         .context("installed Borg has no parent")?;
     let id = std::process::id();
     let staged = parent.join(format!(".borg-update-{id}.exe"));
-    let staged_gui = parent.join(format!(".borg-gui-update-{id}.exe"));
-    let gui_executable = parent.join(gui_executable_name());
     let helper = parent.join(format!(".borg-update-{id}.ps1"));
     fs::copy(candidate, &staged).context("failed to stage update beside installed Borg")?;
-    fs::copy(gui_candidate, &staged_gui).context("failed to stage GUI update beside Borg")?;
     install_native_provider_at(provider, &executable)?;
-    let script = r#"param([int]$ParentId,[string]$Source,[string]$Destination,[string]$GuiSource,[string]$GuiDestination,[string]$Helper)
+    let script = r#"param([int]$ParentId,[string]$Source,[string]$Destination,[string]$Helper)
 Wait-Process -Id $ParentId -ErrorAction SilentlyContinue
 for ($i = 0; $i -lt 120; $i++) {
   try { Move-Item -Force $Source $Destination; break } catch { Start-Sleep -Milliseconds 500 }
 }
-Move-Item -Force $GuiSource $GuiDestination
 Remove-Item -Force -ErrorAction SilentlyContinue $Source
-Remove-Item -Force -ErrorAction SilentlyContinue $GuiSource
 Remove-Item -Force -ErrorAction SilentlyContinue $Helper
 "#;
     fs::write(&helper, script).context("failed to write Windows update helper")?;
@@ -561,10 +525,6 @@ Remove-Item -Force -ErrorAction SilentlyContinue $Helper
         .arg(&staged)
         .arg("-Destination")
         .arg(&executable)
-        .arg("-GuiSource")
-        .arg(&staged_gui)
-        .arg("-GuiDestination")
-        .arg(&gui_executable)
         .arg("-Helper")
         .arg(&helper)
         .creation_flags(0x0800_0000)
@@ -600,14 +560,6 @@ fn platform_asset() -> Result<String> {
 
 fn executable_name() -> &'static str {
     if cfg!(windows) { "borg.exe" } else { "borg" }
-}
-
-fn gui_executable_name() -> &'static str {
-    if cfg!(windows) {
-        "borg-gui.exe"
-    } else {
-        "borg-gui"
-    }
 }
 
 fn native_provider_executable_name() -> &'static str {
@@ -831,14 +783,11 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn unix_release_archive_extracts_both_frontend_binaries() {
+    fn unix_release_archive_extracts_the_cli_binary() {
         use flate2::Compression;
         use flate2::write::GzEncoder;
         let mut archive = tar::Builder::new(GzEncoder::new(Vec::new(), Compression::fast()));
-        for (name, bytes) in [
-            ("borg", b"borg-binary".as_slice()),
-            ("borg-gui", b"borg-gui-binary".as_slice()),
-        ] {
+        for (name, bytes) in [("borg", b"borg-binary".as_slice())] {
             let mut header = tar::Header::new_gnu();
             header.set_size(bytes.len() as u64);
             header.set_mode(0o755);
@@ -850,11 +799,8 @@ mod tests {
         let compressed = archive.into_inner().unwrap().finish().unwrap();
         let directory = tempfile::tempdir().unwrap();
         let destination = directory.path().join("borg");
-        let gui_destination = directory.path().join("borg-gui");
         extract_executable(&compressed, &destination).unwrap();
-        extract_gui_executable(&compressed, &gui_destination).unwrap();
         assert_eq!(fs::read(destination).unwrap(), b"borg-binary");
-        assert_eq!(fs::read(gui_destination).unwrap(), b"borg-gui-binary");
     }
 
     #[cfg(unix)]

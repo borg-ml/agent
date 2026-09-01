@@ -30,8 +30,6 @@ jobs:
         with:
           toolchain: "1.98.0"
           components: rustfmt, clippy
-      - name: Install Linux GUI link dependencies
-        run: sudo apt-get update && sudo apt-get install -y libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev
       - name: Install quality tools
         run: cargo install --locked just cargo-deny cargo-audit
       - name: Run workspace verification
@@ -75,11 +73,8 @@ jobs:
         with:
           toolchain: "1.98.0"
           targets: ${{ matrix.target }}
-      - name: Install Linux GUI link dependencies
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev
       - name: Build Borg Agent
-        run: cargo build --locked --release --target ${{ matrix.target }} -p borg -p borg-gui
+        run: cargo build --locked --release --target ${{ matrix.target }} -p borg
       - name: Run native Borg Agent core-flow tests
         run: cargo test --locked --target ${{ matrix.target }} -p borg --no-fail-fast
       - name: Smoke-test the native Borg Agent binary
@@ -103,7 +98,6 @@ jobs:
           package_dir="borg-${{ matrix.target }}"
           mkdir "$package_dir"
           cp "target/${{ matrix.target }}/release/borg" "$package_dir/"
-          cp "target/${{ matrix.target }}/release/borg-gui" "$package_dir/"
           native_package=""
           for candidate in packages/claude-native-runtime/node_modules/@anthropic-ai/claude-agent-sdk-*; do
             if [[ -x "$candidate/claude" ]]; then
@@ -138,7 +132,6 @@ jobs:
           $packageDir = "borg-${{ matrix.target }}"
           New-Item -ItemType Directory -Path $packageDir
           Copy-Item "target/${{ matrix.target }}/release/borg.exe" $packageDir
-          Copy-Item "target/${{ matrix.target }}/release/borg-gui.exe" $packageDir
           $platformPackage = Get-ChildItem "packages/claude-native-runtime/node_modules/@anthropic-ai" -Directory |
             Where-Object { $_.Name -like "claude-agent-sdk-*" -and (Test-Path (Join-Path $_.FullName "claude.exe")) } |
             Select-Object -First 1

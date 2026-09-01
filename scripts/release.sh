@@ -194,7 +194,7 @@ run_release_checks() (
   test_tmp="$(mktemp -d "${TMPDIR:-/tmp}/b.XXXXXX")"
   trap 'rm -rf -- "$test_tmp"' EXIT
   cargo fmt --all -- --check
-  TMPDIR="$test_tmp" cargo test --workspace --locked -- --test-threads=1
+  TMPDIR="$test_tmp" cargo test --workspace --exclude borg-gui --locked -- --test-threads=1
   git diff --check -- Cargo.toml Cargo.lock
 )
 
@@ -381,7 +381,7 @@ trap cleanup EXIT
 replace_workspace_version "$current_version" "$target_version"
 
 # Refresh workspace package versions in Cargo.lock before enforcing --locked.
-cargo check --workspace --all-targets
+cargo check --workspace --exclude borg-gui --all-targets
 
 mapfile -t changed_files < <(git diff --name-only -- Cargo.toml Cargo.lock)
 [[ " ${changed_files[*]} " == *" Cargo.toml "* ]] ||

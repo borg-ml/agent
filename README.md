@@ -2,7 +2,8 @@
 
 Borg Agent is a Rust-based agent harness and orchestrator. It provides a
 terminal and native GPUI frontends, durable sessions, native tools, provider
-adapters, and optional remote hosts. Releases include `borg` and `borg-gui`.
+adapters, and optional remote hosts. Releases include the `borg` CLI; the
+experimental `borg-gui` frontend is developed and built separately.
 
 [Repository](https://github.com/borg-ml/agent) ·
 [Blu language](https://github.com/borg-ml/blu) ·
@@ -133,15 +134,18 @@ contract. Blu workflow files may use `.blu`, `.lua`, or `.luau` entrypoints.
 - `borg-ui` — frontend-neutral commands, projections, preferences, and local
   session bridge
 - `borg-tui` — Ratatui terminal frontend
-- `borg-gui` — GPUI native frontend
+- `borg-gui` — experimental GPUI native frontend (opt-in)
 - `borg-cli` — public command shell and frontend launchers
 
 ## Development
 
 ```sh
 cargo fmt --all -- --check
-cargo check --workspace
-cargo test --workspace
+cargo check --workspace --exclude borg-gui
+cargo test --workspace --exclude borg-gui
+
+# Opt in to the experimental native GUI.
+cargo run -p borg-gui
 ```
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md) before submitting a change.

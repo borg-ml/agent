@@ -51,17 +51,21 @@ tui-stress:
 # Run the repository quality gates used by local development and CI.
 verify:
     cargo fmt --all -- --check
-    cargo check --workspace --locked
-    cargo test --workspace --locked --no-fail-fast -- --test-threads=1
-    cargo clippy --workspace --all-targets --locked -- -D warnings
+    cargo check --workspace --exclude borg-gui --locked
+    cargo test --workspace --exclude borg-gui --locked --no-fail-fast -- --test-threads=1
+    cargo clippy --workspace --exclude borg-gui --all-targets --locked -- -D warnings
     cargo deny check advisories bans licenses sources
     # Keep the RSA dependency check explicit so a future database feature
     # cannot reintroduce the Marvin-attack edge into the active graph.
-    if cargo tree --workspace --target all -e features -i rsa 2>/dev/null | grep -q 'rsa'; then echo 'active rsa dependency detected' >&2; exit 1; fi
+    if cargo tree --workspace --exclude borg-gui --target all -e features -i rsa 2>/dev/null | grep -q 'rsa'; then echo 'active rsa dependency detected' >&2; exit 1; fi
     # Unmaintained transitive dependencies with no safe upgrade are documented
     # in deny.toml; keep cargo-audit aligned with that reviewed exception list.
     cargo audit --ignore RUSTSEC-2024-0320 --ignore RUSTSEC-2025-0141 --ignore RUSTSEC-2025-0052 --ignore RUSTSEC-2024-0384 --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2026-0173 --ignore RUSTSEC-2025-0134 --ignore RUSTSEC-2026-0206 --ignore RUSTSEC-2026-0192
     git diff --check
+
+# Check the experimental native GUI explicitly; it is excluded from normal verification and releases.
+gui-check:
+    cargo check -p borg-gui --locked
 
 # Bump, verify, commit, tag, and publish a release. Defaults to the next patch.
 release version="":
