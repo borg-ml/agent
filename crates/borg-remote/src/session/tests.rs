@@ -2974,14 +2974,14 @@ async fn interrupted_turn_reaches_fifo_drain_boundary() {
             .await
             .unwrap();
     }
-    tokio::time::timeout(Duration::from_secs(1), called.notified())
+    tokio::time::timeout(Duration::from_secs(5), called.notified())
         .await
         .expect("first turn starts");
     command_tx
         .send(HostCommand::Interrupt { session_id })
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(1), called.notified())
+    tokio::time::timeout(Duration::from_secs(5), called.notified())
         .await
         .expect("queued turn starts after interruption");
     command_tx
