@@ -787,15 +787,14 @@ mod tests {
         use flate2::Compression;
         use flate2::write::GzEncoder;
         let mut archive = tar::Builder::new(GzEncoder::new(Vec::new(), Compression::fast()));
-        for (name, bytes) in [("borg", b"borg-binary".as_slice())] {
-            let mut header = tar::Header::new_gnu();
-            header.set_size(bytes.len() as u64);
-            header.set_mode(0o755);
-            header.set_cksum();
-            archive
-                .append_data(&mut header, name, Cursor::new(bytes))
-                .unwrap();
-        }
+        let bytes = b"borg-binary".as_slice();
+        let mut header = tar::Header::new_gnu();
+        header.set_size(bytes.len() as u64);
+        header.set_mode(0o755);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, "borg", Cursor::new(bytes))
+            .unwrap();
         let compressed = archive.into_inner().unwrap().finish().unwrap();
         let directory = tempfile::tempdir().unwrap();
         let destination = directory.path().join("borg");
