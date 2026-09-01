@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tempfile::tempdir;
@@ -3663,6 +3664,75 @@ async fn large_session_history_query_p95_gate() {
     assert!(
         regex_p95 < Duration::from_millis(10),
         "history regex query p95 exceeded 10 ms: {regex_p95:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "explicit first-search projection catch-up performance gate"]
+async fn first_history_search_after_sustained_appends_profile() {
+    const EVENT_COUNT: u64 = 2_000;
+    const NEEDLE: &str = "first-search-catchup-needle";
+
+    let (_directory, store) = store().await;
+    let session_id = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+    let append_started = Instant::now();
+    for sequence in 1..=EVENT_COUNT {
+        store
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::Error {
+                    message: if sequence == EVENT_COUNT {
+                        NEEDLE.to_string()
+                    } else {
+                        format!("ordinary first-search fixture {sequence}")
+                    },
+                },
+            ))
+            .await
+            .unwrap();
+    }
+    let append_elapsed = append_started.elapsed();
+    let other_session = Uuid::new_v4();
+    store.create_session(other_session).await.unwrap();
+    let store = Arc::new(store);
+    let search_store = Arc::clone(&store);
+    let search = tokio::spawn(async move {
+        let search_started = Instant::now();
+        let page = search_store
+            .query_history(
+                session_id,
+                SessionHistoryQuery {
+                    text: Some(NEEDLE.to_string()),
+                    ..SessionHistoryQuery::default()
+                },
+            )
+            .await
+            .unwrap();
+        (page, search_started.elapsed())
+    });
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let concurrent_append_started = Instant::now();
+    store
+        .append(SessionEvent::new(
+            other_session,
+            0,
+            SessionEventKind::Error {
+                message: "concurrent append".to_string(),
+            },
+        ))
+        .await
+        .unwrap();
+    let concurrent_append_elapsed = concurrent_append_started.elapsed();
+    let (page, first_search_elapsed) = search.await.unwrap();
+    assert_eq!(page.hits.len(), 1);
+    assert!(
+        concurrent_append_elapsed < Duration::from_millis(25),
+        "history projection catch-up blocked another session append for {concurrent_append_elapsed:?}"
+    );
+    eprintln!(
+        "2k durable appends: {append_elapsed:?}; first FTS search: {first_search_elapsed:?}; concurrent append: {concurrent_append_elapsed:?}"
     );
 }
 

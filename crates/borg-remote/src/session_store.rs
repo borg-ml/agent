@@ -1339,37 +1339,49 @@ impl SqliteSessionStore {
         {
             return Ok(());
         }
-        let mut transaction = self.begin_write().await?;
-        sqlx::query(
-            "delete from session_event_search where session_id = ? and not exists ( \
-                 select 1 from session_events e \
-                 where e.session_id=session_event_search.session_id \
-                   and e.event_id=session_event_search.event_id \
-             )",
-        )
-        .bind(session_id.to_string())
-        .execute(&mut *transaction)
-        .await?;
-        sqlx::query(
-            "insert into session_event_search \
-             (session_id, sequence, event_id, event_kind, actor, body) \
-             select e.session_id, e.sequence, e.event_id, e.event_kind, \
-                    json_extract(e.event_json, '$.kind.actor'), \
-                    e.event_json || coalesce(( \
-                        select char(10) || group_concat(cast(p.payload as text), char(10)) \
-                        from session_payloads p \
-                        where p.session_id=e.session_id and p.event_id=e.event_id \
-                    ), '') \
-             from session_events e \
-             where e.session_id=? and not exists ( \
-                 select 1 from session_event_search s \
-                 where s.session_id=e.session_id and s.event_id=e.event_id \
-             )",
-        )
-        .bind(session_id.to_string())
-        .execute(&mut *transaction)
-        .await?;
-        transaction.commit().await?;
+        if u64::try_from(projected_count).unwrap_or_default() > expected_event_count {
+            let mut transaction = self.begin_write().await?;
+            sqlx::query(
+                "delete from session_event_search where session_id = ? and not exists ( \
+                     select 1 from session_events e \
+                     where e.session_id=session_event_search.session_id \
+                       and e.event_id=session_event_search.event_id \
+                 )",
+            )
+            .bind(session_id.to_string())
+            .execute(&mut *transaction)
+            .await?;
+            transaction.commit().await?;
+        }
+        loop {
+            let mut transaction = self.begin_write().await?;
+            let inserted = sqlx::query(
+                "insert or ignore into session_event_search \
+                 (session_id, sequence, event_id, event_kind, actor, body) \
+                 select e.session_id, e.sequence, e.event_id, e.event_kind, \
+                        json_extract(e.event_json, '$.kind.actor'), \
+                        e.event_json || coalesce(( \
+                            select char(10) || group_concat(cast(p.payload as text), char(10)) \
+                            from session_payloads p \
+                            where p.session_id=e.session_id and p.event_id=e.event_id \
+                        ), '') \
+                 from session_events e \
+                 where e.session_id=? and not exists ( \
+                     select 1 from session_event_search s \
+                     where s.session_id=e.session_id and s.event_id=e.event_id \
+                 ) \
+                 order by e.sequence limit 256",
+            )
+            .bind(session_id.to_string())
+            .execute(&mut *transaction)
+            .await?
+            .rows_affected();
+            transaction.commit().await?;
+            if inserted == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
         Ok(())
     }
 
