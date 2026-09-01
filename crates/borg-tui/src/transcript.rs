@@ -929,7 +929,7 @@ impl Transcript {
         let starts_prepared_action = matches!(event.kind, SessionEventKind::ToolStarted { .. })
             && self.preparing_tool.is_some();
         if provider_advanced && !starts_prepared_action {
-            self.mark_running_tools_backgrounded();
+            self.background_foreground_process();
         }
         let completed_turn = match &event.kind {
             SessionEventKind::TurnCompleted { message_id, .. }
@@ -2205,7 +2205,7 @@ impl Transcript {
             .clone()
             .unwrap_or_else(|| format!("action-preparing:{}", event.id));
         if existing.is_none() {
-            self.mark_running_tools_backgrounded();
+            self.background_foreground_process();
             self.preparing_tool = Some(tool_call_id.clone());
         }
         if provider_tool_id.is_some() {
@@ -2245,11 +2245,13 @@ impl Transcript {
         if let Some(TranscriptEntry::Tool {
             complete,
             completed_at: stored_completed_at,
+            backgrounded,
             ..
         }) = self.order.get_mut(index)
         {
             *complete = true;
             *stored_completed_at = Some(completed_at);
+            *backgrounded = false;
         }
     }
 
@@ -2324,13 +2326,23 @@ impl Transcript {
         }
     }
 
-    fn mark_running_tools_backgrounded(&mut self) {
-        let Some(tool_call_id) = self.foreground_tool.take() else {
+    fn background_foreground_process(&mut self) {
+        let Some(tool_call_id) = self.foreground_tool.as_deref() else {
             return;
         };
-        let Some(index) = self.tools.get(&tool_call_id).copied() else {
+        let Some(index) = self.tools.get(tool_call_id).copied() else {
             return;
         };
+        let has_running_process = self.runtime_processes.values().any(|process| {
+            process.running && process.tool_index == Some(index)
+        }) || self
+            .provider_backgrounds
+            .values()
+            .any(|process| process.tool_index == index);
+        if !has_running_process {
+            return;
+        }
+        self.foreground_tool = None;
         if let Some(TranscriptEntry::Tool {
             complete,
             error,

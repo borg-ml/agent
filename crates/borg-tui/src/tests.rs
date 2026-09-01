@@ -1844,7 +1844,6 @@ fn late_completion_does_not_consume_new_action_preparation() {
             input_ref: None,
         },
     ));
-    transcript.mark_running_tools_backgrounded();
     transcript.apply(&SessionEvent::new(
         session_id,
         2,
@@ -1963,7 +1962,7 @@ fn matching_tool_action_updates_refine_one_live_card() {
 }
 
 #[test]
-fn backgrounded_tool_updates_do_not_steal_the_foreground() {
+fn provider_progress_keeps_an_unbacked_tool_in_the_foreground() {
     let session_id = Uuid::new_v4();
     let mut transcript = Transcript::default();
     transcript.apply(&SessionEvent::new(
@@ -1983,29 +1982,20 @@ fn backgrounded_tool_updates_do_not_steal_the_foreground() {
             text: "Moving on while that runs.".to_string(),
         },
     ));
-    transcript.apply(&SessionEvent::new(
-        session_id,
-        3,
-        SessionEventKind::ToolUpdated {
-            tool_call_id: "command-1".to_string(),
-            name: "exec_command".to_string(),
-            input: serde_json::json!({"cmd": "long-running command"}),
-        },
-    ));
-
-    assert_eq!(transcript.foreground_tool, None);
+    assert_eq!(transcript.foreground_tool.as_deref(), Some("command-1"));
     assert!(matches!(
         transcript.order.first(),
         Some(TranscriptEntry::Tool {
             complete: false,
-            backgrounded: true,
+            backgrounded: false,
             ..
         })
     ));
+    assert_eq!(transcript.shell_status(), None);
 }
 
 #[test]
-fn preparing_a_new_action_backgrounds_the_previous_tool_once() {
+fn preparing_a_new_action_does_not_invent_a_background_process() {
     let session_id = Uuid::new_v4();
     let mut transcript = Transcript::default();
     transcript.apply(&SessionEvent::new(
@@ -2043,7 +2033,7 @@ fn preparing_a_new_action_backgrounds_the_previous_tool_once() {
         transcript.order.first(),
         Some(TranscriptEntry::Tool {
             complete: false,
-            backgrounded: true,
+            backgrounded: false,
             ..
         })
     ));
@@ -5773,7 +5763,7 @@ fn message_hover_shows_copy_hint_for_user_and_assistant() {
             effort: None,
             time: "12:00".to_string(),
             status: MessageStatus::Complete,
-            complete: true,
+            complete: false,
         },
         TranscriptEntry::Message {
             actor: EventActor::User,
@@ -8400,7 +8390,7 @@ fn running_actions_keep_edge_spacing_in_compact_and_boxed_runs() {
 }
 
 #[test]
-fn provider_progress_marks_an_unfinished_tool_as_background_work() {
+fn provider_progress_does_not_invent_a_background_process() {
     let session_id = Uuid::new_v4();
     let mut transcript = Transcript::default();
     transcript.apply(&SessionEvent::new(
@@ -8428,47 +8418,20 @@ fn provider_progress_marks_an_unfinished_tool_as_background_work() {
         tool,
         TranscriptEntry::Tool {
             complete: false,
-            backgrounded: true,
+            backgrounded: false,
             ..
         }
     ));
-    assert_eq!(transcript.shell_status().as_deref(), Some("1 shell"));
-    assert_eq!(
-        transcript.active_shell_rows(),
-        vec![("cargo run --bin long-build".to_string(), Some(0))]
-    );
-    let row = transcript
+    assert_eq!(transcript.shell_status(), None);
+    assert!(transcript.active_shell_rows().is_empty());
+    let rendered = transcript
         .lines(120)
         .into_iter()
-        .find(|line| line.to_string().contains("Running in background"))
-        .expect("background lifecycle row");
-    assert!(row.to_string().contains("Running…"), "{row}");
-    assert!(!row.to_string().contains("Run in progress"), "{row}");
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!rendered.contains("Running in background"), "{rendered}");
     assert!(transcript.tool_activity_is_running(0));
-    assert!(
-        row.spans
-            .iter()
-            .any(|span| span.style.fg == Some(USER_LABEL_BLUE))
-    );
-    assert!(row.spans.iter().any(|span| {
-        span.content.contains("Running in background")
-            && span.style.fg == Some(BACKGROUND_RUNNING_TEXT)
-    }));
-
-    let mut animated = row.clone();
-    ToolActivityAnimation {
-        glyph: "⠹",
-        pulse_phase: RUNNING_PULSE_RADIUS,
-    }
-    .apply_header(&mut animated);
-    assert!(animated.to_string().contains('⠹'));
-    assert!(!animated.to_string().contains('↗'));
-    assert!(
-        animated
-            .spans
-            .iter()
-            .any(|span| { span.style.fg == Some(brighten_color(USER_LABEL_BLUE, 2)) })
-    );
 
     transcript.apply(&SessionEvent::new(
         session_id,
