@@ -178,13 +178,18 @@ pub async fn ensure_backend(config: LocalDictationConfig) -> Result<LocalDictati
 
 async fn ensure_installed(configured_model_path: Option<&Path>) -> Result<InstalledDictation> {
     let asset = runtime_asset()?;
-    let cache_dir = dictation_cache_dir()?;
-    fs::create_dir_all(&cache_dir)
-        .with_context(|| format!("failed to create dictation cache {}", cache_dir.display()))?;
-    let _lock = CacheLock::acquire(&cache_dir).await?;
+    let install_dir = dictation_install_dir()?;
+    fs::create_dir_all(&install_dir).with_context(|| {
+        format!(
+            "failed to create durable dictation directory {}",
+            install_dir.display()
+        )
+    })?;
+    let _lock = CacheLock::acquire(&install_dir).await?;
+    migrate_legacy_install(&install_dir).await?;
 
-    let archive_path = cache_dir.join(asset.archive_name);
-    let server_dir = cache_dir.join("runtime");
+    let archive_path = install_dir.join(asset.archive_name);
+    let server_dir = install_dir.join("runtime");
     let server_bin = find_file(&server_dir, runtime_binary_name())?;
     if server_bin.is_none() {
         let runtime_url = format!("{PARAKEET_RUNTIME_URL_PREFIX}{}", asset.archive_name);
@@ -209,7 +214,7 @@ async fn ensure_installed(configured_model_path: Option<&Path>) -> Result<Instal
         );
         path.to_path_buf()
     } else {
-        let path = cache_dir.join(PARAKEET_MODEL_FILE);
+        let path = install_dir.join(PARAKEET_MODEL_FILE);
         download_verified(
             PARAKEET_MODEL_URL,
             &path,
@@ -292,27 +297,91 @@ fn dictation_cache_dir() -> Result<PathBuf> {
         .context("unable to determine a cache directory for local dictation")
 }
 
+#[cfg(any(unix, windows))]
+fn dictation_install_dir() -> Result<PathBuf> {
+    dirs::data_local_dir()
+        .map(|path| path.join("borg").join("dictation").join(PARAKEET_CACHE_KEY))
+        .context("unable to determine a durable data directory for local dictation")
+}
+
+async fn migrate_legacy_install(install_dir: &Path) -> Result<()> {
+    let legacy_dir = dictation_cache_dir()?;
+    migrate_legacy_install_from(&legacy_dir, install_dir).await
+}
+
+async fn migrate_legacy_install_from(legacy_dir: &Path, install_dir: &Path) -> Result<()> {
+    if legacy_dir == install_dir || !legacy_dir.exists() {
+        return Ok(());
+    }
+    let _legacy_lock = CacheLock::acquire(&legacy_dir).await?;
+    let asset = runtime_asset()?;
+    for name in [
+        PARAKEET_MODEL_FILE.to_string(),
+        format!("{PARAKEET_MODEL_FILE}.sha256"),
+        format!("{PARAKEET_MODEL_FILE}.part"),
+        asset.archive_name.to_string(),
+        format!("{}.sha256", asset.archive_name),
+    ] {
+        let source = legacy_dir.join(&name);
+        let destination = install_dir.join(&name);
+        if source.exists() && !destination.exists() {
+            fs::rename(&source, &destination).with_context(|| {
+                format!(
+                    "failed to migrate dictation asset {} to {}",
+                    source.display(),
+                    destination.display()
+                )
+            })?;
+        }
+    }
+    let legacy_runtime = legacy_dir.join("runtime");
+    let durable_runtime = install_dir.join("runtime");
+    if legacy_runtime.exists() && !durable_runtime.exists() {
+        fs::rename(&legacy_runtime, &durable_runtime).with_context(|| {
+            format!(
+                "failed to migrate dictation runtime {} to {}",
+                legacy_runtime.display(),
+                durable_runtime.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
 pub fn parakeet_is_installed(config: &LocalDictationConfig) -> bool {
-    let Ok(cache_dir) = dictation_cache_dir() else {
+    let Ok(install_dir) = dictation_install_dir() else {
         return false;
     };
     let model_installed = config.managed_model_path.as_ref().map_or_else(
         || {
-            let model_path = cache_dir.join(PARAKEET_MODEL_FILE);
-            let marker_path = verification_marker(&model_path);
-            fs::metadata(&model_path).is_ok_and(|metadata| metadata.len() == PARAKEET_MODEL_SIZE)
-                && fs::read_to_string(marker_path)
-                    .is_ok_and(|marker| marker.trim() == PARAKEET_MODEL_SHA256)
+            install_is_complete(&install_dir)
+                || dictation_cache_dir().is_ok_and(|dir| install_is_complete(&dir))
         },
         |path| path.is_file(),
     );
     model_installed
-        && find_file(&cache_dir.join("runtime"), runtime_binary_name())
+        && (find_file(&install_dir.join("runtime"), runtime_binary_name())
             .is_ok_and(|path| path.is_some())
+            || dictation_cache_dir().is_ok_and(|dir| {
+                find_file(&dir.join("runtime"), runtime_binary_name())
+                    .is_ok_and(|path| path.is_some())
+            }))
+}
+
+fn install_is_complete(dir: &Path) -> bool {
+    let model_path = dir.join(PARAKEET_MODEL_FILE);
+    fs::metadata(&model_path).is_ok_and(|metadata| metadata.len() == PARAKEET_MODEL_SIZE)
+        && fs::read_to_string(verification_marker(&model_path))
+            .is_ok_and(|marker| marker.trim() == PARAKEET_MODEL_SHA256)
 }
 
 #[cfg(not(any(unix, windows)))]
 fn dictation_cache_dir() -> Result<PathBuf> {
+    bail!("automatic Parakeet dictation setup is not supported on this platform")
+}
+
+#[cfg(not(any(unix, windows)))]
+fn dictation_install_dir() -> Result<PathBuf> {
     bail!("automatic Parakeet dictation setup is not supported on this platform")
 }
 
@@ -419,13 +488,12 @@ async fn download_verified(
     let _ = tokio::fs::remove_file(destination).await;
     let _ = tokio::fs::remove_file(&marker).await;
     let partial = PathBuf::from(format!("{}.part", destination.display()));
-    let _ = tokio::fs::remove_file(&partial).await;
     let result = download_to_partial(url, &partial, expected_size, label).await;
-    if result.is_err() {
-        let _ = tokio::fs::remove_file(&partial).await;
-    }
     result?;
-    ensure_file_hash(&partial, expected_size, expected_sha256, label).await?;
+    if let Err(error) = ensure_file_hash(&partial, expected_size, expected_sha256, label).await {
+        let _ = tokio::fs::remove_file(&partial).await;
+        return Err(error);
+    }
     tokio::fs::rename(&partial, destination)
         .await
         .with_context(|| format!("failed to install {label} into {}", destination.display()))?;
@@ -476,8 +544,22 @@ async fn download_to_partial(
         .timeout(DICTATION_SETUP_TIMEOUT)
         .build()
         .context("failed to create the dictation download client")?;
-    let response = client
-        .get(url)
+    let mut existing = tokio::fs::metadata(destination)
+        .await
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    if existing > expected_size {
+        tokio::fs::remove_file(destination).await?;
+        existing = 0;
+    }
+    if existing == expected_size {
+        return Ok(());
+    }
+    let mut request = client.get(url);
+    if existing > 0 {
+        request = request.header(reqwest::header::RANGE, format!("bytes={existing}-"));
+    }
+    let response = request
         .send()
         .await
         .with_context(|| format!("failed to download {label}"))?;
@@ -486,17 +568,26 @@ async fn download_to_partial(
         "failed to download {label}: HTTP {}",
         response.status()
     );
+    let resumes = existing > 0 && response.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+    if existing > 0 && !resumes {
+        existing = 0;
+    }
     if let Some(length) = response.content_length() {
         ensure!(
-            length == expected_size,
+            length == expected_size - existing,
             "downloaded {label} has unexpected size: {length} bytes"
         );
     }
-    let mut output = tokio::fs::File::create(destination)
+    let mut output = tokio::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(!resumes)
+        .append(resumes)
+        .open(destination)
         .await
         .with_context(|| format!("failed to create partial {label} download"))?;
     let mut stream = response.bytes_stream();
-    let mut size = 0u64;
+    let mut size = existing;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.with_context(|| format!("failed while downloading {label}"))?;
         size = size.saturating_add(chunk.len() as u64);
@@ -1056,10 +1147,71 @@ mod tests {
     }
 
     #[test]
-    fn runtime_archive_paths_cannot_escape_the_cache() {
+    fn runtime_archive_paths_cannot_escape_the_install_directory() {
         assert!(ensure_safe_archive_path(Path::new("runtime/parakeet-server")).is_ok());
         assert!(ensure_safe_archive_path(Path::new("../parakeet-server")).is_err());
         assert!(ensure_safe_archive_path(Path::new("runtime/../../parakeet-server")).is_err());
+    }
+
+    #[tokio::test]
+    async fn legacy_dictation_assets_migrate_to_durable_storage() {
+        let root = tempfile::tempdir().unwrap();
+        let legacy = root.path().join("cache");
+        let durable = root.path().join("data");
+        std::fs::create_dir_all(legacy.join("runtime")).unwrap();
+        std::fs::create_dir_all(&durable).unwrap();
+        std::fs::write(legacy.join("tdt-0.6b-v2-q4_k.gguf.part"), b"partial").unwrap();
+        std::fs::write(legacy.join("runtime/parakeet-server"), b"runtime").unwrap();
+
+        super::migrate_legacy_install_from(&legacy, &durable)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read(durable.join("tdt-0.6b-v2-q4_k.gguf.part")).unwrap(),
+            b"partial"
+        );
+        assert_eq!(
+            std::fs::read(durable.join("runtime/parakeet-server")).unwrap(),
+            b"runtime"
+        );
+        assert!(!legacy.join("tdt-0.6b-v2-q4_k.gguf.part").exists());
+    }
+
+    #[tokio::test]
+    async fn interrupted_model_download_resumes_from_the_existing_prefix() {
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("model.part");
+        std::fs::write(&destination, b"partial ").unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 2048];
+            let read = tokio::io::AsyncReadExt::read(&mut stream, &mut request)
+                .await
+                .unwrap();
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(request.contains("range: bytes=8-"), "{request}");
+            stream
+                .write_all(
+                    b"HTTP/1.1 206 Partial Content\r\nContent-Length: 8\r\nConnection: close\r\n\r\ndownload",
+                )
+                .await
+                .unwrap();
+        });
+
+        super::download_to_partial(
+            &format!("http://{address}/model"),
+            &destination,
+            16,
+            "test model",
+        )
+        .await
+        .unwrap();
+
+        server.await.unwrap();
+        assert_eq!(std::fs::read(destination).unwrap(), b"partial download");
     }
 
     #[test]
