@@ -105,6 +105,69 @@ async fn sqlite_runtime_store(
 }
 
 #[tokio::test]
+async fn accepted_steers_settle_in_fifo_order_when_acknowledgements_arrive_out_of_order() {
+    let root = tempdir().unwrap();
+    let session_id = Uuid::new_v4();
+    let (_store, mut journal) = sqlite_runtime_store(&root, session_id).await;
+    let (events, mut event_rx) = mpsc::channel(8);
+    let first_id = Uuid::new_v4();
+    let second_id = Uuid::new_v4();
+    let steer = |message_id| {
+        let admission = SteerAdmission::pending();
+        assert!(admission.accept());
+        PendingSteer {
+            prompt: QueuedPrompt {
+                message_id,
+                text: message_id.to_string(),
+                actor: EventActor::User,
+                attachments: Vec::new(),
+                output_schema: None,
+                delivery: PromptDelivery::Steer,
+                visible: true,
+                interrupt_batch: true,
+                batch: Vec::new(),
+            },
+            admission,
+            state: PendingSteerState::AwaitingAcknowledgement,
+            attempt_boundary: 0,
+        }
+    };
+    let mut pending_steers = VecDeque::from([steer(first_id), steer(second_id)]);
+
+    pending_steers[1].state = PendingSteerState::Accepted;
+    settle_accepted_steers(&mut journal, &events, session_id, &mut pending_steers)
+        .await
+        .unwrap();
+    assert!(event_rx.try_recv().is_err());
+    assert_eq!(pending_steers.len(), 2);
+
+    pending_steers[0].state = PendingSteerState::Accepted;
+    settle_accepted_steers(&mut journal, &events, session_id, &mut pending_steers)
+        .await
+        .unwrap();
+
+    let mut settled = Vec::new();
+    while let Ok(event) = event_rx.try_recv() {
+        if let SessionEventKind::Message {
+            message_id, status, ..
+        } = event.kind
+        {
+            settled.push((message_id, status));
+        }
+    }
+    assert_eq!(
+        settled,
+        [
+            (first_id, MessageStatus::InProgress),
+            (first_id, MessageStatus::Complete),
+            (second_id, MessageStatus::InProgress),
+            (second_id, MessageStatus::Complete),
+        ]
+    );
+    assert!(pending_steers.is_empty());
+}
+
+#[tokio::test]
 async fn durable_session_events_project_once_into_the_bound_workspace() {
     let root = tempdir().unwrap();
     let session_id = Uuid::new_v4();

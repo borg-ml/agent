@@ -216,6 +216,7 @@ struct PendingSteer {
 
 enum PendingSteerState {
     AwaitingAcknowledgement,
+    Accepted,
     RetryAtBoundary { error: String },
 }
 
@@ -3292,28 +3293,12 @@ async fn run_agent_session_store_kernel(
                         continue;
                     };
                     if pending_steers[index].admission.is_accepted() {
-                        // Admission is the provider transport's irreversible
-                        // delivery boundary. Settle it now so a much later
-                        // interruption cannot resurrect already-sent input.
-                        let steer = pending_steers
-                            .remove(index)
-                            .expect("steer index was found");
-                        record_prompt_status(
+                        pending_steers[index].state = PendingSteerState::Accepted;
+                        settle_accepted_steers(
                             &mut journal,
                             &events,
                             session_id,
-                            &steer.prompt,
-                            MessageStatus::InProgress,
-                            PromptDelivery::Steer,
-                        )
-                        .await?;
-                        record_prompt_status(
-                            &mut journal,
-                            &events,
-                            session_id,
-                            &steer.prompt,
-                            MessageStatus::Complete,
-                            PromptDelivery::Steer,
+                            &mut pending_steers,
                         )
                         .await?;
                     } else {
@@ -6062,17 +6047,15 @@ async fn promote_uncommitted_steers(
     let mut promoted = Vec::new();
     while let Some(steer) = pending_steers.pop_front() {
         if steer.admission.is_accepted() {
-            if matches!(steer.state, PendingSteerState::AwaitingAcknowledgement) {
-                record_prompt_status(
-                    journal,
-                    events,
-                    session_id,
-                    &steer.prompt,
-                    MessageStatus::InProgress,
-                    PromptDelivery::Steer,
-                )
-                .await?;
-            }
+            record_prompt_status(
+                journal,
+                events,
+                session_id,
+                &steer.prompt,
+                MessageStatus::InProgress,
+                PromptDelivery::Steer,
+            )
+            .await?;
             record_prompt_status(
                 journal,
                 events,
@@ -6102,6 +6085,41 @@ async fn promote_uncommitted_steers(
     }
     for prompt in promoted.into_iter().rev() {
         pending.push_front(prompt);
+    }
+    Ok(())
+}
+
+async fn settle_accepted_steers(
+    journal: &mut RuntimeSessionStore,
+    events: &mpsc::Sender<SessionEvent>,
+    session_id: Uuid,
+    pending_steers: &mut VecDeque<PendingSteer>,
+) -> Result<()> {
+    while matches!(
+        pending_steers.front().map(|steer| &steer.state),
+        Some(PendingSteerState::Accepted)
+    ) {
+        let steer = pending_steers
+            .pop_front()
+            .expect("accepted steer was at the front");
+        record_prompt_status(
+            journal,
+            events,
+            session_id,
+            &steer.prompt,
+            MessageStatus::InProgress,
+            PromptDelivery::Steer,
+        )
+        .await?;
+        record_prompt_status(
+            journal,
+            events,
+            session_id,
+            &steer.prompt,
+            MessageStatus::Complete,
+            PromptDelivery::Steer,
+        )
+        .await?;
     }
     Ok(())
 }
