@@ -194,6 +194,9 @@ pub enum ProviderProgress {
         name: String,
         input: Value,
     },
+    ToolCallGenerating {
+        id: Option<String>,
+    },
     ToolCallStarted {
         id: String,
         name: String,

@@ -989,6 +989,7 @@ async fn read_compatible_model_stream(
     let mut reasoning_content = String::new();
     let mut reasoning_details = Vec::new();
     let mut tool_calls = BTreeMap::<usize, PartialToolCall>::new();
+    let mut generating_tool_calls = HashSet::new();
     let mut started_tool_calls = HashSet::new();
     let mut described_tool_calls = HashSet::new();
     let mut finish_reason = None;
@@ -1089,6 +1090,13 @@ async fn read_compatible_model_stream(
                         delta.pointer("/function/arguments").and_then(Value::as_str)
                     {
                         call.arguments.push_str(arguments);
+                    }
+                    if generating_tool_calls.insert(index)
+                        && let Some(sender) = progress
+                    {
+                        let _ = sender.send(ProviderProgress::ToolCallGenerating {
+                            id: (!call.id.is_empty()).then(|| call.id.clone()),
+                        });
                     }
                     if !call.id.is_empty()
                         && !call.name.is_empty()
@@ -1663,8 +1671,8 @@ mod tests {
         let address = listener.local_addr().expect("test server address");
         let body = [
             r#"data: {"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.text","text":"inspect " }]},"finish_reason":null}]}"#,
-            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"read_","arguments":"{\"action\":\"ed"}}]},"finish_reason":null}]}"#,
-            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"file","arguments":"it\",\"path\":\"src/lib.rs\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"action\":\"ed"}}]},"finish_reason":null}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"read_file","arguments":"it\",\"path\":\"src/lib.rs\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#,
             "data: [DONE]",
             "",
         ]
@@ -1703,13 +1711,20 @@ mod tests {
         };
         assert_eq!(kind, "reasoning_delta");
         assert_eq!(content_text.as_deref(), Some("inspect "));
+        let ProviderProgress::ToolCallGenerating { id } = progress_rx
+            .try_recv()
+            .expect("tool generation progress event")
+        else {
+            panic!("expected tool generation progress event");
+        };
+        assert_eq!(id, None);
         let ProviderProgress::ToolCallStarted { id, name, input } =
             progress_rx.try_recv().expect("tool-call progress event")
         else {
             panic!("expected tool-call progress event");
         };
         assert_eq!(id, "call-1");
-        assert_eq!(name, "read_");
+        assert_eq!(name, "read_file");
         assert_eq!(input, Value::Null);
         let ProviderProgress::ToolCallAction { id, action } =
             progress_rx.try_recv().expect("tool action progress event")

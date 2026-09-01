@@ -1936,7 +1936,24 @@ fn consecutive_unmatched_action_preparations_preserve_audit_rows() {
 fn matching_tool_action_updates_refine_one_live_card() {
     let session_id = Uuid::new_v4();
     let mut transcript = Transcript::default();
-    for (sequence, label) in [(1, "command"), (2, "edit")] {
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::ProviderEvent {
+            provider: CodingProvider::Codex,
+            kind: "action/preparing".to_string(),
+            payload: serde_json::json!({"label": ""}),
+        },
+    ));
+    let generic = transcript
+        .lines(100)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(generic.contains("Generating…"), "{generic}");
+
+    for (sequence, label) in [(2, ""), (3, "edit")] {
         transcript.apply(&SessionEvent::new(
             session_id,
             sequence,

@@ -410,7 +410,10 @@ pub fn tool_call_summary(name: &str, input: &Value) -> (String, String) {
     let tool = tool_leaf_name(name);
 
     if tool == "action_preparing" {
-        let label = string_field(input, "label").unwrap_or("action");
+        let label = string_field(input, "label").unwrap_or_default().trim();
+        if label.is_empty() {
+            return ("Generate".to_string(), String::new());
+        }
         return (
             format!("Generate {}", compact_text(label, 64)),
             String::new(),

@@ -1275,13 +1275,24 @@ async fn call_model_streaming(
                         payload,
                     }).await;
                 }
+                Some(ProviderProgress::ToolCallGenerating { id }) => {
+                    send(
+                        context.events,
+                        SessionEventKind::ProviderEvent {
+                            provider: context.coding_provider,
+                            kind: "action/preparing".to_string(),
+                            payload: json!({"label": "", "tool_call_id": id}),
+                        },
+                    )
+                    .await;
+                }
                 Some(ProviderProgress::ToolCallStarted { id, .. }) => {
                     send(
                         context.events,
                         SessionEventKind::ProviderEvent {
                             provider: context.coding_provider,
                             kind: "action/preparing".to_string(),
-                            payload: json!({"label": "command", "tool_call_id": id}),
+                            payload: json!({"label": "", "tool_call_id": id}),
                         },
                     )
                     .await;
@@ -2329,6 +2340,11 @@ mod tests {
                 })
                 .expect("progress receiver remains alive");
             progress
+                .send(ProviderProgress::ToolCallGenerating {
+                    id: Some("call-1".to_string()),
+                })
+                .expect("progress receiver remains alive");
+            progress
                 .send(ProviderProgress::ToolCallStarted {
                     id: "call-1".to_string(),
                     name: "apply_patch".to_string(),
@@ -2426,7 +2442,14 @@ mod tests {
             Some(SessionEventKind::ProviderEvent { kind, payload, .. })
                 if kind == "action/preparing"
                     && payload["tool_call_id"] == "call-1"
-                    && payload["label"] == "command"
+                    && payload["label"] == ""
+        ));
+        assert!(matches!(
+            events_rx.recv().await,
+            Some(SessionEventKind::ProviderEvent { kind, payload, .. })
+                if kind == "action/preparing"
+                    && payload["tool_call_id"] == "call-1"
+                    && payload["label"] == ""
         ));
         assert!(matches!(
             events_rx.recv().await,
