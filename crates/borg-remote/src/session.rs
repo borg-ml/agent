@@ -1178,9 +1178,12 @@ async fn run_agent_session_store_kernel(
     if launch.capabilities.provider_capabilities.is_empty() {
         launch.capabilities.provider_capabilities = initial_state.provider_capabilities.clone();
     }
+    let provider_checkpoint_contract_current =
+        provider_checkpoint_contract_is_current(&initial_state);
     let (recovery, context_complete) = if fresh {
         (crate::SessionRecovery::default(), true)
     } else if launch.provider == CodingProvider::Codex
+        && provider_checkpoint_contract_current
         && let Some(provider_session_id) = initial_state.provider_session_id.as_deref()
         && let Some(recovery) = store
             .recovery_from_provider_checkpoint(session_id, provider_session_id)
@@ -1251,7 +1254,9 @@ async fn run_agent_session_store_kernel(
     let state = journal.state(session_id).await?;
     validate_session_state(session_id, &state)?;
     let mut provider_context_usage_valid = fresh;
-    let mut provider_session_id = state.provider_session_id;
+    let mut provider_session_id = provider_checkpoint_contract_current
+        .then_some(state.provider_session_id)
+        .flatten();
     // Set when a provider switch lands mid-turn; drained at the next turn
     // boundary once the in-flight turn has reported its own session id.
     let mut provider_switch_pending = false;
@@ -2139,6 +2144,9 @@ async fn run_agent_session_store_kernel(
                                         SessionEventKind::ProviderSessionLinked {
                                             provider_session_id: new_provider_session_id.clone(),
                                             provider_turn_id: None,
+                                            context_contract_version: Some(
+                                                crate::agent::PROVIDER_CONTEXT_CONTRACT_VERSION,
+                                            ),
                                         },
                                     )
                                     .await?;
@@ -4054,6 +4062,10 @@ async fn run_agent_session_store_kernel(
             continue;
         }
     }
+}
+
+fn provider_checkpoint_contract_is_current(state: &SessionState) -> bool {
+    state.provider_context_contract_version == Some(crate::agent::PROVIDER_CONTEXT_CONTRACT_VERSION)
 }
 
 fn subagent_concurrency_limit(launch: &LaunchSession) -> usize {

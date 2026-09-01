@@ -2193,6 +2193,8 @@ pub enum SessionEventKind {
         provider_session_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider_turn_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context_contract_version: Option<u32>,
     },
     PromptRecalled {
         message_id: Uuid,

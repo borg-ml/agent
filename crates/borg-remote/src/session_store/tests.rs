@@ -1533,6 +1533,7 @@ async fn context_clear_resets_provider_projection_and_recovery_prefix() {
         SessionEventKind::ProviderSessionLinked {
             provider_session_id: "old-provider-thread".to_string(),
             provider_turn_id: None,
+            context_contract_version: None,
         },
         message(Uuid::new_v4(), "old context"),
         SessionEventKind::ContextWindowUpdated {
@@ -1743,6 +1744,7 @@ async fn provider_checkpoint_recovery_keeps_only_the_unacknowledged_tail() {
         SessionEventKind::ProviderSessionLinked {
             provider_session_id: "durable-thread".to_string(),
             provider_turn_id: Some("durable-turn".to_string()),
+            context_contract_version: Some(crate::agent::PROVIDER_CONTEXT_CONTRACT_VERSION),
         },
         SessionEventKind::TurnCompleted {
             message_id: completed_id,
@@ -1885,6 +1887,7 @@ async fn fork_records_lineage_without_copying_events() {
         SessionEventKind::ProviderSessionLinked {
             provider_session_id: "provider-thread".to_string(),
             provider_turn_id: None,
+            context_contract_version: None,
         },
         message(retained_message_id, "keep"),
         message(discarded_message_id, "discard"),
@@ -2159,6 +2162,7 @@ async fn inherited_event_pages_match_the_full_projection_across_lineage_boundari
         SessionEventKind::ProviderSessionLinked {
             provider_session_id: "must-not-fork".to_string(),
             provider_turn_id: None,
+            context_contract_version: None,
         },
         message(Uuid::new_v4(), "parent-a"),
         message(Uuid::new_v4(), "parent-b"),
@@ -3115,6 +3119,7 @@ fn persistence_and_fork_rules_are_typed_rust_contracts() {
         !SessionEventKind::ProviderSessionLinked {
             provider_session_id: "provider".to_string(),
             provider_turn_id: None,
+            context_contract_version: None,
         }
         .is_fork_inheritable()
     );

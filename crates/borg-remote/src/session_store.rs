@@ -490,12 +490,18 @@ pub struct SessionState {
     pub status: Option<SessionStatus>,
     pub status_detail: Option<String>,
     pub provider_session_id: Option<String>,
+    /// Instruction contract of the last acknowledged native provider thread.
+    /// Missing means the checkpoint predates explicit compatibility tracking.
+    #[serde(default)]
+    pub provider_context_contract_version: Option<u32>,
     /// Last provider turn committed by a durable `TurnCompleted` boundary.
     pub provider_turn_id: Option<String>,
     /// Codex reports its native checkpoint just before the session actor
     /// commits `TurnCompleted`; keep it pending until that boundary lands.
     pub pending_provider_turn_id: Option<String>,
     pub pending_provider_turn_session_id: Option<String>,
+    #[serde(default)]
+    pub pending_provider_context_contract_version: Option<u32>,
     pub pending_approval_id: Option<String>,
     pub pending_provider_interaction_id: Option<String>,
     pub pending_provider_interaction_kind: Option<String>,
@@ -577,9 +583,11 @@ impl SessionState {
                     // necessarily invalidate the old session id.
                     if provider_changed || *provider != CodingProvider::Codex {
                         self.provider_session_id = None;
+                        self.provider_context_contract_version = None;
                         self.provider_turn_id = None;
                         self.pending_provider_turn_id = None;
                         self.pending_provider_turn_session_id = None;
+                        self.pending_provider_context_contract_version = None;
                     }
                     self.usage.context_tokens = Some(0);
                 }
@@ -597,15 +605,19 @@ impl SessionState {
             SessionEventKind::ProviderSessionLinked {
                 provider_session_id,
                 provider_turn_id,
+                context_contract_version,
             } => {
                 if let Some(provider_turn_id) = provider_turn_id {
                     self.pending_provider_turn_id = Some(provider_turn_id.clone());
                     self.pending_provider_turn_session_id = Some(provider_session_id.clone());
+                    self.pending_provider_context_contract_version = *context_contract_version;
                 } else {
                     self.provider_session_id = Some(provider_session_id.clone());
+                    self.provider_context_contract_version = *context_contract_version;
                     self.provider_turn_id = None;
                     self.pending_provider_turn_id = None;
                     self.pending_provider_turn_session_id = None;
+                    self.pending_provider_context_contract_version = None;
                 }
             }
             SessionEventKind::TurnCompleted {
@@ -624,12 +636,16 @@ impl SessionState {
                             .flatten()
                     });
                     self.provider_session_id = provider_session_id.clone();
+                    self.provider_context_contract_version =
+                        self.pending_provider_context_contract_version;
                 } else {
                     self.provider_session_id = None;
+                    self.provider_context_contract_version = None;
                     self.provider_turn_id = None;
                 }
                 self.pending_provider_turn_id = None;
                 self.pending_provider_turn_session_id = None;
+                self.pending_provider_context_contract_version = None;
             }
             SessionEventKind::ApprovalRequested { approval_id, .. } => {
                 self.pending_approval_id = Some(approval_id.clone());
@@ -712,9 +728,11 @@ impl SessionState {
             }
             SessionEventKind::ContextCleared => {
                 self.provider_session_id = None;
+                self.provider_context_contract_version = None;
                 self.provider_turn_id = None;
                 self.pending_provider_turn_id = None;
                 self.pending_provider_turn_session_id = None;
+                self.pending_provider_context_contract_version = None;
                 self.usage.context_tokens = Some(0);
                 self.context_generation = self.context_generation.saturating_add(1);
             }

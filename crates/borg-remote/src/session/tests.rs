@@ -8286,6 +8286,7 @@ fn codex_resume_requires_a_terminal_checkpoint_after_the_latest_turn_start() {
         SessionEventKind::ProviderSessionLinked {
             provider_session_id: "thread-1".to_string(),
             provider_turn_id: None,
+            context_contract_version: None,
         },
     ));
     assert!(!codex_checkpoint_is_acknowledged(&events, "thread-1"));
@@ -8302,6 +8303,16 @@ fn subscription_input_budget_counts_characters_not_utf8_bytes() {
 
     assert!(prompt.len() > SUBSCRIPTION_INPUT_BUDGET_CHARS);
     assert!(prompt.chars().count() <= SUBSCRIPTION_INPUT_BUDGET_CHARS);
+}
+
+#[test]
+fn legacy_provider_checkpoint_contract_is_never_resumed() {
+    let mut state = SessionState::default();
+    state.provider_session_id = Some("stale-thread".to_string());
+    assert!(!provider_checkpoint_contract_is_current(&state));
+
+    state.provider_context_contract_version = Some(crate::agent::PROVIDER_CONTEXT_CONTRACT_VERSION);
+    assert!(provider_checkpoint_contract_is_current(&state));
 }
 
 #[tokio::test]
@@ -8599,6 +8610,7 @@ async fn resumed_codex_checkpoint_avoids_large_replay_compaction_after_actor_res
         SessionEventKind::ProviderSessionLinked {
             provider_session_id: "resumed-codex-thread".to_string(),
             provider_turn_id: Some("completed-codex-turn".to_string()),
+            context_contract_version: Some(crate::agent::PROVIDER_CONTEXT_CONTRACT_VERSION),
         },
         SessionEventKind::TurnCompleted {
             message_id: previous_id,
@@ -8737,6 +8749,7 @@ async fn crash_resume_forks_the_last_completed_codex_turn_before_replaying_input
         SessionEventKind::ProviderSessionLinked {
             provider_session_id: "codex-thread-before-crash".to_string(),
             provider_turn_id: Some("codex-turn-before-crash".to_string()),
+            context_contract_version: Some(crate::agent::PROVIDER_CONTEXT_CONTRACT_VERSION),
         },
         SessionEventKind::TurnCompleted {
             message_id: completed_id,

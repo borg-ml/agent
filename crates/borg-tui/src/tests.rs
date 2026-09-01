@@ -2125,6 +2125,33 @@ fn tool_duration_appears_only_from_one_tenth_of_a_second() {
 }
 
 #[test]
+fn running_tool_timing_column_never_rewraps_action_text() {
+    let summary =
+        "12:10  ↗ Generating wait for corrected full editor build · Running in background";
+    let short = tool_summary_lines(summary, Some("0.1s"), "  ", 88);
+    let long = tool_summary_lines(summary, Some("1m 00s"), "  ", 88);
+
+    assert_eq!(short.len(), long.len());
+    assert_eq!(
+        &short[0][..short[0].len() - 8],
+        &long[0][..long[0].len() - 8]
+    );
+}
+
+#[test]
+fn marker_only_retired_action_messages_are_not_transcript_entries() {
+    assert!(assistant_message_is_retired_action_leak(
+        "BORG_ACTION:web search"
+    ));
+    assert!(assistant_message_is_retired_action_leak(
+        "[[BORG_ACTION:inspect code]]\n[[BORG_ACTION:test code]]"
+    ));
+    assert!(!assistant_message_is_retired_action_leak(
+        "The string BORG_ACTION:web search should not appear."
+    ));
+}
+
+#[test]
 fn running_tool_elapsed_cache_tick_changes_each_tenth() {
     let session_id = Uuid::new_v4();
     let mut transcript = Transcript::default();

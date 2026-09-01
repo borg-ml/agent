@@ -12083,8 +12083,11 @@ fn tool_summary_lines(
     let Some(elapsed) = elapsed else {
         return wrap_display(summary, content_width.max(1));
     };
+    // Keep action text at one stable width while the timer changes from
+    // tenths to seconds, minutes, hours, or days.
+    const ELAPSED_COLUMN_WIDTH: usize = 8;
     let elapsed_width = UnicodeWidthStr::width(elapsed);
-    let reserved_width = elapsed_width.saturating_add(2);
+    let reserved_width = ELAPSED_COLUMN_WIDTH.saturating_add(2);
     if content_width <= reserved_width {
         return wrap_display(&format!("{summary} · {elapsed}"), content_width.max(1));
     }
@@ -12104,7 +12107,8 @@ fn tool_summary_lines(
     if let Some(first) = lines.first_mut() {
         let padding = content_width
             .saturating_sub(UnicodeWidthStr::width(first.as_str()))
-            .saturating_sub(elapsed_width);
+            .saturating_sub(ELAPSED_COLUMN_WIDTH)
+            .saturating_add(ELAPSED_COLUMN_WIDTH.saturating_sub(elapsed_width));
         first.push_str(&" ".repeat(padding));
         first.push_str(elapsed);
     }
@@ -12130,7 +12134,7 @@ fn format_tool_elapsed_at(
         .num_milliseconds()
         .max(0) as u64;
     if elapsed_ms < 100 {
-        return None;
+        return completed_at.is_none().then(|| "0.0s".to_string());
     }
     if elapsed_ms < 60_000 {
         return Some(format!("{:.1}s", elapsed_ms as f64 / 1_000.0));

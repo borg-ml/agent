@@ -1,6 +1,17 @@
 const USER_INTERRUPT_ACTIVITY: &str = "agent interrupted by user";
 const TOOL_ELAPSED_REFRESH_MILLIS: i64 = 100;
 
+fn assistant_message_is_retired_action_leak(text: &str) -> bool {
+    let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
+    let Some(first) = lines.next() else {
+        return false;
+    };
+    std::iter::once(first).chain(lines).all(|line| {
+        line.trim_start_matches('[')
+            .starts_with("BORG_ACTION:")
+    })
+}
+
 fn user_message_has_structured_whitespace(text: &str) -> bool {
     text.contains('\n')
         && text.lines().any(|line| {
@@ -1138,7 +1149,9 @@ impl Transcript {
                     removed_entry = self.remove_message(*message_id);
                     return removed_entry;
                 }
-                if *actor == EventActor::Assistant && text.trim().is_empty() {
+                if *actor == EventActor::Assistant
+                    && (text.trim().is_empty() || assistant_message_is_retired_action_leak(text))
+                {
                     removed_entry = self.remove_message(*message_id);
                     return removed_entry;
                 }

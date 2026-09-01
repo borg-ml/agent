@@ -59,6 +59,11 @@ remain the sole voice that answers the user. When a tool schema offers an `actio
 use a one- or two-word lowercase summary such as `edit`, `delete files`, or `run tests`. Do not emit a \
 separate action-summary narration item.";
 
+/// Persisted provider threads created under an older instruction contract must
+/// never be resumed. Bump this whenever the provider-facing behavioral
+/// contract changes in a way that stale native context could preserve.
+pub(crate) const PROVIDER_CONTEXT_CONTRACT_VERSION: u32 = 1;
+
 const MAX_RESIDENT_CODEX_SUBSCRIPTION_POOLS: usize = 4;
 
 fn provider_native_agent_tool(name: &str) -> bool {
@@ -1781,6 +1786,7 @@ async fn run_borg_provider_turn(
                         SessionEventKind::ProviderSessionLinked {
                             provider_session_id: session_id,
                             provider_turn_id,
+                            context_contract_version: Some(PROVIDER_CONTEXT_CONTRACT_VERSION),
                         },
                     )
                     .await;
