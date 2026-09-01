@@ -4410,6 +4410,10 @@ async fn run_local_agent_session(
                                 .as_mut()
                                 .expect("terminal")
                                 .set_dictation_state(DictationState::Transcribing);
+                            terminal
+                                .as_mut()
+                                .expect("terminal")
+                                .set_notice("Processing local dictation…".to_string());
                             let config = dictation_backend
                                 .as_ref()
                                 .map(LocalDictationBackend::config)

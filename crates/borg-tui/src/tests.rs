@@ -2227,7 +2227,8 @@ fn cached_transcript_reuses_history_for_same_width_timer_updates() {
     transcript.apply(&started);
     let width = 100;
     let viewport_height = DEFAULT_TOOL_RUN_VIEWPORT_HEIGHT;
-    let labels = transcript.running_tool_elapsed_labels();
+    let render_time = Utc::now();
+    let labels = transcript.running_tool_elapsed_labels_at(render_time);
     let mut cache = None;
     let first = cached_transcript_render(
         &transcript,
@@ -2237,7 +2238,9 @@ fn cached_transcript_reuses_history_for_same_width_timer_updates() {
         None,
         &labels,
         Local::now().date_naive(),
+        render_time,
     );
+    assert_eq!(first.7, labels);
     let mut same_width = first.7.clone();
     let elapsed = same_width[0]
         .1
@@ -2255,6 +2258,7 @@ fn cached_transcript_reuses_history_for_same_width_timer_updates() {
         None,
         &same_width,
         Local::now().date_naive(),
+        Utc::now(),
     );
     assert!(Arc::ptr_eq(&first, &reused));
     let (tool_index, row, _) = first.1[0];
@@ -2272,6 +2276,7 @@ fn cached_transcript_reuses_history_for_same_width_timer_updates() {
         None,
         &wider,
         Local::now().date_naive(),
+        Utc::now(),
     );
     assert!(!Arc::ptr_eq(&first, &reflowed));
 }
@@ -2852,6 +2857,13 @@ fn projection_only_events_keep_the_transcript_layout_cache() {
             provider: CodingProvider::Codex,
             kind: "context_compaction".to_string(),
             payload: serde_json::json!({}),
+        }
+    ));
+    assert!(session_event_changes_transcript(
+        &SessionEventKind::ProviderEvent {
+            provider: CodingProvider::Codex,
+            kind: "action/preparing".to_string(),
+            payload: serde_json::json!({"label": "edit"}),
         }
     ));
     assert!(session_event_changes_transcript(

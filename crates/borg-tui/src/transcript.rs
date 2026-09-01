@@ -2827,8 +2827,10 @@ impl Transcript {
             .then(|| now.timestamp_millis().div_euclid(TOOL_ELAPSED_REFRESH_MILLIS))
     }
 
-    fn running_tool_elapsed_labels(&self) -> Vec<(usize, Option<String>)> {
-        let now = Utc::now();
+    fn running_tool_elapsed_labels_at(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Vec<(usize, Option<String>)> {
         let mut indices = self.tools.values().copied().collect::<Vec<_>>();
         indices.extend(self.active_reasoning);
         indices.sort_unstable();
@@ -2926,13 +2928,24 @@ impl Transcript {
             hovered_entry,
             false,
             None,
+            Utc::now(),
         )
     }
 
+    #[cfg(test)]
     fn render_for_cache(
         &self,
         width: usize,
         tool_run_viewport_height: usize,
+    ) -> TranscriptRender {
+        self.render_for_cache_at(width, tool_run_viewport_height, Utc::now())
+    }
+
+    fn render_for_cache_at(
+        &self,
+        width: usize,
+        tool_run_viewport_height: usize,
+        render_time: DateTime<Utc>,
     ) -> TranscriptRender {
         self.render_with_tool_run_viewport_mode(
             width,
@@ -2942,14 +2955,26 @@ impl Transcript {
             None,
             true,
             None,
+            render_time,
         )
     }
 
+    #[cfg(test)]
     fn render_tool_for_cache(
         &self,
         index: usize,
         width: usize,
         tool_run_viewport_height: usize,
+    ) -> TranscriptRender {
+        self.render_tool_for_cache_at(index, width, tool_run_viewport_height, Utc::now())
+    }
+
+    fn render_tool_for_cache_at(
+        &self,
+        index: usize,
+        width: usize,
+        tool_run_viewport_height: usize,
+        render_time: DateTime<Utc>,
     ) -> TranscriptRender {
         self.render_with_tool_run_viewport_mode(
             width,
@@ -2959,6 +2984,7 @@ impl Transcript {
             None,
             true,
             Some(index),
+            render_time,
         )
     }
 
@@ -2972,6 +2998,7 @@ impl Transcript {
         hovered_entry: Option<usize>,
         defer_completed_message_backgrounds: bool,
         focused_tool: Option<usize>,
+        render_time: DateTime<Utc>,
     ) -> TranscriptRender {
         let today = Local::now().date_naive();
         let today_prefix = today.format("%Y-%m-%d ").to_string();
@@ -2987,7 +3014,6 @@ impl Transcript {
         let mut selection_rows: Vec<SelectionRowRange> = Vec::new();
         let mut running_tool_elapsed = Vec::new();
         let mut tool_run_starts = HashMap::new();
-        let render_time = Utc::now();
         let tool_run_windows = self.tool_run_windows();
         let running_tool = self.has_running_tool();
         if let Some(index) = focused_tool

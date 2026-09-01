@@ -2549,7 +2549,9 @@ impl BorgTerminal {
             | SessionEventKind::ProviderSessionLinked { .. }
             | SessionEventKind::SubagentControl { .. } => false,
             SessionEventKind::ProviderEvent { kind, .. } => {
-                is_context_compaction(kind) || is_live_tool_call_event(kind)
+                is_context_compaction(kind)
+                    || is_live_tool_call_event(kind)
+                    || kind == "action/preparing"
             }
             _ => true,
         };
@@ -5216,7 +5218,8 @@ impl BorgTerminal {
         let full_transcript_width = transcript_width_for_viewport(content_width, 0, 0);
         let goal_tick = self.transcript.active_goal_cache_tick();
         let tool_elapsed_tick = self.transcript.tool_elapsed_cache_tick();
-        let current_tool_elapsed = self.transcript.running_tool_elapsed_labels();
+        let render_time = Utc::now();
+        let current_tool_elapsed = self.transcript.running_tool_elapsed_labels_at(render_time);
         let local_date = Local::now().date_naive();
         let transcript_snapshot_current = self.transcript_render_cache.is_some();
         // Input redraws reuse the last complete viewport snapshot. Transcript
@@ -5258,10 +5261,11 @@ impl BorgTerminal {
             committed_viewport_render,
             || {
                 if let Some(index) = self.focused_tool {
-                    return Arc::new(self.transcript.render_tool_for_cache(
+                    return Arc::new(self.transcript.render_tool_for_cache_at(
                         index,
                         full_transcript_width,
                         tool_run_viewport_height,
+                        render_time,
                     ));
                 }
                 stale_full_transcript_render.unwrap_or_else(|| {
@@ -5274,6 +5278,7 @@ impl BorgTerminal {
                             goal_tick,
                             &current_tool_elapsed,
                             local_date,
+                            render_time,
                         )
                     } else {
                         self.transcript_full_render_cache = None;
@@ -5285,6 +5290,7 @@ impl BorgTerminal {
                             goal_tick,
                             &current_tool_elapsed,
                             local_date,
+                            render_time,
                         )
                     }
                 })
@@ -5637,10 +5643,11 @@ impl BorgTerminal {
                 }
                 Arc::clone(&full_transcript_render)
             } else if let Some(index) = self.focused_tool {
-                Arc::new(self.transcript.render_tool_for_cache(
+                Arc::new(self.transcript.render_tool_for_cache_at(
                     index,
                     transcript_width,
                     tool_run_viewport_height,
+                    render_time,
                 ))
             } else {
                 cached_transcript_render(
@@ -5651,6 +5658,7 @@ impl BorgTerminal {
                     goal_tick,
                     &current_tool_elapsed,
                     local_date,
+                    render_time,
                 )
             };
         self.active_transcript_render = Some(Arc::clone(&transcript_render));
@@ -9238,7 +9246,9 @@ fn session_event_changes_transcript(kind: &SessionEventKind) -> bool {
         } => true,
         SessionEventKind::StatusChanged { .. } => false,
         SessionEventKind::ProviderEvent { kind, .. } => {
-            is_context_compaction(kind) || is_live_tool_call_event(kind)
+            is_context_compaction(kind)
+                || is_live_tool_call_event(kind)
+                || kind == "action/preparing"
         }
         SessionEventKind::SubagentActivity {
             activity,
@@ -11391,6 +11401,7 @@ fn cached_transcript_render(
     goal_tick: Option<i64>,
     current_tool_elapsed: &[(usize, Option<String>)],
     local_date: NaiveDate,
+    render_time: DateTime<Utc>,
 ) -> Arc<TranscriptRender> {
     cache
         .as_ref()
@@ -11412,7 +11423,11 @@ fn cached_transcript_render(
         )
         .map(|(_, _, _, _, _, render)| Arc::clone(render))
         .unwrap_or_else(|| {
-            let render = Arc::new(transcript.render_for_cache(width, tool_run_viewport_height));
+            let render = Arc::new(transcript.render_for_cache_at(
+                width,
+                tool_run_viewport_height,
+                render_time,
+            ));
             let tool_elapsed_tick = transcript.tool_elapsed_cache_tick();
             *cache = Some((
                 width,
