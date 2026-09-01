@@ -5366,10 +5366,6 @@ impl BorgTerminal {
                 .get(&child)
                 .map(|agent| display_agent_name(&agent.task_name))
         });
-        let agent_roster_rows = agent_roster_entries
-            .iter()
-            .map(|(row, _)| row.clone())
-            .collect::<Vec<_>>();
         let total_subagents = agent_roster_entries.len().saturating_sub(1);
         let session_is_active = matches!(status, SessionStatus::Starting | SessionStatus::Running);
         let active_status_started_at = self.active_status_started_at();
@@ -6583,15 +6579,11 @@ impl BorgTerminal {
                 || self.hovered_team_roster.is_some())
                 && total_subagents > 0
             {
-                let tooltip_width = agent_roster_rows
-                    .iter()
-                    .map(|row| row.width() as u16)
-                    .max()
-                    .unwrap_or(24)
-                    .saturating_add(4)
-                    .clamp(30, status_area.width.min(96));
-                let tooltip_height = (agent_roster_rows.len() as u16)
+                let tooltip_width = team_roster_table_width(&agent_roster_entries)
                     .saturating_add(2)
+                    .clamp(30, status_area.width.min(96));
+                let tooltip_height = (agent_roster_entries.len() as u16)
+                    .saturating_add(3)
                     .min(status_area.y.saturating_sub(area.y).max(1));
                 let tooltip = Rect {
                     x: next_agents_status_area
@@ -6603,16 +6595,12 @@ impl BorgTerminal {
                     height: tooltip_height,
                 };
                 frame.render_widget(Clear, tooltip);
-                let roster_lines = agent_roster_entries
-                    .iter()
-                    .enumerate()
-                    .map(|(index, (row, child_id))| {
-                        let focused = *child_id == self.focused_child;
-                        let hovered = self.hovered_team_roster == Some(index);
-                        Line::from(format!("{} {row}", if focused { "›" } else { " " }))
-                            .style(team_roster_row_style(focused, hovered, child_id.is_some()))
-                    })
-                    .collect::<Vec<_>>();
+                let roster_lines = team_roster_table_lines(
+                    &agent_roster_entries,
+                    tooltip.width.saturating_sub(2) as usize,
+                    self.focused_child,
+                    self.hovered_team_roster,
+                );
                 frame.render_widget(
                     Paragraph::new(roster_lines)
                         .style(Style::default().fg(Color::White).bg(COMMAND_PANEL_BG))
@@ -6629,15 +6617,15 @@ impl BorgTerminal {
                         ),
                     tooltip,
                 );
-                for (index, (_, child_id)) in agent_roster_entries.iter().enumerate() {
+                for (index, entry) in agent_roster_entries.iter().enumerate() {
                     next_team_roster_hit_areas.push((
                         Rect {
                             x: tooltip.x.saturating_add(1),
-                            y: tooltip.y.saturating_add(1 + index as u16),
+                            y: tooltip.y.saturating_add(2 + index as u16),
                             width: tooltip.width.saturating_sub(2),
                             height: 1,
                         },
-                        *child_id,
+                        entry.child_id,
                     ));
                 }
             }
@@ -8296,6 +8284,136 @@ fn display_agent_name(task_name: &str) -> String {
         "gpt" => "GPT".to_string(),
         name => name.to_string(),
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AgentRosterColumns {
+    name: usize,
+    model: usize,
+    effort: Option<usize>,
+    state: Option<usize>,
+    usage: Option<usize>,
+}
+
+fn team_roster_table_width(entries: &[AgentRosterEntry]) -> u16 {
+    let columns = team_roster_table_columns(entries, usize::MAX);
+    roster_columns_width(columns).min(u16::MAX as usize) as u16
+}
+
+fn team_roster_table_lines(
+    entries: &[AgentRosterEntry],
+    width: usize,
+    focused_child: Option<Uuid>,
+    hovered_row: Option<usize>,
+) -> Vec<Line<'static>> {
+    let columns = team_roster_table_columns(entries, width);
+    let header = roster_table_row("  ", "AGENT", "MODEL", "EFFORT", "STATE", "USAGE", columns);
+    std::iter::once(Line::from(Span::styled(
+        header,
+        Style::default()
+            .fg(Color::DarkGray)
+            .bg(COMMAND_PANEL_BG)
+            .add_modifier(Modifier::BOLD),
+    )))
+    .chain(entries.iter().enumerate().map(|(index, entry)| {
+        let focused = entry.child_id == focused_child;
+        let row = roster_table_row(
+            if focused { "› " } else { "  " },
+            &entry.name,
+            &entry.model,
+            &entry.effort,
+            &entry.state,
+            &entry.usage,
+            columns,
+        );
+        Line::from(row).style(team_roster_row_style(
+            focused,
+            hovered_row == Some(index),
+            entry.child_id.is_some(),
+        ))
+    }))
+    .collect()
+}
+
+fn team_roster_table_columns(entries: &[AgentRosterEntry], width: usize) -> AgentRosterColumns {
+    let column_width = |header: &str, value: fn(&AgentRosterEntry) -> &str, cap: usize| {
+        entries
+            .iter()
+            .map(value)
+            .map(UnicodeWidthStr::width)
+            .chain(std::iter::once(header.width()))
+            .max()
+            .unwrap_or(1)
+            .min(cap)
+    };
+    let mut columns = AgentRosterColumns {
+        name: column_width("AGENT", |entry| &entry.name, 34),
+        model: column_width("MODEL", |entry| &entry.model, 20),
+        effort: Some(column_width("EFFORT", |entry| &entry.effort, 8)),
+        state: Some(column_width("STATE", |entry| &entry.state, 17)),
+        usage: Some(column_width("USAGE", |entry| &entry.usage, 18)),
+    };
+    while roster_columns_width(columns) > width && columns.name > 12 {
+        columns.name -= 1;
+    }
+    if roster_columns_width(columns) > width {
+        columns.effort = None;
+    }
+    if roster_columns_width(columns) > width {
+        columns.usage = None;
+    }
+    if roster_columns_width(columns) > width {
+        columns.state = None;
+    }
+    while roster_columns_width(columns) > width && columns.model > 5 {
+        columns.model -= 1;
+    }
+    columns
+}
+
+fn roster_columns_width(columns: AgentRosterColumns) -> usize {
+    let visible = 2
+        + usize::from(columns.effort.is_some())
+        + usize::from(columns.state.is_some())
+        + usize::from(columns.usage.is_some());
+    2 + columns.name
+        + columns.model
+        + columns.effort.unwrap_or(0)
+        + columns.state.unwrap_or(0)
+        + columns.usage.unwrap_or(0)
+        + visible.saturating_sub(1) * 2
+}
+
+#[allow(clippy::too_many_arguments)]
+fn roster_table_row(
+    marker: &str,
+    name: &str,
+    model: &str,
+    effort: &str,
+    state: &str,
+    usage: &str,
+    columns: AgentRosterColumns,
+) -> String {
+    let mut cells = vec![
+        roster_table_cell(name, columns.name),
+        roster_table_cell(model, columns.model),
+    ];
+    if let Some(width) = columns.effort {
+        cells.push(roster_table_cell(effort, width));
+    }
+    if let Some(width) = columns.state {
+        cells.push(roster_table_cell(state, width));
+    }
+    if let Some(width) = columns.usage {
+        cells.push(roster_table_cell(usage, width));
+    }
+    format!("{marker}{}", cells.join("  "))
+}
+
+fn roster_table_cell(value: &str, width: usize) -> String {
+    let value = truncate_table_cell(value, width);
+    let padding = width.saturating_sub(value.width());
+    format!("{value}{}", " ".repeat(padding))
 }
 
 fn team_roster_row_style(focused: bool, hovered: bool, is_subagent: bool) -> Style {

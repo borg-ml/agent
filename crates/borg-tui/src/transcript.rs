@@ -170,6 +170,16 @@ struct ProviderBackgroundProjection {
     tool_index: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AgentRosterEntry {
+    name: String,
+    model: String,
+    effort: String,
+    state: String,
+    usage: String,
+    child_id: Option<Uuid>,
+}
+
 #[derive(Default)]
 struct MessageMarkdownCache {
     messages: HashMap<(usize, usize), MarkdownRender>,
@@ -2607,22 +2617,30 @@ impl Transcript {
             .count()
     }
 
-    fn agent_roster_entries(&self) -> Vec<(String, Option<Uuid>)> {
+    fn agent_roster_entries(&self) -> Vec<AgentRosterEntry> {
         let mut rows = Vec::new();
         if let Some(config) = self.config.as_ref() {
             let model = config
                 .model
                 .as_deref()
                 .unwrap_or_else(|| config.provider.catalog_backend());
-            rows.push((
-                format!(
-                    "director  {model}  {}  main thread",
-                    config.effort.as_deref().unwrap_or("default")
-                ),
-                None,
-            ));
+            rows.push(AgentRosterEntry {
+                name: "director".to_string(),
+                model: model.to_string(),
+                effort: config.effort.as_deref().unwrap_or("default").to_string(),
+                state: "main thread".to_string(),
+                usage: "—".to_string(),
+                child_id: None,
+            });
         } else {
-            rows.push(("director  model pending  main thread".to_string(), None));
+            rows.push(AgentRosterEntry {
+                name: "director".to_string(),
+                model: "model pending".to_string(),
+                effort: "default".to_string(),
+                state: "main thread".to_string(),
+                usage: "—".to_string(),
+                child_id: None,
+            });
         }
         let mut agents = self
             .subagent_snapshots
@@ -2638,13 +2656,18 @@ impl Transcript {
                 .unwrap_or_else(|| agent.provider.catalog_backend());
             let effort = agent.effort.as_deref().unwrap_or("default");
             let usage = format_subagent_usage(&agent.usage);
-            (
-                format!(
-                    "{name}  {model}  {effort}  {}{usage}",
-                    subagent_status_label(agent.status)
-                ),
-                Some(agent.session_id),
-            )
+            let usage = usage
+                .trim_start()
+                .strip_prefix("usage ")
+                .unwrap_or(usage.trim_start());
+            AgentRosterEntry {
+                name,
+                model: model.to_string(),
+                effort: effort.to_string(),
+                state: subagent_status_label(agent.status).to_string(),
+                usage: usage.to_string(),
+                child_id: Some(agent.session_id),
+            }
         }));
         rows
     }

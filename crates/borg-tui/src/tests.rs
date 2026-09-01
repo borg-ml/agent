@@ -5154,6 +5154,50 @@ fn agents_status_label_counts_only_working_children() {
 }
 
 #[test]
+fn team_roster_uses_aligned_columns_and_keeps_model_visible_when_narrow() {
+    let entries = vec![
+        AgentRosterEntry {
+            name: "director".to_string(),
+            model: "gpt-5.6-sol".to_string(),
+            effort: "xhigh".to_string(),
+            state: "main thread".to_string(),
+            usage: "88.6k ctx".to_string(),
+            child_id: None,
+        },
+        AgentRosterEntry {
+            name: "homestead_manufacturing_actor_v2".to_string(),
+            model: "gpt-5.6-luna".to_string(),
+            effort: "max".to_string(),
+            state: "running".to_string(),
+            usage: "160.8k ctx".to_string(),
+            child_id: Some(Uuid::new_v4()),
+        },
+    ];
+
+    let rows = team_roster_table_lines(&entries, 90, None, None)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>();
+    let column = |row: &str, value: &str| {
+        row.find(value)
+            .map(|offset| UnicodeWidthStr::width(&row[..offset]))
+    };
+    let model_column = column(&rows[0], "MODEL").expect("model header");
+    assert_eq!(column(&rows[1], "gpt-5.6-sol"), Some(model_column));
+    assert_eq!(column(&rows[2], "gpt-5.6-luna"), Some(model_column));
+    assert!(rows.iter().all(|row| row.width() <= 90));
+
+    let narrow = team_roster_table_lines(&entries, 28, None, None)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>();
+    assert!(narrow[0].contains("AGENT"));
+    assert!(narrow[0].contains("MODEL"));
+    assert!(!narrow[0].contains("STATE"));
+    assert!(narrow.iter().all(|row| row.width() <= 28));
+}
+
+#[test]
 fn subagent_selector_prefers_current_context_over_cumulative_provider_work() {
     let usage = borg_remote::SubagentUsage {
         total_tokens: 800_000,
@@ -5198,11 +5242,7 @@ fn persistent_peers_follow_ordinary_agent_visibility() {
     let mut transcript = Transcript::default();
     transcript.upsert_subagent_snapshot(&peer);
 
-    let ready_rows = transcript
-        .agent_roster_entries()
-        .into_iter()
-        .map(|(row, _)| row)
-        .collect::<Vec<_>>();
+    let ready_rows = transcript.agent_roster_entries();
 
     assert_eq!(ready_rows.len(), 1);
     assert_eq!(transcript.active_subagent_count(), 0);
@@ -5213,14 +5253,13 @@ fn persistent_peers_follow_ordinary_agent_visibility() {
 
     peer.status = SubagentStatus::Running;
     transcript.upsert_subagent_snapshot(&peer);
-    let running_rows = transcript
-        .agent_roster_entries()
-        .into_iter()
-        .map(|(row, _)| row)
-        .collect::<Vec<_>>();
+    let running_rows = transcript.agent_roster_entries();
 
     assert_eq!(running_rows.len(), 2);
-    assert!(running_rows[1].starts_with("Claude  claude-opus-5  high  running"));
+    assert_eq!(running_rows[1].name, "Claude");
+    assert_eq!(running_rows[1].model, "claude-opus-5");
+    assert_eq!(running_rows[1].effort, "high");
+    assert_eq!(running_rows[1].state, "running");
     assert_eq!(transcript.active_subagent_count(), 1);
     assert_eq!(
         agents_status_label(transcript.active_subagent_count()).as_deref(),
@@ -5262,19 +5301,15 @@ fn agent_roster_contains_only_currently_working_children() {
             .insert(agent.session_id, agent);
     }
 
-    let rows = transcript
-        .agent_roster_entries()
-        .into_iter()
-        .map(|(row, _)| row)
-        .collect::<Vec<_>>();
+    let rows = transcript.agent_roster_entries();
 
     assert_eq!(rows.len(), 4);
-    assert!(rows[1].starts_with("a_starting "));
-    assert!(rows[2].starts_with("b_waiting "));
-    assert!(rows[3].starts_with("z_live "));
-    assert!(!rows.iter().any(|row| row.contains("idle")));
-    assert!(!rows.iter().any(|row| row.contains("oldest")));
-    assert!(!rows.iter().any(|row| row.contains("older")));
+    assert_eq!(rows[1].name, "a_starting");
+    assert_eq!(rows[2].name, "b_waiting");
+    assert_eq!(rows[3].name, "z_live");
+    assert!(!rows.iter().any(|row| row.name == "idle"));
+    assert!(!rows.iter().any(|row| row.name == "oldest"));
+    assert!(!rows.iter().any(|row| row.name == "older"));
 }
 
 #[test]
