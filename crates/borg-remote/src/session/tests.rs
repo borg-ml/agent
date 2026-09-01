@@ -25,6 +25,70 @@ fn subscription_prompt_ends_with(prompt: &str, text: &str) -> bool {
     prompt.ends_with(&frame)
 }
 
+#[test]
+fn provider_event_batch_coalescing_preserves_text_and_boundaries() {
+    let first_message_id = Uuid::new_v4();
+    let second_message_id = Uuid::new_v4();
+    let mut batch = Vec::new();
+    for kind in [
+        SessionEventKind::ReasoningDelta {
+            text: "hel".to_string(),
+        },
+        SessionEventKind::ReasoningDelta {
+            text: "lo".to_string(),
+        },
+        SessionEventKind::ReasoningDelta {
+            text: "hello world".to_string(),
+        },
+        SessionEventKind::Message {
+            message_id: first_message_id,
+            actor: EventActor::Assistant,
+            text: "draft".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::InProgress,
+            delivery: None,
+        },
+        SessionEventKind::Message {
+            message_id: first_message_id,
+            actor: EventActor::Assistant,
+            text: "finished draft".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::InProgress,
+            delivery: None,
+        },
+        SessionEventKind::StatusChanged {
+            status: SessionStatus::Running,
+            detail: Some("durable boundary".to_string()),
+        },
+        SessionEventKind::Message {
+            message_id: second_message_id,
+            actor: EventActor::Assistant,
+            text: "next message".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::InProgress,
+            delivery: None,
+        },
+    ] {
+        push_coalesced_provider_event(&mut batch, kind);
+    }
+
+    assert_eq!(batch.len(), 4);
+    assert!(matches!(
+        &batch[0],
+        SessionEventKind::ReasoningDelta { text } if text == "hello world"
+    ));
+    assert!(matches!(
+        &batch[1],
+        SessionEventKind::Message { message_id, text, .. }
+            if *message_id == first_message_id && text == "finished draft"
+    ));
+    assert!(matches!(batch[2], SessionEventKind::StatusChanged { .. }));
+    assert!(matches!(
+        &batch[3],
+        SessionEventKind::Message { message_id, .. } if *message_id == second_message_id
+    ));
+}
+
 async fn sqlite_runtime_store(
     root: &tempfile::TempDir,
     session_id: Uuid,

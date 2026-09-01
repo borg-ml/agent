@@ -3023,10 +3023,21 @@ async fn run_agent_session_store_kernel(
                     break;
                 }
                 kind = provider_events.recv(), if provider_events_open => {
-                    let Some(kind) = kind else {
+                    let Some(first_kind) = kind else {
                         provider_events_open = false;
                         continue;
                     };
+                    let mut provider_batch = Vec::with_capacity(8);
+                    push_coalesced_provider_event(&mut provider_batch, first_kind);
+                    let mut consumed = 1;
+                    while consumed < 64 {
+                        let Ok(kind) = provider_events.try_recv() else {
+                            break;
+                        };
+                        consumed += 1;
+                        push_coalesced_provider_event(&mut provider_batch, kind);
+                    }
+                    for kind in provider_batch {
                     if is_executor_lifecycle_status(&kind) {
                         if executor_reports_provider_drained(&kind) {
                             turn_phase = TurnPhase::Draining;
@@ -3095,6 +3106,7 @@ async fn run_agent_session_store_kernel(
                             tokens,
                         )
                         .await?;
+                    }
                     }
                 }
                 activity = subagent_activity_rx.recv(), if owns_team => {
@@ -7066,6 +7078,53 @@ async fn record(
         .await;
     }
     Ok(())
+}
+
+fn push_coalesced_provider_event(batch: &mut Vec<SessionEventKind>, next: SessionEventKind) {
+    let Some(previous) = batch.last_mut() else {
+        batch.push(next);
+        return;
+    };
+    let replaces_message = matches!(
+        (&*previous, &next),
+        (
+            SessionEventKind::Message {
+                message_id: previous_id,
+                status: MessageStatus::InProgress,
+                ..
+            },
+            SessionEventKind::Message {
+                message_id: next_id,
+                status: MessageStatus::InProgress,
+                ..
+            },
+        ) if previous_id == next_id
+    );
+    if replaces_message
+        || matches!(
+            (&*previous, &next),
+            (
+                SessionEventKind::ContextWindowUpdated { .. },
+                SessionEventKind::ContextWindowUpdated { .. }
+            )
+        )
+    {
+        *previous = next;
+        return;
+    }
+    match (previous, next) {
+        (
+            SessionEventKind::ReasoningDelta { text: previous },
+            SessionEventKind::ReasoningDelta { text: next },
+        ) => {
+            if next.starts_with(previous.as_str()) {
+                *previous = next;
+            } else if !previous.starts_with(next.as_str()) {
+                previous.push_str(&next);
+            }
+        }
+        (_, next) => batch.push(next),
+    }
 }
 
 async fn deliver_recorded_event(
