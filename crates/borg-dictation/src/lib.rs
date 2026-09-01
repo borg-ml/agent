@@ -313,7 +313,7 @@ async fn migrate_legacy_install_from(legacy_dir: &Path, install_dir: &Path) -> R
     if legacy_dir == install_dir || !legacy_dir.exists() {
         return Ok(());
     }
-    let _legacy_lock = CacheLock::acquire(&legacy_dir).await?;
+    let _legacy_lock = CacheLock::acquire(legacy_dir).await?;
     let asset = runtime_asset()?;
     for name in [
         PARAKEET_MODEL_FILE.to_string(),
