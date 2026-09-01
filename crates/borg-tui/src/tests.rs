@@ -4694,6 +4694,29 @@ fn markdown_links_retain_only_clickable_http_destinations() {
 }
 
 #[test]
+fn bare_http_urls_are_styled_and_clickable() {
+    let markdown = "Frontend: http://127.0.0.1:4173/. Keep going.";
+    let lines = markdown_lines(markdown, 80, None);
+    let url = lines[0]
+        .spans
+        .iter()
+        .find(|span| span.content == "http://127.0.0.1:4173/")
+        .expect("bare URL span");
+
+    assert_eq!(url.style.fg, Some(Color::LightBlue));
+    assert!(url.style.add_modifier.contains(Modifier::UNDERLINED));
+    assert_eq!(
+        markdown_link_ranges(markdown, &lines),
+        vec![LinkRowRange {
+            row: 0,
+            start: 10,
+            end: 32,
+            url: "http://127.0.0.1:4173/".to_string(),
+        }]
+    );
+}
+
+#[test]
 fn markdown_math_uses_a_real_terminal_layout() {
     let rendered = markdown_lines(
         "A $2 \\times 2$ map satisfies\n\n$$\n\\frac{a}{b} = \\bar{z}\n$$",

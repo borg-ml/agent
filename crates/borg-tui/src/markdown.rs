@@ -134,7 +134,7 @@ pub(super) fn markdown_lines(
                 } else if code_block.is_some() {
                     code.push_str(&text);
                 } else {
-                    current.push(Span::styled(text.into_string(), markdown_style(&styles)));
+                    push_markdown_text(&mut current, &text, markdown_style(&styles));
                 }
             }
             MarkdownEvent::Html(html) | MarkdownEvent::InlineHtml(html) => {
@@ -390,7 +390,62 @@ pub(super) fn markdown_link_ranges(markdown: &str, lines: &[Line<'_>]) -> Vec<Li
             column += width;
         }
     }
+    for (row, line) in lines.iter().enumerate() {
+        let mut column = 0usize;
+        for span in &line.spans {
+            let width = span.width();
+            if span.style.fg == Some(Color::LightBlue)
+                && span.style.add_modifier.contains(Modifier::UNDERLINED)
+                && !links
+                    .iter()
+                    .any(|link| link.row == row && link.start < column + width && column < link.end)
+                && let Some(url) = safe_http_url(&span.content)
+            {
+                links.push(LinkRowRange {
+                    row,
+                    start: column,
+                    end: column + width,
+                    url,
+                });
+            }
+            column += width;
+        }
+    }
+    links.sort_by_key(|link| (link.row, link.start));
     links
+}
+
+fn push_markdown_text(output: &mut Vec<Span<'static>>, text: &str, style: Style) {
+    let mut rest = text;
+    while let Some(start) = [rest.find("http://"), rest.find("https://")]
+        .into_iter()
+        .flatten()
+        .min()
+    {
+        if start > 0 {
+            output.push(Span::styled(rest[..start].to_string(), style));
+        }
+        let candidate = rest[start..]
+            .split_once(char::is_whitespace)
+            .map_or(&rest[start..], |(value, _)| value);
+        let url = candidate.trim_end_matches(['.', ',', ';', ':', '!', '?', ')', ']', '}']);
+        if safe_http_url(url).is_some() {
+            output.push(Span::styled(
+                url.to_string(),
+                style
+                    .fg(Color::LightBlue)
+                    .add_modifier(Modifier::UNDERLINED),
+            ));
+            rest = &rest[start + url.len()..];
+        } else {
+            let end = start + "http".len();
+            output.push(Span::styled(rest[..end].to_string(), style));
+            rest = &rest[end..];
+        }
+    }
+    if !rest.is_empty() {
+        output.push(Span::styled(rest.to_string(), style));
+    }
 }
 
 fn safe_http_url(value: &str) -> Option<String> {
