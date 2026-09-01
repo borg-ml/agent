@@ -172,8 +172,7 @@ struct ProviderBackgroundProjection {
 
 #[derive(Default)]
 struct MessageMarkdownCache {
-    width: usize,
-    messages: HashMap<usize, MarkdownRender>,
+    messages: HashMap<(usize, usize), MarkdownRender>,
     #[cfg(test)]
     misses: usize,
 }
@@ -186,8 +185,7 @@ struct MarkdownRender {
 
 #[derive(Default)]
 struct ToolBodyCache {
-    width: usize,
-    lines: HashMap<(usize, bool, bool), Vec<Line<'static>>>,
+    lines: HashMap<(usize, usize, bool, bool), Vec<Line<'static>>>,
     #[cfg(test)]
     misses: usize,
 }
@@ -1162,7 +1160,7 @@ impl Transcript {
                     self.message_markdown_cache
                         .get_mut()
                         .messages
-                        .remove(&index);
+                        .retain(|(entry_index, _), _| *entry_index != index);
                     let numbered_attachments = matches!(
                         &self.order[index],
                         TranscriptEntry::Message {
@@ -1374,7 +1372,7 @@ impl Transcript {
                     self.tool_body_cache
                         .get_mut()
                         .lines
-                        .retain(|(tool_index, _, _), _| *tool_index != index);
+                        .retain(|(tool_index, _, _, _), _| *tool_index != index);
                     payload_refs.extend(output_ref.iter().cloned());
                     payload_refs.extend(input_ref.iter().cloned());
                     if name == "Search web"
@@ -1510,7 +1508,7 @@ impl Transcript {
                     self.tool_body_cache
                         .get_mut()
                         .lines
-                        .retain(|(tool_index, _, _), _| *tool_index != process.tool_index);
+                        .retain(|(tool_index, _, _, _), _| *tool_index != process.tool_index);
                     let output = tool_process_output_text(output);
                     if !output.trim().is_empty() {
                         *output_view = Some(("text".to_string(), output));
@@ -1630,7 +1628,7 @@ impl Transcript {
                     self.tool_body_cache
                         .get_mut()
                         .lines
-                        .retain(|(index, _, _), _| *index != tool_index);
+                        .retain(|(index, _, _, _), _| *index != tool_index);
                     let output = [stdout.as_str(), stderr.as_str()]
                         .into_iter()
                         .filter(|text| !text.is_empty())
@@ -1815,8 +1813,30 @@ impl Transcript {
     }
 
     fn reindex_after_removal(&mut self, index: usize) {
-        self.message_markdown_cache.get_mut().messages.clear();
-        self.tool_body_cache.get_mut().lines.clear();
+        let cache = self.message_markdown_cache.get_mut();
+        cache.messages = cache
+            .messages
+            .drain()
+            .filter_map(|((entry_index, width), render)| {
+                (entry_index != index).then_some(((
+                    entry_index - usize::from(entry_index > index),
+                    width,
+                ), render))
+            })
+            .collect();
+        let cache = self.tool_body_cache.get_mut();
+        cache.lines = cache
+            .lines
+            .drain()
+            .filter_map(|((entry_index, width, output, boxed), lines)| {
+                (entry_index != index).then_some(((
+                    entry_index - usize::from(entry_index > index),
+                    width,
+                    output,
+                    boxed,
+                ), lines))
+            })
+            .collect();
         for stored_index in self
             .messages
             .values_mut()
@@ -1928,8 +1948,27 @@ impl Transcript {
     }
 
     fn reindex_after_insertion(&mut self, index: usize) {
-        self.message_markdown_cache.get_mut().messages.clear();
-        self.tool_body_cache.get_mut().lines.clear();
+        let cache = self.message_markdown_cache.get_mut();
+        cache.messages = cache
+            .messages
+            .drain()
+            .map(|((entry_index, width), render)| {
+                ((entry_index + usize::from(entry_index >= index), width), render)
+            })
+            .collect();
+        let cache = self.tool_body_cache.get_mut();
+        cache.lines = cache
+            .lines
+            .drain()
+            .map(|((entry_index, width, output, boxed), lines)| {
+                ((
+                    entry_index + usize::from(entry_index >= index),
+                    width,
+                    output,
+                    boxed,
+                ), lines)
+            })
+            .collect();
         for stored_index in self
             .messages
             .values_mut()
@@ -2436,7 +2475,7 @@ impl Transcript {
             self.message_markdown_cache
                 .get_mut()
                 .messages
-                .remove(&index);
+                .retain(|(entry_index, _), _| *entry_index != index);
         }
         self.finish_reasoning(completed_at);
     }
@@ -2939,13 +2978,6 @@ impl Transcript {
         if focused_tool.is_none() {
             self.prepare_message_markdown_cache(width);
         }
-        {
-            let mut cache = self.tool_body_cache.borrow_mut();
-            if cache.width != width {
-                cache.width = width;
-                cache.lines.clear();
-            }
-        }
         let mut lines = Vec::new();
         let mut tool_rows = Vec::new();
         let mut tool_run_rows = Vec::new();
@@ -3120,7 +3152,7 @@ impl Transcript {
                         let mut cache = self.message_markdown_cache.borrow_mut();
                         #[cfg(test)]
                         let mut missed = false;
-                        let rendered = match cache.messages.entry(index) {
+                        let rendered = match cache.messages.entry((index, width)) {
                             std::collections::hash_map::Entry::Occupied(entry) => {
                                 entry.get().clone()
                             }
@@ -3741,7 +3773,7 @@ impl Transcript {
                             "  │ "
                         };
                         if *complete {
-                            let key = (index, false, tool_window.is_some());
+                            let key = (index, width, false, tool_window.is_some());
                             let mut cache = self.tool_body_cache.borrow_mut();
                             #[cfg(test)]
                             let mut missed = false;
@@ -3789,7 +3821,7 @@ impl Transcript {
                             "  │ "
                         };
                         if *complete {
-                            let key = (index, true, tool_window.is_some());
+                            let key = (index, width, true, tool_window.is_some());
                             let mut cache = self.tool_body_cache.borrow_mut();
                             #[cfg(test)]
                             let mut missed = false;
@@ -4008,15 +4040,6 @@ impl Transcript {
     }
 
     fn prepare_message_markdown_cache(&self, width: usize) {
-        {
-            let mut cache = self.message_markdown_cache.borrow_mut();
-            if cache.width == width {
-                return;
-            }
-            cache.width = width;
-            cache.messages.clear();
-        }
-
         let message_count = self
             .order
             .iter()
@@ -4028,6 +4051,16 @@ impl Transcript {
                 )
             })
             .count();
+        let cached_indices = self
+            .message_markdown_cache
+            .borrow()
+            .messages
+            .keys()
+            .filter_map(|(index, cached_width)| (*cached_width == width).then_some(*index))
+            .collect::<HashSet<_>>();
+        if cached_indices.len() == message_count {
+            return;
+        }
         if message_count < PARALLEL_MARKDOWN_RENDER_MIN_MESSAGES {
             return;
         }
@@ -4046,6 +4079,7 @@ impl Transcript {
         let user_message_color = self.user_message_color;
         let assistant_message_color = self.assistant_message_color;
         let messages = thread::scope(|scope| {
+            let cached_indices = &cached_indices;
             let handles = self
                 .order
                 .chunks(chunk_size)
@@ -4068,6 +4102,10 @@ impl Transcript {
                                 if *status == MessageStatus::Queued {
                                     return None;
                                 }
+                                let index = chunk_index * chunk_size + entry_index;
+                                if cached_indices.contains(&index) {
+                                    return None;
+                                }
                                 let text_color = match actor {
                                     EventActor::User => Some(user_message_color),
                                     EventActor::Assistant => Some(assistant_message_color),
@@ -4083,7 +4121,7 @@ impl Transcript {
                                     line.spans.insert(0, Span::raw("  "));
                                 }
                                 Some((
-                                    chunk_index * chunk_size + entry_index,
+                                    (index, width),
                                     MarkdownRender { lines, links },
                                 ))
                             })
@@ -4103,7 +4141,7 @@ impl Transcript {
         {
             cache.misses += messages.len();
         }
-        cache.messages = messages;
+        cache.messages.extend(messages);
     }
 
     fn tool_run_windows(&self) -> Vec<Option<ToolRunWindow>> {

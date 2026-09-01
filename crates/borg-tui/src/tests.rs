@@ -2402,6 +2402,38 @@ fn live_tail_updates_reuse_completed_message_markdown() {
 }
 
 #[test]
+fn scrollbar_width_oscillation_reuses_both_markdown_variants() {
+    let session_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    for sequence in 1..=32 {
+        transcript.apply(&SessionEvent::new(
+            session_id,
+            sequence,
+            SessionEventKind::Message {
+                message_id: Uuid::new_v4(),
+                actor: EventActor::Assistant,
+                text: format!("Message {sequence} with **formatted content**"),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            },
+        ));
+    }
+
+    let _ = transcript.lines(100);
+    let _ = transcript.lines(97);
+    let misses_after_both_widths = transcript.message_markdown_cache.borrow().misses;
+    let _ = transcript.lines(100);
+    let _ = transcript.lines(97);
+
+    assert_eq!(
+        transcript.message_markdown_cache.borrow().misses,
+        misses_after_both_widths,
+        "scrollbar width toggles must not reparse an already-rendered transcript width"
+    );
+}
+
+#[test]
 fn cached_message_background_deferral_preserves_transcript_layout() {
     let session_id = Uuid::new_v4();
     let mut transcript = Transcript::default();
