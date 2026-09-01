@@ -1335,6 +1335,7 @@ async fn run_local_agent_session(
     crash_context: Arc<TuiCrashContext>,
     reusable_terminal: Option<BorgTerminal>,
 ) -> Result<Option<(Uuid, Option<(String, Vec<PathBuf>)>, Option<BorgTerminal>)>> {
+    let startup_started = std::time::Instant::now();
     let mut agent_config = AgentConfig::load(args.config.as_deref())?;
     let _local_provider_env = agent_config.apply_local_provider_env();
     let dictation_config = LocalDictationConfig::from_env();
@@ -1351,8 +1352,19 @@ async fn run_local_agent_session(
         },
         Path::to_path_buf,
     );
-    let sqlite_store =
-        Arc::new(SqliteSessionStore::open(sessions_dir.join("sessions.sqlite3")).await?);
+    let interactive_store_open = io::stdin().is_terminal()
+        && io::stdout().is_terminal()
+        && !args.json
+        && !args.print
+        && !args.gui_owner
+        && !BorgTerminal::fallback_requested();
+    let store_open_started = std::time::Instant::now();
+    let sqlite_store = Arc::new(if interactive_store_open {
+        SqliteSessionStore::open_interactive(sessions_dir.join("sessions.sqlite3")).await?
+    } else {
+        SqliteSessionStore::open(sessions_dir.join("sessions.sqlite3")).await?
+    });
+    let store_open_ms = store_open_started.elapsed().as_millis() as u64;
     let session_id = if let Some(session_id) = selected_session.or(args.resume) {
         session_id_if_present(sqlite_store.as_ref(), session_id).await?
     } else if args.continue_latest {
@@ -1396,6 +1408,16 @@ async fn run_local_agent_session(
     }
     let store: Arc<dyn SessionStore> = sqlite_store.clone();
     let mut session_state = store.state(session_id).await?;
+    let suppress_terminal_live_tail = interactive_store_open
+        && matches!(
+            session_state.status,
+            Some(
+                SessionStatus::Ready
+                    | SessionStatus::Completed
+                    | SessionStatus::Failed
+                    | SessionStatus::Stopped
+            )
+        );
     // Context usage is intentionally coalesced live state rather than a
     // durable transcript event. Resume must seed the footer from that latest
     // snapshot too; otherwise every long session briefly (or permanently,
@@ -1538,7 +1560,9 @@ async fn run_local_agent_session(
         "{provider:?} requires --model or BORG_OPENAI_COMPATIBLE_MODEL"
     );
     let mut capabilities = borg_remote::SessionCapabilities::from(&agent_config.capabilities);
+    let provider_probe_started = std::time::Instant::now();
     capabilities.provider_capabilities = probe_provider_admission_capabilities().await;
+    let provider_probe_ms = provider_probe_started.elapsed().as_millis() as u64;
     let team_policy = agent_config.autonomous_team_policy(&capabilities, provider, session_id);
     if !resuming
         && args.effort.is_none()
@@ -1644,6 +1668,7 @@ async fn run_local_agent_session(
     };
     let has_initial_prompt = initial_prompt.is_some();
     let interactive = can_prompt || args.gui_owner;
+    let history_started = std::time::Instant::now();
     let (mut history, mut history_page_before_sequence) = if can_prompt && !fallback_terminal {
         let bootstrap =
             recent_tui_history(store.as_ref(), session_id, session_state.latest_sequence).await?;
@@ -1656,6 +1681,7 @@ async fn run_local_agent_session(
             .unwrap_or_else(|| session_state.latest_sequence.saturating_add(1));
         (history, page_before)
     };
+    let history_ms = history_started.elapsed().as_millis() as u64;
     if can_prompt && !fallback_terminal {
         // Durable history is the transcript source of truth, while the latest
         // coalesced message/reasoning rows are the live tail of an in-flight
@@ -1666,10 +1692,12 @@ async fn run_local_agent_session(
                 .into_iter()
                 .map(|live| live.event)
                 .filter(|event| {
-                    matches!(
-                        event.kind,
-                        SessionEventKind::Message { .. } | SessionEventKind::ReasoningDelta { .. }
-                    )
+                    !suppress_terminal_live_tail
+                        && matches!(
+                            event.kind,
+                            SessionEventKind::Message { .. }
+                                | SessionEventKind::ReasoningDelta { .. }
+                        )
                 }),
         );
     }
@@ -1956,6 +1984,23 @@ async fn run_local_agent_session(
             terminal.restore_composer(text, attachments);
         }
         terminal.draw()?;
+        tracing::info!(
+            %session_id,
+            store_open_ms,
+            provider_probe_ms,
+            history_ms,
+            first_paint_ms = startup_started.elapsed().as_millis() as u64,
+            bootstrap_events = history.len(),
+            "interactive session reached first paint"
+        );
+        if interactive_store_open {
+            let maintenance_store = Arc::clone(&sqlite_store);
+            tokio::spawn(async move {
+                if let Err(error) = maintenance_store.finish_interactive_open(session_id).await {
+                    tracing::warn!(%session_id, %error, "deferred interactive store maintenance failed");
+                }
+            });
+        }
     } else if let Some(notice) = startup_update_notice.as_deref() {
         eprintln!("\n  {notice}\n");
     } else if let Some(notice) = retry_notice.as_deref() {

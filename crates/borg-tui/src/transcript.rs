@@ -54,9 +54,9 @@ fn message_badge_colors(color: Color) -> (Color, Color) {
             };
             let background = match MESSAGE_BG {
                 Color::Rgb(base_red, base_green, base_blue) => Color::Rgb(
-                    mix(base_red, red, 24),
-                    mix(base_green, green, 24),
-                    mix(base_blue, blue, 24),
+                    mix(base_red, red, 16),
+                    mix(base_green, green, 16),
+                    mix(base_blue, blue, 16),
                 ),
                 _ => MESSAGE_HOVER_BG,
             };

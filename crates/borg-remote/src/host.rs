@@ -1042,8 +1042,15 @@ async fn probe_provider_capabilities_uncached(
         probe_provider(CodingProvider::OpenRouter, managed_kimi, mode),
         probe_provider(CodingProvider::OpenAiCompatible, managed_kimi, mode),
     );
-    refresh_provider_capability_usage(&[codex, claude, opencode, kimi, openrouter, compatible])
-        .await
+    let capabilities = vec![codex, claude, opencode, kimi, openrouter, compatible];
+    match mode {
+        // Launch only needs locally available authentication routes. Starting
+        // provider subprocesses to refresh subscription usage blocks first
+        // paint for up to ten seconds and is unnecessary until a caller asks
+        // for a fresh capability snapshot or attempts cross-provider work.
+        ProviderProbeMode::Admission => capabilities,
+        ProviderProbeMode::Detailed => refresh_provider_capability_usage(&capabilities).await,
+    }
 }
 
 pub(crate) async fn refresh_provider_capability_usage(
@@ -5264,6 +5271,8 @@ mod tests {
         let mut expected_admission = cold.clone();
         for capability in &mut expected_admission {
             capability.version = None;
+            capability.usage = None;
+            capability.can_spawn = capability.installed && capability.authenticated;
         }
         assert_eq!(admission, expected_admission);
         eprintln!(

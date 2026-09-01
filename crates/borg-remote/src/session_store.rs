@@ -1055,10 +1055,18 @@ impl SqliteSessionStore {
     }
 
     pub async fn open(path: impl AsRef<Path>) -> Result<Self> {
-        Self::open_path(path.as_ref().to_path_buf(), true).await
+        Self::open_path(path.as_ref().to_path_buf(), true, false).await
     }
 
-    async fn open_path(path: PathBuf, reset_incompatible: bool) -> Result<Self> {
+    /// Open a store for latency-sensitive interactive use. A database whose
+    /// schema marker is already current is validated without acquiring the
+    /// global SQLite writer lock; session-scoped stale-live cleanup can run
+    /// after the first frame through `finish_interactive_open`.
+    pub async fn open_interactive(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_path(path.as_ref().to_path_buf(), true, true).await
+    }
+
+    async fn open_path(path: PathBuf, reset_incompatible: bool, interactive: bool) -> Result<Self> {
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
@@ -1099,7 +1107,12 @@ impl SqliteSessionStore {
         let store = Self { pool };
         let schema_deadline = std::time::Instant::now() + SQLITE_SCHEMA_WAIT_TIMEOUT;
         let schema_result = loop {
-            match store.ensure_schema().await {
+            let result = if interactive && store.has_current_schema().await? {
+                store.validate_current_schema().await
+            } else {
+                store.ensure_schema().await
+            };
+            match result {
                 Ok(()) => break Ok(()),
                 Err(error)
                     if sqlite_schema_lock(&error)
@@ -1119,11 +1132,46 @@ impl SqliteSessionStore {
                     archived = %archived.display(),
                     "archived incompatible session database and started a fresh one"
                 );
-                return Box::pin(Self::open_path(path, false)).await;
+                return Box::pin(Self::open_path(path, false, interactive)).await;
             }
             return Err(error);
         }
         Ok(store)
+    }
+
+    async fn has_current_schema(&self) -> Result<bool> {
+        let has_marker: i64 = sqlx::query_scalar(
+            "select exists(select 1 from sqlite_master where type='table' and name='borg_session_schema')",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        if has_marker == 0 {
+            return Ok(false);
+        }
+        let version: Option<i64> =
+            sqlx::query_scalar("select version from borg_session_schema where id=1")
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(version == Some(SESSION_SCHEMA_VERSION))
+    }
+
+    pub async fn finish_interactive_open(&self, session_id: Uuid) -> Result<()> {
+        let mut transaction = self.begin_write().await?;
+        sqlx::query(
+            "delete from session_live_state \
+             where session_id=? and live_key <> 'context_window' \
+               and exists( \
+                 select 1 from sessions \
+                 where id=? and json_extract(state_json, '$.status') in \
+                   ('ready', 'completed', 'failed', 'stopped') \
+               )",
+        )
+        .bind(session_id.to_string())
+        .bind(session_id.to_string())
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(())
     }
 
     pub fn pool(&self) -> &SqlitePool {

@@ -6024,6 +6024,13 @@ fn input_redraw_reuses_the_last_committed_viewport_snapshot() {
     );
 }
 
+#[test]
+fn invalidated_activity_redraw_recomputes_scrollbar_safe_width() {
+    assert!(reuse_current_transcript_width(true, true));
+    assert!(!reuse_current_transcript_width(true, false));
+    assert!(!reuse_current_transcript_width(false, true));
+}
+
 /// Only commands whose bare form is not a command need finishing by hand;
 /// everything else must run outright or the palette is just a typing aid.
 #[test]

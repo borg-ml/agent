@@ -5630,30 +5630,31 @@ impl BorgTerminal {
             full_transcript_render.0.len(),
             transcript_viewport_height,
         );
-        let transcript_render = if input_fast_path {
-            Arc::clone(&full_transcript_render)
-        } else if transcript_width == full_transcript_width {
-            if self.focused_tool.is_none() {
-                self.transcript_render_cache = self.transcript_full_render_cache.clone();
-            }
-            Arc::clone(&full_transcript_render)
-        } else if let Some(index) = self.focused_tool {
-            Arc::new(self.transcript.render_tool_for_cache(
-                index,
-                transcript_width,
-                tool_run_viewport_height,
-            ))
-        } else {
-            cached_transcript_render(
-                &self.transcript,
-                &mut self.transcript_render_cache,
-                transcript_width,
-                tool_run_viewport_height,
-                goal_tick,
-                &current_tool_elapsed,
-                local_date,
-            )
-        };
+        let transcript_render =
+            if reuse_current_transcript_width(input_fast_path, transcript_snapshot_current) {
+                Arc::clone(&full_transcript_render)
+            } else if transcript_width == full_transcript_width {
+                if self.focused_tool.is_none() {
+                    self.transcript_render_cache = self.transcript_full_render_cache.clone();
+                }
+                Arc::clone(&full_transcript_render)
+            } else if let Some(index) = self.focused_tool {
+                Arc::new(self.transcript.render_tool_for_cache(
+                    index,
+                    transcript_width,
+                    tool_run_viewport_height,
+                ))
+            } else {
+                cached_transcript_render(
+                    &self.transcript,
+                    &mut self.transcript_render_cache,
+                    transcript_width,
+                    tool_run_viewport_height,
+                    goal_tick,
+                    &current_tool_elapsed,
+                    local_date,
+                )
+            };
         self.active_transcript_render = Some(Arc::clone(&transcript_render));
         let (
             transcript,
@@ -11489,6 +11490,10 @@ where
     } else {
         fallback_render()
     }
+}
+
+fn reuse_current_transcript_width(input_fast_path: bool, snapshot_current: bool) -> bool {
+    input_fast_path && snapshot_current
 }
 
 fn transcript_width_for_viewport(

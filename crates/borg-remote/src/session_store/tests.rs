@@ -2668,6 +2668,92 @@ async fn reopening_repairs_turn_live_state_left_on_a_terminal_session() {
 }
 
 #[tokio::test]
+async fn interactive_open_defers_terminal_live_state_repair_until_requested() {
+    let (directory, store) = store().await;
+    let path = directory.path().join("sessions.sqlite3");
+    let session_id = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+    store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::StatusChanged {
+                status: SessionStatus::Ready,
+                detail: None,
+            },
+        ))
+        .await
+        .unwrap();
+
+    let message_id = Uuid::new_v4();
+    let event = SessionEvent::new(
+        session_id,
+        0,
+        SessionEventKind::Message {
+            message_id,
+            actor: EventActor::Assistant,
+            text: "stale response".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::InProgress,
+            delivery: None,
+        },
+    );
+    sqlx::query(
+        "insert into session_live_state \
+         (session_id, live_key, revision, event_json, updated_at) values (?, ?, ?, ?, ?)",
+    )
+    .bind(session_id.to_string())
+    .bind(format!("message:{message_id}"))
+    .bind(99_i64)
+    .bind(serde_json::to_string(&event).unwrap())
+    .bind(event.created_at.to_rfc3339())
+    .execute(store.pool())
+    .await
+    .unwrap();
+    drop(store);
+
+    let reopened = SqliteSessionStore::open_interactive(&path).await.unwrap();
+    assert_eq!(
+        reopened
+            .live_events_after(session_id, 0)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    reopened.finish_interactive_open(session_id).await.unwrap();
+    assert!(
+        reopened
+            .live_events_after(session_id, 0)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn current_schema_interactive_open_does_not_wait_for_an_active_writer() {
+    let (directory, store) = store().await;
+    let path = directory.path().join("sessions.sqlite3");
+    let mut writer = store.pool().acquire().await.unwrap();
+    sqlx::query("begin immediate")
+        .execute(&mut *writer)
+        .await
+        .unwrap();
+
+    let reopened = tokio::time::timeout(
+        Duration::from_millis(250),
+        SqliteSessionStore::open_interactive(&path),
+    )
+    .await
+    .expect("current-schema interactive open waited for the active writer")
+    .unwrap();
+    drop(reopened);
+
+    sqlx::query("rollback").execute(&mut *writer).await.unwrap();
+}
+
+#[tokio::test]
 async fn large_tool_payloads_are_loaded_only_by_reference() {
     let (directory, store) = store().await;
     let session_id = Uuid::new_v4();
