@@ -119,6 +119,7 @@ struct Transcript {
     provider_followups: HashMap<String, String>,
     queued_messages: HashSet<Uuid>,
     queued_message_sequences: HashMap<Uuid, u64>,
+    local_minute_cache: HashMap<i64, String>,
     follow_tail: bool,
     selected: Option<usize>,
     diff_expansion: DiffExpansionPolicy,
@@ -202,6 +203,7 @@ impl Default for Transcript {
             provider_followups: HashMap::new(),
             queued_messages: HashSet::new(),
             queued_message_sequences: HashMap::new(),
+            local_minute_cache: HashMap::new(),
             follow_tail: true,
             selected: None,
             diff_expansion: DiffExpansionPolicy::Expanded,
@@ -447,6 +449,21 @@ impl Transcript {
         self.subagents.reserve(event_count / 16);
         self.subagent_snapshots.reserve(event_count / 16);
         self.subagent_entries.reserve(event_count / 16);
+        self.local_minute_cache.reserve(event_count.min(4_096) / 32);
+    }
+
+    fn message_event_time(&mut self, event: &SessionEvent) -> String {
+        const MAX_CACHED_MINUTES: usize = 4_096;
+        let minute = event.created_at.timestamp().div_euclid(60);
+        if let Some(time) = self.local_minute_cache.get(&minute) {
+            return time.clone();
+        }
+        if self.local_minute_cache.len() >= MAX_CACHED_MINUTES {
+            self.local_minute_cache.clear();
+        }
+        let time = local_event_time(event);
+        self.local_minute_cache.insert(minute, time.clone());
+        time
     }
 
     fn seed_session_state(&mut self, state: &SessionState) {
@@ -1086,6 +1103,7 @@ impl Transcript {
                 attachments,
                 delivery: _,
             } => {
+                let event_time = self.message_event_time(event);
                 // A coalesced live snapshot can arrive after its durable
                 // terminal boundary during reconnect. Never resurrect a
                 // responding row once the active turn has been closed.
@@ -1207,7 +1225,7 @@ impl Transcript {
                         attachments,
                         model,
                         effort,
-                        time: local_event_time(event),
+                        time: event_time,
                         status: *status,
                         complete: matches!(
                             *status,
@@ -3033,11 +3051,15 @@ impl Transcript {
                                 Style::default().fg(color).bg(badge_background),
                             ),
                             Span::styled(
-                                format!(" {label}  "),
+                                format!(" {label} "),
                                 Style::default()
                                     .fg(badge_text)
                                     .bg(badge_background)
                                     .add_modifier(Modifier::BOLD),
+                            ),
+                            Span::styled(
+                                "▐",
+                                Style::default().fg(color).bg(badge_background),
                             ),
                         ]
                     } else {
