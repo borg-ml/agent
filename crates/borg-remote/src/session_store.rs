@@ -2696,6 +2696,10 @@ impl SqliteSessionStore {
                 on session_events (session_id, message_id)
                 where message_id is not null;
 
+            create index if not exists idx_session_events_message_sequence
+                on session_events (session_id, sequence desc)
+                where event_kind = 'message';
+
             create index if not exists idx_session_events_fork_inheritable
                 on session_events (session_id, sequence)
                 where fork_inheritable = 1;

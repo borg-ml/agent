@@ -3377,6 +3377,62 @@ async fn large_session_recent_prompt_recall_p95_gate() {
     );
 }
 
+#[tokio::test]
+#[ignore = "explicit sparse-message prompt-recall p95 performance gate"]
+async fn sparse_recent_prompt_recall_p95_gate() {
+    const EVENT_COUNT: u64 = 25_000;
+    const LIMIT: usize = 100;
+    const SAMPLES: usize = 100;
+
+    let (_directory, store) = store().await;
+    let session_id = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+    let mut state = SessionState::default();
+    let mut transaction = store.pool().begin().await.unwrap();
+    for sequence in 1..=EVENT_COUNT {
+        let kind = if sequence % 250 == 0 {
+            SessionEventKind::Message {
+                message_id: Uuid::new_v4(),
+                actor: EventActor::User,
+                text: format!("sparse prompt {sequence}"),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            }
+        } else {
+            SessionEventKind::Error {
+                message: format!("non-message event {sequence}"),
+            }
+        };
+        let event = SessionEvent::new(session_id, sequence, kind);
+        state.apply(&event).unwrap();
+        insert_performance_profile_event(&mut transaction, &event, &state).await;
+    }
+    sqlx::query("update sessions set next_sequence=?, state_json=?, updated_at=? where id=?")
+        .bind(i64::try_from(EVENT_COUNT + 1).unwrap())
+        .bind(serde_json::to_string(&state).unwrap())
+        .bind(Utc::now().to_rfc3339())
+        .bind(session_id.to_string())
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
+
+    let mut samples = Vec::with_capacity(SAMPLES);
+    for _ in 0..SAMPLES {
+        let started = Instant::now();
+        let prompts = store.recent_user_messages(session_id, LIMIT).await.unwrap();
+        assert_eq!(prompts.len(), LIMIT);
+        samples.push(started.elapsed());
+    }
+    let p95 = duration_p95(&mut samples);
+    eprintln!("25k-event sparse prompt recall p95: {p95:?}");
+    assert!(
+        p95 < Duration::from_millis(10),
+        "sparse recent prompt recall p95 exceeded 10 ms: {p95:?}"
+    );
+}
+
 const RECOVERY_PROFILE_OBSOLETE_EVENTS: u64 = 25_000;
 const RECOVERY_PROFILE_RETAINED_EVENTS: u64 = 100;
 
