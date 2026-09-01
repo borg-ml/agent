@@ -147,14 +147,15 @@ async fn prompt_dispatch_does_not_block_input_while_sqlite_is_locked() {
             ..
         } if routed_session == session_id && routed_message == message_id
     ));
+    let completion = tokio::time::timeout(Duration::from_secs(2), completions.recv())
+        .await
+        .expect("prompt completion timed out");
     assert!(matches!(
-        tokio::time::timeout(Duration::from_secs(2), completions.recv())
-            .await
-            .expect("prompt completion timed out"),
+        completion,
         Some(UiInteractionCompletion::Prompt {
-            submission: UiPromptSubmission { message_id: completed, .. },
+            submission,
             outcome: UiPromptOutcome::Routed,
-        }) if completed == message_id
+        }) if submission.message_id == message_id
     ));
     assert_eq!(
         store

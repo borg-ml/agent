@@ -144,8 +144,8 @@ struct UiPromptSubmission {
 
 #[derive(Debug)]
 enum UiInteractionOperation {
-    Command(HostCommand),
-    Prompt(UiPromptSubmission),
+    Command(Box<HostCommand>),
+    Prompt(Box<UiPromptSubmission>),
 }
 
 #[derive(Debug)]
@@ -158,7 +158,7 @@ enum UiPromptOutcome {
 #[derive(Debug)]
 enum UiInteractionCompletion {
     Prompt {
-        submission: UiPromptSubmission,
+        submission: Box<UiPromptSubmission>,
         outcome: UiPromptOutcome,
     },
     CoordinatorClosed,
@@ -179,7 +179,7 @@ fn spawn_ui_interaction_dispatcher(
         while let Some(operation) = operations.recv().await {
             match operation {
                 UiInteractionOperation::Command(command) => {
-                    if !coordinator_closed && commands.send(command).await.is_err() {
+                    if !coordinator_closed && commands.send(*command).await.is_err() {
                         coordinator_closed = true;
                         let _ = completion_tx.send(UiInteractionCompletion::CoordinatorClosed);
                     }
@@ -226,7 +226,7 @@ fn dispatch_ui_command(
     command: HostCommand,
 ) -> bool {
     operations
-        .send(UiInteractionOperation::Command(command))
+        .send(UiInteractionOperation::Command(Box::new(command)))
         .is_ok()
 }
 
@@ -234,9 +234,9 @@ fn dispatch_ui_prompt(
     operations: &mpsc::UnboundedSender<UiInteractionOperation>,
     pending_prompt_ids: &mut HashSet<Uuid>,
     submission: UiPromptSubmission,
-) -> std::result::Result<(), UiPromptSubmission> {
+) -> std::result::Result<(), Box<UiPromptSubmission>> {
     let message_id = submission.message_id;
-    match operations.send(UiInteractionOperation::Prompt(submission)) {
+    match operations.send(UiInteractionOperation::Prompt(Box::new(submission))) {
         Ok(()) => {
             pending_prompt_ids.insert(message_id);
             Ok(())
@@ -291,7 +291,7 @@ enum ResumeLookupResult {
 enum CollaborationTaskResult {
     Started {
         read_only: bool,
-        result: std::result::Result<(Child, String, String), String>,
+        result: Box<std::result::Result<(Child, String, String), String>>,
     },
     Stopped,
 }
@@ -2212,20 +2212,21 @@ async fn run_local_agent_session(
                 collaboration_task = None;
                 if let Some(terminal) = terminal.as_mut() {
                     match result {
-                        Ok(CollaborationTaskResult::Started {
-                            read_only,
-                            result: Ok((child, view, control)),
-                        }) => {
-                            let notice = if read_only {
-                                format!("Read-only collaboration link:\n{view}")
-                            } else {
-                                format!("Control link:\n{control}\n\nRead-only link:\n{view}")
-                            };
-                            collab_child = Some(child);
-                            terminal.show_info("Collaboration", &notice);
-                        }
-                        Ok(CollaborationTaskResult::Started { result: Err(error), .. }) => {
-                            terminal.set_notice(format!("Collaboration failed: {error}"));
+                        Ok(CollaborationTaskResult::Started { read_only, result }) => {
+                            match *result {
+                                Ok((child, view, control)) => {
+                                    let notice = if read_only {
+                                        format!("Read-only collaboration link:\n{view}")
+                                    } else {
+                                        format!("Control link:\n{control}\n\nRead-only link:\n{view}")
+                                    };
+                                    collab_child = Some(child);
+                                    terminal.show_info("Collaboration", &notice);
+                                }
+                                Err(error) => {
+                                    terminal.set_notice(format!("Collaboration failed: {error}"));
+                                }
+                            }
                         }
                         Ok(CollaborationTaskResult::Stopped) => {
                             terminal.set_notice("Collaboration link stopped.".to_string());
@@ -5545,9 +5546,11 @@ async fn run_local_agent_session(
                                         collaboration_task = Some(tokio::spawn(async move {
                                             CollaborationTaskResult::Started {
                                                 read_only,
-                                                result: start_collaboration_host(session_id)
-                                                    .await
-                                                    .map_err(|error| format!("{error:#}")),
+                                                result: Box::new(
+                                                    start_collaboration_host(session_id)
+                                                        .await
+                                                        .map_err(|error| format!("{error:#}")),
+                                                ),
                                             }
                                         }));
                                         terminal
