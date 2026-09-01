@@ -44,6 +44,33 @@ fn line_is_unstyled_blank(line: &Line<'static>) -> bool {
     line.spans.is_empty()
 }
 
+fn message_badge_colors(color: Color) -> (Color, Color) {
+    match color {
+        Color::Rgb(red, green, blue) => {
+            let mix = |base: u8, accent: u8, accent_weight: u16| {
+                ((u16::from(base) * (100 - accent_weight)
+                    + u16::from(accent) * accent_weight)
+                    / 100) as u8
+            };
+            let background = match MESSAGE_BG {
+                Color::Rgb(base_red, base_green, base_blue) => Color::Rgb(
+                    mix(base_red, red, 24),
+                    mix(base_green, green, 24),
+                    mix(base_blue, blue, 24),
+                ),
+                _ => MESSAGE_HOVER_BG,
+            };
+            let text = Color::Rgb(
+                mix(red, u8::MAX, 62),
+                mix(green, u8::MAX, 62),
+                mix(blue, u8::MAX, 62),
+            );
+            (text, background)
+        }
+        _ => (Color::White, MESSAGE_HOVER_BG),
+    }
+}
+
 fn extend_tool_lifecycle_spans(
     spans: &mut Vec<Span<'static>>,
     text: &str,
@@ -2998,13 +3025,18 @@ impl Transcript {
                     let message_content_start = lines.len();
                     let time = display_local_time(time, &today_prefix);
                     let mut header = if matches!(actor, EventActor::User | EventActor::Assistant) {
+                        let (badge_text, badge_background) = message_badge_colors(color);
                         vec![
                             Span::raw("  "),
                             Span::styled(
-                                format!(" {label} "),
+                                "▌",
+                                Style::default().fg(color).bg(badge_background),
+                            ),
+                            Span::styled(
+                                format!(" {label}  "),
                                 Style::default()
-                                    .fg(Color::White)
-                                    .bg(color)
+                                    .fg(badge_text)
+                                    .bg(badge_background)
                                     .add_modifier(Modifier::BOLD),
                             ),
                         ]
