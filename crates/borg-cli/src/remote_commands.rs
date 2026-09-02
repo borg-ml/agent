@@ -992,7 +992,7 @@ async fn enable_systemd_user_linger() -> Result<()> {
 
 #[cfg(not(target_os = "linux"))]
 async fn enable_systemd_user_linger() -> Result<()> {
-    bail!("systemd user lingering is supported only on Linux")
+    anyhow::bail!("systemd user lingering is supported only on Linux")
 }
 
 fn host_service_systemctl_commands() -> [&'static [&'static str]; 4] {
