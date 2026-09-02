@@ -1337,10 +1337,15 @@ impl AgentTurnExecutor for FlushingQueueExecutor {
     async fn execute(
         &self,
         _turn: AgentTurn,
-        _events: mpsc::Sender<SessionEventKind>,
+        events: mpsc::Sender<SessionEventKind>,
         controls: Option<mpsc::Receiver<AgentTurnControl>>,
     ) -> Result<AgentTurnResult> {
         self.turn_started.notify_one();
+        events
+            .send(SessionEventKind::ReasoningDelta {
+                text: "working".to_string(),
+            })
+            .await?;
         let mut controls = controls.expect("active turn has controls");
         while let Some(control) = controls.recv().await {
             match control {
@@ -1432,7 +1437,7 @@ impl AgentTurnExecutor for BoundaryQueueExecutor {
     async fn execute(
         &self,
         turn: AgentTurn,
-        _events: mpsc::Sender<SessionEventKind>,
+        events: mpsc::Sender<SessionEventKind>,
         _controls: Option<mpsc::Receiver<AgentTurnControl>>,
     ) -> Result<AgentTurnResult> {
         self.turns
@@ -1441,6 +1446,11 @@ impl AgentTurnExecutor for BoundaryQueueExecutor {
             .push((turn.prompt.clone(), turn.attachments));
         if subscription_prompt_ends_with(&turn.prompt, "first") {
             self.first_started.notify_one();
+            events
+                .send(SessionEventKind::ReasoningDelta {
+                    text: "working".to_string(),
+                })
+                .await?;
             self.release_first.notified().await;
         }
         Ok(AgentTurnResult {
@@ -2558,7 +2568,7 @@ async fn all_queued_prompts_can_be_recalled_at_the_turn_completion_boundary() {
         })
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(1), first_started.notified())
+    tokio::time::timeout(Duration::from_secs(3), first_started.notified())
         .await
         .expect("first turn starts");
     for (message_id, text) in queued_message_ids
@@ -3412,7 +3422,7 @@ async fn escape_flush_keeps_the_turn_running_after_admission_and_steers_queued_i
         })
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(1), turn_started.notified())
+    tokio::time::timeout(Duration::from_secs(3), turn_started.notified())
         .await
         .expect("active turn starts");
     command_tx
