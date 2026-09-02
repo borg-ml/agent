@@ -71,6 +71,8 @@ direct one-tool-per-capability fallback is preferred.
   backends; see [`docs/web-search.md`](docs/web-search.md).
 - Full Access, Auto, and Manual command-approval modes.
 - Borg Remote hosts that use the same durable session and tool runtime.
+  See the [unattended-host runbook](docs/remote-unattended-runbook.md) for
+  preflight, fault recovery, and rollback procedures.
 
 Extension authority is user-controlled. Packages can request `sandboxed`,
 `trusted`, or `native` runtime access; user policy caps project and user
