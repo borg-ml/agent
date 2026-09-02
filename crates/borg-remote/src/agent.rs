@@ -1644,6 +1644,58 @@ async fn run_borg_provider_turn(
                 )
                 .await;
             }
+            ChatStreamEvent::ToolCallGenerating { id } => {
+                if first_model_output {
+                    first_model_output = false;
+                    tracing::debug!(
+                        target: "borg_ttft",
+                        stage = "first_model_output",
+                        output_kind = "tool_call_generating",
+                        elapsed_ms = provider_turn_started.elapsed().as_millis(),
+                        session_id = %ttft_session_id,
+                        message_id = %ttft_message_id,
+                        "Borg provider stage"
+                    );
+                }
+                send(
+                    &events,
+                    SessionEventKind::ProviderEvent {
+                        provider: turn.provider,
+                        kind: "action/preparing".to_string(),
+                        payload: serde_json::json!({
+                            "label": "",
+                            "tool_call_id": id,
+                        }),
+                    },
+                )
+                .await;
+            }
+            ChatStreamEvent::ToolCallAction { id, action } => {
+                if first_model_output {
+                    first_model_output = false;
+                    tracing::debug!(
+                        target: "borg_ttft",
+                        stage = "first_model_output",
+                        output_kind = "tool_call_action",
+                        elapsed_ms = provider_turn_started.elapsed().as_millis(),
+                        session_id = %ttft_session_id,
+                        message_id = %ttft_message_id,
+                        "Borg provider stage"
+                    );
+                }
+                send(
+                    &events,
+                    SessionEventKind::ProviderEvent {
+                        provider: turn.provider,
+                        kind: "action/preparing".to_string(),
+                        payload: serde_json::json!({
+                            "label": action,
+                            "tool_call_id": id,
+                        }),
+                    },
+                )
+                .await;
+            }
             ChatStreamEvent::ToolCall { id, name, input } => {
                 anyhow::ensure!(
                     !provider_native_agent_tool(&name),

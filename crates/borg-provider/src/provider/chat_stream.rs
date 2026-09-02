@@ -208,6 +208,101 @@ struct ClaudeSteerCorrelation {
     commands: HashMap<String, String>,
 }
 
+#[derive(Default)]
+struct ClaudeToolGenerationState {
+    blocks: HashMap<u64, ClaudeToolGenerationBlock>,
+}
+
+#[derive(Default)]
+struct ClaudeToolGenerationBlock {
+    id: Option<String>,
+    arguments: String,
+    generating_emitted: bool,
+    action_emitted: bool,
+}
+
+impl ClaudeToolGenerationState {
+    fn observe(&mut self, raw: &Value) -> Vec<ChatStreamEvent> {
+        if raw.get("type").and_then(Value::as_str) != Some("stream_event") {
+            return Vec::new();
+        }
+        let Some(event) = raw.get("event") else {
+            return Vec::new();
+        };
+        let Some(index) = event.get("index").and_then(Value::as_u64) else {
+            return Vec::new();
+        };
+        match event.get("type").and_then(Value::as_str) {
+            Some("content_block_start") => {
+                let Some(content_block) = event.get("content_block") else {
+                    return Vec::new();
+                };
+                if content_block.get("type").and_then(Value::as_str) != Some("tool_use") {
+                    self.blocks.remove(&index);
+                    return Vec::new();
+                }
+                let id = content_block
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_string);
+                let mut block = ClaudeToolGenerationBlock {
+                    id: id.clone(),
+                    generating_emitted: true,
+                    ..ClaudeToolGenerationBlock::default()
+                };
+                let mut progress = vec![ChatStreamEvent::ToolCallGenerating { id: id.clone() }];
+                if let (Some(id), Some(action)) = (
+                    id,
+                    content_block.get("input").and_then(complete_tool_action),
+                ) {
+                    block.action_emitted = true;
+                    progress.push(ChatStreamEvent::ToolCallAction { id, action });
+                }
+                self.blocks.insert(index, block);
+                progress
+            }
+            Some("content_block_delta") => {
+                let Some(delta) = event.get("delta") else {
+                    return Vec::new();
+                };
+                if delta.get("type").and_then(Value::as_str) != Some("input_json_delta") {
+                    return Vec::new();
+                }
+                let block = self.blocks.entry(index).or_default();
+                let mut progress = Vec::new();
+                if !block.generating_emitted {
+                    block.generating_emitted = true;
+                    progress.push(ChatStreamEvent::ToolCallGenerating {
+                        id: block.id.clone(),
+                    });
+                }
+                if let Some(partial) = delta.get("partial_json").and_then(Value::as_str) {
+                    block.arguments.push_str(partial);
+                }
+                if !block.action_emitted
+                    && let Some(id) = block.id.clone()
+                    && let Some(action) = super::streamed_tool_action(&block.arguments)
+                {
+                    block.action_emitted = true;
+                    progress.push(ChatStreamEvent::ToolCallAction { id, action });
+                }
+                progress
+            }
+            Some("content_block_stop") => {
+                self.blocks.remove(&index);
+                Vec::new()
+            }
+            _ => Vec::new(),
+        }
+    }
+}
+
+fn complete_tool_action(input: &Value) -> Option<String> {
+    let action = input.get("action")?.as_str()?.trim();
+    (!action.is_empty() && action.chars().count() <= 64).then(|| action.to_string())
+}
+
 #[derive(Debug, Clone)]
 pub enum ChatStreamEvent {
     ProviderEvent {
@@ -228,6 +323,13 @@ pub enum ChatStreamEvent {
     Phase {
         name: String,
         input: Value,
+    },
+    ToolCallGenerating {
+        id: Option<String>,
+    },
+    ToolCallAction {
+        id: String,
+        action: String,
     },
     ToolCall {
         id: String,
@@ -1265,6 +1367,7 @@ async fn relay_claude_runtime(
             None => claude_agents::run(claude_request, native_events, native_controls).await,
         }
     }));
+    let mut tool_generation = ClaudeToolGenerationState::default();
 
     loop {
         tokio::select! {
@@ -1288,23 +1391,33 @@ async fn relay_claude_runtime(
                 let Some(event) = event else {
                     break;
                 };
+                let mut outgoing = match &event {
+                    claude_agents::ChatStreamEvent::ProviderEvent {
+                        raw_payload: Some(raw),
+                        ..
+                    } => tool_generation.observe(raw),
+                    _ => Vec::new(),
+                };
                 let event = map_claude_event_with_correlation(
                     event,
                     billing_mode,
                     Some(&steer_correlation),
                 );
                 let event = normalize_claude_cost(event, cost_tracker.as_ref());
-                if events.send(event).await.is_err()
-                {
-                    if let Some(runner) = runner.take() {
-                        runner.abort();
-                        let _ = runner.await;
+                outgoing.push(event);
+                for event in outgoing {
+                    if events.send(event).await.is_err()
+                    {
+                        if let Some(runner) = runner.take() {
+                            runner.abort();
+                            let _ = runner.await;
+                        }
+                        if let Some(forwarder) = control_forwarder.take() {
+                            forwarder.abort();
+                            let _ = forwarder.await;
+                        }
+                        return Ok(());
                     }
-                    if let Some(forwarder) = control_forwarder.take() {
-                        forwarder.abort();
-                        let _ = forwarder.await;
-                    }
-                    return Ok(());
                 }
             }
         }
@@ -3150,6 +3263,21 @@ async fn emit_codex_events_with_state(
             }
             let (name, input) = codex_tool_signature(item_type, item);
             events
+                .send(ChatStreamEvent::ToolCallGenerating {
+                    id: Some(id.clone()),
+                })
+                .await
+                .ok();
+            if let Some(action) = complete_tool_action(&input) {
+                events
+                    .send(ChatStreamEvent::ToolCallAction {
+                        id: id.clone(),
+                        action,
+                    })
+                    .await
+                    .ok();
+            }
+            events
                 .send(ChatStreamEvent::ToolCall { id, name, input })
                 .await
                 .ok();
@@ -4293,6 +4421,57 @@ mod tests {
     }
 
     #[test]
+    fn claude_tool_input_stream_generates_then_refines_one_action() {
+        let mut state = ClaudeToolGenerationState::default();
+        let started = state.observe(&serde_json::json!({
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_start",
+                "index": 1,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": "tool-1",
+                    "name": "mcp__borg_agent__update_plan",
+                    "input": {}
+                }
+            }
+        }));
+        assert!(matches!(
+            started.as_slice(),
+            [ChatStreamEvent::ToolCallGenerating { id: Some(id) }] if id == "tool-1"
+        ));
+
+        assert!(
+            state
+                .observe(&serde_json::json!({
+                    "type": "stream_event",
+                    "event": {
+                        "type": "content_block_delta",
+                        "index": 1,
+                        "delta": {"type": "input_json_delta", "partial_json": "{\"act"}
+                    }
+                }))
+                .is_empty()
+        );
+        let refined = state.observe(&serde_json::json!({
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_delta",
+                "index": 1,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": "ion\":\"edit\",\"plan\":["
+                }
+            }
+        }));
+        assert!(matches!(
+            refined.as_slice(),
+            [ChatStreamEvent::ToolCallAction { id, action }]
+                if id == "tool-1" && action == "edit"
+        ));
+    }
+
+    #[test]
     fn claude_command_lifecycle_correlates_steers_at_the_provider_boundary() {
         let correlation = StdMutex::new(ClaudeSteerCorrelation {
             pending: VecDeque::from(["borg-message-1".to_string()]),
@@ -5057,6 +5236,10 @@ mod tests {
 
         assert!(matches!(
             receiver.recv().await,
+            Some(ChatStreamEvent::ToolCallGenerating { id: Some(id) }) if id == "item-1"
+        ));
+        assert!(matches!(
+            receiver.recv().await,
             Some(ChatStreamEvent::ToolCall { id, name, input })
                 if id == "item-1"
                     && name == "command_execution"
@@ -5071,6 +5254,46 @@ mod tests {
                 ..
             }) if tool_use_id == "item-1" && output == "/home/shulgin/borg-cli\n"
         ));
+    }
+
+    #[tokio::test]
+    async fn codex_action_metadata_refines_generation_before_the_tool_lands() {
+        let (sender, mut receiver) = mpsc::channel(8);
+        emit_codex_events(
+            &sender,
+            &serde_json::json!({
+                "type": "item.started",
+                "item": {
+                    "id": "tool-1",
+                    "type": "mcp_tool_call",
+                    "server": "borg_agent",
+                    "tool": "update_plan",
+                    "arguments": {
+                        "action": "edit",
+                        "plan": []
+                    }
+                }
+            }),
+        )
+        .await;
+
+        assert!(matches!(
+            receiver.recv().await,
+            Some(ChatStreamEvent::ToolCallGenerating { id: Some(id) }) if id == "tool-1"
+        ));
+        assert!(matches!(
+            receiver.recv().await,
+            Some(ChatStreamEvent::ToolCallAction { id, action })
+                if id == "tool-1" && action == "edit"
+        ));
+        assert!(matches!(
+            receiver.recv().await,
+            Some(ChatStreamEvent::ToolCall { id, name, input })
+                if id == "tool-1"
+                    && name == "mcp__borg_agent__update_plan"
+                    && input["plan"] == serde_json::json!([])
+        ));
+        assert!(receiver.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -5193,6 +5416,10 @@ mod tests {
         assert!(matches!(
             receiver.recv().await,
             Some(ChatStreamEvent::Narration { text }) if text == "Before the tool."
+        ));
+        assert!(matches!(
+            receiver.recv().await,
+            Some(ChatStreamEvent::ToolCallGenerating { id: Some(id) }) if id == "command-1"
         ));
         assert!(matches!(
             receiver.recv().await,

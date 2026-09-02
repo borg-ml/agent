@@ -226,6 +226,41 @@ pub enum ProviderProgress {
     },
 }
 
+pub(super) fn streamed_tool_action(arguments: &str) -> Option<String> {
+    let mut remaining = arguments.trim_start().strip_prefix('{')?.trim_start();
+    let (field, rest) = parse_complete_json_string(remaining)?;
+    if field != "action" {
+        return None;
+    }
+    remaining = rest.trim_start().strip_prefix(':')?.trim_start();
+    let (action, _) = parse_complete_json_string(remaining)?;
+    let action = action.trim();
+    (!action.is_empty() && action.chars().count() <= 64).then(|| action.to_string())
+}
+
+fn parse_complete_json_string(input: &str) -> Option<(String, &str)> {
+    if !input.starts_with('"') {
+        return None;
+    }
+    let mut escaped = false;
+    for (offset, character) in input[1..].char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' => escaped = true,
+            '"' => {
+                let end = offset + 2;
+                let value = serde_json::from_str::<String>(&input[..end]).ok()?;
+                return Some((value, &input[end..]));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 impl ProviderProgress {
     pub fn stdout(chunk: Vec<u8>) -> Self {
         Self::Bytes {

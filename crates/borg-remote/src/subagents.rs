@@ -856,6 +856,7 @@ impl AgentToolDispatcher {
         let extension_api = self.extension_api_snapshot();
         specs.extend(extension_api.tool_specs());
         specs.extend(extension_api.command_specs());
+        add_action_metadata(&mut specs);
         specs
     }
 
@@ -5678,6 +5679,7 @@ fn agent_tool_specs_with_capabilities_and_consultation_and_search(
         }
         specs.extend(subagent_specs);
     }
+    add_action_metadata(&mut specs);
     specs
 }
 
@@ -6411,6 +6413,33 @@ fn todo_response(
     response
         .map_err(anyhow::Error::msg)
         .and_then(|response| serde_json::to_value(response).map_err(Into::into))
+}
+
+fn add_action_metadata(specs: &mut [Value]) {
+    for spec in specs {
+        let Some(schema) = spec.get_mut("inputSchema").and_then(Value::as_object_mut) else {
+            continue;
+        };
+        let Some(properties) = schema
+            .entry("properties")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+        else {
+            continue;
+        };
+        let mut existing = std::mem::take(properties);
+        existing.remove("action");
+        properties.insert(
+            "action".to_string(),
+            json!({
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64,
+                "description": "Optional one- or two-word summary for the live UI. When present, this must be the first argument field."
+            }),
+        );
+        properties.extend(existing);
+    }
 }
 
 fn tool(name: &str, description: &str, input_schema: Value) -> Value {

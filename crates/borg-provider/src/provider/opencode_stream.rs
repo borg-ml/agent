@@ -7,7 +7,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
-use super::{ChatStreamEvent, ChatStreamRequest, LocalAgentPermission};
+use super::{ChatStreamEvent, ChatStreamRequest, LocalAgentPermission, complete_tool_action};
 use crate::runtime::ProviderCallUsage;
 
 /// Run OpenCode as a provider subprocess while Borg remains the session and
@@ -124,6 +124,8 @@ async fn run(
     let mut session_id = request.session_id;
     let mut usage = ProviderCallUsage::default();
     let mut saw_usage = false;
+    let mut generating_tools = HashSet::new();
+    let mut described_tools = HashSet::new();
     let mut started_tools = HashSet::new();
     let mut completed_tools = HashSet::new();
 
@@ -189,7 +191,15 @@ async fn run(
                 }
             }
             "tool_use" => {
-                emit_tool(&events, &value, &mut started_tools, &mut completed_tools).await?
+                emit_tool(
+                    &events,
+                    &value,
+                    &mut generating_tools,
+                    &mut described_tools,
+                    &mut started_tools,
+                    &mut completed_tools,
+                )
+                .await?
             }
             "step_finish" => {
                 if let Some(step_usage) = parse_usage(&value) {
@@ -301,6 +311,8 @@ async fn default_model() -> Result<String> {
 async fn emit_tool(
     events: &mpsc::Sender<ChatStreamEvent>,
     value: &Value,
+    generating_tools: &mut HashSet<String>,
+    described_tools: &mut HashSet<String>,
     started_tools: &mut HashSet<String>,
     completed_tools: &mut HashSet<String>,
 ) -> Result<()> {
@@ -316,6 +328,36 @@ async fn emit_tool(
         .to_string();
     let state = value.pointer("/part/state").cloned().unwrap_or(Value::Null);
     let input = state.get("input").cloned().unwrap_or(Value::Null);
+    if generating_tools.insert(id.clone())
+        && events
+            .send(ChatStreamEvent::ToolCallGenerating {
+                id: Some(id.clone()),
+            })
+            .await
+            .is_err()
+    {
+        return Ok(());
+    }
+    if !started_tools.contains(&id)
+        && !described_tools.contains(&id)
+        && let Some(action) = complete_tool_action(&input)
+    {
+        described_tools.insert(id.clone());
+        if events
+            .send(ChatStreamEvent::ToolCallAction {
+                id: id.clone(),
+                action,
+            })
+            .await
+            .is_err()
+        {
+            return Ok(());
+        }
+    }
+    let status = state.get("status").and_then(Value::as_str);
+    if status == Some("pending") {
+        return Ok(());
+    }
     if started_tools.insert(id.clone())
         && events
             .send(ChatStreamEvent::ToolCall {
@@ -328,7 +370,6 @@ async fn emit_tool(
     {
         return Ok(());
     }
-    let status = state.get("status").and_then(Value::as_str);
     if !matches!(status, Some("completed" | "error")) || !completed_tools.insert(id.clone()) {
         return Ok(());
     }
@@ -381,9 +422,12 @@ fn parse_usage(value: &Value) -> Option<ProviderCallUsage> {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use std::collections::HashSet;
 
-    use super::{LocalAgentPermission, opencode_run_args, parse_usage};
+    use serde_json::json;
+    use tokio::sync::mpsc;
+
+    use super::{ChatStreamEvent, LocalAgentPermission, emit_tool, opencode_run_args, parse_usage};
 
     #[test]
     fn permission_mode_maps_to_supported_opencode_argv() {
@@ -431,5 +475,73 @@ mod tests {
         assert_eq!(usage.cached_input_tokens, 13_184);
         assert_eq!(usage.total_tokens, 13_248);
         assert_eq!(usage.cost_microusd, Some(125_000));
+    }
+
+    #[tokio::test]
+    async fn pending_tool_generation_is_visible_until_opencode_starts_it() {
+        let (sender, mut receiver) = mpsc::channel(8);
+        let mut generating = HashSet::new();
+        let mut described = HashSet::new();
+        let mut started = HashSet::new();
+        let mut completed = HashSet::new();
+        emit_tool(
+            &sender,
+            &json!({
+                "type": "tool_use",
+                "part": {
+                    "id": "tool-1",
+                    "tool": "mcp__borg_agent__update_plan",
+                    "state": {
+                        "status": "pending",
+                        "input": {"action": "edit"}
+                    }
+                }
+            }),
+            &mut generating,
+            &mut described,
+            &mut started,
+            &mut completed,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            receiver.recv().await,
+            Some(ChatStreamEvent::ToolCallGenerating { id: Some(id) }) if id == "tool-1"
+        ));
+        assert!(matches!(
+            receiver.recv().await,
+            Some(ChatStreamEvent::ToolCallAction { id, action })
+                if id == "tool-1" && action == "edit"
+        ));
+        assert!(receiver.try_recv().is_err());
+
+        emit_tool(
+            &sender,
+            &json!({
+                "type": "tool_use",
+                "part": {
+                    "id": "tool-1",
+                    "tool": "mcp__borg_agent__update_plan",
+                    "state": {
+                        "status": "running",
+                        "input": {"action": "edit", "plan": []}
+                    }
+                }
+            }),
+            &mut generating,
+            &mut described,
+            &mut started,
+            &mut completed,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            receiver.recv().await,
+            Some(ChatStreamEvent::ToolCall { id, name, .. })
+                if id == "tool-1" && name == "mcp__borg_agent__update_plan"
+        ));
+        assert!(receiver.try_recv().is_err());
     }
 }

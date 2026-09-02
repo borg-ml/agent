@@ -121,8 +121,8 @@ pub struct TimelineProjector {
     entries: Vec<Arc<TimelineEntry>>,
     messages: HashMap<Uuid, usize>,
     tools: HashMap<String, usize>,
-    preparing_tool: Option<usize>,
-    preparing_provider_tool_id: Option<String>,
+    preparing_tools: HashMap<String, usize>,
+    unkeyed_preparing_tools: Vec<usize>,
     reasoning: Option<usize>,
 }
 
@@ -145,6 +145,17 @@ impl TimelineProjector {
 
     pub fn into_shared_entries(self) -> Vec<Arc<TimelineEntry>> {
         self.entries
+    }
+
+    fn has_preparing_tool(&self, tool_call_id: &str) -> bool {
+        self.preparing_tools.contains_key(tool_call_id) || !self.unkeyed_preparing_tools.is_empty()
+    }
+
+    fn take_preparing_tool(&mut self, tool_call_id: &str) -> Option<usize> {
+        self.preparing_tools.remove(tool_call_id).or_else(|| {
+            (!self.unkeyed_preparing_tools.is_empty())
+                .then(|| self.unkeyed_preparing_tools.remove(0))
+        })
     }
 
     pub fn push(&mut self, event: &SessionEvent) {
@@ -221,24 +232,33 @@ impl TimelineProjector {
                 let provider_tool_id = payload
                     .get("tool_call_id")
                     .and_then(serde_json::Value::as_str);
-                let reuse = self.preparing_tool.is_some()
-                    && match (self.preparing_provider_tool_id.as_deref(), provider_tool_id) {
-                        (Some(current), Some(incoming)) => current == incoming,
-                        (None, Some(_)) => true,
-                        _ => false,
-                    };
-                if !reuse && let Some(index) = self.preparing_tool.take() {
-                    Arc::make_mut(&mut self.entries[index]).running = false;
-                    self.preparing_provider_tool_id = None;
-                }
-                let input = serde_json::json!({
-                    "label": payload
-                        .get("label")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("action")
+                let label = payload
+                    .get("label")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("action");
+                let existing = provider_tool_id.and_then(|provider_tool_id| {
+                    self.preparing_tools
+                        .get(provider_tool_id)
+                        .copied()
+                        .or_else(|| {
+                            if self.unkeyed_preparing_tools.is_empty() {
+                                return None;
+                            }
+                            let index = self.unkeyed_preparing_tools.remove(0);
+                            self.preparing_tools
+                                .insert(provider_tool_id.to_string(), index);
+                            Some(index)
+                        })
                 });
+                if provider_tool_id.is_none()
+                    && !label.is_empty()
+                    && let Some(index) = self.unkeyed_preparing_tools.pop()
+                {
+                    Arc::make_mut(&mut self.entries[index]).running = false;
+                }
+                let input = serde_json::json!({"label": label});
                 let (title, detail) = tool_call_summary("action_preparing", &input);
-                if let Some(index) = self.preparing_tool {
+                if let Some(index) = existing {
                     let entry = Arc::make_mut(&mut self.entries[index]);
                     entry.created_at = event.created_at;
                     entry.title = title;
@@ -247,9 +267,6 @@ impl TimelineProjector {
                     entry.rich_body = None;
                     entry.running = true;
                     entry.failed = false;
-                    if provider_tool_id.is_some() {
-                        self.preparing_provider_tool_id = provider_tool_id.map(str::to_string);
-                    }
                     return;
                 }
                 let index = self.entries.len();
@@ -264,19 +281,20 @@ impl TimelineProjector {
                     running: true,
                     failed: false,
                 }));
-                self.preparing_tool = Some(index);
-                self.preparing_provider_tool_id = provider_tool_id.map(str::to_string);
+                if let Some(provider_tool_id) = provider_tool_id {
+                    self.preparing_tools
+                        .insert(provider_tool_id.to_string(), index);
+                } else {
+                    self.unkeyed_preparing_tools.push(index);
+                }
             }
             SessionEventKind::ToolStarted {
                 tool_call_id,
                 name,
                 input,
                 ..
-            } if self.preparing_tool.is_some()
-                && self
-                    .preparing_provider_tool_id
-                    .as_deref()
-                    .is_none_or(|expected| expected == tool_call_id)
+            } if !self.tools.contains_key(tool_call_id)
+                && self.has_preparing_tool(tool_call_id)
                 && edit_is_awaiting_diff(name, input) =>
             {
                 self.reasoning = None;
@@ -296,15 +314,10 @@ impl TimelineProjector {
                 let (title, detail) = tool_call_summary(name, input);
                 let known_tool = self.tools.get(tool_call_id).copied();
                 let running_tool = known_tool.filter(|index| self.entries[*index].running);
-                let matching_preparation = self
-                    .preparing_provider_tool_id
-                    .as_deref()
-                    .is_none_or(|expected| expected == tool_call_id)
-                    .then(|| self.preparing_tool.take())
+                let matching_preparation = known_tool
+                    .is_none()
+                    .then(|| self.take_preparing_tool(tool_call_id))
                     .flatten();
-                if matching_preparation.is_some() {
-                    self.preparing_provider_tool_id = None;
-                }
                 let index = if matches!(&event.kind, SessionEventKind::ToolStarted { .. }) {
                     matching_preparation.or(running_tool)
                 } else {
@@ -357,13 +370,8 @@ impl TimelineProjector {
                     entry.body = output.clone();
                     entry.rich_body = None;
                 } else if known_index.is_none()
-                    && self
-                        .preparing_provider_tool_id
-                        .as_deref()
-                        .is_none_or(|expected| expected == tool_call_id)
-                    && let Some(index) = self.preparing_tool.take()
+                    && let Some(index) = self.take_preparing_tool(tool_call_id)
                 {
-                    self.preparing_provider_tool_id = None;
                     let entry = Arc::make_mut(&mut self.entries[index]);
                     let label = entry.detail.take().unwrap_or_else(|| "action".into());
                     entry.title = format!("Run {label}");
@@ -595,5 +603,68 @@ mod tests {
         assert!(!entries[0].running);
         assert_eq!(entries[1].title, "Generate inspect second");
         assert!(entries[1].running);
+    }
+
+    #[test]
+    fn parallel_action_preparations_promote_without_orphan_entries() {
+        let session_id = Uuid::new_v4();
+        let mut projector = TimelineProjector::default();
+        for (sequence, tool_call_id, label) in [
+            (1, "tool-a", ""),
+            (2, "tool-b", ""),
+            (3, "tool-a", "read"),
+            (4, "tool-b", "run tests"),
+        ] {
+            projector.push(&SessionEvent::new(
+                session_id,
+                sequence,
+                SessionEventKind::ProviderEvent {
+                    provider: CodingProvider::Codex,
+                    kind: "action/preparing".into(),
+                    payload: serde_json::json!({
+                        "label": label,
+                        "tool_call_id": tool_call_id,
+                    }),
+                },
+            ));
+        }
+        assert_eq!(projector.entries.len(), 2);
+        assert!(projector.entries.iter().all(|entry| entry.running));
+
+        for (sequence, tool_call_id, name, input) in [
+            (
+                5,
+                "tool-a",
+                "read_file",
+                serde_json::json!({"path": "src/lib.rs"}),
+            ),
+            (
+                6,
+                "tool-b",
+                "exec_command",
+                serde_json::json!({"cmd": "cargo test"}),
+            ),
+        ] {
+            projector.push(&SessionEvent::new(
+                session_id,
+                sequence,
+                SessionEventKind::ToolStarted {
+                    tool_call_id: tool_call_id.into(),
+                    name: name.into(),
+                    input,
+                    input_ref: None,
+                },
+            ));
+        }
+
+        assert_eq!(projector.entries.len(), 2);
+        assert_ne!(projector.tools["tool-a"], projector.tools["tool-b"]);
+        assert!(projector.entries.iter().all(|entry| entry.running));
+        assert!(
+            projector
+                .entries
+                .iter()
+                .all(|entry| !entry.title.starts_with("Generate"))
+        );
     }
 }

@@ -385,10 +385,11 @@ async fn handle_line_with_cancel(
             let Some(name) = params.get("name").and_then(Value::as_str) else {
                 return Some(rpc_error(id, -32602, "missing tool name".to_string()));
             };
-            let arguments = params
+            let mut arguments = params
                 .get("arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
+            strip_action_metadata(&mut arguments);
             match forward(endpoint, name, arguments, cancel).await {
                 Ok(value) => Ok(if modern {
                     modern_tool_result(value)
@@ -405,6 +406,12 @@ async fn handle_line_with_cancel(
         Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
         Err(error) => rpc_error(id, -32000, format!("{error:#}")),
     })
+}
+
+fn strip_action_metadata(arguments: &mut Value) {
+    if let Some(arguments) = arguments.as_object_mut() {
+        arguments.remove("action");
+    }
 }
 
 fn request_protocol(
@@ -653,9 +660,8 @@ mod tests {
         )
         .await
         .unwrap();
-        let names = response["result"]["tools"]
-            .as_array()
-            .unwrap()
+        let tools = response["result"]["tools"].as_array().unwrap();
+        let names = tools
             .iter()
             .filter_map(|tool| tool.get("name").and_then(Value::as_str))
             .collect::<Vec<_>>();
@@ -669,6 +675,43 @@ mod tests {
         assert!(names.contains(&"lsp_workspace_diagnostics"));
         assert!(names.contains(&"list_blu_workflows"));
         assert!(names.contains(&"run_blu_extension"));
+        for tool in tools {
+            let properties = tool["inputSchema"]["properties"]
+                .as_object()
+                .expect("agent tool properties");
+            assert_eq!(
+                properties.keys().next().map(String::as_str),
+                Some("action"),
+                "{} must present action first",
+                tool["name"]
+            );
+            assert!(
+                !tool["inputSchema"]["required"]
+                    .as_array()
+                    .is_some_and(|required| required.iter().any(|field| field == "action")),
+                "{} must keep action optional",
+                tool["name"]
+            );
+        }
+    }
+
+    #[test]
+    fn action_metadata_is_removed_before_tool_dispatch() {
+        let mut arguments = json!({
+            "action": "edit",
+            "path": "src/main.rs",
+            "payload": {"action": "domain value"}
+        });
+
+        strip_action_metadata(&mut arguments);
+
+        assert_eq!(
+            arguments,
+            json!({
+                "path": "src/main.rs",
+                "payload": {"action": "domain value"}
+            })
+        );
     }
 
     #[tokio::test]

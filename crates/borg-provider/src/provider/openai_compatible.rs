@@ -15,7 +15,8 @@ use super::{
     ProviderProgress, StructuredOutputDialect, apply_provider_request_timeout,
     chat_completion_response_format, extract_chat_completions_usage, nonempty_env,
     parse_chat_completion_json_text, provider_cost_usd_to_microusd,
-    read_provider_error_response_text, read_provider_success_response_text, truncate_provider_text,
+    read_provider_error_response_text, read_provider_success_response_text, streamed_tool_action,
+    truncate_provider_text,
 };
 
 const COMPATIBLE_STREAM_MAX_BYTES: usize = 128 * 1024 * 1024;
@@ -1193,41 +1194,6 @@ async fn read_compatible_model_stream(
         finish_reason,
         raw,
     })
-}
-
-fn streamed_tool_action(arguments: &str) -> Option<String> {
-    let mut remaining = arguments.trim_start().strip_prefix('{')?.trim_start();
-    let (field, rest) = parse_complete_json_string(remaining)?;
-    if field != "action" {
-        return None;
-    }
-    remaining = rest.trim_start().strip_prefix(':')?.trim_start();
-    let (action, _) = parse_complete_json_string(remaining)?;
-    let action = action.trim();
-    (!action.is_empty() && action.chars().count() <= 64).then(|| action.to_string())
-}
-
-fn parse_complete_json_string(input: &str) -> Option<(String, &str)> {
-    if !input.starts_with('"') {
-        return None;
-    }
-    let mut escaped = false;
-    for (offset, character) in input[1..].char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        match character {
-            '\\' => escaped = true,
-            '"' => {
-                let end = offset + 2;
-                let value = serde_json::from_str::<String>(&input[..end]).ok()?;
-                return Some((value, &input[end..]));
-            }
-            _ => {}
-        }
-    }
-    None
 }
 
 fn compatible_retryable_status(status: reqwest::StatusCode) -> bool {
