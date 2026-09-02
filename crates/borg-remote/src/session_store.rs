@@ -1820,6 +1820,40 @@ impl SqliteSessionStore {
             .transpose()
     }
 
+    /// Return host-owned launches that still have durable non-terminal work.
+    /// The remote host calls this after a process restart so an acknowledged
+    /// prompt cannot remain stranded until another command happens to arrive.
+    pub async fn pending_host_launch_metadata(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(Uuid, serde_json::Value)>> {
+        let rows = sqlx::query(
+            "select h.session_id, h.metadata_json from host_launches h \
+             where exists (select 1 from session_actions a \
+                 where a.session_id=h.session_id \
+                   and a.state not in ('completed','failed','cancelled')) \
+             order by h.created_at asc limit ?",
+        )
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                let session_id = parse_uuid(row.try_get("session_id")?)?;
+                let metadata: &str = row.try_get("metadata_json")?;
+                ensure!(
+                    metadata.len() <= MAX_HOST_LAUNCH_METADATA_BYTES,
+                    "host launch metadata exceeds {MAX_HOST_LAUNCH_METADATA_BYTES} bytes"
+                );
+                Ok((
+                    session_id,
+                    serde_json::from_str(metadata)
+                        .context("host launch metadata contains invalid JSON")?,
+                ))
+            })
+            .collect()
+    }
+
     /// Claim one trusted runtime namespace for a worker process. A running
     /// manifest owned by a different worker is evidence that Borg restarted
     /// or recovered; callers can then offer an explicit checkpoint restore

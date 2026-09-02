@@ -4,7 +4,6 @@ use std::io::{Read, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -66,6 +65,29 @@ const PROVIDER_AUTH_JSON_MAX_BYTES: u64 = 1024 * 1024;
 const REMOTE_RETRY_INITIAL: Duration = Duration::from_secs(2);
 const REMOTE_RETRY_MAX: Duration = Duration::from_secs(60);
 const REMOTE_RETRY_AFTER_MAX: Duration = Duration::from_secs(300);
+const HOST_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+const HOST_HEARTBEAT_RETRY_MAX: Duration = Duration::from_secs(30);
+const SYSTEMD_NOTIFY_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+struct HostAcknowledgement {
+    sequence: u64,
+    claim_token: Option<Uuid>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct PersistedHostState {
+    host_id: Uuid,
+    acknowledged: HostAcknowledgement,
+}
+
+struct AbortTask(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 
 #[derive(Default)]
 struct RemoteRetryBackoff {
@@ -1781,8 +1803,11 @@ pub async fn run_host_with_executor_factory(
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(35))
         .build()?;
-    let acknowledged = Arc::new(AtomicU64::new(0));
-    let mut acknowledged_claim_token = None;
+    let host_state_path = host_state_path(config_path);
+    let acknowledged = Arc::new(Mutex::new(load_host_acknowledgement(
+        &host_state_path,
+        config.host_id,
+    )));
     let sessions: Arc<Mutex<HashMap<Uuid, mpsc::Sender<HostCommand>>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let session_root = config_path
@@ -1795,34 +1820,29 @@ pub async fn run_host_with_executor_factory(
     let mut capabilities =
         probe_capabilities_with_profile(config.roots.clone(), config.execution_profile).await;
     capabilities.resource_limits = config.resource_limits.clone();
-    let mut capabilities_probed_at = Instant::now();
+    let _heartbeat = AbortTask(tokio::spawn(run_host_heartbeat_loop(
+        client.clone(),
+        config.clone(),
+        Arc::clone(&acknowledged),
+        capabilities,
+    )));
     let mut command_poll_backoff = RemoteRetryBackoff::default();
     loop {
-        if capabilities_probed_at.elapsed() >= Duration::from_secs(300) {
-            capabilities =
-                probe_capabilities_with_profile(config.roots.clone(), config.execution_profile)
-                    .await;
-            capabilities.resource_limits = config.resource_limits.clone();
-            capabilities_probed_at = Instant::now();
-        }
-        if let Err(error) = heartbeat(
+        resume_pending_host_sessions(
             &client,
             &config,
-            capabilities.clone(),
-            acknowledged.load(Ordering::Relaxed),
-            acknowledged_claim_token,
+            &session_root,
+            &sessions,
+            &session_store,
+            &executor_factory,
         )
-        .await
-        {
-            tracing::warn!(%error, "remote host heartbeat failed; retrying");
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            continue;
-        }
+        .await?;
+        let command_cursor = acknowledged.lock().await.sequence;
         let response = client
             .get(endpoint(&config.server, "/api/remote/host/commands"))
             .bearer_auth(&config.host_token)
             .query(&[
-                ("after", acknowledged.load(Ordering::Relaxed).to_string()),
+                ("after", command_cursor.to_string()),
                 ("wait_seconds", "20".to_string()),
                 ("protocol", "1".to_string()),
             ])
@@ -1882,10 +1902,112 @@ pub async fn run_host_with_executor_factory(
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 break;
             }
-            if sequence >= acknowledged.load(Ordering::Relaxed) {
-                acknowledged_claim_token = claim_token;
+            advance_host_acknowledgement(
+                &host_state_path,
+                config.host_id,
+                &acknowledged,
+                sequence,
+                claim_token,
+            )
+            .await?;
+        }
+    }
+}
+
+async fn run_host_heartbeat_loop(
+    client: Client,
+    config: HostConfig,
+    acknowledged: Arc<Mutex<HostAcknowledgement>>,
+    mut capabilities: HostCapabilities,
+) {
+    let mut capabilities_probed_at = Instant::now();
+    let mut retry = RemoteRetryBackoff::default();
+    let mut service_ready = notify_systemd(&[
+        "--ready",
+        "--status=Borg Remote initialized; connecting to its control plane",
+    ])
+    .await;
+    loop {
+        if capabilities_probed_at.elapsed() >= Duration::from_secs(300) {
+            capabilities =
+                probe_capabilities_with_profile(config.roots.clone(), config.execution_profile)
+                    .await;
+            capabilities.resource_limits = config.resource_limits.clone();
+            capabilities_probed_at = Instant::now();
+        }
+        let acknowledgement = *acknowledged.lock().await;
+        match heartbeat(
+            &client,
+            &config,
+            capabilities.clone(),
+            acknowledgement.sequence,
+            acknowledgement.claim_token,
+        )
+        .await
+        {
+            Ok(()) => {
+                retry.reset();
+                if !service_ready {
+                    service_ready = notify_systemd(&[
+                        "--ready",
+                        "--status=Borg Remote connected to its control plane",
+                    ])
+                    .await;
+                }
+                if service_ready {
+                    let _ = notify_systemd(&[
+                        "--status=Borg Remote connected to its control plane",
+                        "WATCHDOG=1",
+                    ])
+                    .await;
+                }
+                tokio::time::sleep(HOST_HEARTBEAT_INTERVAL).await;
             }
-            acknowledged.fetch_max(sequence, Ordering::Relaxed);
+            Err(error) => {
+                let delay = retry.next_delay(None).min(HOST_HEARTBEAT_RETRY_MAX);
+                tracing::warn!(
+                    %error,
+                    retry_seconds = delay.as_secs(),
+                    "remote host heartbeat failed; retrying"
+                );
+                if service_ready {
+                    let _ = notify_systemd(&[
+                        "--status=Borg Remote control plane unavailable; retrying",
+                        "WATCHDOG=1",
+                    ])
+                    .await;
+                }
+                tokio::time::sleep(delay).await;
+            }
+        }
+    }
+}
+
+async fn notify_systemd(arguments: &[&str]) -> bool {
+    if std::env::var_os("NOTIFY_SOCKET").is_none() {
+        return true;
+    }
+    match tokio::time::timeout(
+        SYSTEMD_NOTIFY_TIMEOUT,
+        Command::new("systemd-notify").args(arguments).status(),
+    )
+    .await
+    {
+        Ok(Ok(status)) if status.success() => true,
+        Ok(Ok(status)) => {
+            tracing::warn!(
+                ?status,
+                "systemd-notify rejected the Borg Remote health update"
+            );
+            false
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "failed to run systemd-notify for Borg Remote");
+            false
+        }
+        Err(_) => {
+            tracing::warn!("systemd-notify timed out for Borg Remote");
+            false
         }
     }
 }
@@ -2485,11 +2607,68 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
                 }
             }
         };
-        if let Some(session) = session {
-            session.send(command).await.ok();
+        let Some(session) = session else {
+            tracing::warn!(%session_id, "remote command has no durable launch metadata; retaining it for relay retry");
+            return false;
+        };
+        if let HostCommand::Prompt {
+            message_id,
+            text,
+            attachments,
+            delivery,
+            ..
+        } = &command
+            && let Err(error) = admit_remote_prompt(
+                session_store.as_ref(),
+                session_id,
+                *message_id,
+                text,
+                attachments,
+                *delivery,
+            )
+            .await
+        {
+            tracing::warn!(%error, %session_id, %message_id, "failed to durably admit remote prompt; retaining it for relay retry");
+            return false;
         }
+        if session.send(command).await.is_err() {
+            tracing::warn!(%session_id, "remote session actor stopped before command delivery; retaining it for relay retry");
+            return false;
+        }
+        return true;
     }
     true
+}
+
+async fn admit_remote_prompt(
+    store: &SqliteSessionStore,
+    session_id: Uuid,
+    message_id: Uuid,
+    text: &str,
+    attachments: &[PathBuf],
+    delivery: crate::PromptDelivery,
+) -> Result<()> {
+    let workspace_durable = match store.workspace_store().await? {
+        Some(workspace) => workspace.contains_message(message_id).await?,
+        None => false,
+    };
+    if !workspace_durable {
+        store
+            .admit_prompt(SessionEvent::new(
+                session_id,
+                0,
+                crate::SessionEventKind::Message {
+                    message_id,
+                    actor: crate::EventActor::User,
+                    text: text.to_string(),
+                    attachments: attachments.to_vec(),
+                    status: crate::MessageStatus::Queued,
+                    delivery: Some(delivery),
+                },
+            ))
+            .await?;
+    }
+    Ok(())
 }
 
 async fn upload_host_action_result<T: Serialize>(
@@ -3159,6 +3338,60 @@ struct HostSessionLaunch {
     session_id: Uuid,
     request: LaunchSession,
     attachment: Option<WorkspaceAttachment>,
+}
+
+async fn resume_pending_host_sessions(
+    client: &Client,
+    config: &HostConfig,
+    session_root: &Path,
+    sessions: &Arc<Mutex<HashMap<Uuid, mpsc::Sender<HostCommand>>>>,
+    session_store: &SqliteSessionStore,
+    executor_factory: &HostExecutorFactory,
+) -> Result<()> {
+    let mut available = config
+        .resource_limits
+        .max_concurrent_sessions
+        .saturating_sub(sessions.lock().await.len() as u32) as usize;
+    if available == 0 {
+        return Ok(());
+    }
+    for (session_id, value) in session_store.pending_host_launch_metadata(256).await? {
+        if available == 0 {
+            break;
+        }
+        if sessions.lock().await.contains_key(&session_id) {
+            continue;
+        }
+        let metadata = match serde_json::from_value::<PersistedLaunchMetadata>(value) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                tracing::error!(%error, %session_id, "cannot recover invalid remote session launch metadata");
+                continue;
+            }
+        };
+        if let Err(error) =
+            validate_workspace_attachment(config, session_id, metadata.attachment.as_ref())
+        {
+            tracing::error!(%error, %session_id, "cannot recover remote session with an invalid workspace attachment");
+            continue;
+        }
+        tracing::info!(%session_id, "recovering remote session with durable unfinished work");
+        spawn_host_session(
+            client.clone(),
+            config.clone(),
+            session_root.to_path_buf(),
+            Arc::clone(sessions),
+            Arc::clone(executor_factory),
+            HostSessionLaunch {
+                session_id,
+                request: metadata.request,
+                attachment: metadata.attachment,
+            },
+        )
+        .await;
+        available -= 1;
+    }
+    Ok(())
 }
 
 async fn spawn_host_session(
@@ -3932,7 +4165,65 @@ fn canonical_roots(roots: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
         .collect()
 }
 
+fn host_state_path(config_path: &Path) -> PathBuf {
+    config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("host-state.json")
+}
+
+fn load_host_acknowledgement(path: &Path, host_id: Uuid) -> HostAcknowledgement {
+    let state = match fs::read(path) {
+        Ok(bytes) => serde_json::from_slice::<PersistedHostState>(&bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return HostAcknowledgement::default();
+        }
+        Err(error) => {
+            tracing::warn!(%error, path = %path.display(), "failed to read the durable remote host cursor; relying on relay replay");
+            return HostAcknowledgement::default();
+        }
+    };
+    match state {
+        Ok(state) if state.host_id == host_id => state.acknowledged,
+        Ok(_) => HostAcknowledgement::default(),
+        Err(error) => {
+            tracing::warn!(%error, path = %path.display(), "the durable remote host cursor is invalid; relying on relay replay");
+            HostAcknowledgement::default()
+        }
+    }
+}
+
+async fn advance_host_acknowledgement(
+    path: &Path,
+    host_id: Uuid,
+    acknowledged: &Mutex<HostAcknowledgement>,
+    sequence: u64,
+    claim_token: Option<Uuid>,
+) -> Result<()> {
+    let current = *acknowledged.lock().await;
+    if sequence < current.sequence {
+        return Ok(());
+    }
+    let next = HostAcknowledgement {
+        sequence,
+        claim_token,
+    };
+    write_private_json(
+        path,
+        &PersistedHostState {
+            host_id,
+            acknowledged: next,
+        },
+    )?;
+    *acknowledged.lock().await = next;
+    Ok(())
+}
+
 fn write_config(path: &Path, config: &HostConfig) -> Result<()> {
+    write_private_json(path, config)
+}
+
+fn write_private_json(path: &Path, value: &impl Serialize) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
         #[cfg(unix)]
@@ -3941,7 +4232,7 @@ fn write_config(path: &Path, config: &HostConfig) -> Result<()> {
             fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
         }
     }
-    let bytes = serde_json::to_vec_pretty(config)?;
+    let bytes = serde_json::to_vec_pretty(value)?;
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path
         .file_name()
@@ -5022,6 +5313,128 @@ mod tests {
             "a denied command must be acknowledged as handled"
         );
         assert!(sessions.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn undeliverable_remote_prompt_is_durable_and_unacknowledged() {
+        let root = tempdir().unwrap();
+        let config = test_config(root.path());
+        let session_id = Uuid::new_v4();
+        let message_id = Uuid::new_v4();
+        let launch = LaunchSession {
+            request_id: Uuid::new_v4(),
+            cwd: root.path().to_path_buf(),
+            provider: CodingProvider::Codex,
+            model: None,
+            effort: None,
+            fast: Some(false),
+            response_language: crate::ResponseLanguage::Auto,
+            permission_mode: crate::PermissionMode::Manual,
+            name: None,
+            initial_prompt: None,
+            capabilities: Default::default(),
+            subagent_concurrency_limit: None,
+            extension_skill_roots: Vec::new(),
+            team_policy: None,
+        };
+        let session_store = Arc::new(
+            SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+                .await
+                .unwrap(),
+        );
+        session_store.create_session(session_id).await.unwrap();
+        for kind in [
+            crate::SessionEventKind::SessionStarted,
+            crate::SessionEventKind::SessionConfigured {
+                cwd: root.path().to_path_buf(),
+                provider: CodingProvider::Codex,
+                model: None,
+                effort: None,
+                fast: false,
+                response_language: crate::ResponseLanguage::Auto,
+                permission_mode: crate::PermissionMode::Manual,
+            },
+        ] {
+            session_store
+                .append(SessionEvent::new(session_id, 0, kind))
+                .await
+                .unwrap();
+        }
+        persist_launch_metadata(&session_store, session_id, &launch, None)
+            .await
+            .unwrap();
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        let (dead_sender, dead_receiver) = mpsc::channel(1);
+        drop(dead_receiver);
+        sessions.lock().await.insert(session_id, dead_sender);
+
+        let handled = dispatch(
+            DispatchContext {
+                client: Client::new(),
+                config,
+                session_root: root.path().to_path_buf(),
+                sessions,
+                session_store: Arc::clone(&session_store),
+                receipts: Arc::new(sqlite_receipts().await),
+                executor_factory: default_host_executor_factory(),
+            },
+            HostCommand::Prompt {
+                session_id,
+                message_id,
+                text: "survive the actor crash".to_string(),
+                attachments: Vec::new(),
+                output_schema: None,
+                delivery: crate::PromptDelivery::Queue,
+            },
+        )
+        .await;
+
+        assert!(!handled, "the relay must retry an undelivered command");
+        assert!(
+            session_store
+                .contains_message(session_id, message_id)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            session_store
+                .pending_host_launch_metadata(8)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>(),
+            [session_id]
+        );
+    }
+
+    #[tokio::test]
+    async fn host_acknowledgement_survives_restart_without_crossing_enrollments() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("host-state.json");
+        let host_id = Uuid::new_v4();
+        let claim_token = Uuid::new_v4();
+        let acknowledged = Mutex::new(HostAcknowledgement::default());
+
+        advance_host_acknowledgement(&path, host_id, &acknowledged, 9, Some(claim_token))
+            .await
+            .unwrap();
+        advance_host_acknowledgement(&path, host_id, &acknowledged, 4, Some(Uuid::new_v4()))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            load_host_acknowledgement(&path, host_id),
+            HostAcknowledgement {
+                sequence: 9,
+                claim_token: Some(claim_token),
+            }
+        );
+        assert_eq!(
+            load_host_acknowledgement(&path, Uuid::new_v4()),
+            HostAcknowledgement::default(),
+            "a re-enrolled host must not inherit the previous host's cursor"
+        );
     }
 
     #[test]

@@ -1300,6 +1300,7 @@ fn reinstalling_the_remote_host_restarts_it_on_the_new_binary() {
         host_service_systemctl_commands(),
         [
             &["--user", "daemon-reload"][..],
+            &["--user", "reset-failed", "borg-remote.service"][..],
             &["--user", "enable", "borg-remote.service"][..],
             &["--user", "restart", "borg-remote.service"][..],
         ]
@@ -1367,6 +1368,15 @@ fn trusted_remote_host_service_keeps_legacy_unit_small() {
     assert!(!unit.contains("IPAddressDeny=any"));
     assert!(!unit.contains("NoNewPrivileges=true"));
     assert!(unit.contains("ExecStart=\"/usr/local/bin/borg\""));
+    for directive in [
+        "StartLimitIntervalSec=0",
+        "Type=notify",
+        "NotifyAccess=all",
+        "Restart=always",
+        "WatchdogSec=90",
+    ] {
+        assert!(unit.contains(directive), "missing {directive} in {unit}");
+    }
 }
 
 #[test]

@@ -749,6 +749,7 @@ async fn install_host_service(config_path: &Path) -> Result<()> {
             "systemd-analyze rejected the isolated hosted service unit"
         );
     }
+    enable_systemd_user_linger().await?;
     for args in host_service_systemctl_commands() {
         let mut command = tokio::process::Command::new("systemctl");
         command.args(args);
@@ -760,7 +761,7 @@ async fn install_host_service(config_path: &Path) -> Result<()> {
         anyhow::ensure!(status.success(), "systemctl {} failed", args.join(" "));
     }
     println!(
-        "Borg Remote is installed and running as a user service.\n  {}",
+        "Borg Remote is installed, boot-persistent, and running as a user service.\n  {}",
         service_path.display()
     );
     Ok(())
@@ -774,7 +775,7 @@ fn host_service_unit(
     allowed_networks: &[String],
 ) -> Result<String> {
     let mut service = format!(
-        "[Unit]\nDescription=Borg Remote host\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStart={} remote host --config {}\nEnvironment={}\nRestart=always\nRestartSec=2\n",
+        "[Unit]\nDescription=Borg Remote host\nAfter=network-online.target\nWants=network-online.target\nStartLimitIntervalSec=0\n\n[Service]\nType=notify\nNotifyAccess=all\nExecStart={} remote host --config {}\nEnvironment={}\nRestart=always\nRestartSec=5\nWatchdogSec=90\nTimeoutStartSec=120\nTimeoutStopSec=30\n",
         systemd_quote(validated_systemd_value(&executable.to_string_lossy())?),
         systemd_quote(validated_systemd_value(&config_path.to_string_lossy())?),
         systemd_quote(validated_systemd_value(&format!("PATH={path}"))?),
@@ -952,9 +953,48 @@ fn configure_systemd_user_bus(command: &mut tokio::process::Command) {
 #[cfg(not(target_os = "linux"))]
 fn configure_systemd_user_bus(_command: &mut tokio::process::Command) {}
 
-fn host_service_systemctl_commands() -> [&'static [&'static str]; 3] {
+#[cfg(target_os = "linux")]
+async fn enable_systemd_user_linger() -> Result<()> {
+    let user = unsafe { libc::geteuid() }.to_string();
+    let status = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        tokio::process::Command::new("loginctl")
+            .args(["enable-linger", &user])
+            .status(),
+    )
+    .await
+    .context("timed out enabling boot persistence for the Borg Remote user service")?
+    .context("failed to run `loginctl enable-linger`")?;
+    ensure!(
+        status.success(),
+        "Borg Remote is installed for this login session, but boot persistence could not be enabled; run `sudo loginctl enable-linger {user}` and retry"
+    );
+
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        tokio::process::Command::new("loginctl")
+            .args(["show-user", &user, "--property=Linger", "--value"])
+            .output(),
+    )
+    .await
+    .context("timed out verifying Borg Remote boot persistence")?
+    .context("failed to verify Borg Remote boot persistence")?;
+    ensure!(
+        output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "yes",
+        "Borg Remote user lingering is not enabled; run `sudo loginctl enable-linger {user}` and retry"
+    );
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn enable_systemd_user_linger() -> Result<()> {
+    bail!("systemd user lingering is supported only on Linux")
+}
+
+fn host_service_systemctl_commands() -> [&'static [&'static str]; 4] {
     [
         &["--user", "daemon-reload"],
+        &["--user", "reset-failed", "borg-remote.service"],
         &["--user", "enable", "borg-remote.service"],
         &["--user", "restart", "borg-remote.service"],
     ]
