@@ -65,7 +65,7 @@ description = "Review the current change"
 [api]
 version = 1
 
-# Active packages can override any validated editor preference, keybinding,
+# Active packages can override any validated agent UI preference, keybinding,
 # and slash alias. Later packages in dependency-first load order win.
 [api.editor.transcript]
 assistant_label = "borg"

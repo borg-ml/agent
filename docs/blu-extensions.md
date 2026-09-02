@@ -1,10 +1,10 @@
 # Blu extensions
 
-For the user-facing editor, keybinding, notification, access-policy, and native
+For the user-facing agent UI, keybinding, notification, access-policy, and native
 extension guide, start with [`customization.md`](customization.md).
 
 Blu is Borg's live extension package system. It combines the discoverability
-of an editor package manager with a deliberately small, auditable execution
+of an agent extension manager with a deliberately small, auditable execution
 surface.
 
 ## Package layout
@@ -74,7 +74,7 @@ Borg hashes manifests, package contents, declared skill roots, state, effective
 capabilities, trust, and explicit reload signals. Running local TUI sessions check that revision twice per
 second; enrolled Remote hosts revalidate immediately before every turn. A valid
 change updates skill roots, MCP server definitions, and executable workflow
-source for the next turn without restarting the session. Editor, theme,
+source for the next turn without restarting the session. Interface, theme,
 keybinding, and alias contributions apply immediately after the validated
 catalog swap. The current turn is
 never mutated underneath a provider. If validation fails, Borg keeps the
@@ -126,8 +126,9 @@ workflow = "review"
 description = "Run the durable review command"
 ```
 
-`api.editor` is a partial, typed `editor.toml` tree. It covers layout,
-rendering/presentation, theme/transcript, interaction, and future public editor
+`api.editor` is the compatibility name for a partial, typed agent UI preference
+tree stored in `editor.toml`. It covers layout,
+rendering/presentation, theme/transcript, interaction, and future public agent UI
 preferences without requiring a manifest-version change. Unknown or invalid
 fields isolate the package. Keybindings replace the named action's chord list;
 aliases target slash commands. Active packages merge in dependency-first load
@@ -174,7 +175,7 @@ automation remains compatible.
 Inside a running Borg TUI, `/extensions` shows the exact last-known-good live
 snapshot, activation reasons, scope, and revision. Filesystem changes are
 watched automatically; `borg extensions reload` is available when tooling or
-an editor needs an explicit reload signal.
+a frontend needs an explicit reload signal.
 
 ## Selectable workflow runtimes
 

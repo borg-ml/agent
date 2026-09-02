@@ -9,6 +9,7 @@ experimental `borg-gui` frontend is developed and built separately.
 [Blu language](https://github.com/borg-ml/blu) ·
 [Documentation](docs/) ·
 [简体中文](docs/zh-Hans/README.md) ·
+[Español](docs/es/README.md) ·
 [Русский](docs/ru/README.md)
 
 ## Install
@@ -87,12 +88,12 @@ cp configs/editor.example.toml ~/.config/borg/editor.toml
 
 Use `$XDG_CONFIG_HOME/borg` instead when `XDG_CONFIG_HOME` is set. The agent
 configuration covers providers, capabilities, MCP servers, aliases, and team
-settings. The editor configuration covers shared interface language plus TUI
+settings. The agent interface configuration covers shared language plus TUI
 presentation and input behavior; the native frontend uses the same interface
 language with platform-native input and rendering. `/ui-language` changes UI
 labels, while `/language` independently controls the model's response language.
 
-See [`docs/customization.md`](docs/customization.md) for editor settings,
+See [`docs/customization.md`](docs/customization.md) for agent interface settings,
 keybindings, alerts, extension authority, and native extension authoring.
 Use `borg customize inspect`, `borg customize export`, and
 `borg customize import` to inspect or move the complete effective setup.
@@ -132,13 +133,14 @@ contract. Blu workflow files may use `.blu`, `.lua`, or `.luau` entrypoints.
 
 ## Documentation
 
-- [`docs/customization.md`](docs/customization.md) — editor settings,
+- [`docs/customization.md`](docs/customization.md) — agent interface settings,
   keybindings, alerts, trust policy, and native extensions
 - [`docs/session-lifecycle.md`](docs/session-lifecycle.md) — detached hosts,
   attachment, resume, and shutdown behavior
 - [`docs/usage-count.md`](docs/usage-count.md) — active-install metric and
   privacy contract
 - [`docs/zh-Hans/README.md`](docs/zh-Hans/README.md) — Simplified Chinese guide
+- [`docs/es/README.md`](docs/es/README.md) — Spanish guide
 - [`docs/ru/README.md`](docs/ru/README.md) — Russian guide
 - [`TODO.md`](TODO.md) — remaining customization surface and extension API work
 - [`docs/blu-extensions.md`](docs/blu-extensions.md) — extension packages and

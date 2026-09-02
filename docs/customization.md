@@ -2,8 +2,8 @@
 
 Borg has three customization layers:
 
-1. `editor.toml` controls shared interface language plus terminal presentation
-   and interaction behavior.
+1. The agent interface preference file (`editor.toml`) controls shared language,
+   terminal presentation, and interaction behavior.
 2. `agent.toml` controls capabilities, keybindings, aliases, providers, and extension policy.
 3. Blu packages add skills, commands, tools, hooks, workflows, or native code.
 
@@ -13,9 +13,9 @@ The default user configuration directory is `$XDG_CONFIG_HOME/borg`, or
 [`configs/agent.example.toml`](../configs/agent.example.toml). An explicit
 `borg agent --config PATH` replaces the default agent configuration path.
 
-## Interactive editor settings
+## Interactive agent settings
 
-Run `/settings` to open the settings picker. Changes made by editor pickers are
+Run `/settings` to open the settings picker. Changes made by agent UI pickers are
 persisted to `editor.toml`.
 
 | Setting | Command | Configuration |
@@ -130,10 +130,11 @@ Use `borg extensions list`, `borg extensions info ID`, `borg extensions doctor`,
 or `/extensions` to see requested access, activation state, and admission
 failures. Valid package changes are picked up at the next turn boundary.
 
-### Editor API
+### Agent UI API (`api.editor`)
 
-An active package can contribute a validated partial `editor.toml` tree plus
-keybindings and command aliases. This covers every public editor preference;
+An active package can contribute a validated partial agent UI preference tree
+(`editor.toml`) plus
+keybindings and command aliases. This covers every public agent UI preference;
 unknown fields and invalid chords isolate the package.
 
 ```toml
@@ -218,11 +219,11 @@ last-known-good runtime snapshot.
 
 ## Profiles and effective-state inspection
 
-`borg customize inspect` shows the contributing files, effective editor state,
+`borg customize inspect` shows the contributing files, effective interface state,
 keybindings, aliases, extension access policy, catalog revision, and every
 extension admission decision. Add `--json` for tooling.
 
-`borg customize export PROFILE.json` writes user agent/editor settings plus user
+`borg customize export PROFILE.json` writes user agent and interface settings plus user
 and current-project Blu state as one versioned profile. Use `--force` to replace
 an existing archive. `borg customize import PROFILE.json` validates the entire
 archive before changing anything; `--force` deliberately makes the imported
