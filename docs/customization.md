@@ -2,7 +2,8 @@
 
 Borg has three customization layers:
 
-1. `editor.toml` controls the terminal UI and interaction behavior.
+1. `editor.toml` controls shared interface language plus terminal presentation
+   and interaction behavior.
 2. `agent.toml` controls capabilities, keybindings, aliases, providers, and extension policy.
 3. Blu packages add skills, commands, tools, hooks, workflows, or native code.
 
@@ -19,6 +20,7 @@ persisted to `editor.toml`.
 
 | Setting | Command | Configuration |
 | --- | --- | --- |
+| Interface language | `/ui-language` | `presentation.ui_language = "auto"`, `"en"`, `"zh-Hans"`, `"es"`, or `"ru"` |
 | Active-turn messages | `/followups` | `interaction.active_messages = "steer"` or `"queue"` |
 | Keep machine awake | `/sleep` | `interaction.prevent_sleep = true` or `false` |
 | Desktop completion notification | `/notifications` | `interaction.completion_notifications = "off"`, `"unfocused"`, or `"always"` |
@@ -31,6 +33,16 @@ persisted to `editor.toml`.
 | Dictation icon | `/icons` | `presentation.dictation_icon = "nerd_font"` or `"emoji"` |
 | Transcript labels | `/user-label`, `/assistant-label` | `transcript.user_label`, `transcript.assistant_label` |
 | Transcript colors | `/colors`, `/color` | the four `transcript.*_color` values in `#RRGGBB` form |
+
+Interface language and response language are deliberately separate. The former
+translates Borg's labels and chrome and is a local preference shared by the TUI
+and GUI. The latter is selected with `/language`, belongs to the durable
+session configuration, and instructs the model which language to use. Command
+names, model IDs, paths, tool output, and user content are never translated.
+
+`auto` follows `LC_ALL`, then `LC_MESSAGES`, then `LANG`, with English as the
+fallback. A language change applies immediately to newly rendered interface
+copy; persisted events and provider output are left unchanged.
 
 Notification and sound policies are independent. This always shows a desktop
 notification but only sounds when the terminal is unfocused:

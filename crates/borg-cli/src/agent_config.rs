@@ -17,6 +17,7 @@ pub(crate) struct AgentConfig {
     pub(crate) mcp: McpConfig,
     pub(crate) approvals: ApprovalConfig,
     pub(crate) updates: UpdateConfig,
+    pub(crate) usage_count: UsageCountConfig,
     pub(crate) local: LocalProviderConfig,
     /// Named OpenAI-compatible routes. The durable session keeps the generic
     /// native provider kind and records the stable `provider/model` alias.
@@ -309,6 +310,19 @@ pub(crate) struct UpdateConfig {
     pub(crate) auto_install: bool,
     /// Minimum interval between release checks.
     pub(crate) check_interval_hours: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct UsageCountConfig {
+    /// Send a content-free, monthly rotating active-install heartbeat.
+    pub(crate) enabled: bool,
+}
+
+impl Default for UsageCountConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
 }
 
 impl Default for UpdateConfig {

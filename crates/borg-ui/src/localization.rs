@@ -8,14 +8,16 @@ pub enum UiLanguage {
     English,
     SimplifiedChinese,
     Spanish,
+    Russian,
 }
 
 impl UiLanguage {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::Auto,
         Self::English,
         Self::SimplifiedChinese,
         Self::Spanish,
+        Self::Russian,
     ];
 
     pub const fn code(self) -> &'static str {
@@ -24,6 +26,7 @@ impl UiLanguage {
             Self::English => "en",
             Self::SimplifiedChinese => "zh-Hans",
             Self::Spanish => "es",
+            Self::Russian => "ru",
         }
     }
 
@@ -33,6 +36,7 @@ impl UiLanguage {
             Self::English => "English",
             Self::SimplifiedChinese => "简体中文",
             Self::Spanish => "Español",
+            Self::Russian => "Русский",
         }
     }
 
@@ -44,6 +48,7 @@ impl UiLanguage {
                 Some(Self::SimplifiedChinese)
             }
             "es" | "spanish" | "español" => Some(Self::Spanish),
+            "ru" | "ru-ru" | "russian" | "русский" => Some(Self::Russian),
             _ => None,
         }
     }
@@ -61,6 +66,8 @@ impl UiLanguage {
             Self::SimplifiedChinese
         } else if locale.starts_with("es") {
             Self::Spanish
+        } else if locale.starts_with("ru") {
+            Self::Russian
         } else {
             Self::English
         }
@@ -73,6 +80,7 @@ pub fn text<'a>(language: UiLanguage, english: &'a str) -> &'a str {
     match (language.resolved(), english) {
         (UiLanguage::SimplifiedChinese, value) => chinese(value).unwrap_or(value),
         (UiLanguage::Spanish, value) => spanish(value).unwrap_or(value),
+        (UiLanguage::Russian, value) => russian(value).unwrap_or(value),
         _ => english,
     }
 }
@@ -82,6 +90,7 @@ fn chinese(value: &str) -> Option<&'static str> {
         "Automatic" => "跟随系统",
         "English" => "英语",
         "Spanish" => "西班牙语",
+        "Russian" => "俄语",
         "What are we working on?" => "我们要做什么？",
         "Describe a task…" => "描述任务…",
         "Type a follow-up to redirect the current turn now…" => "输入后续消息以调整当前任务…",
@@ -115,6 +124,22 @@ fn chinese(value: &str) -> Option<&'static str> {
         "Response and drafting language" => "回复与起草语言",
         "UI language" => "界面语言",
         "Interface language" => "界面语言",
+        "native session" => "本机会话",
+        "GOAL" => "目标",
+        "RECENT SESSIONS" => "最近会话",
+        "CHOOSE MODEL" => "选择模型",
+        "load earlier history" => "加载更早的历史记录",
+        "TEAM" => "团队",
+        "back to root" => "返回主代理",
+        "PLAN" => "计划",
+        "Approval required" => "需要批准",
+        "Deny" => "拒绝",
+        "Approve once" => "仅批准一次",
+        "Allow session" => "本会话允许",
+        "Provider input" => "提供商输入",
+        "Cancel" => "取消",
+        "COMMANDS" => "命令",
+        "esc / close" => "esc / 关闭",
         "Agent" => "代理",
         "Agents" => "代理",
         "Tasks" => "任务",
@@ -150,10 +175,15 @@ fn spanish(value: &str) -> Option<&'static str> {
         "Automatic" => "Automático",
         "English" => "Inglés",
         "Spanish" => "Español",
+        "Russian" => "Ruso",
         "What are we working on?" => "¿En qué estamos trabajando?",
         "Describe a task…" => "Describe una tarea…",
-        "Type a follow-up to redirect the current turn now…" => "Escribe un mensaje para redirigir el turno actual…",
-        "Type a follow-up to send after the current turn…" => "Escribe un mensaje para enviar después del turno actual…",
+        "Type a follow-up to redirect the current turn now…" => {
+            "Escribe un mensaje para redirigir el turno actual…"
+        }
+        "Type a follow-up to send after the current turn…" => {
+            "Escribe un mensaje para enviar después del turno actual…"
+        }
         "send" => "enviar",
         "commands" => "comandos",
         "palette menu" => "menú de comandos",
@@ -183,6 +213,22 @@ fn spanish(value: &str) -> Option<&'static str> {
         "Response and drafting language" => "Idioma de respuesta y redacción",
         "UI language" => "Idioma de la interfaz",
         "Interface language" => "Idioma de la interfaz",
+        "native session" => "sesión nativa",
+        "GOAL" => "OBJETIVO",
+        "RECENT SESSIONS" => "SESIONES RECIENTES",
+        "CHOOSE MODEL" => "ELEGIR MODELO",
+        "load earlier history" => "cargar historial anterior",
+        "TEAM" => "EQUIPO",
+        "back to root" => "volver al agente principal",
+        "PLAN" => "PLAN",
+        "Approval required" => "Se requiere aprobación",
+        "Deny" => "Denegar",
+        "Approve once" => "Aprobar una vez",
+        "Allow session" => "Permitir en la sesión",
+        "Provider input" => "Entrada del proveedor",
+        "Cancel" => "Cancelar",
+        "COMMANDS" => "COMANDOS",
+        "esc / close" => "esc / cerrar",
         "Agent" => "Agente",
         "Agents" => "Agentes",
         "Tasks" => "Tareas",
@@ -213,15 +259,110 @@ fn spanish(value: &str) -> Option<&'static str> {
     })
 }
 
+fn russian(value: &str) -> Option<&'static str> {
+    Some(match value {
+        "Automatic" => "Автоматически",
+        "English" => "Английский",
+        "Spanish" => "Испанский",
+        "Russian" => "Русский",
+        "What are we working on?" => "Над чем будем работать?",
+        "Describe a task…" => "Опишите задачу…",
+        "Type a follow-up to redirect the current turn now…" => {
+            "Введите сообщение, чтобы изменить текущий ход…"
+        }
+        "Type a follow-up to send after the current turn…" => {
+            "Введите сообщение для отправки после текущего хода…"
+        }
+        "send" => "отправить",
+        "commands" => "команды",
+        "palette menu" => "палитра команд",
+        "Jump to bottom" => "Перейти вниз",
+        "Pending Input" => "Ожидающий ввод",
+        "ready" => "готов",
+        "starting" => "запускается",
+        "running" => "выполняется",
+        "awaiting approval" => "ожидает подтверждения",
+        "stopped" => "остановлен",
+        "failed" => "ошибка",
+        "main thread" => "главный поток",
+        "model pending" => "ожидание модели",
+        "default" => "по умолчанию",
+        "full access" => "полный доступ",
+        "manual" => "вручную",
+        "unknown" => "неизвестно",
+        "offline" => "не в сети",
+        "standard" => "обычный",
+        "fast" => "быстрый",
+        "model" => "модель",
+        "effort" => "усилие",
+        "access" => "доступ",
+        "login" => "войти",
+        "dismiss" => "закрыть",
+        "Response language" => "Язык ответа",
+        "Response and drafting language" => "Язык ответов и черновиков",
+        "UI language" | "Interface language" => "Язык интерфейса",
+        "native session" => "локальный сеанс",
+        "GOAL" => "ЦЕЛЬ",
+        "RECENT SESSIONS" => "НЕДАВНИЕ СЕАНСЫ",
+        "CHOOSE MODEL" => "ВЫБЕРИТЕ МОДЕЛЬ",
+        "load earlier history" => "загрузить раннюю историю",
+        "TEAM" => "КОМАНДА",
+        "back to root" => "к главному агенту",
+        "PLAN" => "ПЛАН",
+        "Approval required" => "Требуется подтверждение",
+        "Deny" => "Отклонить",
+        "Approve once" => "Разрешить один раз",
+        "Allow session" => "Разрешить для сеанса",
+        "Provider input" => "Ввод для провайдера",
+        "Cancel" => "Отмена",
+        "COMMANDS" => "КОМАНДЫ",
+        "esc / close" => "esc / закрыть",
+        "Agent" => "Агент",
+        "Agents" => "Агенты",
+        "Tasks" => "Задачи",
+        "Usage" => "Использование",
+        "AGENT" => "АГЕНТ",
+        "MODEL" => "МОДЕЛЬ",
+        "EFFORT" => "УСИЛИЕ",
+        "STATE" => "СОСТОЯНИЕ",
+        "USAGE" => "ТОКЕНЫ",
+        "No local Borg session" => "Нет локального сеанса Borg",
+        "unconfigured" => "не настроено",
+        "Context" => "Контекст",
+        "Input tokens" => "Входные токены",
+        "Output tokens" => "Выходные токены",
+        "Total tokens" => "Всего токенов",
+        "Provider time" => "Время провайдера",
+        "Working directory" => "Рабочий каталог",
+        "Permission" => "Разрешения",
+        "Provider" => "Провайдер",
+        "Fast mode" => "Быстрый режим",
+        "Help" => "Справка",
+        "Settings" => "Настройки",
+        "New session" => "Новый сеанс",
+        "Open session" => "Открыть сеанс",
+        "Back to director" => "Вернуться к координатору",
+        "No subagents are running" => "Нет запущенных субагентов",
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn language_codes_are_stable_and_translations_fall_back_to_english() {
-        assert_eq!(UiLanguage::parse("zh-CN"), Some(UiLanguage::SimplifiedChinese));
+        assert_eq!(
+            UiLanguage::parse("zh-CN"),
+            Some(UiLanguage::SimplifiedChinese)
+        );
         assert_eq!(UiLanguage::parse("español"), Some(UiLanguage::Spanish));
+        assert_eq!(UiLanguage::parse("русский"), Some(UiLanguage::Russian));
         assert_eq!(text(UiLanguage::SimplifiedChinese, "Settings"), "设置");
-        assert_eq!(text(UiLanguage::SimplifiedChinese, "protocol-id"), "protocol-id");
+        assert_eq!(
+            text(UiLanguage::SimplifiedChinese, "protocol-id"),
+            "protocol-id"
+        );
     }
 }

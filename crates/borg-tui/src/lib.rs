@@ -34,11 +34,11 @@ use borg_remote::{
 };
 #[cfg(test)]
 use borg_remote::{tool_call_summary, tool_code_view};
+use borg_ui::localization::{UiLanguage, text as ui_text};
 use borg_ui::preferences::{
     CompletionAlertPolicy, DictationIconStyle, DiffExpansionPolicy, TranscriptPreferences,
     parse_hex_color,
 };
-use borg_ui::localization::{UiLanguage, text as ui_text};
 use borg_ui::timeline::tool_lifecycle_label;
 use chrono::{DateTime, Local, NaiveDate, Utc};
 use crossterm::cursor::SetCursorStyle;
@@ -3548,10 +3548,7 @@ impl BorgTerminal {
             options: UiLanguage::ALL
                 .into_iter()
                 .map(|language| {
-                    PickerOption::new(
-                        ui_text(self.ui_language, language.name()),
-                        language.code(),
-                    )
+                    PickerOption::new(ui_text(self.ui_language, language.name()), language.code())
                 })
                 .collect(),
             selected: UiLanguage::ALL
@@ -5597,12 +5594,10 @@ impl BorgTerminal {
                 "Answer the provider request…"
             } else {
                 match status {
-                    SessionStatus::Running | SessionStatus::Starting => {
-                        ui_text(
-                            ui_language,
-                            active_message_placeholder(self.steer_active_turn),
-                        )
-                    }
+                    SessionStatus::Running | SessionStatus::Starting => ui_text(
+                        ui_language,
+                        active_message_placeholder(self.steer_active_turn),
+                    ),
                     SessionStatus::WaitingForApproval => "Allow · Y   Deny · N",
                     _ => ui_text(ui_language, "Describe a task…"),
                 }
@@ -11395,7 +11390,10 @@ fn primary_controls_spans(keymap: &KeyMap, language: UiLanguage) -> Vec<Span<'st
     vec![
         Span::styled(format!("{} ", ui_text(language, "send")), binding_style),
         Span::styled(keymap.label(KeyAction::Send), key_style),
-        Span::styled(format!(" · {} ", ui_text(language, "commands")), binding_style),
+        Span::styled(
+            format!(" · {} ", ui_text(language, "commands")),
+            binding_style,
+        ),
         Span::styled("/", key_style),
         Span::styled(
             format!(" · {} ", ui_text(language, "palette menu")),

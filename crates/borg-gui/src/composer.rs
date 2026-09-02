@@ -11,6 +11,17 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use borg_ui::palette;
 
+fn mask_secret(content: &str) -> String {
+    content.graphemes(true).map(|_| '*').collect()
+}
+
+fn masked_offset(content: &str, offset: usize) -> usize {
+    content
+        .grapheme_indices(true)
+        .take_while(|(start, _)| *start < offset)
+        .count()
+}
+
 actions!(
     composer,
     [
@@ -509,8 +520,17 @@ impl Element for ComposerElement {
     ) -> Prepaint {
         let input = self.input.read(cx);
         let content = input.content.clone();
-        let cursor = input.cursor();
-        let selected = input.selected.clone();
+        let mut cursor = input.cursor();
+        let mut selected = input.selected.clone();
+        let mut marked = input.marked.clone();
+        if input.secret {
+            cursor = masked_offset(&content, cursor);
+            selected =
+                masked_offset(&content, selected.start)..masked_offset(&content, selected.end);
+            marked = marked.map(|range| {
+                masked_offset(&content, range.start)..masked_offset(&content, range.end)
+            });
+        }
         let style = window.text_style();
         let (display, color) = if content.is_empty() {
             (
@@ -518,7 +538,7 @@ impl Element for ComposerElement {
                 hsla(0., 0., 0.62, 0.65),
             )
         } else if input.secret {
-            ("*".repeat(content.len()).into(), style.color)
+            (mask_secret(&content).into(), style.color)
         } else {
             (content, style.color)
         };
@@ -533,7 +553,7 @@ impl Element for ComposerElement {
         let mut boundaries = vec![0, display.len()];
         if !input.content.is_empty() {
             boundaries.extend([selected.start, selected.end]);
-            if let Some(marked) = &input.marked {
+            if let Some(marked) = &marked {
                 boundaries.extend([marked.start, marked.end]);
             }
         }
@@ -550,7 +570,7 @@ impl Element for ComposerElement {
                         && start < selected.end
                         && end > selected.start)
                         .then(|| rgba(0x4aa3ff44).into()),
-                    underline: input.marked.as_ref().and_then(|marked| {
+                    underline: marked.as_ref().and_then(|marked| {
                         (start < marked.end && end > marked.start).then(|| UnderlineStyle {
                             color: Some(base_run.color),
                             thickness: px(1.),
@@ -677,5 +697,16 @@ impl Render for Composer {
             .line_height(px(24.))
             .text_size(px(14.))
             .child(ComposerElement { input: cx.entity() })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{mask_secret, masked_offset};
+
+    #[test]
+    fn secret_mask_uses_one_cell_per_grapheme() {
+        assert_eq!(mask_secret("中文e\u{301}👩‍💻"), "****");
+        assert_eq!(masked_offset("中文e\u{301}👩‍💻", "中文e\u{301}".len()), 3);
     }
 }

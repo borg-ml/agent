@@ -22,13 +22,12 @@ use borg_remote::{
     SessionConfigAction, SessionEvent, SessionEventKind, SessionGoal, SessionState, SessionStatus,
     SessionStore, SessionWriterLease, SpawnSubagent, SqliteSessionStore, SubagentAction,
     SubagentSnapshot, SubagentStatus, TodoAction, default_host_config_path, enroll_host,
-    force_terminate_local_session_owner, local_session_owner_uses_current_binary, login_provider,
-    local_session_owner_is_active, mirror_local_session, obsolete_local_session_owner_pid,
-    probe_capabilities,
-    probe_provider_admission_capabilities, provider_credentials_present,
-    run_agent_session_with_store_and_writer, run_agent_session_with_store_writer_and_peers,
-    run_attached_session, run_host_with_executor_factory, send_local_session_command,
-    session_control_socket_path,
+    force_terminate_local_session_owner, local_session_owner_is_active,
+    local_session_owner_uses_current_binary, login_provider, mirror_local_session,
+    obsolete_local_session_owner_pid, probe_capabilities, probe_provider_admission_capabilities,
+    provider_credentials_present, run_agent_session_with_store_and_writer,
+    run_agent_session_with_store_writer_and_peers, run_attached_session,
+    run_host_with_executor_factory, send_local_session_command, session_control_socket_path,
 };
 use chrono::{Local, TimeZone, Utc};
 use futures_util::FutureExt;
@@ -49,13 +48,13 @@ use crate::editor_preferences::{
     ActiveMessageBehavior, CompletionAlertPolicy, DictationIconStyle, DiffExpansionPolicy,
     EditorPreferences,
 };
-use borg_ui::localization::UiLanguage;
 use crate::sleep_inhibitor::SleepInhibitor;
 use crate::terminal_ui::{
     BorgTerminal, DictationState, ProviderAuthChoice, ResumeSessionOption, TerminalInputEvent,
     UiAction, dictation_icon_style_for_preference, discard_pending_terminal_input,
     spawn_terminal_io_worker,
 };
+use borg_ui::localization::UiLanguage;
 
 #[path = "local_server.rs"]
 mod local_server;
@@ -497,6 +496,7 @@ pub(crate) async fn run_remote_command(command: RemoteCommand) -> Result<()> {
         }
         RemoteCommand::Host { config } => {
             let agent_config = AgentConfig::load(None)?;
+            crate::usage_count::spawn_background(agent_config.usage_count);
             crate::updater::spawn_background(agent_config.updates);
             let config_path = config.unwrap_or_else(default_host_config_path);
             println!("Borg Remote host connected from {}", config_path.display());
@@ -1021,6 +1021,7 @@ pub(crate) async fn run_local_agent(args: LocalAgentCliArgs) -> Result<()> {
     let agent_config = AgentConfig::load(args.config.as_deref())?;
     // Provider environment is applied inside each owned session, after resume
     // configuration is resolved and before the server/executor starts.
+    crate::usage_count::spawn_background(agent_config.usage_count.clone());
     crate::updater::spawn_background(agent_config.updates.clone());
     let ephemeral_sessions = args.ephemeral.then(tempfile::tempdir).transpose()?;
     let crash_context = Arc::new(TuiCrashContext::default());
@@ -1044,12 +1045,7 @@ pub(crate) async fn run_local_agent(args: LocalAgentCliArgs) -> Result<()> {
     let mut resume_retry_delay = LOCAL_RESUME_RETRY_INITIAL_DELAY;
     loop {
         if let Some(session_id) = detached_session {
-            ensure_detached_session_host(
-                &args,
-                session_id,
-                include_initial_host_prompt,
-            )
-            .await?;
+            ensure_detached_session_host(&args, session_id, include_initial_host_prompt).await?;
             include_initial_host_prompt = false;
         }
         let resume_requested =
@@ -1240,7 +1236,9 @@ fn append_session_host_arguments(
     if let Some(cwd) = args.cwd.as_ref().or(implicit_cwd.as_ref()) {
         command.arg("--cwd").arg(cwd);
     }
-    command.arg("--provider").arg(provider_argument(args.provider));
+    command
+        .arg("--provider")
+        .arg(provider_argument(args.provider));
     if let Some(model) = args.model.as_ref() {
         command.arg("--model").arg(model);
     }
@@ -1630,7 +1628,9 @@ async fn run_local_agent_session(
         SqliteSessionStore::open(sessions_dir.join("sessions.sqlite3")).await?
     });
     let store_open_ms = store_open_started.elapsed().as_millis() as u64;
-    let session_id = if let Some(session_id) = selected_session.or(args.resume).or(args.session_host) {
+    let session_id = if let Some(session_id) =
+        selected_session.or(args.resume).or(args.session_host)
+    {
         session_id_if_present(sqlite_store.as_ref(), session_id).await?
     } else if args.continue_latest {
         let current_dir = args

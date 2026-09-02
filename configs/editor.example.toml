@@ -17,6 +17,9 @@ completion_notifications = "unfocused"
 completion_sound = "unfocused"
 
 [presentation]
+# Interface labels only; independent of the model response language selected
+# by /language. Valid values: auto, en, zh-Hans, es, ru.
+ui_language = "auto"
 refresh_rate_fps = 60
 diff_expansion = "expanded" # expanded | collapsed | until_next_action
 auto_expand_tools = false

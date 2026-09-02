@@ -316,6 +316,7 @@ mod tests {
                 completion_sound: CompletionAlertPolicy::Off,
             },
             presentation: PresentationPreferences {
+                ui_language: UiLanguage::SimplifiedChinese,
                 refresh_rate_fps: 144,
                 diff_expansion: Some(DiffExpansionPolicy::UntilNextAction),
                 auto_expand_edits: false,

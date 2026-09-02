@@ -1140,13 +1140,13 @@ fn keybinding_help_is_action_first_and_uses_configuration() {
     };
     let keymap = KeyMap::from_config(&config).expect("keymap");
     assert_eq!(
-        primary_controls_line(&keymap),
+        primary_controls_line(&keymap, UiLanguage::English),
         "send ctrl+s · commands / · palette menu tab or ?"
     );
-    let controls = primary_controls_spans(&keymap);
+    let controls = primary_controls_spans(&keymap, UiLanguage::English);
     assert_eq!(
         Line::from(controls.clone()).to_string(),
-        primary_controls_line(&keymap)
+        primary_controls_line(&keymap, UiLanguage::English)
     );
     assert_eq!(controls[0].style.fg, Some(Color::DarkGray));
     assert_eq!(controls[1].style.fg, Some(Color::Gray));

@@ -4,7 +4,9 @@ use borg_ui::{
     ApprovalDecision, CodingProvider, FrontendCommand, ModelOption, PromptDelivery,
     ResponseLanguage, SessionView,
     local::{LocalSessionOption, LocalSessionUpdate, LocalSessionWorker},
+    localization::{UiLanguage, text as ui_text},
     palette,
+    preferences::EditorPreferences,
     timeline::{TimelineEntry, TimelineKind, tool_lifecycle_label},
 };
 use gpui::{
@@ -76,6 +78,7 @@ struct BorgGui {
     info_panel: Option<(SharedString, SharedString)>,
     expanded_entries: HashSet<String>,
     temporary_attachments: HashSet<PathBuf>,
+    ui_language: UiLanguage,
 }
 
 impl BorgGui {
@@ -85,6 +88,31 @@ impl BorgGui {
         cx: &mut Context<Self>,
     ) -> Self {
         cx.subscribe(&composer, |this, _, event: &Submitted, cx| {
+            if let Some(value) = event.0.trim().strip_prefix("/ui-language ") {
+                match UiLanguage::parse(value) {
+                    Some(language) => {
+                        let mut preferences = EditorPreferences::load().unwrap_or_default();
+                        preferences.presentation.ui_language = language;
+                        match preferences.save() {
+                            Ok(()) => {
+                                this.ui_language = language;
+                                this.info_panel = Some((
+                                    ui_text(language, "Interface language").into(),
+                                    language.name().into(),
+                                ));
+                            }
+                            Err(error) => this.error = Some(error.to_string()),
+                        }
+                    }
+                    None => {
+                        this.error = Some(
+                            "Unknown interface language. Use auto, en, zh-Hans, es, or ru.".into(),
+                        )
+                    }
+                }
+                cx.notify();
+                return;
+            }
             if let Some((kind, payload)) = this.view.as_ref().and_then(|view| {
                 Some((
                     view.state.pending_provider_interaction_kind.clone()?,
@@ -306,6 +334,10 @@ impl BorgGui {
             info_panel: None,
             expanded_entries: HashSet::new(),
             temporary_attachments: HashSet::new(),
+            ui_language: EditorPreferences::load()
+                .unwrap_or_default()
+                .presentation
+                .ui_language,
         };
         if let Some(updates) = updates {
             this.schedule_updates(updates, cx);
@@ -928,11 +960,12 @@ impl Drop for BorgGui {
 
 impl Render for BorgGui {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let ui_language = self.ui_language;
         let cwd: SharedString = self
             .view
             .as_ref()
             .map(|v| v.cwd.display().to_string())
-            .unwrap_or_else(|| "No local Borg session".into())
+            .unwrap_or_else(|| ui_text(ui_language, "No local Borg session").into())
             .into();
         let timeline = Arc::clone(&self.timeline);
         let transcript_state = self.transcript_state.clone();
@@ -958,11 +991,11 @@ impl Render for BorgGui {
             .and_then(|v| v.state.configuration.as_ref());
         let model: SharedString = configuration
             .and_then(|c| c.model.clone())
-            .unwrap_or_else(|| "unconfigured".into())
+            .unwrap_or_else(|| ui_text(ui_language, "unconfigured").into())
             .into();
         let effort: SharedString = configuration
             .and_then(|c| c.effort.clone())
-            .unwrap_or_else(|| "default".into())
+            .unwrap_or_else(|| ui_text(ui_language, "default").into())
             .into();
         let access: SharedString = configuration
             .map(|c| match c.permission_mode {
@@ -1073,6 +1106,11 @@ impl Render for BorgGui {
             ("/effort LEVEL", "change reasoning effort", "/effort "),
             ("/permission MODE", "full, auto, or manual", "/permission "),
             ("/language NAME", "change response language", "/language "),
+            (
+                "/ui-language NAME",
+                "change interface language",
+                "/ui-language ",
+            ),
             ("/fast on|off", "toggle priority mode", "/fast "),
             ("/settings", "inspect live session settings", "/settings"),
             ("/usage", "inspect tokens, time, and cost", "/usage"),
@@ -1129,7 +1167,7 @@ impl Render for BorgGui {
                                     .cursor_pointer()
                                     .on_click(cx.listener(Self::toggle_sessions))
                                     .text_color(rgb(palette::TEXT_MUTED))
-                                    .child("native session  ▾"),
+                                    .child(format!("{}  ▾", ui_text(ui_language, "native session"))),
                             ),
                     )
                     .child(
@@ -1155,7 +1193,7 @@ impl Render for BorgGui {
                                 .id("goal-summary")
                                 .cursor_pointer()
                                 .on_click(cx.listener(Self::show_goal))
-                                .child(div().text_color(rgb(palette::GREEN)).child("GOAL"))
+                                .child(div().text_color(rgb(palette::GREEN)).child(ui_text(ui_language, "GOAL")))
                                 .child(div().min_w_0().overflow_hidden().text_ellipsis().child(goal)),
                         ),
                 )
@@ -1183,9 +1221,9 @@ impl Render for BorgGui {
                                 .py_1()
                                 .text_xs()
                                 .text_color(rgb(palette::TEXT_MUTED))
-                                .child("RECENT SESSIONS"),
+                                .child(ui_text(ui_language, "RECENT SESSIONS")),
                         )
-                        .child(div().id("new-session").px_3().py_2().mb_1().cursor_pointer().text_color(rgb(palette::ORANGE)).hover(|style| style.bg(rgb(palette::SURFACE_RAISED))).on_click(cx.listener(Self::new_session)).child("+ New session"))
+                        .child(div().id("new-session").px_3().py_2().mb_1().cursor_pointer().text_color(rgb(palette::ORANGE)).hover(|style| style.bg(rgb(palette::SURFACE_RAISED))).on_click(cx.listener(Self::new_session)).child(format!("+ {}", ui_text(ui_language, "New session"))))
                         .children(session_options.into_iter().map(|session| {
                             let session_id = session.session_id;
                             let title = session.title.chars().take(72).collect::<String>();
@@ -1252,7 +1290,7 @@ impl Render for BorgGui {
                                             div()
                                                 .font_weight(FontWeight::SEMIBOLD)
                                                 .text_color(rgb(palette::ORANGE))
-                                                .child("CHOOSE MODEL"),
+                                                .child(ui_text(ui_language, "CHOOSE MODEL")),
                                         )
                                         .child(
                                             div()
@@ -1341,7 +1379,7 @@ impl Render for BorgGui {
                                     .cursor_pointer()
                                     .hover(|s| s.bg(rgb(palette::SURFACE_RAISED)))
                                     .on_click(cx.listener(Self::load_older))
-                                    .child("load earlier history"),
+                                    .child(ui_text(ui_language, "load earlier history")),
                             )
                             .child(
                                 list(transcript_state, move |index, _, _| {
@@ -1377,7 +1415,7 @@ impl Render for BorgGui {
                                             .justify_between()
                                             .text_xs()
                                             .text_color(rgb(palette::TEXT_MUTED))
-                                            .child("TEAM")
+                                            .child(ui_text(ui_language, "TEAM"))
                                             .when(focused_child, |header| {
                                                 header.child(
                                                     div()
@@ -1385,7 +1423,7 @@ impl Render for BorgGui {
                                                         .cursor_pointer()
                                                         .text_color(rgb(palette::BLUE))
                                                         .on_click(cx.listener(Self::focus_root))
-                                                        .child("back to root"),
+                                                        .child(ui_text(ui_language, "back to root")),
                                                 )
                                             }),
                                     )
@@ -1430,7 +1468,7 @@ impl Render for BorgGui {
                                                     .border_color(rgb(palette::BORDER))
                                                     .text_xs()
                                                     .text_color(rgb(palette::TEXT_MUTED))
-                                                    .child("PLAN"),
+                                                    .child(ui_text(ui_language, "PLAN")),
                                             )
                                             .children(todos.into_iter().map(|item| {
                                                 let item_id = item.id;
@@ -1593,7 +1631,7 @@ impl Render for BorgGui {
                                 .child(
                                     div()
                                         .text_color(rgb(palette::PEACH))
-                                        .child("Approval required"),
+                                        .child(ui_text(ui_language, "Approval required")),
                                 )
                                 .child(
                                     div()
@@ -1606,7 +1644,7 @@ impl Render for BorgGui {
                                                 .py_1()
                                                 .cursor_pointer()
                                                 .on_click(cx.listener(Self::deny))
-                                                .child("Deny"),
+                                                .child(ui_text(ui_language, "Deny")),
                                         )
                                         .child(
                                             div()
@@ -1617,7 +1655,7 @@ impl Render for BorgGui {
                                                 .text_color(rgb(palette::CANVAS))
                                                 .cursor_pointer()
                                                 .on_click(cx.listener(Self::approve_once))
-                                                .child("Approve once"),
+                                                .child(ui_text(ui_language, "Approve once")),
                                         )
                                         .child(
                                             div()
@@ -1629,7 +1667,7 @@ impl Render for BorgGui {
                                                 .text_color(rgb(palette::ORANGE))
                                                 .cursor_pointer()
                                                 .on_click(cx.listener(Self::approve_session))
-                                                .child("Allow session"),
+                                                .child(ui_text(ui_language, "Allow session")),
                                         ),
                                 ),
                         )
@@ -1655,7 +1693,7 @@ impl Render for BorgGui {
                                         .child(
                                             div()
                                                 .text_color(rgb(palette::BLUE))
-                                                .child("Provider input"),
+                                                .child(ui_text(ui_language, "Provider input")),
                                         )
                                         .child(div().text_sm().child(prompt))
                                         .child(
@@ -1672,7 +1710,7 @@ impl Render for BorgGui {
                                         .py_1()
                                         .cursor_pointer()
                                         .on_click(cx.listener(Self::cancel_provider_input))
-                                        .child("Cancel"),
+                                        .child(ui_text(ui_language, "Cancel")),
                                 ),
                         )
                     })
@@ -1770,7 +1808,7 @@ impl Render for BorgGui {
                 root.child(
                     div().absolute().inset_0().bg(gpui::rgba(0x00000088)).flex().items_center().justify_center()
                         .child(div().id("help-panel").w(px(620.)).max_h(px(620.)).overflow_y_scroll().border_1().border_color(rgb(palette::BORDER)).bg(rgb(palette::SURFACE)).p_5().flex().flex_col().gap_2()
-                            .child(div().flex().items_center().justify_between().mb_2().child(div().font_weight(FontWeight::SEMIBOLD).text_color(rgb(palette::ORANGE)).child("COMMANDS")).child(div().id("close-help").cursor_pointer().text_color(rgb(palette::TEXT_MUTED)).on_click(cx.listener(Self::toggle_help)).child("esc / close")))
+                            .child(div().flex().items_center().justify_between().mb_2().child(div().font_weight(FontWeight::SEMIBOLD).text_color(rgb(palette::ORANGE)).child(ui_text(ui_language, "COMMANDS"))).child(div().id("close-help").cursor_pointer().text_color(rgb(palette::TEXT_MUTED)).on_click(cx.listener(Self::toggle_help)).child(ui_text(ui_language, "esc / close"))))
                             .children(command_help.into_iter().enumerate().map(|(index, (command, detail, insertion))| {
                                 let composer = palette_composer.clone();
                                 div().id(SharedString::from(format!("command-{index}"))).flex().gap_4().px_2().py_1().text_sm().cursor_pointer().hover(|style| style.bg(rgb(palette::SURFACE_RAISED))).on_click(cx.listener(move |this, _, window, cx| {

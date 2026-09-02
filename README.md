@@ -7,7 +7,9 @@ experimental `borg-gui` frontend is developed and built separately.
 
 [Repository](https://github.com/borg-ml/agent) ·
 [Blu language](https://github.com/borg-ml/blu) ·
-[Documentation](docs/)
+[Documentation](docs/) ·
+[简体中文](docs/zh-Hans/README.md) ·
+[Русский](docs/ru/README.md)
 
 ## Install
 
@@ -39,6 +41,12 @@ borg gui
 borg capabilities
 borg extensions list
 ```
+
+Interactive sessions run in a detached per-session host. Closing one TUI or
+GUI view does not stop an active turn, its provider app server, or subagents;
+another view can attach to the same durable session. An unattended host exits
+after five minutes only when the session is ready and has no pending prompt.
+See [`docs/session-lifecycle.md`](docs/session-lifecycle.md).
 
 The default native-provider harness exposes one shell-first `exec` surface.
 The model can use shell pipelines or invoke the installed language best suited
@@ -79,8 +87,10 @@ cp configs/editor.example.toml ~/.config/borg/editor.toml
 
 Use `$XDG_CONFIG_HOME/borg` instead when `XDG_CONFIG_HOME` is set. The agent
 configuration covers providers, capabilities, MCP servers, aliases, and team
-settings. The editor configuration covers TUI presentation and input behavior;
-the native frontend uses platform-native input and rendering.
+settings. The editor configuration covers shared interface language plus TUI
+presentation and input behavior; the native frontend uses the same interface
+language with platform-native input and rendering. `/ui-language` changes UI
+labels, while `/language` independently controls the model's response language.
 
 See [`docs/customization.md`](docs/customization.md) for editor settings,
 keybindings, alerts, extension authority, and native extension authoring.
@@ -90,6 +100,16 @@ Use `borg customize inspect`, `borg customize export`, and
 `borg capabilities --json` shows the effective runtime capabilities. Automated
 checks can use `borg agent --ephemeral --local-only` to avoid changing resume
 history.
+
+## Privacy-minimal usage count
+
+Release download totals provide the all-time installation proxy. To estimate
+active installations, release builds send at most one content-free heartbeat
+per day. It contains one random identifier that rotates every 31 days—no
+version, OS, model, session, prompt, path, or device data. Set
+`usage_count.enabled = false` in `agent.toml` or export
+`BORG_DISABLE_USAGE_COUNT=1` to disable it. The receiver must discard network
+metadata and raw request logs and retain only aggregate daily/monthly counts.
 
 ## Blu extensions
 
@@ -114,6 +134,12 @@ contract. Blu workflow files may use `.blu`, `.lua`, or `.luau` entrypoints.
 
 - [`docs/customization.md`](docs/customization.md) — editor settings,
   keybindings, alerts, trust policy, and native extensions
+- [`docs/session-lifecycle.md`](docs/session-lifecycle.md) — detached hosts,
+  attachment, resume, and shutdown behavior
+- [`docs/usage-count.md`](docs/usage-count.md) — active-install metric and
+  privacy contract
+- [`docs/zh-Hans/README.md`](docs/zh-Hans/README.md) — Simplified Chinese guide
+- [`docs/ru/README.md`](docs/ru/README.md) — Russian guide
 - [`TODO.md`](TODO.md) — remaining customization surface and extension API work
 - [`docs/blu-extensions.md`](docs/blu-extensions.md) — extension packages and
   workflows
