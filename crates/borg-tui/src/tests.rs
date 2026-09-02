@@ -1936,7 +1936,8 @@ fn consecutive_unmatched_action_preparations_preserve_audit_rows() {
 fn matching_tool_action_updates_refine_one_live_card() {
     let session_id = Uuid::new_v4();
     let mut transcript = Transcript::default();
-    transcript.apply(&SessionEvent::new(
+    let started_at = Utc::now();
+    let mut generating = SessionEvent::new(
         session_id,
         1,
         SessionEventKind::ProviderEvent {
@@ -1944,7 +1945,10 @@ fn matching_tool_action_updates_refine_one_live_card() {
             kind: "action/preparing".to_string(),
             payload: serde_json::json!({"label": ""}),
         },
-    ));
+    );
+    generating.created_at = started_at;
+    let started_time = local_event_time(&generating);
+    transcript.apply(&generating);
     let generic = transcript
         .lines(100)
         .into_iter()
@@ -1954,7 +1958,7 @@ fn matching_tool_action_updates_refine_one_live_card() {
     assert!(generic.contains("Generating…"), "{generic}");
 
     for (sequence, label) in [(2, ""), (3, "edit")] {
-        transcript.apply(&SessionEvent::new(
+        let mut refinement = SessionEvent::new(
             session_id,
             sequence,
             SessionEventKind::ProviderEvent {
@@ -1965,9 +1969,19 @@ fn matching_tool_action_updates_refine_one_live_card() {
                     "tool_call_id": "tool-1",
                 }),
             },
-        ));
+        );
+        refinement.created_at = started_at + chrono::Duration::seconds(sequence as i64);
+        transcript.apply(&refinement);
     }
     assert_eq!(transcript.order.len(), 1);
+    assert!(matches!(
+        &transcript.order[0],
+        TranscriptEntry::Tool {
+            time,
+            started_at: stored_started_at,
+            ..
+        } if time == &started_time && *stored_started_at == started_at
+    ));
     let rendered = transcript
         .lines(100)
         .into_iter()
@@ -1976,6 +1990,38 @@ fn matching_tool_action_updates_refine_one_live_card() {
         .join("\n");
     assert!(rendered.contains("Generating edit"), "{rendered}");
     assert!(!rendered.contains("Generating command"), "{rendered}");
+}
+
+#[test]
+fn unkeyed_action_label_refines_the_generic_live_card() {
+    let session_id = Uuid::new_v4();
+    let started_at = Utc::now();
+    let mut transcript = Transcript::default();
+    for (sequence, label) in [(1, ""), (2, "edit session retry policy")] {
+        let mut event = SessionEvent::new(
+            session_id,
+            sequence,
+            SessionEventKind::ProviderEvent {
+                provider: CodingProvider::Codex,
+                kind: "action/preparing".to_string(),
+                payload: serde_json::json!({"label": label}),
+            },
+        );
+        event.created_at =
+            started_at + chrono::Duration::seconds(sequence.saturating_sub(1) as i64);
+        transcript.apply(&event);
+    }
+
+    assert_eq!(transcript.order.len(), 1);
+    assert!(matches!(
+        &transcript.order[0],
+        TranscriptEntry::Tool {
+            name,
+            started_at: stored_started_at,
+            complete: false,
+            ..
+        } if name == "Generate edit session retry policy" && *stored_started_at == started_at
+    ));
 }
 
 #[test]

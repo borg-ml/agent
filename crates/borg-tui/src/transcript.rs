@@ -2254,22 +2254,45 @@ impl Transcript {
         label: &str,
         provider_tool_id: Option<&str>,
     ) {
-        let existing = provider_tool_id.and_then(|provider_tool_id| {
-            self.preparing_tools
-                .get(provider_tool_id)
-                .cloned()
-                .or_else(|| {
-                    if self.unkeyed_preparing_tools.is_empty() {
-                        return None;
-                    }
-                    let preparing_id = self.unkeyed_preparing_tools.remove(0);
-                    self.preparing_tools
-                        .insert(provider_tool_id.to_string(), preparing_id.clone());
-                    Some(preparing_id)
+        let existing = provider_tool_id
+            .and_then(|provider_tool_id| {
+                self.preparing_tools
+                    .get(provider_tool_id)
+                    .cloned()
+                    .or_else(|| {
+                        if self.unkeyed_preparing_tools.is_empty() {
+                            return None;
+                        }
+                        let preparing_id = self.unkeyed_preparing_tools.remove(0);
+                        self.preparing_tools
+                            .insert(provider_tool_id.to_string(), preparing_id.clone());
+                        Some(preparing_id)
+                    })
+            })
+            .or_else(|| {
+                provider_tool_id.is_none().then(|| {
+                    self.unkeyed_preparing_tools.last().cloned().filter(|preparing_id| {
+                        self.tools
+                            .get(preparing_id)
+                            .and_then(|index| self.order.get(*index))
+                            .is_some_and(|entry| {
+                                matches!(
+                                    entry,
+                                    TranscriptEntry::Tool {
+                                        source_name,
+                                        name,
+                                        complete: false,
+                                        ..
+                                    } if source_name == "action_preparing" && name == "Generate"
+                                )
+                            })
+                    })
                 })
-        });
+                .flatten()
+            });
         if provider_tool_id.is_none()
             && !label.is_empty()
+            && existing.is_none()
             && let Some(preparing_id) = self.unkeyed_preparing_tools.pop()
         {
             self.finish_preparing_tool(&preparing_id, event.created_at);
@@ -2297,11 +2320,8 @@ impl Transcript {
         );
         if existing.is_some()
             && let Some(index) = self.tools.get(&tool_call_id).copied()
-            && let Some(TranscriptEntry::Tool {
-                time, backgrounded, ..
-            }) = self.order.get_mut(index)
+            && let Some(TranscriptEntry::Tool { backgrounded, .. }) = self.order.get_mut(index)
         {
-            *time = local_event_time(event);
             *backgrounded = false;
         }
         self.foreground_tool = Some(tool_call_id);

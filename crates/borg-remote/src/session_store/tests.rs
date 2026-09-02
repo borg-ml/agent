@@ -2338,6 +2338,8 @@ async fn live_state_coalesces_without_consuming_durable_sequences() {
         ))
         .await
         .unwrap();
+    let reasoning_id = first_reasoning.id;
+    let reasoning_started_at = first_reasoning.created_at;
     assert!(matches!(
         first_reasoning.kind,
         SessionEventKind::ReasoningDelta { ref text } if text == "thinking "
@@ -2352,6 +2354,8 @@ async fn live_state_coalesces_without_consuming_durable_sequences() {
         ))
         .await
         .unwrap();
+    assert_eq!(second_reasoning.id, reasoning_id);
+    assert_eq!(second_reasoning.created_at, reasoning_started_at);
     assert!(matches!(
         second_reasoning.kind,
         SessionEventKind::ReasoningDelta { ref text } if text == "thinking carefully"

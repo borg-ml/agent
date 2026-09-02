@@ -3945,11 +3945,13 @@ impl SqliteSessionStore {
             .bind(&live_key)
             .fetch_optional(&mut *transaction)
             .await?;
-            let mut accumulated = prior
+            let prior = prior
                 .map(|value| serde_json::from_str::<SessionEvent>(&value))
-                .transpose()?
-                .and_then(|event| match event.kind {
-                    SessionEventKind::ReasoningDelta { text } => Some(text),
+                .transpose()?;
+            let mut accumulated = prior
+                .as_ref()
+                .and_then(|event| match &event.kind {
+                    SessionEventKind::ReasoningDelta { text } => Some(text.clone()),
                     _ => None,
                 })
                 .unwrap_or_default();
@@ -3959,7 +3961,12 @@ impl SqliteSessionStore {
             } else if !accumulated.starts_with(text) {
                 accumulated.push_str(text);
             }
-            let mut snapshot = event.clone();
+            // The live key is one logical action. Keep its canonical identity
+            // and start time while replacing only the accumulated payload.
+            // Otherwise clients that rebuild from live state see the timer
+            // restart on every streamed snapshot while incremental clients do
+            // not.
+            let mut snapshot = prior.unwrap_or_else(|| event.clone());
             snapshot.kind = SessionEventKind::ReasoningDelta { text: accumulated };
             snapshot
         } else {

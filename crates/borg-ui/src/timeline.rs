@@ -210,7 +210,7 @@ impl TimelineProjector {
                 } else {
                     self.reasoning = Some(self.entries.len());
                     self.entries.push(Arc::new(TimelineEntry {
-                        id: format!("reasoning:{}", event.sequence),
+                        id: format!("reasoning:{}", event.id),
                         created_at: event.created_at,
                         kind: TimelineKind::Reasoning,
                         title: "Thinking".into(),
@@ -236,22 +236,39 @@ impl TimelineProjector {
                     .get("label")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("action");
-                let existing = provider_tool_id.and_then(|provider_tool_id| {
-                    self.preparing_tools
-                        .get(provider_tool_id)
-                        .copied()
-                        .or_else(|| {
-                            if self.unkeyed_preparing_tools.is_empty() {
-                                return None;
-                            }
-                            let index = self.unkeyed_preparing_tools.remove(0);
-                            self.preparing_tools
-                                .insert(provider_tool_id.to_string(), index);
-                            Some(index)
-                        })
-                });
+                let existing = provider_tool_id
+                    .and_then(|provider_tool_id| {
+                        self.preparing_tools
+                            .get(provider_tool_id)
+                            .copied()
+                            .or_else(|| {
+                                if self.unkeyed_preparing_tools.is_empty() {
+                                    return None;
+                                }
+                                let index = self.unkeyed_preparing_tools.remove(0);
+                                self.preparing_tools
+                                    .insert(provider_tool_id.to_string(), index);
+                                Some(index)
+                            })
+                    })
+                    .or_else(|| {
+                        provider_tool_id
+                            .is_none()
+                            .then(|| {
+                                self.unkeyed_preparing_tools
+                                    .last()
+                                    .copied()
+                                    .filter(|index| {
+                                        self.entries.get(*index).is_some_and(|entry| {
+                                            entry.running && entry.title == "Generate"
+                                        })
+                                    })
+                            })
+                            .flatten()
+                    });
                 if provider_tool_id.is_none()
                     && !label.is_empty()
+                    && existing.is_none()
                     && let Some(index) = self.unkeyed_preparing_tools.pop()
                 {
                     Arc::make_mut(&mut self.entries[index]).running = false;
@@ -260,7 +277,6 @@ impl TimelineProjector {
                 let (title, detail) = tool_call_summary("action_preparing", &input);
                 if let Some(index) = existing {
                     let entry = Arc::make_mut(&mut self.entries[index]);
-                    entry.created_at = event.created_at;
                     entry.title = title;
                     entry.detail = (!detail.is_empty()).then_some(detail);
                     entry.body.clear();
@@ -603,6 +619,33 @@ mod tests {
         assert!(!entries[0].running);
         assert_eq!(entries[1].title, "Generate inspect second");
         assert!(entries[1].running);
+    }
+
+    #[test]
+    fn unkeyed_action_refinement_preserves_one_identity_and_start_time() {
+        let session_id = Uuid::new_v4();
+        let started_at = Utc::now();
+        let mut projector = TimelineProjector::default();
+        for (sequence, label) in [(1, ""), (2, "edit session retry policy")] {
+            let mut event = SessionEvent::new(
+                session_id,
+                sequence,
+                SessionEventKind::ProviderEvent {
+                    provider: CodingProvider::Codex,
+                    kind: "action/preparing".into(),
+                    payload: serde_json::json!({"label": label}),
+                },
+            );
+            event.created_at =
+                started_at + chrono::Duration::seconds(sequence.saturating_sub(1) as i64);
+            projector.push(&event);
+        }
+
+        let entries = projector.into_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].title, "Generate edit session retry policy");
+        assert_eq!(entries[0].created_at, started_at);
+        assert!(entries[0].running);
     }
 
     #[test]
