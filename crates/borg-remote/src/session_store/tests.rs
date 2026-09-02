@@ -1471,6 +1471,14 @@ async fn recent_user_messages_are_bounded_ordered_and_ignore_non_recallable_prom
         SessionEventKind::Message {
             message_id: Uuid::new_v4(),
             actor: EventActor::User,
+            text: "Team message from /root/worker:\n\ninternal report".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: Some(PromptDelivery::Queue),
+        },
+        SessionEventKind::Message {
+            message_id: Uuid::new_v4(),
+            actor: EventActor::User,
             text: "failed but recallable".to_string(),
             attachments: Vec::new(),
             status: MessageStatus::Failed,

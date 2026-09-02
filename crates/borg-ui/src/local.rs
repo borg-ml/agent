@@ -565,12 +565,8 @@ impl LocalSessionClient {
             .await?;
         let mut changed = !events.is_empty();
         for event in events {
-            if let SessionEventKind::Message {
-                actor: EventActor::User,
-                text,
-                status: MessageStatus::Complete | MessageStatus::Failed,
-                ..
-            } = &event.kind
+            if event.kind.is_recallable_user_message()
+                && let SessionEventKind::Message { text, .. } = &event.kind
             {
                 let history = Arc::make_mut(&mut self.composer_history);
                 if history.last() != Some(text) {

@@ -5160,6 +5160,29 @@ fn active_subagent_count_tracks_only_working_children() {
 }
 
 #[test]
+fn completed_child_turn_is_not_reported_as_running() {
+    let event = SessionEventKind::TurnCompleted {
+        message_id: Uuid::new_v4(),
+        provider_session_id: None,
+        final_text: "handed off to the director".to_string(),
+        error: None,
+    };
+
+    assert_eq!(
+        subagent_status_from_child_event(&event),
+        Some(SubagentStatus::Ready)
+    );
+    assert_eq!(
+        effective_subagent_status(
+            SubagentActivityKind::Updated,
+            SubagentStatus::Running,
+            Some(&SessionEvent::new(Uuid::new_v4(), 1, event)),
+        ),
+        SubagentStatus::Ready
+    );
+}
+
+#[test]
 fn agents_status_label_counts_only_working_children() {
     let working = agents_status_label(1).expect("one agent is working");
     let larger_team = agents_status_label(2).expect("two agents are working");

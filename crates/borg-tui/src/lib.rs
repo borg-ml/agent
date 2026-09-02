@@ -2941,7 +2941,8 @@ impl BorgTerminal {
             .unwrap_or_default();
         self.child_pending_approvals.remove(&child_id);
         for event in &events {
-            if let SessionEventKind::StatusChanged { status, .. } = event.kind {
+            if let Some(status) = subagent_status_from_child_event(&event.kind) {
+                let status = subagent_session_status(status);
                 self.child_statuses.insert(child_id, status);
                 track_child_activity(
                     &mut self.child_active_since,
@@ -8289,17 +8290,18 @@ fn effective_subagent_status(
 }
 
 fn subagent_status_from_child_event(kind: &SessionEventKind) -> Option<SubagentStatus> {
-    let SessionEventKind::StatusChanged { status, .. } = kind else {
-        return None;
-    };
-    Some(match status {
-        SessionStatus::Starting => SubagentStatus::Starting,
-        SessionStatus::Running => SubagentStatus::Running,
-        SessionStatus::Ready | SessionStatus::Completed => SubagentStatus::Ready,
-        SessionStatus::WaitingForApproval => SubagentStatus::WaitingForApproval,
-        SessionStatus::Stopped => SubagentStatus::Stopped,
-        SessionStatus::Failed => SubagentStatus::Failed,
-    })
+    match kind {
+        SessionEventKind::StatusChanged { status, .. } => Some(match status {
+            SessionStatus::Starting => SubagentStatus::Starting,
+            SessionStatus::Running => SubagentStatus::Running,
+            SessionStatus::Ready | SessionStatus::Completed => SubagentStatus::Ready,
+            SessionStatus::WaitingForApproval => SubagentStatus::WaitingForApproval,
+            SessionStatus::Stopped => SubagentStatus::Stopped,
+            SessionStatus::Failed => SubagentStatus::Failed,
+        }),
+        SessionEventKind::TurnCompleted { .. } => Some(SubagentStatus::Ready),
+        _ => None,
+    }
 }
 
 fn focused_child_interrupt_target(
@@ -8554,20 +8556,18 @@ impl Composer {
     fn seed_session_events(&mut self, events: &[SessionEvent]) {
         let mut seen = HashSet::new();
         for event in events {
+            if !event.kind.is_recallable_user_message() {
+                continue;
+            }
             let SessionEventKind::Message {
                 message_id,
-                actor: EventActor::User,
                 text,
                 attachments,
-                status: MessageStatus::Complete,
                 ..
             } = &event.kind
             else {
                 continue;
             };
-            if text.starts_with("Team message from /") {
-                continue;
-            }
             if seen.insert(*message_id) && self.history_message_ids.insert(*message_id) {
                 if !attachments.is_empty() {
                     if let Some(highest) = image_numbers_in_text(text).into_iter().max() {

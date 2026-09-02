@@ -200,6 +200,18 @@ pub enum EventPersistence {
 }
 
 impl SessionEventKind {
+    pub fn is_recallable_user_message(&self) -> bool {
+        matches!(
+            self,
+            Self::Message {
+                actor: crate::EventActor::User,
+                text,
+                status: MessageStatus::Complete | MessageStatus::Failed,
+                ..
+            } if !text.starts_with("Team message from /")
+        )
+    }
+
     pub fn is_completed_context_compaction(&self) -> bool {
         matches!(
             self,
@@ -956,16 +968,7 @@ pub trait SessionStore: Send + Sync {
             .read(session_id)
             .await?
             .into_iter()
-            .filter(|event| {
-                matches!(
-                    event.kind,
-                    SessionEventKind::Message {
-                        actor: crate::EventActor::User,
-                        status: crate::MessageStatus::Complete | crate::MessageStatus::Failed,
-                        ..
-                    }
-                )
-            })
+            .filter(|event| event.kind.is_recallable_user_message())
             .rev()
             .take(limit)
             .collect::<Vec<_>>();
@@ -5650,6 +5653,7 @@ impl SessionStore for SqliteSessionStore {
              where session_id = ? and event_kind = 'message' \
              and json_extract(event_json, '$.kind.actor') = 'user' \
              and json_extract(event_json, '$.kind.status') in ('complete', 'failed') \
+             and json_extract(event_json, '$.kind.text') not like 'Team message from /%' \
              order by sequence desc limit ?",
         )
         .bind(session_id.to_string())
