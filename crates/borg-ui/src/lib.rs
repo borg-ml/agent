@@ -12,6 +12,7 @@ pub use borg_remote::{
 use uuid::Uuid;
 
 pub mod local;
+pub mod localization;
 pub mod markdown;
 pub mod preferences;
 pub mod timeline;

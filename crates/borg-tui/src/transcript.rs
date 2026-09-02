@@ -2650,10 +2650,7 @@ impl Transcript {
         agents.sort_by(|left, right| left.task_name.cmp(&right.task_name));
         rows.extend(agents.into_iter().map(|agent| {
             let name = display_agent_name(&agent.task_name);
-            let model = agent
-                .model
-                .as_deref()
-                .unwrap_or_else(|| agent.provider.catalog_backend());
+            let model = display_subagent_model(agent);
             let effort = agent.effort.as_deref().unwrap_or("default");
             let usage = format_subagent_usage(&agent.usage);
             let usage = usage
@@ -2662,7 +2659,7 @@ impl Transcript {
                 .unwrap_or(usage.trim_start());
             AgentRosterEntry {
                 name,
-                model: model.to_string(),
+                model,
                 effort: effort.to_string(),
                 state: subagent_status_label(agent.status).to_string(),
                 usage: usage.to_string(),

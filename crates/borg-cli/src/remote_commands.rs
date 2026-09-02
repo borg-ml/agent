@@ -23,7 +23,8 @@ use borg_remote::{
     SessionStore, SessionWriterLease, SpawnSubagent, SqliteSessionStore, SubagentAction,
     SubagentSnapshot, SubagentStatus, TodoAction, default_host_config_path, enroll_host,
     force_terminate_local_session_owner, local_session_owner_uses_current_binary, login_provider,
-    mirror_local_session, obsolete_local_session_owner_pid, probe_capabilities,
+    local_session_owner_is_active, mirror_local_session, obsolete_local_session_owner_pid,
+    probe_capabilities,
     probe_provider_admission_capabilities, provider_credentials_present,
     run_agent_session_with_store_and_writer, run_agent_session_with_store_writer_and_peers,
     run_attached_session, run_host_with_executor_factory, send_local_session_command,
@@ -48,6 +49,7 @@ use crate::editor_preferences::{
     ActiveMessageBehavior, CompletionAlertPolicy, DictationIconStyle, DiffExpansionPolicy,
     EditorPreferences,
 };
+use borg_ui::localization::UiLanguage;
 use crate::sleep_inhibitor::SleepInhibitor;
 use crate::terminal_ui::{
     BorgTerminal, DictationState, ProviderAuthChoice, ResumeSessionOption, TerminalInputEvent,
@@ -66,6 +68,8 @@ const IDLE_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_milli
 const MAX_RENDER_BACKOFF_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 const LOCAL_RESUME_RETRY_INITIAL_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
 const LOCAL_RESUME_RETRY_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+const SESSION_HOST_START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const SESSION_HOST_IDLE_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 const EXTENSION_DISCOVERY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 /// Keep first paint bounded while retaining enough context to include a real
 /// recent exchange instead of an empty shell made only of projection events.
@@ -1023,11 +1027,31 @@ pub(crate) async fn run_local_agent(args: LocalAgentCliArgs) -> Result<()> {
     // Keep this guard outside the caught session future: terminal Drop runs
     // while unwinding, then this guard is restored after catch_unwind returns.
     let _tui_panic_hook = TuiPanicHook::install(Arc::clone(&crash_context.tui_active));
-    let mut selected_session = None;
+    let detached_session = if should_use_detached_session_host(&args) {
+        Some(prepare_detached_session(&args).await?)
+    } else {
+        None
+    };
+    let mut selected_session = detached_session;
+    let mut include_initial_host_prompt = if let Some(session_id) = detached_session {
+        let store = open_local_session_store().await?;
+        store.state(session_id).await?.latest_sequence == 0
+    } else {
+        false
+    };
     let mut restored_prompt = None;
     let mut reusable_terminal = None;
     let mut resume_retry_delay = LOCAL_RESUME_RETRY_INITIAL_DELAY;
     loop {
+        if let Some(session_id) = detached_session {
+            ensure_detached_session_host(
+                &args,
+                session_id,
+                include_initial_host_prompt,
+            )
+            .await?;
+            include_initial_host_prompt = false;
+        }
         let resume_requested =
             args.resume.is_some() || args.continue_latest || selected_session.is_some();
         let result = AssertUnwindSafe(run_local_agent_session(
@@ -1095,6 +1119,206 @@ pub(crate) async fn run_local_agent(args: LocalAgentCliArgs) -> Result<()> {
         };
     }
 }
+
+fn should_use_detached_session_host(args: &LocalAgentCliArgs) -> bool {
+    io::stdin().is_terminal()
+        && io::stdout().is_terminal()
+        && !args.json
+        && !args.print
+        && !args.ephemeral
+        && !args.gui_owner
+        && args.session_host.is_none()
+}
+
+async fn open_local_session_store() -> Result<SqliteSessionStore> {
+    let sessions_dir = default_host_config_path()
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("sessions");
+    SqliteSessionStore::open(sessions_dir.join("sessions.sqlite3")).await
+}
+
+async fn prepare_detached_session(args: &LocalAgentCliArgs) -> Result<Uuid> {
+    let sessions_dir = default_host_config_path()
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("sessions");
+    let store = open_local_session_store().await?;
+    let session_id = if let Some(session_id) = args.resume {
+        session_id_if_present(&store, session_id).await?
+    } else if args.continue_latest {
+        let cwd = args
+            .cwd
+            .as_deref()
+            .unwrap_or_else(|| Path::new("."))
+            .canonicalize()
+            .context("current project directory does not exist")?;
+        latest_session_id_in_directory(&sessions_dir, &store, &cwd)
+            .await?
+            .context("there are no non-empty local Borg sessions to continue in this directory")?
+    } else {
+        let session_id = Uuid::new_v4();
+        if let Some(workspace_id) = args.workspace {
+            store
+                .create_session_in_workspace(session_id, workspace_id)
+                .await?;
+        } else {
+            store.create_session(session_id).await?;
+        }
+        session_id
+    };
+    Ok(session_id)
+}
+
+async fn ensure_detached_session_host(
+    args: &LocalAgentCliArgs,
+    session_id: Uuid,
+    include_initial_prompt: bool,
+) -> Result<()> {
+    let sessions_dir = default_host_config_path()
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("sessions");
+    let lock_path = sessions_dir.join(format!("{session_id}.lock"));
+    let Some(writer) = SessionWriterLease::try_acquire(&lock_path)? else {
+        return Ok(());
+    };
+    drop(writer);
+
+    let store = open_local_session_store().await?;
+    anyhow::ensure!(
+        store.load_host_launch_metadata(session_id).await?.is_none(),
+        "this session is owned by the background Borg remote host"
+    );
+
+    let executable = std::env::current_exe().context("failed to locate the Borg executable")?;
+    let mut command = TokioCommand::new(&executable);
+    command
+        .arg("__agent")
+        .arg("--session-host")
+        .arg(session_id.to_string())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    append_session_host_arguments(&mut command, args, include_initial_prompt)?;
+    detach_session_host_command(&mut command);
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("failed to start detached session host with {executable:?}"))?;
+
+    let socket_path = session_control_socket_path(&sessions_dir, session_id);
+    let deadline = tokio::time::Instant::now() + SESSION_HOST_START_TIMEOUT;
+    loop {
+        if socket_path.exists() && local_session_owner_is_active(&sessions_dir, session_id)? {
+            tokio::spawn(async move {
+                if let Err(error) = child.wait().await {
+                    tracing::debug!(%error, "detached session host reaper stopped");
+                }
+            });
+            return Ok(());
+        }
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!("detached session host exited during startup with {status}");
+        }
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for the detached session host"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+fn append_session_host_arguments(
+    command: &mut TokioCommand,
+    args: &LocalAgentCliArgs,
+    include_initial_prompt: bool,
+) -> Result<()> {
+    let implicit_cwd = (include_initial_prompt && args.cwd.is_none())
+        .then(std::env::current_dir)
+        .transpose()
+        .context("current project directory does not exist")?;
+    if let Some(cwd) = args.cwd.as_ref().or(implicit_cwd.as_ref()) {
+        command.arg("--cwd").arg(cwd);
+    }
+    command.arg("--provider").arg(provider_argument(args.provider));
+    if let Some(model) = args.model.as_ref() {
+        command.arg("--model").arg(model);
+    }
+    if let Some(effort) = args.effort.as_ref() {
+        command.arg("--effort").arg(effort);
+    }
+    if args.fast {
+        command.arg("--fast");
+    }
+    if let Some(config) = args.config.as_ref() {
+        command.arg("--config").arg(config);
+    }
+    command
+        .arg("--permission")
+        .arg(permission_argument(args.permission));
+    if args.local_only {
+        command.arg("--local-only");
+    }
+    if include_initial_prompt {
+        if let Some(peer) = args.peer_provider {
+            command.arg("--peer-provider").arg(provider_argument(peer));
+            if let Some(model) = args.peer_model.as_ref() {
+                command.arg("--peer-model").arg(model);
+            }
+            if let Some(effort) = args.peer_effort.as_ref() {
+                command.arg("--peer-effort").arg(effort);
+            }
+        }
+        if !args.prompt.is_empty() {
+            command.arg("--").args(&args.prompt);
+        }
+    }
+    Ok(())
+}
+
+fn provider_argument(provider: crate::cli::RemoteProviderArg) -> &'static str {
+    use crate::cli::RemoteProviderArg;
+    match provider {
+        RemoteProviderArg::Codex => "codex",
+        RemoteProviderArg::Claude => "claude",
+        RemoteProviderArg::OpenCode => "open-code",
+        RemoteProviderArg::Kimi => "kimi",
+        RemoteProviderArg::OpenRouter => "open-router",
+        RemoteProviderArg::OpenAiCompatible => "open-ai-compatible",
+    }
+}
+
+fn permission_argument(permission: crate::cli::RemotePermissionArg) -> &'static str {
+    use crate::cli::RemotePermissionArg;
+    match permission {
+        RemotePermissionArg::FullAccess => "full-access",
+        RemotePermissionArg::Auto => "auto",
+        RemotePermissionArg::Manual => "manual",
+    }
+}
+
+#[cfg(unix)]
+fn detach_session_host_command(command: &mut TokioCommand) {
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(windows)]
+fn detach_session_host_command(command: &mut TokioCommand) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    command.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+}
+
+#[cfg(not(any(unix, windows)))]
+fn detach_session_host_command(_command: &mut TokioCommand) {}
 
 fn print_mode_banner() {
     #[cfg(unix)]
@@ -1397,6 +1621,7 @@ async fn run_local_agent_session(
         && !args.json
         && !args.print
         && !args.gui_owner
+        && args.session_host.is_none()
         && !BorgTerminal::fallback_requested();
     let store_open_started = std::time::Instant::now();
     let sqlite_store = Arc::new(if interactive_store_open {
@@ -1405,7 +1630,7 @@ async fn run_local_agent_session(
         SqliteSessionStore::open(sessions_dir.join("sessions.sqlite3")).await?
     });
     let store_open_ms = store_open_started.elapsed().as_millis() as u64;
-    let session_id = if let Some(session_id) = selected_session.or(args.resume) {
+    let session_id = if let Some(session_id) = selected_session.or(args.resume).or(args.session_host) {
         session_id_if_present(sqlite_store.as_ref(), session_id).await?
     } else if args.continue_latest {
         let current_dir = args
@@ -1652,7 +1877,7 @@ async fn run_local_agent_session(
     let lifecycle_executor = Arc::clone(&executor);
     let mut rendered = HashMap::new();
     let stdin_is_terminal = io::stdin().is_terminal();
-    let machine_output = args.json || args.print || args.gui_owner;
+    let machine_output = args.json || args.print || args.gui_owner || args.session_host.is_some();
     let can_prompt = stdin_is_terminal && !machine_output;
     let rich_tui_allowed = rich_terminal_can_prompt(
         stdin_is_terminal,
@@ -1669,7 +1894,7 @@ async fn run_local_agent_session(
     let fallback_terminal = can_prompt && !rich_tui_allowed;
     let mut initial_prompt = if !args.prompt.is_empty() {
         Some(args.prompt.join(" "))
-    } else if !stdin_is_terminal && !args.gui_owner {
+    } else if !stdin_is_terminal && !args.gui_owner && args.session_host.is_none() {
         let mut piped = String::new();
         tokio::io::stdin().read_to_string(&mut piped).await?;
         (!piped.trim().is_empty()).then(|| piped.trim().to_string())
@@ -1707,7 +1932,7 @@ async fn run_local_agent_session(
         Vec::new()
     };
     let has_initial_prompt = initial_prompt.is_some();
-    let interactive = can_prompt || args.gui_owner;
+    let interactive = can_prompt || args.gui_owner || args.session_host.is_some();
     let history_started = std::time::Instant::now();
     let (mut history, mut history_page_before_sequence) = if can_prompt && !fallback_terminal {
         let bootstrap =
@@ -2010,6 +2235,7 @@ async fn run_local_agent_session(
         terminal.set_auto_expand_tools(editor_preferences.presentation.auto_expand_tools);
         terminal.set_action_descriptors(editor_preferences.presentation.action_descriptors);
         terminal.set_running_sweeps(editor_preferences.presentation.running_sweeps);
+        terminal.set_ui_language(editor_preferences.presentation.ui_language);
         terminal.set_layout_preferences(&editor_preferences.layout);
         terminal.set_completion_alerts(
             editor_preferences.interaction.completion_notifications,
@@ -2132,6 +2358,7 @@ async fn run_local_agent_session(
     let mut detached_from_terminal = false;
     let mut detached_prompt = None;
     let mut handoff_on_safe_boundary = false;
+    let mut session_host_idle_since = None;
     let mut last_ctrl_c = None;
     let mut terminal_dirty = false;
     let mut interaction_dirty = false;
@@ -2175,6 +2402,8 @@ async fn run_local_agent_session(
     blu_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut update_tick = tokio::time::interval(std::time::Duration::from_secs(1));
     update_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut session_host_tick = tokio::time::interval(std::time::Duration::from_secs(1));
+    session_host_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut blu_discovery_task: Option<BluDiscoveryTask> = None;
     let mut agent_config_poll_task: Option<tokio::task::JoinHandle<AgentConfigPollResult>> = None;
     let mut shutdown_signal_open = true;
@@ -2188,6 +2417,31 @@ async fn run_local_agent_session(
     let mut terminal_io_completions_open = true;
     loop {
         tokio::select! {
+            _ = session_host_tick.tick(), if args.session_host.is_some() => {
+                let unattended_idle = status == SessionStatus::Ready
+                    && !local_prompt_submission_pending(
+                        &pending_prompt_ids,
+                        &local_prompt_admissions,
+                    )
+                    && control_server
+                        .as_ref()
+                        .is_some_and(|server| !server.has_attached_viewers());
+                if unattended_idle {
+                    let idle_since = session_host_idle_since
+                        .get_or_insert_with(tokio::time::Instant::now);
+                    if idle_since.elapsed() >= SESSION_HOST_IDLE_TTL && !stop_sent {
+                        tracing::info!(%session_id, "detached session host reached its idle TTL");
+                        stop_sent = true;
+                        user_requested_exit = true;
+                        dispatch_host_command_without_blocking(
+                            &session_command_tx,
+                            HostCommand::Stop { session_id },
+                        );
+                    }
+                } else {
+                    session_host_idle_since = None;
+                }
+            }
             completion = terminal_io_completions.recv(), if terminal_io_completions_open => {
                 match completion {
                     Some(completion) => {
@@ -2910,6 +3164,9 @@ async fn run_local_agent_session(
                                 terminal.set_running_sweeps(
                                     editor_preferences.presentation.running_sweeps,
                                 );
+                                terminal.set_ui_language(
+                                    editor_preferences.presentation.ui_language,
+                                );
                                 terminal.set_layout_preferences(&editor_preferences.layout);
                                 terminal.set_completion_alerts(
                                     editor_preferences.interaction.completion_notifications,
@@ -3420,6 +3677,31 @@ async fn run_local_agent_session(
                             .ok();
                     } else {
                         println!("\n  Unknown language. Use /language to list choices.\n");
+                    }
+                    continue;
+                }
+                if line == "/ui-language" {
+                    let language = editor_preferences.presentation.ui_language;
+                    println!(
+                        "\n  Interface language: {} ({})\n  Available: {}\n",
+                        language.name(),
+                        language.code(),
+                        UiLanguage::ALL.map(UiLanguage::code).join(", ")
+                    );
+                    continue;
+                }
+                if let Some(value) = line.strip_prefix("/ui-language ") {
+                    if let Some(language) = UiLanguage::parse(value) {
+                        editor_preferences.presentation.ui_language = language;
+                        dispatch_editor_preferences_save(
+                            &editor_preferences_tx,
+                            &editor_preferences,
+                        );
+                        println!("\n  Interface language set to {}.\n", language.name());
+                    } else {
+                        println!(
+                            "\n  Unknown UI language. Use /ui-language to list choices.\n"
+                        );
                     }
                     continue;
                 }
@@ -4276,6 +4558,21 @@ async fn run_local_agent_session(
                             },
                         );
                     }
+                    UiAction::SetUiLanguage(language) => {
+                        editor_preferences.presentation.ui_language = language;
+                        dispatch_editor_preferences_save(
+                            &editor_preferences_tx,
+                            &editor_preferences,
+                        );
+                        let terminal = terminal.as_mut().expect("terminal");
+                        terminal.set_ui_language(language);
+                        terminal.set_notice(format!(
+                            "Interface language: {} ({})",
+                            language.name(),
+                            language.code()
+                        ));
+                        terminal_dirty = true;
+                    }
                     UiAction::SetFast(enabled) => {
                         dispatch_ui_command(
                             &ui_interaction_tx,
@@ -4983,6 +5280,11 @@ async fn run_local_agent_session(
                                 .as_mut()
                                 .expect("terminal")
                                 .open_language_picker();
+                        } else if line == "/ui-language" && attachments.is_empty() {
+                            terminal
+                                .as_mut()
+                                .expect("terminal")
+                                .open_ui_language_picker();
                         } else if line == "/fast" && attachments.is_empty() {
                             terminal.as_mut().expect("terminal").open_fast_picker(current_fast);
                         } else if line == "/refresh" && attachments.is_empty() {
@@ -5191,6 +5493,29 @@ async fn run_local_agent_session(
                             } else {
                                 terminal.as_mut().expect("terminal").set_notice(
                                     "Unknown language. Use /language to choose one.",
+                                );
+                            }
+                        } else if let Some(value) = line.strip_prefix("/ui-language ")
+                            && attachments.is_empty()
+                        {
+                            if let Some(language) = UiLanguage::parse(value) {
+                                editor_preferences.presentation.ui_language = language;
+                                dispatch_editor_preferences_save(
+                                    &editor_preferences_tx,
+                                    &editor_preferences,
+                                );
+                                terminal
+                                    .as_mut()
+                                    .expect("terminal")
+                                    .set_ui_language(language);
+                                terminal.as_mut().expect("terminal").set_notice(format!(
+                                    "{}: {}",
+                                    borg_ui::localization::text(language, "Interface language"),
+                                    language.name()
+                                ));
+                            } else {
+                                terminal.as_mut().expect("terminal").set_notice(
+                                    "Unknown interface language. Use /ui-language to choose one.",
                                 );
                             }
                         } else if let Some(value) = line.strip_prefix("/fast ")

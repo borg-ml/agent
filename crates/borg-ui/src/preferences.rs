@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::localization::UiLanguage;
+
 const DEFAULT_REFRESH_RATE_FPS: u16 = 60;
 const MIN_REFRESH_RATE_FPS: u16 = 15;
 const MAX_REFRESH_RATE_FPS: u16 = 240;
@@ -116,6 +118,7 @@ impl Default for InteractionPreferences {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PresentationPreferences {
+    pub ui_language: UiLanguage,
     pub refresh_rate_fps: u16,
     pub diff_expansion: Option<DiffExpansionPolicy>,
     /// Legacy compatibility for editor.toml files written before diff_expansion.
@@ -129,6 +132,7 @@ pub struct PresentationPreferences {
 impl Default for PresentationPreferences {
     fn default() -> Self {
         Self {
+            ui_language: UiLanguage::Auto,
             refresh_rate_fps: DEFAULT_REFRESH_RATE_FPS,
             diff_expansion: None,
             auto_expand_edits: true,

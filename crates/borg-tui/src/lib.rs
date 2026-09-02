@@ -38,6 +38,7 @@ use borg_ui::preferences::{
     CompletionAlertPolicy, DictationIconStyle, DiffExpansionPolicy, TranscriptPreferences,
     parse_hex_color,
 };
+use borg_ui::localization::{UiLanguage, text as ui_text};
 use borg_ui::timeline::tool_lifecycle_label;
 use chrono::{DateTime, Local, NaiveDate, Utc};
 use crossterm::cursor::SetCursorStyle;
@@ -465,6 +466,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/model", "choose the model"),
     ("/effort", "choose reasoning effort"),
     ("/language", "choose response and drafting language"),
+    ("/ui-language", "choose the interface language"),
     ("/lsp", "view language server support"),
     ("/extensions", "view the live Blu extension runtime"),
     ("/fast", "toggle provider priority/fast mode"),
@@ -504,7 +506,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/login", "reconnect the current provider"),
     ("/remote", "connect this machine to your Borg account"),
     ("/collab", "share this live session"),
-    ("/quit", "end the session"),
+    ("/quit", "close this view; active work continues"),
     ("/exit", "alias for /quit"),
 ];
 
@@ -735,6 +737,7 @@ pub enum UiAction {
     SetEffort(String),
     SetPermissionMode(PermissionMode),
     SetResponseLanguage(ResponseLanguage),
+    SetUiLanguage(UiLanguage),
     SetFast(bool),
     SetRefreshRate(u64),
     SetPreventSleep(bool),
@@ -883,6 +886,7 @@ pub struct BorgTerminal {
     composer: Composer,
     attachment_store: AttachmentStore,
     keymap: KeyMap,
+    ui_language: UiLanguage,
     cwd: PathBuf,
     configured_model_entries: Vec<borg_provider::DynamicModelEntry>,
     extension_commands: Vec<borg_remote::ExtensionApiCommand>,
@@ -1141,6 +1145,7 @@ enum PickerKind {
     Effort,
     Permission,
     Language,
+    UiLanguage,
     Fast,
     RefreshRate,
     PreventSleep,
@@ -1909,6 +1914,7 @@ impl BorgTerminal {
             composer: Composer::default(),
             attachment_store,
             keymap,
+            ui_language: UiLanguage::Auto,
             cwd,
             configured_model_entries: Vec::new(),
             extension_commands: Vec::new(),
@@ -3377,9 +3383,10 @@ impl BorgTerminal {
 
     pub fn open_settings_picker(&mut self, user_label: &str, assistant_label: &str) {
         let options = vec![
-            "Model".to_string(),
+            self.tr("Model").to_string(),
             "Reasoning effort".to_string(),
-            "Response language".to_string(),
+            self.tr("Response language").to_string(),
+            self.tr("UI language").to_string(),
             "Language servers".to_string(),
             "Provider fast mode".to_string(),
             "Active messages".to_string(),
@@ -3400,6 +3407,7 @@ impl BorgTerminal {
             "/model",
             "/effort",
             "/language",
+            "/ui-language",
             "/lsp",
             "/fast",
             "/followups",
@@ -3418,7 +3426,7 @@ impl BorgTerminal {
         ];
         self.picker = Some(Picker {
             kind: PickerKind::Settings,
-            title: "Settings",
+            title: self.tr("Settings"),
             options: options
                 .into_iter()
                 .zip(values)
@@ -3527,6 +3535,28 @@ impl BorgTerminal {
                         .iter()
                         .position(|language| language.code() == current)
                 })
+                .unwrap_or(0),
+            query: None,
+            viewport_offset: Cell::new(0),
+        });
+    }
+
+    pub fn open_ui_language_picker(&mut self) {
+        self.picker = Some(Picker {
+            kind: PickerKind::UiLanguage,
+            title: self.tr("Interface language"),
+            options: UiLanguage::ALL
+                .into_iter()
+                .map(|language| {
+                    PickerOption::new(
+                        ui_text(self.ui_language, language.name()),
+                        language.code(),
+                    )
+                })
+                .collect(),
+            selected: UiLanguage::ALL
+                .iter()
+                .position(|language| *language == self.ui_language)
                 .unwrap_or(0),
             query: None,
             viewport_offset: Cell::new(0),
@@ -3683,6 +3713,16 @@ impl BorgTerminal {
         self.composer_max_height = preferences.composer_max_height;
         self.show_footer = preferences.show_footer;
         self.invalidate_transcript_render_cache();
+    }
+
+    pub fn set_ui_language(&mut self, language: UiLanguage) {
+        self.ui_language = language;
+        self.invalidate_transcript_render_cache();
+        self.event_redraw_needed = true;
+    }
+
+    fn tr<'a>(&self, english: &'a str) -> &'a str {
+        ui_text(self.ui_language, english)
     }
 
     pub fn open_dictation_icon_picker(&mut self) {
@@ -5102,6 +5142,10 @@ impl BorgTerminal {
                 ResponseLanguage::parse(&picker.selected_value())
                     .expect("language picker values are canonical"),
             ),
+            PickerKind::UiLanguage => UiAction::SetUiLanguage(
+                UiLanguage::parse(&picker.selected_value())
+                    .expect("UI language picker values are canonical"),
+            ),
             PickerKind::Fast => UiAction::SetFast(picker.selected_value() == "On"),
             PickerKind::RefreshRate => UiAction::SetRefreshRate(
                 picker
@@ -5409,7 +5453,7 @@ impl BorgTerminal {
                 self.keymap.label(KeyAction::Interrupt)
             )
         } else {
-            primary_controls_line(&self.keymap)
+            primary_controls_line(&self.keymap, self.ui_language)
         };
         let interaction_hint = bottom_interaction_hint(BottomInteractionHintState {
             status_hovered: self.status_hovered,
@@ -5481,13 +5525,13 @@ impl BorgTerminal {
                     if resume_picker_open {
                         spans.push(Span::raw(primary_controls.clone()));
                     } else {
-                        spans.extend(primary_controls_spans(&self.keymap));
+                        spans.extend(primary_controls_spans(&self.keymap, self.ui_language));
                     }
                     Line::from(spans)
                 } else if resume_picker_open {
                     Line::from(primary_controls.clone())
                 } else {
-                    Line::from(primary_controls_spans(&self.keymap))
+                    Line::from(primary_controls_spans(&self.keymap, self.ui_language))
                 }]
             }
         });
@@ -5544,6 +5588,7 @@ impl BorgTerminal {
         } else {
             " > "
         };
+        let ui_language = self.ui_language;
         let mut composer_render_lines = if self.picker.as_ref().is_some_and(|_| !modal_picker_open)
         {
             Vec::new()
@@ -5553,10 +5598,13 @@ impl BorgTerminal {
             } else {
                 match status {
                     SessionStatus::Running | SessionStatus::Starting => {
-                        active_message_placeholder(self.steer_active_turn)
+                        ui_text(
+                            ui_language,
+                            active_message_placeholder(self.steer_active_turn),
+                        )
                     }
                     SessionStatus::WaitingForApproval => "Allow · Y   Deny · N",
-                    _ => "Describe a task…",
+                    _ => ui_text(ui_language, "Describe a task…"),
                 }
             };
             vec![Line::from(vec![
@@ -5760,7 +5808,7 @@ impl BorgTerminal {
                         )),
                         Line::from(""),
                         Line::from(Span::styled(
-                            "What are we working on?",
+                            ui_text(ui_language, "What are we working on?"),
                             Style::default().fg(Color::Gray),
                         )),
                         Line::from(""),
@@ -6182,7 +6230,7 @@ impl BorgTerminal {
                 }
             }
             if !is_launch_screen && self.scroll_from_bottom > 0 {
-                let label = " ↓ Jump to bottom ";
+                let label = format!(" ↓ {} ", ui_text(ui_language, "Jump to bottom"));
                 let button_width = label.width() as u16;
                 let button = Rect {
                     x: chunks[2].right().saturating_sub(button_width + 1),
@@ -6220,7 +6268,11 @@ impl BorgTerminal {
                             .borders(Borders::TOP | Borders::LEFT)
                             .border_style(Style::default().fg(Color::DarkGray))
                             .title(Span::styled(
-                                format!(" Pending Input · {} ", queued_prompts.len()),
+                                format!(
+                                    " {} · {} ",
+                                    ui_text(ui_language, "Pending Input"),
+                                    queued_prompts.len()
+                                ),
                                 Style::default()
                                     .fg(if self.focused_child.is_some() {
                                         SUBAGENT_PINK
@@ -6600,6 +6652,7 @@ impl BorgTerminal {
                     tooltip.width.saturating_sub(2) as usize,
                     self.focused_child,
                     self.hovered_team_roster,
+                    ui_language,
                 );
                 frame.render_widget(
                     Paragraph::new(roster_lines)
@@ -8286,6 +8339,26 @@ fn display_agent_name(task_name: &str) -> String {
     }
 }
 
+fn display_subagent_model(agent: &SubagentSnapshot) -> String {
+    let explicit = agent.model.as_deref();
+    let model = explicit.or_else(|| match (agent.provider, agent.task_name.as_str()) {
+        (CodingProvider::Claude, "/root/claude") => Some("claude-opus-5"),
+        _ => None,
+    });
+    let model = model
+        .map(str::to_string)
+        .or_else(|| {
+            borg_provider::model_catalog_for_backend(agent.provider.catalog_backend())
+                .map(|catalog| catalog.default_model.to_string())
+        })
+        .unwrap_or_else(|| agent.provider.catalog_backend().to_string());
+    borg_provider::CODEX_SELECTABLE_MODELS
+        .iter()
+        .chain(borg_provider::CLAUDE_SELECTABLE_MODELS.iter())
+        .find_map(|(id, label)| (*id == model).then_some((*label).to_string()))
+        .unwrap_or(model)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct AgentRosterColumns {
     name: usize,
@@ -8305,9 +8378,18 @@ fn team_roster_table_lines(
     width: usize,
     focused_child: Option<Uuid>,
     hovered_row: Option<usize>,
+    language: UiLanguage,
 ) -> Vec<Line<'static>> {
     let columns = team_roster_table_columns(entries, width);
-    let header = roster_table_row("  ", "AGENT", "MODEL", "EFFORT", "STATE", "USAGE", columns);
+    let header = roster_table_row(
+        "  ",
+        ui_text(language, "AGENT"),
+        ui_text(language, "MODEL"),
+        ui_text(language, "EFFORT"),
+        ui_text(language, "STATE"),
+        ui_text(language, "USAGE"),
+        columns,
+    );
     std::iter::once(Line::from(Span::styled(
         header,
         Style::default()
@@ -8321,8 +8403,8 @@ fn team_roster_table_lines(
             if focused { "› " } else { "  " },
             &entry.name,
             &entry.model,
-            &entry.effort,
-            &entry.state,
+            ui_text(language, &entry.effort),
+            ui_text(language, &entry.state),
             &entry.usage,
             columns,
         );
@@ -9029,17 +9111,13 @@ fn subagent_status_label(status: SubagentStatus) -> &'static str {
 }
 
 fn format_subagent_usage(usage: &borg_remote::SubagentUsage) -> String {
-    let displayed_tokens = usage
-        .context_tokens
-        .filter(|tokens| *tokens > 0)
-        .map(|tokens| (tokens, "ctx"))
-        .or_else(|| (usage.total_tokens > 0).then_some((usage.total_tokens, "tok")));
+    let displayed_tokens = (usage.total_tokens > 0).then_some(usage.total_tokens);
     if displayed_tokens.is_none() && usage.cost_microusd.is_none() {
         return "  usage —".to_string();
     }
     let mut parts = Vec::new();
-    if let Some((tokens, unit)) = displayed_tokens {
-        parts.push(format_compact_count(tokens, unit));
+    if let Some(tokens) = displayed_tokens {
+        parts.push(format_compact_token_total(tokens));
     }
     if let Some(cost_microusd) = usage.cost_microusd {
         let cost = cost_microusd as f64 / 1_000_000.0;
@@ -9053,13 +9131,13 @@ fn format_subagent_usage(usage: &borg_remote::SubagentUsage) -> String {
     format!("  {}", parts.join(" · "))
 }
 
-fn format_compact_count(value: u64, unit: &str) -> String {
+fn format_compact_token_total(value: u64) -> String {
     if value >= 1_000_000 {
-        format!("{:.1}m {unit}", value as f64 / 1_000_000.0)
+        format!("{:.1}m", value as f64 / 1_000_000.0)
     } else if value >= 1_000 {
-        format!("{:.1}k {unit}", value as f64 / 1_000.0)
+        format!("{:.1}k", value as f64 / 1_000.0)
     } else {
-        format!("{value} {unit}")
+        value.to_string()
     }
 }
 
@@ -11300,23 +11378,29 @@ fn slash_help(matches: &[&(&str, &str)]) -> String {
         .join(" · ")
 }
 
-fn primary_controls_line(keymap: &KeyMap) -> String {
+fn primary_controls_line(keymap: &KeyMap, language: UiLanguage) -> String {
     format!(
-        "send {} · commands / · palette menu tab or {}",
+        "{} {} · {} / · {} tab or {}",
+        ui_text(language, "send"),
         keymap.label(KeyAction::Send),
+        ui_text(language, "commands"),
+        ui_text(language, "palette menu"),
         keymap.label(KeyAction::Keybindings)
     )
 }
 
-fn primary_controls_spans(keymap: &KeyMap) -> Vec<Span<'static>> {
+fn primary_controls_spans(keymap: &KeyMap, language: UiLanguage) -> Vec<Span<'static>> {
     let binding_style = Style::default().fg(Color::DarkGray);
     let key_style = Style::default().fg(Color::Gray);
     vec![
-        Span::styled("send ", binding_style),
+        Span::styled(format!("{} ", ui_text(language, "send")), binding_style),
         Span::styled(keymap.label(KeyAction::Send), key_style),
-        Span::styled(" · commands ", binding_style),
+        Span::styled(format!(" · {} ", ui_text(language, "commands")), binding_style),
         Span::styled("/", key_style),
-        Span::styled(" · palette menu ", binding_style),
+        Span::styled(
+            format!(" · {} ", ui_text(language, "palette menu")),
+            binding_style,
+        ),
         Span::styled("tab", key_style),
         Span::styled(" or ", binding_style),
         Span::styled(keymap.label(KeyAction::Keybindings), key_style),

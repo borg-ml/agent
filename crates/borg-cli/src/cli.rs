@@ -488,6 +488,9 @@ pub(crate) struct LocalAgentCliArgs {
     /// Run without a terminal frontend while a native GUI owns this session.
     #[arg(long, hide = true)]
     pub(crate) gui_owner: bool,
+    /// Run the detached owner process for one local session.
+    #[arg(long, hide = true)]
+    pub(crate) session_host: Option<Uuid>,
 }
 
 impl LocalAgentCliArgs {
@@ -512,6 +515,7 @@ impl LocalAgentCliArgs {
             local_only: false,
             ephemeral: false,
             gui_owner: false,
+            session_host: None,
         }
     }
 
@@ -536,6 +540,7 @@ impl LocalAgentCliArgs {
             local_only: false,
             ephemeral: false,
             gui_owner: false,
+            session_host: None,
         }
     }
 }

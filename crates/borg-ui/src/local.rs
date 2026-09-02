@@ -335,18 +335,19 @@ async fn ensure_session_owner(
     }
     let borg = borg_executable()?;
     let mut child = tokio::process::Command::new(&borg)
-        .arg("--gui-owner")
-        .arg("--resume")
+        .arg("--session-host")
         .arg(session_id.to_string())
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .kill_on_drop(true)
         .spawn()
         .with_context(|| format!("failed to start session owner {}", borg.display()))?;
     for _ in 0..200 {
         if socket.exists() {
-            return Ok(Some(child));
+            tokio::spawn(async move {
+                let _ = child.wait().await;
+            });
+            return Ok(None);
         }
         if let Some(status) = child.try_wait()? {
             anyhow::bail!("Borg session owner exited during startup with {status}");
@@ -359,25 +360,30 @@ async fn ensure_session_owner(
 
 async fn launch_new_session_owner() -> Result<(LocalSessionClient, Option<tokio::process::Child>)> {
     let borg = borg_executable()?;
-    let previous_session_id = LocalSessionClient::open(None)
-        .await?
-        .map(|client| client.view().session_id);
+    let sessions_dir = default_host_config_path()
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("sessions");
+    let store = Arc::new(SqliteSessionStore::open(sessions_dir.join("sessions.sqlite3")).await?);
+    let session_id = Uuid::new_v4();
+    store.create_session(session_id).await?;
     let mut child = tokio::process::Command::new(&borg)
-        .arg("--gui-owner")
+        .arg("--session-host")
+        .arg(session_id.to_string())
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .kill_on_drop(true)
         .spawn()
         .with_context(|| format!("failed to start session owner {}", borg.display()))?;
     for _ in 0..200 {
-        if let Some(client) = LocalSessionClient::open(None).await?
-            && Some(client.view().session_id) != previous_session_id
-        {
+        if let Some(client) = LocalSessionClient::open(Some(session_id)).await? {
             let socket =
                 session_control_socket_path(&client.sessions_dir, client.view().session_id);
             if socket.exists() {
-                return Ok((client, Some(child)));
+                tokio::spawn(async move {
+                    let _ = child.wait().await;
+                });
+                return Ok((client, None));
             }
         }
         if let Some(status) = child.try_wait()? {

@@ -5191,7 +5191,7 @@ fn team_roster_uses_aligned_columns_and_keeps_model_visible_when_narrow() {
         },
     ];
 
-    let rows = team_roster_table_lines(&entries, 90, None, None)
+    let rows = team_roster_table_lines(&entries, 90, None, None, UiLanguage::English)
         .into_iter()
         .map(|line| line.to_string())
         .collect::<Vec<_>>();
@@ -5204,7 +5204,7 @@ fn team_roster_uses_aligned_columns_and_keeps_model_visible_when_narrow() {
     assert_eq!(column(&rows[2], "gpt-5.6-luna"), Some(model_column));
     assert!(rows.iter().all(|row| row.width() <= 90));
 
-    let narrow = team_roster_table_lines(&entries, 28, None, None)
+    let narrow = team_roster_table_lines(&entries, 28, None, None, UiLanguage::English)
         .into_iter()
         .map(|line| line.to_string())
         .collect::<Vec<_>>();
@@ -5215,7 +5215,7 @@ fn team_roster_uses_aligned_columns_and_keeps_model_visible_when_narrow() {
 }
 
 #[test]
-fn subagent_selector_prefers_current_context_over_cumulative_provider_work() {
+fn subagent_selector_shows_cumulative_usage_without_a_redundant_unit_suffix() {
     let usage = borg_remote::SubagentUsage {
         total_tokens: 800_000,
         context_tokens: Some(100_000),
@@ -5223,8 +5223,29 @@ fn subagent_selector_prefers_current_context_over_cumulative_provider_work() {
     };
 
     let label = format_subagent_usage(&usage);
-    assert!(label.contains("100.0k ctx"), "{label}");
-    assert!(!label.contains("800.0k"), "{label}");
+    assert_eq!(label, "  800.0k");
+}
+
+#[test]
+fn persistent_claude_peer_shows_its_product_model() {
+    let now = Utc::now();
+    let peer = SubagentSnapshot {
+        session_id: Uuid::new_v4(),
+        parent_session_id: Uuid::new_v4(),
+        task_name: "/root/claude".to_string(),
+        status: SubagentStatus::Ready,
+        provider: CodingProvider::Claude,
+        model: None,
+        effort: Some("high".to_string()),
+        cwd: PathBuf::from("/workspace"),
+        created_at: now,
+        updated_at: now,
+        detail: None,
+        final_text: None,
+        usage: borg_remote::SubagentUsage::default(),
+    };
+
+    assert_eq!(display_subagent_model(&peer), "Opus 5");
 }
 
 #[test]
