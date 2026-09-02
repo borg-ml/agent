@@ -779,7 +779,7 @@ fn host_service_unit(
     allowed_networks: &[String],
 ) -> Result<String> {
     let mut service = format!(
-        "[Unit]\nDescription=Borg Remote host\nAfter=network-online.target\nWants=network-online.target\nStartLimitIntervalSec=0\n\n[Service]\nType=notify\nNotifyAccess=all\nExecStart={} remote host --config {}\nEnvironment={}\nRestart=always\nRestartSec=5\nWatchdogSec=90\nTimeoutStartSec=120\nTimeoutStopSec=30\n",
+        "[Unit]\nDescription=Borg Remote host\nAfter=network-online.target\nWants=network-online.target\nStartLimitIntervalSec=0\n\n[Service]\nType=notify\nNotifyAccess=all\nExecStart={} remote host --config {}\nEnvironment={}\nRestart=always\nRestartSec=5\nWatchdogSec=90\nWatchdogSignal=SIGKILL\nLimitCORE=0\nTimeoutStartSec=120\nTimeoutStopSec=30\n",
         systemd_quote(validated_systemd_value(&executable.to_string_lossy())?),
         systemd_quote(validated_systemd_value(&config_path.to_string_lossy())?),
         systemd_quote(validated_systemd_value(&format!("PATH={path}"))?),

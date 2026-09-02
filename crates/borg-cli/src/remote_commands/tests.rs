@@ -1374,6 +1374,8 @@ fn trusted_remote_host_service_keeps_legacy_unit_small() {
         "NotifyAccess=all",
         "Restart=always",
         "WatchdogSec=90",
+        "WatchdogSignal=SIGKILL",
+        "LimitCORE=0",
     ] {
         assert!(unit.contains(directive), "missing {directive} in {unit}");
     }

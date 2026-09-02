@@ -15,8 +15,10 @@ borg remote install --config "$HOME/.borg/remote/host.json"
 
 The installed user service is enabled across logout and reboot with systemd
 user lingering. It uses readiness notification, a 90-second watchdog,
-five-second restart backoff, and unlimited restart attempts. Re-running the
-command is safe and regenerates the service from the invoking binary.
+five-second restart backoff, and unlimited restart attempts. The watchdog
+uses `SIGKILL` and core dumps are disabled so a failed host cannot persist
+in-memory credentials. Re-running the command is safe and regenerates the
+service from the invoking binary.
 
 ## Preflight before leaving
 
