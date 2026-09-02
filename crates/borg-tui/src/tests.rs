@@ -5295,7 +5295,7 @@ fn persistent_peers_follow_ordinary_agent_visibility() {
 
     assert_eq!(running_rows.len(), 2);
     assert_eq!(running_rows[1].name, "Claude");
-    assert_eq!(running_rows[1].model, "claude-opus-5");
+    assert_eq!(running_rows[1].model, "Opus 5");
     assert_eq!(running_rows[1].effort, "high");
     assert_eq!(running_rows[1].state, "running");
     assert_eq!(transcript.active_subagent_count(), 1);

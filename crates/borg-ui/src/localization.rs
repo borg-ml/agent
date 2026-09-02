@@ -76,7 +76,7 @@ impl UiLanguage {
 
 /// Translate presentation copy only. Command names, picker values, protocol
 /// fields, and persisted strings stay language-neutral and stable.
-pub fn text<'a>(language: UiLanguage, english: &'a str) -> &'a str {
+pub fn text(language: UiLanguage, english: &str) -> &str {
     match (language.resolved(), english) {
         (UiLanguage::SimplifiedChinese, value) => chinese(value).unwrap_or(value),
         (UiLanguage::Spanish, value) => spanish(value).unwrap_or(value),
