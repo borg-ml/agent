@@ -30,6 +30,7 @@ pub struct KeybindingConfig {
     pub attach_image: Vec<String>,
     pub dictate: Vec<String>,
     pub copy: Vec<String>,
+    pub find: Vec<String>,
     pub scroll_up: Vec<String>,
     pub scroll_down: Vec<String>,
     pub select_previous: Vec<String>,
@@ -40,6 +41,18 @@ pub struct KeybindingConfig {
 
 impl Default for KeybindingConfig {
     fn default() -> Self {
+        #[cfg(target_os = "macos")]
+        let (attach_image, copy, find) = (
+            vec!["cmd+v".into()],
+            vec!["cmd+c".into()],
+            vec!["cmd+f".into()],
+        );
+        #[cfg(not(target_os = "macos"))]
+        let (attach_image, copy, find) = (
+            vec!["ctrl+v".into()],
+            vec!["ctrl+shift+c".into()],
+            vec!["ctrl+f".into()],
+        );
         Self {
             send: vec!["enter".into()],
             queue: vec!["tab".into()],
@@ -48,9 +61,10 @@ impl Default for KeybindingConfig {
             interrupt: vec!["esc".into()],
             clear_or_exit: vec!["ctrl+c".into()],
             exit: vec!["ctrl+d".into()],
-            attach_image: vec!["ctrl+v".into()],
+            attach_image,
             dictate: vec!["alt+v".into()],
-            copy: vec!["ctrl+y".into()],
+            copy,
+            find,
             scroll_up: vec!["pageup".into()],
             scroll_down: vec!["pagedown".into()],
             select_previous: vec!["alt+up".into()],
@@ -74,6 +88,7 @@ impl KeybindingConfig {
             "attach_image" => &mut self.attach_image,
             "dictate" => &mut self.dictate,
             "copy" => &mut self.copy,
+            "find" => &mut self.find,
             "scroll_up" => &mut self.scroll_up,
             "scroll_down" => &mut self.scroll_down,
             "select_previous" => &mut self.select_previous,
@@ -93,7 +108,7 @@ impl KeybindingConfig {
         Ok(())
     }
 
-    pub fn entries(&self) -> [(&'static str, &[String]); 16] {
+    pub fn entries(&self) -> [(&'static str, &[String]); 17] {
         [
             ("send", &self.send),
             ("queue", &self.queue),
@@ -105,6 +120,7 @@ impl KeybindingConfig {
             ("attach_image", &self.attach_image),
             ("dictate", &self.dictate),
             ("copy", &self.copy),
+            ("find", &self.find),
             ("scroll_up", &self.scroll_up),
             ("scroll_down", &self.scroll_down),
             ("select_previous", &self.select_previous),
@@ -120,7 +136,12 @@ pub fn validate_key_chord(value: &str) -> anyhow::Result<()> {
     let mut key = None;
     while let Some(part) = parts.next() {
         let part = part.trim().to_ascii_lowercase();
-        if parts.peek().is_some() && matches!(part.as_str(), "ctrl" | "alt" | "shift") {
+        if parts.peek().is_some()
+            && matches!(
+                part.as_str(),
+                "ctrl" | "alt" | "shift" | "cmd" | "command" | "super"
+            )
+        {
             continue;
         }
         anyhow::ensure!(key.is_none(), "only one non-modifier key is allowed");
@@ -874,6 +895,22 @@ pub fn parse_goal_action(line: &str) -> anyhow::Result<GoalAction> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_modifier_is_valid_in_custom_keybindings() {
+        assert!(validate_key_chord("cmd+c").is_ok());
+        assert!(validate_key_chord("command+shift+left").is_ok());
+        assert!(validate_key_chord("super+v").is_ok());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_defaults_use_native_clipboard_shortcuts() {
+        let defaults = KeybindingConfig::default();
+        assert_eq!(defaults.copy, ["cmd+c"]);
+        assert_eq!(defaults.attach_image, ["cmd+v"]);
+        assert_eq!(defaults.find, ["cmd+f"]);
+    }
 
     #[test]
     fn native_model_picker_crosses_catalog_backends() {

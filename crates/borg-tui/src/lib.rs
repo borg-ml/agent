@@ -36,8 +36,8 @@ use borg_remote::{
 use borg_remote::{tool_call_summary, tool_code_view};
 use borg_ui::localization::{UiLanguage, text as ui_text};
 use borg_ui::preferences::{
-    CompletionAlertPolicy, DictationIconStyle, DiffExpansionPolicy, TranscriptPreferences,
-    parse_hex_color,
+    CompletionAlertPolicy, DictationIconStyle, DiffExpansionPolicy, ToolClickBehavior,
+    TranscriptPreferences, parse_hex_color,
 };
 use borg_ui::timeline::tool_lifecycle_label;
 use chrono::{DateTime, Local, NaiveDate, Utc};
@@ -62,6 +62,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph};
 use ratatui::{TerminalOptions, Viewport};
+use regex::Regex;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 use uuid::Uuid;
@@ -218,6 +219,7 @@ enum KeyAction {
     AttachImage,
     Dictate,
     Copy,
+    Find,
     ScrollUp,
     ScrollDown,
     SelectPrevious,
@@ -245,6 +247,7 @@ struct KeyMap {
     attach_image: Vec<KeyChord>,
     dictate: Vec<KeyChord>,
     copy: Vec<KeyChord>,
+    find: Vec<KeyChord>,
     scroll_up: Vec<KeyChord>,
     scroll_down: Vec<KeyChord>,
     select_previous: Vec<KeyChord>,
@@ -266,6 +269,7 @@ impl KeyMap {
             attach_image: parse_key_chords(&config.attach_image)?,
             dictate: parse_key_chords(&config.dictate)?,
             copy: parse_key_chords(&config.copy)?,
+            find: parse_key_chords(&config.find)?,
             scroll_up: parse_key_chords(&config.scroll_up)?,
             scroll_down: parse_key_chords(&config.scroll_down)?,
             select_previous: parse_key_chords(&config.select_previous)?,
@@ -287,6 +291,7 @@ impl KeyMap {
             KeyAction::AttachImage => &self.attach_image,
             KeyAction::Dictate => &self.dictate,
             KeyAction::Copy => &self.copy,
+            KeyAction::Find => &self.find,
             KeyAction::ScrollUp => &self.scroll_up,
             KeyAction::ScrollDown => &self.scroll_down,
             KeyAction::SelectPrevious => &self.select_previous,
@@ -297,8 +302,11 @@ impl KeyMap {
     }
 
     fn matches(&self, action: KeyAction, key: &KeyEvent) -> bool {
-        let modifiers =
-            key.modifiers & (KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT);
+        let modifiers = key.modifiers
+            & (KeyModifiers::CONTROL
+                | KeyModifiers::ALT
+                | KeyModifiers::SHIFT
+                | KeyModifiers::SUPER);
         self.chords(action)
             .iter()
             .any(|chord| key_codes_match(chord.code, key.code) && chord.modifiers == modifiers)
@@ -333,6 +341,7 @@ fn parse_key_chord(value: &str) -> Result<KeyChord> {
             "ctrl" => modifiers.insert(KeyModifiers::CONTROL),
             "alt" => modifiers.insert(KeyModifiers::ALT),
             "shift" => modifiers.insert(KeyModifiers::SHIFT),
+            "cmd" | "command" | "super" => modifiers.insert(KeyModifiers::SUPER),
             "enter" => code = Some(KeyCode::Enter),
             "esc" => code = Some(KeyCode::Esc),
             "tab" => code = Some(KeyCode::Tab),
@@ -431,6 +440,29 @@ impl ComposerSelection {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ComposerNavigation {
+    WordLeft,
+    WordRight,
+    LineStart,
+    LineEnd,
+}
+
+fn composer_navigation(key: &KeyEvent) -> Option<(ComposerNavigation, bool)> {
+    let navigation_modifiers =
+        key.modifiers & (KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER);
+    let navigation = match (key.code, navigation_modifiers) {
+        (KeyCode::Left, KeyModifiers::SUPER) => ComposerNavigation::LineStart,
+        (KeyCode::Right, KeyModifiers::SUPER) => ComposerNavigation::LineEnd,
+        (KeyCode::Left, KeyModifiers::ALT | KeyModifiers::CONTROL) => ComposerNavigation::WordLeft,
+        (KeyCode::Right, KeyModifiers::ALT | KeyModifiers::CONTROL) => {
+            ComposerNavigation::WordRight
+        }
+        _ => return None,
+    };
+    Some((navigation, key.modifiers.contains(KeyModifiers::SHIFT)))
+}
+
 #[derive(Clone, Debug)]
 enum PendingTranscriptClick {
     Link(String),
@@ -444,12 +476,19 @@ enum PendingTranscriptClick {
     Background,
 }
 
+#[derive(Clone, Debug)]
+struct ThreadFindState {
+    pattern: String,
+    row: usize,
+}
+
 const ACTIVE_MESSAGES_SEND_NOW: &str = "Send now and redirect the current turn";
 const ACTIVE_MESSAGES_WAIT: &str = "Wait and send after the current turn finishes";
 
 const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/help", "open commands and keybindings"),
     ("/copy", "copy the last assistant message"),
+    ("/find", "find regex in this thread"),
     (
         "/ask",
         "ask another model through its persistent peer thread",
@@ -478,6 +517,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/sleep", "keep the machine awake during active turns"),
     ("/expand-edits", "auto-expand edit diffs"),
     ("/expand-tools", "auto-expand other tool details"),
+    ("/tool-click", "choose full-screen or inline action opening"),
     (
         "/action-descriptors",
         "show generation descriptors before tools",
@@ -582,8 +622,9 @@ enum TerminalIoRequestKind {
         value: String,
         cwd: PathBuf,
     },
-    CaptureImage {
+    CaptureClipboard {
         store: AttachmentStore,
+        cwd: PathBuf,
     },
     OpenLink {
         url: String,
@@ -603,7 +644,6 @@ pub struct TerminalIoCompletion {
 enum TerminalIoCompletionKind {
     Copied(std::result::Result<String, String>),
     Pasted(std::result::Result<PasteOutcome, String>),
-    ImageCaptured(std::result::Result<PathBuf, String>),
     LinkOpened(std::result::Result<(), String>),
 }
 
@@ -640,10 +680,10 @@ pub fn spawn_terminal_io_worker() -> (
                             .map_err(|error| format!("{error:#}")),
                     )
                 }
-                TerminalIoRequestKind::CaptureImage { store } => {
-                    TerminalIoCompletionKind::ImageCaptured(
+                TerminalIoRequestKind::CaptureClipboard { store, cwd } => {
+                    TerminalIoCompletionKind::Pasted(
                         store
-                            .capture_clipboard_image()
+                            .capture_clipboard_paste(&cwd)
                             .map_err(|error| format!("{error:#}")),
                     )
                 }
@@ -676,9 +716,9 @@ impl TerminalIoRequest {
         }
     }
 
-    fn capture_image(store: AttachmentStore) -> Self {
+    fn capture_clipboard(store: AttachmentStore, cwd: PathBuf) -> Self {
         Self {
-            kind: TerminalIoRequestKind::CaptureImage { store },
+            kind: TerminalIoRequestKind::CaptureClipboard { store, cwd },
         }
     }
 
@@ -744,6 +784,7 @@ pub enum UiAction {
     SetSteerActive(bool),
     SetDiffExpansion(DiffExpansionPolicy),
     SetAutoExpandTools(bool),
+    SetToolClickBehavior(ToolClickBehavior),
     SetActionDescriptors(bool),
     SetRunningSweeps(bool),
     SetCompletionNotifications(CompletionAlertPolicy),
@@ -924,6 +965,8 @@ pub struct BorgTerminal {
     dictation_icon: DictationIconStyle,
     running_sweeps: bool,
     action_descriptors: bool,
+    tool_click_behavior: ToolClickBehavior,
+    thread_find: Option<ThreadFindState>,
     completion_notifications: CompletionAlertPolicy,
     completion_sound: CompletionAlertPolicy,
     horizontal_margin: u16,
@@ -1004,6 +1047,7 @@ pub struct BorgTerminal {
     pending_scroll_anchor_height: Option<usize>,
     pending_transcript_anchor: Option<TranscriptViewportAnchor>,
     event_redraw_needed: bool,
+    last_tool_timer_refresh_tick: Option<i64>,
     cursor_blink_started_at: Instant,
     splash_started_at: Instant,
     splash_glitch_seed: u64,
@@ -1152,6 +1196,7 @@ enum PickerKind {
     ActiveMessages,
     AutoExpandEdits,
     AutoExpandTools,
+    ToolClickBehavior,
     ActionDescriptors,
     RunningSweeps,
     CompletionNotifications,
@@ -1949,6 +1994,8 @@ impl BorgTerminal {
             dictation_icon: dictation_icon_style_for_preference(None),
             running_sweeps: true,
             action_descriptors: true,
+            tool_click_behavior: ToolClickBehavior::Fullscreen,
+            thread_find: None,
             completion_notifications: CompletionAlertPolicy::Unfocused,
             completion_sound: CompletionAlertPolicy::Unfocused,
             horizontal_margin: HORIZONTAL_MARGIN,
@@ -2027,6 +2074,7 @@ impl BorgTerminal {
             pending_scroll_anchor_height: None,
             pending_transcript_anchor: None,
             event_redraw_needed: false,
+            last_tool_timer_refresh_tick: None,
             cursor_blink_started_at: Instant::now(),
             splash_started_at: Instant::now(),
             splash_glitch_seed: Uuid::new_v4().as_u128() as u64,
@@ -2489,6 +2537,13 @@ impl BorgTerminal {
 
     pub fn has_running_tool(&self) -> bool {
         self.transcript.has_running_tool()
+    }
+
+    pub fn running_tool_timer_refresh_due(&mut self) -> bool {
+        let tick = self.transcript.running_tool_timer_tick_at(Utc::now());
+        let due = tick.is_some() && tick != self.last_tool_timer_refresh_tick;
+        self.last_tool_timer_refresh_tick = tick;
+        due
     }
 
     pub fn has_active_subagents(&self) -> bool {
@@ -3223,13 +3278,6 @@ impl BorgTerminal {
             TerminalIoCompletionKind::Pasted(Err(error)) => {
                 self.notice = Some(format!("Paste failed: {error}"));
             }
-            TerminalIoCompletionKind::ImageCaptured(Ok(path)) => {
-                let label = self.composer.insert_attachment(path);
-                self.notice = Some(format!("Attached {label}"));
-            }
-            TerminalIoCompletionKind::ImageCaptured(Err(error)) => {
-                self.notice = Some(format!("Image paste failed: {error}"));
-            }
             TerminalIoCompletionKind::LinkOpened(Ok(())) => {}
             TerminalIoCompletionKind::LinkOpened(Err(error)) => {
                 self.notice = Some(format!("Could not open link: {error}"));
@@ -3395,6 +3443,7 @@ impl BorgTerminal {
             "Keep machine awake".to_string(),
             "Auto-expand edits".to_string(),
             "Auto-expand tools".to_string(),
+            "Tool click behavior".to_string(),
             "Action descriptors".to_string(),
             "Running sweep animations".to_string(),
             "Completion notifications".to_string(),
@@ -3416,6 +3465,7 @@ impl BorgTerminal {
             "/sleep",
             "/expand-edits",
             "/expand-tools",
+            "/tool-click",
             "/action-descriptors",
             "/animations",
             "/notifications",
@@ -3645,6 +3695,18 @@ impl BorgTerminal {
         ));
     }
 
+    pub fn open_tool_click_behavior_picker(&mut self) {
+        self.picker = Some(Picker::new(
+            PickerKind::ToolClickBehavior,
+            "Tool click behavior",
+            ["Fullscreen", "Inline"],
+            Some(match self.tool_click_behavior {
+                ToolClickBehavior::Fullscreen => "Fullscreen",
+                ToolClickBehavior::Inline => "Inline",
+            }),
+        ));
+    }
+
     pub fn open_action_descriptors_picker(&mut self) {
         self.picker = Some(Picker::new(
             PickerKind::ActionDescriptors,
@@ -3760,6 +3822,10 @@ impl BorgTerminal {
         }
         self.transcript.set_auto_expand_tools(enabled);
         self.invalidate_transcript_render_cache();
+    }
+
+    pub fn set_tool_click_behavior(&mut self, behavior: ToolClickBehavior) {
+        self.tool_click_behavior = behavior;
     }
 
     pub fn set_dictation_icon(&mut self, style: DictationIconStyle) {
@@ -4729,11 +4795,17 @@ impl BorgTerminal {
                 if let Some((start, max_offset)) = run {
                     self.transcript.anchor_tool_run(start, max_offset);
                 }
-                if self.transcript.tool_is_expanded(index) {
-                    self.capture_transcript_anchor_for_collapse();
-                }
-                let payloads = self.transcript.toggle_tool(index);
-                self.invalidate_transcript_render_cache();
+                let payloads = match self.tool_click_behavior {
+                    ToolClickBehavior::Fullscreen => self.open_tool_inspector(index),
+                    ToolClickBehavior::Inline => {
+                        if self.transcript.tool_is_expanded(index) {
+                            self.capture_transcript_anchor_for_collapse();
+                        }
+                        let payloads = self.transcript.toggle_tool(index);
+                        self.invalidate_transcript_render_cache();
+                        payloads
+                    }
+                };
                 if !payloads.is_empty() {
                     return UiAction::LoadPayloads(payloads);
                 }
@@ -4961,6 +5033,79 @@ impl BorgTerminal {
         self.transcript.follow_tail = self.scroll_from_bottom == 0;
     }
 
+    fn open_thread_find(&mut self) {
+        let pattern = self
+            .thread_find
+            .as_ref()
+            .map(|find| find.pattern.as_str())
+            .unwrap_or_default();
+        self.composer.replace_text(format!(
+            "/find{}",
+            if pattern.is_empty() {
+                " ".to_string()
+            } else {
+                format!(" {pattern}")
+            }
+        ));
+        self.composer_selection = None;
+        self.notice = Some("Enter a regex and press Enter · repeat to find next".to_string());
+    }
+
+    fn find_in_thread(&mut self, requested_pattern: &str) {
+        let requested_pattern = requested_pattern.trim();
+        let pattern = if requested_pattern.is_empty() {
+            self.thread_find
+                .as_ref()
+                .map(|find| find.pattern.clone())
+                .unwrap_or_default()
+        } else {
+            requested_pattern.to_string()
+        };
+        if pattern.is_empty() {
+            self.notice = Some("Usage: /find <regex>".to_string());
+            return;
+        }
+        let regex = match Regex::new(&pattern) {
+            Ok(regex) => regex,
+            Err(error) => {
+                self.notice = Some(format!("Invalid regex: {error}"));
+                return;
+            }
+        };
+        let Some(render) = self.active_transcript_render.as_ref() else {
+            self.notice = Some("Nothing in this thread to search yet".to_string());
+            return;
+        };
+        let matches = thread_find_matches(&regex, &render.0);
+        if matches.is_empty() {
+            self.notice = Some(format!("No matches for /{pattern}/"));
+            return;
+        }
+        let previous_row = self
+            .thread_find
+            .as_ref()
+            .filter(|find| find.pattern == pattern)
+            .map(|find| find.row);
+        let (row, position) = next_thread_match(&matches, previous_row);
+        let viewport_height = self
+            .transcript_viewport_area
+            .map_or(1, |area| usize::from(area.height).max(1));
+        let scroll_start = row
+            .saturating_sub(viewport_height / 2)
+            .min(self.transcript_scroll_max);
+        self.scroll_from_bottom = self.transcript_scroll_max.saturating_sub(scroll_start);
+        self.transcript.follow_tail = false;
+        self.history_page_requested = false;
+        self.thread_find = Some(ThreadFindState {
+            pattern: pattern.clone(),
+            row,
+        });
+        self.notice = Some(format!(
+            "Match {position}/{} for /{pattern}/ · repeat /find to continue",
+            matches.len()
+        ));
+    }
+
     fn capture_transcript_anchor_for_collapse(&mut self) {
         if self.scroll_from_bottom == 0 || self.pending_transcript_anchor.is_some() {
             return;
@@ -5165,6 +5310,13 @@ impl BorgTerminal {
             }
             PickerKind::AutoExpandTools => {
                 UiAction::SetAutoExpandTools(picker.selected_value() == "On")
+            }
+            PickerKind::ToolClickBehavior => {
+                UiAction::SetToolClickBehavior(if picker.selected_value() == "Inline" {
+                    ToolClickBehavior::Inline
+                } else {
+                    ToolClickBehavior::Fullscreen
+                })
             }
             PickerKind::ActionDescriptors => {
                 UiAction::SetActionDescriptors(picker.selected_value() == "On")
@@ -7232,11 +7384,39 @@ impl BorgTerminal {
         Ok(())
     }
 
+    fn navigate_composer(&mut self, navigation: ComposerNavigation, selecting: bool) {
+        let anchor = self
+            .composer_selection
+            .map_or(self.composer.cursor, |selection| selection.anchor);
+        match navigation {
+            ComposerNavigation::WordLeft => self.composer.move_word_left(),
+            ComposerNavigation::WordRight => self.composer.move_word_right(),
+            ComposerNavigation::LineStart => self.composer.move_line_start(),
+            ComposerNavigation::LineEnd => self.composer.move_line_end(),
+        }
+        self.composer_selection = selecting.then_some(ComposerSelection {
+            anchor,
+            focus: self.composer.cursor,
+            dragging: false,
+            pointer: Position::new(0, 0),
+        });
+        if self
+            .composer_selection
+            .is_some_and(ComposerSelection::is_empty)
+        {
+            self.composer_selection = None;
+        }
+    }
+
     fn handle_key(&mut self, mut key: KeyEvent) -> Result<UiAction> {
         if is_selection_copy_shortcut(&key)
             && let Some(request) = self.copy_text_selection_request()
         {
             return Ok(UiAction::TerminalIo(request));
+        }
+        if self.picker.is_none() && self.keymap.matches(KeyAction::Find, &key) {
+            self.open_thread_find();
+            return Ok(UiAction::None);
         }
         let ctrl_c = is_ctrl_c(&key);
         if ctrl_c {
@@ -7535,7 +7715,6 @@ impl BorgTerminal {
         if self.rewind_primed {
             self.rewind_primed = false;
         }
-        self.composer_selection = None;
         if self.pending_approval {
             return Ok(if self.keymap.matches(KeyAction::Approve, &key) {
                 UiAction::Approve {
@@ -7552,6 +7731,7 @@ impl BorgTerminal {
             });
         }
         if deletes_previous_word(&key) {
+            self.composer_selection = None;
             self.composer.backspace_word();
             self.update_slash_notice();
             return Ok(UiAction::None);
@@ -7560,9 +7740,10 @@ impl BorgTerminal {
             return Ok(UiAction::Quit);
         }
         if self.keymap.matches(KeyAction::AttachImage, &key) {
-            self.notice = Some("Reading clipboard image…".to_string());
-            return Ok(UiAction::TerminalIo(TerminalIoRequest::capture_image(
+            self.notice = Some("Reading clipboard…".to_string());
+            return Ok(UiAction::TerminalIo(TerminalIoRequest::capture_clipboard(
                 self.attachment_store.clone(),
+                self.cwd.clone(),
             )));
         }
         if self.keymap.matches(KeyAction::Dictate, &key) {
@@ -7580,19 +7761,11 @@ impl BorgTerminal {
             }
             return Ok(UiAction::None);
         }
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            return match key.code {
-                KeyCode::Left => {
-                    self.composer.move_word_left();
-                    Ok(UiAction::None)
-                }
-                KeyCode::Right => {
-                    self.composer.move_word_right();
-                    Ok(UiAction::None)
-                }
-                _ => Ok(UiAction::None),
-            };
+        if let Some((navigation, selecting)) = composer_navigation(&key) {
+            self.navigate_composer(navigation, selecting);
+            return Ok(UiAction::None);
         }
+        self.composer_selection = None;
         if self.keymap.matches(KeyAction::SelectPrevious, &key) {
             self.transcript.select_previous();
             self.notice = Some(self.transcript.selection_notice(&self.keymap));
@@ -7658,6 +7831,15 @@ impl BorgTerminal {
                 self.composer.clear();
                 self.notice = None;
                 return Ok(UiAction::ToggleDictation);
+            }
+            if self.composer.attachments.is_empty()
+                && let Some(pattern) = self.composer.text.trim().strip_prefix("/find")
+                && pattern.chars().next().is_none_or(char::is_whitespace)
+            {
+                let pattern = pattern.trim().to_string();
+                self.composer.clear();
+                self.find_in_thread(&pattern);
+                return Ok(UiAction::None);
             }
             let (text, attachments) = self.composer.take();
             if text.trim().is_empty() && attachments.is_empty() {
@@ -8784,6 +8966,20 @@ impl Composer {
             .map(|(start, _)| start)
             .find(|start| *start > self.cursor)
             .unwrap_or(self.text.len());
+        self.preferred_column = None;
+    }
+
+    fn move_line_start(&mut self) {
+        self.cursor = self.text[..self.cursor]
+            .rfind('\n')
+            .map_or(0, |newline| newline + 1);
+        self.preferred_column = None;
+    }
+
+    fn move_line_end(&mut self) {
+        self.cursor = self.text[self.cursor..]
+            .find('\n')
+            .map_or(self.text.len(), |newline| self.cursor + newline);
         self.preferred_column = None;
     }
 
@@ -11300,6 +11496,21 @@ fn fuzzy_matches(haystack: &str, needle: &str) -> bool {
         .all(|wanted| haystack.any(|character| character == wanted))
 }
 
+fn thread_find_matches(regex: &Regex, lines: &[Line<'static>]) -> Vec<usize> {
+    lines
+        .iter()
+        .enumerate()
+        .filter_map(|(row, line)| regex.is_match(&line.to_string()).then_some(row))
+        .collect()
+}
+
+fn next_thread_match(matches: &[usize], previous_row: Option<usize>) -> (usize, usize) {
+    let position = previous_row
+        .and_then(|previous| matches.iter().position(|row| *row > previous))
+        .unwrap_or(0);
+    (matches[position], position + 1)
+}
+
 /// Commands whose bare form is not a command at all: submitting `/steer` with
 /// no message would send the literal word to the model, so the palette puts
 /// them in the composer for the user to finish.
@@ -11443,9 +11654,10 @@ fn keybinding_reference(keymap: &KeyMap) -> Vec<(&'static str, String)> {
         ("interrupt or close", keymap.label(KeyAction::Interrupt)),
         ("clear · twice exits", keymap.label(KeyAction::ClearOrExit)),
         ("exit", keymap.label(KeyAction::Exit)),
-        ("attach image", keymap.label(KeyAction::AttachImage)),
+        ("paste clipboard", keymap.label(KeyAction::AttachImage)),
         ("start/stop dictation", keymap.label(KeyAction::Dictate)),
         ("copy selection/response", keymap.label(KeyAction::Copy)),
+        ("find in thread", keymap.label(KeyAction::Find)),
         (
             "scroll transcript",
             format!(
@@ -11532,9 +11744,17 @@ fn keybinding_lines(keymap: &KeyMap, width: usize) -> Vec<Line<'static>> {
         .iter()
         .flat_map(|binding| {
             let label = format!("{} {}", binding.0, binding.1);
+            if label.width() <= width.max(1) {
+                return vec![Line::from(vec![
+                    Span::styled(binding.0.to_string(), action_style),
+                    Span::raw(" "),
+                    Span::styled(binding.1.clone(), key_style),
+                ])];
+            }
             wrap_display(&label, width.max(1))
                 .into_iter()
                 .map(|line| Line::from(vec![Span::styled(line, action_style)]))
+                .collect()
         })
         .collect()
 }

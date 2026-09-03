@@ -93,30 +93,39 @@ impl AttachmentStore {
     }
 
     #[cfg(not(target_os = "android"))]
-    pub fn capture_clipboard_image(&self) -> Result<PathBuf> {
+    pub fn capture_clipboard_paste(&self, cwd: &Path) -> Result<PasteOutcome> {
         let mut clipboard = arboard::Clipboard::new().context("system clipboard is unavailable")?;
         if let Ok(files) = clipboard.get().file_list()
             && let Some(path) = files.into_iter().find(|path| is_supported_image(path))
         {
-            return self.stage_path(&path);
+            return Ok(PasteOutcome {
+                text: String::new(),
+                attachments: vec![self.stage_path(&path)?],
+            });
         }
-        let image = clipboard
-            .get_image()
-            .context("the clipboard does not contain an image")?;
-        let width = u32::try_from(image.width).context("clipboard image is too wide")?;
-        let height = u32::try_from(image.height).context("clipboard image is too tall")?;
-        let rgba = RgbaImage::from_raw(width, height, image.bytes.into_owned())
-            .context("clipboard returned an invalid RGBA image")?;
-        let mut encoded = Vec::new();
-        DynamicImage::ImageRgba8(rgba)
-            .write_to(&mut Cursor::new(&mut encoded), ImageFormat::Png)
-            .context("failed to encode clipboard image")?;
-        self.write_image_bytes(&encoded, "png")
+        if let Ok(image) = clipboard.get_image() {
+            let width = u32::try_from(image.width).context("clipboard image is too wide")?;
+            let height = u32::try_from(image.height).context("clipboard image is too tall")?;
+            let rgba = RgbaImage::from_raw(width, height, image.bytes.into_owned())
+                .context("clipboard returned an invalid RGBA image")?;
+            let mut encoded = Vec::new();
+            DynamicImage::ImageRgba8(rgba)
+                .write_to(&mut Cursor::new(&mut encoded), ImageFormat::Png)
+                .context("failed to encode clipboard image")?;
+            return Ok(PasteOutcome {
+                text: String::new(),
+                attachments: vec![self.write_image_bytes(&encoded, "png")?],
+            });
+        }
+        let text = clipboard
+            .get_text()
+            .context("the clipboard does not contain text or an image")?;
+        self.stage_paste(&text, cwd)
     }
 
     #[cfg(target_os = "android")]
-    pub fn capture_clipboard_image(&self) -> Result<PathBuf> {
-        bail!("clipboard image paste is unavailable on Android/Termux")
+    pub fn capture_clipboard_paste(&self, _cwd: &Path) -> Result<PasteOutcome> {
+        bail!("clipboard paste is unavailable on Android/Termux")
     }
 
     fn write_image_bytes(&self, bytes: &[u8], extension: &str) -> Result<PathBuf> {

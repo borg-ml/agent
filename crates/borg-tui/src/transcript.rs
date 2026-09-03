@@ -1,15 +1,16 @@
 const USER_INTERRUPT_ACTIVITY: &str = "agent interrupted by user";
 const TOOL_ELAPSED_REFRESH_MILLIS: i64 = 100;
+const LONG_TOOL_ELAPSED_REFRESH_MILLIS: i64 = 1_000;
+const LONG_TOOL_ELAPSED_THRESHOLD_MILLIS: i64 = 60_000;
 
 fn assistant_message_is_retired_action_leak(text: &str) -> bool {
     let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
     let Some(first) = lines.next() else {
         return false;
     };
-    std::iter::once(first).chain(lines).all(|line| {
-        line.trim_start_matches('[')
-            .starts_with("BORG_ACTION:")
-    })
+    std::iter::once(first)
+        .chain(lines)
+        .all(|line| line.trim_start_matches('[').starts_with("BORG_ACTION:"))
 }
 
 fn user_message_has_structured_whitespace(text: &str) -> bool {
@@ -18,7 +19,9 @@ fn user_message_has_structured_whitespace(text: &str) -> bool {
             line.contains('\t')
                 || line.starts_with(' ')
                 || line.contains("  ")
-                || line.chars().any(|character| "│┃┌┐└┘┬┴┼╭╮╰╯".contains(character))
+                || line
+                    .chars()
+                    .any(|character| "│┃┌┐└┘┬┴┼╭╮╰╯".contains(character))
         })
 }
 
@@ -46,9 +49,7 @@ fn goal_status_label(status: GoalStatus) -> &'static str {
 }
 
 fn line_is_blank(line: &Line<'static>) -> bool {
-    line.spans
-        .iter()
-        .all(|span| span.content.trim().is_empty())
+    line.spans.iter().all(|span| span.content.trim().is_empty())
 }
 
 fn line_is_unstyled_blank(line: &Line<'static>) -> bool {
@@ -59,8 +60,7 @@ fn message_badge_colors(color: Color) -> (Color, Color) {
     match color {
         Color::Rgb(red, green, blue) => {
             let mix = |base: u8, accent: u8, accent_weight: u16| {
-                ((u16::from(base) * (100 - accent_weight)
-                    + u16::from(accent) * accent_weight)
+                ((u16::from(base) * (100 - accent_weight) + u16::from(accent) * accent_weight)
                     / 100) as u8
             };
             let background = match MESSAGE_BG {
@@ -385,11 +385,7 @@ fn compaction_has_expandable_detail(summary: &str) -> bool {
 
     !matches!(
         normalized.as_str(),
-        ""
-            | "context compacted"
-            | "context was compacted"
-            | "no summary"
-            | "no details"
+        "" | "context compacted" | "context was compacted" | "no summary" | "no details"
     )
 }
 
@@ -419,7 +415,9 @@ impl Transcript {
     fn message_id_at(&self, index: usize) -> Option<Uuid> {
         self.messages
             .iter()
-            .find_map(|(message_id, message_index)| (*message_index == index).then_some(*message_id))
+            .find_map(|(message_id, message_index)| {
+                (*message_index == index).then_some(*message_id)
+            })
     }
 
     fn upsert_subagent_snapshot(&mut self, agent: &SubagentSnapshot) {
@@ -579,7 +577,10 @@ impl Transcript {
                     if matches!(
                         goal.status,
                         GoalStatus::Paused | GoalStatus::Blocked | GoalStatus::UsageLimited
-                    ) => GoalStatus::Active,
+                    ) =>
+                {
+                    GoalStatus::Active
+                }
                 _ => return false,
             };
             goal.status = next_status;
@@ -689,7 +690,10 @@ impl Transcript {
 
     fn compaction_revert_sequence(&self, index: usize) -> Option<u64> {
         let TranscriptEntry::Compaction {
-            summary, sequence, complete, ..
+            summary,
+            sequence,
+            complete,
+            ..
         } = self.order.get(index)?
         else {
             return None;
@@ -1244,19 +1248,22 @@ impl Transcript {
                         self.reindex_after_insertion(insertion_index);
                     }
                     self.messages.insert(*message_id, insertion_index);
-                    self.order.insert(insertion_index, TranscriptEntry::Message {
-                        actor: *actor,
-                        text: text.clone(),
-                        attachments,
-                        model,
-                        effort,
-                        time: event_time,
-                        status: *status,
-                        complete: matches!(
-                            *status,
-                            MessageStatus::Complete | MessageStatus::Failed
-                        ),
-                    });
+                    self.order.insert(
+                        insertion_index,
+                        TranscriptEntry::Message {
+                            actor: *actor,
+                            text: text.clone(),
+                            attachments,
+                            model,
+                            effort,
+                            time: event_time,
+                            status: *status,
+                            complete: matches!(
+                                *status,
+                                MessageStatus::Complete | MessageStatus::Failed
+                            ),
+                        },
+                    );
                 }
             }
             SessionEventKind::ReasoningDelta { text } => {
@@ -1265,9 +1272,7 @@ impl Transcript {
             SessionEventKind::ReasoningCompleted => {
                 self.finish_reasoning(event.created_at);
             }
-            SessionEventKind::ProviderEvent { kind, payload, .. }
-                if kind == "action/preparing" =>
-            {
+            SessionEventKind::ProviderEvent { kind, payload, .. } if kind == "action/preparing" => {
                 if !self.action_descriptors {
                     return removed_entry;
                 }
@@ -1291,13 +1296,10 @@ impl Transcript {
                 else {
                     return removed_entry;
                 };
-                let Some(raw_name) = payload.get("name").and_then(serde_json::Value::as_str)
-                else {
+                let Some(raw_name) = payload.get("name").and_then(serde_json::Value::as_str) else {
                     return removed_entry;
                 };
-                let input = payload
-                    .get("input")
-                    .unwrap_or(&serde_json::Value::Null);
+                let input = payload.get("input").unwrap_or(&serde_json::Value::Null);
                 self.promote_preparing_tool_if_untracked(tool_call_id);
                 self.upsert_running_tool(event, tool_call_id, raw_name, input, None);
             }
@@ -1314,13 +1316,7 @@ impl Transcript {
                     return removed_entry;
                 }
                 self.promote_preparing_tool_if_untracked(tool_call_id);
-                self.upsert_running_tool(
-                    event,
-                    tool_call_id,
-                    name,
-                    input,
-                    input_ref.as_ref(),
-                );
+                self.upsert_running_tool(event, tool_call_id, name, input, input_ref.as_ref());
             }
             SessionEventKind::ToolUpdated {
                 tool_call_id,
@@ -1359,8 +1355,9 @@ impl Transcript {
                 let followup_handle =
                     tool_process_followup_handle(&source_name_for_process, input.as_ref())
                         .or(stored_followup_handle);
-                let reported_background_handle =
-                    (!*is_error).then(|| tool_output_background_handle(output)).flatten();
+                let reported_background_handle = (!*is_error)
+                    .then(|| tool_output_background_handle(output))
+                    .flatten();
                 let output_handle = (tool_can_start_background_process(&source_name_for_process))
                     .then(|| reported_background_handle.clone())
                     .flatten();
@@ -1622,14 +1619,18 @@ impl Transcript {
                 stderr,
                 ..
             } => {
-                let tool_index = self.runtime_processes.get(process_id).and_then(|process| process.tool_index);
+                let tool_index = self
+                    .runtime_processes
+                    .get(process_id)
+                    .and_then(|process| process.tool_index);
                 if let Some(process) = self.runtime_processes.get_mut(process_id) {
                     process.running = false;
                 }
                 if let Some(tool_index) = tool_index
-                    && !self.runtime_processes.values().any(|process| {
-                        process.running && process.tool_index == Some(tool_index)
-                    })
+                    && !self
+                        .runtime_processes
+                        .values()
+                        .any(|process| process.running && process.tool_index == Some(tool_index))
                     && let Some(TranscriptEntry::Tool {
                         output_view,
                         backgrounded,
@@ -1661,9 +1662,7 @@ impl Transcript {
             {
                 self.finish_reasoning(event.created_at);
             }
-            SessionEventKind::ProviderEvent { kind, .. }
-                if kind == "context_compaction_failed" =>
-            {
+            SessionEventKind::ProviderEvent { kind, .. } if kind == "context_compaction_failed" => {
                 self.finish_reasoning(event.created_at);
                 self.cache_diagnostics.reset();
                 if matches!(
@@ -1745,11 +1744,8 @@ impl Transcript {
                 agent,
                 event: child_event,
             } => {
-                let status = effective_subagent_status(
-                    *activity,
-                    agent.status,
-                    child_event.as_deref(),
-                );
+                let status =
+                    effective_subagent_status(*activity, agent.status, child_event.as_deref());
                 self.upsert_subagent_snapshot_with_status(agent, status);
                 if let Some((label, detail, body, state)) =
                     subagent_action_projection(*activity, agent, child_event.as_deref())
@@ -1829,10 +1825,10 @@ impl Transcript {
             .messages
             .drain()
             .filter_map(|((entry_index, width), render)| {
-                (entry_index != index).then_some(((
-                    entry_index - usize::from(entry_index > index),
-                    width,
-                ), render))
+                (entry_index != index).then_some((
+                    (entry_index - usize::from(entry_index > index), width),
+                    render,
+                ))
             })
             .collect();
         let cache = self.tool_body_cache.get_mut();
@@ -1840,12 +1836,15 @@ impl Transcript {
             .lines
             .drain()
             .filter_map(|((entry_index, width, output, boxed), lines)| {
-                (entry_index != index).then_some(((
-                    entry_index - usize::from(entry_index > index),
-                    width,
-                    output,
-                    boxed,
-                ), lines))
+                (entry_index != index).then_some((
+                    (
+                        entry_index - usize::from(entry_index > index),
+                        width,
+                        output,
+                        boxed,
+                    ),
+                    lines,
+                ))
             })
             .collect();
         for stored_index in self
@@ -1860,8 +1859,7 @@ impl Transcript {
         }
         for process in self.runtime_processes.values_mut() {
             process.tool_index = process.tool_index.and_then(|tool_index| {
-                (tool_index != index)
-                    .then_some(tool_index - usize::from(tool_index > index))
+                (tool_index != index).then_some(tool_index - usize::from(tool_index > index))
             });
         }
         self.provider_backgrounds.retain(|_, process| {
@@ -1952,7 +1950,7 @@ impl Transcript {
                 (self
                     .queued_message_sequences
                     .get(message_id)
-                .is_some_and(|existing| *existing > sequence))
+                    .is_some_and(|existing| *existing > sequence))
                 .then_some(index)
             })
             .unwrap_or(self.order.len())
@@ -1964,7 +1962,10 @@ impl Transcript {
             .messages
             .drain()
             .map(|((entry_index, width), render)| {
-                ((entry_index + usize::from(entry_index >= index), width), render)
+                (
+                    (entry_index + usize::from(entry_index >= index), width),
+                    render,
+                )
             })
             .collect();
         let cache = self.tool_body_cache.get_mut();
@@ -1972,12 +1973,15 @@ impl Transcript {
             .lines
             .drain()
             .map(|((entry_index, width, output, boxed), lines)| {
-                ((
-                    entry_index + usize::from(entry_index >= index),
-                    width,
-                    output,
-                    boxed,
-                ), lines)
+                (
+                    (
+                        entry_index + usize::from(entry_index >= index),
+                        width,
+                        output,
+                        boxed,
+                    ),
+                    lines,
+                )
             })
             .collect();
         for stored_index in self
@@ -2002,9 +2006,9 @@ impl Transcript {
                 process.tool_index += 1;
             }
         }
-        self.selected = self.selected.map(|selected| {
-            selected + usize::from(selected >= index)
-        });
+        self.selected = self
+            .selected
+            .map(|selected| selected + usize::from(selected >= index));
         self.tool_run_offsets = self
             .tool_run_offsets
             .drain()
@@ -2018,9 +2022,7 @@ impl Transcript {
         self.active_reasoning = self
             .active_reasoning
             .map(|reasoning| reasoning + usize::from(reasoning >= index));
-        self.last_edit = self
-            .last_edit
-            .map(|edit| edit + usize::from(edit >= index));
+        self.last_edit = self.last_edit.map(|edit| edit + usize::from(edit >= index));
     }
 
     fn append_reasoning(&mut self, text: &str, started_at: DateTime<Utc>, time: String) {
@@ -2120,23 +2122,22 @@ impl Transcript {
         }
     }
 
-    fn provider_reasoning_lifecycle(
-        kind: &str,
-        payload: &serde_json::Value,
-    ) -> Option<bool> {
+    fn provider_reasoning_lifecycle(kind: &str, payload: &serde_json::Value) -> Option<bool> {
         let (method, suffix) = kind
             .rsplit_once(':')
             .map_or((kind, None), |(method, suffix)| (method, Some(suffix)));
         let item_type = suffix
-            .or_else(|| payload.pointer("/item/type").and_then(serde_json::Value::as_str))
+            .or_else(|| {
+                payload
+                    .pointer("/item/type")
+                    .and_then(serde_json::Value::as_str)
+            })
             .or_else(|| {
                 payload
                     .pointer("/params/item/type")
                     .and_then(serde_json::Value::as_str)
             });
-        let method = method
-            .to_ascii_lowercase()
-            .replace(['.', '_', '-'], "/");
+        let method = method.to_ascii_lowercase().replace(['.', '_', '-'], "/");
         let is_reasoning = item_type
             .is_some_and(|item_type| item_type.to_ascii_lowercase().contains("reasoning"))
             || method.contains("reasoning");
@@ -2185,9 +2186,7 @@ impl Transcript {
         }
         let expanded = input_ref.is_none()
             && ((is_edit_diff && self.diff_expansion != DiffExpansionPolicy::Collapsed)
-                || (!is_edit_diff
-                    && code_view.is_some()
-                    && (rich_ui || self.auto_expand_tools)));
+                || (!is_edit_diff && code_view.is_some() && (rich_ui || self.auto_expand_tools)));
         if let Some(tool_index) = self.tools.get(tool_call_id).copied()
             && let Some(TranscriptEntry::Tool {
                 source_name: stored_source_name,
@@ -2270,9 +2269,14 @@ impl Transcript {
                     })
             })
             .or_else(|| {
-                provider_tool_id.is_none().then(|| {
-                    self.unkeyed_preparing_tools.last().cloned().filter(|preparing_id| {
-                        self.tools
+                provider_tool_id
+                    .is_none()
+                    .then(|| {
+                        self.unkeyed_preparing_tools
+                            .last()
+                            .cloned()
+                            .filter(|preparing_id| {
+                                self.tools
                             .get(preparing_id)
                             .and_then(|index| self.order.get(*index))
                             .is_some_and(|entry| {
@@ -2286,9 +2290,9 @@ impl Transcript {
                                     } if source_name == "action_preparing" && name == "Generate"
                                 )
                             })
+                            })
                     })
-                })
-                .flatten()
+                    .flatten()
             });
         if provider_tool_id.is_none()
             && !label.is_empty()
@@ -2425,12 +2429,14 @@ impl Transcript {
         let Some(index) = self.tools.get(tool_call_id).copied() else {
             return;
         };
-        let has_running_process = self.runtime_processes.values().any(|process| {
-            process.running && process.tool_index == Some(index)
-        }) || self
-            .provider_backgrounds
+        let has_running_process = self
+            .runtime_processes
             .values()
-            .any(|process| process.tool_index == index);
+            .any(|process| process.running && process.tool_index == Some(index))
+            || self
+                .provider_backgrounds
+                .values()
+                .any(|process| process.tool_index == index);
         if !has_running_process {
             return;
         }
@@ -2759,7 +2765,11 @@ impl Transcript {
                     claimed_tools.insert(index);
                     Some((
                         compact_text(
-                            if detail.trim().is_empty() { name } else { detail },
+                            if detail.trim().is_empty() {
+                                name
+                            } else {
+                                detail
+                            },
                             120,
                         ),
                         Some(index),
@@ -2768,21 +2778,25 @@ impl Transcript {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        rows.extend(self
-            .runtime_processes
-            .values()
-            .filter(|process| {
-                process.running
-                    && process
-                        .tool_index
-                        .is_none_or(|tool_index| !claimed_tools.contains(&tool_index))
-            })
-            .map(|process| {
-                (
-                    format!("pid {}  {}", process.pid, compact_text(&process.command, 100)),
-                    process.tool_index,
-                )
-            })
+        rows.extend(
+            self.runtime_processes
+                .values()
+                .filter(|process| {
+                    process.running
+                        && process
+                            .tool_index
+                            .is_none_or(|tool_index| !claimed_tools.contains(&tool_index))
+                })
+                .map(|process| {
+                    (
+                        format!(
+                            "pid {}  {}",
+                            process.pid,
+                            compact_text(&process.command, 100)
+                        ),
+                        process.tool_index,
+                    )
+                }),
         );
         rows.extend(
             self.provider_backgrounds
@@ -2873,14 +2887,36 @@ impl Transcript {
     }
 
     fn tool_elapsed_cache_tick_at(&self, now: DateTime<Utc>) -> Option<i64> {
-        self.has_running_tool()
-            .then(|| now.timestamp_millis().div_euclid(TOOL_ELAPSED_REFRESH_MILLIS))
+        self.has_running_tool().then(|| {
+            now.timestamp_millis()
+                .div_euclid(TOOL_ELAPSED_REFRESH_MILLIS)
+        })
     }
 
-    fn running_tool_elapsed_labels_at(
-        &self,
-        now: DateTime<Utc>,
-    ) -> Vec<(usize, Option<String>)> {
+    fn running_tool_timer_tick_at(&self, now: DateTime<Utc>) -> Option<i64> {
+        let mut indices = self.tools.values().copied().collect::<Vec<_>>();
+        indices.extend(self.active_reasoning);
+        let has_recent_tool = indices.into_iter().any(|index| {
+            matches!(
+                self.order.get(index),
+                Some(TranscriptEntry::Tool {
+                    started_at,
+                    complete: false,
+                    ..
+                }) if now.signed_duration_since(*started_at).num_milliseconds()
+                    < LONG_TOOL_ELAPSED_THRESHOLD_MILLIS
+            )
+        });
+        self.has_running_tool().then(|| {
+            now.timestamp_millis().div_euclid(if has_recent_tool {
+                TOOL_ELAPSED_REFRESH_MILLIS
+            } else {
+                LONG_TOOL_ELAPSED_REFRESH_MILLIS
+            })
+        })
+    }
+
+    fn running_tool_elapsed_labels_at(&self, now: DateTime<Utc>) -> Vec<(usize, Option<String>)> {
         let mut indices = self.tools.values().copied().collect::<Vec<_>>();
         indices.extend(self.active_reasoning);
         indices.sort_unstable();
@@ -2904,9 +2940,21 @@ impl Transcript {
 
     fn has_running_tool(&self) -> bool {
         self.active_reasoning.is_some_and(|index| {
-            matches!(self.order.get(index), Some(TranscriptEntry::Tool { complete: false, .. }))
+            matches!(
+                self.order.get(index),
+                Some(TranscriptEntry::Tool {
+                    complete: false,
+                    ..
+                })
+            )
         }) || self.tools.values().any(|index| {
-            matches!(self.order.get(*index), Some(TranscriptEntry::Tool { complete: false, .. }))
+            matches!(
+                self.order.get(*index),
+                Some(TranscriptEntry::Tool {
+                    complete: false,
+                    ..
+                })
+            )
         })
     }
 
@@ -2983,11 +3031,7 @@ impl Transcript {
     }
 
     #[cfg(test)]
-    fn render_for_cache(
-        &self,
-        width: usize,
-        tool_run_viewport_height: usize,
-    ) -> TranscriptRender {
+    fn render_for_cache(&self, width: usize, tool_run_viewport_height: usize) -> TranscriptRender {
         self.render_for_cache_at(width, tool_run_viewport_height, Utc::now())
     }
 
@@ -3077,7 +3121,10 @@ impl Transcript {
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
-                    format!(" · {name} · {}", if *complete { "complete" } else { "live" }),
+                    format!(
+                        " · {name} · {}",
+                        if *complete { "complete" } else { "live" }
+                    ),
                     Style::default().fg(Color::Gray),
                 ),
                 Span::styled(" · Esc to return", Style::default().fg(Color::DarkGray)),
@@ -3088,7 +3135,10 @@ impl Transcript {
             if focused_tool.is_some_and(|focused| focused != index) {
                 continue;
             }
-            let tool_window = focused_tool.is_none().then_some(tool_run_windows[index]).flatten();
+            let tool_window = focused_tool
+                .is_none()
+                .then_some(tool_run_windows[index])
+                .flatten();
             if let Some(window) = tool_window.filter(|window| index == window.start) {
                 let row = lines.len();
                 lines.push(Line::from(Span::styled(
@@ -3097,12 +3147,7 @@ impl Transcript {
                 )));
                 tool_run_starts.insert(
                     window.start,
-                    (
-                        row,
-                        tool_rows.len(),
-                        entry_rows.len(),
-                        selection_rows.len(),
-                    ),
+                    (row, tool_rows.len(), entry_rows.len(), selection_rows.len()),
                 );
             }
             let visible_message = matches!(
@@ -3179,10 +3224,7 @@ impl Transcript {
                         let (badge_text, badge_background) = message_badge_colors(color);
                         vec![
                             Span::raw("  "),
-                            Span::styled(
-                                "▌",
-                                Style::default().fg(color).bg(badge_background),
-                            ),
+                            Span::styled("▌", Style::default().fg(color).bg(badge_background)),
                             Span::styled(
                                 format!(" {label} "),
                                 Style::default()
@@ -3190,10 +3232,7 @@ impl Transcript {
                                     .bg(badge_background)
                                     .add_modifier(Modifier::BOLD),
                             ),
-                            Span::styled(
-                                "▐",
-                                Style::default().fg(color).bg(badge_background),
-                            ),
+                            Span::styled("▐", Style::default().fg(color).bg(badge_background)),
                         ]
                     } else {
                         vec![Span::styled(
@@ -3951,15 +3990,11 @@ impl Transcript {
                     if let Some(window) = tool_window
                         && index + 1 == window.end
                     {
-                        let (
-                            header_row,
-                            first_tool_row,
-                            first_entry_row,
-                            first_selection_row,
-                        ) = tool_run_starts
-                            .get(&window.start)
-                            .copied()
-                            .expect("tool run header was recorded");
+                        let (header_row, first_tool_row, first_entry_row, first_selection_row) =
+                            tool_run_starts
+                                .get(&window.start)
+                                .copied()
+                                .expect("tool run header was recorded");
                         let content_start = header_row + 1;
                         let content_end = lines.len();
                         let total_lines = content_end.saturating_sub(content_start);
@@ -4049,8 +4084,7 @@ impl Transcript {
                                 ));
                             }
                         }
-                        let run_selection_rows =
-                            selection_rows.split_off(first_selection_row);
+                        let run_selection_rows = selection_rows.split_off(first_selection_row);
                         for range in run_selection_rows {
                             let start = range.start.saturating_sub(content_start);
                             let end = range.end.saturating_sub(content_start);
@@ -4058,8 +4092,7 @@ impl Transcript {
                             let visible_selection_end = end.min(visible_end);
                             if visible_start < visible_selection_end {
                                 let screen_start = content_start + visible_start - offset;
-                                let screen_end =
-                                    content_start + visible_selection_end - offset;
+                                let screen_end = content_start + visible_selection_end - offset;
                                 let body_start = range
                                     .body_start
                                     .saturating_add(visible_start.saturating_sub(start));
@@ -4196,10 +4229,7 @@ impl Transcript {
                                 for line in &mut lines {
                                     line.spans.insert(0, Span::raw("  "));
                                 }
-                                Some((
-                                    (index, width),
-                                    MarkdownRender { lines, links },
-                                ))
+                                Some(((index, width), MarkdownRender { lines, links }))
                             })
                             .collect::<Vec<_>>()
                     })

@@ -95,6 +95,13 @@ pub enum DiffExpansionPolicy {
     UntilNextAction,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolClickBehavior {
+    Fullscreen,
+    Inline,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct InteractionPreferences {
@@ -124,6 +131,7 @@ pub struct PresentationPreferences {
     /// Legacy compatibility for editor.toml files written before diff_expansion.
     pub auto_expand_edits: bool,
     pub auto_expand_tools: bool,
+    pub tool_click_behavior: ToolClickBehavior,
     pub action_descriptors: bool,
     pub running_sweeps: bool,
     pub dictation_icon: Option<DictationIconStyle>,
@@ -137,6 +145,7 @@ impl Default for PresentationPreferences {
             diff_expansion: None,
             auto_expand_edits: true,
             auto_expand_tools: false,
+            tool_click_behavior: ToolClickBehavior::Fullscreen,
             action_descriptors: true,
             running_sweeps: true,
             dictation_icon: None,
@@ -321,6 +330,7 @@ mod tests {
                 diff_expansion: Some(DiffExpansionPolicy::UntilNextAction),
                 auto_expand_edits: false,
                 auto_expand_tools: true,
+                tool_click_behavior: ToolClickBehavior::Inline,
                 action_descriptors: false,
                 running_sweeps: false,
                 dictation_icon: Some(DictationIconStyle::NerdFont),
@@ -344,10 +354,12 @@ mod tests {
     #[test]
     fn missing_file_uses_current_editor_defaults() {
         let temp = tempfile::tempdir().unwrap();
+        let preferences = EditorPreferences::load_from(&temp.path().join("missing.toml")).unwrap();
 
+        assert_eq!(preferences, EditorPreferences::default());
         assert_eq!(
-            EditorPreferences::load_from(&temp.path().join("missing.toml")).unwrap(),
-            EditorPreferences::default()
+            preferences.presentation.tool_click_behavior,
+            ToolClickBehavior::Fullscreen
         );
     }
 

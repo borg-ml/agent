@@ -46,7 +46,7 @@ use crate::dictation::{
 };
 use crate::editor_preferences::{
     ActiveMessageBehavior, CompletionAlertPolicy, DictationIconStyle, DiffExpansionPolicy,
-    EditorPreferences,
+    EditorPreferences, ToolClickBehavior,
 };
 use crate::sleep_inhibitor::SleepInhibitor;
 use crate::terminal_ui::{
@@ -2233,6 +2233,7 @@ async fn run_local_agent_session(
         }
         terminal.set_diff_expansion(editor_preferences.presentation.effective_diff_expansion());
         terminal.set_auto_expand_tools(editor_preferences.presentation.auto_expand_tools);
+        terminal.set_tool_click_behavior(editor_preferences.presentation.tool_click_behavior);
         terminal.set_action_descriptors(editor_preferences.presentation.action_descriptors);
         terminal.set_running_sweeps(editor_preferences.presentation.running_sweeps);
         terminal.set_ui_language(editor_preferences.presentation.ui_language);
@@ -2392,6 +2393,8 @@ async fn run_local_agent_session(
     let mut interaction_tick = tui_render_interval(tui_frame_interval(tui_fps));
     let mut activity_tick = tokio::time::interval(ACTIVITY_FRAME_INTERVAL);
     activity_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut tool_timer_tick = tokio::time::interval(std::time::Duration::from_millis(100));
+    tool_timer_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut idle_tick = tokio::time::interval(IDLE_FRAME_INTERVAL);
     idle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut cache_tick = tokio::time::interval(std::time::Duration::from_secs(30));
@@ -3042,6 +3045,13 @@ async fn run_local_agent_session(
                 terminal.draw_for_activity()?;
                 interaction_dirty = false;
             }
+            _ = tool_timer_tick.tick(), if terminal.as_ref().is_some_and(BorgTerminal::has_running_tool) => {
+                let terminal = terminal.as_mut().expect("terminal");
+                if terminal.running_tool_timer_refresh_due() {
+                    terminal.draw_for_activity()?;
+                    interaction_dirty = false;
+                }
+            }
             _ = idle_tick.tick(), if terminal.as_ref().is_some_and(|terminal| {
                 terminal_needs_idle_tick(
                     terminal.has_expiring_notice(),
@@ -3157,6 +3167,9 @@ async fn run_local_agent_session(
                                 );
                                 terminal.set_auto_expand_tools(
                                     editor_preferences.presentation.auto_expand_tools,
+                                );
+                                terminal.set_tool_click_behavior(
+                                    editor_preferences.presentation.tool_click_behavior,
                                 );
                                 terminal.set_action_descriptors(
                                     editor_preferences.presentation.action_descriptors,
@@ -4659,6 +4672,19 @@ async fn run_local_agent_session(
                             if enabled { "on" } else { "off" }
                         ));
                     }
+                    UiAction::SetToolClickBehavior(behavior) => {
+                        editor_preferences.presentation.tool_click_behavior = behavior;
+                        dispatch_editor_preferences_save(
+                            &editor_preferences_tx,
+                            &editor_preferences,
+                        );
+                        let terminal = terminal.as_mut().expect("terminal");
+                        terminal.set_tool_click_behavior(behavior);
+                        terminal.set_notice(format!(
+                            "Tool clicks open {}",
+                            tool_click_behavior_label(behavior)
+                        ));
+                    }
                     UiAction::SetActionDescriptors(enabled) => {
                         editor_preferences.presentation.action_descriptors = enabled;
                         dispatch_editor_preferences_save(
@@ -5307,6 +5333,11 @@ async fn run_local_agent_session(
                                 .as_mut()
                                 .expect("terminal")
                                 .open_auto_expand_tools_picker();
+                        } else if line == "/tool-click" && attachments.is_empty() {
+                            terminal
+                                .as_mut()
+                                .expect("terminal")
+                                .open_tool_click_behavior_picker();
                         } else if line == "/action-descriptors" && attachments.is_empty() {
                             terminal
                                 .as_mut()
@@ -5686,6 +5717,26 @@ async fn run_local_agent_session(
                             } else {
                                 terminal.as_mut().expect("terminal").set_notice(
                                     "Choose /expand-tools on or /expand-tools off",
+                                );
+                            }
+                        } else if let Some(value) = line.strip_prefix("/tool-click ")
+                            && attachments.is_empty()
+                        {
+                            if let Some(behavior) = parse_tool_click_behavior(value) {
+                                editor_preferences.presentation.tool_click_behavior = behavior;
+                                dispatch_editor_preferences_save(
+                                    &editor_preferences_tx,
+                                    &editor_preferences,
+                                );
+                                let terminal = terminal.as_mut().expect("terminal");
+                                terminal.set_tool_click_behavior(behavior);
+                                terminal.set_notice(format!(
+                                    "Tool clicks open {}",
+                                    tool_click_behavior_label(behavior)
+                                ));
+                            } else {
+                                terminal.as_mut().expect("terminal").set_notice(
+                                    "Choose /tool-click fullscreen or /tool-click inline",
                                 );
                             }
                         } else if let Some(value) = line.strip_prefix("/action-descriptors ")
@@ -7541,6 +7592,21 @@ fn parse_on_off(value: &str) -> Option<bool> {
     }
 }
 
+fn parse_tool_click_behavior(value: &str) -> Option<ToolClickBehavior> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "fullscreen" | "full-screen" | "inspect" => Some(ToolClickBehavior::Fullscreen),
+        "inline" | "in-place" => Some(ToolClickBehavior::Inline),
+        _ => None,
+    }
+}
+
+fn tool_click_behavior_label(behavior: ToolClickBehavior) -> &'static str {
+    match behavior {
+        ToolClickBehavior::Fullscreen => "in fullscreen",
+        ToolClickBehavior::Inline => "inline",
+    }
+}
+
 fn parse_diff_expansion(value: &str) -> Option<DiffExpansionPolicy> {
     match value.trim().to_ascii_lowercase().replace('_', "-").as_str() {
         "expanded" | "on" => Some(DiffExpansionPolicy::Expanded),
@@ -8506,10 +8572,11 @@ fn live_customization_summary(
             }
         ),
         format!(
-            "rendering: {} FPS · edits {} · tools {} · action descriptors {} · sweeps {}",
+            "rendering: {} FPS · edits {} · tools {} · tool clicks {} · action descriptors {} · sweeps {}",
             editor.presentation.refresh_rate_fps,
             diff_expansion_label(editor.presentation.effective_diff_expansion()),
             editor.presentation.auto_expand_tools,
+            tool_click_behavior_label(editor.presentation.tool_click_behavior),
             editor.presentation.action_descriptors,
             editor.presentation.running_sweeps
         ),

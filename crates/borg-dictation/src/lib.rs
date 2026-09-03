@@ -140,7 +140,10 @@ pub async fn ensure_backend(config: LocalDictationConfig) -> Result<LocalDictati
 
     let installed = timeout(
         DICTATION_SETUP_TIMEOUT,
-        ensure_installed(config.managed_model_path.as_deref()),
+        ensure_installed(
+            config.managed_model_path.as_deref(),
+            config.record_command.is_none(),
+        ),
     )
     .await
     .context("timed out installing the local Parakeet dictation backend")??;
@@ -176,7 +179,10 @@ pub async fn ensure_backend(config: LocalDictationConfig) -> Result<LocalDictati
     })
 }
 
-async fn ensure_installed(configured_model_path: Option<&Path>) -> Result<InstalledDictation> {
+async fn ensure_installed(
+    configured_model_path: Option<&Path>,
+    install_recorder: bool,
+) -> Result<InstalledDictation> {
     let asset = runtime_asset()?;
     let install_dir = dictation_install_dir()?;
     fs::create_dir_all(&install_dir).with_context(|| {
@@ -187,6 +193,9 @@ async fn ensure_installed(configured_model_path: Option<&Path>) -> Result<Instal
     })?;
     let _lock = CacheLock::acquire(&install_dir).await?;
     migrate_legacy_install(&install_dir).await?;
+    if install_recorder {
+        ensure_recorder_dependency().await?;
+    }
 
     let archive_path = install_dir.join(asset.archive_name);
     let server_dir = install_dir.join("runtime");
@@ -229,6 +238,65 @@ async fn ensure_installed(configured_model_path: Option<&Path>) -> Result<Instal
     Ok(InstalledDictation {
         server_bin,
         model_path,
+    })
+}
+
+async fn ensure_recorder_dependency() -> Result<()> {
+    if ffmpeg_program().is_some() {
+        return Ok(());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let brew = [
+            Path::new("/opt/homebrew/bin/brew"),
+            Path::new("/usr/local/bin/brew"),
+        ]
+        .into_iter()
+        .find(|path| path.is_file())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("brew"));
+        let status = Command::new(&brew)
+            .args(["install", "ffmpeg"])
+            .env("HOMEBREW_NO_AUTO_UPDATE", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .with_context(|| {
+                "ffmpeg is required for dictation and Homebrew could not be started; install Homebrew or ffmpeg manually"
+            })?;
+        ensure!(
+            status.success(),
+            "Homebrew could not install ffmpeg (status {status})"
+        );
+        ensure!(
+            ffmpeg_program().is_some(),
+            "Homebrew installed ffmpeg, but Borg could not find its executable"
+        );
+        return Ok(());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    bail!("dictation requires ffmpeg; install it with your system package manager");
+}
+
+fn ffmpeg_program() -> Option<PathBuf> {
+    [
+        PathBuf::from("ffmpeg"),
+        PathBuf::from("/opt/homebrew/bin/ffmpeg"),
+        PathBuf::from("/usr/local/bin/ffmpeg"),
+    ]
+    .into_iter()
+    .find(|program| {
+        if program.components().count() == 1 {
+            std::env::var_os("PATH").is_some_and(|path| {
+                std::env::split_paths(&path).any(|dir| dir.join(program).is_file())
+            })
+        } else {
+            program.is_file()
+        }
     })
 }
 
@@ -894,7 +962,7 @@ fn recorder_command(config: &LocalDictationConfig, output: &std::path::Path) -> 
         return Ok(command);
     }
 
-    let mut command = Command::new("ffmpeg");
+    let mut command = Command::new(ffmpeg_program().unwrap_or_else(|| PathBuf::from("ffmpeg")));
     command.args(["-hide_banner", "-loglevel", "error", "-y"]);
     #[cfg(target_os = "linux")]
     command.args(["-f", "pulse", "-i", "default"]);

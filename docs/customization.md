@@ -28,6 +28,7 @@ persisted to `editor.toml`.
 | Refresh rate | `/refresh` | `presentation.refresh_rate_fps = 15..240` |
 | Edit diff display | `/expand-edits` | `presentation.diff_expansion = "expanded"`, `"collapsed"`, or `"until_next_action"` |
 | Expand tool details | `/expand-tools` | `presentation.auto_expand_tools = true` or `false` |
+| Tool click behavior | `/tool-click` | `presentation.tool_click_behavior = "fullscreen"` or `"inline"` |
 | Action descriptors | `/action-descriptors` | `presentation.action_descriptors = true` or `false` |
 | Running animations | `/animations` | `presentation.running_sweeps = true` or `false` |
 | Dictation icon | `/icons` | `presentation.dictation_icon = "nerd_font"` or `"emoji"` |
@@ -39,6 +40,11 @@ translates Borg's labels and chrome and is a local preference shared by the TUI
 and GUI. The latter is selected with `/language`, belongs to the durable
 session configuration, and instructs the model which language to use. Command
 names, model IDs, paths, tool output, and user content are never translated.
+
+Tool clicks default to `fullscreen`, which isolates the selected call so its
+complete stdout or edit diff can use the viewport. `inline` toggles the body in
+place instead. Clicking a grouped tool-run header continues to expand or
+collapse the run inline in either mode.
 
 `auto` follows `LC_ALL`, then `LC_MESSAGES`, then `LANG`, with English as the
 fallback. A language change applies immediately to newly rendered interface
@@ -76,8 +82,8 @@ externally managed dictation endpoint.
 ## Keybindings and command aliases
 
 Keybindings live in `agent.toml`. An action accepts one or more chords; omitted
-actions retain their defaults. Supported modifiers are `ctrl`, `alt`, and
-`shift`.
+actions retain their defaults. Supported modifiers are `ctrl`, `alt`, `shift`,
+and `cmd` (`command` and `super` are aliases).
 
 ```toml
 [keybindings]
@@ -85,8 +91,12 @@ send = ["enter"]
 queue = ["tab"]
 newline = ["shift+enter", "alt+enter"]
 interrupt = ["esc"]
-copy = ["ctrl+y"]
+copy = ["cmd+c"] # macOS; use ctrl+shift+c on Linux/Windows
+find = ["cmd+f"] # macOS; use ctrl+f on Linux/Windows
 ```
+
+Thread search is also available as `/find <regex>`. Repeat `/find` to advance
+to the next match and wrap around the thread.
 
 Aliases prepend a built-in slash command and preserve trailing arguments:
 

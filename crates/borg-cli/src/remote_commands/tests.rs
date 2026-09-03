@@ -5,6 +5,19 @@ use tempfile::tempdir;
 #[cfg(unix)]
 use tokio::io::AsyncReadExt;
 
+#[test]
+fn tool_click_behavior_accepts_fullscreen_and_inline_modes() {
+    assert_eq!(
+        parse_tool_click_behavior("fullscreen"),
+        Some(ToolClickBehavior::Fullscreen)
+    );
+    assert_eq!(
+        parse_tool_click_behavior("inline"),
+        Some(ToolClickBehavior::Inline)
+    );
+    assert_eq!(parse_tool_click_behavior("sideways"), None);
+}
+
 #[tokio::test]
 async fn goal_dispatch_does_not_wait_for_a_full_command_queue() {
     let session_id = Uuid::new_v4();

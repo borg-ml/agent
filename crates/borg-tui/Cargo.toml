@@ -24,6 +24,7 @@ image = { version = "0.25.10", default-features = false, features = ["png", "jpe
 pulldown-cmark = "0.13"
 qrcode = { version = "0.14.1", default-features = false }
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache", "macros", "underline-color"] }
+regex.workspace = true
 serde_json.workspace = true
 shlex = "2.0"
 syntect = { version = "5.3", default-features = false, features = ["default-syntaxes", "default-themes", "parsing", "regex-fancy", "yaml-load"] }

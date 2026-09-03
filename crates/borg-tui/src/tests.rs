@@ -836,6 +836,53 @@ fn platform_copy_shortcuts_are_recognized_for_custom_text_selection() {
 }
 
 #[test]
+fn macos_style_navigation_maps_command_and_option_arrows() {
+    for (modifiers, code, expected, selecting) in [
+        (
+            KeyModifiers::ALT,
+            KeyCode::Left,
+            ComposerNavigation::WordLeft,
+            false,
+        ),
+        (
+            KeyModifiers::ALT | KeyModifiers::SHIFT,
+            KeyCode::Right,
+            ComposerNavigation::WordRight,
+            true,
+        ),
+        (
+            KeyModifiers::SUPER,
+            KeyCode::Left,
+            ComposerNavigation::LineStart,
+            false,
+        ),
+        (
+            KeyModifiers::SUPER | KeyModifiers::SHIFT,
+            KeyCode::Right,
+            ComposerNavigation::LineEnd,
+            true,
+        ),
+    ] {
+        assert_eq!(
+            composer_navigation(&KeyEvent::new(code, modifiers)),
+            Some((expected, selecting))
+        );
+    }
+}
+
+#[test]
+fn composer_line_navigation_stays_within_the_current_logical_line() {
+    let mut composer = Composer::default();
+    composer.insert("first line\nsecond line\nthird");
+    composer.cursor = "first line\nsecond".len();
+
+    composer.move_line_start();
+    assert_eq!(composer.cursor, "first line\n".len());
+    composer.move_line_end();
+    assert_eq!(composer.cursor, "first line\nsecond line".len());
+}
+
+#[test]
 fn subagent_activity_timers_are_independent_and_stop_with_their_agent() {
     let first = Uuid::new_v4();
     let second = Uuid::new_v4();
@@ -2185,6 +2232,52 @@ fn tool_duration_appears_only_from_one_tenth_of_a_second() {
         ),
         Some("0.1s".to_string())
     );
+}
+
+#[test]
+fn running_tool_timer_switches_to_one_second_ticks_after_one_minute() {
+    let session_id = Uuid::new_v4();
+    let started_at = DateTime::parse_from_rfc3339("2026-07-29T10:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let mut started = SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::ToolStarted {
+            tool_call_id: "timed-live".to_string(),
+            name: "command_execution".to_string(),
+            input: serde_json::json!({"command": "cargo check"}),
+            input_ref: None,
+        },
+    );
+    started.created_at = started_at;
+    let mut transcript = Transcript::default();
+    transcript.apply(&started);
+
+    assert_ne!(
+        transcript.running_tool_timer_tick_at(started_at + chrono::Duration::milliseconds(100)),
+        transcript.running_tool_timer_tick_at(started_at + chrono::Duration::milliseconds(200))
+    );
+    assert_eq!(
+        transcript.running_tool_timer_tick_at(started_at + chrono::Duration::seconds(61)),
+        transcript.running_tool_timer_tick_at(started_at + chrono::Duration::milliseconds(61_900))
+    );
+}
+
+#[test]
+fn thread_find_advances_and_wraps_through_regex_matches() {
+    let lines = vec![
+        Line::from("alpha"),
+        Line::from("cargo check"),
+        Line::from("omega"),
+        Line::from("cargo test"),
+    ];
+    let matches = thread_find_matches(&Regex::new("cargo (check|test)").unwrap(), &lines);
+
+    assert_eq!(matches, [1, 3]);
+    assert_eq!(next_thread_match(&matches, None), (1, 1));
+    assert_eq!(next_thread_match(&matches, Some(1)), (3, 2));
+    assert_eq!(next_thread_match(&matches, Some(3)), (1, 1));
 }
 
 #[test]
