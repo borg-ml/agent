@@ -833,7 +833,7 @@ fn systemctl_system_output(args: &[&str]) -> Result<Output> {
     Ok(output)
 }
 
-fn configure_systemd_user_bus(command: &mut ProcessCommand) {
+fn configure_systemd_user_bus(_command: &mut ProcessCommand) {
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::fs::MetadataExt;
@@ -850,12 +850,12 @@ fn configure_systemd_user_bus(command: &mut ProcessCommand) {
             return;
         };
         if std::env::var_os("XDG_RUNTIME_DIR").is_none() {
-            command.env("XDG_RUNTIME_DIR", &runtime_dir);
+            _command.env("XDG_RUNTIME_DIR", &runtime_dir);
         }
         if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none() {
             let bus = runtime_dir.join("bus");
             if bus.exists() {
-                command.env(
+                _command.env(
                     "DBUS_SESSION_BUS_ADDRESS",
                     format!("unix:path={}", bus.display()),
                 );

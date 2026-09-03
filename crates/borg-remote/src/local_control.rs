@@ -158,11 +158,6 @@ fn process_executable_identity(pid: u32) -> Result<Option<String>> {
     Ok(Some(executable_identity(&file.metadata()?)))
 }
 
-#[cfg(not(target_os = "linux"))]
-fn process_executable_identity(_pid: u32) -> Result<Option<String>> {
-    Ok(None)
-}
-
 #[cfg(target_os = "linux")]
 fn process_start_time(pid: u32) -> Result<Option<u64>> {
     let path = PathBuf::from("/proc").join(pid.to_string()).join("stat");

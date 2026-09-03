@@ -695,7 +695,6 @@ pub fn spawn_terminal_io_worker() -> (
                 break;
             }
         }
-        drop(clipboard_lease);
     });
     (TerminalIoSender(requests_tx), completions_rx)
 }

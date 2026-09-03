@@ -273,7 +273,7 @@ async fn install_latest() -> Result<String> {
     if staging.exists() {
         fs::remove_dir_all(&staging).context("failed to clear stale Codex staging")?;
     }
-    let staged = extract_and_validate(Runtime::Codex, &archive, &staging, &version, &target).await;
+    let staged = extract_and_validate(Runtime::Codex, &archive, &staging, &version, target).await;
     let staged = match staged {
         Ok(()) => staging,
         Err(error) => {
@@ -538,18 +538,18 @@ fn activate(release: &Path) -> Result<()> {
     // Publishing into ~/.local/bin is best effort: Borg always calls the
     // resolved absolute path, so a read-only or absent bin directory must not
     // fail the install. It only affects what the user's own shell finds.
-    if let Some(bin) = user_bin_dir() {
-        if fs::create_dir_all(&bin).is_ok() {
-            for name in [
-                Runtime::Codex.executable_file_name(),
-                codex_code_mode_host_name().to_string(),
-            ] {
-                let source = release.join("bin").join(&name);
-                if source.exists()
-                    && let Err(error) = replace_symlink(&source, &bin.join(&name))
-                {
-                    tracing::warn!(%error, "failed to link {name} into {}", bin.display());
-                }
+    if let Some(bin) = user_bin_dir()
+        && fs::create_dir_all(&bin).is_ok()
+    {
+        for name in [
+            Runtime::Codex.executable_file_name(),
+            codex_code_mode_host_name().to_string(),
+        ] {
+            let source = release.join("bin").join(&name);
+            if source.exists()
+                && let Err(error) = replace_symlink(&source, &bin.join(&name))
+            {
+                tracing::warn!(%error, "failed to link {name} into {}", bin.display());
             }
         }
     }

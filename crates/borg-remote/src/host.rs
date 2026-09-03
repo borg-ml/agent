@@ -58,7 +58,9 @@ pub struct HostConfig {
 /// The marker is deliberately paired with process-level checks below. An
 /// arbitrary environment variable is not an isolation boundary; the server's
 /// isolated-host allowlist and the service manager's sandbox are the authority.
+#[cfg(target_os = "linux")]
 const SYSTEMD_ISOLATION_ATTESTATION: &str = "systemd-user-sandbox-v1";
+#[cfg(target_os = "linux")]
 const ISOLATION_ATTESTATION_ENV: &str = "BORG_HOST_ISOLATION_ATTESTATION";
 const PROVIDER_CAPABILITIES_CACHE_TTL: Duration = Duration::from_secs(5);
 const PROVIDER_AUTH_JSON_MAX_BYTES: u64 = 1024 * 1024;

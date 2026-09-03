@@ -1,5 +1,6 @@
 use tracing::warn;
 
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 const INHIBITION_REASON: &str = "Borg is running an active turn";
 
 trait SleepGuard {
@@ -241,7 +242,7 @@ mod linux {
 
 #[cfg(target_os = "macos")]
 mod macos {
-    use super::{ChildGuard, INHIBITION_REASON, SleepGuard};
+    use super::{ChildGuard, SleepGuard};
     use std::process::{Command, Stdio};
 
     pub(super) fn acquire() -> Option<Box<dyn SleepGuard>> {

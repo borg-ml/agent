@@ -482,12 +482,6 @@ pub fn candidate_paths(runtime: Runtime) -> Vec<PathBuf> {
 // Kept so existing call sites and tests keep a stable name for the pin env.
 pub const CODEX_BIN_ENV: &str = "BORG_CODEX_BIN";
 
-/// Reset the resolution cache. Tests only.
-#[cfg(test)]
-pub(crate) async fn clear_cache() {
-    cache().lock().await.clear();
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

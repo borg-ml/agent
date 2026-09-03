@@ -107,7 +107,7 @@ pub(crate) fn reexec_local_agent_if_enabled(command: &Command, no_limits: bool) 
     #[cfg(not(target_os = "linux"))]
     {
         let _ = no_limits;
-        return Ok(());
+        Ok(())
     }
     #[cfg(target_os = "linux")]
     {
@@ -882,7 +882,7 @@ fn ensure_command_succeeded(label: &str, output: &Output) -> Result<()> {
     Ok(())
 }
 
-fn configure_systemd_user_bus(command: &mut ProcessCommand) {
+fn configure_systemd_user_bus(_command: &mut ProcessCommand) {
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::fs::MetadataExt;
@@ -899,12 +899,12 @@ fn configure_systemd_user_bus(command: &mut ProcessCommand) {
             return;
         };
         if std::env::var_os("XDG_RUNTIME_DIR").is_none() {
-            command.env("XDG_RUNTIME_DIR", &runtime_dir);
+            _command.env("XDG_RUNTIME_DIR", &runtime_dir);
         }
         if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none() {
             let bus = runtime_dir.join("bus");
             if bus.exists() {
-                command.env(
+                _command.env(
                     "DBUS_SESSION_BUS_ADDRESS",
                     format!("unix:path={}", bus.display()),
                 );
@@ -922,6 +922,7 @@ fn inside_managed_slice() -> Result<bool> {
         .any(|path| path.split('/').any(|component| component == SLICE_NAME)))
 }
 
+#[cfg(target_os = "linux")]
 fn environment_bypasses_limits() -> bool {
     std::env::var_os("BORG_LIMITS").is_some_and(|value| value == "0")
 }

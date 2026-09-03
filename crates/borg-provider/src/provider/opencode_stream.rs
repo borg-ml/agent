@@ -4,7 +4,6 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::Command;
 use tokio::sync::mpsc;
 
 use super::{ChatStreamEvent, ChatStreamRequest, LocalAgentPermission, complete_tool_action};

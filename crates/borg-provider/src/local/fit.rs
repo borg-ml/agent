@@ -1,4 +1,6 @@
+#[cfg(target_os = "linux")]
 use std::fs;
+#[cfg(target_os = "linux")]
 use std::path::Path;
 
 use super::LocalModel;
@@ -77,6 +79,7 @@ pub fn available_vram_bytes() -> Option<u64> {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn read_u64(path: &Path) -> Option<u64> {
     fs::read_to_string(path).ok()?.trim().parse().ok()
 }
