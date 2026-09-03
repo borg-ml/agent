@@ -69,8 +69,8 @@ uuid.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 dirs.workspace = true
-flate2 = "1"
-tar = "0.4"
+flate2.workspace = true
+tar.workspace = true
 libc.workspace = true
 
 [target.'cfg(windows)'.dependencies]

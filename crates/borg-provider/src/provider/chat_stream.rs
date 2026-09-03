@@ -574,7 +574,7 @@ pub async fn read_claude_account_rate_limits() -> Result<ClaudeAccountRateLimits
 
 #[cfg(feature = "claude")]
 async fn read_claude_account_rate_limits_inner() -> Result<ClaudeAccountRateLimits> {
-    let mut command = Command::new("claude");
+    let mut command = crate::provider_bin::command(crate::provider_bin::Runtime::Claude).await?;
     command
         .args([
             "--print",
@@ -728,7 +728,7 @@ fn parse_claude_account_rate_limits(value: &Value) -> Result<ClaudeAccountRateLi
 
 #[cfg(feature = "codex")]
 async fn read_codex_account_rate_limits_inner() -> Result<CodexAccountRateLimits> {
-    let mut command = Command::new("codex");
+    let mut command = crate::provider_bin::codex_command().await?;
     command
         .args(["app-server", "--stdio"])
         .stdin(Stdio::piped())
@@ -1211,7 +1211,8 @@ async fn run_claude_subscription_process(
         .as_ref()
         .and_then(|(_, setup)| setup.claude_config_path.as_deref());
     let command =
-        build_claude_command_spec(&request, permission, auth_home.as_ref(), mcp_config_path)?;
+        build_claude_command_spec(&request, permission, auth_home.as_ref(), mcp_config_path)
+            .await?;
     let claude_request = claude_agents::ChatStreamRequest {
         prompt: request.prompt,
         attachments: request.attachments,
@@ -1253,7 +1254,8 @@ async fn run_claude_subscription_process_pooled(
             .as_ref()
             .and_then(|(_, setup)| setup.claude_config_path.as_deref());
         let command =
-            build_claude_command_spec(&request, permission, auth_home.as_ref(), mcp_config_path)?;
+            build_claude_command_spec(&request, permission, auth_home.as_ref(), mcp_config_path)
+                .await?;
         state.lifecycle_key = Some(lifecycle_key.clone());
         state.command = Some(command);
         *state
@@ -1835,7 +1837,7 @@ async fn start_pooled_codex_process(
     permission: LocalAgentPermission,
     auth_home: Option<&TempDir>,
 ) -> Result<StartedCodexProcess> {
-    let mut command = codex_app_server_command(request, auth_home)?;
+    let mut command = codex_app_server_command(request, auth_home).await?;
     let mut child = command.spawn().with_context(|| {
         format!(
             "failed to start {}",
@@ -2158,7 +2160,7 @@ async fn run_codex_subscription_process(
     let auth_home = restore_auth_home(request.provider_auth.as_ref())?;
     let billing_mode =
         provider_billing_mode(SubscriptionProvider::Codex, &request, auth_home.as_ref());
-    let mut command = codex_app_server_command(&request, auth_home.as_ref())?;
+    let mut command = codex_app_server_command(&request, auth_home.as_ref()).await?;
     let mut child = command.spawn().with_context(|| {
         format!(
             "failed to start {}",
@@ -2508,11 +2510,11 @@ fn codex_rpc_error(value: &Value) -> String {
         })
 }
 
-fn codex_app_server_command(
+async fn codex_app_server_command(
     request: &ChatStreamRequest,
     auth_home: Option<&TempDir>,
 ) -> Result<Command> {
-    let mut command = Command::new("codex");
+    let mut command = crate::provider_bin::codex_command().await?;
     command.args([
         "app-server",
         "--stdio",
@@ -2788,7 +2790,7 @@ fn claude_command_args(
     args
 }
 
-fn build_claude_command_spec(
+async fn build_claude_command_spec(
     request: &ChatStreamRequest,
     permission: LocalAgentPermission,
     auth_home: Option<&TempDir>,
@@ -2799,7 +2801,8 @@ fn build_claude_command_spec(
         environment.push(("HOME".to_string(), auth_home.path().display().to_string()));
     }
     Ok(claude_agents::CommandSpec {
-        program: PathBuf::from("claude"),
+        // Resolve rather than trusting PATH, exactly as every other spawn does.
+        program: crate::provider_bin::executable(crate::provider_bin::Runtime::Claude).await?,
         args: claude_command_args(request, permission, mcp_config_path),
         current_dir: request
             .working_directory
@@ -4207,8 +4210,8 @@ mod tests {
         assert!(!parsed.extra_usage_available);
     }
 
-    #[test]
-    fn subscription_commands_attach_provider_mcp_config() {
+    #[tokio::test]
+    async fn subscription_commands_attach_provider_mcp_config() {
         let root = tempfile::tempdir().expect("temporary provider home");
         let server = ExternalMcpServer {
             name: "borg_agent".to_string(),
@@ -4326,7 +4329,9 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["get_goal", "update_plan"]
         );
-        let codex_command = codex_app_server_command(&request, None).expect("Codex command");
+        let codex_command = codex_app_server_command(&request, None)
+            .await
+            .expect("Codex command");
         let codex_args = codex_command
             .as_std()
             .get_args()

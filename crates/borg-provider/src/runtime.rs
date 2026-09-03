@@ -92,6 +92,13 @@ pub fn openrouter_product_model() -> &'static str {
 /// Borg's directly managed Kimi route uses one product model profile. The
 /// provider adapter still accepts an explicit model so deployments can test a
 /// compatible model without changing the default CLI/Web contract.
+/// Borg's directly managed GLM route. The Coding Plan serves GLM-5.3 and
+/// GLM-5.3-Flash; older ids are routed to those by the vendor, so pinning the
+/// current one avoids a silent downgrade to Flash.
+pub fn glm_product_model() -> &'static str {
+    "glm-5.3"
+}
+
 pub fn kimi_product_model() -> &'static str {
     "kimi-k3"
 }

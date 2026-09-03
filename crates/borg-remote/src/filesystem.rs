@@ -437,7 +437,12 @@ fn existing_path(root: &Path, relative: &Path) -> FsResult<PathBuf> {
         }
     }
     let canonical = current.canonicalize().map_err(io_failure)?;
-    if !canonical.starts_with(root) {
+    // Compare canonical against canonical. `root` may reach the workspace
+    // through a symlink — on macOS `/tmp` and `/var` are symlinks into
+    // `/private`, and a home directory can be one too — so comparing a resolved
+    // path against an unresolved root rejects every legitimate file in it.
+    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    if !canonical.starts_with(&canonical_root) {
         return Err(invalid("path must stay under the workspace root"));
     }
     Ok(canonical)

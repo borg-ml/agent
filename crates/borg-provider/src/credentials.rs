@@ -27,6 +27,10 @@ const CREDENTIALS_FILE_MAX_BYTES: u64 = 256 * 1024;
 pub enum ApiKeyCredential {
     Anthropic,
     OpenRouter,
+    /// Z.ai key, for the GLM Coding Plan.
+    Zai,
+    /// Moonshot key, for Kimi Code.
+    Kimi,
 }
 
 impl ApiKeyCredential {
@@ -34,6 +38,10 @@ impl ApiKeyCredential {
         match self {
             Self::Anthropic => "ANTHROPIC_API_KEY",
             Self::OpenRouter => "OPENROUTER_API_KEY",
+            // The user-facing variable for their own key. The plan overlay maps
+            // it onto whichever token header the hosting CLI expects.
+            Self::Zai => "ZAI_API_KEY",
+            Self::Kimi => "KIMI_API_KEY",
         }
     }
 
@@ -41,6 +49,8 @@ impl ApiKeyCredential {
         match self {
             Self::Anthropic => "anthropic_api_key",
             Self::OpenRouter => "openrouter_api_key",
+            Self::Zai => "zai_api_key",
+            Self::Kimi => "kimi_api_key",
         }
     }
 }

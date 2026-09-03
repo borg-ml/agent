@@ -17,6 +17,9 @@ pub enum CodingProvider {
     Claude,
     OpenCode,
     Kimi,
+    /// Z.ai GLM. Like Kimi, driven by Borg's native model client over the
+    /// OpenAI-compatible wire format — no vendor CLI is involved.
+    Glm,
     OpenRouter,
     OpenAiCompatible,
 }
@@ -177,6 +180,7 @@ impl CodingProvider {
             Self::Claude => "claude",
             Self::OpenCode => "open-code",
             Self::Kimi => "kimi",
+            Self::Glm => "glm",
             Self::OpenRouter => "openrouter",
             Self::OpenAiCompatible => "openai-compatible",
         }
@@ -192,6 +196,7 @@ impl CodingProvider {
             Self::Claude => "Claude",
             Self::OpenCode => "OpenCode",
             Self::Kimi => "Kimi",
+            Self::Glm => "GLM",
             Self::OpenRouter => "OpenRouter",
             Self::OpenAiCompatible => "OpenAI-compatible",
         }
@@ -213,6 +218,7 @@ impl CodingProvider {
                 })
             })
             .or_else(|| (model == borg_provider::kimi_product_model()).then_some(Self::Kimi))
+            .or_else(|| (model == borg_provider::glm_product_model()).then_some(Self::Glm))
             .or_else(|| {
                 model
                     .strip_prefix("opencode/")
@@ -233,7 +239,7 @@ impl CodingProvider {
             Self::Codex => "codex",
             Self::Claude => "claude",
             Self::OpenCode => "opencode",
-            Self::Kimi | Self::OpenRouter | Self::OpenAiCompatible => "borg",
+            Self::Kimi | Self::Glm | Self::OpenRouter | Self::OpenAiCompatible => "borg",
         }
     }
 
@@ -242,7 +248,10 @@ impl CodingProvider {
     }
 
     pub fn uses_native_harness(self) -> bool {
-        matches!(self, Self::Kimi | Self::OpenRouter | Self::OpenAiCompatible)
+        matches!(
+            self,
+            Self::Kimi | Self::Glm | Self::OpenRouter | Self::OpenAiCompatible
+        )
     }
 }
 

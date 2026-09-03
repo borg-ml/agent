@@ -1281,6 +1281,7 @@ fn provider_argument(provider: crate::cli::RemoteProviderArg) -> &'static str {
         RemoteProviderArg::Claude => "claude",
         RemoteProviderArg::OpenCode => "open-code",
         RemoteProviderArg::Kimi => "kimi",
+        RemoteProviderArg::Glm => "glm",
         RemoteProviderArg::OpenRouter => "open-router",
         RemoteProviderArg::OpenAiCompatible => "open-ai-compatible",
     }
@@ -1758,6 +1759,7 @@ async fn run_local_agent_session(
     let requested_model = args.model.clone().or_else(|| match requested_provider {
         CodingProvider::Codex => Some(borg_provider::codex_product_model().to_string()),
         CodingProvider::Kimi => Some(borg_provider::kimi_product_model().to_string()),
+        CodingProvider::Glm => Some(borg_provider::glm_product_model().to_string()),
         CodingProvider::OpenCode => None,
         CodingProvider::OpenRouter => Some(borg_provider::openrouter_product_model().to_string()),
         CodingProvider::OpenAiCompatible => std::env::var("BORG_OPENAI_COMPATIBLE_MODEL")
@@ -1772,7 +1774,9 @@ async fn run_local_agent_session(
         CodingProvider::OpenRouter => None,
         CodingProvider::OpenAiCompatible => None,
         CodingProvider::Claude | CodingProvider::OpenCode => None,
-        CodingProvider::Kimi => Some(borg_provider::kimi_default_effort().to_string()),
+        CodingProvider::Kimi | CodingProvider::Glm => {
+            Some(borg_provider::kimi_default_effort().to_string())
+        }
     });
     let (
         recorded_cwd,
@@ -8487,6 +8491,7 @@ fn provider_name(provider: CodingProvider) -> &'static str {
         CodingProvider::Claude => "claude",
         CodingProvider::OpenCode => "open-code",
         CodingProvider::Kimi => "kimi",
+        CodingProvider::Glm => "glm",
         CodingProvider::OpenRouter => "openrouter",
         CodingProvider::OpenAiCompatible => "openai-compatible",
     }

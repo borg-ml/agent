@@ -1258,6 +1258,7 @@ async fn probe_provider(
                         | CodingProvider::Claude
                         | CodingProvider::OpenCode => provider_auth_status(provider).await.ok(),
                         CodingProvider::Kimi
+                        | CodingProvider::Glm
                         | CodingProvider::OpenRouter
                         | CodingProvider::OpenAiCompatible => None,
                     }
@@ -1274,6 +1275,7 @@ async fn probe_provider(
                     .as_deref()
                     .is_some_and(opencode_auth_status_authenticated),
                 CodingProvider::Kimi
+                | CodingProvider::Glm
                 | CodingProvider::OpenRouter
                 | CodingProvider::OpenAiCompatible => false,
             };
@@ -1338,6 +1340,20 @@ async fn probe_provider(
                 detail.push("Kimi API key configured");
             }
         }
+        CodingProvider::Glm => {
+            // A selected GLM Coding Plan supplies its own key; a pay-as-you-go
+            // key is the fallback, exactly as for Kimi.
+            if borg_provider::subscription::active_for(borg_provider::Plan::GlmCoding)
+                .and_then(|plan| plan.api_key())
+                .is_some()
+            {
+                auth_methods.push(ProviderAuthMethod::Subscription);
+                detail.push("GLM Coding Plan key configured");
+            } else if nonempty_env("BORG_GLM_API_KEY").is_some() {
+                auth_methods.push(ProviderAuthMethod::ApiKey);
+                detail.push("GLM API key configured");
+            }
+        }
         CodingProvider::OpenRouter => {
             if borg_provider::credentials::api_key(
                 borg_provider::credentials::ApiKeyCredential::OpenRouter,
@@ -1374,9 +1390,10 @@ async fn probe_provider(
         // These routes execute in Borg's native harness; they do not depend
         // on a separately installed `borg` executable being discoverable in a
         // service user's PATH.
-        CodingProvider::Kimi | CodingProvider::OpenRouter | CodingProvider::OpenAiCompatible => {
-            true
-        }
+        CodingProvider::Kimi
+        | CodingProvider::Glm
+        | CodingProvider::OpenRouter
+        | CodingProvider::OpenAiCompatible => true,
         CodingProvider::Codex | CodingProvider::Claude | CodingProvider::OpenCode => match mode {
             ProviderProbeMode::Admission => {
                 executable_in_path(Path::new(provider.executable())).is_some()
@@ -1413,9 +1430,10 @@ fn provider_subscription_credentials_present(provider: CodingProvider) -> bool {
         CodingProvider::OpenCode => opencode_auth_json()
             .as_ref()
             .is_some_and(opencode_auth_json_authenticated),
-        CodingProvider::Kimi | CodingProvider::OpenRouter | CodingProvider::OpenAiCompatible => {
-            false
-        }
+        CodingProvider::Kimi
+        | CodingProvider::Glm
+        | CodingProvider::OpenRouter
+        | CodingProvider::OpenAiCompatible => false,
     }
 }
 
@@ -1537,9 +1555,21 @@ fn nonempty_env(name: &str) -> Option<String> {
 
 async fn provider_auth_status(provider: CodingProvider) -> Result<String> {
     match provider {
-        CodingProvider::Codex => command_output("codex", &["login", "status"]).await,
-        CodingProvider::Claude => command_output("claude", &["auth", "status", "--json"]).await,
-        CodingProvider::OpenCode => command_output("opencode", &["providers", "list"]).await,
+        // Each of these resolves its executable by probing candidates rather
+        // than trusting the first entry on PATH, which may be a broken launcher.
+        CodingProvider::Codex => {
+            runtime_output(borg_provider::Runtime::Codex, &["login", "status"]).await
+        }
+        CodingProvider::Claude => {
+            runtime_output(
+                borg_provider::Runtime::Claude,
+                &["auth", "status", "--json"],
+            )
+            .await
+        }
+        CodingProvider::OpenCode => {
+            runtime_output(borg_provider::Runtime::OpenCode, &["providers", "list"]).await
+        }
         _ => bail!("{provider:?} does not use an interactive provider login"),
     }
 }
@@ -1588,6 +1618,13 @@ fn opencode_auth_status_authenticated(output: &str) -> bool {
     output.lines().any(|line| line.contains('●'))
 }
 
+/// Run a resolved provider runtime and capture its output.
+async fn runtime_output(runtime: borg_provider::Runtime, args: &[&str]) -> Result<String> {
+    let mut command = borg_provider::runtime_command(runtime).await?;
+    command.args(args).stdin(Stdio::null());
+    command_output_from(&mut command, runtime.program()).await
+}
+
 async fn command_output(executable: &str, args: &[&str]) -> Result<String> {
     let mut command = Command::new(executable);
     command.args(args).stdin(Stdio::null());
@@ -1629,6 +1666,12 @@ pub fn provider_credentials_present(provider: CodingProvider) -> bool {
             nonempty_env("BORG_KIMI_API_KEY").is_some()
                 || nonempty_env("MOONSHOT_API_KEY").is_some()
         }
+        CodingProvider::Glm => {
+            borg_provider::subscription::active_for(borg_provider::Plan::GlmCoding)
+                .and_then(|plan| plan.api_key())
+                .is_some()
+                || nonempty_env("BORG_GLM_API_KEY").is_some()
+        }
         CodingProvider::OpenRouter => borg_provider::credentials::api_key(
             borg_provider::credentials::ApiKeyCredential::OpenRouter,
         )
@@ -1657,7 +1700,10 @@ fn provider_login_command(provider: CodingProvider) -> Result<Command> {
         CodingProvider::OpenCode => {
             command.args(["providers", "login"]);
         }
-        CodingProvider::Kimi | CodingProvider::OpenRouter | CodingProvider::OpenAiCompatible => {
+        CodingProvider::Kimi
+        | CodingProvider::Glm
+        | CodingProvider::OpenRouter
+        | CodingProvider::OpenAiCompatible => {
             unreachable!("handled above")
         }
     };
@@ -3002,6 +3048,7 @@ fn provider_arg(provider: CodingProvider) -> &'static str {
         CodingProvider::Claude => "claude",
         CodingProvider::OpenCode => "open-code",
         CodingProvider::Kimi => "kimi",
+        CodingProvider::Glm => "glm",
         CodingProvider::OpenRouter => "open-router",
         CodingProvider::OpenAiCompatible => "open-ai-compatible",
     }
@@ -4149,7 +4196,15 @@ fn validate_host_cwd(roots: &[PathBuf], requested: &Path) -> Result<PathBuf> {
     if !cwd.is_dir() {
         bail!("session path is not a directory: {}", cwd.display());
     }
-    if !roots.is_empty() && !roots.iter().any(|root| cwd.starts_with(root)) {
+    // `cwd` is canonical, so the roots must be too: an enrolled root reached
+    // through a symlink (macOS `/tmp` and `/var` are symlinks into `/private`)
+    // would otherwise never match a path inside it.
+    if !roots.is_empty()
+        && !roots.iter().any(|root| {
+            let root = root.canonicalize().unwrap_or_else(|_| root.clone());
+            cwd.starts_with(&root)
+        })
+    {
         bail!("session directory is outside this host's enrolled roots");
     }
     Ok(cwd)

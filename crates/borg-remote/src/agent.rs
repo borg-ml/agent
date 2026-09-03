@@ -440,6 +440,7 @@ impl SubscriptionPoolRegistry {
                     }
                     CodingProvider::OpenCode
                     | CodingProvider::Kimi
+                    | CodingProvider::Glm
                     | CodingProvider::OpenRouter
                     | CodingProvider::OpenAiCompatible => {
                         unreachable!("native providers do not use subscription pools")
@@ -893,6 +894,7 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
                 .await
             }
             CodingProvider::Kimi
+            | CodingProvider::Glm
             | CodingProvider::OpenRouter
             | CodingProvider::OpenAiCompatible => unreachable!("native provider handled above"),
         };
@@ -1131,7 +1133,10 @@ pub async fn run_agent_turn_controlled(
         .await
         .ok();
     match turn.provider {
-        CodingProvider::Kimi | CodingProvider::OpenRouter | CodingProvider::OpenAiCompatible => {
+        CodingProvider::Kimi
+        | CodingProvider::Glm
+        | CodingProvider::OpenRouter
+        | CodingProvider::OpenAiCompatible => {
             NativeHarness::default().run(turn, events, controls).await
         }
         CodingProvider::Codex | CodingProvider::Claude | CodingProvider::OpenCode => {

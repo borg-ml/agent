@@ -363,7 +363,11 @@ fn bun_command() -> String {
 }
 
 fn spawn_worker(root: &Path, command: &str, source: &str, runtime: &str) -> Result<PythonProcess> {
-    let mut process = Command::new(command);
+    // Resolve to an absolute path against the supervisor's PATH: the child is
+    // about to be given a sanitized PATH that cannot see user install
+    // directories such as `~/.bun/bin` or `/opt/homebrew/bin`.
+    let program = crate::process_environment::resolve_runtime_program(command);
+    let mut process = Command::new(&program);
     // Model-authored code may use the worker namespace and the explicit Borg
     // host-call protocol, but it must not inherit deployment, provider, or
     // control-plane credentials from the supervising process.

@@ -757,6 +757,7 @@ impl NativeModelClient for CompatibleModelClient {
         let gateway = configured_gateway.or(self.gateway.as_ref());
         let profile = match provider {
             crate::CodingProvider::Kimi => OpenAiCompatibleProfile::Kimi,
+            crate::CodingProvider::Glm => OpenAiCompatibleProfile::Glm,
             crate::CodingProvider::OpenRouter => OpenAiCompatibleProfile::OpenRouter,
             crate::CodingProvider::OpenAiCompatible => OpenAiCompatibleProfile::Generic,
             crate::CodingProvider::Codex

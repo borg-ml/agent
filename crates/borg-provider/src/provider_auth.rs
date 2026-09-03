@@ -312,7 +312,7 @@ pub async fn validate_home(
 }
 
 async fn validate_claude_home(home_dir: &Path) -> Result<ProviderAuthValidation> {
-    let mut cmd = Command::new("claude");
+    let mut cmd = crate::provider_bin::command(crate::provider_bin::Runtime::Claude).await?;
     cmd.args(["auth", "status", "--json"])
         .env("HOME", home_dir)
         .stdout(Stdio::piped())
@@ -358,7 +358,7 @@ async fn validate_claude_home(home_dir: &Path) -> Result<ProviderAuthValidation>
 
 async fn validate_openai_home(home_dir: &Path) -> Result<ProviderAuthValidation> {
     let codex_home = ensure_codex_home(home_dir)?;
-    let mut cmd = Command::new("codex");
+    let mut cmd = crate::provider_bin::codex_command().await?;
     cmd.args(["login", "status"])
         .env("HOME", home_dir)
         .env("CODEX_HOME", &codex_home)

@@ -400,6 +400,7 @@ fn cache_window(provider: CodingProvider) -> Option<Duration> {
         CodingProvider::Claude => Some(CLAUDE_CACHE_WINDOW),
         CodingProvider::OpenCode
         | CodingProvider::Kimi
+        | CodingProvider::Glm
         | CodingProvider::OpenRouter
         | CodingProvider::OpenAiCompatible => None,
     }

@@ -107,8 +107,41 @@ async fn doctor(json: bool, deep: bool) -> Result<()> {
     } else {
         store.readiness().await?
     };
+    // Read-only: `borg doctor` reports health, it never installs. Runtimes
+    // heal themselves lazily when a backend is actually used.
+    let mut runtimes = Vec::new();
+    for runtime in borg_provider::Runtime::ALL {
+        runtimes.push((
+            runtime,
+            borg_provider::provider_bin::diagnose(runtime).await,
+        ));
+    }
     if json {
-        println!("{}", serde_json::to_string_pretty(&health)?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "session_store": health,
+                "coding_plan": borg_provider::subscription::describe(),
+                "runtimes": runtimes
+                    .iter()
+                    .map(|(runtime, result)| {
+                        (
+                            runtime.program().to_string(),
+                            match result {
+                                Ok(path) => serde_json::json!({
+                                    "ok": true,
+                                    "path": path.display().to_string(),
+                                }),
+                                Err(message) => serde_json::json!({
+                                    "ok": false,
+                                    "error": message,
+                                }),
+                            },
+                        )
+                    })
+                    .collect::<serde_json::Map<_, _>>(),
+            }))?
+        );
     } else {
         println!(
             "Durable session store: {}",
@@ -142,7 +175,22 @@ async fn doctor(json: bool, deep: bool) -> Result<()> {
             health.sessions, health.events, health.payloads
         );
         println!("  projection version: {}", health.projection_version);
+        println!("{}", borg_provider::subscription::describe());
+        for (runtime, result) in &runtimes {
+            match result {
+                Ok(path) => println!("{}: ready · {}", runtime.label(), path.display()),
+                Err(message) => {
+                    println!("{}: not installed", runtime.label());
+                    for line in message.lines() {
+                        println!("  {line}");
+                    }
+                }
+            }
+        }
     }
+    // A missing runtime is not a fault: Borg installs it on first use, and a
+    // user who never selects that backend never needs it. Only the durable
+    // store failing is worth a non-zero exit.
     anyhow::ensure!(health.is_ready(), "durable session store is degraded");
     Ok(())
 }

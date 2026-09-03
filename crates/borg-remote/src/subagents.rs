@@ -338,7 +338,7 @@ impl AgentToolServer {
         std::fs::create_dir_all(&runtime_dir)?;
         std::fs::set_permissions(&runtime_dir, Permissions::from_mode(0o700))
             .with_context(|| format!("failed to secure {}", runtime_dir.display()))?;
-        let socket_path = runtime_dir.join(format!("{session_id}.sock"));
+        let socket_path = agent_tool_socket_path(&runtime_dir, session_id)?;
         if socket_path.exists() {
             std::fs::remove_file(&socket_path)?;
         }
@@ -4888,6 +4888,7 @@ fn default_model_for_cross_provider_peer(provider: CodingProvider) -> Option<Str
         CodingProvider::Claude => None,
         CodingProvider::OpenCode => None,
         CodingProvider::Kimi => Some(borg_provider::kimi_product_model().to_string()),
+        CodingProvider::Glm => Some(borg_provider::glm_product_model().to_string()),
         CodingProvider::OpenRouter => Some(borg_provider::openrouter_product_model().to_string()),
         CodingProvider::OpenAiCompatible => None,
     }
@@ -4897,6 +4898,7 @@ fn default_effort_for_cross_provider_peer(provider: CodingProvider) -> Option<St
     match provider {
         CodingProvider::Codex => Some(borg_provider::codex_default_effort().to_string()),
         CodingProvider::Kimi => Some(borg_provider::kimi_default_effort().to_string()),
+        CodingProvider::Glm => Some(borg_provider::kimi_default_effort().to_string()),
         CodingProvider::Claude
         | CodingProvider::OpenCode
         | CodingProvider::OpenRouter
@@ -6795,3 +6797,123 @@ async fn finish_agent(
 
 #[cfg(test)]
 mod tests;
+
+/// Unix domain sockets have a hard limit on their path: `sun_path` is 104 bytes
+/// on macOS and the BSDs, 108 on Linux. The session runtime directory can
+/// easily exceed that on macOS, where the per-user temporary directory alone is
+/// ~48 bytes before any session identifier is appended — so binding inside it
+/// fails with `path must be shorter than SUN_LEN` and takes the whole session
+/// down with it.
+///
+/// Prefer the runtime directory, because keeping the socket beside the rest of
+/// the session state is what makes cleanup and inspection obvious. Fall back to
+/// a short private directory only when the preferred path will not fit.
+#[cfg(unix)]
+const MAX_UNIX_SOCKET_PATH_BYTES: usize = 100;
+
+#[cfg(unix)]
+fn unix_socket_path_fits(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    path.as_os_str().as_bytes().len() < MAX_UNIX_SOCKET_PATH_BYTES
+}
+
+#[cfg(unix)]
+fn agent_tool_socket_path(runtime_dir: &Path, session_id: Uuid) -> Result<PathBuf> {
+    // `simple` drops the hyphens, buying four bytes for free.
+    let name = format!("{}.sock", session_id.simple());
+    let preferred = runtime_dir.join(&name);
+    if unix_socket_path_fits(&preferred) {
+        return Ok(preferred);
+    }
+    let short = short_socket_dir()?;
+    let fallback = short.join(&name);
+    anyhow::ensure!(
+        unix_socket_path_fits(&fallback),
+        "agent tool socket path is too long even under {}",
+        short.display()
+    );
+    Ok(fallback)
+}
+
+/// Create a fresh, private directory with a short path.
+///
+/// `create_dir` fails if anything already exists at the name — including a
+/// symlink — so a successful call proves we created it and therefore own it.
+/// That is what makes this safe to place under a world-writable `/tmp`.
+#[cfg(unix)]
+fn short_socket_dir() -> Result<PathBuf> {
+    let base = Path::new("/tmp");
+    for _ in 0..8 {
+        let candidate = base.join(format!(
+            ".borg-{}",
+            &Uuid::new_v4().simple().to_string()[..12]
+        ));
+        match std::fs::create_dir(&candidate) {
+            Ok(()) => {
+                std::fs::set_permissions(&candidate, Permissions::from_mode(0o700))
+                    .with_context(|| format!("failed to secure {}", candidate.display()))?;
+                return Ok(candidate);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to create {}", candidate.display()));
+            }
+        }
+    }
+    anyhow::bail!("could not create a short directory for the agent tool socket")
+}
+
+#[cfg(all(test, unix))]
+mod socket_path_tests {
+    use super::*;
+
+    #[test]
+    fn a_short_runtime_directory_is_used_directly() {
+        let session = Uuid::new_v4();
+        let path = agent_tool_socket_path(Path::new("/tmp/borg-test"), session).expect("path");
+        assert!(path.starts_with("/tmp/borg-test"));
+        assert!(unix_socket_path_fits(&path));
+    }
+
+    #[test]
+    fn an_overlong_runtime_directory_falls_back_to_a_short_path() {
+        let deep = PathBuf::from(format!("/tmp/{}", "d".repeat(120)));
+        let session = Uuid::new_v4();
+        let path = agent_tool_socket_path(&deep, session).expect("path");
+        assert!(
+            !path.starts_with(&deep),
+            "should not use the overlong directory"
+        );
+        assert!(
+            unix_socket_path_fits(&path),
+            "fallback must fit in sun_path: {}",
+            path.display()
+        );
+        // The fallback directory is created privately; clean it up.
+        if let Some(parent) = path.parent() {
+            let mode = std::fs::metadata(parent).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700, "fallback directory must be private");
+            std::fs::remove_dir_all(parent).ok();
+        }
+    }
+
+    #[test]
+    fn the_macos_socket_limit_is_respected() {
+        // The exact case that failed: macOS per-user temp + session subdirectory.
+        let runtime = PathBuf::from(
+            "/var/folders/h0/twccxwr971j2bs699hk_k9w00000gn/T/.tmp9Neylt/agent-tools",
+        );
+        let path = agent_tool_socket_path(&runtime, Uuid::new_v4()).expect("path");
+        assert!(
+            unix_socket_path_fits(&path),
+            "{} is too long",
+            path.display()
+        );
+        if let Some(parent) = path.parent()
+            && parent.starts_with("/tmp/.borg-")
+        {
+            std::fs::remove_dir_all(parent).ok();
+        }
+    }
+}

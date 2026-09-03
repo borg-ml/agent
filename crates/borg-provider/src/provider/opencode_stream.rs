@@ -44,7 +44,7 @@ async fn run(
         Some(cwd) => cwd,
         None => std::env::current_dir().context("failed to resolve OpenCode working directory")?,
     };
-    let mut command = Command::new("opencode");
+    let mut command = crate::provider_bin::command(crate::provider_bin::Runtime::OpenCode).await?;
     command
         .args(opencode_run_args(
             request.session_id.as_deref(),
@@ -285,7 +285,8 @@ fn opencode_run_args(
 }
 
 async fn default_model() -> Result<String> {
-    let output = Command::new("opencode")
+    let output = crate::provider_bin::command(crate::provider_bin::Runtime::OpenCode)
+        .await?
         .arg("models")
         .stdin(std::process::Stdio::null())
         .output()

@@ -1030,6 +1030,7 @@ pub(crate) enum RemoteProviderArg {
     Claude,
     OpenCode,
     Kimi,
+    Glm,
     OpenRouter,
     OpenAiCompatible,
 }
@@ -1041,6 +1042,7 @@ impl From<RemoteProviderArg> for borg_remote::CodingProvider {
             RemoteProviderArg::Claude => Self::Claude,
             RemoteProviderArg::OpenCode => Self::OpenCode,
             RemoteProviderArg::Kimi => Self::Kimi,
+            RemoteProviderArg::Glm => Self::Glm,
             RemoteProviderArg::OpenRouter => Self::OpenRouter,
             RemoteProviderArg::OpenAiCompatible => Self::OpenAiCompatible,
         }

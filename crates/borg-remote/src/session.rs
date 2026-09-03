@@ -4129,6 +4129,7 @@ fn default_consultation_effort(provider: CodingProvider) -> Option<String> {
     match provider {
         CodingProvider::Codex => Some(borg_provider::codex_default_effort().to_string()),
         CodingProvider::Kimi => Some(borg_provider::kimi_default_effort().to_string()),
+        CodingProvider::Glm => Some(borg_provider::kimi_default_effort().to_string()),
         CodingProvider::OpenRouter | CodingProvider::OpenAiCompatible => Some("medium".to_string()),
         CodingProvider::Claude | CodingProvider::OpenCode => None,
     }

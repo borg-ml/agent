@@ -23,6 +23,7 @@ base64.workspace = true
 borg-core.workspace = true
 claude-agents = { workspace = true, optional = true }
 chrono.workspace = true
+flate2.workspace = true
 futures = "0.3"
 getrandom = "0.4"
 hex.workspace = true
@@ -31,6 +32,7 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+tar.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
 toml = "1.1.4"

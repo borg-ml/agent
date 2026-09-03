@@ -69,6 +69,8 @@ impl ModelGateway {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenAiCompatibleProfile {
     Kimi,
+    /// Z.ai GLM, reached over the same OpenAI-compatible wire format.
+    Glm,
     OpenRouter,
     Generic,
 }
@@ -77,6 +79,7 @@ impl OpenAiCompatibleProfile {
     fn label(self) -> &'static str {
         match self {
             Self::Kimi => "kimi",
+            Self::Glm => "glm",
             Self::OpenRouter => "openrouter",
             Self::Generic => "openai-compatible",
         }
@@ -85,6 +88,7 @@ impl OpenAiCompatibleProfile {
     fn endpoint(self) -> String {
         match self {
             Self::Kimi => kimi_chat_completions_endpoint(),
+            Self::Glm => glm_chat_completions_endpoint(),
             Self::OpenRouter => openrouter_chat_completions_endpoint(),
             Self::Generic => chat_completions_endpoint(),
         }
@@ -93,8 +97,15 @@ impl OpenAiCompatibleProfile {
     fn api_key(self) -> Option<String> {
         match self {
             Self::Kimi => {
-                nonempty_env("BORG_KIMI_API_KEY").or_else(|| nonempty_env("MOONSHOT_API_KEY"))
+                // A selected Kimi Code plan supplies the key for its own quota;
+                // the pay-as-you-go variables remain the fallback.
+                subscription_key(crate::subscription::Plan::KimiCode)
+                    .or_else(|| nonempty_env("BORG_KIMI_API_KEY"))
+                    .or_else(|| nonempty_env("MOONSHOT_API_KEY"))
             }
+            Self::Glm => subscription_key(crate::subscription::Plan::GlmCoding)
+                .or_else(|| nonempty_env("BORG_GLM_API_KEY"))
+                .or_else(|| nonempty_env("ZHIPUAI_API_KEY")),
             Self::OpenRouter => {
                 crate::credentials::api_key(crate::credentials::ApiKeyCredential::OpenRouter)
             }
@@ -229,7 +240,15 @@ impl OpenAiCompatibleProvider {
             return Err(ProviderCallError {
                 message: match profile {
                     OpenAiCompatibleProfile::Kimi => {
-                        "BORG_KIMI_API_KEY or MOONSHOT_API_KEY is not set".to_string()
+                        "no Kimi key: set BORG_SUBSCRIPTION=kimi with KIMI_API_KEY for a \
+                         Kimi Code plan, or BORG_KIMI_API_KEY / MOONSHOT_API_KEY for the \
+                         pay-as-you-go API"
+                            .to_string()
+                    }
+                    OpenAiCompatibleProfile::Glm => {
+                        "no GLM key: set BORG_SUBSCRIPTION=glm with ZAI_API_KEY for a \
+                         GLM Coding Plan, or BORG_GLM_API_KEY for the pay-as-you-go API"
+                            .to_string()
                     }
                     OpenAiCompatibleProfile::OpenRouter => {
                         "OPENROUTER_API_KEY is not set".to_string()
@@ -281,6 +300,11 @@ impl OpenAiCompatibleProvider {
             OpenAiCompatibleProfile::Kimi => {
                 body["reasoning_effort"] = json!(kimi_reasoning_effort(self.effort.as_deref()));
                 body["max_completion_tokens"] = json!(kimi_max_completion_tokens());
+            }
+            OpenAiCompatibleProfile::Glm => {
+                // Z.ai takes the OpenAI `reasoning_effort` spelling; it has no
+                // separate completion-token knob to set here.
+                body["reasoning_effort"] = json!(glm_reasoning_effort(self.effort.as_deref()));
             }
             OpenAiCompatibleProfile::OpenRouter => {
                 if let Some(reasoning) = compatible_reasoning(self.effort.as_deref()) {
@@ -337,7 +361,9 @@ impl OpenAiCompatibleProvider {
         }
         if let Some(schema) = request.output_schema.as_ref() {
             let format = match profile {
-                OpenAiCompatibleProfile::Kimi => Some("json_schema".to_string()),
+                OpenAiCompatibleProfile::Kimi | OpenAiCompatibleProfile::Glm => {
+                    Some("json_schema".to_string())
+                }
                 OpenAiCompatibleProfile::OpenRouter => {
                     nonempty_env("BORG_OPENROUTER_RESPONSE_FORMAT")
                         .or_else(|| Some("json_schema".to_string()))
@@ -481,6 +507,11 @@ impl OpenAiCompatibleProvider {
         let duration_ms = elapsed_millis_u64(started_at);
         let mut usage = match profile {
             OpenAiCompatibleProfile::Kimi => kimi_usage_from_response(&streamed.raw, duration_ms),
+            // Plan usage is quota-metered rather than priced per token, so the
+            // generic extractor (which reports no cost) is the honest one.
+            OpenAiCompatibleProfile::Glm => {
+                extract_chat_completions_usage(&streamed.raw, duration_ms, None)
+            }
             OpenAiCompatibleProfile::OpenRouter => extract_chat_completions_usage(
                 &streamed.raw,
                 duration_ms,
@@ -713,15 +744,54 @@ fn merge_gateway_body(body: &mut Value, extras: &Map<String, Value>) {
     }
 }
 
-fn kimi_chat_completions_endpoint() -> String {
-    let base = nonempty_env("BORG_KIMI_BASE_URL")
-        .unwrap_or_else(|| "https://api.moonshot.ai/v1".to_string());
+/// The key a selected coding plan provides, if it is the plan for this profile.
+fn subscription_key(plan: crate::subscription::Plan) -> Option<String> {
+    crate::subscription::active_for(plan).and_then(|plan| plan.api_key())
+}
+
+/// The base URL a selected coding plan serves from, if any.
+///
+/// An explicit `BORG_*_BASE_URL` always wins: an operator pointing Borg at a
+/// proxy or a regional host must not be overridden by a plan default.
+fn subscription_base_url(plan: crate::subscription::Plan) -> Option<String> {
+    crate::subscription::active_for(plan).map(|plan| plan.base_url().to_string())
+}
+
+fn chat_completions_url(base: String) -> String {
     let trimmed = base.trim_end_matches('/');
     if trimmed.ends_with("/chat/completions") {
         trimmed.to_string()
     } else {
         format!("{trimmed}/chat/completions")
     }
+}
+
+fn kimi_chat_completions_endpoint() -> String {
+    // Kimi Code is served from `api.kimi.com/coding`, not the pay-as-you-go
+    // `api.moonshot.ai`. Defaulting to the latter under an active plan would
+    // spend credits while the plan sat unused.
+    let base = nonempty_env("BORG_KIMI_BASE_URL")
+        .or_else(|| subscription_base_url(crate::subscription::Plan::KimiCode))
+        .unwrap_or_else(|| "https://api.moonshot.ai/v1".to_string());
+    chat_completions_url(base)
+}
+
+/// Z.ai accepts the OpenAI `reasoning_effort` vocabulary. Borg's own effort
+/// levels are wider, so clamp rather than pass an unknown value through.
+fn glm_reasoning_effort(effort: Option<&str>) -> &'static str {
+    match effort.map(str::trim) {
+        Some("none") | Some("low") => "low",
+        Some("max") | Some("xhigh") | Some("ultra") | Some("high") => "high",
+        _ => "medium",
+    }
+}
+
+fn glm_chat_completions_endpoint() -> String {
+    let base = nonempty_env("BORG_GLM_BASE_URL")
+        .or_else(|| subscription_base_url(crate::subscription::Plan::GlmCoding))
+        // Without a plan, the general API host is the right default.
+        .unwrap_or_else(|| "https://api.z.ai/api/paas/v4".to_string());
+    chat_completions_url(base)
 }
 
 fn kimi_reasoning_effort(effort: Option<&str>) -> &'static str {

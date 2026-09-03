@@ -1778,6 +1778,13 @@ fn model_picker_options_with_configured(
                 borg_provider::kimi_product_model(),
             ));
         }
+        Some(CodingProvider::Glm) => {
+            // The Coding Plan serves these two; older ids are silently routed
+            // to them by the vendor, so offering them would mislead.
+            for model in ["glm-5.3", "glm-5.3-flash"] {
+                options.push(PickerOption::new(model, model));
+            }
+        }
         provider @ (Some(CodingProvider::OpenAiCompatible)
         | Some(CodingProvider::OpenCode)
         | None) => {
