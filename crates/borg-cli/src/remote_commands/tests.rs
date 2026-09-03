@@ -230,6 +230,17 @@ fn tool_start_gets_a_visible_frame_even_when_completion_is_already_queued() {
 }
 
 #[test]
+fn first_tool_argument_token_gets_an_immediate_generating_frame() {
+    let generating = SessionEventKind::ProviderEvent {
+        provider: CodingProvider::Codex,
+        kind: "action/preparing".to_string(),
+        payload: serde_json::json!({"label": "", "tool_call_id": null}),
+    };
+
+    assert!(session_event_needs_immediate_frame(&generating));
+}
+
+#[test]
 fn status_is_an_alias_for_usage() {
     assert!(is_usage_command("/usage"));
     assert!(is_usage_command("/status"));

@@ -227,6 +227,17 @@ impl TimelineProjector {
                     Arc::make_mut(&mut self.entries[index]).running = false;
                 }
             }
+            SessionEventKind::ProviderEvent { kind, .. }
+                if kind == "action/preparing_cancelled" =>
+            {
+                if let Some(index) = self.unkeyed_preparing_tools.pop() {
+                    if index + 1 == self.entries.len() {
+                        self.entries.pop();
+                    } else if let Some(entry) = self.entries.get_mut(index) {
+                        Arc::make_mut(entry).running = false;
+                    }
+                }
+            }
             SessionEventKind::ProviderEvent { kind, payload, .. } if kind == "action/preparing" => {
                 self.reasoning = None;
                 let provider_tool_id = payload

@@ -1,7 +1,5 @@
 use std::fs::{self, File, OpenOptions};
-use std::io;
-#[cfg(windows)]
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
@@ -40,6 +38,17 @@ struct RuntimeAsset {
     archive_name: &'static str,
     sha256: &'static str,
     size: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FfmpegAsset {
+    archive_name: &'static str,
+    url: &'static str,
+    archive_sha256: &'static str,
+    archive_size: u64,
+    binary_entry: &'static str,
+    binary_sha256: &'static str,
+    binary_size: u64,
 }
 
 struct InstalledDictation {
@@ -194,7 +203,7 @@ async fn ensure_installed(
     let _lock = CacheLock::acquire(&install_dir).await?;
     migrate_legacy_install(&install_dir).await?;
     if install_recorder {
-        ensure_recorder_dependency().await?;
+        ensure_recorder_dependency(&install_dir).await?;
     }
 
     let archive_path = install_dir.join(asset.archive_name);
@@ -241,48 +250,58 @@ async fn ensure_installed(
     })
 }
 
-async fn ensure_recorder_dependency() -> Result<()> {
-    if ffmpeg_program().is_some() {
+const IMAGEIO_FFMPEG_VERSION: &str = "0.6.0";
+const IMAGEIO_LICENSE_ENTRY: &str = "imageio_ffmpeg-0.6.0.dist-info/LICENSE";
+
+async fn ensure_recorder_dependency(install_dir: &Path) -> Result<()> {
+    if system_ffmpeg_program().is_some() {
         return Ok(());
     }
 
-    #[cfg(target_os = "macos")]
-    {
-        let brew = [
-            Path::new("/opt/homebrew/bin/brew"),
-            Path::new("/usr/local/bin/brew"),
-        ]
-        .into_iter()
-        .find(|path| path.is_file())
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("brew"));
-        let status = Command::new(&brew)
-            .args(["install", "ffmpeg"])
-            .env("HOMEBREW_NO_AUTO_UPDATE", "1")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await
-            .with_context(|| {
-                "ffmpeg is required for dictation and Homebrew could not be started; install Homebrew or ffmpeg manually"
-            })?;
-        ensure!(
-            status.success(),
-            "Homebrew could not install ffmpeg (status {status})"
-        );
-        ensure!(
-            ffmpeg_program().is_some(),
-            "Homebrew installed ffmpeg, but Borg could not find its executable"
-        );
-        return Ok(());
+    let asset = ffmpeg_asset()?;
+    let ffmpeg_dir = install_dir.join("ffmpeg");
+    fs::create_dir_all(&ffmpeg_dir)
+        .with_context(|| format!("failed to create {}", ffmpeg_dir.display()))?;
+    let binary_path = ffmpeg_dir.join(ffmpeg_binary_name());
+    let binary_installed = cache_marker_matches(
+        &binary_path,
+        &verification_marker(&binary_path),
+        asset.binary_size,
+        asset.binary_sha256,
+    )
+    .await?;
+    if !binary_installed {
+        let archive_path = ffmpeg_dir.join(asset.archive_name);
+        download_verified(
+            asset.url,
+            &archive_path,
+            asset.archive_size,
+            asset.archive_sha256,
+            "FFmpeg runtime",
+        )
+        .await?;
+        extract_ffmpeg(&archive_path, &binary_path, asset.binary_entry)?;
+        ensure_file_hash(
+            &binary_path,
+            asset.binary_size,
+            asset.binary_sha256,
+            "installed FFmpeg runtime",
+        )
+        .await?;
+        write_verification_marker(&verification_marker(&binary_path), asset.binary_sha256).await?;
     }
 
-    #[cfg(not(target_os = "macos"))]
-    bail!("dictation requires ffmpeg; install it with your system package manager");
+    fs::write(
+        ffmpeg_dir.join("NOTICE.txt"),
+        format!(
+            "FFmpeg runtime extracted from the imageio-ffmpeg {IMAGEIO_FFMPEG_VERSION} platform wheel.\n\nWheel: {}\nSHA-256: {}\nSource and build details: https://github.com/imageio/imageio-ffmpeg/tree/v{IMAGEIO_FFMPEG_VERSION}\nFFmpeg license: this is a GPL build; run the bundled executable with -L for its full license notice.\nPackaging license: IMAGEIO-FFMPEG-LICENSE.txt\n",
+            asset.archive_name, asset.archive_sha256
+        ),
+    )?;
+    Ok(())
 }
 
-fn ffmpeg_program() -> Option<PathBuf> {
+fn system_ffmpeg_program() -> Option<PathBuf> {
     [
         PathBuf::from("ffmpeg"),
         PathBuf::from("/opt/homebrew/bin/ffmpeg"),
@@ -298,6 +317,133 @@ fn ffmpeg_program() -> Option<PathBuf> {
             program.is_file()
         }
     })
+}
+
+fn ffmpeg_program() -> Option<PathBuf> {
+    system_ffmpeg_program().or_else(|| {
+        let asset = ffmpeg_asset().ok()?;
+        let path = dictation_install_dir()
+            .ok()?
+            .join("ffmpeg")
+            .join(ffmpeg_binary_name());
+        let metadata = fs::metadata(&path).ok()?;
+        let marker = fs::read_to_string(verification_marker(&path)).ok()?;
+        (metadata.len() == asset.binary_size
+            && marker.trim().eq_ignore_ascii_case(asset.binary_sha256))
+        .then_some(path)
+    })
+}
+
+#[cfg(windows)]
+fn ffmpeg_binary_name() -> &'static str {
+    "ffmpeg.exe"
+}
+
+#[cfg(not(windows))]
+fn ffmpeg_binary_name() -> &'static str {
+    "ffmpeg"
+}
+
+fn ffmpeg_asset() -> Result<FfmpegAsset> {
+    ffmpeg_asset_for(std::env::consts::OS, std::env::consts::ARCH)
+        .context("automatic FFmpeg setup is not supported on this platform")
+}
+
+fn ffmpeg_asset_for(os: &str, arch: &str) -> Option<FfmpegAsset> {
+    match (os, arch) {
+        ("macos", "aarch64") => Some(FfmpegAsset {
+            archive_name: "imageio_ffmpeg-0.6.0-macos-arm64.whl",
+            url: "https://files.pythonhosted.org/packages/40/5c/f3d8a657d362cc93b81aab8feda487317da5b5d31c0e1fdfd5e986e55d17/imageio_ffmpeg-0.6.0-py3-none-macosx_11_0_arm64.whl",
+            archive_sha256: "b1ae3173414b5fc5f538a726c4e48ea97edc0d2cdc11f103afee655c463fa742",
+            archive_size: 21_113_891,
+            binary_entry: "imageio_ffmpeg/binaries/ffmpeg-macos-aarch64-v7.1",
+            binary_sha256: "6d175a4743ca50256e89a8cdd731100f9cee33bd79aeea46894d209410dc6617",
+            binary_size: 49_368_728,
+        }),
+        ("macos", "x86_64") => Some(FfmpegAsset {
+            archive_name: "imageio_ffmpeg-0.6.0-macos-x86_64.whl",
+            url: "https://files.pythonhosted.org/packages/da/58/87ef68ac83f4c7690961bce288fd8e382bc5f1513860fc7f90a9c1c1c6bf/imageio_ffmpeg-0.6.0-py3-none-macosx_10_9_intel.macosx_10_9_x86_64.whl",
+            archive_sha256: "9d2baaf867088508d4a3458e61eeb30e945c4ad8016025545f66c4b5aaef0a61",
+            archive_size: 24_932_969,
+            binary_entry: "imageio_ffmpeg/binaries/ffmpeg-macos-x86_64-v7.1",
+            binary_sha256: "4a4a968b98859588e98500ae25973d80a5ca5eed0724222b9f76360dcb72a001",
+            binary_size: 75_991_688,
+        }),
+        ("linux", "x86_64") => Some(FfmpegAsset {
+            archive_name: "imageio_ffmpeg-0.6.0-linux-x86_64.whl",
+            url: "https://files.pythonhosted.org/packages/a0/2d/43c8522a2038e9d0e7dbdf3a61195ecc31ca576fb1527a528c877e87d973/imageio_ffmpeg-0.6.0-py3-none-manylinux2014_x86_64.whl",
+            archive_sha256: "c7e46fcec401dd990405049d2e2f475e2b397779df2519b544b8aab515195282",
+            archive_size: 29_498_237,
+            binary_entry: "imageio_ffmpeg/binaries/ffmpeg-linux-x86_64-v7.0.2",
+            binary_sha256: "e7e7fb30477f717e6f55f9180a70386c62677ef8a4d4d1a5d948f4098aa3eb99",
+            binary_size: 79_826_272,
+        }),
+        ("linux", "aarch64") => Some(FfmpegAsset {
+            archive_name: "imageio_ffmpeg-0.6.0-linux-aarch64.whl",
+            url: "https://files.pythonhosted.org/packages/33/e7/1925bfbc563c39c1d2e82501d8372734a5c725e53ac3b31b4c2d081e895b/imageio_ffmpeg-0.6.0-py3-none-manylinux2014_aarch64.whl",
+            archive_sha256: "1d47bebd83d2c5fc770720d211855f208af8a596c82d17730aa51e815cdee6dc",
+            archive_size: 25_632_706,
+            binary_entry: "imageio_ffmpeg/binaries/ffmpeg-linux-aarch64-v7.0.2",
+            binary_sha256: "6bb182d0d75d23028db82e9e4f723ca69b853d055698486e6984ddb2c06fb8ce",
+            binary_size: 51_134_160,
+        }),
+        ("windows", "x86_64") => Some(FfmpegAsset {
+            archive_name: "imageio_ffmpeg-0.6.0-windows-x86_64.whl",
+            url: "https://files.pythonhosted.org/packages/2c/c6/fa760e12a2483469e2bf5058c5faff664acf66cadb4df2ad6205b016a73d/imageio_ffmpeg-0.6.0-py3-none-win_amd64.whl",
+            archive_sha256: "02fa47c83703c37df6bfe4896aab339013f62bf02c5ebf2dce6da56af04ffc0a",
+            archive_size: 31_246_824,
+            binary_entry: "imageio_ffmpeg/binaries/ffmpeg-win-x86_64-v7.1.exe",
+            binary_sha256: "2ce797a0f88d7f067180338fb227f7b1928ea727bd9a4d7a1d022f7c52af71a3",
+            binary_size: 87_638_016,
+        }),
+        _ => None,
+    }
+}
+
+fn extract_ffmpeg(archive_path: &Path, binary_path: &Path, binary_entry: &str) -> Result<()> {
+    let partial_path = binary_path.with_extension("partial");
+    let result = (|| -> Result<()> {
+        let archive_file = File::open(archive_path)
+            .with_context(|| format!("failed to open {}", archive_path.display()))?;
+        let mut archive =
+            zip::ZipArchive::new(archive_file).context("failed to read FFmpeg wheel")?;
+        let mut output = File::create(&partial_path)
+            .with_context(|| format!("failed to create {}", partial_path.display()))?;
+        {
+            let mut binary = archive
+                .by_name(binary_entry)
+                .context("FFmpeg wheel did not contain its expected executable")?;
+            io::copy(&mut binary, &mut output).context("failed to extract FFmpeg runtime")?;
+        }
+        output.flush()?;
+        output.sync_all()?;
+        let license_path = binary_path
+            .parent()
+            .context("FFmpeg destination has no parent directory")?
+            .join("IMAGEIO-FFMPEG-LICENSE.txt");
+        let mut license = archive
+            .by_name(IMAGEIO_LICENSE_ENTRY)
+            .context("FFmpeg wheel did not contain its packaging license")?;
+        let mut license_output = File::create(&license_path)?;
+        io::copy(&mut license, &mut license_output)?;
+        license_output.flush()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&partial_path, fs::Permissions::from_mode(0o755))?;
+        }
+        if binary_path.exists() {
+            fs::remove_file(binary_path)
+                .with_context(|| format!("failed to replace existing {}", binary_path.display()))?;
+        }
+        fs::rename(&partial_path, binary_path)
+            .with_context(|| format!("failed to install FFmpeg into {}", binary_path.display()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&partial_path);
+    }
+    result
 }
 
 const PARAKEET_RUNTIME_URL_PREFIX: &str =
@@ -965,7 +1111,7 @@ fn recorder_command(config: &LocalDictationConfig, output: &std::path::Path) -> 
     let mut command = Command::new(ffmpeg_program().unwrap_or_else(|| PathBuf::from("ffmpeg")));
     command.args(["-hide_banner", "-loglevel", "error", "-y"]);
     #[cfg(target_os = "linux")]
-    command.args(["-f", "pulse", "-i", "default"]);
+    command.args(["-f", "alsa", "-i", "default"]);
     #[cfg(target_os = "macos")]
     command.args(["-f", "avfoundation", "-i", ":0"]);
     #[cfg(target_os = "windows")]
@@ -1180,8 +1326,8 @@ mod tests {
     use tokio::process::Command;
 
     use super::{
-        LocalDictationConfig, LocalDictationRecorder, ensure_safe_archive_path,
-        transcription_response_text, transcription_text, wait_for_endpoint,
+        LocalDictationConfig, LocalDictationRecorder, ensure_safe_archive_path, extract_ffmpeg,
+        ffmpeg_asset_for, transcription_response_text, transcription_text, wait_for_endpoint,
     };
 
     fn default_config() -> LocalDictationConfig {
@@ -1219,6 +1365,59 @@ mod tests {
         assert!(ensure_safe_archive_path(Path::new("runtime/parakeet-server")).is_ok());
         assert!(ensure_safe_archive_path(Path::new("../parakeet-server")).is_err());
         assert!(ensure_safe_archive_path(Path::new("runtime/../../parakeet-server")).is_err());
+    }
+
+    #[test]
+    fn ffmpeg_assets_cover_the_managed_dictation_platforms() {
+        for (os, arch, archive) in [
+            ("macos", "aarch64", "imageio_ffmpeg-0.6.0-macos-arm64.whl"),
+            ("macos", "x86_64", "imageio_ffmpeg-0.6.0-macos-x86_64.whl"),
+            ("linux", "aarch64", "imageio_ffmpeg-0.6.0-linux-aarch64.whl"),
+            ("linux", "x86_64", "imageio_ffmpeg-0.6.0-linux-x86_64.whl"),
+            (
+                "windows",
+                "x86_64",
+                "imageio_ffmpeg-0.6.0-windows-x86_64.whl",
+            ),
+        ] {
+            let asset = ffmpeg_asset_for(os, arch).expect("supported FFmpeg asset");
+            assert_eq!(asset.archive_name, archive);
+            assert_eq!(asset.archive_sha256.len(), 64);
+            assert_eq!(asset.binary_sha256.len(), 64);
+            assert!(asset.url.starts_with("https://files.pythonhosted.org/"));
+        }
+        assert!(ffmpeg_asset_for("windows", "aarch64").is_none());
+        assert!(ffmpeg_asset_for("freebsd", "x86_64").is_none());
+    }
+
+    #[test]
+    fn ffmpeg_wheel_is_extracted_and_replaces_an_incomplete_binary() {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+
+        let root = tempfile::tempdir().unwrap();
+        let archive = root.path().join("ffmpeg.whl");
+        let binary = root.path().join("ffmpeg");
+        std::fs::write(&binary, b"incomplete").unwrap();
+        let mut wheel = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+        wheel
+            .start_file("package/ffmpeg", SimpleFileOptions::default())
+            .unwrap();
+        wheel.write_all(b"verified ffmpeg").unwrap();
+        wheel
+            .start_file(super::IMAGEIO_LICENSE_ENTRY, SimpleFileOptions::default())
+            .unwrap();
+        wheel.write_all(b"packaging license").unwrap();
+        wheel.finish().unwrap();
+
+        extract_ffmpeg(&archive, &binary, "package/ffmpeg").unwrap();
+
+        assert_eq!(std::fs::read(binary).unwrap(), b"verified ffmpeg");
+        assert_eq!(
+            std::fs::read(root.path().join("IMAGEIO-FFMPEG-LICENSE.txt")).unwrap(),
+            b"packaging license"
+        );
+        assert!(!root.path().join("ffmpeg.partial").exists());
     }
 
     #[tokio::test]

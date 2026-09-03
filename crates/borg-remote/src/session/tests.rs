@@ -25,6 +25,49 @@ fn subscription_prompt_ends_with(prompt: &str, text: &str) -> bool {
     prompt.ends_with(&frame)
 }
 
+#[tokio::test]
+async fn generation_boundary_waits_for_a_busy_live_projection() {
+    let session_id = Uuid::new_v4();
+    let (events, mut receiver) = mpsc::channel(1);
+    events
+        .send(SessionEvent::new(
+            session_id,
+            1,
+            SessionEventKind::ReasoningCompleted,
+        ))
+        .await
+        .unwrap();
+    let boundary = SessionEvent::new(
+        session_id,
+        0,
+        SessionEventKind::ProviderEvent {
+            provider: CodingProvider::Codex,
+            kind: "action/preparing".to_string(),
+            payload: serde_json::json!({"label": "", "tool_call_id": null}),
+        },
+    );
+    let delivery = tokio::spawn(async move {
+        deliver_recorded_event(
+            &events,
+            session_id,
+            boundary,
+            crate::EventPersistence::Ephemeral,
+        )
+        .await;
+    });
+
+    tokio::task::yield_now().await;
+    assert!(matches!(
+        receiver.recv().await.unwrap().kind,
+        SessionEventKind::ReasoningCompleted
+    ));
+    delivery.await.unwrap();
+    assert!(matches!(
+        receiver.recv().await.unwrap().kind,
+        SessionEventKind::ProviderEvent { ref kind, .. } if kind == "action/preparing"
+    ));
+}
+
 #[test]
 fn provider_event_batch_coalescing_preserves_text_and_boundaries() {
     let first_message_id = Uuid::new_v4();

@@ -7170,7 +7170,12 @@ async fn deliver_recorded_event(
     // the single session actor forever. Ephemeral/coalesced events are safe to
     // drop because reconnecting consumers recover durable state and live state
     // is regenerated from the store.
-    if matches!(persistence, crate::EventPersistence::Durable) {
+    let ordered_live_boundary = matches!(
+        &event.kind,
+        SessionEventKind::ProviderEvent { kind, .. }
+            if kind == "action/preparing" || kind == "action/preparing_cancelled"
+    );
+    if matches!(persistence, crate::EventPersistence::Durable) || ordered_live_boundary {
         let sequence = event.sequence;
         match tokio::time::timeout(LIVE_EVENT_DELIVERY_TIMEOUT, events.send(event)).await {
             Ok(Ok(())) => {}

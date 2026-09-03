@@ -263,6 +263,11 @@ impl SessionEventKind {
             {
                 EventPersistence::Durable
             }
+            Self::ProviderEvent { kind, .. }
+                if kind == "action/preparing" || kind == "action/preparing_cancelled" =>
+            {
+                EventPersistence::Coalesced
+            }
             Self::ProviderEvent { .. } => EventPersistence::Ephemeral,
             Self::Message {
                 actor: crate::EventActor::User | crate::EventActor::System,
@@ -384,6 +389,11 @@ impl SessionEventKind {
                 ..
             } => Some(format!("message:{message_id}")),
             Self::ReasoningDelta { .. } => Some("reasoning".to_string()),
+            Self::ProviderEvent { kind, .. }
+                if kind == "action/preparing" || kind == "action/preparing_cancelled" =>
+            {
+                Some("action_preparing".to_string())
+            }
             Self::ContextWindowUpdated { .. } => Some("context_window".to_string()),
             _ => None,
         }
@@ -407,7 +417,7 @@ impl SessionEventKind {
             | Self::StatusChanged {
                 status: SessionStatus::Ready | SessionStatus::Stopped,
                 ..
-            } => vec!["reasoning".to_string()],
+            } => vec!["reasoning".to_string(), "action_preparing".to_string()],
             Self::ReasoningCompleted
             | Self::ToolStarted { .. }
             | Self::ToolCompleted { .. }
@@ -416,8 +426,12 @@ impl SessionEventKind {
             | Self::StatusChanged {
                 status: SessionStatus::WaitingForApproval,
                 ..
-            } => vec!["reasoning".to_string()],
-            Self::ContextCleared => vec!["reasoning".to_string(), "context_window".to_string()],
+            } => vec!["reasoning".to_string(), "action_preparing".to_string()],
+            Self::ContextCleared => vec![
+                "reasoning".to_string(),
+                "action_preparing".to_string(),
+                "context_window".to_string(),
+            ],
             _ => Vec::new(),
         }
     }

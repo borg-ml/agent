@@ -1287,6 +1287,23 @@ impl Transcript {
                         .and_then(serde_json::Value::as_str),
                 );
             }
+            SessionEventKind::ProviderEvent { kind, .. }
+                if kind == "action/preparing_cancelled" =>
+            {
+                if let Some(preparing_id) = self.unkeyed_preparing_tools.pop()
+                    && let Some(index) = self.tools.get(&preparing_id).copied()
+                {
+                    if self.foreground_tool.as_deref() == Some(preparing_id.as_str()) {
+                        self.foreground_tool = None;
+                    }
+                    if index + 1 == self.order.len() {
+                        self.tools.remove(&preparing_id);
+                        self.order.pop();
+                    } else {
+                        self.finish_preparing_tool(&preparing_id, event.created_at);
+                    }
+                }
+            }
             SessionEventKind::ProviderEvent { kind, payload, .. }
                 if is_live_tool_call_event(kind) =>
             {

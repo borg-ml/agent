@@ -7722,7 +7722,7 @@ fn session_event_needs_immediate_frame(kind: &SessionEventKind) -> bool {
     matches!(
         kind,
         SessionEventKind::ToolStarted { .. } | SessionEventKind::ToolUpdated { .. }
-    ) || matches!(kind, SessionEventKind::ProviderEvent { kind, .. } if kind == "tool_call_started")
+    ) || matches!(kind, SessionEventKind::ProviderEvent { kind, .. } if kind == "tool_call_started" || kind == "action/preparing")
 }
 
 fn should_schedule_interaction_frame(

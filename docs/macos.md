@@ -18,10 +18,13 @@ keybindings.
 
 ## Dictation setup
 
-The first managed dictation setup installs the Parakeet runtime and model. On
-macOS it also installs `ffmpeg` with Homebrew when `ffmpeg` is missing. A custom
-`BORG_CLI_DICTATION_RECORD_COMMAND` remains fully user-managed and skips this
-dependency installation.
+The first managed dictation setup installs the Parakeet runtime and model. When
+`ffmpeg` is missing, Borg also downloads a pinned, checksum-verified
+`imageio-ffmpeg` 0.6.0 platform wheel and extracts its FFmpeg 7.x executable
+into Borg's own data directory. This does not require Homebrew and uses the
+matching managed binary on macOS, Linux, and Windows. An existing `ffmpeg` on
+`PATH` is preferred. A custom `BORG_CLI_DICTATION_RECORD_COMMAND` remains fully
+user-managed and skips this dependency installation.
 
 ## Ghostty bottom padding
 

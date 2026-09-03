@@ -21,6 +21,7 @@ sha2.workspace = true
 shlex = "2.0"
 tempfile.workspace = true
 tokio.workspace = true
+zip = { version = "8", default-features = false, features = ["deflate"] }
 
 [target.'cfg(unix)'.dependencies]
 dirs.workspace = true
@@ -29,4 +30,3 @@ tar = "0.4"
 
 [target.'cfg(windows)'.dependencies]
 dirs.workspace = true
-zip = { version = "8", default-features = false, features = ["deflate"] }

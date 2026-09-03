@@ -127,9 +127,11 @@ manifest_version_change() {
   local previous="$3"
   local target="$4"
   local changed_file
-  local -a changed_files
+  local -a changed_files=()
 
-  mapfile -t changed_files < <(git diff --name-only "$parent" "$commit" -- Cargo.toml Cargo.lock)
+  while IFS= read -r changed_file; do
+    changed_files+=("$changed_file")
+  done < <(git diff --name-only "$parent" "$commit" -- Cargo.toml Cargo.lock)
   [[ " ${changed_files[*]} " == *" Cargo.toml "* ]] || return 1
   for changed_file in "${changed_files[@]}"; do
     case "$changed_file" in
@@ -383,7 +385,10 @@ replace_workspace_version "$current_version" "$target_version"
 # Refresh workspace package versions in Cargo.lock before enforcing --locked.
 cargo check --workspace --exclude borg-gui --all-targets
 
-mapfile -t changed_files < <(git diff --name-only -- Cargo.toml Cargo.lock)
+changed_files=()
+while IFS= read -r changed_file; do
+  changed_files+=("$changed_file")
+done < <(git diff --name-only -- Cargo.toml Cargo.lock)
 [[ " ${changed_files[*]} " == *" Cargo.toml "* ]] ||
   die "Cargo.toml was not updated"
 [[ " ${changed_files[*]} " == *" Cargo.lock "* ]] ||

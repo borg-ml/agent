@@ -130,6 +130,18 @@ assert_equal() {
     fail "$label: expected '$expected', got '$actual'"
 }
 
+replace_in_files() {
+  local expression="$1"
+  local path
+  local replacement
+  shift
+  for path in "$@"; do
+    replacement="$(mktemp "${path}.XXXXXX")"
+    sed "$expression" "$path" >"$replacement"
+    mv "$replacement" "$path"
+  done
+}
+
 fixture_version() {
   awk '
     /^\[workspace\.package\]$/ {
@@ -347,7 +359,7 @@ assert_equal $'Cargo.lock\nCargo.toml' \
   fail "release discarded generated drift"
 
 interrupted_fixture="$(make_fixture interrupted)"
-sed -i 's/1\.2\.3/1.2.4/g' \
+replace_in_files 's/1\.2\.3/1.2.4/g' \
   "$interrupted_fixture/Cargo.toml" "$interrupted_fixture/Cargo.lock"
 git -C "$interrupted_fixture" add Cargo.toml Cargo.lock
 git -C "$interrupted_fixture" commit --quiet -m "Bump workspace version to 1.2.4"
@@ -363,7 +375,7 @@ assert_equal "$interrupted_head" \
   "interrupted release tag"
 
 prebumped_fixture="$(make_fixture prebumped 0.1.43)"
-sed -i 's/0\.1\.43/0.1.44/g' \
+replace_in_files 's/0\.1\.43/0.1.44/g' \
   "$prebumped_fixture/Cargo.toml" "$prebumped_fixture/Cargo.lock"
 echo "coalesced release change" >"$prebumped_fixture/status.txt"
 git -C "$prebumped_fixture" add Cargo.toml Cargo.lock status.txt

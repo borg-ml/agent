@@ -2518,6 +2518,8 @@ async fn codex_app_server_command(
     command.args([
         "app-server",
         "--stdio",
+        "--enable",
+        "apply_patch_streaming_events",
         "--config",
         "agents.enabled=false",
         "--disable",
@@ -3049,6 +3051,7 @@ struct CodexReasoningState {
     streams: HashMap<(String, Option<u64>), String>,
     aggregates: HashMap<String, String>,
     aligned_single_streams: HashSet<String>,
+    generating_tools: HashSet<String>,
 }
 
 impl CodexReasoningState {
@@ -3256,6 +3259,15 @@ async fn emit_codex_events_with_state(
                 return;
             };
             let item_type = codex_item_type(item);
+            if codex_item_is_agent_message(item_type) {
+                events
+                    .send(ChatStreamEvent::Phase {
+                        name: "action/preparing_cancelled".to_string(),
+                        input: Value::Null,
+                    })
+                    .await
+                    .ok();
+            }
             if codex_item_is_non_rendered(item_type) {
                 return;
             }
@@ -3264,13 +3276,16 @@ async fn emit_codex_events_with_state(
                 tracing::warn!(item_type, "Codex item started without an id");
                 return;
             }
+            let generation_already_visible = reasoning_state.generating_tools.remove(&id);
             let (name, input) = codex_tool_signature(item_type, item);
-            events
-                .send(ChatStreamEvent::ToolCallGenerating {
-                    id: Some(id.clone()),
-                })
-                .await
-                .ok();
+            if !generation_already_visible {
+                events
+                    .send(ChatStreamEvent::ToolCallGenerating {
+                        id: Some(id.clone()),
+                    })
+                    .await
+                    .ok();
+            }
             if let Some(action) = complete_tool_action(&input) {
                 events
                     .send(ChatStreamEvent::ToolCallAction {
@@ -3294,18 +3309,14 @@ async fn emit_codex_events_with_state(
                 tracing::warn!("Codex patch update without an item id");
                 return;
             };
-            let Some(changes) = value.pointer("/params/changes").and_then(Value::as_array) else {
-                tracing::warn!(item_id = id, "Codex patch update without changes");
-                return;
-            };
-            events
-                .send(ChatStreamEvent::ToolCallUpdate {
-                    id: id.to_string(),
-                    name: "Edit".to_string(),
-                    input: serde_json::json!({"changes": changes}),
-                })
-                .await
-                .ok();
+            if reasoning_state.generating_tools.insert(id.to_string()) {
+                events
+                    .send(ChatStreamEvent::ToolCallGenerating {
+                        id: Some(id.to_string()),
+                    })
+                    .await
+                    .ok();
+            }
         }
         "item/completed" => {
             let Some(item) = codex_event_item(value) else {
@@ -3320,6 +3331,12 @@ async fn emit_codex_events_with_state(
                     // aggregate completed item.
                     events
                         .send(ChatStreamEvent::Narration { text: message })
+                        .await
+                        .ok();
+                }
+                if item.get("phase").and_then(Value::as_str) == Some("commentary") {
+                    events
+                        .send(ChatStreamEvent::ToolCallGenerating { id: None })
                         .await
                         .ok();
                 }
@@ -3342,6 +3359,15 @@ async fn emit_codex_events_with_state(
                     })
                     .await
                     .ok();
+                // Codex app-server does not expose generic custom-tool input
+                // deltas. Once reasoning ends, the next model item is being
+                // generated; keep an unkeyed card live so long code-mode edits
+                // are visible for their entire generation interval. A normal
+                // assistant message cancels it from item/started above.
+                events
+                    .send(ChatStreamEvent::ToolCallGenerating { id: None })
+                    .await
+                    .ok();
                 return;
             }
             if codex_item_is_non_rendered(item_type) {
@@ -3352,12 +3378,22 @@ async fn emit_codex_events_with_state(
                 tracing::warn!(item_type, "Codex item completed without an id");
                 return;
             }
+            reasoning_state.generating_tools.remove(&id);
             events
                 .send(ChatStreamEvent::ToolResult {
                     tool_use_id: id,
                     output: codex_tool_output(item_type, item),
                     is_error: codex_tool_is_error(item_type, item),
                     input: codex_tool_completion_input(item_type, item),
+                })
+                .await
+                .ok();
+        }
+        "turn/completed" => {
+            events
+                .send(ChatStreamEvent::Phase {
+                    name: "action/preparing_cancelled".to_string(),
+                    input: Value::Null,
                 })
                 .await
                 .ok();
@@ -4350,6 +4386,11 @@ mod tests {
         assert!(
             codex_args
                 .windows(2)
+                .any(|args| { args[0] == "--enable" && args[1] == "apply_patch_streaming_events" })
+        );
+        assert!(
+            codex_args
+                .windows(2)
                 .any(|args| args[0] == "--disable" && args[1] == "collaboration_modes")
         );
         assert!(
@@ -4915,7 +4956,10 @@ mod tests {
             receiver.recv().await,
             Some(ChatStreamEvent::Phase { name, .. }) if name == "reasoning_completed"
         ));
-        assert!(receiver.try_recv().is_err());
+        assert!(matches!(
+            receiver.recv().await,
+            Some(ChatStreamEvent::ToolCallGenerating { id: None })
+        ));
     }
 
     #[test]
@@ -5034,7 +5078,28 @@ mod tests {
             receiver.recv().await,
             Some(ChatStreamEvent::Phase { name, .. }) if name == "reasoning_completed"
         ));
-        assert!(receiver.try_recv().is_err());
+        assert!(matches!(
+            receiver.recv().await,
+            Some(ChatStreamEvent::ToolCallGenerating { id: None })
+        ));
+
+        emit_codex_events_with_state(
+            &sender,
+            &serde_json::json!({
+                "method": "item/started",
+                "params": {"item": {
+                    "id": "message-1",
+                    "type": "agentMessage",
+                    "text": ""
+                }}
+            }),
+            &mut state,
+        )
+        .await;
+        assert!(matches!(
+            receiver.recv().await,
+            Some(ChatStreamEvent::Phase { name, .. }) if name == "action/preparing_cancelled"
+        ));
     }
 
     #[test]
@@ -5302,33 +5367,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_streamed_patch_snapshots_become_tool_updates_before_completion() {
+    async fn codex_streamed_patch_stays_generating_until_the_complete_edit_lands() {
         let (sender, mut receiver) = mpsc::channel(8);
-        emit_codex_events(
+        let mut state = CodexReasoningState::default();
+        let partial = serde_json::json!({
+            "method": "item/fileChange/patchUpdated",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "itemId": "edit-1",
+                "changes": [{
+                    "path": "src/main.rs",
+                    "kind": {"type": "update", "move_path": null},
+                    "diff": "@@ -1 +1,2 @@\n-old\n+new\n+still streaming"
+                }]
+            }
+        });
+        emit_codex_events_with_state(&sender, &partial, &mut state).await;
+        emit_codex_events_with_state(&sender, &partial, &mut state).await;
+
+        assert!(matches!(
+            receiver.recv().await,
+            Some(ChatStreamEvent::ToolCallGenerating { id: Some(id) }) if id == "edit-1"
+        ));
+        assert!(
+            receiver.try_recv().is_err(),
+            "partial edit snapshots must not promote the tool"
+        );
+
+        emit_codex_events_with_state(
             &sender,
             &serde_json::json!({
-                "method": "item/fileChange/patchUpdated",
-                "params": {
-                    "threadId": "thread-1",
-                    "turnId": "turn-1",
-                    "itemId": "edit-1",
-                    "changes": [{
-                        "path": "src/main.rs",
-                        "kind": {"type": "update", "move_path": null},
-                        "diff": "@@ -1 +1,2 @@\n-old\n+new\n+still streaming"
-                    }]
-                }
+                "method": "item/started",
+                "params": {"item": {
+                    "id": "edit-1",
+                    "type": "fileChange",
+                    "status": "inProgress",
+                    "changes": [{"path": "src/main.rs", "diff": "complete diff"}]
+                }}
             }),
+            &mut state,
         )
         .await;
 
         assert!(matches!(
             receiver.recv().await,
-            Some(ChatStreamEvent::ToolCallUpdate { id, name, input })
+            Some(ChatStreamEvent::ToolCall { id, name, input })
                 if id == "edit-1"
                     && name == "Edit"
-                    && input["changes"][0]["path"] == "src/main.rs"
-                    && input["changes"][0]["diff"].as_str().is_some_and(|diff| diff.contains("still streaming"))
+                    && input["changes"][0]["diff"] == "complete diff"
         ));
     }
 
@@ -5424,6 +5511,10 @@ mod tests {
         ));
         assert!(matches!(
             receiver.recv().await,
+            Some(ChatStreamEvent::ToolCallGenerating { id: None })
+        ));
+        assert!(matches!(
+            receiver.recv().await,
             Some(ChatStreamEvent::ToolCallGenerating { id: Some(id) }) if id == "command-1"
         ));
         assert!(matches!(
@@ -5441,6 +5532,10 @@ mod tests {
         assert!(matches!(
             receiver.recv().await,
             Some(ChatStreamEvent::Narration { text }) if text == "After the tool."
+        ));
+        assert!(matches!(
+            receiver.recv().await,
+            Some(ChatStreamEvent::ToolCallGenerating { id: None })
         ));
         assert_eq!(text, "Before the tool.After the tool.");
         assert_eq!(final_text.as_deref(), Some("After the tool."));
