@@ -5503,7 +5503,7 @@ fn team_roster_uses_aligned_columns_and_keeps_model_visible_when_narrow() {
             model: "gpt-5.6-sol".to_string(),
             effort: "xhigh".to_string(),
             state: "main thread".to_string(),
-            usage: "88.6k ctx".to_string(),
+            usage: "88.6k".to_string(),
             child_id: None,
         },
         AgentRosterEntry {
@@ -5511,7 +5511,7 @@ fn team_roster_uses_aligned_columns_and_keeps_model_visible_when_narrow() {
             model: "gpt-5.6-luna".to_string(),
             effort: "max".to_string(),
             state: "running".to_string(),
-            usage: "160.8k ctx".to_string(),
+            usage: "160.8k".to_string(),
             child_id: Some(Uuid::new_v4()),
         },
     ];
@@ -5554,7 +5554,7 @@ fn subagent_selector_shows_cumulative_usage_without_a_redundant_unit_suffix() {
             context_tokens: Some(84_600),
             ..Default::default()
         }),
-        "  84.6k ctx"
+        "  —"
     );
     assert_eq!(
         format_subagent_usage(&borg_remote::SubagentUsage::default()),

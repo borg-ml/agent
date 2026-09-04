@@ -9532,18 +9532,12 @@ fn subagent_status_label(status: SubagentStatus) -> &'static str {
 
 fn format_subagent_usage(usage: &borg_remote::SubagentUsage) -> String {
     let displayed_tokens = (usage.total_tokens > 0).then_some(usage.total_tokens);
-    let displayed_context = displayed_tokens
-        .is_none()
-        .then_some(usage.context_tokens)
-        .flatten();
-    if displayed_tokens.is_none() && displayed_context.is_none() && usage.cost_microusd.is_none() {
+    if displayed_tokens.is_none() && usage.cost_microusd.is_none() {
         return "  —".to_string();
     }
     let mut parts = Vec::new();
     if let Some(tokens) = displayed_tokens {
         parts.push(format_compact_token_total(tokens));
-    } else if let Some(tokens) = displayed_context {
-        parts.push(format!("{} ctx", format_compact_token_total(tokens)));
     }
     if let Some(cost_microusd) = usage.cost_microusd {
         let cost = cost_microusd as f64 / 1_000_000.0;
