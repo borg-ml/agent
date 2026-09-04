@@ -957,6 +957,7 @@ mod tests {
             [
                 ("claude-opus-5", "Opus 5"),
                 ("claude-sonnet-5", "Sonnet 5"),
+                ("claude-fable-5-1", "Fable 5.1"),
                 ("claude-fable-5", "Fable 5"),
             ]
         );

@@ -23,7 +23,8 @@ impl ProviderModelCatalog {
     }
 }
 
-pub const CODEX_SELECTABLE_MODELS: [(&str, &str); 3] = [
+pub const CODEX_SELECTABLE_MODELS: [(&str, &str); 4] = [
+    ("gpt-6-astra", "Astra"),
     ("gpt-5.6-sol", "Sol"),
     ("gpt-5.6-terra", "Terra"),
     ("gpt-5.6-luna", "Luna"),
@@ -37,9 +38,10 @@ pub const CODEX_MODEL_CATALOG: ProviderModelCatalog = ProviderModelCatalog {
     effort_levels: &CODEX_EFFORT_LEVELS,
 };
 
-pub const CLAUDE_SELECTABLE_MODELS: [(&str, &str); 3] = [
+pub const CLAUDE_SELECTABLE_MODELS: [(&str, &str); 4] = [
     ("claude-opus-5", "Opus 5"),
     ("claude-sonnet-5", "Sonnet 5"),
+    ("claude-fable-5-1", "Fable 5.1"),
     ("claude-fable-5", "Fable 5"),
 ];
 pub const CLAUDE_EFFORT_LEVELS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];

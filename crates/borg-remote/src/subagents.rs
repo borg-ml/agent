@@ -5040,11 +5040,13 @@ pub fn subagent_tool_specs(provider: CodingProvider) -> Vec<Value> {
                         "type": "string",
                         "description": model_description,
                         "examples": [
+                            "gpt-6-astra",
                             "gpt-5.6-sol",
                             "gpt-5.6-terra",
                             "gpt-5.6-luna",
                             "claude-opus-5",
-                            "claude-sonnet-5"
+                            "claude-sonnet-5",
+                            "claude-fable-5-1"
                         ]
                     },
                     "reasoning_effort": { "type": "string" }
