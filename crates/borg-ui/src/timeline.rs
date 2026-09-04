@@ -12,11 +12,7 @@ use uuid::Uuid;
 pub fn tool_lifecycle_label(name: &str, complete: bool) -> Cow<'_, str> {
     if complete && (name == "Generate" || name.starts_with("Generate ")) {
         let label = name.strip_prefix("Generate ").unwrap_or("command");
-        return Cow::Owned(if label == "image" {
-            "Created image".to_string()
-        } else {
-            format!("Ran {label}")
-        });
+        return Cow::Owned(format!("Stopped generating {label}"));
     }
     if name == "Git add" {
         return Cow::Borrowed(if complete {
@@ -39,7 +35,7 @@ pub fn tool_lifecycle_label(name: &str, complete: bool) -> Cow<'_, str> {
         "Check" => Some(("Checking", "Checked")),
         "Find" => Some(("Finding", "Found")),
         "Go" => Some(("Going", "Went")),
-        "Generate" => Some(("Generating", "Ran")),
+        "Generate" => Some(("Generating", "Stopped generating")),
         "View" => Some(("Viewing", "Viewed")),
         "Create" => Some(("Creating", "Created")),
         "Delete" => Some(("Deleting", "Deleted")),
@@ -228,6 +224,16 @@ impl TimelineProjector {
                         running: true,
                         failed: false,
                     }));
+                }
+            }
+            SessionEventKind::TurnCompleted { .. } => {
+                for index in self
+                    .preparing_tools
+                    .drain()
+                    .map(|(_, index)| index)
+                    .chain(self.unkeyed_preparing_tools.drain(..))
+                {
+                    Arc::make_mut(&mut self.entries[index]).running = false;
                 }
             }
             SessionEventKind::ReasoningCompleted => {
@@ -642,6 +648,10 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].title, "Generate inspect first");
         assert!(!entries[0].running);
+        assert_eq!(
+            tool_lifecycle_label(&entries[0].title, true),
+            "Stopped generating inspect first"
+        );
         assert_eq!(entries[1].title, "Generate inspect second");
         assert!(entries[1].running);
     }

@@ -1918,6 +1918,56 @@ fn action_preparation_can_be_hidden_without_hiding_tool_activity() {
 }
 
 #[test]
+fn turn_end_does_not_claim_an_unexecuted_preparation_ran() {
+    for error in [None, Some("interrupted"), Some("connection lost")] {
+        let session_id = Uuid::new_v4();
+        let events = [
+            SessionEvent::new(
+                session_id,
+                1,
+                SessionEventKind::ProviderEvent {
+                    provider: CodingProvider::Codex,
+                    kind: "action/preparing".into(),
+                    payload: serde_json::json!({"label": "command", "tool_call_id": "pending"}),
+                },
+            ),
+            SessionEvent::new(
+                session_id,
+                2,
+                SessionEventKind::TurnCompleted {
+                    message_id: Uuid::new_v4(),
+                    provider_session_id: None,
+                    final_text: String::new(),
+                    error: error.map(str::to_string),
+                },
+            ),
+        ];
+        let mut transcript = Transcript::default();
+        for event in &events {
+            transcript.apply(event);
+        }
+        let rendered = transcript
+            .lines(100)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            rendered.contains("Stopped generating command"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("Ran command"), "{rendered}");
+        assert!(!transcript.has_running_tool());
+        let entries = borg_ui::timeline::project_timeline(&events);
+        assert!(!entries[0].running);
+        assert_eq!(
+            borg_ui::timeline::tool_lifecycle_label(&entries[0].title, true),
+            "Stopped generating command"
+        );
+    }
+}
+
+#[test]
 fn action_preparation_completes_when_the_start_event_is_missing() {
     let session_id = Uuid::new_v4();
     let mut transcript = Transcript::default();
@@ -2051,7 +2101,11 @@ fn consecutive_unmatched_action_preparations_preserve_audit_rows() {
         .map(|line| line.to_string())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(rendered.contains("inspect first target"), "{rendered}");
+    assert!(
+        rendered.contains("Stopped generating inspect first target"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("Ran inspect first target"), "{rendered}");
     assert!(rendered.contains("inspect second target"), "{rendered}");
     assert!(!rendered.contains("Running in background"), "{rendered}");
     assert!(transcript.has_running_tool());
