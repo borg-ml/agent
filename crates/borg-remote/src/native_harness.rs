@@ -152,7 +152,7 @@ impl NativeHarness {
         match self.harness {
             HarnessMode::Borg => system_prompt.push_str(concat!(
                 "\n\nBorg provides one shell-first execution surface through `exec`. ",
-                "Put the optional `action` argument first in every tool call so the live UI can display it while the remaining arguments stream. ",
+                "Put the required `action` argument first in every tool call so the live UI can display it while the remaining arguments stream. ",
                 "Use shell commands for orchestration and invoke the language or installed runtime that best fits the problem, such as TypeScript/JavaScript for web and JSON work or Python for data and scientific work. ",
                 "This is trusted user-authority execution, not a security sandbox. ",
                 "Use `borg tools` to discover Borg, Blu, plugin, history, workflow, and collaboration capabilities on demand, and `borg call NAME JSON` to invoke one. ",
@@ -160,7 +160,7 @@ impl NativeHarness {
             )),
             HarnessMode::Native => system_prompt.push_str(concat!(
                 "\n\nUse the available Borg capabilities directly. `exec_command` runs trusted user-authority shell commands and can invoke any installed language runtime. ",
-                "Put the optional `action` argument first in every tool call so the live UI can display it while the remaining arguments stream. ",
+                "Put the required `action` argument first in every tool call so the live UI can display it while the remaining arguments stream. ",
                 "Use `query_history` when compacted context is insufficient."
             )),
         }
@@ -1282,7 +1282,7 @@ async fn call_model_streaming(
                         SessionEventKind::ProviderEvent {
                             provider: context.coding_provider,
                             kind: "action/preparing".to_string(),
-                            payload: json!({"label": "", "tool_call_id": id}),
+                            payload: json!({"label": if id.is_some() { "command" } else { "" }, "tool_call_id": id}),
                         },
                     )
                     .await;
@@ -1293,7 +1293,7 @@ async fn call_model_streaming(
                         SessionEventKind::ProviderEvent {
                             provider: context.coding_provider,
                             kind: "action/preparing".to_string(),
-                            payload: json!({"label": "", "tool_call_id": id}),
+                            payload: json!({"label": "command", "tool_call_id": id}),
                         },
                     )
                     .await;
@@ -1440,6 +1440,10 @@ async fn execute_tool(
     let external_mcp = runtime.mcp.contains(&tool_call.function.name);
     let shell_command = match tool_call.function.name.as_str() {
         "exec_command" | "exec" => input.get("cmd").and_then(Value::as_str).map(str::to_string),
+        "monitor" => input
+            .get("command")
+            .and_then(Value::as_str)
+            .map(str::to_string),
         _ => None,
     };
     if (shell_command.is_some()
@@ -1533,12 +1537,12 @@ async fn execute_tool(
 
     let workflow_approved = matches!(
         tool_call.function.name.as_str(),
-        "run_workflow" | "run_blu_workflow" | "run_blu_extension" | "runtime_exec"
+        "run_workflow" | "run_blu_workflow" | "run_blu_extension" | "runtime_exec" | "monitor"
     ) && runtime.permission != PermissionMode::FullAccess;
     let call_cancel = (external_mcp
         || matches!(
             tool_call.function.name.as_str(),
-            "run_workflow" | "run_blu_workflow" | "run_blu_extension" | "runtime_exec"
+            "run_workflow" | "run_blu_workflow" | "run_blu_extension" | "runtime_exec" | "monitor"
         ))
     .then(CancellationToken::new);
     let call = runtime.call(
@@ -2183,10 +2187,18 @@ fn add_action_metadata(definition: &mut ModelToolDefinition) -> Result<()> {
             "type": "string",
             "minLength": 1,
             "maxLength": 64,
-            "description": "Optional one- or two-word summary for the live UI. When present, this must be the first argument field."
+            "description": "Required one- or two-word summary for the live UI. Always emit this as the first argument field."
         }),
     );
     properties.extend(existing);
+    let required = schema
+        .entry("required")
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+        .context("native tool required schema is not an array")?;
+    if !required.iter().any(|field| field == "action") {
+        required.push(json!("action"));
+    }
     Ok(())
 }
 
@@ -2443,14 +2455,14 @@ mod tests {
             Some(SessionEventKind::ProviderEvent { kind, payload, .. })
                 if kind == "action/preparing"
                     && payload["tool_call_id"] == "call-1"
-                    && payload["label"] == ""
+                    && payload["label"] == "command"
         ));
         assert!(matches!(
             events_rx.recv().await,
             Some(SessionEventKind::ProviderEvent { kind, payload, .. })
                 if kind == "action/preparing"
                     && payload["tool_call_id"] == "call-1"
-                    && payload["label"] == ""
+                    && payload["label"] == "command"
         ));
         assert!(matches!(
             events_rx.recv().await,
@@ -2494,7 +2506,7 @@ mod tests {
     }
 
     #[test]
-    fn native_action_metadata_is_first_and_optional() {
+    fn native_action_metadata_is_first_and_required() {
         let mut definition = exec_tool_definition().expect("exec schema is valid");
         add_action_metadata(&mut definition).expect("action metadata is valid");
         let properties = definition.input_schema["properties"].as_object().unwrap();
@@ -2502,7 +2514,7 @@ mod tests {
         assert!(
             definition.input_schema["required"]
                 .as_array()
-                .is_none_or(|required| required.iter().all(|field| field != "action"))
+                .is_some_and(|required| required.iter().any(|field| field == "action"))
         );
     }
 

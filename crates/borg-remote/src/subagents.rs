@@ -188,6 +188,7 @@ struct BluWorkflowToolContext {
 /// their own goal or collaboration semantics.
 #[derive(Clone)]
 pub struct AgentToolDispatcher {
+    monitors: Option<crate::monitor::Monitors>,
     goals: SessionGoalTools,
     todos: SessionTodoTools,
     consultation: Option<SessionConsultationTools>,
@@ -712,6 +713,7 @@ impl AgentToolDispatcher {
                 autonomy,
             });
         Self {
+            monitors: None,
             goals,
             todos,
             consultation,
@@ -738,6 +740,11 @@ impl AgentToolDispatcher {
             harness_lock: Arc::new(Mutex::new(())),
             web_search,
         }
+    }
+
+    pub(crate) fn with_monitors(mut self, monitors: crate::monitor::Monitors) -> Self {
+        self.monitors = Some(monitors);
+        self
     }
 
     pub(crate) fn with_resource_limits(mut self, limits: Option<HostResourceLimits>) -> Self {
@@ -1179,6 +1186,59 @@ impl AgentToolDispatcher {
                 .await;
         }
         match name {
+            "monitor" => {
+                ensure!(
+                    self.runtime_permission == crate::PermissionMode::FullAccess
+                        || workflow_approved,
+                    "monitor requires Full Access or an explicit approval"
+                );
+                let args = serde_json::from_value(arguments)?;
+                let monitors = self
+                    .monitors
+                    .as_ref()
+                    .context("monitors are unavailable for this session")?;
+                let timeout = self
+                    .resource_limits
+                    .as_ref()
+                    .map(|limits| limits.max_workspace_command_timeout_ms)
+                    .unwrap_or(24 * 60 * 60 * 1000);
+                Ok(serde_json::to_value(
+                    monitors
+                        .start(
+                            self.actor_session_id,
+                            &self.runtime_root,
+                            args,
+                            self.session_store(),
+                            timeout,
+                        )
+                        .await?,
+                )?)
+            }
+            "list_monitors" => {
+                let _: NoArgs = serde_json::from_value(arguments)?;
+                Ok(serde_json::to_value(
+                    self.monitors
+                        .as_ref()
+                        .context("monitors are unavailable for this session")?
+                        .list()
+                        .await,
+                )?)
+            }
+            "stop_monitor" => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Args {
+                    monitor_id: Uuid,
+                }
+                let args: Args = serde_json::from_value(arguments)?;
+                Ok(serde_json::to_value(
+                    self.monitors
+                        .as_ref()
+                        .context("monitors are unavailable for this session")?
+                        .stop(args.monitor_id)
+                        .await?,
+                )?)
+            }
             "list_workflows" | "list_blu_workflows" => {
                 let _: NoArgs = serde_json::from_value(arguments)?;
                 let context = self
@@ -5018,6 +5078,10 @@ fn boxed_agent_store_session(
 pub fn subagent_tool_specs(provider: CodingProvider) -> Vec<Value> {
     let description = subagent_tool_description(provider);
     let model_description = subagent_model_override_description();
+    let model_examples = borg_provider::runtime::MODEL_CATALOGS
+        .iter()
+        .flat_map(|catalog| catalog.selectable_models.iter().map(|(model, _)| *model))
+        .collect::<Vec<_>>();
     vec![
         tool(
             "spawn_agent",
@@ -5025,7 +5089,11 @@ pub fn subagent_tool_specs(provider: CodingProvider) -> Vec<Value> {
             json!({
                 "type": "object",
                 "properties": {
-                    "task_name": { "type": "string" },
+                    "task_name": {
+                        "type": "string", "minLength": 1, "maxLength": 64,
+                        "pattern": "^[a-z0-9_]+$",
+                        "description": "Short task name using lowercase letters, digits, and underscores, such as nuclear_art."
+                    },
                     "message": { "type": "string" },
                     "provider": {
                         "type": "string",
@@ -5039,15 +5107,7 @@ pub fn subagent_tool_specs(provider: CodingProvider) -> Vec<Value> {
                     "model": {
                         "type": "string",
                         "description": model_description,
-                        "examples": [
-                            "gpt-6-astra",
-                            "gpt-5.6-sol",
-                            "gpt-5.6-terra",
-                            "gpt-5.6-luna",
-                            "claude-opus-5",
-                            "claude-sonnet-5",
-                            "claude-fable-5-1"
-                        ]
+                        "examples": model_examples
                     },
                     "reasoning_effort": { "type": "string" }
                 },
@@ -5339,6 +5399,32 @@ fn agent_tool_specs_with_capabilities_and_consultation_and_search(
         "additionalProperties": false
     });
     let mut specs = vec![
+        tool(
+            "monitor",
+            "Start a session-scoped background command that watches logs, files, or external status. Each stdout line is delivered to you automatically in bounded batches, including when idle. Use a command that emits only meaningful changes. Do not poll or wait for it. Requires shell approval; runs until stopped, session exit, or 24 hours. Use list_monitors and stop_monitor to manage watches.",
+            json!({
+                "type": "object", "properties": {
+                    "command": {"type": "string", "minLength": 1},
+                    "label": {"type": "string", "minLength": 1, "maxLength": 100},
+                    "workdir": {"type": "string"}
+                }, "required": ["command", "label"], "additionalProperties": false
+            }),
+        ),
+        tool(
+            "list_monitors",
+            "List this session's background monitors and whether they are running.",
+            json!({
+                "type": "object", "properties": {}, "additionalProperties": false
+            }),
+        ),
+        tool(
+            "stop_monitor",
+            "Stop a background monitor and its process tree.",
+            json!({
+                "type": "object", "properties": {"monitor_id": {"type": "string", "format": "uuid"}},
+                "required": ["monitor_id"], "additionalProperties": false
+            }),
+        ),
         tool(
             "list_workflows",
             "List active trusted extension workflows across embedded Blu/Lua/Luau, Python, IPython, JavaScript, and TypeScript runtimes. Sources are never exposed; use extension_id and name with run_workflow.",
@@ -6439,10 +6525,18 @@ fn add_action_metadata(specs: &mut [Value]) {
                 "type": "string",
                 "minLength": 1,
                 "maxLength": 64,
-                "description": "Optional one- or two-word summary for the live UI. When present, this must be the first argument field."
+                "description": "Required one- or two-word summary for the live UI. Always emit this as the first argument field."
             }),
         );
         properties.extend(existing);
+        if let Some(required) = schema
+            .entry("required")
+            .or_insert_with(|| json!([]))
+            .as_array_mut()
+            && !required.iter().any(|field| field == "action")
+        {
+            required.push(json!("action"));
+        }
     }
 }
 

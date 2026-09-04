@@ -31,6 +31,11 @@ const ROOT_INBOX_REFRESH_INTERVAL: Duration = Duration::from_millis(50);
 const USAGE_LIMIT_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(5 * 60);
 #[cfg(test)]
 const USAGE_LIMIT_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(10);
+#[cfg(not(test))]
+const NETWORK_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const NETWORK_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(10);
+const NETWORK_RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
 const USAGE_LIMIT_RETRY_MAX_DELAY: Duration = Duration::from_secs(30 * 60);
 const WORKSPACE_PROJECTION_REPAIR_BATCH_SIZE: usize = 512;
 const RETAINED_COMPACTION_SYSTEM_PROMPT: &str = "This is an internal context-compaction preparation turn. Do not use tools, modify files, or answer the user. Return only a compact continuation summary of the supplied prior provider conversation.";
@@ -1311,8 +1316,10 @@ async fn run_agent_session_store_kernel(
     // all other failures remain durable as failed messages instead of being
     // mistaken for completed input.
     let mut automatic_retry_message_ids = HashSet::new();
-    let mut usage_limit_retry_not_before: Option<Instant> = None;
+    let mut retry_not_before: Option<Instant> = None;
     let mut usage_limit_retry_delay = USAGE_LIMIT_RETRY_INITIAL_DELAY;
+    let mut network_retry_delay = NETWORK_RETRY_INITIAL_DELAY;
+    let mut network_retry_message_id = None;
     let mut at_turn_boundary = !pending.is_empty();
     let mut projection_repair_started = false;
     let mut next_ready_detail = (!fresh).then(|| "Resumed".to_string());
@@ -1391,6 +1398,10 @@ async fn run_agent_session_store_kernel(
     let workflow_snapshot = executor.extension_workflow_snapshot();
     let workflow_processes = crate::native_process::ProcessManager::default();
     let web_search = executor.web_search_provider();
+    let (monitor_events_tx, mut monitor_events_rx) = mpsc::channel(16);
+    let monitors =
+        crate::monitor::Monitors::new(workflow_processes.clone(), monitor_events_tx, session_id);
+    let _monitor_shutdown = SessionAutonomyShutdown(monitors.cancel.clone());
     let dispatcher = crate::AgentToolDispatcher::new_with_search(
         goal_tools.clone(),
         todo_tools.clone(),
@@ -1410,7 +1421,8 @@ async fn run_agent_session_store_kernel(
         launch.permission_mode,
         web_search,
     )
-    .with_resource_limits(launch.capabilities.resource_limits.clone());
+    .with_resource_limits(launch.capabilities.resource_limits.clone())
+    .with_monitors(monitors);
     if let Some(extension_api) = executor.extension_api_snapshot() {
         dispatcher.configure_extension_api(extension_api)?;
     }
@@ -1484,6 +1496,19 @@ async fn run_agent_session_store_kernel(
             )
             .await?;
             if interrupted_at_boundary {
+                if let Some(message_id) = network_retry_message_id.take() {
+                    cancel_connection_retry(
+                        &mut journal,
+                        &events,
+                        session_id,
+                        &mut pending,
+                        message_id,
+                    )
+                    .await?;
+                    retry_not_before = None;
+                    network_retry_delay = NETWORK_RETRY_INITIAL_DELAY;
+                    next_ready_detail = Some("Reconnection cancelled. Your work is saved.".into());
+                }
                 pause_active_goal(
                     &mut journal,
                     &events,
@@ -1504,11 +1529,15 @@ async fn run_agent_session_store_kernel(
             .as_ref()
             .is_some_and(|goal| goal.status == GoalStatus::Active);
         let usage_limit_retry_waiting =
-            usage_limit_retry_not_before.is_some_and(|deadline| deadline > Instant::now());
+            retry_not_before.is_some_and(|deadline| deadline > Instant::now());
         let next = if !usage_limit_retry_waiting
-            && let Some(prompt) = pop_next_pending_prompt(&mut pending, goal_is_active)
-        {
+            && let Some(prompt) = pop_next_pending_prompt(
+                &mut pending,
+                goal_is_active || network_retry_message_id.is_some(),
+            ) {
             Some(prompt)
+        } else if !usage_limit_retry_waiting && let Ok(text) = monitor_events_rx.try_recv() {
+            Some(monitor_prompt(text, &mut monitor_events_rx))
         } else if !usage_limit_retry_waiting
             && let Some(active_goal) = goal
                 .as_ref()
@@ -1531,7 +1560,11 @@ async fn run_agent_session_store_kernel(
                 &events,
                 session_id,
                 SessionEventKind::StatusChanged {
-                    status: SessionStatus::Ready,
+                    status: if network_retry_message_id.is_some() {
+                        SessionStatus::Starting
+                    } else {
+                        SessionStatus::Ready
+                    },
                     detail: next_ready_detail.take(),
                 },
             )
@@ -1544,7 +1577,7 @@ async fn run_agent_session_store_kernel(
             );
             loop {
                 let usage_limit_wait = async {
-                    match usage_limit_retry_not_before {
+                    match retry_not_before {
                         Some(deadline) => {
                             tokio::time::sleep(deadline.saturating_duration_since(Instant::now()))
                                 .await
@@ -1554,10 +1587,10 @@ async fn run_agent_session_store_kernel(
                 };
                 let command = tokio::select! {
                     biased;
-                    _ = usage_limit_wait, if usage_limit_retry_not_before.is_some() => {
-                        usage_limit_retry_not_before = None;
+                    _ = usage_limit_wait, if retry_not_before.is_some() => {
+                        retry_not_before = None;
                         let goal_is_active = goal.as_ref().is_some_and(|goal| goal.status == GoalStatus::Active);
-                        break pop_next_pending_prompt(&mut pending, goal_is_active).or_else(|| {
+                        break pop_next_pending_prompt(&mut pending, goal_is_active || network_retry_message_id.is_some()).or_else(|| {
                             goal.as_ref()
                                 .filter(|goal| goal_allows_automatic_continuation(goal))
                                 .map(|active_goal| QueuedPrompt {
@@ -1574,6 +1607,9 @@ async fn run_agent_session_store_kernel(
                         });
                     }
                     command = next_host_command(&mut deferred_commands, &mut commands) => command,
+                    Some(text) = monitor_events_rx.recv(), if retry_not_before.is_none() => {
+                        break Some(monitor_prompt(text, &mut monitor_events_rx));
+                    }
                     message = root_message_rx.recv(), if owns_team => {
                         match message {
                             Ok(message) => {
@@ -1764,6 +1800,21 @@ async fn run_agent_session_store_kernel(
                             .await?;
                             continue;
                         }
+                        if retry_not_before.is_some_and(|deadline| deadline > Instant::now()) {
+                            queue_pending_prompt(
+                                &mut journal,
+                                &events,
+                                session_id,
+                                &mut pending,
+                                &mut team_message_ids,
+                                message_id,
+                                text,
+                                attachments,
+                                output_schema,
+                            )
+                            .await?;
+                            continue;
+                        }
                         break Some(QueuedPrompt {
                             message_id,
                             text,
@@ -1775,6 +1826,42 @@ async fn run_agent_session_store_kernel(
                             interrupt_batch: actor == EventActor::User,
                             batch: Vec::new(),
                         });
+                    }
+                    Some(HostCommand::Interrupt {
+                        session_id: command_session_id,
+                    }) if command_session_id == session_id
+                        && network_retry_message_id.is_some() =>
+                    {
+                        if let Some(message_id) = network_retry_message_id.take() {
+                            cancel_connection_retry(
+                                &mut journal,
+                                &events,
+                                session_id,
+                                &mut pending,
+                                message_id,
+                            )
+                            .await?;
+                        }
+                        retry_not_before = None;
+                        network_retry_delay = NETWORK_RETRY_INITIAL_DELAY;
+                        pause_active_goal(
+                            &mut journal,
+                            &events,
+                            session_id,
+                            &mut goal,
+                            &mut goal_active_since,
+                        )
+                        .await?;
+                        record(
+                            &mut journal,
+                            &events,
+                            session_id,
+                            SessionEventKind::StatusChanged {
+                                status: SessionStatus::Ready,
+                                detail: Some("Reconnection cancelled. Your work is saved.".into()),
+                            },
+                        )
+                        .await?;
                     }
                     Some(HostCommand::RecallQueuedPrompt { .. }) => {}
                     Some(HostCommand::FlushPendingInput { .. }) => {}
@@ -2683,6 +2770,16 @@ async fn run_agent_session_store_kernel(
                 }
             });
         }
+        let mut prompt_delta = if native_provider {
+            prompt.text.clone()
+        } else {
+            format_subscription_frame(&format_subscription_actor_value(prompt.actor, &prompt.text))
+        };
+        if network_retry_message_id == Some(prompt.message_id) {
+            let recovery = "\n\nThe previous attempt lost its network connection. Continue from the recorded progress above. Do not repeat completed actions. Check the state of any interrupted command before deciding whether to run it again.";
+            provider_prompt.push_str(recovery);
+            prompt_delta.push_str(recovery);
+        }
         let turn = AgentTurn {
             session_id,
             message_id: prompt.message_id,
@@ -2695,14 +2792,7 @@ async fn run_agent_session_store_kernel(
                 .then(|| provider_fork_turn_id.clone())
                 .flatten(),
             cwd: launch.cwd.clone(),
-            prompt_delta: if native_provider {
-                prompt.text.clone()
-            } else {
-                format_subscription_frame(&format_subscription_actor_value(
-                    prompt.actor,
-                    &prompt.text,
-                ))
-            },
+            prompt_delta,
             prompt: provider_prompt,
             attachments: prompt.attachments.clone(),
             output_schema: prompt.output_schema.clone(),
@@ -2777,7 +2867,7 @@ async fn run_agent_session_store_kernel(
                         if matches!(
                             &kind,
                             SessionEventKind::Error { message }
-                                if is_safe_automatic_retry_error(message)
+                                if is_safe_automatic_retry_error(message) || provider_error_is_connection_lost(message)
                         ) {
                             retryable_provider_errors.push(kind);
                             continue;
@@ -2839,8 +2929,16 @@ async fn run_agent_session_store_kernel(
                     .await?;
                         match result {
                         Ok(outcome) => {
+                            if network_retry_message_id.take().is_some() {
+                                record(&mut journal, &events, session_id, SessionEventKind::ProviderEvent {
+                                    provider: launch.provider,
+                                    kind: "network_recovered".into(),
+                                    payload: serde_json::json!({}),
+                                }).await?;
+                            }
+                            network_retry_delay = NETWORK_RETRY_INITIAL_DELAY;
                             usage_limit_retry_delay = USAGE_LIMIT_RETRY_INITIAL_DELAY;
-                            usage_limit_retry_not_before = None;
+                            retry_not_before = None;
                             goal_turn_failures.reset();
                             subscription_context_reusable =
                                 subscription_context_reusable_after_turn(
@@ -2902,7 +3000,8 @@ async fn run_agent_session_store_kernel(
                             let usage_limit_retry = launch.capabilities.auto_resume_usage_limits
                                 && provider_supports_usage_limit_resume(launch.provider)
                                 && provider_error_is_temporary_usage_limited(&error);
-                            let retry = usage_limit_retry || automatic_retry_allowed(
+                            let network_retry = !interrupted && provider_error_is_connection_lost(&error);
+                            let retry = network_retry || usage_limit_retry || automatic_retry_allowed(
                                 &error,
                                 interrupted,
                                 prompt.visible,
@@ -2910,10 +3009,13 @@ async fn run_agent_session_store_kernel(
                                 turn_had_side_effects,
                                 !automatic_retry_message_ids.contains(&prompt.message_id),
                             );
-                            if retry && !usage_limit_retry {
+                            if retry && !usage_limit_retry && !network_retry {
                                 automatic_retry_message_ids.insert(prompt.message_id);
                             }
                             if !retry {
+                                network_retry_message_id = None;
+                                network_retry_delay = NETWORK_RETRY_INITIAL_DELAY;
+                                retry_not_before = None;
                                 for kind in retryable_provider_errors.drain(..) {
                                     record(&mut journal, &events, session_id, kind).await?;
                                 }
@@ -2922,7 +3024,9 @@ async fn run_agent_session_store_kernel(
                                 autonomy_result = Some(Err(anyhow::anyhow!(error.clone())));
                             }
                             let ready_detail = if retry {
-                                if usage_limit_retry {
+                                if network_retry {
+                                    format!("Connection interrupted · retrying in {}s · Esc to cancel. Your work is saved.", network_retry_delay.as_secs())
+                                } else if usage_limit_retry {
                                     "The provider usage limit was reached; Borg preserved this work and will resume it automatically when capacity is available."
                                         .to_string()
                                 } else if provider_isolation_recovery {
@@ -2948,9 +3052,19 @@ async fn run_agent_session_store_kernel(
                             } else {
                                 format!("Turn failed; the session remains available: {error}")
                             };
-                            if usage_limit_retry {
+                            if network_retry {
                                 goal_turn_failures.reset();
-                                usage_limit_retry_not_before =
+                                network_retry_message_id = Some(prompt.message_id);
+                                retry_not_before = Some(Instant::now() + network_retry_delay);
+                                record(&mut journal, &events, session_id, SessionEventKind::ProviderEvent {
+                                    provider: launch.provider,
+                                    kind: "network_retry".into(),
+                                    payload: serde_json::json!({"delay_ms": network_retry_delay.as_millis() as u64}),
+                                }).await?;
+                                network_retry_delay = network_retry_delay.saturating_mul(2).min(NETWORK_RETRY_MAX_DELAY);
+                            } else if usage_limit_retry {
+                                goal_turn_failures.reset();
+                                retry_not_before =
                                     Some(Instant::now() + usage_limit_retry_delay);
                                 usage_limit_retry_delay = usage_limit_retry_delay
                                     .saturating_mul(2)
@@ -3019,7 +3133,9 @@ async fn run_agent_session_store_kernel(
                             }
                             if retry {
                                 let mut retry_prompt = prompt.clone();
-                                retry_prompt.delivery = PromptDelivery::Queue;
+                                retry_prompt.delivery = if network_retry && prompt.actor == EventActor::System {
+                                    PromptDelivery::Steer
+                                } else { PromptDelivery::Queue };
                                 pending.push_front(retry_prompt);
                             }
                             next_ready_detail = Some(ready_detail);
@@ -3059,7 +3175,7 @@ async fn run_agent_session_store_kernel(
                     if matches!(
                         &kind,
                         SessionEventKind::Error { message }
-                            if is_safe_automatic_retry_error(message)
+                            if is_safe_automatic_retry_error(message) || provider_error_is_connection_lost(message)
                     ) {
                         retryable_provider_errors.push(kind);
                         continue;
@@ -4421,6 +4537,25 @@ fn native_conversation(
             }
             SessionEventKind::TurnCompleted {
                 error: Some(error), ..
+            } if provider_error_is_connection_lost(error) => {
+                let partial = if native_structured_in_turn && !pending_native.is_empty() {
+                    &pending_native
+                } else {
+                    &pending_generic
+                };
+                if !partial.is_empty() {
+                    conversation.push(borg_provider::provider::ModelMessage::user(format!(
+                        "The connection was interrupted during this attempt. Recorded progress follows; completed actions must not be repeated, and commands without results need their state checked before rerunning.\n\n{}",
+                        format_subscription_conversation_with_tool_limit(partial, Some(16 * 1024))
+                    )));
+                }
+                pending_generic.clear();
+                pending_native.clear();
+                active_provider = None;
+                native_structured_in_turn = false;
+            }
+            SessionEventKind::TurnCompleted {
+                error: Some(error), ..
             } if !is_interrupted_turn_error(error) => {
                 let unresolved_prompts = pending_generic
                     .drain(..)
@@ -5490,6 +5625,27 @@ fn recall_withdrawable_steers(
     }
     *pending_steers = retained;
     recalled
+}
+
+fn monitor_prompt(mut text: String, receiver: &mut mpsc::Receiver<String>) -> QueuedPrompt {
+    while text.len() < 48 * 1024 {
+        let Ok(next) = receiver.try_recv() else {
+            break;
+        };
+        text.push_str("\n\n");
+        text.push_str(&next);
+    }
+    QueuedPrompt {
+        message_id: Uuid::new_v4(),
+        text,
+        actor: EventActor::System,
+        attachments: Vec::new(),
+        output_schema: None,
+        delivery: PromptDelivery::Steer,
+        visible: true,
+        interrupt_batch: false,
+        batch: Vec::new(),
+    }
 }
 
 fn pop_next_pending_prompt(
@@ -6809,6 +6965,81 @@ async fn usage_limit_active_goal(
         .await?;
     }
     Ok(())
+}
+
+async fn cancel_connection_retry(
+    journal: &mut RuntimeSessionStore,
+    events: &mpsc::Sender<SessionEvent>,
+    session_id: Uuid,
+    pending: &mut VecDeque<QueuedPrompt>,
+    message_id: Uuid,
+) -> Result<()> {
+    if let Some(index) = pending
+        .iter()
+        .position(|prompt| prompt.message_id == message_id)
+        && let Some(prompt) = pending.remove(index)
+        && prompt.visible
+    {
+        record_prompt_status(
+            journal,
+            events,
+            session_id,
+            &prompt,
+            MessageStatus::Failed,
+            prompt.delivery,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+fn provider_error_is_connection_lost(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    if [
+        "unauthorized",
+        "invalid api key",
+        "authentication",
+        "permission denied",
+        "billing",
+        "quota",
+    ]
+    .iter()
+    .any(|pattern| error.contains(pattern))
+    {
+        return false;
+    }
+    [
+        "connection timed out",
+        "request timed out",
+        "stream ended before",
+        "stream ended without a finish_reason",
+        "network is unreachable",
+        "network unreachable",
+        "network is down",
+        "no internet",
+        "internet connection",
+        "connection reset",
+        "connection refused",
+        "connection closed",
+        "connection lost",
+        "connection error",
+        "connectionerror",
+        "error connecting",
+        "dns error",
+        "dns resolution",
+        "failed to lookup address",
+        "name or service not known",
+        "temporary failure in name resolution",
+        "error sending request for url",
+        "stream disconnected",
+        "stream closed unexpectedly",
+        "websocket connection",
+        "network error",
+        "networkerror",
+        "fetch failed",
+    ]
+    .iter()
+    .any(|pattern| error.contains(pattern))
 }
 
 fn provider_error_is_usage_limited(error: &str) -> bool {

@@ -9609,3 +9609,348 @@ async fn parent_journal_preserves_full_child_transcript_events() {
     .unwrap();
     assert!(event_rx.try_recv().is_err());
 }
+
+struct NetworkThenSuccessExecutor {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl AgentTurnExecutor for NetworkThenSuccessExecutor {
+    async fn execute(
+        &self,
+        turn: AgentTurn,
+        events: mpsc::Sender<SessionEventKind>,
+        _controls: Option<mpsc::Receiver<AgentTurnControl>>,
+    ) -> Result<AgentTurnResult> {
+        let attempt = self.calls.fetch_add(1, Ordering::AcqRel);
+        if attempt == 0 {
+            events
+                .send(SessionEventKind::ToolStarted {
+                    tool_call_id: "completed-work".into(),
+                    name: "exec_command".into(),
+                    input: serde_json::json!({"cmd": "git status"}),
+                    input_ref: None,
+                })
+                .await
+                .unwrap();
+            events
+                .send(SessionEventKind::ToolCompleted {
+                    tool_call_id: "completed-work".into(),
+                    output: "clean".into(),
+                    output_ref: None,
+                    is_error: false,
+                    input: None,
+                    input_ref: None,
+                })
+                .await
+                .unwrap();
+        } else {
+            assert!(turn.prompt.contains("Do not repeat completed actions"));
+            assert!(turn.prompt.contains("completed-work") || turn.prompt.contains("git status"));
+        }
+        if attempt < 3 {
+            anyhow::bail!("error sending request for url: network is unreachable");
+        }
+        Ok(AgentTurnResult {
+            provider_session_id: Some("reconnected".into()),
+            final_text: "done".into(),
+        })
+    }
+}
+
+#[test]
+fn connection_retry_does_not_retry_authentication_or_command_failures() {
+    for error in [
+        "authentication failed: connection error",
+        "invalid API key",
+        "permission denied",
+        "shell command timed out",
+        "tool execution failed",
+    ] {
+        assert!(!provider_error_is_connection_lost(error), "{error}");
+    }
+    for error in [
+        "network is unreachable",
+        "error sending request for url",
+        "stream disconnected before completion",
+        "ConnectionError: connection closed",
+    ] {
+        assert!(provider_error_is_connection_lost(error), "{error}");
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn connection_outage_retries_repeatedly_and_preserves_the_durable_prompt() {
+    let root = tempdir().unwrap();
+    let session_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    let (command_tx, command_rx) = mpsc::channel(8);
+    let (event_tx, mut event_rx) = mpsc::channel(128);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let executor = Arc::new(NetworkThenSuccessExecutor {
+        calls: Arc::clone(&calls),
+    });
+    let actor = tokio::spawn({
+        let journal_path = root.path().join("session.lock");
+        let cwd = root.path().to_path_buf();
+        async move {
+            run_agent_session_with_executor(
+                &journal_path,
+                session_id,
+                LaunchSession {
+                    request_id: message_id,
+                    cwd,
+                    provider: CodingProvider::Codex,
+                    model: None,
+                    effort: None,
+                    fast: Some(false),
+                    response_language: crate::ResponseLanguage::Auto,
+                    permission_mode: PermissionMode::Manual,
+                    name: None,
+                    initial_prompt: Some("finish this task".to_string()),
+                    capabilities: Default::default(),
+                    subagent_concurrency_limit: None,
+                    extension_skill_roots: Vec::new(),
+                    team_policy: None,
+                },
+                command_rx,
+                event_tx,
+                executor,
+            )
+            .await
+        }
+    });
+
+    let mut completions = 0;
+    while completions < 4 {
+        let event = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+            .await
+            .expect("network retry completes")
+            .expect("session remains attached");
+        if matches!(
+            event.kind,
+            SessionEventKind::TurnCompleted {
+                message_id: completed_message_id,
+                ..
+            } if completed_message_id == message_id
+        ) {
+            completions += 1;
+        }
+    }
+
+    command_tx
+        .send(HostCommand::Stop { session_id })
+        .await
+        .unwrap();
+    actor.await.unwrap().unwrap();
+    assert_eq!(calls.load(Ordering::Acquire), 4);
+
+    let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .action(session_id, message_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        crate::SessionActionState::Completed
+    );
+}
+
+struct MonitorWakeExecutor {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl AgentTurnExecutor for MonitorWakeExecutor {
+    async fn execute(
+        &self,
+        turn: AgentTurn,
+        _events: mpsc::Sender<SessionEventKind>,
+        _controls: Option<mpsc::Receiver<AgentTurnControl>>,
+    ) -> Result<AgentTurnResult> {
+        if self.calls.fetch_add(1, Ordering::AcqRel) == 0 {
+            turn.agent_tools
+                .call(
+                    "monitor",
+                    serde_json::json!({
+                        "command": "printf 'deployment ready\\n'", "label": "Deployment"
+                    }),
+                )
+                .await?;
+        } else {
+            assert!(
+                turn.prompt.contains("Monitor event: Deployment"),
+                "{}",
+                turn.prompt
+            );
+            assert!(turn.prompt.contains("deployment ready"), "{}", turn.prompt);
+        }
+        Ok(AgentTurnResult {
+            provider_session_id: Some("monitored".into()),
+            final_text: "watching".into(),
+        })
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn monitor_event_wakes_an_idle_session_without_an_active_goal() {
+    let root = tempdir().unwrap();
+    let session_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    let (command_tx, command_rx) = mpsc::channel(8);
+    let (event_tx, mut event_rx) = mpsc::channel(128);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let executor = Arc::new(MonitorWakeExecutor {
+        calls: Arc::clone(&calls),
+    });
+    let actor = tokio::spawn({
+        let journal_path = root.path().join("session.lock");
+        let cwd = root.path().to_path_buf();
+        async move {
+            run_agent_session_with_executor(
+                &journal_path,
+                session_id,
+                LaunchSession {
+                    request_id: message_id,
+                    cwd,
+                    provider: CodingProvider::Codex,
+                    model: None,
+                    effort: None,
+                    fast: Some(false),
+                    response_language: crate::ResponseLanguage::Auto,
+                    permission_mode: PermissionMode::FullAccess,
+                    name: None,
+                    initial_prompt: Some("finish this task".to_string()),
+                    capabilities: Default::default(),
+                    subagent_concurrency_limit: None,
+                    extension_skill_roots: Vec::new(),
+                    team_policy: None,
+                },
+                command_rx,
+                event_tx,
+                executor,
+            )
+            .await
+        }
+    });
+
+    let mut completions = 0;
+    while completions < 2 {
+        let event = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+            .await
+            .expect("monitor notification wakes idle agent")
+            .expect("session remains attached");
+        if matches!(
+            event.kind,
+            SessionEventKind::TurnCompleted { message_id: _, .. }
+        ) {
+            completions += 1;
+        }
+    }
+
+    command_tx
+        .send(HostCommand::Stop { session_id })
+        .await
+        .unwrap();
+    actor.await.unwrap().unwrap();
+    assert_eq!(calls.load(Ordering::Acquire), 2);
+
+    let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .action(session_id, message_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        crate::SessionActionState::Completed
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn escape_cancels_connection_retry_without_losing_the_prompt() {
+    let root = tempdir().unwrap();
+    let session_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    let (command_tx, command_rx) = mpsc::channel(8);
+    let (event_tx, mut event_rx) = mpsc::channel(128);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let executor = Arc::new(NetworkThenSuccessExecutor {
+        calls: Arc::clone(&calls),
+    });
+    let actor = tokio::spawn({
+        let journal_path = root.path().join("session.lock");
+        let cwd = root.path().to_path_buf();
+        async move {
+            run_agent_session_with_executor(
+                &journal_path,
+                session_id,
+                LaunchSession {
+                    request_id: message_id,
+                    cwd,
+                    provider: CodingProvider::Codex,
+                    model: None,
+                    effort: None,
+                    fast: Some(false),
+                    response_language: crate::ResponseLanguage::Auto,
+                    permission_mode: PermissionMode::Manual,
+                    name: None,
+                    initial_prompt: Some("finish this task".to_string()),
+                    capabilities: Default::default(),
+                    subagent_concurrency_limit: None,
+                    extension_skill_roots: Vec::new(),
+                    team_policy: None,
+                },
+                command_rx,
+                event_tx,
+                executor,
+            )
+            .await
+        }
+    });
+
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        match event.kind {
+            SessionEventKind::ProviderEvent { kind, .. } if kind == "network_retry" => {
+                command_tx
+                    .send(HostCommand::Interrupt { session_id })
+                    .await
+                    .unwrap();
+            }
+            SessionEventKind::StatusChanged {
+                status: SessionStatus::Ready,
+                detail: Some(detail),
+            } if detail.contains("Reconnection cancelled") => break,
+            _ => {}
+        }
+    }
+
+    command_tx
+        .send(HostCommand::Stop { session_id })
+        .await
+        .unwrap();
+    actor.await.unwrap().unwrap();
+    assert_eq!(calls.load(Ordering::Acquire), 1);
+
+    let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .action(session_id, message_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        crate::SessionActionState::Failed
+    );
+}

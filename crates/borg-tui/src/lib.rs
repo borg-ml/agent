@@ -45,7 +45,8 @@ use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{
     DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
     EnableFocusChange, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
-    MouseButton, MouseEvent, MouseEventKind,
+    KeyboardEnhancementFlags, MouseButton, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -446,17 +447,42 @@ enum ComposerNavigation {
     WordRight,
     LineStart,
     LineEnd,
+    LineUp,
+    LineDown,
+    DocumentStart,
+    DocumentEnd,
 }
 
 fn composer_navigation(key: &KeyEvent) -> Option<(ComposerNavigation, bool)> {
-    let navigation_modifiers =
-        key.modifiers & (KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER);
-    let navigation = match (key.code, navigation_modifiers) {
-        (KeyCode::Left, KeyModifiers::SUPER) => ComposerNavigation::LineStart,
-        (KeyCode::Right, KeyModifiers::SUPER) => ComposerNavigation::LineEnd,
-        (KeyCode::Left, KeyModifiers::ALT | KeyModifiers::CONTROL) => ComposerNavigation::WordLeft,
-        (KeyCode::Right, KeyModifiers::ALT | KeyModifiers::CONTROL) => {
+    let modifiers = key.modifiers;
+    let command = modifiers.intersects(KeyModifiers::SUPER | KeyModifiers::META);
+    let word = modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL);
+    let navigation = match key.code {
+        KeyCode::Left if command => ComposerNavigation::LineStart,
+        KeyCode::Right if command => ComposerNavigation::LineEnd,
+        KeyCode::Up if command => ComposerNavigation::DocumentStart,
+        KeyCode::Down if command => ComposerNavigation::DocumentEnd,
+        KeyCode::Left if word => ComposerNavigation::WordLeft,
+        KeyCode::Right if word => ComposerNavigation::WordRight,
+        KeyCode::Up if word => ComposerNavigation::LineUp,
+        KeyCode::Down if word => ComposerNavigation::LineDown,
+        KeyCode::Home if modifiers.contains(KeyModifiers::CONTROL) => {
+            ComposerNavigation::DocumentStart
+        }
+        KeyCode::End if modifiers.contains(KeyModifiers::CONTROL) => {
+            ComposerNavigation::DocumentEnd
+        }
+        KeyCode::Home => ComposerNavigation::LineStart,
+        KeyCode::End => ComposerNavigation::LineEnd,
+        KeyCode::Char('b') if modifiers.contains(KeyModifiers::ALT) => ComposerNavigation::WordLeft,
+        KeyCode::Char('f') if modifiers.contains(KeyModifiers::ALT) => {
             ComposerNavigation::WordRight
+        }
+        KeyCode::Char('a') if modifiers.contains(KeyModifiers::CONTROL) => {
+            ComposerNavigation::LineStart
+        }
+        KeyCode::Char('e') if modifiers.contains(KeyModifiers::CONTROL) => {
+            ComposerNavigation::LineEnd
         }
         _ => return None,
     };
@@ -899,6 +925,7 @@ pub struct BorgTerminal {
     terminal: Terminal<CrosstermBackend<Stdout>>,
     input: TerminalInput,
     mode: ScreenMode,
+    keyboard_enhanced: bool,
     transcript: Transcript,
     director_transcript: Option<Box<Transcript>>,
     child_transcripts: HashMap<Uuid, Transcript>,
@@ -933,6 +960,7 @@ pub struct BorgTerminal {
     git_status_cache: GitStatusCache,
     status: SessionStatus,
     interrupt_requested: bool,
+    connection_retry_at: Option<DateTime<Utc>>,
     steer_active_turn: bool,
     /// Highest durable root sequence incorporated into this projection.
     /// Asynchronous history/state hydration may finish after live events, so
@@ -1915,7 +1943,7 @@ impl BorgTerminal {
             return Err(error.into());
         }
         let backend = CrosstermBackend::new(stdout);
-        let terminal = match Terminal::with_options(
+        let mut terminal = match Terminal::with_options(
             backend,
             TerminalOptions {
                 viewport: match mode {
@@ -1937,10 +1965,16 @@ impl BorgTerminal {
                 return Err(error).context("failed to initialize terminal renderer");
             }
         };
+        let keyboard_enhanced = execute!(
+            terminal.backend_mut(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )
+        .is_ok();
         Ok(Self {
             terminal,
             input: TerminalInput::spawn(),
             mode,
+            keyboard_enhanced,
             transcript: Transcript::default(),
             director_transcript: None,
             child_transcripts: HashMap::new(),
@@ -1972,6 +2006,7 @@ impl BorgTerminal {
             git_status_cache: GitStatusCache::default(),
             status: SessionStatus::Starting,
             interrupt_requested: false,
+            connection_retry_at: None,
             steer_active_turn: false,
             session_state_sequence: 0,
             pending_approval: false,
@@ -2570,6 +2605,34 @@ impl BorgTerminal {
     }
 
     pub fn apply_session_event(&mut self, event: &SessionEvent) -> bool {
+        if !self.replaying_history {
+            match &event.kind {
+                SessionEventKind::ProviderEvent { kind, payload, .. }
+                    if kind == "network_retry" =>
+                {
+                    let delay = payload
+                        .get("delay_ms")
+                        .and_then(serde_json::Value::as_i64)
+                        .unwrap_or(0);
+                    self.connection_retry_at =
+                        Some(event.created_at + chrono::Duration::milliseconds(delay));
+                    self.set_notice("Connection interrupted · work saved · reconnecting automatically · Esc to cancel");
+                }
+                SessionEventKind::ProviderEvent { kind, .. } if kind == "network_recovered" => {
+                    self.connection_retry_at = None;
+                    self.set_notice("Connection restored · work resumed");
+                }
+                SessionEventKind::StatusChanged {
+                    status: SessionStatus::Ready | SessionStatus::Stopped | SessionStatus::Failed,
+                    ..
+                } => {
+                    if self.connection_retry_at.take().is_some() {
+                        self.notice = None;
+                    }
+                }
+                _ => {}
+            }
+        }
         if !self.replaying_history && matches!(event.kind, SessionEventKind::TurnCompleted { .. }) {
             let notification =
                 completion_alert_enabled(self.completion_notifications, self.window_focused);
@@ -2619,6 +2682,8 @@ impl BorgTerminal {
                 is_context_compaction(kind)
                     || is_live_tool_call_event(kind)
                     || kind == "action/preparing"
+                    || kind == "network_retry"
+                    || kind == "network_recovered"
             }
             _ => true,
         };
@@ -5524,8 +5589,21 @@ impl BorgTerminal {
         let pending_provider_interaction_secret =
             self.focused_child.is_none() && self.pending_provider_interaction_secret;
         let status = self.active_status();
+        let reconnect_label = self
+            .connection_retry_at
+            .filter(|_| self.focused_child.is_none())
+            .map(|deadline| {
+                let seconds = (deadline - Utc::now()).num_seconds().max(0);
+                if seconds > 0 {
+                    format!("retry in {seconds}s")
+                } else {
+                    "reconnecting".to_string()
+                }
+            });
         let status_label = if self.interrupt_requested && status_control_is_actionable(status) {
             "stopping"
+        } else if let Some(label) = reconnect_label.as_deref() {
+            label
         } else if self.borging_this_run
             && matches!(status, SessionStatus::Starting | SessionStatus::Running)
         {
@@ -7399,6 +7477,27 @@ impl BorgTerminal {
             ComposerNavigation::WordRight => self.composer.move_word_right(),
             ComposerNavigation::LineStart => self.composer.move_line_start(),
             ComposerNavigation::LineEnd => self.composer.move_line_end(),
+            ComposerNavigation::DocumentStart => {
+                self.composer.cursor = 0;
+                self.composer.preferred_column = None;
+            }
+            ComposerNavigation::DocumentEnd => {
+                self.composer.cursor = self.composer.text.len();
+                self.composer.preferred_column = None;
+            }
+            ComposerNavigation::LineUp | ComposerNavigation::LineDown => {
+                let width = self
+                    .composer_area
+                    .map_or(80, |area| area.width.saturating_sub(2).max(1) as usize);
+                self.composer.move_vertical(
+                    if navigation == ComposerNavigation::LineUp {
+                        -1
+                    } else {
+                        1
+                    },
+                    width,
+                );
+            }
         }
         self.composer_selection = selecting.then_some(ComposerSelection {
             anchor,
@@ -7872,6 +7971,7 @@ impl BorgTerminal {
         }
         if self.keymap.matches(KeyAction::Interrupt, &key) {
             if status_control_is_actionable(self.active_status())
+                && self.connection_retry_at.is_none()
                 && self.has_pending_input_for_escape()
             {
                 return Ok(self.flush_pending_input());
@@ -8095,6 +8195,10 @@ impl BorgTerminal {
         let _ = execute!(self.terminal.backend_mut(), DisableMouseCapture);
         let _ = execute!(self.terminal.backend_mut(), DisableFocusChange);
         let _ = execute!(self.terminal.backend_mut(), DisableBracketedPaste);
+        if self.keyboard_enhanced {
+            let _ = execute!(self.terminal.backend_mut(), PopKeyboardEnhancementFlags);
+            self.keyboard_enhanced = false;
+        }
         if self.mode == ScreenMode::Alternate {
             let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
         }

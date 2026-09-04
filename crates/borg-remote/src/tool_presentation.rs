@@ -1028,10 +1028,20 @@ fn summarize_tool_result(
         }
     }
     if is_error {
-        return trimmed
+        let cause = trimmed
+            .split_once("\nCaused by:")
+            .map_or(trimmed, |(_, cause)| cause.trim());
+        return cause
             .lines()
             .find(|line| !line.trim().is_empty())
-            .map(|line| compact_text(line, 100));
+            .map(|line| {
+                compact_text(
+                    line.trim()
+                        .strip_prefix("Mcp error: -32000: ")
+                        .unwrap_or(line.trim()),
+                    120,
+                )
+            });
     }
     if git_call(name, input).is_some() {
         return concise_git_result(trimmed);

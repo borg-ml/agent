@@ -2615,7 +2615,7 @@ fn update_plan_accepts_legacy_aliases_but_advertises_the_canonical_contract() {
         .find(|tool| tool["name"] == "update_plan")
         .expect("update_plan tool spec");
     let schema = &update_plan["inputSchema"];
-    assert_eq!(schema["required"], json!(["plan"]));
+    assert_eq!(schema["required"], json!(["plan", "action"]));
     assert_eq!(
         schema["properties"]["plan"]["maxItems"],
         crate::session::MAX_PLAN_ITEMS
@@ -2840,6 +2840,17 @@ fn every_parent_model_can_see_codex_luna_as_a_subagent_option() {
             .into_iter()
             .find(|tool| tool["name"] == "spawn_agent")
             .expect("spawn_agent tool");
+        let examples = spawn["inputSchema"]["properties"]["model"]["examples"]
+            .as_array()
+            .unwrap();
+        for catalog in borg_provider::runtime::MODEL_CATALOGS {
+            for (model, _) in catalog.selectable_models {
+                assert!(
+                    examples.contains(&json!(model)),
+                    "{parent:?} omitted {model}"
+                );
+            }
+        }
         assert!(
             spawn["description"]
                 .as_str()

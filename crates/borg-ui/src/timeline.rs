@@ -10,6 +10,14 @@ use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 pub fn tool_lifecycle_label(name: &str, complete: bool) -> Cow<'_, str> {
+    if complete && (name == "Generate" || name.starts_with("Generate ")) {
+        let label = name.strip_prefix("Generate ").unwrap_or("command");
+        return Cow::Owned(if label == "image" {
+            "Created image".to_string()
+        } else {
+            format!("Ran {label}")
+        });
+    }
     if name == "Git add" {
         return Cow::Borrowed(if complete {
             "Updated Git index"
@@ -31,7 +39,7 @@ pub fn tool_lifecycle_label(name: &str, complete: bool) -> Cow<'_, str> {
         "Check" => Some(("Checking", "Checked")),
         "Find" => Some(("Finding", "Found")),
         "Go" => Some(("Going", "Went")),
-        "Generate" => Some(("Generating", "Generated")),
+        "Generate" => Some(("Generating", "Ran")),
         "View" => Some(("Viewing", "Viewed")),
         "Create" => Some(("Creating", "Created")),
         "Delete" => Some(("Deleting", "Deleted")),
@@ -400,7 +408,13 @@ impl TimelineProjector {
                     && let Some(index) = self.take_preparing_tool(tool_call_id)
                 {
                     let entry = Arc::make_mut(&mut self.entries[index]);
-                    let label = entry.detail.take().unwrap_or_else(|| "action".into());
+                    let label = entry.detail.take().unwrap_or_else(|| {
+                        entry
+                            .title
+                            .strip_prefix("Generate ")
+                            .unwrap_or("command")
+                            .to_string()
+                    });
                     entry.title = format!("Run {label}");
                     entry.running = false;
                     entry.failed = *is_error;

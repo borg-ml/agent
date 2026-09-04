@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -515,6 +515,7 @@ pub struct SessionState {
     pub effective_capabilities: Option<crate::EffectiveCapabilities>,
     pub status: Option<SessionStatus>,
     pub status_detail: Option<String>,
+    pub active_processes: BTreeSet<Uuid>,
     pub provider_session_id: Option<String>,
     /// Instruction contract of the last acknowledged native provider thread.
     /// Missing means the checkpoint predates explicit compatibility tracking.
@@ -575,6 +576,12 @@ impl SessionState {
         self.activity_at = Some(event.created_at);
         match &event.kind {
             SessionEventKind::SessionStarted => self.started_at = Some(event.created_at),
+            SessionEventKind::RuntimeProcessStarted { process_id, .. } => {
+                self.active_processes.insert(*process_id);
+            }
+            SessionEventKind::RuntimeProcessCompleted { process_id, .. } => {
+                self.active_processes.remove(process_id);
+            }
             SessionEventKind::SessionConfigured {
                 cwd,
                 provider,

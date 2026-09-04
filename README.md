@@ -46,7 +46,8 @@ borg extensions list
 Interactive sessions run in a detached per-session host. Closing one TUI or
 GUI view does not stop an active turn, its provider app server, or subagents;
 another view can attach to the same durable session. An unattended host exits
-after five minutes only when the session is ready and has no pending prompt.
+after five minutes only when the session is ready, has no pending prompt, and
+has no running background processes.
 See [`docs/session-lifecycle.md`](docs/session-lifecycle.md).
 
 The default native-provider harness exposes one shell-first `exec` surface.
@@ -55,6 +56,25 @@ to the problem; session-scoped Borg, Blu, plugin, workflow, and collaboration
 capabilities are discovered from that shell with `borg tools` and invoked with
 `borg call NAME JSON`. Set `capabilities.harness = "native"` only when the
 direct one-tool-per-capability fallback is preferred.
+
+Ask Borg to monitor a log or deployment, for example: “Watch the build log and
+let me know when it fails.” The `monitor` tool runs a background shell command
+and delivers stdout lines automatically, in bounded batches. `list_monitors`
+and `stop_monitor` manage the watches. Monitors last for the current session,
+up to 24 hours (or the host's command limit), and stop with their process trees
+when the session ends. A monitor can wake an idle agent; human messages take
+priority, and arriving events are handled at the next turn boundary.
+
+If the provider connection drops, Borg saves the interrupted work and retries
+automatically with delays capped at 30 seconds. The terminal shows the retry
+countdown; Escape cancels recovery. Completed tool work is included in recovery
+context so the agent can check interrupted commands before continuing.
+
+On macOS, Option/Ctrl+Left/Right move by word, Cmd+Left/Right go to line
+boundaries, and Cmd+Up/Down go to the start/end of the composer. Shift extends
+the selection. Legacy terminal word and line shortcuts are supported too.
+Full-screen action inspection wraps long commands so their final arguments
+remain visible alongside the output.
 
 ## What it provides
 

@@ -686,10 +686,10 @@ mod tests {
                 tool["name"]
             );
             assert!(
-                !tool["inputSchema"]["required"]
+                tool["inputSchema"]["required"]
                     .as_array()
                     .is_some_and(|required| required.iter().any(|field| field == "action")),
-                "{} must keep action optional",
+                "{} must require action",
                 tool["name"]
             );
         }

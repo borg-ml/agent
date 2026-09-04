@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{ChildStdin, Command};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, broadcast};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -34,6 +34,7 @@ pub(crate) struct ProcessManager {
 struct ProcessManagerInner {
     processes: Mutex<HashMap<Uuid, Arc<ProcessEntry>>>,
     recovered_sessions: Mutex<HashSet<Uuid>>,
+    updates: broadcast::Sender<(Uuid, Option<Vec<u8>>)>,
 }
 
 #[derive(Debug)]
@@ -48,6 +49,7 @@ struct ProcessEntry {
     status: Mutex<ProcessStatus>,
     changed: Notify,
     finished: Notify,
+    updates: broadcast::Sender<(Uuid, Option<Vec<u8>>)>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -96,12 +98,17 @@ impl Default for ProcessManager {
             inner: Arc::new(ProcessManagerInner {
                 processes: Mutex::new(HashMap::new()),
                 recovered_sessions: Mutex::new(HashSet::new()),
+                updates: broadcast::channel(256).0,
             }),
         }
     }
 }
 
 impl ProcessManager {
+    pub(crate) fn subscribe_output(&self) -> broadcast::Receiver<(Uuid, Option<Vec<u8>>)> {
+        self.inner.updates.subscribe()
+    }
+
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn exec(
@@ -260,6 +267,7 @@ impl ProcessManager {
             }),
             changed: Notify::new(),
             finished: Notify::new(),
+            updates: self.inner.updates.clone(),
         });
         self.inner
             .processes
@@ -828,6 +836,11 @@ async fn read_pipe<R>(
         match reader.read(&mut buffer).await {
             Ok(0) => break,
             Ok(read) => {
+                if matches!(stream, OutputStream::Stdout) {
+                    let _ = entry
+                        .updates
+                        .send((entry.process_id, Some(buffer[..read].to_vec())));
+                }
                 let journal_chunk = {
                     let mut output = entry
                         .output
@@ -964,6 +977,7 @@ async fn supervise_process(
         .await;
     }
     entry.changed.notify_waiters();
+    let _ = entry.updates.send((entry.process_id, None));
     entry.finished.notify_waiters();
 }
 

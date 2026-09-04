@@ -840,6 +840,84 @@ fn macos_style_navigation_maps_command_and_option_arrows() {
     for (modifiers, code, expected, selecting) in [
         (
             KeyModifiers::ALT,
+            KeyCode::Char('b'),
+            ComposerNavigation::WordLeft,
+            false,
+        ),
+        (
+            KeyModifiers::ALT,
+            KeyCode::Char('f'),
+            ComposerNavigation::WordRight,
+            false,
+        ),
+        (
+            KeyModifiers::CONTROL,
+            KeyCode::Char('a'),
+            ComposerNavigation::LineStart,
+            false,
+        ),
+        (
+            KeyModifiers::CONTROL,
+            KeyCode::Char('e'),
+            ComposerNavigation::LineEnd,
+            false,
+        ),
+        (
+            KeyModifiers::CONTROL,
+            KeyCode::Left,
+            ComposerNavigation::WordLeft,
+            false,
+        ),
+        (
+            KeyModifiers::ALT | KeyModifiers::CONTROL,
+            KeyCode::Right,
+            ComposerNavigation::WordRight,
+            false,
+        ),
+        (
+            KeyModifiers::META,
+            KeyCode::Left,
+            ComposerNavigation::LineStart,
+            false,
+        ),
+        (
+            KeyModifiers::SUPER,
+            KeyCode::Up,
+            ComposerNavigation::DocumentStart,
+            false,
+        ),
+        (
+            KeyModifiers::SUPER | KeyModifiers::SHIFT,
+            KeyCode::Down,
+            ComposerNavigation::DocumentEnd,
+            true,
+        ),
+        (
+            KeyModifiers::CONTROL,
+            KeyCode::Up,
+            ComposerNavigation::LineUp,
+            false,
+        ),
+        (
+            KeyModifiers::ALT,
+            KeyCode::Down,
+            ComposerNavigation::LineDown,
+            false,
+        ),
+        (
+            KeyModifiers::NONE,
+            KeyCode::Home,
+            ComposerNavigation::LineStart,
+            false,
+        ),
+        (
+            KeyModifiers::NONE,
+            KeyCode::End,
+            ComposerNavigation::LineEnd,
+            false,
+        ),
+        (
+            KeyModifiers::ALT,
             KeyCode::Left,
             ComposerNavigation::WordLeft,
             false,
@@ -1872,7 +1950,7 @@ fn action_preparation_completes_when_the_start_event_is_missing() {
         .collect::<Vec<_>>()
         .join("\n");
     assert_eq!(transcript.order.len(), 1);
-    assert!(completed.contains("Generated command"), "{completed}");
+    assert!(completed.contains("Ran command"), "{completed}");
     assert!(!completed.contains("Generating command"), "{completed}");
     assert!(!transcript.has_running_tool());
 }
@@ -9243,7 +9321,10 @@ fn focused_tool_inspector_isolates_one_tool_and_forces_its_live_body_open() {
         .collect::<Vec<_>>()
         .join("\n");
 
-    assert!(rendered.contains("Tool output · Edit · live"), "{rendered}");
+    assert!(
+        rendered.contains("Action details · Edit · live"),
+        "{rendered}"
+    );
     assert!(rendered.contains("Editing…"), "{rendered}");
     assert!(rendered.contains("enabled = true"), "{rendered}");
     assert!(!rendered.contains("conversation context"), "{rendered}");
@@ -11269,4 +11350,54 @@ fn provider_background_handle_drives_shell_status_and_full_output() {
         .join("\n");
     assert!(fullscreen.contains("first line"), "{fullscreen}");
     assert!(fullscreen.contains("last line"), "{fullscreen}");
+}
+
+#[test]
+fn fullscreen_command_preserves_long_lines_and_completion_input() {
+    let session_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    let command = format!(
+        "printf '%s' {} FINAL_ARGUMENT\nprintf done",
+        "x".repeat(200)
+    );
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::ToolStarted {
+            tool_call_id: "command".into(),
+            name: "exec_command".into(),
+            input: serde_json::json!({}),
+            input_ref: None,
+        },
+    ));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::ToolCompleted {
+            tool_call_id: "command".into(),
+            input: Some(serde_json::json!({"cmd": command})),
+            input_ref: None,
+            output: "command output".into(),
+            output_ref: None,
+            is_error: false,
+        },
+    ));
+    let rendered = transcript
+        .render_tool_for_cache(0, 60, 8)
+        .0
+        .iter()
+        .map(Line::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("FINAL_ARGUMENT"), "{rendered}");
+    assert!(rendered.contains("printf done"), "{rendered}");
+    assert!(rendered.contains("command output"), "{rendered}");
+    assert_eq!(
+        rendered
+            .lines()
+            .filter(|line| line.starts_with("  │ "))
+            .map(|line| line.matches('x').count())
+            .sum::<usize>(),
+        200
+    );
 }

@@ -171,7 +171,11 @@ fn bold_reasoning_thoughts(mut source: &str) -> Option<Vec<&str>> {
 }
 
 fn plain_lines(source: &str, width: usize) -> Vec<Line<'static>> {
-    colored_plain_lines(source, width, Color::White)
+    source
+        .lines()
+        .flat_map(|line| super::wrap_display(line, width.max(1)))
+        .map(|line| Line::from(Span::styled(line, Style::default().fg(Color::White))))
+        .collect()
 }
 
 fn colored_plain_lines(source: &str, width: usize, color: Color) -> Vec<Line<'static>> {

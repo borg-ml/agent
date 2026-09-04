@@ -856,6 +856,12 @@ impl Transcript {
             SessionPayloadKind::ToolResultInput => {
                 let input: serde_json::Value = serde_json::from_slice(&bytes)
                     .context("stored tool result input is not valid JSON")?;
+                let presentation = project_tool_presentation(source_name, &input, None, *error);
+                if presentation.category != ToolPresentationCategory::Edit
+                    && let Some(body) = presentation.input
+                {
+                    *code_view = Some((body.language, body.text));
+                }
                 if name == "Search web"
                     && let Some(query) = web_search_query(&input)
                 {
@@ -1405,8 +1411,14 @@ impl Transcript {
                     {
                         *detail = format!("“{}”", compact_text(&query, 120));
                     }
+                    let completion_presentation = project_tool_presentation(
+                        source_name,
+                        input.as_ref().unwrap_or(&serde_json::Value::Null),
+                        Some(output),
+                        *is_error,
+                    );
                     if *is_error && !output.trim().is_empty() {
-                        let message = output.lines().next().unwrap_or_default();
+                        let message = completion_presentation.result.as_deref().unwrap_or(output);
                         let message = compact_text(message, 120);
                         if detail.trim().is_empty() {
                             *detail = message;
@@ -1418,16 +1430,16 @@ impl Transcript {
                     *completed_at = Some(event.created_at);
                     *error = *is_error;
                     *backgrounded = !*is_error && tool_output_is_backgrounded(output);
-                    let completion_presentation = project_tool_presentation(
-                        source_name,
-                        input.as_ref().unwrap_or(&serde_json::Value::Null),
-                        Some(output),
-                        *is_error,
-                    );
                     if completion_presentation.category == ToolPresentationCategory::Read
                         && !completion_presentation.detail.is_empty()
                     {
                         *detail = completion_presentation.detail.clone();
+                    }
+                    if completion_presentation.category != ToolPresentationCategory::Edit
+                        && input.as_ref().is_some_and(|value| value.as_object().is_none_or(|object| !object.is_empty()))
+                        && let Some(body) = completion_presentation.input.as_ref()
+                    {
+                        *code_view = Some((body.language.clone(), body.text.clone()));
                     }
                     // Keep the result summary on the tool header when the
                     // input had no useful detail (for example `git status`),
@@ -2412,7 +2424,8 @@ impl Transcript {
             if !detail.is_empty() {
                 *name = format!("Run {detail}");
                 detail.clear();
-            } else if let Some(label) = name.strip_prefix("Prepare ") {
+            } else {
+                let label = name.strip_prefix("Generate ").or_else(|| name.strip_prefix("Prepare ")).unwrap_or("command");
                 *name = format!("Run {label}");
             }
         }
@@ -3132,7 +3145,7 @@ impl Transcript {
         {
             lines.push(Line::from(vec![
                 Span::styled(
-                    "  Tool output",
+                    "  Action details",
                     Style::default()
                         .fg(BORG_ORANGE)
                         .add_modifier(Modifier::BOLD),

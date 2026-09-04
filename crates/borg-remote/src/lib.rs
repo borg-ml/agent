@@ -18,6 +18,7 @@ mod harness;
 mod host;
 mod local_control;
 mod lsp;
+mod monitor;
 mod native_context;
 mod native_harness;
 mod native_io;

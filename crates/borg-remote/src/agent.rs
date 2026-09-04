@@ -1668,7 +1668,7 @@ async fn run_borg_provider_turn(
                         provider: turn.provider,
                         kind: "action/preparing".to_string(),
                         payload: serde_json::json!({
-                            "label": "",
+                            "label": if id.is_some() { "command" } else { "" },
                             "tool_call_id": id,
                         }),
                     },

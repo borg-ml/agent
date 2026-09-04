@@ -2426,6 +2426,7 @@ async fn run_local_agent_session(
         tokio::select! {
             _ = session_host_tick.tick(), if args.session_host.is_some() => {
                 let unattended_idle = status == SessionStatus::Ready
+                    && delivered_projection.state().active_processes.is_empty()
                     && !local_prompt_submission_pending(
                         &pending_prompt_ids,
                         &local_prompt_admissions,
