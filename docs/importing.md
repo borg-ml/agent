@@ -40,7 +40,8 @@ conversation using the copied history, with manual permission mode initially.
 Imports are snapshots. Stable source IDs make repeat imports skip existing
 threads and memories, preserving any subsequent Borg edits. New source threads
 are still copied. An existing thread is not silently replaced or merged when
-its source changes. Each thread is committed atomically; interrupted imports can
+its source changes. Local transcripts are staged one at a time, so large histories
+do not have to fit in memory. Each thread is committed atomically; interrupted imports can
 be rerun. Originals remain untouched.
 
 Memory includes source memory files and account/project instructions. Copies are
@@ -102,5 +103,5 @@ historical text. Dates use RFC 3339. Both arrays may be empty or omitted.
 Attachments may contain `data_base64` instead of `path`. File paths must remain
 inside the export directory, including after resolving symbolic links. ZIP
 entries with unsafe paths or links are rejected or reported. Files are limited
-to 256 MiB each, archives and extracted conversation content to 1 GiB, individual attachments
+to 256 MiB each, archives to 1 GiB, individual attachments
 to 64 MiB, and individual memory entries to 4 MiB.

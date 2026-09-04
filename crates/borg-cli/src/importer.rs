@@ -97,12 +97,17 @@ pub(super) struct Thread {
 pub(crate) struct PreparedImport {
     source: Source,
     threads: Vec<Thread>,
+    staged_threads: Vec<PathBuf>,
+    staging: Option<tempfile::TempDir>,
     memory: Vec<ImportedMemory>,
     pub warnings: Vec<String>,
 }
 impl PreparedImport {
     pub fn counts(&self) -> (usize, usize) {
-        (self.threads.len(), self.memory.len())
+        (
+            self.threads.len() + self.staged_threads.len(),
+            self.memory.len(),
+        )
     }
 }
 pub(crate) enum ImportTaskResult {
@@ -193,8 +198,32 @@ async fn execute_into(
         warnings: plan.warnings,
         ..Default::default()
     };
+    let _staging = plan.staging;
     if threads {
-        for thread in plan.threads {
+        let mut inline = plan.threads.into_iter();
+        let mut staged = plan.staged_threads.into_iter();
+        loop {
+            let thread = if let Some(thread) = inline.next() {
+                thread
+            } else if let Some(path) = staged.next() {
+                let result = tokio::task::spawn_blocking(move || -> Result<Thread> {
+                    Ok(serde_json::from_reader(std::io::BufReader::new(
+                        std::fs::File::open(path)?,
+                    ))?)
+                })
+                .await?;
+                match result {
+                    Ok(thread) => thread,
+                    Err(error) => {
+                        report
+                            .warnings
+                            .push(format!("Staged thread could not be read: {error:#}"));
+                        continue;
+                    }
+                }
+            } else {
+                break;
+            };
             let id = Uuid::new_v5(
                 &Uuid::NAMESPACE_URL,
                 format!("borg-import:{}:thread:{}", plan.source.key(), thread.id).as_bytes(),
@@ -543,6 +572,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn staged_local_import_survives_source_removal_after_preview() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("claude");
+        let project = source.join("projects/project");
+        std::fs::create_dir_all(&project).unwrap();
+        let transcript = project.join("thread.jsonl");
+        let records = [
+            serde_json::json!({"type":"user","sessionId":"local-source","uuid":"u","message":{"content":"Question"}}),
+            serde_json::json!({"type":"assistant","sessionId":"local-source","uuid":"a","message":{"content":"Answer"}}),
+        ];
+        std::fs::write(
+            &transcript,
+            records
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        let args = ImportArgs {
+            source: Some(Source::ClaudeCode),
+            path: Some(source),
+            no_threads: false,
+            no_memory: true,
+            preview: false,
+            yes: true,
+            json: false,
+        };
+        let plan = prepare(&args).await.unwrap();
+        assert_eq!(plan.counts(), (1, 0));
+        assert!(plan.threads.is_empty());
+        assert_eq!(plan.staged_threads.len(), 1);
+        std::fs::remove_file(transcript).unwrap();
+        let store = SqliteSessionStore::open(root.path().join("borg.sqlite3"))
+            .await
+            .unwrap();
+        let report = execute_into(plan, true, false, &store, &root.path().join("memory"))
+            .await
+            .unwrap();
+        assert_eq!(report.threads_copied, 1);
+        assert!(store.read(report.session_ids[0]).await.unwrap().iter().any(|event| matches!(&event.kind, SessionEventKind::Message { text, .. } if text == "Answer")));
+    }
+
+    #[tokio::test]
     async fn import_category_opt_outs_do_not_copy_excluded_data() {
         let root = tempfile::tempdir().unwrap();
         for (threads, memory) in [(true, false), (false, true)] {
@@ -552,6 +625,8 @@ mod tests {
                 .unwrap();
             let memories = destination.join("memory");
             let plan = PreparedImport {
+                staged_threads: Vec::new(),
+                staging: None,
                 source: Source::Portable,
                 threads: vec![Thread {
                     id: "test".into(),

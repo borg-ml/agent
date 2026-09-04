@@ -22,6 +22,8 @@ pub(super) fn read(
 ) -> Result<PreparedImport> {
     ensure!(path.exists(), "source does not exist: {}", path.display());
     let mut plan = PreparedImport {
+        staged_threads: Vec::new(),
+        staging: None,
         source,
         threads: Vec::new(),
         memory: Vec::new(),
@@ -80,7 +82,21 @@ pub(super) fn read(
         }
     }
     files.sort();
-    let mut total = 0;
+    let mut names = HashMap::new();
+    if matches!(source, Source::Codex) && threads {
+        if let Ok(file) = fs::File::open(path.join("session_index.jsonl")) {
+            for line in BufReader::new(file).lines() {
+                if let Ok(value) = serde_json::from_str::<Value>(&line?) {
+                    if let (Some(id), Some(name)) =
+                        (value["id"].as_str(), value["thread_name"].as_str())
+                    {
+                        names.insert(id.to_string(), name.to_string());
+                    }
+                }
+            }
+        }
+    }
+    let mut staged_ids = HashSet::new();
     let mut project_roots = HashMap::new();
     let mut thread_scopes = HashMap::new();
     for file in &files {
@@ -96,57 +112,46 @@ pub(super) fn read(
                 continue;
             }
             match read_jsonl(source, file, &mut plan.warnings) {
-                Ok(Some(thread)) => {
+                Ok(Some(mut thread)) => {
                     if let Some(cwd) = &thread.cwd {
                         thread_scopes.insert(thread.id.clone(), cwd.clone());
                     }
                     if let (Some(parent), Some(cwd)) = (file.parent(), thread.cwd.as_ref()) {
-                        project_roots.insert(parent.to_path_buf(), cwd.clone());
-                    }
-                    if threads {
-                        let extracted = thread
-                            .messages
-                            .iter()
-                            .map(|message| {
-                                message.text.len() as u64
-                                    + message
-                                        .attachments
-                                        .iter()
-                                        .filter_map(|a| a.data_base64.as_ref())
-                                        .map(|data| data.len() as u64)
-                                        .sum::<u64>()
-                            })
-                            .sum::<u64>();
-                        if total + extracted > MAX_TOTAL {
-                            plan.warnings.push(format!("{}: extracted conversations exceed 1 GiB; import this source file separately", file.display()));
+                        let project_root = if matches!(source, Source::ClaudeCode) {
+                            file.strip_prefix(path.join("projects"))
+                                .ok()
+                                .and_then(|relative| relative.components().next())
+                                .map(|part| path.join("projects").join(part))
                         } else {
-                            total += extracted;
-                            plan.threads.push(thread);
+                            None
+                        };
+                        project_roots.insert(
+                            project_root.unwrap_or_else(|| parent.to_path_buf()),
+                            cwd.clone(),
+                        );
+                    }
+                    if threads && staged_ids.insert(thread.id.clone()) {
+                        if let Some(name) = names.get(&thread.id) {
+                            thread.title.clone_from(name);
                         }
+                        normalize_attachments(&mut thread, path, source, &mut plan.warnings)?;
+                        if plan.staging.is_none() {
+                            plan.staging = Some(tempfile::tempdir()?);
+                        }
+                        let destination = plan
+                            .staging
+                            .as_ref()
+                            .unwrap()
+                            .path()
+                            .join(format!("{}.json", plan.staged_threads.len()));
+                        let mut writer = std::io::BufWriter::new(fs::File::create(&destination)?);
+                        serde_json::to_writer(&mut writer, &thread)?;
+                        std::io::Write::flush(&mut writer)?;
+                        plan.staged_threads.push(destination);
                     }
                 }
                 Ok(None) => {}
                 Err(error) => plan.warnings.push(format!("{}: {error:#}", file.display())),
-            }
-        }
-    }
-    if matches!(source, Source::Codex) && threads {
-        let index = path.join("session_index.jsonl");
-        if let Ok(file) = fs::File::open(index) {
-            let mut names = HashMap::new();
-            for line in BufReader::new(file).lines() {
-                if let Ok(value) = serde_json::from_str::<Value>(&line?) {
-                    if let (Some(id), Some(name)) =
-                        (value["id"].as_str(), value["thread_name"].as_str())
-                    {
-                        names.insert(id.to_string(), name.to_string());
-                    }
-                }
-            }
-            for thread in &mut plan.threads {
-                if let Some(name) = names.get(&thread.id) {
-                    thread.title.clone_from(name);
-                }
             }
         }
     }
@@ -284,62 +289,72 @@ pub(super) fn read(
             plan.warnings.push(format!("Memory {} will be copied inactive: set cwd in its imported memory file to map the source project.", entry.title));
         }
     }
-    if threads && plan.threads.is_empty() {
+    if threads && plan.threads.is_empty() && plan.staged_threads.is_empty() {
         plan.warnings
             .push("No supported threads found in this source.".into());
     }
     let mut ids = HashSet::new();
     plan.threads.retain(|thread| ids.insert(thread.id.clone()));
     for thread in &mut plan.threads {
-        ensure!(
-            !thread.id.is_empty() && thread.messages.len() <= 100_000,
-            "invalid thread id or too many messages"
-        );
-        for message in &mut thread.messages {
-            for attachment in &mut message.attachments {
-                if attachment.data_base64.is_some() {
-                    continue;
-                }
-                if let Some(relative) = attachment.path.as_ref() {
-                    let resolved = if relative.is_absolute() {
-                        relative.clone()
-                    } else {
-                        path.parent()
-                            .filter(|_| path.is_file())
-                            .unwrap_or(path)
-                            .join(relative)
-                    };
-                    let trusted_local = matches!(source, Source::Codex | Source::ClaudeCode);
-                    let source_root = path
-                        .parent()
+        normalize_attachments(thread, path, source, &mut plan.warnings)?;
+    }
+    Ok(plan)
+}
+
+fn normalize_attachments(
+    thread: &mut Thread,
+    path: &Path,
+    source: Source,
+    warnings: &mut Vec<String>,
+) -> Result<()> {
+    ensure!(
+        !thread.id.is_empty() && thread.messages.len() <= 100_000,
+        "invalid thread id or too many messages"
+    );
+    for message in &mut thread.messages {
+        for attachment in &mut message.attachments {
+            if attachment.data_base64.is_some() {
+                continue;
+            }
+            if let Some(relative) = attachment.path.as_ref() {
+                let resolved = if relative.is_absolute() {
+                    relative.clone()
+                } else {
+                    path.parent()
                         .filter(|_| path.is_file())
                         .unwrap_or(path)
-                        .canonicalize()?;
-                    let within_export = resolved
-                        .canonicalize()
-                        .is_ok_and(|p| p.starts_with(&source_root));
-                    if !trusted_local && !within_export {
-                        plan.warnings.push(format!(
-                            "Attachment {} points outside the export and was not copied",
-                            attachment.name
-                        ));
-                        attachment.path = None;
-                        continue;
-                    }
-                    if resolved
-                        .metadata()
-                        .is_ok_and(|m| m.is_file() && m.len() <= 64 * 1024 * 1024)
-                    {
-                        attachment.data_base64 = Some(
-                            base64::engine::general_purpose::STANDARD.encode(fs::read(&resolved)?),
-                        );
-                    }
+                        .join(relative)
+                };
+                let trusted_local = matches!(source, Source::Codex | Source::ClaudeCode);
+                let source_root = path
+                    .parent()
+                    .filter(|_| path.is_file())
+                    .unwrap_or(path)
+                    .canonicalize()?;
+                let within_export = resolved
+                    .canonicalize()
+                    .is_ok_and(|p| p.starts_with(&source_root));
+                if !trusted_local && !within_export {
+                    warnings.push(format!(
+                        "Attachment {} points outside the export and was not copied",
+                        attachment.name
+                    ));
                     attachment.path = None;
+                    continue;
                 }
+                if resolved
+                    .metadata()
+                    .is_ok_and(|m| m.is_file() && m.len() <= 64 * 1024 * 1024)
+                {
+                    attachment.data_base64 = Some(
+                        base64::engine::general_purpose::STANDARD.encode(fs::read(&resolved)?),
+                    );
+                }
+                attachment.path = None;
             }
         }
     }
-    Ok(plan)
+    Ok(())
 }
 
 fn collect(root: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
@@ -467,6 +482,11 @@ fn content(value: &Value) -> (String, Vec<Attachment>) {
 }
 
 fn read_jsonl(source: Source, file: &Path, warnings: &mut Vec<String>) -> Result<Option<Thread>> {
+    #[derive(Deserialize)]
+    struct Header {
+        #[serde(rename = "type", default)]
+        kind: String,
+    }
     let mut thread = Thread {
         id: String::new(),
         title: String::new(),
@@ -478,6 +498,18 @@ fn read_jsonl(source: Source, file: &Path, warnings: &mut Vec<String>) -> Result
     let mut seen = HashMap::new();
     for (line_number, line) in BufReader::new(fs::File::open(file)?).lines().enumerate() {
         let line = line?;
+        if let Ok(header) = serde_json::from_str::<Header>(&line) {
+            let relevant = match source {
+                Source::Codex => matches!(
+                    header.kind.as_str(),
+                    "session_meta" | "response_item" | "event_msg"
+                ),
+                _ => matches!(header.kind.as_str(), "user" | "assistant" | "ai-title"),
+            };
+            if !relevant {
+                continue;
+            }
+        }
         let value: Value = match serde_json::from_str(&line) {
             Ok(value) => value,
             Err(_) => {
@@ -586,11 +618,12 @@ fn read_jsonl(source: Source, file: &Path, warnings: &mut Vec<String>) -> Result
         }
     }
     if matches!(source, Source::Codex) {
-        if completed.iter().any(|m| m.role == "user")
-            && completed.iter().any(|m| m.role == "assistant")
+        if (completed.iter().any(|m| m.role == "user")
+            && completed.iter().any(|m| m.role == "assistant"))
+            || (thread.messages.is_empty() && !completed.is_empty())
         {
             thread.messages = completed;
-        } else if !thread.messages.iter().any(|m| m.role == "user") {
+        } else if !thread.messages.iter().any(|m| m.role == "user") && !fallback.is_empty() {
             thread.messages = fallback;
         }
     }
@@ -855,6 +888,24 @@ mod tests {
         assert_eq!(thread.messages.len(), 3);
         assert_eq!(thread.messages[1].role, "tool");
         assert_eq!(thread.messages[2].text, "Answer");
+        let assistant_only = [records[0].clone(), records[4].clone()];
+        fs::write(
+            &codex,
+            assistant_only
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            read_jsonl(Source::Codex, &codex, &mut warnings)
+                .unwrap()
+                .unwrap()
+                .messages
+                .len(),
+            1
+        );
         let claude = root.path().join("claude.jsonl");
         let records = [
             serde_json::json!({"type":"user","sessionId":"claude-id","uuid":"user","cwd":"/project","message":{"content":"Question"}}),
@@ -875,6 +926,17 @@ mod tests {
             .unwrap();
         assert_eq!(thread.messages.len(), 2);
         assert_eq!(thread.messages[1].text, "Complete");
+        let subagents = root.path().join("subagents");
+        fs::create_dir(&subagents).unwrap();
+        fs::copy(&claude, subagents.join("worker.jsonl")).unwrap();
+        let child = read_jsonl(
+            Source::ClaudeCode,
+            &subagents.join("worker.jsonl"),
+            &mut warnings,
+        )
+        .unwrap()
+        .unwrap();
+        assert_ne!(child.id, thread.id);
         assert!(warnings.is_empty());
     }
 
