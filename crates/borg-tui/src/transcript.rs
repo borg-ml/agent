@@ -3912,6 +3912,7 @@ impl Transcript {
                         && expandable
                         && let Some((language, source)) = code_view
                     {
+                        let body_start = lines.len();
                         let body_prefix = if tool_window.is_some() {
                             "│   │ "
                         } else {
@@ -3953,6 +3954,13 @@ impl Transcript {
                                 width,
                                 body_prefix,
                             ));
+                        }
+                        if focused_tool == Some(index) && language == "command" {
+                            for line in &mut lines[body_start..] {
+                                for span in line.spans.iter_mut().skip(1) {
+                                    span.style = span.style.fg(USER_LABEL_BLUE);
+                                }
+                            }
                         }
                     }
                     if show_tool_body

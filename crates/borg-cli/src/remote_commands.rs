@@ -1740,7 +1740,7 @@ async fn run_local_agent_session(
             path.canonicalize()
                 .with_context(|| format!("project directory does not exist: {}", path.display()))?,
         ),
-        None if resuming => None,
+        None if recorded_config.is_some() => None,
         None => Some(
             Path::new(".")
                 .canonicalize()
