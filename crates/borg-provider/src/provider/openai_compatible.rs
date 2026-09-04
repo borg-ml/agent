@@ -1798,15 +1798,23 @@ mod tests {
     }
 
     #[test]
-    fn streamed_action_must_be_the_first_complete_argument_field() {
+    fn streamed_action_is_early_when_first_and_accepts_reordered_complete_input() {
         assert_eq!(
             streamed_tool_action(r#"{"action":"delete files","#).as_deref(),
             Some("delete files")
         );
         assert_eq!(streamed_tool_action(r#"{"action":"edi"#), None);
         assert_eq!(
-            streamed_tool_action(r#"{"cmd":"pwd","action":"inspect"}"#),
+            streamed_tool_action(r#"{"cmd":"pwd","action":"inspect"}"#).as_deref(),
+            Some("inspect")
+        );
+        assert_eq!(
+            streamed_tool_action(r#"{"payload":{"action":"nested"},"action":"edi"#),
             None
+        );
+        assert_eq!(
+            streamed_tool_action(r#"{"payload":{"action":"nested"},"action":"edit"}"#).as_deref(),
+            Some("edit")
         );
     }
 

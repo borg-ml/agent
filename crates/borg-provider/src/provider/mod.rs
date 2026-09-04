@@ -229,11 +229,23 @@ pub enum ProviderProgress {
 pub(super) fn streamed_tool_action(arguments: &str) -> Option<String> {
     let mut remaining = arguments.trim_start().strip_prefix('{')?.trim_start();
     let (field, rest) = parse_complete_json_string(remaining)?;
-    if field != "action" {
-        return None;
-    }
-    remaining = rest.trim_start().strip_prefix(':')?.trim_start();
-    let (action, _) = parse_complete_json_string(remaining)?;
+    let action = if field == "action" {
+        remaining = rest.trim_start().strip_prefix(':')?.trim_start();
+        parse_complete_json_string(remaining)?.0
+    } else {
+        // Reordered metadata is still usable once the input is complete.
+        // Avoid reparsing a growing edit body on every token while waiting.
+        if !arguments.trim_end().ends_with('}') {
+            return None;
+        }
+        #[derive(Deserialize)]
+        struct ActionMetadata {
+            action: String,
+        }
+        serde_json::from_str::<ActionMetadata>(arguments)
+            .ok()?
+            .action
+    };
     let action = action.trim();
     (!action.is_empty() && action.chars().count() <= 64).then(|| action.to_string())
 }

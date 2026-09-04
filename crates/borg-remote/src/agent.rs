@@ -1650,7 +1650,7 @@ async fn run_borg_provider_turn(
                 .await;
             }
             ChatStreamEvent::ToolCallGenerating { id } => {
-                if first_model_output {
+                if first_model_output && id.is_some() {
                     first_model_output = false;
                     tracing::debug!(
                         target: "borg_ttft",
